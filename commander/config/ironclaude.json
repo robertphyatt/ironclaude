@@ -1,0 +1,12 @@
+{
+  "poll_interval_seconds": 15,
+  "heartbeat_interval_seconds": 900,
+  "worker_stale_threshold_seconds": 300,
+  "brain_heartbeat_timeout_seconds": 60,
+  "max_worker_retries": 3,
+  "machines": [
+    {"name": "laptop", "url": "http://localhost:11434", "model": "qwen3-coder-next:q2_k", "max_workers": 1}
+  ],
+  "tmp_dir": "/tmp/ic",
+  "log_dir": "/tmp/ic-logs"
+}

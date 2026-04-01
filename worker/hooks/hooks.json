@@ -1,0 +1,166 @@
+{
+  "description": "Professional mode enforcement, plan execution monitoring, drift detection, and episodic memory sync",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/session-init.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/episodic-memory-sync.sh --background",
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/episodic-memory-reminder.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/skill-state-bridge.sh"
+          }
+        ],
+        "matcher": "Skill"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/plan-task-context.sh"
+          }
+        ],
+        "matcher": "Read|Grep|Glob|Edit|Write|NotebookEdit|MultiEdit|Bash|Task"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/professional-mode-guard.sh"
+          }
+        ],
+        "matcher": "Edit|Write|NotebookEdit|MultiEdit|Bash|Read|Grep|Glob"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/subagent-circuit-breaker.sh"
+          }
+        ],
+        "matcher": "Task"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/task-completion-validator.sh"
+          }
+        ],
+        "matcher": "Skill"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/subagent-circuit-breaker.sh"
+          }
+        ],
+        "matcher": "Task"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/memory-search-tracker.sh"
+          }
+        ],
+        "matcher": "Task"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/subagent-circuit-breaker.sh"
+          }
+        ],
+        "matcher": "TaskOutput"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/mcp-state-logger.sh"
+          }
+        ],
+        "matcher": "mcp__plugin_ironclaude_state-manager__mark_design_ready|mcp__plugin_ironclaude_state-manager__mark_plan_ready|mcp__plugin_ironclaude_state-manager__mark_brainstorming|mcp__plugin_ironclaude_state-manager__mark_executing|mcp__plugin_ironclaude_state-manager__mark_debugging|mcp__plugin_ironclaude_state-manager__create_plan|mcp__plugin_ironclaude_state-manager__start_execution|mcp__plugin_ironclaude_state-manager__retreat"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/state-activator.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/plan-execution-reminder.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/topic-change-detector.sh"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/subagent-drift-detector.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/get-back-to-work-claude.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

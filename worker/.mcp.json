@@ -1,0 +1,12 @@
+{
+  "episodic-memory": {
+    "command": "node",
+    "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-servers/episodic-memory/cli/mcp-server-wrapper.js"],
+    "env": {}
+  },
+  "state-manager": {
+    "command": "node",
+    "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-servers/state-manager/cli/mcp-server-wrapper.js"],
+    "env": {}
+  }
+}

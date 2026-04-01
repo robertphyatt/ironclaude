@@ -1,0 +1,54 @@
+#!/bin/sh
+# pre-commit — Reject commits where plugin.json and marketplace.json versions differ
+# Installed automatically by session-init.sh
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Warning: jq not found, skipping version check" >&2
+  exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$REPO_ROOT" ]; then
+  exit 0
+fi
+
+PLUGIN_JSON="$REPO_ROOT/plugins/ironclaude/.claude-plugin/plugin.json"
+MARKETPLACE_JSON="$REPO_ROOT/.claude-plugin/marketplace.json"
+
+if [ ! -f "$PLUGIN_JSON" ] || [ ! -f "$MARKETPLACE_JSON" ]; then
+  exit 0
+fi
+
+# ─── Professional mode check ───
+DB_PATH="$HOME/.claude/ironclaude.db"
+if command -v sqlite3 >/dev/null 2>&1 && [ -f "$DB_PATH" ]; then
+  PM_ROW=$(sqlite3 "$DB_PATH" \
+    "SELECT professional_mode, workflow_stage FROM sessions ORDER BY updated_at DESC LIMIT 1;" 2>/dev/null || true)
+  if [ -n "$PM_ROW" ]; then
+    PM=$(echo "$PM_ROW" | cut -d'|' -f1)
+    PM_STAGE=$(echo "$PM_ROW" | cut -d'|' -f2)
+    if [ "$PM" = "on" ] && [ "$PM_STAGE" != "executing" ]; then
+      echo "ERROR: Professional mode is active (stage: ${PM_STAGE})." >&2
+      echo "Commits are only allowed during plan execution." >&2
+      echo "" >&2
+      echo "To commit, complete a plan execution cycle:" >&2
+      echo "  /executing-plans" >&2
+      echo "" >&2
+      echo "Or deactivate professional mode:" >&2
+      echo "  /deactivate-professional-mode" >&2
+      exit 1
+    fi
+  fi
+fi
+
+V1=$(jq -r '.version' "$PLUGIN_JSON" 2>/dev/null)
+V2=$(jq -r '.plugins[0].version' "$MARKETPLACE_JSON" 2>/dev/null)
+
+if [ "$V1" != "$V2" ]; then
+  echo "ERROR: Version mismatch!"
+  echo "  plugin.json:      $V1"
+  echo "  marketplace.json: $V2"
+  echo ""
+  echo "Run: scripts/bump-version.sh $V1"
+  exit 1
+fi

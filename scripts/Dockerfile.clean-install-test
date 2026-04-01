@@ -1,0 +1,31 @@
+# Clean-room environment for testing ironclaude plugin installation.
+# Usage:
+#   docker build -f scripts/Dockerfile.clean-install-test -t ironclaude-test .
+#   docker run -it ironclaude-test
+#
+# Then follow the README install steps manually inside the container.
+
+FROM node:20-bookworm
+
+# Install system deps that a typical dev machine would have
+RUN apt-get update && apt-get install -y \
+    git \
+    jq \
+    sqlite3 \
+    curl \
+    python3 \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code CLI
+RUN npm install -g @anthropic-ai/claude-code
+
+# Set up a non-root user (Claude Code may need this)
+RUN useradd -m -s /bin/bash testuser
+USER testuser
+WORKDIR /home/testuser
+
+# Copy the repo (simulates what marketplace add would clone)
+COPY --chown=testuser:testuser . /home/testuser/ironclaude-repo
+
+CMD ["/bin/bash"]
