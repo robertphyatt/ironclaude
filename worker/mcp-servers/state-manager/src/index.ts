@@ -36,7 +36,7 @@ function appendErrorLog(tool: string, sessionId: string, error: string): void {
 // Session binding state
 let _ppidFilePath: string | null = null;
 let _sessionBound = false;
-let _sessionBindingSource: 'env' | 'ppid_file' | 'none' = 'none';
+let _sessionBindingSource: 'ppid_file' | 'none' = 'none';
 
 import { readToolDefinitions, readToolNames, handleReadTool, setCurrentSession as setReadSession, setSessionBindingSource } from './tools/read-tools.js';
 import { writeToolDefinitions, writeToolNames, handleWriteTool, setCurrentSession as setWriteSession } from './tools/write-tools.js';
@@ -151,28 +151,13 @@ async function main() {
   const db = initDb();
   console.error('Database initialized');
 
-  // Primary: eager session binding from env var (set via .mcp.json env block)
-  const envSessionId = process.env.CLAUDE_SESSION_ID;
-  if (envSessionId && !envSessionId.startsWith('${')) {
-    setReadSession(envSessionId);
-    setWriteSession(envSessionId);
-    _sessionBound = true;
-    _sessionBindingSource = 'env';
-    setSessionBindingSource('env');
-    console.error(`Bound to session via env var: ${envSessionId}`);
-  } else {
-    console.error(`CLAUDE_SESSION_ID not set or unsubstituted (${process.env.CLAUDE_SESSION_ID ?? 'unset'}), will use PPID file fallback`);
-  }
-
-  // Fallback: PPID file binding (lazy with retry on first tool call)
+  // Bind MCP server to its Claude Code session via PPID file (lazy on first tool call)
   const claudePpid = process.env.CLAUDE_PPID;
   if (claudePpid) {
     _ppidFilePath = path.join(os.homedir(), '.claude', `ironclaude-session-${claudePpid}.id`);
-    if (!_sessionBound) {
-      console.error(`Will bind to session via PPID file on first tool call: ${_ppidFilePath}`);
-    }
+    console.error(`Will bind to session via PPID file on first tool call: ${_ppidFilePath}`);
   } else {
-    console.error(`CRITICAL: CLAUDE_PPID not set. PPID fallback will fail.`);
+    console.error(`CRITICAL: CLAUDE_PPID not set. Session binding will fail.`);
   }
 
   console.error('State Manager MCP server running via stdio');
