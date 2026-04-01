@@ -186,6 +186,24 @@ export const readToolDefinitions = [
       idempotentHint: true,
     },
   },
+  {
+    name: 'get_testing_theatre_status',
+    description:
+      'Returns the testing_theatre_checked flag (0 or 1) for the current session. ' +
+      'Used by the code-review skill to determine if testing-theatre-detection was invoked ' +
+      'before assigning a final grade.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {},
+      required: [] as string[],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -662,6 +680,28 @@ export function handleReadTool(
 
       return {
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      };
+    }
+
+    // ----- get_testing_theatre_status -----
+    case 'get_testing_theatre_status': {
+      const session = getSession(db, resolvedId);
+      if (!session) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: 'Session not found', session_id: resolvedId }) }],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              testing_theatre_checked: session.testing_theatre_checked,
+              session_id: resolvedId,
+            }),
+          },
+        ],
       };
     }
 

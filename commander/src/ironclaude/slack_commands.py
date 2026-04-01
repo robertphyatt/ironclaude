@@ -42,6 +42,22 @@ class SlackSocketHandler:
         parsed = parse_inbound_command(text)
         self._queue.put({"parsed": parsed, "respond": say, "original_text": text, "ts": event.get("ts", "")})
 
+    def _handle_reaction_added_event(self, event: dict) -> None:
+        """Handle an incoming reaction_added event from Slack."""
+        item = event.get("item", {})
+        logger.debug(
+            "reaction_added: emoji=%r item_type=%r ts=%r user=%r",
+            event.get("reaction"), item.get("type"), item.get("ts"), event.get("user"),
+        )
+        if item.get("type") != "message":
+            return
+        self._queue.put({
+            "type": "reaction",
+            "emoji": event.get("reaction", ""),
+            "message_ts": item.get("ts", ""),
+            "user": event.get("user", ""),
+        })
+
     def start(self) -> None:
         """Start Socket Mode in a daemon thread."""
         from slack_bolt import App
@@ -64,20 +80,8 @@ class SlackSocketHandler:
             self._handle_message_event(event, say)
 
         @app.event("reaction_added")
-        def handle_reaction_added(event, say):
-            item = event.get("item", {})
-            logger.debug(
-                "reaction_added: emoji=%r item_type=%r ts=%r user=%r",
-                event.get("reaction"), item.get("type"), item.get("ts"), event.get("user"),
-            )
-            if item.get("type") != "message":
-                return
-            self._queue.put({
-                "type": "reaction",
-                "emoji": event.get("reaction", ""),
-                "message_ts": item.get("ts", ""),
-                "user": event.get("user", ""),
-            })
+        def handle_reaction_added(event):
+            self._handle_reaction_added_event(event)
 
         self._running = True
 

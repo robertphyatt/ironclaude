@@ -2,7 +2,7 @@
 # brain-stop-hook.sh — Claude Code Stop hook for IronClaude worker sessions.
 # Blocks the session from stopping if:
 #   1. The last response contains permission-seeking language, OR
-#   2. The worker (via IC_WORKER_ID) has incomplete tasks in ic.db,
+#   2. The worker (via IC_WORKER_ID) has incomplete tasks in ironclaude.db,
 #      or any workers have status != 'completed' (brain context fallback).
 # Throttle: max 3 blocks per 5 minutes per session.
 #
@@ -10,7 +10,7 @@
 # Output (stdout): JSON with decision ("approve"/"block"), reason, systemMessage
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DB_PATH="${IC_DB_PATH:-${SCRIPT_DIR}/../data/db/ic.db}"
+DB_PATH="${IC_DB_PATH:-${SCRIPT_DIR}/../data/db/ironclaude.db}"
 
 # --- Parse stdin ---
 INPUT=$(cat)

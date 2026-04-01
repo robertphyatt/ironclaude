@@ -1681,7 +1681,7 @@ def main():
     from ironclaude.worker_registry import WorkerRegistry
     from ironclaude.tmux_manager import TmuxManager
 
-    db_path = sys.argv[1] if len(sys.argv) > 1 else "data/db/ic.db"
+    db_path = sys.argv[1] if len(sys.argv) > 1 else "data/db/ironclaude.db"
     log_dir = os.environ.get("IC_LOG_DIR", "/tmp/ic-logs")
     ledger_path = os.environ.get("IC_LEDGER_PATH", "/tmp/ic/task-ledger.json")
 
