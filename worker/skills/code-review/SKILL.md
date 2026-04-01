@@ -157,18 +157,19 @@ Wait for results. Note any issues found.
 
 **Step 6.5: Verify testing-theatre-detection was invoked**
 
-Before assigning a final grade, read the `testing_theatre_checked` flag from the sessions table:
+Before assigning a final grade, check the `testing_theatre_checked` flag:
 
-```bash
-sqlite3 -cmd ".timeout 1000" ~/.claude/ironclaude.db "SELECT testing_theatre_checked FROM sessions WHERE terminal_session='$(echo $CLAUDE_SESSION_ID | sed "s/'/''/g")' LIMIT 1;"
+```
+Use MCP tool: mcp__plugin_ironclaude_state-manager__get_testing_theatre_status
+(no parameters required)
 ```
 
-If the flag is `0` (testing-theatre-detection was NOT invoked):
+If the tool returns `testing_theatre_checked: 0`, or returns an error (treat as 0):
 - **Cap the grade at C regardless of other findings.**
 - Display: "Testing-theatre-detection was not invoked. Grade capped at C. Run testing-theatre-detection before finalizing the review."
 - Do NOT record the verdict until testing-theatre-detection has been run.
 
-If the flag is `1`: Proceed normally with grade assignment.
+If the tool returns `testing_theatre_checked: 1`: Proceed normally with grade assignment.
 
 ### Phase 5: Report Findings
 
