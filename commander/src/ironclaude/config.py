@@ -19,7 +19,7 @@ DEFAULTS = {
     "machines": [],
     "tmp_dir": "/tmp/ic",
     "log_dir": "/tmp/ic-logs",
-    "db_path": "data/db/ic.db",
+    "db_path": "data/db/ironclaude.db",
     "brain_cwd": "~/.ironclaude/brain",
     "brain_prompt_path": "",  # test11
     "operator_name": "Operator",
