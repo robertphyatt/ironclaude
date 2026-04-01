@@ -32,21 +32,60 @@ class TestSlackSocketHandler:
         handler.stop()  # Should not raise
 
 
-def test_reaction_added_event_queued():
-    """Verify reaction_added events are queued with correct format."""
-    handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test")
-    # Simulate what the reaction_added handler would queue
-    handler._queue.put({
-        "type": "reaction",
-        "emoji": "thumbsup",
-        "message_ts": "123.456",
-        "user": "U_OPERATOR",
-    })
-    items = handler.drain()
-    assert len(items) == 1
-    assert items[0]["type"] == "reaction"
-    assert items[0]["emoji"] == "thumbsup"
-    assert items[0]["message_ts"] == "123.456"
+class TestReactionAddedEventHandler:
+    """Direct tests for _handle_reaction_added_event class method."""
+
+    def test_message_reaction_queued(self):
+        """Normal message reaction is queued with correct format."""
+        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test")
+        event = {
+            "reaction": "thumbsup",
+            "item": {"type": "message", "channel": "C123", "ts": "123.456"},
+            "user": "U_OP123",
+        }
+        handler._handle_reaction_added_event(event)
+        items = handler.drain()
+        assert len(items) == 1
+        assert items[0]["type"] == "reaction"
+        assert items[0]["emoji"] == "thumbsup"
+        assert items[0]["message_ts"] == "123.456"
+        assert items[0]["user"] == "U_OP123"
+
+    def test_non_message_item_ignored(self):
+        """Reactions on files or other non-message items are not queued."""
+        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test")
+        event = {
+            "reaction": "thumbsup",
+            "item": {"type": "file", "file": "F123"},
+            "user": "U_OP123",
+        }
+        handler._handle_reaction_added_event(event)
+        assert handler.drain() == []
+
+    def test_missing_reaction_key_queues_empty_emoji(self):
+        """Missing reaction key results in empty emoji string, no crash."""
+        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test")
+        event = {
+            "item": {"type": "message", "channel": "C123", "ts": "123.456"},
+            "user": "U_OP123",
+        }
+        handler._handle_reaction_added_event(event)
+        items = handler.drain()
+        assert len(items) == 1
+        assert items[0]["emoji"] == ""
+
+    def test_missing_ts_key_queues_empty_message_ts(self):
+        """Missing item.ts results in empty message_ts string, no crash."""
+        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test")
+        event = {
+            "reaction": "thumbsup",
+            "item": {"type": "message", "channel": "C123"},
+            "user": "U_OP123",
+        }
+        handler._handle_reaction_added_event(event)
+        items = handler.drain()
+        assert len(items) == 1
+        assert items[0]["message_ts"] == ""
 
 
 def test_message_event_includes_ts():

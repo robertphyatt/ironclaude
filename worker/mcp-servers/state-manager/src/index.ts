@@ -36,7 +36,7 @@ function appendErrorLog(tool: string, sessionId: string, error: string): void {
 // Session binding state
 let _ppidFilePath: string | null = null;
 let _sessionBound = false;
-let _sessionBindingSource: 'ppid_file' | 'none' = 'none';
+let _sessionBindingSource: 'env' | 'ppid_file' | 'none' = 'none';
 
 import { readToolDefinitions, readToolNames, handleReadTool, setCurrentSession as setReadSession, setSessionBindingSource } from './tools/read-tools.js';
 import { writeToolDefinitions, writeToolNames, handleWriteTool, setCurrentSession as setWriteSession } from './tools/write-tools.js';
@@ -93,20 +93,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
-    // Lazy session binding from PPID file (runs once on first tool call)
+    // Lazy session binding from PPID file with retry (runs once on first tool call)
     if (!_sessionBound && _ppidFilePath) {
-      try {
-        const sid = fs.readFileSync(_ppidFilePath, 'utf-8').trim();
-        if (sid && !sid.startsWith('${')) {
-          setReadSession(sid);
-          setWriteSession(sid);
-          _sessionBound = true;
-          _sessionBindingSource = 'ppid_file';
-          setSessionBindingSource('ppid_file');
-          console.error(`Bound to session via PPID file: ${sid}`);
+      const maxAttempts = 5;
+      const delayMs = 300;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          const sid = fs.readFileSync(_ppidFilePath, 'utf-8').trim();
+          if (sid && !sid.startsWith('${')) {
+            setReadSession(sid);
+            setWriteSession(sid);
+            _sessionBound = true;
+            _sessionBindingSource = 'ppid_file';
+            setSessionBindingSource('ppid_file');
+            console.error(`Bound to session via PPID file: ${sid} (attempt ${attempt}/${maxAttempts})`);
+            break;
+          }
+        } catch {
+          // File doesn't exist yet
         }
-      } catch {
-        // File doesn't exist yet or unreadable — resolveSessionId will hard-fail
+        if (attempt < maxAttempts) {
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
       }
     }
 
@@ -143,13 +151,28 @@ async function main() {
   const db = initDb();
   console.error('Database initialized');
 
-  // Bind MCP server to its Claude Code session via PPID file (lazy on first tool call)
+  // Primary: eager session binding from env var (set via .mcp.json env block)
+  const envSessionId = process.env.CLAUDE_SESSION_ID;
+  if (envSessionId && !envSessionId.startsWith('${')) {
+    setReadSession(envSessionId);
+    setWriteSession(envSessionId);
+    _sessionBound = true;
+    _sessionBindingSource = 'env';
+    setSessionBindingSource('env');
+    console.error(`Bound to session via env var: ${envSessionId}`);
+  } else {
+    console.error(`CLAUDE_SESSION_ID not set or unsubstituted (${process.env.CLAUDE_SESSION_ID ?? 'unset'}), will use PPID file fallback`);
+  }
+
+  // Fallback: PPID file binding (lazy with retry on first tool call)
   const claudePpid = process.env.CLAUDE_PPID;
   if (claudePpid) {
     _ppidFilePath = path.join(os.homedir(), '.claude', `ironclaude-session-${claudePpid}.id`);
-    console.error(`Will bind to session via PPID file on first tool call: ${_ppidFilePath}`);
+    if (!_sessionBound) {
+      console.error(`Will bind to session via PPID file on first tool call: ${_ppidFilePath}`);
+    }
   } else {
-    console.error(`CRITICAL: CLAUDE_PPID not set. Session binding will fail.`);
+    console.error(`CRITICAL: CLAUDE_PPID not set. PPID fallback will fail.`);
   }
 
   console.error('State Manager MCP server running via stdio');

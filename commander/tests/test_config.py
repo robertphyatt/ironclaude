@@ -28,6 +28,10 @@ class TestLoadConfig:
         assert "poll_interval_seconds" in cfg
         assert "tmp_dir" in cfg
 
+    def test_db_path_default(self):
+        cfg = load_config("/nonexistent/path.json")
+        assert cfg["db_path"] == "data/db/ironclaude.db"
+
     def test_required_env_vars(self, tmp_path, monkeypatch):
         config_file = tmp_path / "ironclaude.json"
         config_file.write_text("{}")
