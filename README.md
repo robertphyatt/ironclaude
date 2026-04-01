@@ -77,6 +77,7 @@ The Worker is a Claude Code plugin that enforces the brainstorm-plan-execute wor
 
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed
 - Node.js 20+ (for MCP servers)
+- sqlite3 CLI (for hooks — pre-installed on macOS; `sudo apt install sqlite3` on Linux)
 
 ### Install
 
@@ -95,6 +96,14 @@ The Worker is a Claude Code plugin that enforces the brainstorm-plan-execute wor
 ```
 
 When active, Claude operates in architect mode -- planning and designing without making code changes unless executing an approved plan. Every action is validated by hooks that check whether it's permitted in the current workflow phase.
+
+### Set Up Statusline (Recommended)
+
+```
+/statusline
+```
+
+Configures your terminal prompt to show IronClaude's current state: workflow stage, plan name, professional mode status, and review grades. Makes the workflow visible at a glance.
 
 ### The Workflow
 

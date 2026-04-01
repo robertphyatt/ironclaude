@@ -23,6 +23,21 @@ function log(msg) {
   console.error(msg);
 }
 
+function ensureSqlite3() {
+  try {
+    execSync('command -v sqlite3', { stdio: 'pipe' });
+  } catch {
+    log('[startup] FATAL: sqlite3 CLI not found in PATH.');
+    log('[startup] IronClaude hooks require the sqlite3 command-line tool.');
+    log('[startup] Install it:');
+    log('[startup]   macOS:         brew install sqlite3  (usually pre-installed)');
+    log('[startup]   Ubuntu/Debian: sudo apt install sqlite3');
+    log('[startup]   Alpine:        apk add sqlite');
+    log('[startup]   Fedora/RHEL:   sudo dnf install sqlite');
+    process.exit(1);
+  }
+}
+
 // Plugin root is THREE levels up from cli/ (cli/ -> episodic-memory/ -> mcp-servers/ -> plugin root)
 const PLUGIN_ROOT = join(__dirname, '..', '..', '..');
 
@@ -151,6 +166,7 @@ async function main() {
   try {
     log(`Starting episodic-memory wrapper (PID=${process.pid}, PPID=${process.ppid})`);
 
+    ensureSqlite3();
     repairCacheIfNeeded();
     ensureBuildComplete();
 
