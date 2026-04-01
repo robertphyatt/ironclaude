@@ -1,0 +1,14 @@
+{
+  "name": "ironclaude",
+  "owner": {
+    "name": "Robert Hyatt"
+  },
+  "plugins": [
+    {
+      "name": "ironclaude",
+      "source": "./worker",
+      "version": "1.0.0",
+      "description": "Ironclad workflow discipline for Claude Code — professional mode, systematic planning, and multi-session orchestration"
+    }
+  ]
+}
