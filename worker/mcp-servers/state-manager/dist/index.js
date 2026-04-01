@@ -13508,6 +13508,21 @@ var readToolDefinitions = [
       destructiveHint: false,
       idempotentHint: true
     }
+  },
+  {
+    name: "get_testing_theatre_status",
+    description: "Returns the testing_theatre_checked flag (0 or 1) for the current session. Used by the code-review skill to determine if testing-theatre-detection was invoked before assigning a final grade.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true
+    }
   }
 ];
 var readToolNames = new Set(readToolDefinitions.map((t) => t.name));
@@ -13908,6 +13923,26 @@ ${JSON.stringify({ results, passed, total }, null, 2)}`
       };
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+      };
+    }
+    // ----- get_testing_theatre_status -----
+    case "get_testing_theatre_status": {
+      const session = getSession(db, resolvedId);
+      if (!session) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ error: "Session not found", session_id: resolvedId }) }]
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              testing_theatre_checked: session.testing_theatre_checked,
+              session_id: resolvedId
+            })
+          }
+        ]
       };
     }
     default:
@@ -15010,25 +15045,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const db = initDb();
   console.error("Database initialized");
-  const envSessionId = process.env.CLAUDE_SESSION_ID;
-  if (envSessionId && !envSessionId.startsWith("${")) {
-    setCurrentSession(envSessionId);
-    setCurrentSession2(envSessionId);
-    _sessionBound = true;
-    _sessionBindingSource2 = "env";
-    setSessionBindingSource("env");
-    console.error(`Bound to session via env var: ${envSessionId}`);
-  } else {
-    console.error(`CLAUDE_SESSION_ID not set or unsubstituted (${process.env.CLAUDE_SESSION_ID ?? "unset"}), will use PPID file fallback`);
-  }
   const claudePpid = process.env.CLAUDE_PPID;
   if (claudePpid) {
     _ppidFilePath = path4.join(os4.homedir(), ".claude", `ironclaude-session-${claudePpid}.id`);
-    if (!_sessionBound) {
-      console.error(`Will bind to session via PPID file on first tool call: ${_ppidFilePath}`);
-    }
+    console.error(`Will bind to session via PPID file on first tool call: ${_ppidFilePath}`);
   } else {
-    console.error(`CRITICAL: CLAUDE_PPID not set. PPID fallback will fail.`);
+    console.error(`CRITICAL: CLAUDE_PPID not set. Session binding will fail.`);
   }
   console.error("State Manager MCP server running via stdio");
   const transport = new StdioServerTransport();
