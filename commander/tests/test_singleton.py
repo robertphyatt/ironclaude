@@ -89,15 +89,31 @@ class TestAcquireSingletonLock:
         with open(pid_file) as f:
             assert int(f.read().strip()) == os.getpid()
 
+    def test_fd_cloexec_set_on_lock_fd(self, pid_file):
+        """Lock fd has FD_CLOEXEC set so it is not inherited across os.execvp."""
+        main_module._acquire_singleton_lock()
+        fd = main_module._pid_lock_fd
+        assert fd is not None
+        flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+        assert flags & fcntl.FD_CLOEXEC, "FD_CLOEXEC must be set on lock fd"
+
 
 class TestHandleRestartReleasesLock:
     def test_sighup_truncates_and_closes_fd_before_execvp(self, monkeypatch):
-        """_handle_restart releases PID lock before os.execvp."""
+        """_handle_restart cleans up children and releases PID lock before os.execvp."""
+        from unittest.mock import MagicMock
+
         fake_fd = 99
         main_module._pid_lock_fd = fake_fd
 
+        # Set up fake _daemon with brain and _db
+        fake_daemon = MagicMock()
+        fake_daemon._db = MagicMock()
+        monkeypatch.setattr(main_module, "_daemon", fake_daemon)
+
         truncated = []
         closed = []
+        pkill_called = []
 
         def fake_ftruncate(fd, size):
             truncated.append(fd)
@@ -108,13 +124,63 @@ class TestHandleRestartReleasesLock:
         def fake_execvp(path, args):
             raise SystemExit(0)
 
+        def fake_subprocess_run(cmd, **kwargs):
+            pkill_called.append(list(cmd))
+            return MagicMock(returncode=0)
+
         monkeypatch.setattr(os, "ftruncate", fake_ftruncate)
         monkeypatch.setattr(os, "close", fake_close)
         monkeypatch.setattr(os, "execvp", fake_execvp)
+        monkeypatch.setattr(main_module.subprocess, "run", fake_subprocess_run)
+        monkeypatch.setattr(main_module.time, "sleep", lambda _: None)
 
         with pytest.raises(SystemExit):
             main_module._handle_restart(signal.SIGHUP, None)
 
+        fake_daemon.shutdown.assert_called_once()
+        fake_daemon.brain.shutdown.assert_called_once()
+        fake_daemon._db.close.assert_called_once()
+        assert any(cmd[0] == "pkill" for cmd in pkill_called), "pkill -P should be called"
         assert fake_fd in truncated, "fd should be truncated before exec"
         assert fake_fd in closed, "fd should be closed before exec"
         assert main_module._pid_lock_fd is None, "_pid_lock_fd should be cleared"
+
+    def test_handle_restart_close_runs_even_if_ftruncate_raises(self, monkeypatch):
+        """os.close is called even when os.ftruncate raises OSError — regression for production outage."""
+        from unittest.mock import MagicMock
+
+        fake_fd = 99
+        main_module._pid_lock_fd = fake_fd
+        monkeypatch.setattr(main_module, "_daemon", None)
+
+        ftruncate_called = []
+        close_called = []
+
+        def fake_ftruncate(fd, size):
+            ftruncate_called.append(fd)
+            raise OSError("simulated disk error")
+
+        def fake_close(fd):
+            close_called.append(fd)
+
+        def fake_execvp(*a, **kw):
+            raise SystemExit(0)
+
+        def fake_subprocess_run(cmd, **kwargs):
+            m = MagicMock()
+            m.stdout = ""
+            m.returncode = 0
+            return m
+
+        monkeypatch.setattr(os, "ftruncate", fake_ftruncate)
+        monkeypatch.setattr(os, "close", fake_close)
+        monkeypatch.setattr(os, "execvp", fake_execvp)
+        monkeypatch.setattr(main_module.subprocess, "run", fake_subprocess_run)
+        monkeypatch.setattr(main_module.time, "sleep", lambda _: None)
+
+        with pytest.raises(SystemExit):
+            main_module._handle_restart(signal.SIGHUP, None)
+
+        assert fake_fd in ftruncate_called, "ftruncate should have been attempted"
+        assert fake_fd in close_called, "close must run even when ftruncate raises OSError"
+        assert main_module._pid_lock_fd is None

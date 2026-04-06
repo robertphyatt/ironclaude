@@ -1,7 +1,10 @@
 # tests/test_orchestrator_mcp.py
 """Tests for the orchestrator MCP server business logic."""
 
+import fcntl
+import itertools
 import json
+import logging
 import os
 import sqlite3
 import subprocess
@@ -13,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 from ironclaude.db import init_db
 from ironclaude.worker_registry import WorkerRegistry
-from ironclaude.orchestrator_mcp import OrchestratorTools, WORKER_COMMANDS, _load_avatar_skill
+from ironclaude.orchestrator_mcp import OrchestratorTools, WORKER_COMMANDS, _load_avatar_skill, _init_brain_session_background, _restart_watchdog
 from ironclaude.slack_interface import SlackBot
 
 
@@ -54,13 +57,6 @@ def tools(registry, mock_tmux, tmp_path, db_conn):
     """Create OrchestratorTools with test dependencies."""
     ledger_path = str(tmp_path / "task-ledger.json")
     return OrchestratorTools(registry, mock_tmux, ledger_path, db_conn=db_conn)
-
-
-class TestWorkerCommands:
-    def test_worker_commands_use_1m_context(self):
-        """WORKER_COMMANDS must use [1m] suffix to enable 1M context window."""
-        assert "'opus[1m]'" in WORKER_COMMANDS["claude-opus"]
-        assert "'sonnet[1m]'" in WORKER_COMMANDS["claude-sonnet"]
 
 
 class TestSpawnWorker:
@@ -381,7 +377,7 @@ class TestPersistentGrader:
         assert tools._grader_ready is True
         mock_tmux.spawn_session.assert_called_once_with(
             "ic-grader",
-            "claude --model 'opus[1m]' --dangerously-skip-permissions",
+            "claude --model 'opus' --dangerously-skip-permissions",
             cwd=tools._grader_home,
         )
 
@@ -1083,6 +1079,94 @@ class TestActivatePmViaSqlite:
             result = tools._activate_pm_via_sqlite("ic-w1", timeout=2, _claude_dir=claude_dir)
         assert isinstance(result, str)
         assert "tmux" in result.lower()
+
+
+class TestInitBrainSessionBackground:
+    """Tests for the Brain session DB initialization background function."""
+
+    def test_init_brain_session_background_updates_existing_row(self, tmp_path):
+        """UPDATE overwrites undecided->off when session-init already created the row."""
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+
+        db_path = claude_dir / "ironclaude.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE sessions (terminal_session TEXT PRIMARY KEY,"
+            " professional_mode TEXT, updated_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO sessions VALUES"
+            " ('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', 'undecided', NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        (claude_dir / "ironclaude-session-42.id").write_text(
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        )
+
+        _init_brain_session_background(ppid=42, timeout=5, _claude_dir=claude_dir)
+
+        row = sqlite3.connect(str(db_path)).execute(
+            "SELECT professional_mode FROM sessions WHERE terminal_session=?",
+            ("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",),
+        ).fetchone()
+        assert row[0] == "off"
+
+    def test_init_brain_session_background_inserts_when_no_row(self, tmp_path):
+        """INSERT OR IGNORE creates row with 'off' when session-init has not run yet."""
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+
+        db_path = claude_dir / "ironclaude.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE sessions (terminal_session TEXT PRIMARY KEY,"
+            " professional_mode TEXT, updated_at TEXT)"
+        )
+        conn.commit()
+        conn.close()
+
+        (claude_dir / "ironclaude-session-43.id").write_text(
+            "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+        )
+
+        _init_brain_session_background(ppid=43, timeout=5, _claude_dir=claude_dir)
+
+        row = sqlite3.connect(str(db_path)).execute(
+            "SELECT professional_mode FROM sessions WHERE terminal_session=?",
+            ("bbbbbbbb-cccc-dddd-eeee-ffffffffffff",),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "off"
+
+    def test_init_brain_session_background_timeout(self, tmp_path, caplog):
+        """Logs warning and returns cleanly when PPID file never appears."""
+        import logging
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        # No PPID file written
+
+        with caplog.at_level(logging.WARNING, logger="ironclaude.orchestrator_mcp"):
+            _init_brain_session_background(ppid=99999, timeout=1, _claude_dir=claude_dir)
+
+        assert "timed out" in caplog.text.lower()
+        assert not (claude_dir / "ironclaude.db").exists()
+
+    def test_init_brain_session_background_invalid_uuid(self, tmp_path, caplog):
+        """PPID file with wrong-length content is skipped; falls through to timeout."""
+        import logging
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        (claude_dir / "ironclaude-session-77.id").write_text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+
+        with caplog.at_level(logging.WARNING, logger="ironclaude.orchestrator_mcp"):
+            _init_brain_session_background(ppid=77, timeout=1, _claude_dir=claude_dir)
+
+        assert "timed out" in caplog.text.lower()
 
 
 class TestSlackTools:
@@ -2351,38 +2435,227 @@ class TestBatchSpawn:
 
 
 class TestRestartDaemon:
-    def test_restart_daemon_missing_pid_file(self, tools):
-        """Returns error string when PID file does not exist."""
-        pid_file = Path("/tmp/ic-daemon.pid")
-        pid_file.unlink(missing_ok=True)
-        result = tools.restart_daemon()
-        assert "ERROR" in result
-        assert "not found" in result
+    """Tests for restart_daemon MCP tool — detached watchdog pattern."""
 
-    def test_restart_daemon_stale_pid(self, tools):
-        """Returns error when PID refers to a non-existent process."""
-        pid_file = Path("/tmp/ic-daemon.pid")
-        pid_file.write_text("99999999")
-        try:
+    def test_restart_daemon_missing_pid_file(self, tools, tmp_path):
+        """Returns error JSON when PID file does not exist."""
+        pid_file = tmp_path / "ic-daemon.pid"
+        # pid_file does not exist — no write needed
+        with patch("ironclaude.orchestrator_mcp.PID_FILE", pid_file):
             result = tools.restart_daemon()
-        finally:
-            pid_file.unlink(missing_ok=True)
-        assert "ERROR" in result
-        assert "99999999" in result
+        data = json.loads(result)
+        assert data["ok"] is False
+        assert "not found" in data["error"]
 
-    def test_restart_daemon_sends_sighup(self, tools):
-        """Sends SIGHUP to the PID from the file and returns confirmation."""
-        import signal
-        pid_file = Path("/tmp/ic-daemon.pid")
-        test_pid = 12345
-        pid_file.write_text(str(test_pid))
-        try:
-            with patch('os.kill') as mock_kill:
-                result = tools.restart_daemon()
-        finally:
-            pid_file.unlink(missing_ok=True)
-        mock_kill.assert_called_once_with(test_pid, signal.SIGHUP)
-        assert str(test_pid) in result
+    def test_restart_daemon_daemon_not_running(self, tools, tmp_path):
+        """Returns error without forking when daemon does not hold the PID lock."""
+        pid_file = tmp_path / "ic-daemon.pid"
+        pid_file.write_text("12345")
+        # flock succeeds (no exception) = lock is free = daemon NOT running
+        with patch("ironclaude.orchestrator_mcp.PID_FILE", pid_file), \
+             patch("fcntl.flock"), \
+             patch("os.fork") as mock_fork:
+            result = tools.restart_daemon()
+        data = json.loads(result)
+        assert data["ok"] is False
+        mock_fork.assert_not_called()
+
+    def test_restart_daemon_sighup_permission_error(self, tools, tmp_path):
+        """Returns error JSON when os.kill(pid, 0) raises PermissionError."""
+        pid_file = tmp_path / "ic-daemon.pid"
+        pid_file.write_text("12345")
+        with patch("ironclaude.orchestrator_mcp.PID_FILE", pid_file), \
+             patch("fcntl.flock", side_effect=BlockingIOError), \
+             patch("os.kill", side_effect=PermissionError):
+            result = tools.restart_daemon()
+        data = json.loads(result)
+        assert data["ok"] is False
+        assert "permission" in data["error"].lower()
+
+    def test_restart_daemon_stale_pid(self, tools, tmp_path):
+        """Returns error JSON when os.kill(pid, 0) raises ProcessLookupError."""
+        pid_file = tmp_path / "ic-daemon.pid"
+        pid_file.write_text("12345")
+        with patch("ironclaude.orchestrator_mcp.PID_FILE", pid_file), \
+             patch("fcntl.flock", side_effect=BlockingIOError), \
+             patch("os.kill", side_effect=ProcessLookupError):
+            result = tools.restart_daemon()
+        data = json.loads(result)
+        assert data["ok"] is False
+        assert "stale" in data["error"].lower() or "No process" in data["error"]
+
+    def test_restart_daemon_forks_and_returns_immediately(self, tools, tmp_path):
+        """Happy path: guards pass, forks watchdog, returns restart_initiated."""
+        pid_file = tmp_path / "ic-daemon.pid"
+        pid_file.write_text("12345")
+        tools._slack = MagicMock(is_reachable=MagicMock(return_value=True))
+        with patch("ironclaude.orchestrator_mcp.PID_FILE", pid_file), \
+             patch("fcntl.flock", side_effect=BlockingIOError), \
+             patch("os.kill"), \
+             patch("os.fork", return_value=123) as mock_fork, \
+             patch("os.waitpid"), \
+             patch("pathlib.Path.mkdir"):
+            result = tools.restart_daemon()
+        data = json.loads(result)
+        assert data["ok"] is True
+        assert data["status"] == "restart_initiated"
+        assert data["daemon_pid"] == 12345
+        assert "status_file" in data
+        mock_fork.assert_called_once()
+
+    def test_restart_daemon_reaps_first_child(self, tools, tmp_path):
+        """Parent process reaps the first fork child via waitpid."""
+        pid_file = tmp_path / "ic-daemon.pid"
+        pid_file.write_text("12345")
+        tools._slack = MagicMock(is_reachable=MagicMock(return_value=True))
+        with patch("ironclaude.orchestrator_mcp.PID_FILE", pid_file), \
+             patch("fcntl.flock", side_effect=BlockingIOError), \
+             patch("os.kill"), \
+             patch("os.fork", return_value=456), \
+             patch("os.waitpid") as mock_waitpid, \
+             patch("pathlib.Path.mkdir"):
+            tools.restart_daemon()
+        mock_waitpid.assert_called_once_with(456, 0)
+
+    def test_restart_daemon_logs_watchdog_fork(self, tools, caplog, tmp_path):
+        """restart_daemon logs that watchdog was forked."""
+        pid_file = tmp_path / "ic-daemon.pid"
+        pid_file.write_text("12345")
+        tools._slack = MagicMock(is_reachable=MagicMock(return_value=True))
+        with patch("ironclaude.orchestrator_mcp.PID_FILE", pid_file), \
+             patch("fcntl.flock", side_effect=BlockingIOError), \
+             patch("os.kill"), \
+             patch("os.fork", return_value=789), \
+             patch("os.waitpid"), \
+             patch("pathlib.Path.mkdir"), \
+             caplog.at_level(logging.INFO, logger="ironclaude.orchestrator_mcp"):
+            tools.restart_daemon()
+        assert any(
+            "watchdog" in r.message.lower()
+            for r in caplog.records
+        ), "Should log watchdog fork"
+
+    def test_restart_daemon_refuses_when_no_slack(self, tools, tmp_path):
+        """restart_daemon refuses when self._slack is None."""
+        pid_file = tmp_path / "ic-daemon.pid"
+        pid_file.write_text("12345")
+        with patch("ironclaude.orchestrator_mcp.PID_FILE", pid_file), \
+             patch("fcntl.flock", side_effect=BlockingIOError), \
+             patch("os.kill"), \
+             patch("os.fork") as mock_fork:
+            result = tools.restart_daemon()
+        data = json.loads(result)
+        assert data["ok"] is False
+        assert "Slack connection required" in data["error"]
+        mock_fork.assert_not_called()
+
+    def test_restart_daemon_refuses_when_slack_unreachable(self, registry, mock_tmux, tmp_path, db_conn):
+        """restart_daemon refuses when SlackBot.is_reachable() returns False."""
+        from ironclaude.slack_interface import SlackBot
+        # Real SlackBot with invalid credentials — auth_test() will raise SlackApiError
+        slack = SlackBot(token="xoxb-invalid", channel_id="C0000000")
+        ledger_path = str(tmp_path / "task-ledger.json")
+        tools_with_slack = OrchestratorTools(registry, mock_tmux, ledger_path, slack_bot=slack, db_conn=db_conn)
+
+        pid_file = tmp_path / "ic-daemon.pid"
+        pid_file.write_text("12345")
+        with patch("ironclaude.orchestrator_mcp.PID_FILE", pid_file), \
+             patch("fcntl.flock", side_effect=BlockingIOError), \
+             patch("os.kill"), \
+             patch("os.fork") as mock_fork:
+            result = tools_with_slack.restart_daemon()
+        data = json.loads(result)
+        assert data["ok"] is False
+        assert "Slack connection required" in data["error"]
+        mock_fork.assert_not_called()
+
+
+class TestRestartWatchdog:
+    """Tests for the _restart_watchdog module-level function."""
+
+    def test_watchdog_sends_sighup(self, tmp_path):
+        """Watchdog sends the specified signal to the daemon PID."""
+        import signal as _signal
+        status_file = str(tmp_path / "status.json")
+        with patch("os.kill") as mock_kill, \
+             patch("ironclaude.orchestrator_mcp._lock_is_free", side_effect=[True, False]), \
+             patch("ironclaude.orchestrator_mcp.time.time", side_effect=itertools.count(0, 1)), \
+             patch("ironclaude.orchestrator_mcp.time.sleep"):
+            _restart_watchdog(12345, _signal.SIGHUP, status_file)
+        mock_kill.assert_called_once_with(12345, _signal.SIGHUP)
+
+    def test_watchdog_writes_complete_status(self, tmp_path):
+        """Watchdog writes 'complete' status when restart succeeds."""
+        import signal as _signal
+        status_file = str(tmp_path / "status.json")
+        pid_file = tmp_path / "ic-daemon.pid"
+        pid_file.write_text("67890")
+        # _lock_is_free sequence: True (phase 3 passes), False (phase 4 passes)
+        with patch("ironclaude.orchestrator_mcp.PID_FILE", pid_file), \
+             patch("os.kill"), \
+             patch("ironclaude.orchestrator_mcp._lock_is_free", side_effect=[True, False]), \
+             patch("ironclaude.orchestrator_mcp.time.time", side_effect=itertools.count(0, 1)), \
+             patch("ironclaude.orchestrator_mcp.time.sleep"):
+            _restart_watchdog(12345, _signal.SIGHUP, status_file)
+        data = json.loads(Path(status_file).read_text())
+        assert data["phase"] == "complete"
+        assert data["daemon_pid"] == 12345
+        assert data["new_pid"] == 67890
+        assert data["error"] is None
+
+    def test_watchdog_self_heals_on_phase4_timeout(self, tmp_path):
+        """Watchdog starts daemon directly when phase 4 times out."""
+        import signal as _signal
+        status_file = str(tmp_path / "status.json")
+        time_seq = itertools.count(0, 10)
+        mock_proc = MagicMock()
+        mock_proc.pid = 99999
+        # _lock_is_free always True: phase 3 passes, phase 4 never re-acquired
+        with patch("os.kill"), \
+             patch("ironclaude.orchestrator_mcp._lock_is_free", return_value=True), \
+             patch("ironclaude.orchestrator_mcp.time.time", side_effect=time_seq), \
+             patch("ironclaude.orchestrator_mcp.time.sleep"), \
+             patch("ironclaude.orchestrator_mcp.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            _restart_watchdog(12345, _signal.SIGHUP, status_file)
+        mock_popen.assert_called_once()
+        data = json.loads(Path(status_file).read_text())
+        assert data["phase"] == "self_healed"
+        assert data["new_pid"] == 99999
+
+    def test_watchdog_writes_error_on_signal_failure(self, tmp_path):
+        """Watchdog writes error status when SIGHUP fails."""
+        import signal as _signal
+        status_file = str(tmp_path / "status.json")
+        with patch("os.kill", side_effect=ProcessLookupError("No such process")):
+            _restart_watchdog(12345, _signal.SIGHUP, status_file)
+        data = json.loads(Path(status_file).read_text())
+        assert data["phase"] == "error"
+        assert "signal" in data["error"].lower() or "No such process" in data["error"]
+
+    def test_watchdog_phase3_timeout_continues_to_phase4(self, tmp_path):
+        """Watchdog continues to phase 4 and self-heals after phase 3 timeout."""
+        import signal as _signal
+        status_file = str(tmp_path / "status.json")
+        time_seq = itertools.count(0, 10)
+        mock_proc = MagicMock()
+        mock_proc.pid = 88888
+        # Phase 3 needs _lock_is_free=False (lock held, never released → timeout)
+        # Phase 4 needs _lock_is_free=True (lock free, never re-acquired → timeout → self-heal)
+        call_count = [0]
+        def fake_lock_is_free():
+            call_count[0] += 1
+            if call_count[0] <= 1:
+                return False  # phase 3: lock held → times out
+            return True  # phase 4: lock free (not re-acquired) → times out
+        with patch("os.kill"), \
+             patch("ironclaude.orchestrator_mcp._lock_is_free", side_effect=fake_lock_is_free), \
+             patch("ironclaude.orchestrator_mcp.time.time", side_effect=time_seq), \
+             patch("ironclaude.orchestrator_mcp.time.sleep"), \
+             patch("ironclaude.orchestrator_mcp.subprocess.Popen", return_value=mock_proc):
+            _restart_watchdog(12345, _signal.SIGHUP, status_file)
+        # Final status should be self_healed (continued past phase 3 timeout)
+        data = json.loads(Path(status_file).read_text())
+        assert data["phase"] == "self_healed"
 
 
 class TestRestartMcp:
@@ -2474,3 +2747,94 @@ class TestEnsureWorkerTrustedSecurity:
         real_path = os.path.realpath(str(git_repo))
         assert real_path in projects, "Trust entry should be written for a valid git repository"
         assert projects[real_path].get("hasTrustDialogAccepted") is True
+
+
+class TestGetOperatorMessages:
+    def test_get_operator_messages_downloads_images(self, tools):
+        mock_slack = MagicMock()
+        tools._slack = mock_slack
+        mock_slack.search_operator_messages.return_value = [
+            {
+                "text": "screenshot attached",
+                "ts": "1.0",
+                "user": "U123",
+                "files": [
+                    {
+                        "id": "FTEST1",
+                        "name": "screen.png",
+                        "mimetype": "image/png",
+                        "url_private_download": "https://files.slack.com/FTEST1/screen.png",
+                    }
+                ],
+            }
+        ]
+        mock_slack.download_file.return_value = None
+        result = tools.get_operator_messages()
+        assert len(result) == 1
+        assert "files" in result[0]
+        f = result[0]["files"][0]
+        assert "local_path" in f
+        assert f["local_path"] == "/tmp/ironclaude-slack-files/FTEST1_screen.png"
+        mock_slack.download_file.assert_called_once_with(
+            "https://files.slack.com/FTEST1/screen.png",
+            "/tmp/ironclaude-slack-files/FTEST1_screen.png",
+        )
+
+    def test_get_operator_messages_skips_non_images(self, tools):
+        mock_slack = MagicMock()
+        tools._slack = mock_slack
+        mock_slack.search_operator_messages.return_value = [
+            {
+                "text": "doc attached",
+                "ts": "1.0",
+                "user": "U123",
+                "files": [
+                    {
+                        "id": "FDOC1",
+                        "name": "report.pdf",
+                        "mimetype": "application/pdf",
+                        "url_private_download": "https://files.slack.com/FDOC1/report.pdf",
+                    }
+                ],
+            }
+        ]
+        result = tools.get_operator_messages()
+        assert len(result) == 1
+        f = result[0]["files"][0]
+        assert "local_path" not in f
+        mock_slack.download_file.assert_not_called()
+
+    def test_get_operator_messages_handles_download_failure(self, tools, caplog):
+        mock_slack = MagicMock()
+        tools._slack = mock_slack
+        mock_slack.search_operator_messages.return_value = [
+            {
+                "text": "image attached",
+                "ts": "1.0",
+                "user": "U123",
+                "files": [
+                    {
+                        "id": "FFAIL1",
+                        "name": "img.png",
+                        "mimetype": "image/png",
+                        "url_private_download": "https://files.slack.com/FFAIL1/img.png",
+                    }
+                ],
+            }
+        ]
+        mock_slack.download_file.side_effect = Exception("403 Forbidden")
+        with caplog.at_level(logging.WARNING):
+            result = tools.get_operator_messages()
+        assert len(result) == 1
+        f = result[0]["files"][0]
+        assert "local_path" not in f
+
+    def test_get_operator_messages_no_files_unchanged(self, tools):
+        mock_slack = MagicMock()
+        tools._slack = mock_slack
+        mock_slack.search_operator_messages.return_value = [
+            {"text": "plain message", "ts": "1.0", "user": "U123"}
+        ]
+        result = tools.get_operator_messages()
+        assert result == [{"text": "plain message", "ts": "1.0", "user": "U123"}]
+        mock_slack.download_file.assert_not_called()

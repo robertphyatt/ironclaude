@@ -10,6 +10,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
+import subprocess
+import sys
 import queue
 import re
 import threading
@@ -47,6 +50,7 @@ class BrainClient:
 
     MAX_PERMISSION_CORRECTIONS = 3
     PERMISSION_CORRECTION_WINDOW = 600  # seconds (10 minutes)
+    BRAIN_PID_FILE = "/tmp/ic/brain.pid"
     CORRECTION_MESSAGE = (
         "Continue without asking for permission. Do not ask "
         "'shall I', 'should I', 'would you like me to', or "
@@ -125,9 +129,11 @@ class BrainClient:
         self.restart_window_seconds = 600  # 10 minutes
         self._restart_timestamps: list[float] = []
         self._permission_correction_timestamps: list[float] = []
+        self._brain_pid: int | None = None
 
     def start(self, system_prompt: str, cwd: str | None = None) -> None:
         """Start the brain SDK client in a background thread."""
+        self._kill_brain_subprocess()   # singleton guard — kill any pre-existing brain
         self._system_prompt = system_prompt
         self._cwd = cwd
         # Resolve episodic memory MCP server path (fail hard if not found)
@@ -145,6 +151,7 @@ class BrainClient:
         ollama_candidate = Path(__file__).parent / "ollama_mcp.py"
         if ollama_candidate.exists():
             self._ollama_mcp_path = str(ollama_candidate)
+        logger.info(f"MCP servers discovered: orchestrator={self._orchestrator_path}, research={self._research_mcp_path}, ollama={self._ollama_mcp_path}")
         self._stop_event.clear()
         self._running = True
         self._thread = threading.Thread(
@@ -318,7 +325,7 @@ class BrainClient:
         }
         if self._orchestrator_path and self._db_path:
             mcp_servers["orchestrator"] = {
-                "command": "python3",
+                "command": sys.executable,
                 "args": [self._orchestrator_path, self._db_path],
                 "env": {
                     "SUPABASE_URL": os.environ.get("SUPABASE_URL", ""),
@@ -327,14 +334,15 @@ class BrainClient:
             }
         if self._research_mcp_path:
             mcp_servers["research"] = {
-                "command": "python3",
+                "command": sys.executable,
                 "args": [self._research_mcp_path],
             }
         if self._ollama_mcp_path:
             mcp_servers["ollama"] = {
-                "command": "python3",
+                "command": sys.executable,
                 "args": [self._ollama_mcp_path],
             }
+        logger.info(f"MCP servers configured for brain session: {list(mcp_servers.keys())}")
 
         if resume_session_id:
             options = ClaudeAgentOptions(
@@ -378,22 +386,47 @@ class BrainClient:
                 except asyncio.TimeoutError:
                     continue
 
-        async for message in query(prompt=message_generator(), options=options):
-            if isinstance(message, ResultMessage):
-                self._session_id = message.session_id
-            if isinstance(message, AssistantMessage):
-                text_parts = []
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        text_parts.append(block.text)
-                if text_parts:
-                    full_text = "\n\n".join(text_parts)
-                    self._response_queue.put(full_text)
-                    self._last_response_time = time.time()
-                    logger.info(f"Brain response received ({len(full_text)} chars)")
-                    correction = self._check_permission_seeking(full_text)
-                    if correction is not None:
-                        await self._message_queue.put(correction)
+        async def _discover_and_write_pid() -> None:
+            await asyncio.sleep(2.0)
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", "claude.*stream-json.*Orchestrator"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                pids = [int(p) for p in result.stdout.strip().split() if p.strip()]
+                if pids:
+                    self._brain_pid = pids[0]
+                    pid_dir = Path(self.BRAIN_PID_FILE).parent
+                    pid_dir.mkdir(parents=True, exist_ok=True)
+                    Path(self.BRAIN_PID_FILE).write_text(str(pids[0]))
+                    logger.info(f"Brain subprocess PID {pids[0]} written to {self.BRAIN_PID_FILE}")
+            except Exception as e:
+                logger.warning(f"Failed to discover brain subprocess PID: {e}")
+
+        pid_task = asyncio.create_task(_discover_and_write_pid())
+        try:
+            async for message in query(prompt=message_generator(), options=options):
+                if isinstance(message, ResultMessage):
+                    self._session_id = message.session_id
+                if isinstance(message, AssistantMessage):
+                    text_parts = []
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            text_parts.append(block.text)
+                    if text_parts:
+                        full_text = "\n\n".join(text_parts)
+                        self._response_queue.put(full_text)
+                        self._last_response_time = time.time()
+                        logger.info(f"Brain response received ({len(full_text)} chars)")
+                        correction = self._check_permission_seeking(full_text)
+                        if correction is not None:
+                            await self._message_queue.put(correction)
+        finally:
+            pid_task.cancel()
+            try:
+                await pid_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     def send_message(self, text: str) -> bool:
         """Send a message to the brain. Thread-safe."""
@@ -482,6 +515,66 @@ class BrainClient:
         logger.error("Failed to restart brain session")
         return False
 
+    def _kill_brain_subprocess(self) -> None:
+        """Kill any running brain subprocess. Three-tier lookup: instance var → PID file → pgrep.
+
+        Unconditionally clears _brain_pid and removes BRAIN_PID_FILE when done.
+        """
+        pid = self._brain_pid
+
+        # Fall back to PID file
+        if pid is None:
+            pid_file = Path(self.BRAIN_PID_FILE)
+            if pid_file.exists():
+                try:
+                    pid = int(pid_file.read_text().strip())
+                except (ValueError, OSError):
+                    pid = None
+
+        # Fall back to pgrep scan — collect ALL matches
+        if pid is None:
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", "claude.*stream-json.*Orchestrator"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                kill_pids = [int(p) for p in result.stdout.strip().split() if p.strip()]
+                if kill_pids:
+                    logger.info(f"Found {len(kill_pids)} orphan brain subprocess(es) via pgrep: {kill_pids}")
+            except Exception as e:
+                logger.warning(f"pgrep scan for brain subprocess failed: {e}")
+                kill_pids = []
+        else:
+            kill_pids = [pid]
+
+        for kpid in kill_pids:
+            try:
+                os.kill(kpid, signal.SIGTERM)
+                logger.info(f"Sent SIGTERM to brain subprocess PID {kpid}")
+                for _ in range(30):
+                    time.sleep(0.1)
+                    try:
+                        os.kill(kpid, 0)
+                    except ProcessLookupError:
+                        break
+                else:
+                    try:
+                        os.kill(kpid, signal.SIGKILL)
+                        logger.info(f"Sent SIGKILL to brain subprocess PID {kpid}")
+                    except ProcessLookupError:
+                        pass
+            except ProcessLookupError:
+                logger.debug(f"Brain subprocess PID {kpid} already dead")
+            except PermissionError:
+                logger.warning(f"No permission to kill brain subprocess PID {kpid}")
+
+        # Unconditional cleanup
+        self._brain_pid = None
+        try:
+            Path(self.BRAIN_PID_FILE).unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(f"Failed to remove brain PID file: {e}")
+
     def shutdown(self) -> None:
         """Shut down the brain client."""
         self._running = False
@@ -489,5 +582,6 @@ class BrainClient:
         if self._thread is not None:
             self._thread.join(timeout=10)
         self._thread = None
+        self._kill_brain_subprocess()   # force-kill subprocess after thread join
         self._loop = None
         self._message_queue = None

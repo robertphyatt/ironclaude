@@ -185,6 +185,7 @@ The Commander orchestrates multiple Claude Code worker sessions via Slack. A Bra
    - `chat:write` -- send messages
    - `commands` -- slash commands
    - `files:write` -- upload log files and diffs
+   - `files:read` -- download operator-uploaded images (required for image viewing)
    - `im:history` -- receive direct messages
    - `reactions:read` -- read emoji reactions (for directive approval)
    - `reactions:write` -- add/remove emoji reactions (status indicators)

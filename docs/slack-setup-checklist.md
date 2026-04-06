@@ -35,6 +35,7 @@ Go to **OAuth & Permissions > Scopes > Bot Token Scopes** and add:
 | `reactions:write` | Add/remove emoji reactions to messages (directive status indicators) |
 | `reactions:read` | Read reactions on messages (for emoji reconciliation) |
 | `files:write` | Upload log files to Slack |
+| `files:read` | Download operator-uploaded images (required for image viewing) |
 
 - [ ] After adding scopes, click **Install to Workspace** (or **Reinstall**)
 - [ ] Copy the `Bot User OAuth Token` (`xoxb-...`) and save as `SLACK_BOT_TOKEN` in your `.env`

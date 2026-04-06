@@ -7,10 +7,28 @@ import math
 import re
 import time
 import logging
+import requests
 from datetime import datetime, timedelta
 from slack_sdk import WebClient
 
 logger = logging.getLogger("ironclaude.slack")
+
+
+def _format_message(m: dict) -> dict:
+    """Extract standard fields from a Slack message, including file metadata if present."""
+    result = {"text": m["text"], "ts": m["ts"], "user": m.get("user", "")}
+    if m.get("files"):
+        result["files"] = [
+            {
+                "id": f["id"],
+                "name": f.get("name", ""),
+                "mimetype": f.get("mimetype", ""),
+                "url_private_download": f.get("url_private_download", ""),
+            }
+            for f in m["files"]
+        ]
+    return result
+
 
 DIRECTIVE_STATUS_EMOJI = {
     "pending_confirmation": "hourglass_flowing_sand",
@@ -21,6 +39,7 @@ DIRECTIVE_STATUS_EMOJI = {
 }
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 
 
 class SlackBot:
@@ -57,6 +76,17 @@ class SlackBot:
         )
         return response.get("file", {}).get("id", "")
 
+    def download_file(self, url: str, save_path: str) -> None:
+        """Download a private Slack file to save_path using bot token auth. Raises on failure."""
+        import os
+        dir_part = os.path.dirname(save_path)
+        if dir_part:
+            os.makedirs(dir_part, exist_ok=True)
+        resp = requests.get(url, headers={"Authorization": f"Bearer {self._client.token}"}, timeout=30)
+        resp.raise_for_status()
+        with open(save_path, "wb") as fh:
+            fh.write(resp.content)
+
     def flush_queue(self) -> None:
         """Retry sending queued messages."""
         remaining = []
@@ -74,7 +104,7 @@ class SlackBot:
             channel=self._channel_id, limit=limit, oldest=oldest
         )
         return [
-            {"text": m["text"], "ts": m["ts"], "user": m.get("user", "")}
+            _format_message(m)
             for m in result.get("messages", [])
             if m.get("user") and not m.get("bot_id")
         ]
@@ -135,7 +165,7 @@ class SlackBot:
         )
 
         return [
-            {"text": m["text"], "ts": m["ts"], "user": m.get("user", "")}
+            _format_message(m)
             for m in all_matches
             if float(m["ts"]) >= cutoff_start
             and (cutoff_end is None or float(m["ts"]) < cutoff_end)
@@ -231,7 +261,7 @@ def format_help_text() -> str:
     return "\n".join(lines)
 
 
-def parse_inbound_command(text: str) -> dict:
+def parse_inbound_command(text: str, registry=None) -> dict:
     """Parse a user message into a command dict."""
     text = text.strip()
     if text.startswith("/"):
@@ -279,5 +309,10 @@ def parse_inbound_command(text: str) -> dict:
 
     if upper == "SUMMARY":
         return {"type": "summary"}
+
+    if registry is not None:
+        plugin_result = registry.parse_command(text)
+        if plugin_result is not None:
+            return plugin_result
 
     return {"type": "message", "text": text}
