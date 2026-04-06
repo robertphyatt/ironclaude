@@ -96,7 +96,6 @@ def discover_plugins(registry: PluginRegistry, plugin_dirs: list[str] | None = N
         # repo_root = commander/
         repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         builtin_dir = os.path.join(repo_root, "src", "ironclaude", "plugins")
-        scan_dir = os.path.join(repo_root, "scan")
         plugin_dirs = []
         # Scan builtin plugins dir for subdirectories
         if os.path.isdir(builtin_dir):
@@ -104,9 +103,6 @@ def discover_plugins(registry: PluginRegistry, plugin_dirs: list[str] | None = N
                 subdir = os.path.join(builtin_dir, entry)
                 if os.path.isdir(subdir):
                     plugin_dirs.append(subdir)
-        # Add external plugin dirs (gitignored, user-managed)
-        if os.path.isdir(scan_dir):
-            plugin_dirs.append(scan_dir)
 
     loaded = []
     for plugin_dir in plugin_dirs:

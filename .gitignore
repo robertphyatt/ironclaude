@@ -7,7 +7,7 @@
 # Commander (Python)
 __pycache__/
 *.pyc
-commander/scan/
+commander/src/ironclaude/plugins/scan/
 commander/.env
 commander/data/db/*.db
 commander/data/db/*.db-shm
