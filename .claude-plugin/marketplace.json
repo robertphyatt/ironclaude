@@ -7,7 +7,7 @@
     {
       "name": "ironclaude",
       "source": "./worker",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "description": "Ironclad workflow discipline for Claude Code — professional mode, systematic planning, and multi-session orchestration"
     }
   ]

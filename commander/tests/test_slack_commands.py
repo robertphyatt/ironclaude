@@ -1,5 +1,6 @@
 # tests/test_slack_commands.py
 import pytest
+from unittest.mock import MagicMock, patch
 from ironclaude.slack_commands import SlackSocketHandler, format_help_text
 
 
@@ -153,6 +154,54 @@ class TestOperatorRestriction:
         handler._handle_message_event(event, say=None)
         items = handler.drain()
         assert items[0]["ts"] == "999.888"
+
+
+class TestSlashCommandRegistryParsing:
+    """Verify slash commands pass registry to parse_inbound_command."""
+
+    @patch("ironclaude.slack_commands.parse_inbound_command")
+    def test_slash_command_passes_registry(self, mock_parse):
+        """Slash command handler must pass registry=self._registry."""
+        mock_parse.return_value = {"type": "scan_start"}
+        mock_registry = MagicMock()
+        handler = SlackSocketHandler(
+            app_token="xapp-test",
+            bot_token="xoxb-test",
+            registry=mock_registry,
+        )
+
+        captured = {}
+
+        with patch("slack_bolt.App") as MockApp, \
+             patch("slack_bolt.adapter.socket_mode.SocketModeHandler") as MockSMH:
+            mock_app = MockApp.return_value
+
+            def capture_command(pattern):
+                def decorator(fn):
+                    captured["handle_command"] = fn
+                    return fn
+                return decorator
+
+            mock_app.command.side_effect = capture_command
+            mock_app.event.side_effect = lambda name: lambda fn: fn
+
+            def stop_loop():
+                handler._running = False
+            MockSMH.return_value.start.side_effect = stop_loop
+
+            handler.start()
+
+        handler.stop()
+
+        ack = MagicMock()
+        respond = MagicMock()
+        captured["handle_command"](
+            ack=ack,
+            command={"command": "/ironclaude", "text": "scan start"},
+            respond=respond,
+        )
+
+        mock_parse.assert_called_once_with(" scan start", registry=mock_registry)
 
 
 class TestFormatHelpText:

@@ -17,11 +17,10 @@ from ironclaude.slack_interface import parse_inbound_command, SLASH_COMMANDS, fo
 
 logger = logging.getLogger("ironclaude.slack_commands")
 
-
 class SlackSocketHandler:
     """Socket Mode handler for Slack slash commands."""
 
-    def __init__(self, app_token: str, bot_token: str, operator_user_id: str = ""):
+    def __init__(self, app_token: str, bot_token: str, operator_user_id: str = "", registry=None):
         self._app_token = app_token
         self._bot_token = bot_token
         self._operator_user_id = operator_user_id
@@ -30,16 +29,30 @@ class SlackSocketHandler:
         self._running = False
         self._connected = False
         self._last_disconnect_time: float | None = None
+        self._registry = registry
 
     def _handle_message_event(self, event: dict, say) -> None:
         """Handle an incoming channel message event."""
-        text = event.get("text", "")
-        if not text or event.get("bot_id"):
+        if event.get("bot_id"):
             return
         if self._operator_user_id and event.get("user") != self._operator_user_id:
             logger.warning("Ignoring message from non-operator user: %s", event.get("user"))
             return
-        parsed = parse_inbound_command(text)
+        text = event.get("text", "")
+        # Run plugin preprocessors before text parsing
+        if self._registry is not None:
+            try:
+                preprocessed = self._registry.preprocess_event(event, say, None)
+                if preprocessed is not None:
+                    preprocessed.setdefault("respond", say)
+                    preprocessed.setdefault("ts", event.get("ts", ""))
+                    self._queue.put(preprocessed)
+                    return
+            except Exception as e:
+                logger.warning("Plugin preprocessor error: %s", e)
+        if not text:
+            return
+        parsed = parse_inbound_command(text, registry=self._registry)
         self._queue.put({"parsed": parsed, "respond": say, "original_text": text, "ts": event.get("ts", "")})
 
     def _handle_reaction_added_event(self, event: dict) -> None:
@@ -71,7 +84,7 @@ class SlackSocketHandler:
             cmd_name = command.get("command", "").lstrip("/").removeprefix("ironclaude")
             cmd_text = command.get("text", "")
             full_text = f"{cmd_name} {cmd_text}" if cmd_text else cmd_name
-            parsed = parse_inbound_command(full_text)
+            parsed = parse_inbound_command(full_text, registry=self._registry)
             slash_text = f"/{cmd_name}" + (f" {cmd_text}" if cmd_text else "")
             self._queue.put({"parsed": parsed, "respond": respond, "original_text": slash_text})
 

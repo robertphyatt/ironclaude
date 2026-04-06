@@ -339,24 +339,33 @@ Call MCP `mcp__plugin_ironclaude_state-manager__mark_design_ready` with the `fil
 
 If `mcp__plugin_ironclaude_state-manager__mark_design_ready` returns an error (wrong stage), display the error to the user. Do NOT proceed to Step 9 until it succeeds.
 
-**Step 9: Announce completion and next steps**
+**Step 9: Announce completion and prompt for next steps**
 
-Display:
+<HARD-GATE>
+DO NOT write plan content yourself. DO NOT output task lists, waves, or steps.
+DO NOT say "I'll write the plan now" and then produce plan prose.
+The Skill tool IS the plan-writing process. Invoking it is not optional.
+Anything other than invoking the Skill tool is NOT writing a plan.
+</HARD-GATE>
+
+Display design completion status:
 ```
 Design complete and saved to docs/plans/YYYY-MM-DD-<topic>-design.md.
 
 Professional mode is ACTIVE - changes staged for your review.
-
-Ready to create an implementation plan?
-[If yes: /writing-plans docs/plans/YYYY-MM-DD-<topic>-design.md]
 ```
 
-Wait for user response. If they want to proceed, remind them of the command:
+Use AskUserQuestion tool:
+  question: "Ready to create the implementation plan?"
+  header: "Next step"
+  options: "Yes, invoke writing-plans" | "No, stop here"
 
-```
-To create the implementation plan, use:
-/writing-plans docs/plans/YYYY-MM-DD-<topic>-design.md
-```
+If user confirms: invoke Skill tool IMMEDIATELY with:
+  skill: "ironclaude:writing-plans"
+  args: "docs/plans/YYYY-MM-DD-<topic>-design.md"
+
+Do NOT produce any text output between the confirmation and the Skill invocation.
+If user declines: stop here. The design doc is saved; they can invoke /writing-plans later.
 
 ## Key Principles
 
@@ -367,5 +376,5 @@ To create the implementation plan, use:
 - **Incremental validation**: Present design in sections, validate each
 - **Be flexible**: Go back and clarify when something doesn't make sense
 - **Always document**: Write to docs/plans/ before proceeding
-- **Explicit skill invocation**: Use Skill tool to invoke writing-plans, never assume
+- **Explicit skill invocation**: When user confirms at Step 9, invoke `Skill tool { skill: "ironclaude:writing-plans", args: "<design-path>" }` immediately. Never substitute prose, task lists, or step descriptions for the Skill invocation. Writing the plan means CALLING THE SKILL TOOL, not describing what you would write.
 - **Predict before asking**: Before every question, state your prediction with reasoning ("My prediction: You'll say X because..."). This forces thinking from the user's perspective and is enforced by the get-back-to-work hook.

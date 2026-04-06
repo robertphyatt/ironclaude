@@ -21,6 +21,7 @@ import secrets
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +32,10 @@ import shlex
 from ironclaude.tmux_manager import _strip_ansi
 
 logger = logging.getLogger("ironclaude.orchestrator_mcp")
+
+_UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+
+PID_FILE = Path("/tmp/ic-daemon.pid")
 
 
 def log_worker_event(event_type: str, **fields) -> None:
@@ -79,6 +84,96 @@ def _load_avatar_skill() -> str:
     return skill_path.read_text()
 
 
+def _lock_is_free() -> bool:
+    """Return True if the PID file lock can be acquired (nobody holds it)."""
+    try:
+        fd = os.open(str(PID_FILE), os.O_RDWR | os.O_CREAT)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _restart_watchdog(daemon_pid: int, sig: int, status_path: str) -> None:
+    """Detached watchdog: send signal, monitor restart, self-heal on failure.
+
+    Runs in a double-forked grandchild process (fully detached from daemon tree).
+    Writes status JSON to status_path at completion.
+    """
+
+    def _write_status(phase: str, new_pid: int | None = None, error: str | None = None) -> None:
+        try:
+            with open(status_path, "w") as f:
+                json.dump({
+                    "phase": phase,
+                    "daemon_pid": daemon_pid,
+                    "new_pid": new_pid,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "error": error,
+                }, f)
+        except OSError:
+            pass
+
+    # Send signal
+    try:
+        os.kill(daemon_pid, sig)
+    except (ProcessLookupError, PermissionError) as e:
+        _write_status("error", error=f"Failed to send signal: {e}")
+        return
+
+    # Phase 3: wait up to 15s for old daemon to release the lock
+    deadline = time.time() + 15
+    lock_released = False
+    while time.time() < deadline:
+        if _lock_is_free():
+            lock_released = True
+            break
+        time.sleep(0.5)
+
+    if not lock_released:
+        _write_status("phase3_timeout")
+        # Continue anyway — daemon may have restarted very quickly
+
+    # Phase 4: wait up to 20s for new daemon to re-acquire lock
+    deadline = time.time() + 20
+    lock_reacquired = False
+    while time.time() < deadline:
+        if not _lock_is_free():
+            lock_reacquired = True
+            break
+        time.sleep(0.5)
+
+    if lock_reacquired:
+        # Read new PID from file
+        new_pid = None
+        try:
+            new_pid = int(PID_FILE.read_text().strip())
+        except (ValueError, OSError):
+            pass
+        _write_status("complete", new_pid=new_pid)
+        return
+
+    # Self-heal: start daemon directly
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "ironclaude.main"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        # Wait a few seconds for it to acquire the lock
+        time.sleep(3)
+        _write_status("self_healed", new_pid=proc.pid)
+    except OSError as e:
+        _write_status("error", error=f"Self-heal failed: {e}")
+
+
 def ensure_worker_trusted(repo: str) -> None:
     """Ensure a worker's repo directory is trusted in ~/.claude.json.
 
@@ -124,6 +219,68 @@ def ensure_worker_trusted(repo: str) -> None:
         logger.warning(f"{claude_json_path} not found — cannot pre-trust worker directory")
     except OSError as e:
         logger.warning(f"Could not update {claude_json_path}: {e}")
+
+
+def _init_brain_session_background(
+    ppid: int,
+    timeout: int = 30,
+    _claude_dir: Path | None = None,
+) -> None:
+    """Write professional_mode='off' to the Brain's sessions row at startup.
+
+    Called from main() in a daemon thread. Polls for the PPID-keyed session ID
+    file written by session-init.sh, then writes professional_mode='off' to
+    ~/.claude/ironclaude.db using the same INSERT OR IGNORE + UPDATE pattern
+    as _deactivate_pm_via_sqlite.
+
+    Args:
+        ppid: Claude CLI PID (os.getppid() from main() — our direct parent).
+        timeout: Seconds to wait for the PPID file to appear. Default 30s.
+        _claude_dir: Override ~/.claude path (for testing).
+    """
+    claude_dir = _claude_dir if _claude_dir is not None else Path("~/.claude").expanduser()
+    session_id_file = claude_dir / f"ironclaude-session-{ppid}.id"
+    db_path = claude_dir / "ironclaude.db"
+
+    # Poll for PPID file — session-init.sh writes it after ~1s on fresh startup
+    deadline = time.time() + timeout
+    session_uuid = None
+    while time.time() < deadline:
+        if session_id_file.exists():
+            candidate = session_id_file.read_text().strip()
+            if _UUID_RE.match(candidate):
+                session_uuid = candidate
+                break
+        time.sleep(1)
+
+    if session_uuid is None:
+        logger.warning(
+            f"Brain session init timed out after {timeout}s "
+            f"(file: {session_id_file})"
+        )
+        return
+
+    # Mirror of _deactivate_pm_via_sqlite Step 3 — direct UUID, no tmux needed
+    try:
+        with sqlite3.connect(str(db_path), timeout=5) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "INSERT OR IGNORE INTO sessions (terminal_session, professional_mode)"
+                " VALUES (?, 'off')",
+                (session_uuid,),
+            )
+            conn.execute(
+                "UPDATE sessions SET professional_mode='off', updated_at=datetime('now')"
+                " WHERE terminal_session=?",
+                (session_uuid,),
+            )
+            conn.commit()
+        logger.info(
+            f"Brain session initialized: professional_mode='off' "
+            f"(session {session_uuid[:8]}...)"
+        )
+    except sqlite3.Error as e:
+        logger.warning(f"Brain session init sqlite error: {e}")
 
 
 class OrchestratorTools:
@@ -347,15 +504,32 @@ class OrchestratorTools:
         """Read recent Slack messages from the operator (non-bot messages).
 
         Returns a list of message dicts with keys: text, ts, user.
+        Messages with image attachments include a 'files' list; each image file
+        that was downloaded successfully also has a 'local_path' key the Brain
+        can pass to the Read tool to view the image.
         Returns [] if Slack is unavailable or not configured.
         Set only_operator=False to include bot messages.
         """
         if self._slack is None:
             return []
-        return self._slack.search_operator_messages(
+        messages = self._slack.search_operator_messages(
             limit=limit, hours_back=hours_back, start_date=start_date, end_date=end_date,
             only_operator=only_operator,
         )
+        _IMAGE_MIMETYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+        dl_dir = Path("/tmp/ironclaude-slack-files")
+        dl_dir.mkdir(exist_ok=True)
+        for msg in messages:
+            for f in msg.get("files", []):
+                if f.get("mimetype") in _IMAGE_MIMETYPES and f.get("url_private_download"):
+                    safe_name = Path(f["name"]).name
+                    local_path = str(dl_dir / f"{f['id']}_{safe_name}")
+                    try:
+                        self._slack.download_file(f["url_private_download"], local_path)
+                        f["local_path"] = local_path
+                    except Exception as e:
+                        logger.warning("Failed to download Slack image %s: %s", f["name"], e)
+        return messages
 
 
     def submit_directive(self, source_ts: str, source_text: str, interpretation: str) -> dict:
@@ -1288,22 +1462,97 @@ Has the worker genuinely completed its objective based on the evidence?"""
         return f"Worker {worker_id} killed and marked completed."
 
     def restart_daemon(self) -> str:
-        """Send SIGHUP to the IronClaude daemon to trigger a graceful self-restart."""
+        """Send SIGHUP to restart the daemon via a detached watchdog process.
+
+        The MCP server is a grandchild of the daemon — when the daemon kills the
+        brain subprocess on SIGHUP, this process dies too.  So we fork a fully
+        detached watchdog (double-fork + setsid) that handles monitoring and
+        self-healing independently.
+
+        Returns immediately with {"ok": true, "status": "restart_initiated"}.
+        Guard check failures return {"ok": false, "error": "..."} without forking.
+        """
         import signal as _signal
-        pid_file = Path("/tmp/ic-daemon.pid")
+
+        pid_file = PID_FILE
+
+        # Guard: confirm PID file exists
         if not pid_file.exists():
-            return "ERROR: PID file /tmp/ic-daemon.pid not found — is the daemon running?"
+            return json.dumps({
+                "ok": False,
+                "error": "PID file /tmp/ic-daemon.pid not found — is the daemon running?",
+            })
         try:
             daemon_pid = int(pid_file.read_text().strip())
         except (ValueError, OSError) as e:
-            return f"ERROR: Could not read PID file: {e}"
+            return json.dumps({"ok": False, "error": f"Could not read PID file: {e}"})
+
+        # Guard: confirm daemon actually holds the lock (i.e. is running)
+        if _lock_is_free():
+            return json.dumps({
+                "ok": False,
+                "error": "Daemon is not holding the PID lock — process may not be running",
+            })
+
+        # Guard: confirm we can signal the daemon
         try:
-            os.kill(daemon_pid, _signal.SIGHUP)
+            os.kill(daemon_pid, 0)
         except ProcessLookupError:
-            return f"ERROR: No process with PID {daemon_pid} — stale PID file?"
+            return json.dumps({
+                "ok": False,
+                "error": f"No process with PID {daemon_pid} — stale PID file?",
+            })
         except PermissionError:
-            return f"ERROR: No permission to signal PID {daemon_pid}"
-        return f"Daemon restart requested (SIGHUP sent to PID {daemon_pid})"
+            return json.dumps({
+                "ok": False,
+                "error": f"No permission to signal PID {daemon_pid}",
+            })
+
+        # Guard: confirm Slack is reachable before restarting
+        if self._slack is None or not self._slack.is_reachable():
+            return json.dumps({
+                "ok": False,
+                "error": "Slack connection required — cannot restart without verified Slack connectivity",
+            })
+
+        # Ensure status directory exists before forking
+        status_dir = Path("/tmp/ic")
+        status_dir.mkdir(parents=True, exist_ok=True)
+        status_file = str(status_dir / "restart-status.json")
+
+        # Double-fork a detached watchdog
+        pid1 = os.fork()
+        if pid1 == 0:
+            # First child — detach from parent session
+            try:
+                os.setsid()
+                pid2 = os.fork()
+                if pid2 > 0:
+                    os._exit(0)  # First child exits; grandchild is the watchdog
+            except OSError:
+                os._exit(1)
+
+            # === Watchdog process (fully detached) ===
+            try:
+                _restart_watchdog(daemon_pid, _signal.SIGHUP, status_file)
+            except Exception:
+                pass
+            os._exit(0)
+
+        # Parent: reap first child immediately
+        os.waitpid(pid1, 0)
+
+        logger.info(
+            f"Detached restart watchdog forked for daemon PID {daemon_pid}. "
+            "MCP tool returning immediately."
+        )
+
+        return json.dumps({
+            "ok": True,
+            "status": "restart_initiated",
+            "daemon_pid": daemon_pid,
+            "status_file": status_file,
+        })
 
     def game_launch(self, resolution: str = "1280x720") -> str:
         """Launch GodotSteam with Artificial Adventures in windowed mode."""
@@ -1367,7 +1616,7 @@ Has the worker genuinely completed its objective based on the evidence?"""
         self._game_pid = None
         return json.dumps({"status": "killed"})
 
-    def restart_mcp(self) -> None:
+    def restart_mcp(self) -> str:
         """Close DB and exec a fresh instance of this MCP server.
 
         Preserves stdin/stdout so Claude Code's stdio pipe survives the restart.
@@ -1577,7 +1826,10 @@ def _create_mcp_server(tools: OrchestratorTools):
             end_date: Optional ISO date (YYYY-MM-DD) for upper bound (inclusive through end of day).
             only_operator: If True (default), return only operator messages. Set False to include bot messages.
 
-        Returns JSON array of messages with keys: text, ts, user.
+        Returns JSON array of messages with keys: text, ts, user. Messages with
+        image attachments include a 'files' list; each image entry that was
+        downloaded successfully has a 'local_path' key the Brain can pass to the
+        Read tool to view the image.
         Returns empty array if Slack is unavailable or not configured.
         """
         return json.dumps(
@@ -1708,6 +1960,15 @@ def main():
     )
 
     mcp = _create_mcp_server(tools)
+
+    # Initialize Brain's DB row before blocking on mcp.run()
+    # os.getppid() here = the Claude CLI process PID (our direct parent).
+    threading.Thread(
+        target=_init_brain_session_background,
+        args=(os.getppid(),),
+        daemon=True,
+    ).start()
+
     mcp.run()
 
 

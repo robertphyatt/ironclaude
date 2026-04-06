@@ -5,13 +5,15 @@
  */
 
 import { spawn, execSync } from 'child_process';
-import { existsSync, cpSync, appendFileSync, mkdirSync } from 'fs';
+import { existsSync, cpSync, appendFileSync, mkdirSync, writeFileSync, renameSync, unlinkSync } from 'fs';
 import { dirname, join, sep } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+const PPID_FILE = join(homedir(), '.claude', `ironclaude-session-${process.ppid}.id`);
+const PENDING_MARKER = join(homedir(), '.claude', `ironclaude-ppid-pending-${process.ppid}`);
 
 // File-based logging — Claude Code swallows stderr, so we need a persistent log
 const LOG_FILE = join(homedir(), '.claude', 'ironclaude-mcp-episodic-memory.log');
@@ -162,11 +164,24 @@ function repairCacheIfNeeded() {
   }
 }
 
+function registerPpidIfNeeded() {
+  if (existsSync(PPID_FILE)) return;
+  try {
+    const tmp = PENDING_MARKER + '.tmp';
+    writeFileSync(tmp, String(process.pid));
+    renameSync(tmp, PENDING_MARKER);
+    log(`[ppid] No session file found — pending marker written: ${PENDING_MARKER}`);
+  } catch (err) {
+    log(`[ppid] Failed to write pending marker: ${err.message}`);
+  }
+}
+
 async function main() {
   try {
     log(`Starting episodic-memory wrapper (PID=${process.pid}, PPID=${process.ppid})`);
 
     ensureSqlite3();
+    registerPpidIfNeeded();
     repairCacheIfNeeded();
     ensureBuildComplete();
 
@@ -181,6 +196,7 @@ async function main() {
 
     process.on('SIGTERM', () => child.kill('SIGTERM'));
     process.on('SIGINT', () => child.kill('SIGINT'));
+    process.on('exit', () => { try { unlinkSync(PENDING_MARKER); } catch {} });
 
     child.on('exit', (code, signal) => {
       log(`MCP server exited: code=${code} signal=${signal}`);

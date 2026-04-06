@@ -101,18 +101,14 @@ class TestWorkerCheckinNotification:
     def test_basic_checkin(self):
         msg = format_worker_checkin("w1", 15, "executing", "Running tests...", False)
         assert "w1" in msg
-        assert "15 min" in msg
+        assert "15min" in msg
         assert "executing" in msg
         assert "Running tests..." in msg
         assert "waiting for your input" not in msg
 
     def test_prompt_waiting_adds_warning(self):
         msg = format_worker_checkin("w1", 5, "brainstorming", "Which approach?", True)
-        assert "waiting for your input" in msg
-
-    def test_action_required_always_present(self):
-        msg = format_worker_checkin("w1", 30, "executing", "output", False)
-        assert "Action required" in msg
+        assert "Waiting for input" in msg
 
     def test_checkin_prefix(self):
         msg = format_worker_checkin("w1", 10, "design_ready", "Ready", False)

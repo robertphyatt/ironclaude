@@ -811,6 +811,80 @@ class TestMCPDiscovery:
         client.start("test prompt", "/tmp")
         assert client._research_mcp_path == expected
 
+
+class TestBrainPIDTracking:
+    """PID tracking, singleton guard, and orphan kill for brain subprocess."""
+
+    def test_pid_file_constant_exists(self):
+        """BrainClient has BRAIN_PID_FILE class constant containing 'brain.pid'."""
+        assert hasattr(BrainClient, 'BRAIN_PID_FILE')
+        assert 'brain.pid' in BrainClient.BRAIN_PID_FILE
+
+    def test_kill_subprocess_safe_when_no_pid(self, tmp_path, monkeypatch):
+        """_kill_brain_subprocess is safe when no PID is known and no PID file exists."""
+        client = BrainClient()
+        monkeypatch.setattr(BrainClient, 'BRAIN_PID_FILE', str(tmp_path / 'brain.pid'))
+        client._kill_brain_subprocess()  # Must not raise
+        assert client._brain_pid is None
+
+    def test_kill_subprocess_cleans_up_stale_pid_file(self, tmp_path, monkeypatch):
+        """_kill_brain_subprocess removes PID file even when process is already dead."""
+        from unittest.mock import patch
+        pid_file = tmp_path / 'brain.pid'
+        pid_file.write_text('12345')
+        client = BrainClient()
+        monkeypatch.setattr(BrainClient, 'BRAIN_PID_FILE', str(pid_file))
+        with patch('ironclaude.brain_client.os.kill', side_effect=ProcessLookupError):
+            client._kill_brain_subprocess()
+        assert not pid_file.exists()
+
+    def test_kill_subprocess_clears_instance_pid(self, tmp_path, monkeypatch):
+        """_kill_brain_subprocess sets _brain_pid to None after kill attempt."""
+        from unittest.mock import patch
+        client = BrainClient()
+        client._brain_pid = 12345
+        monkeypatch.setattr(BrainClient, 'BRAIN_PID_FILE', str(tmp_path / 'brain.pid'))
+        with patch('ironclaude.brain_client.os.kill', side_effect=ProcessLookupError):
+            client._kill_brain_subprocess()
+        assert client._brain_pid is None
+
+    def test_shutdown_calls_kill_subprocess(self, monkeypatch):
+        """shutdown() calls _kill_brain_subprocess() after thread join."""
+        client = BrainClient()
+        kill_called = []
+        monkeypatch.setattr(client, '_kill_brain_subprocess', lambda: kill_called.append(True))
+        client.shutdown()
+        assert kill_called == [True]
+
+    def test_start_calls_kill_subprocess_first(self, monkeypatch):
+        """start() calls _kill_brain_subprocess() before spawning the brain thread."""
+        import unittest.mock as mock
+        client = BrainClient()
+        kill_calls = []
+        monkeypatch.setattr(client, '_kill_brain_subprocess', lambda: kill_calls.append(True))
+        monkeypatch.setattr(BrainClient, 'discover_episodic_memory_path',
+                            lambda *a, **kw: '/fake/path')
+        with mock.patch('ironclaude.brain_client.threading.Thread') as mock_thread:
+            mock_thread.return_value = mock.MagicMock()
+            client.start('test prompt')
+        assert len(kill_calls) == 1
+
+    def test_stale_pid_file_cleaned_on_start(self, tmp_path, monkeypatch):
+        """start() removes stale PID file from previous crash via singleton guard."""
+        import unittest.mock as mock
+        from unittest.mock import patch
+        pid_file = tmp_path / 'brain.pid'
+        pid_file.write_text('12345')
+        client = BrainClient()
+        monkeypatch.setattr(BrainClient, 'BRAIN_PID_FILE', str(pid_file))
+        monkeypatch.setattr(BrainClient, 'discover_episodic_memory_path',
+                            lambda *a, **kw: '/fake/path')
+        with mock.patch('ironclaude.brain_client.threading.Thread') as mock_thread, \
+             patch('ironclaude.brain_client.os.kill', side_effect=ProcessLookupError):
+            mock_thread.return_value = mock.MagicMock()
+            client.start('test prompt')
+        assert not pid_file.exists()
+
     def test_ollama_mcp_path_resolves_relative_to_package(self):
         """_ollama_mcp_path points to src/ic/ollama_mcp.py."""
         from pathlib import Path

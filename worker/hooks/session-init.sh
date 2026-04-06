@@ -50,11 +50,21 @@ STATUSLINE_PATH="$VERSION_DIR/hooks/statusline.sh"
 
 if [ -f "$SETTINGS_JSON" ] && command -v jq &>/dev/null; then
   CURRENT_CMD=$(jq -r '.statusLine.command // empty' "$SETTINGS_JSON" 2>/dev/null || true)
-  if [ -n "$CURRENT_CMD" ] && [ "$CURRENT_CMD" != "$STATUSLINE_PATH" ]; then
+  if [ -z "$CURRENT_CMD" ]; then
+    # INSERT: No statusLine yet — add full object (type + command required by Claude Code)
+    TMP_SETTINGS=$(mktemp)
+    if jq --arg cmd "$STATUSLINE_PATH" '.statusLine = {"type": "command", "command": $cmd}' "$SETTINGS_JSON" > "$TMP_SETTINGS" 2>/dev/null && [ -s "$TMP_SETTINGS" ]; then
+      mv "$TMP_SETTINGS" "$SETTINGS_JSON"
+      log_hook "session-init" "Settings" "statusline inserted: $STATUSLINE_PATH"
+    else
+      rm -f "$TMP_SETTINGS"
+    fi
+  elif [ "$CURRENT_CMD" != "$STATUSLINE_PATH" ]; then
+    # UPDATE: statusLine exists but points to stale path — patch command only
     TMP_SETTINGS=$(mktemp)
     if jq --arg cmd "$STATUSLINE_PATH" '.statusLine.command = $cmd' "$SETTINGS_JSON" > "$TMP_SETTINGS" 2>/dev/null && [ -s "$TMP_SETTINGS" ]; then
       mv "$TMP_SETTINGS" "$SETTINGS_JSON"
-      log_hook "session-init" "Settings" "statusline path set to $STATUSLINE_PATH"
+      log_hook "session-init" "Settings" "statusline path updated to $STATUSLINE_PATH"
     else
       rm -f "$TMP_SETTINGS"
     fi
@@ -179,19 +189,15 @@ if [ "$RAW_SOURCE" = "resume" ]; then
   mv "$TMP_PPID_FILE" "$PPID_FILE"
   log_hook "session-init" "PPID" "session file written (resume): $PPID_FILE"
 elif [ "$RAW_SOURCE" = "startup" ]; then
-  # Startup: defer to let a possible concurrent resume event go first
+  # Write immediately so MCP tools can bind during the 1-second resume-wait window.
+  TMP_PPID_FILE=$(mktemp "$HOME/.claude/.ironclaude-session-XXXXXX")
+  printf '%s' "$SESSION_TAG" > "$TMP_PPID_FILE"
+  mv "$TMP_PPID_FILE" "$PPID_FILE"
+  log_hook "session-init" "PPID" "session file written early (startup): $PPID_FILE"
   sleep 1
   if [ -f "$STAGE_DIR/resume" ]; then
-    # Resume event arrived and already wrote the correct PPID file — skip
-    log_hook "session-init" "PPID" "deferred to resume event (startup skipped)"
-  else
-    # No resume within 1 second — fresh session, startup is correct
-    TMP_PPID_FILE=$(mktemp "$HOME/.claude/.ironclaude-session-XXXXXX")
-    printf '%s' "$SESSION_TAG" > "$TMP_PPID_FILE"
-    mv "$TMP_PPID_FILE" "$PPID_FILE"
-    log_hook "session-init" "PPID" "session file written (fresh startup): $PPID_FILE"
+    log_hook "session-init" "PPID" "resume event superseded startup write"
   fi
-  # Cleanup staging directory (startup handler is always the last to finish)
   rm -rf "$STAGE_DIR"
 else
   # Unknown source — write unconditionally (backward compat)

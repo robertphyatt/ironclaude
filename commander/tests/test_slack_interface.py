@@ -1,6 +1,7 @@
 # tests/test_slack_interface.py
 import logging
 import pytest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from ironclaude.slack_interface import SlackBot, parse_inbound_command
@@ -80,6 +81,48 @@ class TestSlackBot:
         bot = SlackBot(token="xoxb-test", channel_id="C123")
         with pytest.raises(Exception, match="api error"):
             bot.get_recent_messages()
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_get_recent_messages_includes_file_metadata(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.conversations_history.return_value = {
+            "messages": [
+                {
+                    "text": "screenshot attached",
+                    "ts": "1.0",
+                    "user": "U123",
+                    "files": [
+                        {
+                            "id": "F999",
+                            "name": "screenshot.png",
+                            "mimetype": "image/png",
+                            "url_private_download": "https://files.slack.com/F999/screenshot.png",
+                        }
+                    ],
+                }
+            ]
+        }
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        msgs = bot.get_recent_messages()
+        assert len(msgs) == 1
+        assert "files" in msgs[0]
+        assert msgs[0]["files"][0]["id"] == "F999"
+        assert msgs[0]["files"][0]["name"] == "screenshot.png"
+        assert msgs[0]["files"][0]["mimetype"] == "image/png"
+        assert msgs[0]["files"][0]["url_private_download"] == "https://files.slack.com/F999/screenshot.png"
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_get_recent_messages_no_files_no_key(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.conversations_history.return_value = {
+            "messages": [{"text": "hello", "ts": "1.0", "user": "U123"}]
+        }
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        msgs = bot.get_recent_messages()
+        assert len(msgs) == 1
+        assert "files" not in msgs[0]
 
 
 class TestParseInboundCommand:
@@ -409,3 +452,75 @@ class TestSearchOperatorMessagesDateValidation:
             user_token="xoxp-test", operator_user_id="U123",
         )
         bot.search_operator_messages(start_date=None, end_date=None)  # must not raise
+
+
+class TestSearchOperatorMessagesFileMetadata:
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_search_operator_messages_includes_file_metadata(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.search_messages.return_value = {
+            "messages": {
+                "paging": {"pages": 1},
+                "matches": [
+                    {
+                        "text": "diagram attached",
+                        "ts": "9999999999.0",
+                        "user": "U123",
+                        "files": [
+                            {
+                                "id": "F777",
+                                "name": "diagram.png",
+                                "mimetype": "image/png",
+                                "url_private_download": "https://files.slack.com/F777/diagram.png",
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(
+            token="xoxb-test", channel_id="C123",
+            user_token="xoxp-test", operator_user_id="U123",
+        )
+        msgs = bot.search_operator_messages(hours_back=24)
+        assert len(msgs) == 1
+        assert "files" in msgs[0]
+        assert msgs[0]["files"][0]["id"] == "F777"
+        assert msgs[0]["files"][0]["mimetype"] == "image/png"
+
+
+class TestSlackBotDownloadFile:
+    @patch("ironclaude.slack_interface.requests")
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_download_file_calls_requests_with_bearer_token(self, mock_client_cls, mock_requests, tmp_path):
+        mock_client = MagicMock()
+        mock_client.token = "xoxb-test"
+        mock_client_cls.return_value = mock_client
+        mock_resp = MagicMock()
+        mock_resp.content = b"fake image bytes"
+        mock_requests.get.return_value = mock_resp
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        save_path = str(tmp_path / "F999_screenshot.png")
+        bot.download_file("https://files.slack.com/F999/screenshot.png", save_path)
+        mock_requests.get.assert_called_once_with(
+            "https://files.slack.com/F999/screenshot.png",
+            headers={"Authorization": "Bearer xoxb-test"},
+            timeout=30,
+        )
+        mock_resp.raise_for_status.assert_called_once()
+        assert Path(save_path).read_bytes() == b"fake image bytes"
+
+    @patch("ironclaude.slack_interface.requests")
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_download_file_raises_on_http_error(self, mock_client_cls, mock_requests, tmp_path):
+        from requests.exceptions import HTTPError
+        mock_client = MagicMock()
+        mock_client.token = "xoxb-test"
+        mock_client_cls.return_value = mock_client
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.side_effect = HTTPError("403 Forbidden")
+        mock_requests.get.return_value = mock_resp
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        with pytest.raises(HTTPError):
+            bot.download_file("https://files.slack.com/F999/screenshot.png", str(tmp_path / "out.png"))

@@ -9,6 +9,27 @@ run_hook "state-activator"
 INPUT=$(cat)
 init_session_id
 
+# ═══ Pending PPID marker handshake ═══
+# MCP wrappers write ironclaude-ppid-pending-{PPID} when no session file exists
+# (e.g., after plugin reload). Write the session file so MCP retry loop can bind.
+for marker in "$HOME/.claude"/ironclaude-ppid-pending-*; do
+  [ -f "$marker" ] || continue
+  ppid_val=$(basename "$marker" | sed 's/ironclaude-ppid-pending-//')
+  # Validate ppid_val is numeric (defense against unexpected filenames)
+  if ! [[ "$ppid_val" =~ ^[0-9]+$ ]]; then
+    rm -f "$marker"
+    continue
+  fi
+  ppid_file="$HOME/.claude/ironclaude-session-${ppid_val}.id"
+  if [ ! -f "$ppid_file" ]; then
+    TMP_PPID=$(mktemp "$HOME/.claude/.ironclaude-session-XXXXXX")
+    printf '%s' "$SESSION_TAG" > "$TMP_PPID"
+    mv "$TMP_PPID" "$ppid_file"
+    log_hook "state-activator" "PPID" "wrote session file from pending marker: $ppid_file"
+  fi
+  rm -f "$marker"
+done
+
 # Surface any MCP tool errors from the sideband log
 surface_mcp_errors
 

@@ -100,15 +100,7 @@ def format_worker_checkin(
     worker_id: str, elapsed_minutes: int, stage: str,
     log_tail: str, prompt_waiting: bool,
 ) -> str:
-    msg = (
-        f"[CHECK-IN] Worker {worker_id} — running {elapsed_minutes} min, "
-        f"stage: {stage}.\n"
-        f"Current output:\n{log_tail}"
-    )
+    msg = f"[CHECK-IN] {worker_id} {elapsed_minutes}min {stage}\n{log_tail}"
     if prompt_waiting:
-        msg += (
-            "\n⚠️ Worker appears to be waiting for your input. "
-            "Use get_worker_log to see the full prompt, then send_to_worker to respond."
-        )
-    msg += "\nAction required: Review and respond if needed."
+        msg += "\n⚠️ Waiting for input."
     return msg

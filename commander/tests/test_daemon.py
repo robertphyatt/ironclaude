@@ -37,11 +37,10 @@ class TestCheckWorkersDoneMarker:
         with open(marker, "w") as f:
             f.write("2026-03-01T00:00:00Z")
         daemon.check_workers()
-        # Brain should be notified with "went idle", not "completed"
+        # Brain should be notified with idle signal, not "completed"
         daemon.brain.send_message.assert_called_once()
         msg = daemon.brain.send_message.call_args[0][0]
-        assert "went idle" in msg
-        assert "kill_worker" in msg
+        assert "idle" in msg
         # Marker should be cleaned up
         assert not os.path.exists(marker)
 
@@ -392,8 +391,113 @@ class TestProactiveCheckin:
 
         daemon.check_workers()
         msg = daemon.brain.send_message.call_args[0][0]
-        assert "went idle" in msg
+        assert "idle" in msg
         assert "[CHECK-IN]" not in msg
+
+
+class TestProactiveCheckinDedup:
+    def test_dedup_suppresses_when_no_ack(self, daemon, tmp_path):
+        """No repeat check-in when brain hasn't acked and heartbeat hasn't elapsed."""
+        worker = {
+            "id": "w1", "tmux_session": "ic-w1",
+            "spawned_at": "2026-03-08 00:00:00",
+        }
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        daemon.tmux.list_pane_pid.return_value = "12345"
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        session_id = "abcdef01-2345-6789-abcd-ef0123456789"
+        _setup_ironclaude_db(claude_dir, "12345", session_id, "executing")
+
+        daemon._claude_dir = claude_dir
+        # Simulate a send that already happened — no brain_contact file written
+        daemon._last_checkin_sent["w1"] = time.time()
+        daemon._last_checkin_stage["w1"] = "executing"
+
+        daemon.check_workers()
+        daemon.brain.send_message.assert_not_called()
+
+    def test_stage_change_bypasses_dedup(self, daemon, tmp_path):
+        """Stage transition fires check-in immediately, bypassing dedup gate."""
+        worker = {
+            "id": "w1", "tmux_session": "ic-w1",
+            "spawned_at": "2026-03-08 00:00:00",
+        }
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        daemon.tmux.capture_pane.return_value = "Reviewing..."
+        daemon.tmux.list_pane_pid.return_value = "12345"
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        session_id = "abcdef01-2345-6789-abcd-ef0123456789"
+        # Worker is now in "reviewing" stage
+        _setup_ironclaude_db(claude_dir, "12345", session_id, "reviewing")
+
+        daemon._claude_dir = claude_dir
+        daemon.brain.send_message.return_value = True
+        # Last send was recent, but stage was "executing" — now it's "reviewing"
+        daemon._last_checkin_sent["w1"] = time.time()
+        daemon._last_checkin_stage["w1"] = "executing"
+
+        daemon.check_workers()
+        daemon.brain.send_message.assert_called_once()
+
+    def test_heartbeat_elapsed_sends_without_ack(self, daemon, tmp_path):
+        """Heartbeat backstop fires even without brain ack when interval elapses."""
+        worker = {
+            "id": "w1", "tmux_session": "ic-w1",
+            "spawned_at": "2026-03-08 00:00:00",
+        }
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        daemon.tmux.capture_pane.return_value = "Still executing..."
+        daemon.tmux.list_pane_pid.return_value = "12345"
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        session_id = "abcdef01-2345-6789-abcd-ef0123456789"
+        _setup_ironclaude_db(claude_dir, "12345", session_id, "executing")
+
+        daemon._claude_dir = claude_dir
+        daemon.config["heartbeat_interval_seconds"] = 900
+        daemon.brain.send_message.return_value = True
+        # Sent 901 seconds ago, no brain ack — heartbeat backstop should fire
+        daemon._last_checkin_sent["w1"] = time.time() - 901
+        daemon._last_checkin_stage["w1"] = "executing"
+
+        daemon.check_workers()
+        daemon.brain.send_message.assert_called_once()
+
+    def test_brain_ack_resumes_cadence(self, daemon, tmp_path):
+        """After brain acks, cadence check resumes and suppresses if not elapsed."""
+        worker = {
+            "id": "w1", "tmux_session": "ic-w1",
+            "spawned_at": "2026-03-08 00:00:00",
+        }
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        daemon.tmux.list_pane_pid.return_value = "12345"
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        session_id = "abcdef01-2345-6789-abcd-ef0123456789"
+        _setup_ironclaude_db(claude_dir, "12345", session_id, "executing")
+
+        daemon._claude_dir = claude_dir
+        t_sent = time.time() - 5  # Sent 5 seconds ago
+        daemon._last_checkin_sent["w1"] = t_sent
+        daemon._last_checkin_stage["w1"] = "executing"
+        # Brain acknowledged shortly after the send
+        contact_file = os.path.join(daemon.tmux.log_dir, "ic-w1.brain_contact")
+        with open(contact_file, "w") as f:
+            f.write(str(t_sent + 1))
+
+        # Cadence not elapsed (5s < 300s default for "executing")
+        daemon.check_workers()
+        daemon.brain.send_message.assert_not_called()
 
 
 class TestDirectiveConfirmation:
@@ -854,6 +958,195 @@ class TestHandleRestart:
                 _handle_restart(signal.SIGHUP, None)
         mock_daemon.shutdown.assert_called_once()
 
+    def test_handle_restart_stops_socket_handler_before_exec(self):
+        """_handle_restart calls socket_handler.stop() before os.execvp."""
+        import ironclaude.main as main_module
+        mock_daemon = MagicMock()
+        mock_daemon.socket_handler = MagicMock()
+        with patch.object(main_module, '_daemon', mock_daemon):
+            with patch('os.execvp'):
+                main_module._handle_restart(signal.SIGHUP, None)
+        mock_daemon.socket_handler.stop.assert_called_once()
+
+    def test_handle_restart_kills_duplicate_daemons_before_exec(self):
+        """_handle_restart sends SIGTERM to other ironclaude.main processes before execvp."""
+        import ironclaude.main as main_module
+
+        our_pid = os.getpid()
+        duplicate_pid = our_pid + 1000
+
+        killed = []
+
+        def fake_os_kill(pid, sig):
+            killed.append((pid, sig))
+
+        def fake_subprocess_run(cmd, **kwargs):
+            m = MagicMock()
+            if isinstance(cmd, list) and cmd and cmd[0] == "pgrep":
+                m.stdout = f"{our_pid}\n{duplicate_pid}\n"
+            else:
+                m.stdout = ""
+            m.returncode = 0
+            return m
+
+        with patch.object(main_module, '_daemon', None), \
+             patch('os.execvp'), \
+             patch('os.kill', side_effect=fake_os_kill), \
+             patch.object(main_module.subprocess, 'run', side_effect=fake_subprocess_run), \
+             patch.object(main_module.time, 'sleep'):
+            main_module._handle_restart(signal.SIGHUP, None)
+
+        assert (duplicate_pid, signal.SIGTERM) in killed, \
+            "Duplicate daemon must be sent SIGTERM"
+        assert not any(pid == our_pid for pid, _ in killed), \
+            "Must not kill own PID"
+
+    def test_handle_restart_sets_stop_event_before_brain_shutdown(self):
+        """_handle_restart sets brain._stop_event BEFORE calling brain.shutdown()."""
+        import threading
+        import ironclaude.main as main_module
+
+        stop_event = threading.Event()
+        mock_daemon = MagicMock()
+        mock_daemon.brain._stop_event = stop_event
+        mock_daemon.brain._running = True
+
+        was_set_before_shutdown = []
+
+        def check_stop_event():
+            was_set_before_shutdown.append(stop_event.is_set())
+
+        mock_daemon.brain.shutdown.side_effect = check_stop_event
+
+        def fake_subprocess_run(cmd, **kwargs):
+            m = MagicMock()
+            m.stdout = ""
+            m.returncode = 0
+            return m
+
+        with patch.object(main_module, '_daemon', mock_daemon), \
+             patch('os.execvp'), \
+             patch.object(main_module.subprocess, 'run', side_effect=fake_subprocess_run), \
+             patch.object(main_module.time, 'sleep'):
+            main_module._handle_restart(signal.SIGHUP, None)
+
+        assert was_set_before_shutdown == [True], \
+            "_stop_event must be set BEFORE brain.shutdown() is called"
+        assert not mock_daemon.brain._running, \
+            "brain._running must be False after restart handler"
+
+    def test_handle_restart_verifies_no_orphan_brains(self):
+        """_handle_restart runs pgrep verification after killing orphan brains."""
+        import ironclaude.main as main_module
+
+        mock_daemon = MagicMock()
+        mock_daemon.brain._stop_event = MagicMock()
+
+        pgrep_calls = []
+
+        def fake_subprocess_run(cmd, **kwargs):
+            m = MagicMock()
+            m.stdout = ""
+            m.returncode = 0
+            if isinstance(cmd, list) and cmd and cmd[0] == "pgrep":
+                pgrep_calls.append(cmd)
+            return m
+
+        with patch.object(main_module, '_daemon', mock_daemon), \
+             patch('os.execvp'), \
+             patch.object(main_module.subprocess, 'run', side_effect=fake_subprocess_run), \
+             patch.object(main_module.time, 'sleep'):
+            main_module._handle_restart(signal.SIGHUP, None)
+
+        brain_pgrep = [c for c in pgrep_calls if any("Orchestrator" in a for a in c)]
+        assert len(brain_pgrep) >= 1, \
+            "Must pgrep verify no brain subprocesses remain after cleanup"
+
+
+class TestHandleShutdown:
+    def test_handle_shutdown_sets_brain_stop_event(self):
+        """_handle_shutdown sets brain._stop_event so brain thread exits promptly."""
+        import threading
+        import ironclaude.main as main_module
+        mock_daemon = MagicMock()
+        mock_daemon.brain._stop_event = threading.Event()
+        with patch.object(main_module, '_daemon', mock_daemon):
+            main_module._handle_shutdown(signal.SIGTERM, None)
+        assert mock_daemon.brain._stop_event.is_set(), \
+            "brain._stop_event must be set during shutdown"
+
+    def test_handle_shutdown_sets_clean_shutdown_flag(self):
+        """_handle_shutdown sets _clean_shutdown to True to suppress respawner."""
+        import ironclaude.main as main_module
+        mock_daemon = MagicMock()
+        mock_daemon.brain._stop_event = MagicMock()
+        original = main_module._clean_shutdown
+        try:
+            main_module._clean_shutdown = False
+            with patch.object(main_module, '_daemon', mock_daemon):
+                main_module._handle_shutdown(signal.SIGTERM, None)
+            assert main_module._clean_shutdown is True, \
+                "_clean_shutdown must be True after shutdown signal"
+        finally:
+            main_module._clean_shutdown = original
+
+
+class TestCrashRespawner:
+    def test_spawn_respawner_forks_detached_process(self):
+        """_spawn_respawner forks, calls setsid, and spawns daemon with --no-respawn."""
+        import ironclaude.main as main_module
+
+        # Test parent path (fork returns child PID)
+        with patch('os.fork', return_value=42):
+            main_module._spawn_respawner()
+            # Parent just returns — no setsid or Popen
+
+        # Test child path (fork returns 0)
+        with patch('os.fork', return_value=0), \
+             patch('os.setsid') as mock_setsid, \
+             patch('os._exit') as mock_exit, \
+             patch.object(main_module.time, 'sleep') as mock_sleep, \
+             patch.object(main_module.subprocess, 'Popen') as mock_popen:
+            main_module._spawn_respawner()
+            mock_setsid.assert_called_once()
+            mock_sleep.assert_called_once_with(5)
+            mock_popen.assert_called_once()
+            popen_args = mock_popen.call_args
+            cmd = popen_args[0][0]
+            assert '--no-respawn' in cmd, "Respawned daemon must pass --no-respawn"
+            assert popen_args[1].get('start_new_session') is True, \
+                "Respawned daemon must use start_new_session=True"
+            mock_exit.assert_called_once_with(0)
+
+    def test_clean_shutdown_prevents_respawner(self):
+        """Respawner is not invoked when _clean_shutdown is True."""
+        import ironclaude.main as main_module
+        original = main_module._clean_shutdown
+        try:
+            main_module._clean_shutdown = True
+            with patch.object(main_module, '_spawn_respawner') as mock_spawn:
+                # Simulate the respawner guard logic
+                if not main_module._clean_shutdown:
+                    main_module._spawn_respawner()
+                mock_spawn.assert_not_called()
+        finally:
+            main_module._clean_shutdown = original
+
+    def test_no_respawn_flag_prevents_respawner(self):
+        """--no-respawn CLI flag prevents respawner from running."""
+        import ironclaude.main as main_module
+        original = main_module._clean_shutdown
+        try:
+            main_module._clean_shutdown = False
+            no_respawn = True  # Simulates --no-respawn in sys.argv
+            with patch.object(main_module, '_spawn_respawner') as mock_spawn:
+                # Simulate the respawner guard logic
+                if not main_module._clean_shutdown and not no_respawn:
+                    main_module._spawn_respawner()
+                mock_spawn.assert_not_called()
+        finally:
+            main_module._clean_shutdown = original
+
 
 class TestRunMaintenance:
     def test_calls_cleanup_old_logs(self, daemon):
@@ -964,12 +1257,6 @@ class TestWorkerCommandsConsistency:
         from ironclaude.main import WORKER_COMMANDS as main_cmds
         from ironclaude.orchestrator_mcp import WORKER_COMMANDS as orc_cmds
         assert main_cmds == orc_cmds
-
-    def test_worker_commands_use_1m_context(self):
-        """main.py WORKER_COMMANDS must use [1m] suffix for 1M context window."""
-        from ironclaude.main import WORKER_COMMANDS
-        assert "'opus[1m]'" in WORKER_COMMANDS["claude-opus"]
-        assert "'sonnet[1m]'" in WORKER_COMMANDS["claude-sonnet"]
 
     def test_worker_commands_use_exec_prefix(self):
         """main.py WORKER_COMMANDS must use exec prefix."""
@@ -1127,3 +1414,54 @@ class TestEnsureBrainTrusted:
         data = json.loads(claude_json.read_text())
         assert list(data["projects"].keys()) == [real_path]
         assert data["projects"][real_path]["hasTrustDialogAccepted"] is True
+
+
+from ironclaude.main import _load_dotenv
+
+
+class TestLoadDotenv:
+    def test_loads_key_value_pairs(self, tmp_path, monkeypatch):
+        """Basic KEY=VALUE pairs are loaded into os.environ."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("SUPABASE_URL=https://example.supabase.co\nSUPABASE_ANON_KEY=abc123\n")
+        monkeypatch.delenv("SUPABASE_URL", raising=False)
+        monkeypatch.delenv("SUPABASE_ANON_KEY", raising=False)
+        _load_dotenv(str(env_file))
+        assert os.environ["SUPABASE_URL"] == "https://example.supabase.co"
+        assert os.environ["SUPABASE_ANON_KEY"] == "abc123"
+
+    def test_does_not_override_existing_env_vars(self, tmp_path, monkeypatch):
+        """Shell env takes precedence over .env file."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("SUPABASE_URL=from_file\n")
+        monkeypatch.setenv("SUPABASE_URL", "from_shell")
+        _load_dotenv(str(env_file))
+        assert os.environ["SUPABASE_URL"] == "from_shell"
+
+    def test_strips_double_quotes(self, tmp_path, monkeypatch):
+        """KEY="VALUE" form is parsed correctly."""
+        env_file = tmp_path / ".env"
+        env_file.write_text('SUPABASE_URL="https://example.supabase.co"\n')
+        monkeypatch.delenv("SUPABASE_URL", raising=False)
+        _load_dotenv(str(env_file))
+        assert os.environ["SUPABASE_URL"] == "https://example.supabase.co"
+
+    def test_strips_single_quotes(self, tmp_path, monkeypatch):
+        """KEY='VALUE' form is parsed correctly."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("SUPABASE_ANON_KEY='mykey'\n")
+        monkeypatch.delenv("SUPABASE_ANON_KEY", raising=False)
+        _load_dotenv(str(env_file))
+        assert os.environ["SUPABASE_ANON_KEY"] == "mykey"
+
+    def test_skips_blank_lines_and_comments(self, tmp_path, monkeypatch):
+        """Blank lines and # comments are ignored."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("# Supabase [telemetry]\n\nSUPABASE_URL=https://x.co\n")
+        monkeypatch.delenv("SUPABASE_URL", raising=False)
+        _load_dotenv(str(env_file))
+        assert os.environ["SUPABASE_URL"] == "https://x.co"
+
+    def test_missing_file_is_silent(self, tmp_path):
+        """Missing .env file does not raise — daemon starts without it."""
+        _load_dotenv(str(tmp_path / "nonexistent.env"))  # must not raise

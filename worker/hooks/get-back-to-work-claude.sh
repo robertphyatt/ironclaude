@@ -432,6 +432,7 @@ Examples of grade D/F (unfinished):
 - Claude said Now I will run the tests but did not run them
 - Claude said Let me update the config file next but stopped before doing it
 - Claude listed 5 tasks to do but only completed 2
+- Claude described writing a plan, listed implementation tasks or waves, or said it would write the plan now, but did not invoke the writing-plans Skill tool
 
 A = Perfectly finished -- work complete, or appropriately waiting for user input, or asking the user a question
 B = Generally done -- no clear unfinished autonomous work remaining

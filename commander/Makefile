@@ -1,10 +1,16 @@
 .PHONY: test run install
 
+VENV := .venv
+PYTHON := $(VENV)/bin/python
+PIP := $(VENV)/bin/pip
+
 install:
-	pip install -e ".[dev]"
+	python3 -m venv $(VENV)
+	$(PIP) install -e ".[dev]"
+	$(PIP) freeze > requirements.txt
 
 test:
-	python -m pytest tests/ -v
+	$(PYTHON) -m pytest tests/ -v
 
 run:
-	@set -a && . ./.env && set +a && python -m ironclaude.main
+	@set -a && . ./.env && set +a && $(PYTHON) -m ironclaude.main

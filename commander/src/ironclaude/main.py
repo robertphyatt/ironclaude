@@ -6,6 +6,7 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import shlex
@@ -33,6 +34,7 @@ from ironclaude.notifications import (
     format_task_progress, format_plan_ready, format_blocked,
 )
 from ironclaude.orchestrator_mcp import ensure_worker_trusted
+from ironclaude.plugins import PluginRegistry, discover_plugins
 
 logger = logging.getLogger("ironclaude")
 
@@ -75,6 +77,7 @@ PROMPT_PATTERNS = [
 
 _daemon = None
 _pid_lock_fd: int | None = None
+_clean_shutdown = False
 
 _PID_FILE = "/tmp/ic-daemon.pid"
 
@@ -86,10 +89,34 @@ def _substitute_prompt(text: str, config: dict) -> str:
     return text
 
 
+def _load_dotenv(dotenv_path: str = ".env") -> None:
+    """Load .env file into os.environ without overriding existing vars.
+
+    Shell environment always takes precedence over .env file values.
+    Silently ignores missing file.
+    """
+    try:
+        with open(dotenv_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                    value = value[1:-1]
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except FileNotFoundError:
+        pass
+
+
 def _acquire_singleton_lock() -> None:
     """Acquire an exclusive flock on the PID file to enforce daemon singleton."""
     global _pid_lock_fd
     fd = os.open(_PID_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.fcntl(fd, fcntl.F_SETFD, fcntl.FD_CLOEXEC)  # prevent fd inheritance across exec
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -130,23 +157,156 @@ def _acquire_singleton_lock() -> None:
 
 
 def _handle_shutdown(signum, frame):
+    global _clean_shutdown
     logger.info(f"Received signal {signum}, shutting down...")
+    _clean_shutdown = True
     if _daemon:
+        if _daemon.plugin_registry:
+            _daemon.plugin_registry.run_lifecycle("shutdown", _daemon)
         _daemon.shutdown()
+        _daemon.brain._stop_event.set()
+
+
+def _kill_duplicate_daemons() -> None:
+    """Kill any ironclaude.main processes other than the current process before restart."""
+    our_pid = os.getpid()
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "ironclaude.main"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for pid_str in result.stdout.strip().splitlines():
+            try:
+                pid = int(pid_str.strip())
+            except ValueError:
+                continue
+            if pid == our_pid:
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+                logger.info(f"Killed duplicate daemon PID {pid} before restart")
+            except (ProcessLookupError, PermissionError) as e:
+                logger.warning(f"Could not kill duplicate daemon PID {pid}: {e}")
+    except Exception as e:
+        logger.warning(f"Failed to scan for duplicate daemons: {e}")
+    time.sleep(2)
+
+
+def _spawn_respawner() -> None:
+    """Fork a detached watchdog that restarts the daemon after 5 seconds."""
+    logger.info("Abnormal exit detected — forking crash respawner (5s delay)")
+    pid = os.fork()
+    if pid == 0:
+        # Child: detach from parent's process group
+        os.setsid()
+        time.sleep(5)
+        subprocess.Popen(
+            [sys.executable, '-m', 'ironclaude.main', '--no-respawn'],
+            start_new_session=True,
+        )
+        os._exit(0)
+    # Parent: continues to exit normally
+
+
+def _kill_orphan_brains() -> None:
+    """Kill any orphaned brain claude subprocesses surviving daemon restart."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "claude.*stream-json.*Orchestrator"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids = [int(p) for p in result.stdout.strip().split() if p.strip()]
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                logger.info(f"Killed orphan brain subprocess PID {pid}")
+            except (ProcessLookupError, PermissionError) as e:
+                logger.warning(f"Could not kill orphan brain PID {pid}: {e}")
+        if pids:
+            time.sleep(2)
+    except Exception as e:
+        logger.warning(f"Failed to kill orphan brains: {e}")
 
 
 def _handle_restart(signum, frame):
+    global _clean_shutdown
     logger.info("Daemon restart requested via SIGHUP")
+    _clean_shutdown = True
     if _daemon:
+        # Step 1: Poison brain retry loop BEFORE any subprocess kills
+        try:
+            logger.info("Restart step 1: poison brain retry loop")
+            _daemon.brain._stop_event.set()
+            _daemon.brain._running = False
+        except Exception:
+            pass
+        logger.info("Restart step 2: daemon.shutdown()")
         _daemon.shutdown()
+        # Explicitly stop Slack socket connection (main()'s finally block won't run on execvp)
+        try:
+            if _daemon.socket_handler:
+                logger.info("Restart step 3: socket_handler.stop()")
+                _daemon.socket_handler.stop()
+        except Exception:
+            pass
+        # Shut down BrainClient — thread joins quickly since _stop_event already set
+        try:
+            logger.info("Restart step 4: brain.shutdown()")
+            _daemon.brain.shutdown()
+        except Exception:
+            pass
+        # Belt-and-suspenders: kill any brain subprocesses that survived shutdown
+        try:
+            logger.info("Restart step 5: _kill_orphan_brains()")
+            _kill_orphan_brains()
+        except Exception:
+            pass
+        # Verify no brain subprocesses remain
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "claude.*stream-json.*Orchestrator"],
+                capture_output=True, text=True, timeout=5,
+            )
+            survivors = [p for p in result.stdout.strip().split() if p.strip()]
+            if survivors:
+                logger.warning(f"Brain subprocesses still alive after cleanup: {survivors}")
+            else:
+                logger.info("Restart step 6: verified no brain subprocesses remain")
+        except Exception:
+            pass
+        # Belt-and-suspenders: kill any surviving child processes
+        try:
+            logger.info("Restart step 7: pkill children")
+            subprocess.run(
+                ["pkill", "-P", str(os.getpid())],
+                capture_output=True,
+                timeout=5,
+            )
+            time.sleep(1)
+        except Exception:
+            pass
+        # Close the DB connection before exec
+        try:
+            if _daemon._db:
+                _daemon._db.close()
+        except Exception:
+            pass
+    # Kill any other ironclaude.main processes before restarting
+    logger.info("Restart step 8: _kill_duplicate_daemons()")
+    _kill_duplicate_daemons()
     global _pid_lock_fd
     if _pid_lock_fd is not None:
         try:
+            logger.info("Restart step 9: releasing lock fd")
             os.ftruncate(_pid_lock_fd, 0)
+        except OSError:
+            pass
+        try:
             os.close(_pid_lock_fd)
         except OSError:
             pass
         _pid_lock_fd = None
+    logger.info("Restart step 10: os.execvp() — this is the last log line before restart")
     os.execvp(sys.executable, [sys.executable, '-m', 'ironclaude.main'])
 
 
@@ -194,7 +354,7 @@ def ensure_brain_trusted(brain_cwd: str) -> None:
 class IroncladeDaemon:
     def __init__(self, config: dict, slack: SlackBot, socket_handler: SlackSocketHandler | None,
                  registry: WorkerRegistry, tmux_manager: TmuxManager, brain: BrainClient,
-                 db_conn=None):
+                 db_conn=None, plugin_registry=None):
         self.config = config
         self.slack = slack
         self.socket_handler = socket_handler
@@ -204,11 +364,13 @@ class IroncladeDaemon:
         self._running = True
         self._paused = False
         self._brain_paused = False
+        self.plugin_registry = plugin_registry or PluginRegistry()
         self._last_heartbeat = 0.0
         self._decisions_dir = os.path.join(config.get("tmp_dir", "/tmp/ic"), "brain-decisions")
         self._ledger_path = os.path.join(config.get("tmp_dir", "/tmp/ic"), "task-ledger.json")
         self._db = db_conn
         self._last_checkin_sent: dict[str, float] = {}
+        self._last_checkin_stage: dict[str, str | None] = {}
         self._claude_dir: Path | None = None
         self._last_maintenance = 0.0
         self._state_manager_db_path = os.path.expanduser("~/.claude/ironclaude.db")
@@ -270,6 +432,10 @@ class IroncladeDaemon:
                 logger.info("routing reaction: emoji=%r ts=%r", item["emoji"], item["message_ts"])
                 self._handle_directive_reaction(item["emoji"], item["message_ts"])
                 continue
+            # Check for plugin event types
+            if "parsed" not in item and item.get("type"):
+                if self.plugin_registry.handle_event(self, item):
+                    continue
             parsed = item["parsed"]
             cmd_type = parsed["type"]
             logger.info(f"Slack command: {item.get('original_text', cmd_type)}")
@@ -293,11 +459,7 @@ class IroncladeDaemon:
                 if msg_ts:
                     self.slack.add_reaction("eyes", msg_ts)
                 self.brain.send_message(
-                    f"OPERATOR MESSAGE (ts={msg_ts}): {text}\n"
-                    f"Evaluate: if this contains a task, instruction, or actionable request, "
-                    f"call submit_directive(source_ts='{msg_ts}', source_text='{text}', "
-                    f"interpretation='<your interpretation>'). "
-                    f"If this is a pure acknowledgment or question directed at you, respond directly."
+                    f"OPERATOR MESSAGE (ts={msg_ts}): {text}"
                 )
                 self.slack.post_message(f"Forwarded to brain: {text}")
             elif cmd_type == "detail":
@@ -320,6 +482,8 @@ class IroncladeDaemon:
                 self.slack.post_message(f"Rejection queued for `{worker_id}`.")
             elif cmd_type == "summary":
                 self._handle_summary()
+            elif self.plugin_registry.handle_command(self, cmd_type, parsed):
+                pass  # handled by plugin
             else:
                 self.slack.post_message(f"Command `{cmd_type}` acknowledged (not yet implemented).")
 
@@ -556,6 +720,7 @@ class IroncladeDaemon:
             logger.info("Brain compacted and resumed successfully")
             return
         if not self.brain.needs_restart():
+            logger.debug("Brain healthy (alive, no timeout)")
             return
         if self.brain.circuit_breaker_tripped():
             self._brain_paused = True
@@ -566,7 +731,8 @@ class IroncladeDaemon:
             ))
             logger.error(
                 f"Brain circuit breaker tripped: {self.brain.restart_count} restarts. "
-                f"Brain paused until manual intervention."
+                f"Brain paused until manual intervention. "
+                f"restart_timestamps={self.brain._restart_timestamps}"
             )
             return
         repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -583,6 +749,7 @@ class IroncladeDaemon:
         if success:
             self.slack.post_message(format_brain_restarted(self.brain.restart_count, self.brain.restart_reason))
             logger.info(f"Brain restarted fresh ({self.brain.restart_reason})")
+            logger.info(f"Brain new pid={self.brain._brain_pid}")
 
     def process_brain_decisions(self):
         """Read and act on brain decision files."""
@@ -753,9 +920,7 @@ class IroncladeDaemon:
                 log_worker_event("WORKER_IDLE", worker_id=worker_id)
                 self.slack.post_message(format_worker_idle(worker_id))
                 delivered = self.brain.send_message(
-                    f"Worker {worker_id} went idle (stop hook fired). "
-                    f"Use get_worker_log to review its output, then either "
-                    f"kill_worker to release it or send_to_worker to give it more work."
+                    f"Worker {worker_id} idle."
                 )
                 if delivered:
                     try:
@@ -774,8 +939,7 @@ class IroncladeDaemon:
                 log_worker_event("WORKER_DEAD", worker_id=worker_id)
                 self.slack.post_message(format_worker_completed(worker_id, "Session ended"))
                 self.brain.send_message(
-                    f"Worker {worker_id} has completed. "
-                    f"Use get_worker_log to review its output."
+                    f"Worker {worker_id} session died (tmux gone)."
                 )
                 continue
 
@@ -794,12 +958,23 @@ class IroncladeDaemon:
                 except (ValueError, OSError):
                     pass
 
-            # Also check when we last sent a check-in
+            # Dedup gate: suppress if brain hasn't acked and heartbeat window hasn't elapsed
+            heartbeat_interval = self.config.get("heartbeat_interval_seconds", 900)
             last_sent = self._last_checkin_sent.get(worker_id, 0.0)
-            most_recent = max(last_contact, last_sent)
+            last_stage_sent = self._last_checkin_stage.get(worker_id)
+            stage_changed = (last_stage_sent is not None and stage != last_stage_sent)
 
-            if time.time() - most_recent < cadence:
-                continue
+            if not stage_changed:
+                if last_sent > 0:
+                    brain_acknowledged = last_contact > last_sent
+                    heartbeat_elapsed = (time.time() - last_sent) >= heartbeat_interval
+                    if not brain_acknowledged and not heartbeat_elapsed:
+                        continue
+                # Cadence check (applies on first send and after ack)
+                most_recent = max(last_contact, last_sent)
+                if time.time() - most_recent < cadence:
+                    continue
+            # stage_changed=True → bypass both gates, fire immediately
 
             # Cadence expired — send proactive notification
             try:
@@ -812,14 +987,15 @@ class IroncladeDaemon:
             spawned_at = worker.get("spawned_at", "")
             try:
                 from datetime import datetime
-                spawn_time = datetime.fromisoformat(spawned_at.replace("Z", "+00:00"))
-                elapsed = int((datetime.now(spawn_time.tzinfo or None) - spawn_time.replace(tzinfo=None)).total_seconds() / 60)
+                spawn_time = datetime.fromisoformat(spawned_at)
+                elapsed = int((datetime.utcnow() - spawn_time).total_seconds() / 60)
             except (ValueError, TypeError):
                 elapsed = 0
 
             message = format_worker_checkin(worker_id, elapsed, stage or "unknown", log_tail, prompt_waiting)
             self.brain.send_message(message)
             self._last_checkin_sent[worker_id] = time.time()
+            self._last_checkin_stage[worker_id] = stage
 
     def _handle_detail(self, parsed: dict):
         """Handle /detail command — show worker status and log."""
@@ -903,12 +1079,30 @@ class IroncladeDaemon:
 
 
 def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    _log_format = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+    os.makedirs("/tmp/ic", exist_ok=True)
+    _file_handler = RotatingFileHandler(
+        "/tmp/ic/daemon.log", maxBytes=5 * 1024 * 1024, backupCount=3
     )
+    _file_handler.setFormatter(logging.Formatter(_log_format))
+    _stderr_handler = logging.StreamHandler()
+    _stderr_handler.setFormatter(logging.Formatter(_log_format))
+    _root_logger = logging.getLogger()
+    _root_logger.setLevel(logging.INFO)
+    _root_logger.addHandler(_file_handler)
+    _root_logger.addHandler(_stderr_handler)
+
+    no_respawn = '--no-respawn' in sys.argv
 
     _acquire_singleton_lock()
+    logger.info(
+        "Daemon started — pid=%d executable=%s cwd=%s utc=%s",
+        os.getpid(),
+        sys.executable,
+        os.getcwd(),
+        datetime.now(timezone.utc).isoformat(),
+    )
+    _load_dotenv()
 
     config = load_config()
 
@@ -976,10 +1170,18 @@ def main():
     operator_user_id = config.get("slack_operator_user_id", "")
     slack = SlackBot(token=slack_token, channel_id=channel_id, user_token=user_token, operator_user_id=operator_user_id)
 
+    # Plugin system
+    plugin_registry = PluginRegistry()
+    loaded_plugins = discover_plugins(plugin_registry)
+    if loaded_plugins:
+        logger.info("Loaded plugins: %s", ", ".join(loaded_plugins))
+    from ironclaude.slack_interface import SLASH_COMMANDS
+    SLASH_COMMANDS.update(plugin_registry.get_slash_commands())
+
     socket_handler = None
     app_token = config.get("slack_app_token", "")
     if app_token:
-        socket_handler = SlackSocketHandler(app_token=app_token, bot_token=slack_token, operator_user_id=operator_user_id)
+        socket_handler = SlackSocketHandler(app_token=app_token, bot_token=slack_token, operator_user_id=operator_user_id, registry=plugin_registry)
         socket_handler.start()
         logger.info("Slack Socket Mode enabled")
     else:
@@ -1007,8 +1209,9 @@ def main():
     daemon = IroncladeDaemon(
         config=config, slack=slack, socket_handler=socket_handler,
         registry=registry, tmux_manager=tmux, brain=brain,
-        db_conn=conn,
+        db_conn=conn, plugin_registry=plugin_registry,
     )
+    plugin_registry.run_lifecycle("init", daemon)
 
     global _daemon
     _daemon = daemon
@@ -1033,6 +1236,9 @@ def main():
         socket_handler.stop()
     slack.post_message("IronClaude Commander daemon stopped.")
     logger.info("IronClaude Commander daemon stopped.")
+
+    if not _clean_shutdown and not no_respawn:
+        _spawn_respawner()
 
 
 if __name__ == "__main__":
