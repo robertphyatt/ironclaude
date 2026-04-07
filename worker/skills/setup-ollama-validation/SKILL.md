@@ -102,10 +102,10 @@ ollama list
 Analyze the output and recommend the fastest model that's at least Haiku-quality.
 
 Known good models (in order of preference for this task):
-- qwen3:8b (recommended, reliable JSON output, fast on GPU)
+- qwen3.5:9b (recommended for scan pipeline, fast on GPU)
+- qwen3:8b (reliable JSON output, fast on GPU)
 - llama3.2:3b (fast, good quality)
 - gemma2:2b (good quality)
-- qwen2.5:1.5b (fast, acceptable quality)
 
 Models NOT recommended:
 - phi3:mini (generates hallucinated garbage in reasoning fields, unreliable for structured evaluation)
