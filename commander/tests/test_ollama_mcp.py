@@ -21,7 +21,7 @@ class TestListModels:
         fake_output = (
             "NAME                    ID              SIZE      MODIFIED\n"
             "llama3.2:latest         a80c4f17acd5    2.0 GB    2 hours ago\n"
-            "qwen2.5-coder:7b       2b0496514b09    4.7 GB    3 days ago\n"
+            "qwen3.5:9b             2b0496514b09    4.7 GB    3 days ago\n"
         )
         mock_result = MagicMock()
         mock_result.returncode = 0
@@ -40,7 +40,7 @@ class TestListModels:
         assert result[0]["name"] == "llama3.2:latest"
         assert result[0]["size"] == "2.0 GB"
         assert result[0]["modified"] == "2 hours ago"
-        assert result[1]["name"] == "qwen2.5-coder:7b"
+        assert result[1]["name"] == "qwen3.5:9b"
         assert result[1]["size"] == "4.7 GB"
 
     def test_handles_error(self, tools):
