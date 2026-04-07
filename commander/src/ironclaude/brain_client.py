@@ -130,10 +130,13 @@ class BrainClient:
         self._restart_timestamps: list[float] = []
         self._permission_correction_timestamps: list[float] = []
         self._brain_pid: int | None = None
+        self._expected_kill: bool = False
 
     def start(self, system_prompt: str, cwd: str | None = None) -> None:
         """Start the brain SDK client in a background thread."""
+        self._expected_kill = True
         self._kill_brain_subprocess()   # singleton guard — kill any pre-existing brain
+        self._expected_kill = False
         self._system_prompt = system_prompt
         self._cwd = cwd
         # Resolve episodic memory MCP server path (fail hard if not found)
@@ -520,6 +523,12 @@ class BrainClient:
 
         Unconditionally clears _brain_pid and removes BRAIN_PID_FILE when done.
         """
+        import traceback
+        try:
+            caller = "".join(traceback.format_stack()[-3:-1]).strip()
+            logger.info(f"_kill_brain_subprocess called from:\n{caller}")
+        except Exception as _tb_err:
+            logger.warning(f"_kill_brain_subprocess traceback capture failed: {_tb_err}")
         pid = self._brain_pid
 
         # Fall back to PID file
@@ -582,6 +591,8 @@ class BrainClient:
         if self._thread is not None:
             self._thread.join(timeout=10)
         self._thread = None
+        self._expected_kill = True
         self._kill_brain_subprocess()   # force-kill subprocess after thread join
+        self._expected_kill = False
         self._loop = None
         self._message_queue = None
