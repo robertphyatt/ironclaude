@@ -160,6 +160,36 @@ class TestDiscoverPlugins:
         assert "alpha" in reg.get_slash_commands()
         assert "beta" in reg.get_slash_commands()
 
+    def test_parent_dir_remains_on_syspath_for_deferred_handler_imports(self, tmp_path):
+        """Handler closures must be able to import sibling modules at call time.
+
+        Regression test for the bug where discover_plugins() stripped parent_dir
+        from sys.path in a finally block, breaking runtime imports in handlers.
+        """
+        import sys
+
+        plugin_dir = tmp_path / "myplugin"
+        plugin_dir.mkdir()
+        # Sibling module the handler will import at call time (not load time)
+        (tmp_path / "helpers.py").write_text("VALUE = 42\n")
+        (plugin_dir / "plugin.py").write_text(
+            "def register(registry):\n"
+            "    def handler(daemon, parsed):\n"
+            "        import helpers  # deferred import — needs parent_dir on sys.path\n"
+            "        return helpers.VALUE\n"
+            "    registry.register_command(\n"
+            "        'test', 'Test',\n"
+            "        lambda t: {'type': 'test'} if t == 'test' else None,\n"
+            "        handler\n"
+            "    )\n"
+        )
+        reg = PluginRegistry()
+        discover_plugins(reg, plugin_dirs=[str(plugin_dir)])
+        # Parent dir must still be on sys.path so the handler can import helpers
+        assert str(tmp_path) in sys.path
+        # Calling the handler must not raise ImportError
+        reg.handle_command(None, "test", {"type": "test"})
+
 
 class TestParseInboundCommandRegistryFallthrough:
     def test_unknown_command_tries_registry(self):
