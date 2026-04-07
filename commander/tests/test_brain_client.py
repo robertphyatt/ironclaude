@@ -1145,3 +1145,52 @@ class TestShutdownWakesOrphanedThreads:
         assert not stop_event_state_when_run[0], (
             "_stop_event was still set when thread ran — start() must clear it before launching thread"
         )
+
+
+class TestKillSubprocessDiagnostics:
+    def test_kill_subprocess_logs_caller(self):
+        """_kill_brain_subprocess logs its call stack."""
+        from unittest.mock import patch
+        client = BrainClient()
+        with patch('ironclaude.brain_client.logger') as mock_logger:
+            client._kill_brain_subprocess()
+        info_calls = [str(c) for c in mock_logger.info.call_args_list]
+        assert any("_kill_brain_subprocess called from:" in c for c in info_calls)
+
+    def test_expected_kill_false_by_default(self):
+        """_expected_kill starts as False."""
+        client = BrainClient()
+        assert client._expected_kill is False
+
+    def test_expected_kill_set_during_start_singleton(self):
+        """start() sets _expected_kill=True before calling _kill_brain_subprocess."""
+        from unittest.mock import patch
+        client = BrainClient()
+        captured = []
+
+        def spy():
+            captured.append(client._expected_kill)
+
+        client._kill_brain_subprocess = spy
+        with patch.object(client, 'discover_episodic_memory_path', return_value='/fake/path'):
+            with patch('threading.Thread') as mock_thread:
+                mock_thread.return_value.start = lambda: None
+                try:
+                    client.start("test prompt")
+                except Exception:
+                    pass  # start() may fail after singleton guard — that's OK
+        assert captured == [True], f"Expected [True] but got {captured}"
+        assert client._expected_kill is False
+
+    def test_expected_kill_set_during_shutdown(self):
+        """shutdown() sets _expected_kill=True before calling _kill_brain_subprocess."""
+        client = BrainClient()
+        captured = []
+
+        def spy():
+            captured.append(client._expected_kill)
+
+        client._kill_brain_subprocess = spy
+        client.shutdown()
+        assert captured == [True], f"Expected [True] but got {captured}"
+        assert client._expected_kill is False
