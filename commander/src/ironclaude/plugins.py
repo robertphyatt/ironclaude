@@ -114,19 +114,14 @@ def discover_plugins(registry: PluginRegistry, plugin_dirs: list[str] | None = N
             continue
         plugin_name = os.path.basename(plugin_dir)
         try:
-            # Add parent dir to sys.path temporarily for imports within the plugin
+            # Add parent dir to sys.path permanently so handler functions can import
+            # plugin submodules at runtime (e.g. scan.session, scan.preprocess)
             parent_dir = os.path.dirname(plugin_dir)
-            added_to_path = False
             if parent_dir not in sys.path:
                 sys.path.insert(0, parent_dir)
-                added_to_path = True
-            try:
-                spec = importlib.util.spec_from_file_location(f"plugin_{plugin_name}", plugin_file)
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-            finally:
-                if added_to_path:
-                    sys.path.remove(parent_dir)
+            spec = importlib.util.spec_from_file_location(f"plugin_{plugin_name}", plugin_file)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
             if not hasattr(mod, "register"):
                 logger.warning("Plugin %s has no register() function, skipping", plugin_name)
                 continue
