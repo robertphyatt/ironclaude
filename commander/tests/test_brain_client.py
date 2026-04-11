@@ -704,6 +704,31 @@ class TestDefaultDenyGuard:
         assert msg is None
 
 
+class TestExplicitMutationToolDeny:
+    """Explicit deny for mutation tools — belt-and-suspenders on top of default deny."""
+
+    def test_edit_tool_explicitly_denied(self):
+        """Edit denied with spawn_worker redirect — explicit check, not default fallthrough."""
+        client = BrainClient()
+        allowed, msg = client._tool_guard_logic("Edit", {})
+        assert allowed is False
+        assert "spawn_worker" in msg
+
+    def test_write_tool_explicitly_denied(self):
+        """Write denied with spawn_worker redirect — explicit check, not default fallthrough."""
+        client = BrainClient()
+        allowed, msg = client._tool_guard_logic("Write", {})
+        assert allowed is False
+        assert "spawn_worker" in msg
+
+    def test_notebook_edit_explicitly_denied(self):
+        """NotebookEdit denied with spawn_worker redirect — explicit check, not default fallthrough."""
+        client = BrainClient()
+        allowed, msg = client._tool_guard_logic("NotebookEdit", {})
+        assert allowed is False
+        assert "spawn_worker" in msg
+
+
 class TestBackoffSeconds:
     """Exponential backoff calculation."""
 
