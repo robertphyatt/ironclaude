@@ -1219,3 +1219,14 @@ class TestKillSubprocessDiagnostics:
         client.shutdown()
         assert captured == [True], f"Expected [True] but got {captured}"
         assert client._expected_kill is False
+
+
+class TestSigtermDiagnostics:
+    def test_process_tree_logged_on_pid_discovery(self, caplog):
+        """_log_brain_pid_diagnostics logs pid at WARNING level."""
+        import logging
+        import os
+        pid = os.getpid()  # Use current process PID — guaranteed to exist
+        with caplog.at_level(logging.WARNING, logger="ironclaude.brain"):
+            BrainClient._log_brain_pid_diagnostics(pid)
+        assert any(f"pid={pid}" in r.message for r in caplog.records)

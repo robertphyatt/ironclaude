@@ -316,6 +316,18 @@ class BrainClient:
         logger.info("Permission-seeking detected in brain response, sending correction")
         return self.CORRECTION_MESSAGE
 
+    @staticmethod
+    def _log_brain_pid_diagnostics(pid: int) -> None:
+        """Log brain subprocess process identity for SIGTERM diagnostics."""
+        try:
+            pgid = os.getpgid(pid)
+            ppid = os.getppid()
+            logger.warning(
+                f"Brain subprocess diagnostics: pid={pid} ppid={ppid} pgid={pgid}"
+            )
+        except Exception as e:
+            logger.debug(f"Could not log brain process diagnostics: {e}")
+
     async def _brain_session(self, system_prompt: str, cwd: str | None, resume_session_id: str | None = None) -> None:
         """Run the brain session with streaming I/O."""
         from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage
@@ -411,6 +423,7 @@ class BrainClient:
                     pid_dir.mkdir(parents=True, exist_ok=True)
                     Path(self.BRAIN_PID_FILE).write_text(str(pids[0]))
                     logger.info(f"Brain subprocess PID {pids[0]} written to {self.BRAIN_PID_FILE}")
+                    BrainClient._log_brain_pid_diagnostics(pids[0])
             except Exception as e:
                 logger.warning(f"Failed to discover brain subprocess PID: {e}")
 
