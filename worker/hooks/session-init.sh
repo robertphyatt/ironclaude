@@ -212,13 +212,16 @@ fi
 : > "$MCP_ERROR_LOG" 2>/dev/null || true
 
 # ═══ Post-resume state snapshot ═══
-# If session is mid-workflow, emit state snapshot as system message before Claude's first token.
+# If session is mid-workflow or has review_pending, emit state snapshot as system message before Claude's first token.
 # Reads SQLite directly — MCP is not available at session-init time.
 export SAFE_SESSION
 WORKFLOW_STAGE=$(sqlite3 "$DB_PATH" \
   "SELECT workflow_stage FROM sessions WHERE terminal_session='${SAFE_SESSION}';" 2>/dev/null || echo "")
+REVIEW_PENDING=$(sqlite3 "$DB_PATH" \
+  "SELECT review_pending FROM sessions WHERE terminal_session='${SAFE_SESSION}';" 2>/dev/null || echo "0")
+export REVIEW_PENDING
 
-if [ -n "$WORKFLOW_STAGE" ] && [ "$WORKFLOW_STAGE" != "idle" ]; then
+if { [ -n "$WORKFLOW_STAGE" ] && [ "$WORKFLOW_STAGE" != "idle" ]; } || [ "$REVIEW_PENDING" = "1" ]; then
   SNAPSHOT=$(python3 - <<'PYEOF' 2>/dev/null
 import json, subprocess, os, sys, re
 
@@ -240,6 +243,7 @@ plan_json_str = query(f"SELECT plan_json FROM sessions WHERE terminal_session='{
 current_wave = query(f"SELECT current_wave FROM sessions WHERE terminal_session='{session}';")
 total_waves = query(f"SELECT MAX(wave_number) FROM wave_tasks WHERE terminal_session='{session}';")
 tasks_raw = query(f"SELECT task_id, task_name, status FROM wave_tasks WHERE terminal_session='{session}' ORDER BY wave_number, task_id;")
+review_pending = os.environ.get("REVIEW_PENDING", "0")
 
 plan_goal = ""
 if plan_json_str:
@@ -268,6 +272,19 @@ if tasks_raw:
             sym = symbols.get(status, "\u00b7")
             lines.append(f"    {sym} Task {task_id}: {task_name} ({status})")
 
+# Prepend review gate warning if active — tells worker to call code-review skill on compaction recovery
+if review_pending == "1":
+    warning = [
+        "\u26a0\ufe0f  WORKFLOW STATE RECOVERY:",
+        f"  - workflow_stage: {stage}",
+        "  - review_pending: true",
+    ]
+    if current_wave:
+        warning.append(f"  - current_wave: {current_wave}")
+    warning.append('  \u2192 Call skill "ironclaude:code-review" to clear the review gate before any Bash/Edit.')
+    warning.append("")
+    lines = warning + lines
+
 content = "\n".join(lines)
 print(json.dumps({"type": "system", "content": content}))
 PYEOF
@@ -275,7 +292,7 @@ PYEOF
 
   if [ -n "$SNAPSHOT" ]; then
     echo "$SNAPSHOT"
-    log_hook "session-init" "Snapshot" "emitted state snapshot (stage=$WORKFLOW_STAGE)"
+    log_hook "session-init" "Snapshot" "emitted state snapshot (stage=$WORKFLOW_STAGE, review_pending=$REVIEW_PENDING)"
   else
     # Python failed — emit minimal warning so Claude knows to call get_resume_state
     echo '{"type":"system","content":"[ironclaude] State read failed. Call get_resume_state to check status manually."}'
