@@ -157,8 +157,12 @@ def _acquire_singleton_lock() -> None:
 
 
 def _handle_shutdown(signum, frame):
+    import traceback
     global _clean_shutdown
-    logger.info(f"Received signal {signum}, shutting down...")
+    logger.warning(
+        f"Received signal {signum} — pid={os.getpid()} ppid={os.getppid()} pgid={os.getpgid(0)}"
+    )
+    logger.warning(f"Shutdown caller stack:\n{''.join(traceback.format_stack(frame))}")
     _clean_shutdown = True
     if _daemon:
         if _daemon.plugin_registry:
