@@ -194,6 +194,14 @@ class BrainClient:
             self._memory_armed = False
             return (True, None)
 
+        # Mutation tools — explicitly denied (brain must delegate to workers)
+        DENIED_TOOLS = ("Edit", "Write", "NotebookEdit")
+        if tool_name in DENIED_TOOLS:
+            return (False,
+                f"Brain cannot use {tool_name} directly. "
+                f"To make changes, spawn a worker via spawn_worker."
+            )
+
         # Bash: only git read-only commands allowed
         if tool_name == "Bash":
             cmd = tool_input.get("command", "").strip()
