@@ -1062,6 +1062,41 @@ class TestHandleRestart:
         assert len(brain_pgrep) >= 1, \
             "Must pgrep verify no brain subprocesses remain after cleanup"
 
+    def test_handle_restart_uses_targeted_brain_kill_not_pkill(self):
+        """_handle_restart kills brain by PID, not via pkill -P."""
+        import ironclaude.main as main_module
+
+        mock_daemon = MagicMock()
+        mock_daemon.brain._stop_event = MagicMock()
+        mock_daemon.brain._brain_pid = 99999
+
+        subprocess_cmds = []
+        kill_calls = []
+
+        def fake_subprocess_run(cmd, **kwargs):
+            m = MagicMock()
+            m.stdout = ""
+            m.returncode = 0
+            if isinstance(cmd, list):
+                subprocess_cmds.append(cmd)
+            return m
+
+        def fake_os_kill(pid, sig):
+            kill_calls.append((pid, sig))
+
+        with patch.object(main_module, '_daemon', mock_daemon), \
+             patch('os.execvp'), \
+             patch('os.kill', side_effect=fake_os_kill), \
+             patch.object(main_module.subprocess, 'run', side_effect=fake_subprocess_run), \
+             patch.object(main_module.time, 'sleep'):
+            main_module._handle_restart(signal.SIGHUP, None)
+
+        pkill_cmds = [c for c in subprocess_cmds if c and c[0] == "pkill"]
+        assert len(pkill_cmds) == 0, \
+            f"pkill must not be called, but found: {pkill_cmds}"
+        assert (99999, signal.SIGTERM) in kill_calls, \
+            "Must send SIGTERM to brain PID directly"
+
 
 class TestHandleShutdown:
     def test_handle_shutdown_sets_brain_stop_event(self):
@@ -1089,6 +1124,45 @@ class TestHandleShutdown:
                 "_clean_shutdown must be True after shutdown signal"
         finally:
             main_module._clean_shutdown = original
+
+
+class TestDaemonProcessGroupIsolation:
+    def test_main_calls_setpgid_before_singleton_lock(self):
+        """main() calls os.setpgid(0, 0) before _acquire_singleton_lock."""
+        import ironclaude.main as main_module
+
+        call_order = []
+
+        def track_setpgid(pid, pgid):
+            call_order.append("setpgid")
+
+        def track_lock():
+            call_order.append("lock")
+            raise SystemExit(0)  # Stop main() early
+
+        with patch.object(main_module.os, 'setpgid', side_effect=track_setpgid), \
+             patch.object(main_module, '_acquire_singleton_lock', side_effect=track_lock), \
+             pytest.raises(SystemExit):
+            main_module.main()
+
+        assert call_order == ["setpgid", "lock"], \
+            f"setpgid must be called before singleton lock, got: {call_order}"
+
+    def test_main_setpgid_failure_does_not_crash(self):
+        """main() continues if os.setpgid raises PermissionError."""
+        import ironclaude.main as main_module
+
+        def fail_setpgid(pid, pgid):
+            raise PermissionError("Operation not permitted")
+
+        def stop_lock():
+            raise SystemExit(0)
+
+        with patch.object(main_module.os, 'setpgid', side_effect=fail_setpgid), \
+             patch.object(main_module, '_acquire_singleton_lock', side_effect=stop_lock), \
+             pytest.raises(SystemExit):
+            main_module.main()
+        # No crash = pass
 
 
 class TestCrashRespawner:
@@ -1465,3 +1539,50 @@ class TestLoadDotenv:
     def test_missing_file_is_silent(self, tmp_path):
         """Missing .env file does not raise — daemon starts without it."""
         _load_dotenv(str(tmp_path / "nonexistent.env"))  # must not raise
+
+
+class TestHandleSpawnWorkerAdvisor:
+    def test_sends_advisor_before_objective_when_enabled(self, tmp_path):
+        """With advisor in config, /advisor {model} is sent after PM wait, before objective."""
+        config = {
+            "tmp_dir": str(tmp_path),
+            "advisor": {"enabled": True, "advisor_model": "opus"},
+        }
+        slack = MagicMock()
+        registry = MagicMock()
+        tmux = MagicMock()
+        tmux.spawn_session.return_value = True
+        tmux.log_dir = str(tmp_path / "logs")
+        os.makedirs(tmux.log_dir, exist_ok=True)
+        brain = MagicMock()
+        d = IroncladeDaemon(config, slack, None, registry, tmux, brain)
+        d._wait_for_ready = MagicMock(return_value=True)
+
+        with patch("ironclaude.main.ensure_worker_trusted"):
+            d._handle_spawn_worker({
+                "worker_id": "w1",
+                "type": "claude-sonnet",
+                "repo": "/tmp/repo",
+                "objective": "Test objective",
+            })
+
+        keys_sent = [call[0][1] for call in tmux.send_keys.call_args_list]
+        assert "/advisor opus" in keys_sent
+        advisor_idx = keys_sent.index("/advisor opus")
+        obj_idx = keys_sent.index("Test objective")
+        assert advisor_idx < obj_idx, f"advisor at {advisor_idx} must precede objective at {obj_idx}"
+
+    def test_skips_advisor_when_not_in_config(self, daemon):
+        """Default daemon config has no advisor key — no /advisor command sent."""
+        daemon._wait_for_ready = MagicMock(return_value=True)
+
+        with patch("ironclaude.main.ensure_worker_trusted"):
+            daemon._handle_spawn_worker({
+                "worker_id": "w1",
+                "type": "claude-sonnet",
+                "repo": "/tmp/repo",
+                "objective": "Test objective",
+            })
+
+        keys_sent = [call[0][1] for call in daemon.tmux.send_keys.call_args_list]
+        assert not any(k.startswith("/advisor") for k in keys_sent)

@@ -8,5 +8,10 @@
     {"name": "laptop", "url": "http://localhost:11434", "model": "qwen3-coder-next:q2_k", "max_workers": 1}
   ],
   "tmp_dir": "/tmp/ic",
-  "log_dir": "/tmp/ic-logs"
+  "log_dir": "/tmp/ic-logs",
+  "advisor": {
+    "enabled": true,
+    "executor_model": "sonnet",
+    "advisor_model": "opus"
+  }
 }
