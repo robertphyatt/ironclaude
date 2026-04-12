@@ -290,7 +290,7 @@ class OrchestratorTools:
     All methods are synchronous and raise exceptions on error.
     """
 
-    def __init__(self, registry, tmux, ledger_path: str, grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = ""):
+    def __init__(self, registry, tmux, ledger_path: str, grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None):
         self.registry = registry
         self.tmux = tmux
         self.ledger_path = ledger_path
@@ -304,6 +304,19 @@ class OrchestratorTools:
         self._supabase_anon_key = supabase_anon_key
         self._failed_worker_bases: set[str] = set()
         self._game_pid: int | None = None
+        self._advisor_cfg = advisor_cfg or {}
+
+    def _get_worker_command(self, worker_type: str, model_name: str = "") -> str:
+        """Build worker command, using advisor config for model selection."""
+        advisor = self._advisor_cfg
+        if worker_type == "ollama":
+            return f"export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
+        elif worker_type in WORKER_COMMANDS:
+            if advisor.get("enabled") and worker_type == "claude-sonnet":
+                model = advisor.get("executor_model", "sonnet")
+                return f"export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model {shlex.quote(model)} --dangerously-skip-permissions"
+            return WORKER_COMMANDS[worker_type]
+        raise ValueError(f"Invalid worker type '{worker_type}'")
 
     def _write_brain_contact(self, worker_id: str) -> None:
         """Write brain contact timestamp for daemon to read."""
@@ -1013,13 +1026,8 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 )
 
             cmd = f"ollama launch claude --model {shlex.quote(model_name)} -- --dangerously-skip-permissions"
-        elif worker_type in WORKER_COMMANDS:
-            cmd = WORKER_COMMANDS[worker_type]
         else:
-            raise ValueError(
-                f"Invalid worker type '{worker_type}'. "
-                f"Supported: ollama, {', '.join(WORKER_COMMANDS.keys())}"
-            )
+            cmd = self._get_worker_command(worker_type, model_name)
 
         # Inject worker ID for stop hook completion detection
         cmd = f"export IC_WORKER_ID={shlex.quote(worker_id)}; {cmd}"
@@ -1049,6 +1057,12 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
         if pm_failure is not None:
             self.tmux.kill_session(session_name)
             return {"error": f"PM activation failed for worker '{worker_id}': {pm_failure}"}
+
+        # Stage 5.5: enable advisor if configured
+        if self._advisor_cfg.get("enabled"):
+            advisor_model = self._advisor_cfg.get("advisor_model", "opus")
+            self.tmux.send_keys(session_name, f"/advisor {advisor_model}")
+            time.sleep(3)
 
         # Stage 6: send objective
         self.registry.register_worker(worker_id, worker_type, session_name, repo=repo, description=objective)
@@ -1232,6 +1246,10 @@ Model recommendation (include "recommended_model" for each):
             worker_id = req["worker_id"]
             idx = next(i for i, r in enumerate(results) if r is None)
             if session_name in activated:
+                if self._advisor_cfg.get("enabled"):
+                    advisor_model = self._advisor_cfg.get("advisor_model", "opus")
+                    self.tmux.send_keys(session_name, f"/advisor {advisor_model}")
+                    time.sleep(3)
                 self.registry.register_worker(
                     worker_id, req["worker_type"], session_name,
                     repo=req["repo"], description=req["objective"])
@@ -1936,6 +1954,8 @@ def main():
     db_path = sys.argv[1] if len(sys.argv) > 1 else "data/db/ironclaude.db"
     log_dir = os.environ.get("IC_LOG_DIR", "/tmp/ic-logs")
     ledger_path = os.environ.get("IC_LEDGER_PATH", "/tmp/ic/task-ledger.json")
+    from ironclaude.config import load_config
+    cfg = load_config()
 
     conn = init_db(db_path)
     registry = WorkerRegistry(conn)
@@ -1957,6 +1977,7 @@ def main():
         registry, tmux, ledger_path,
         slack_bot=slack_bot, db_conn=conn, operator_name=operator_name,
         supabase_url=supabase_url, supabase_anon_key=supabase_anon_key,
+        advisor_cfg=cfg.get("advisor", {}),
     )
 
     mcp = _create_mcp_server(tools)

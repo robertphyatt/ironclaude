@@ -278,15 +278,17 @@ def _handle_restart(signum, frame):
                 logger.info("Restart step 6: verified no brain subprocesses remain")
         except Exception:
             pass
-        # Belt-and-suspenders: kill any surviving child processes
+        # Belt-and-suspenders: targeted kill of brain subprocess if still alive
         try:
-            logger.info("Restart step 7: pkill children")
-            subprocess.run(
-                ["pkill", "-P", str(os.getpid())],
-                capture_output=True,
-                timeout=5,
-            )
-            time.sleep(1)
+            brain_pid = _daemon.brain._brain_pid
+            if brain_pid is not None:
+                logger.info(f"Restart step 7: targeted kill of brain PID {brain_pid}")
+                os.kill(brain_pid, signal.SIGTERM)
+                time.sleep(1)
+            else:
+                logger.info("Restart step 7: no brain PID to kill")
+        except (ProcessLookupError, PermissionError):
+            pass
         except Exception:
             pass
         # Close the DB connection before exec
@@ -855,6 +857,13 @@ class IroncladeDaemon:
         # Stage 5: wait for professional mode
         self._wait_for_ready(session_name, timeout=15, marker="Professional Mode: ON")
 
+        # Stage 5.5: enable advisor if configured
+        advisor_cfg = self.config.get("advisor", {})
+        if advisor_cfg.get("enabled"):
+            advisor_model = advisor_cfg.get("advisor_model", "opus")
+            self.tmux.send_keys(session_name, f"/advisor {advisor_model}")
+            self._wait_for_ready(session_name, timeout=10, marker="advisor")
+
         # Stage 6: register and send objective
         self.registry.register_worker(worker_id, worker_type, session_name, repo=repo, description=objective)
         self.tmux.send_keys(session_name, objective)
@@ -1097,6 +1106,13 @@ def main():
     _root_logger.addHandler(_stderr_handler)
 
     no_respawn = '--no-respawn' in sys.argv
+
+    # Isolate daemon from pipeline process group (e.g. make run | tee)
+    # so SIGTERM to the pipeline group doesn't kill the brain subprocess
+    try:
+        os.setpgid(0, 0)
+    except PermissionError:
+        logger.warning("Could not create new process group (setpgid failed)")
 
     _acquire_singleton_lock()
     logger.info(

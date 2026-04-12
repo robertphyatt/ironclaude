@@ -87,3 +87,9 @@ class TestLoadConfig:
         monkeypatch.setenv("SLACK_ROBERT_USER_ID", "U456")
         cfg = load_config(str(config_file))
         assert cfg["slack_operator_user_id"] == "U789"
+
+    def test_advisor_default(self):
+        cfg = load_config("/nonexistent/path.json")
+        assert cfg["advisor"]["enabled"] is True
+        assert cfg["advisor"]["executor_model"] == "sonnet"
+        assert cfg["advisor"]["advisor_model"] == "opus"

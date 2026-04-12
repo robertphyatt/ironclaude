@@ -321,7 +321,12 @@ class BrainClient:
         """Log brain subprocess process identity for SIGTERM diagnostics."""
         try:
             pgid = os.getpgid(pid)
-            ppid = os.getppid()
+            # Use ps to get the brain subprocess's actual ppid (not daemon's)
+            result = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=3,
+            )
+            ppid = result.stdout.strip() if result.returncode == 0 else "unknown"
             logger.warning(
                 f"Brain subprocess diagnostics: pid={pid} ppid={ppid} pgid={pgid}"
             )

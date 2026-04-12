@@ -174,6 +174,7 @@ The Commander orchestrates multiple Claude Code worker sessions via Slack. A Bra
 - Python 3.11+
 - [tmux](https://github.com/tmux/tmux/wiki/Installing)
 - A Slack workspace where you can create apps (free tier works)
+- **macOS or Linux** (Commander uses POSIX process management: `os.fork`, `os.setpgid`, `fcntl.flock`)
 
 ### Slack App Setup
 

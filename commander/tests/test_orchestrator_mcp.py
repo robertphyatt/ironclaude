@@ -132,6 +132,43 @@ class TestSpawnWorker:
         assert call_order[0] == ("ensure_claude_md", "/tmp/test-repo")
         assert call_order[1] == ("spawn_session",)
 
+    def test_spawn_worker_sends_advisor_before_objective_when_enabled(self, registry, mock_tmux, tmp_path, db_conn):
+        """With advisor enabled, /advisor {model} is sent after PM, before objective."""
+        from unittest.mock import patch
+        ledger_path = str(tmp_path / "task-ledger.json")
+        tools = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            advisor_cfg={"enabled": True, "advisor_model": "opus"},
+        )
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        with patch("ironclaude.orchestrator_mcp.time.sleep"):
+            result = tools.spawn_worker(
+                worker_id="w-adv",
+                worker_type="claude-sonnet",
+                repo="/tmp/repo",
+                objective="Do the thing",
+            )
+        assert "w-adv" in result
+        keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
+        assert "/advisor opus" in keys_sent
+        advisor_idx = keys_sent.index("/advisor opus")
+        obj_idx = keys_sent.index("Do the thing")
+        assert advisor_idx < obj_idx, f"advisor at {advisor_idx} must precede objective at {obj_idx}"
+
+    def test_spawn_worker_no_advisor_when_disabled(self, tools, mock_tmux):
+        """With advisor disabled (default), no /advisor command is sent."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        tools.spawn_worker(
+            worker_id="w-no-adv",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="Do the thing",
+        )
+        keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
+        assert not any(k.startswith("/advisor") for k in keys_sent)
+
 
 class TestWorkerCommunication:
     def test_approve_plan_logs_rationale(self, tools, registry, mock_tmux):
@@ -2838,3 +2875,28 @@ class TestGetOperatorMessages:
         result = tools.get_operator_messages()
         assert result == [{"text": "plain message", "ts": "1.0", "user": "U123"}]
         mock_slack.download_file.assert_not_called()
+
+
+class TestGetWorkerCommand:
+    def test_returns_worker_commands_fallback_when_no_advisor(self, tools):
+        """Without advisor config, returns WORKER_COMMANDS entry unchanged."""
+        cmd = tools._get_worker_command("claude-sonnet")
+        assert cmd == WORKER_COMMANDS["claude-sonnet"]
+
+    def test_opus_unaffected_even_when_advisor_enabled(self, tools):
+        """Opus always returns WORKER_COMMANDS entry regardless of advisor."""
+        tools._advisor_cfg = {"enabled": True, "executor_model": "sonnet", "advisor_model": "opus"}
+        cmd = tools._get_worker_command("claude-opus")
+        assert cmd == WORKER_COMMANDS["claude-opus"]
+
+    def test_uses_executor_model_for_sonnet_when_advisor_enabled(self, tools):
+        """With advisor enabled, sonnet command uses configurable executor_model."""
+        tools._advisor_cfg = {"enabled": True, "executor_model": "sonnet", "advisor_model": "opus"}
+        cmd = tools._get_worker_command("claude-sonnet")
+        assert "--model sonnet" in cmd
+        assert "exec claude" in cmd
+
+    def test_raises_for_invalid_type(self, tools):
+        """Raises ValueError for unknown worker type."""
+        with pytest.raises(ValueError, match="Invalid worker type"):
+            tools._get_worker_command("bad-type")

@@ -24,6 +24,11 @@ DEFAULTS = {
     "brain_prompt_path": "",  # test11
     "operator_name": "Operator",
     "autonomy_level": "3",
+    "advisor": {
+        "enabled": True,
+        "executor_model": "sonnet",
+        "advisor_model": "opus",
+    },
 }
 
 # Env vars that override JSON config (env name -> config key, type)

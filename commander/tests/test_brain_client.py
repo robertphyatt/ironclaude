@@ -1222,11 +1222,54 @@ class TestKillSubprocessDiagnostics:
 
 
 class TestSigtermDiagnostics:
-    def test_process_tree_logged_on_pid_discovery(self, caplog):
-        """_log_brain_pid_diagnostics logs pid at WARNING level."""
+    def test_log_brain_pid_diagnostics_uses_ps_for_ppid(self, caplog, monkeypatch):
+        """_log_brain_pid_diagnostics uses ps command for brain's ppid, not os.getppid."""
         import logging
         import os
-        pid = os.getpid()  # Use current process PID — guaranteed to exist
+        from unittest.mock import MagicMock
+
+        pid = os.getpid()
+        fake_ppid = "12345"
+
+        def fake_subprocess_run(cmd, **kwargs):
+            m = MagicMock()
+            if isinstance(cmd, list) and cmd[0] == "ps":
+                m.stdout = f"  {fake_ppid}\n"
+                m.returncode = 0
+            else:
+                m.stdout = ""
+                m.returncode = 1
+            return m
+
+        import ironclaude.brain_client as bc_module
+        monkeypatch.setattr(bc_module.subprocess, "run", fake_subprocess_run)
+
         with caplog.at_level(logging.WARNING, logger="ironclaude.brain"):
             BrainClient._log_brain_pid_diagnostics(pid)
-        assert any(f"pid={pid}" in r.message for r in caplog.records)
+
+        assert any(f"pid={pid}" in r.message and f"ppid={fake_ppid}" in r.message
+                   for r in caplog.records), \
+            f"Must log brain's ppid from ps output, got: {[r.message for r in caplog.records]}"
+
+    def test_log_brain_pid_diagnostics_handles_ps_failure(self, caplog, monkeypatch):
+        """_log_brain_pid_diagnostics logs ppid=unknown if ps fails."""
+        import logging
+        import os
+        from unittest.mock import MagicMock
+
+        pid = os.getpid()
+
+        def fail_subprocess_run(cmd, **kwargs):
+            m = MagicMock()
+            m.stdout = ""
+            m.returncode = 1
+            return m
+
+        import ironclaude.brain_client as bc_module
+        monkeypatch.setattr(bc_module.subprocess, "run", fail_subprocess_run)
+
+        with caplog.at_level(logging.WARNING, logger="ironclaude.brain"):
+            BrainClient._log_brain_pid_diagnostics(pid)
+
+        assert any(f"pid={pid}" in r.message and "ppid=" in r.message
+                   for r in caplog.records)
