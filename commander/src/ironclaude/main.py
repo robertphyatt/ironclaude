@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import fcntl
 import json
 import logging
@@ -78,6 +79,7 @@ PROMPT_PATTERNS = [
 _daemon = None
 _pid_lock_fd: int | None = None
 _clean_shutdown = False
+_sigaction_callback = None  # GC anchor for ctypes CFUNCTYPE; must outlive sigaction syscall
 
 _PID_FILE = "/tmp/ic-daemon.pid"
 
@@ -169,6 +171,85 @@ def _handle_shutdown(signum, frame):
             _daemon.plugin_registry.run_lifecycle("shutdown", _daemon)
         _daemon.shutdown()
         _daemon.brain._stop_event.set()
+
+
+def _install_sigaction_handler() -> None:
+    """Install SA_SIGINFO signal handler for SIGTERM and SIGINT on macOS arm64.
+
+    Captures sender PID/UID/comm from siginfo_t. Falls back to signal.signal() on any error.
+    SA_SIGINFO = 0x0040; struct layouts verified for macOS arm64.
+    """
+    SA_SIGINFO = 0x0040
+
+    class SigInfo(ctypes.Structure):
+        _fields_ = [
+            ("si_signo", ctypes.c_int),
+            ("si_errno", ctypes.c_int),
+            ("si_code",  ctypes.c_int),
+            ("si_pid",   ctypes.c_int),   # pid_t, offset 12
+            ("si_uid",   ctypes.c_uint),  # uid_t, offset 16
+        ]
+
+    class SigAction(ctypes.Structure):
+        _fields_ = [
+            ("sa_sigaction", ctypes.c_void_p),  # function pointer union, 8 bytes on arm64
+            ("sa_mask",      ctypes.c_uint32),   # sigset_t = uint32 on macOS
+            ("sa_flags",     ctypes.c_int),
+        ]
+
+    SIGACTION_CB = ctypes.CFUNCTYPE(
+        None, ctypes.c_int, ctypes.POINTER(SigInfo), ctypes.c_void_p
+    )
+
+    def _sigaction_cb(signum, siginfo_ptr, _ctx):
+        try:
+            if siginfo_ptr:
+                sender_pid = siginfo_ptr.contents.si_pid
+                sender_uid = siginfo_ptr.contents.si_uid
+            else:
+                sender_pid = 0
+                sender_uid = 0
+            try:
+                result = subprocess.run(
+                    ["ps", "-p", str(sender_pid), "-o", "comm="],
+                    capture_output=True, text=True, timeout=2,
+                )
+                sender_comm = result.stdout.strip() or "<unknown>"
+            except Exception:
+                sender_comm = "<unknown>"
+            logger.warning(
+                f"Received signal {signum} FROM pid={sender_pid} uid={sender_uid} "
+                f"(comm={sender_comm}) — our pid={os.getpid()} ppid={os.getppid()} "
+                f"pgid={os.getpgid(0)}"
+            )
+        except Exception as e:
+            logger.warning(f"Received signal {signum} (siginfo parse error: {e})")
+        _handle_shutdown(signum, None)
+
+    global _sigaction_callback
+    # Store callback before sigaction syscall — prevents GC between assignment and use
+    _sigaction_callback = SIGACTION_CB(_sigaction_cb)
+
+    try:
+        libc = ctypes.CDLL(None)
+        libc.sigaction.restype = ctypes.c_int
+        libc.sigaction.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(SigAction),
+            ctypes.POINTER(SigAction),
+        ]
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            sa = SigAction()
+            sa.sa_sigaction = ctypes.cast(_sigaction_callback, ctypes.c_void_p)
+            sa.sa_mask = 0
+            sa.sa_flags = SA_SIGINFO
+            ret = libc.sigaction(sig, ctypes.byref(sa), None)
+            if ret != 0:
+                raise OSError(f"sigaction returned {ret} for signal {sig}")
+    except Exception as e:
+        logger.warning(f"sigaction setup failed ({e}), falling back to signal.signal")
+        signal.signal(signal.SIGTERM, _handle_shutdown)
+        signal.signal(signal.SIGINT, _handle_shutdown)
 
 
 def _kill_duplicate_daemons() -> None:
@@ -1236,8 +1317,7 @@ def main():
     global _daemon
     _daemon = daemon
 
-    signal.signal(signal.SIGTERM, _handle_shutdown)
-    signal.signal(signal.SIGINT, _handle_shutdown)
+    _install_sigaction_handler()
     signal.signal(signal.SIGHUP, _handle_restart)
 
     logger.info("IronClaude Commander daemon starting.")
