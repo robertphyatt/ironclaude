@@ -1,3 +1,8 @@
+> ⚠️ **History Rewrite Notice**
+> This repository underwent a history rewrite on 2026-04-15. If you cloned before this date, your local copy is no longer compatible with `origin/main`.
+> **Option A (recommended):** Delete your local clone and re-clone.
+> **Option B:** `git fetch --all && git reset --hard origin/main` (discards any local changes).
+
 # IronClaude
 
 **Workflow discipline and multi-agent orchestration for Claude Code.**

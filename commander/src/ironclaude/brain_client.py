@@ -19,6 +19,7 @@ import threading
 import time
 from glob import glob
 from pathlib import Path
+from ironclaude.signal_forensics import _logged_kill
 
 logger = logging.getLogger("ironclaude.brain")
 
@@ -278,6 +279,25 @@ class BrainClient:
                     self._compacting = False  # Clear on error to allow restart
                     if self._stop_event.is_set():
                         break
+                    # Forensic snapshot: brain died from SIGTERM — log all .venv/bin/python processes
+                    err_str = str(e)
+                    if "-15" in err_str or "SIGTERM" in err_str or "signal 15" in err_str.lower():
+                        try:
+                            result = subprocess.run(
+                                ["ps", "aux"],
+                                capture_output=True, text=True, timeout=5,
+                            )
+                            venv_procs = [
+                                line for line in result.stdout.splitlines()
+                                if ".venv/bin/python" in line
+                            ]
+                            logger.warning(
+                                f"Brain exit-15 forensics: {len(venv_procs)} "
+                                f".venv/bin/python process(es):\n"
+                                + "\n".join(venv_procs)
+                            )
+                        except Exception as fe:
+                            logger.warning(f"Brain exit-15 forensics ps snapshot failed: {fe}")
                     delay = _backoff_seconds(attempt)
                     logger.error(
                         f"Brain session error (attempt {attempt + 1}): {e}. "
@@ -584,7 +604,7 @@ class BrainClient:
 
         for kpid in kill_pids:
             try:
-                os.kill(kpid, signal.SIGTERM)
+                _logged_kill(kpid, signal.SIGTERM, f"kill_brain_subprocess SIGTERM pid={kpid}")
                 logger.info(f"Sent SIGTERM to brain subprocess PID {kpid}")
                 for _ in range(30):
                     time.sleep(0.1)
@@ -594,7 +614,7 @@ class BrainClient:
                         break
                 else:
                     try:
-                        os.kill(kpid, signal.SIGKILL)
+                        _logged_kill(kpid, signal.SIGKILL, f"kill_brain_subprocess SIGKILL escalation pid={kpid}")
                         logger.info(f"Sent SIGKILL to brain subprocess PID {kpid}")
                     except ProcessLookupError:
                         pass

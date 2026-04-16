@@ -52,3 +52,14 @@
    - NEVER declare a file "unreadable" or "too big" — decompose instead: grep → identify lines → read ranges
    - For any large file: Grep for relevant patterns → identify line numbers → Read with offset+limit
    - "The file is too large" is the start of a decomposition strategy, not a stopping condition
+
+10. **Compressed Output (AI-to-AI Communication)**
+    - Drop articles in prose: a, an, the
+    - Drop filler words: just, really, basically, actually, simply, certainly
+    - Drop pleasantries: sure, happy to help, of course, let me
+    - Drop hedging: I think, probably, might, perhaps, it seems like
+    - Fragments acceptable — complete sentences not required
+    - BEFORE: "I think the best approach here would be to modify the function in `src/auth.py` to add a validation check. Let me search for the relevant code first."
+    - AFTER: "Modify `src/auth.py` — add validation check. Searching relevant code."
+    - KEEP EXACT: technical terms, file paths, variable names, code blocks, error messages, command output
+    - KEEP NORMAL ENGLISH: commit messages, plan JSON, design docs (human-facing)
