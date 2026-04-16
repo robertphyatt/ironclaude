@@ -29,6 +29,7 @@ from pathlib import Path
 import requests
 import shlex
 
+from ironclaude.signal_forensics import _logged_kill
 from ironclaude.tmux_manager import _strip_ansi
 
 logger = logging.getLogger("ironclaude.orchestrator_mcp")
@@ -122,7 +123,7 @@ def _restart_watchdog(daemon_pid: int, sig: int, status_path: str) -> None:
 
     # Send signal
     try:
-        os.kill(daemon_pid, sig)
+        _logged_kill(daemon_pid, sig, f"restart_watchdog sig={sig} daemon_pid={daemon_pid}")
     except (ProcessLookupError, PermissionError) as e:
         _write_status("error", error=f"Failed to send signal: {e}")
         return
