@@ -1273,3 +1273,49 @@ class TestSigtermDiagnostics:
 
         assert any(f"pid={pid}" in r.message and "ppid=" in r.message
                    for r in caplog.records)
+
+
+class TestBrainSessionOptions:
+    """Verify system_prompt is passed in both fresh and resume ClaudeAgentOptions."""
+
+    def _run_and_capture(self, client, system_prompt, resume_session_id=None):
+        """Run _brain_session with patched SDK, return captured ClaudeAgentOptions kwargs."""
+        import asyncio
+        from unittest.mock import patch
+
+        captured = {}
+
+        class CapturingOptions:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        async def noop_query(prompt=None, options=None):
+            return
+            yield  # noqa: unreachable — makes this an async generator
+
+        with patch("claude_agent_sdk.ClaudeAgentOptions", CapturingOptions), \
+             patch("claude_agent_sdk.query", noop_query):
+            client._episodic_memory_path = "/fake/memory.js"
+            asyncio.run(client._brain_session(system_prompt, None, resume_session_id))
+
+        return captured
+
+    def test_fresh_branch_includes_system_prompt(self):
+        """Fresh session passes system_prompt to ClaudeAgentOptions."""
+        client = BrainClient()
+        captured = self._run_and_capture(client, "my-prompt", resume_session_id=None)
+        assert captured.get("system_prompt") == "my-prompt"
+
+    def test_resume_branch_includes_system_prompt(self):
+        """Resumed session passes system_prompt to ClaudeAgentOptions (guard bypass fix)."""
+        client = BrainClient()
+        captured = self._run_and_capture(client, "my-prompt", resume_session_id="abc123")
+        assert captured.get("system_prompt") == "my-prompt"
+
+    def test_resume_branch_retains_all_guards(self):
+        """Resumed session has identical permission guards to fresh session."""
+        client = BrainClient()
+        captured = self._run_and_capture(client, "my-prompt", resume_session_id="abc123")
+        assert captured.get("permission_mode") == "bypassPermissions"
+        assert captured.get("allowed_tools") == BrainClient.ALLOWED_TOOLS
+        assert captured.get("can_use_tool") is not None

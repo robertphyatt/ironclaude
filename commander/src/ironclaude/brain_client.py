@@ -394,6 +394,7 @@ class BrainClient:
 
         if resume_session_id:
             options = ClaudeAgentOptions(
+                system_prompt=system_prompt,
                 permission_mode="bypassPermissions",
                 include_partial_messages=False,
                 allowed_tools=self.ALLOWED_TOOLS,
