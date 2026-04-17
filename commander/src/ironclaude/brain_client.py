@@ -175,6 +175,10 @@ class BrainClient:
         Returns (True, None) to allow, (False, message) to deny.
         Separated from SDK types so tests can call this synchronously.
         """
+        # Mutation tools — first-position hard block; brain must delegate to workers
+        if tool_name in ("Edit", "Write", "NotebookEdit"):
+            return (False, "Brain cannot use mutation tools — route through workers")
+
         # Research tools — always ungated
         if tool_name.startswith("mcp__research__"):
             return (True, None)
@@ -194,14 +198,6 @@ class BrainClient:
                 return (False, f"Search episodic memory first. What would {self._operator_name} do?")
             self._memory_armed = False
             return (True, None)
-
-        # Mutation tools — explicitly denied (brain must delegate to workers)
-        DENIED_TOOLS = ("Edit", "Write", "NotebookEdit")
-        if tool_name in DENIED_TOOLS:
-            return (False,
-                f"Brain cannot use {tool_name} directly. "
-                f"To make changes, spawn a worker via spawn_worker."
-            )
 
         # Bash: only git read-only commands allowed
         if tool_name == "Bash":
