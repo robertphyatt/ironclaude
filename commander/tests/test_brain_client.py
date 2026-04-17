@@ -654,14 +654,14 @@ class TestDefaultDenyGuard:
         client = BrainClient()
         allowed, msg = client._tool_guard_logic("Edit", {"file_path": "/tmp/foo.py", "old_string": "a", "new_string": "b"})
         assert allowed is False
-        assert "spawn_worker" in msg
+        assert "mutation tools" in msg
 
     def test_write_denied_with_worker_redirect(self):
         """Write tool denied — brain must use workers for file creation."""
         client = BrainClient()
         allowed, msg = client._tool_guard_logic("Write", {"file_path": "/tmp/foo.py", "content": "hello"})
         assert allowed is False
-        assert "spawn_worker" in msg
+        assert "mutation tools" in msg
 
     def test_notebook_edit_denied(self):
         """NotebookEdit denied."""
@@ -708,25 +708,25 @@ class TestExplicitMutationToolDeny:
     """Explicit deny for mutation tools — belt-and-suspenders on top of default deny."""
 
     def test_edit_tool_explicitly_denied(self):
-        """Edit denied with spawn_worker redirect — explicit check, not default fallthrough."""
+        """Edit denied with canonical message — explicit first-position check."""
         client = BrainClient()
         allowed, msg = client._tool_guard_logic("Edit", {})
         assert allowed is False
-        assert "spawn_worker" in msg
+        assert msg == "Brain cannot use mutation tools — route through workers"
 
     def test_write_tool_explicitly_denied(self):
-        """Write denied with spawn_worker redirect — explicit check, not default fallthrough."""
+        """Write denied with canonical message — explicit first-position check."""
         client = BrainClient()
         allowed, msg = client._tool_guard_logic("Write", {})
         assert allowed is False
-        assert "spawn_worker" in msg
+        assert msg == "Brain cannot use mutation tools — route through workers"
 
     def test_notebook_edit_explicitly_denied(self):
-        """NotebookEdit denied with spawn_worker redirect — explicit check, not default fallthrough."""
+        """NotebookEdit denied with canonical message — explicit first-position check."""
         client = BrainClient()
         allowed, msg = client._tool_guard_logic("NotebookEdit", {})
         assert allowed is False
-        assert "spawn_worker" in msg
+        assert msg == "Brain cannot use mutation tools — route through workers"
 
 
 class TestBackoffSeconds:
@@ -1319,3 +1319,36 @@ class TestBrainSessionOptions:
         assert captured.get("permission_mode") == "bypassPermissions"
         assert captured.get("allowed_tools") == BrainClient.ALLOWED_TOOLS
         assert captured.get("can_use_tool") is not None
+
+
+class TestMutationToolFirstCheck:
+    """Mutation tool check is first in _tool_guard_logic — unconditional, before all other checks."""
+
+    def test_edit_denied_with_canonical_message(self):
+        """Edit denied with exact canonical message."""
+        client = BrainClient()
+        allowed, msg = client._tool_guard_logic("Edit", {"file_path": "/tmp/foo.py", "old_string": "a", "new_string": "b"})
+        assert allowed is False
+        assert msg == "Brain cannot use mutation tools — route through workers"
+
+    def test_write_denied_with_canonical_message(self):
+        """Write denied with exact canonical message."""
+        client = BrainClient()
+        allowed, msg = client._tool_guard_logic("Write", {"file_path": "/tmp/foo.py", "content": "hello"})
+        assert allowed is False
+        assert msg == "Brain cannot use mutation tools — route through workers"
+
+    def test_notebook_edit_denied_with_canonical_message(self):
+        """NotebookEdit denied with exact canonical message."""
+        client = BrainClient()
+        allowed, msg = client._tool_guard_logic("NotebookEdit", {})
+        assert allowed is False
+        assert msg == "Brain cannot use mutation tools — route through workers"
+
+    def test_mutation_denied_even_when_memory_armed(self):
+        """Mutation check fires before memory toggle check — armed state cannot bypass it."""
+        client = BrainClient()
+        client._memory_armed = True
+        allowed, msg = client._tool_guard_logic("Edit", {})
+        assert allowed is False
+        assert msg == "Brain cannot use mutation tools — route through workers"
