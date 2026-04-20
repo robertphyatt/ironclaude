@@ -6,7 +6,7 @@ Every AskUserQuestion call across all skills MUST follow this 3-part structure.
 
 ## 1. Re-ground (1-2 sentences)
 
-State the project, current branch, and what task/phase you're in. Assume the user hasn't looked at this window in 20 minutes and may be context-switching between multiple claude-tron worker sessions.
+State the project, current branch, and what task/phase you're in. Assume the user hasn't looked at this window in 20 minutes and may be context-switching between multiple ironclaude worker sessions.
 
 Example: *"We're in the ironclaude plugin on branch `feat/fix-first-review`, executing Task 3 of the gstack improvements plan (updating code-review SKILL.md)."*
 

@@ -705,7 +705,7 @@ class TestDefaultDenyGuard:
 
 
 class TestExplicitMutationToolDeny:
-    """Explicit deny for mutation tools — belt-and-suspenders on top of default deny."""
+    """First-position mutation-tool deny: Edit/Write/NotebookEdit rejected before any other check."""
 
     def test_edit_tool_explicitly_denied(self):
         """Edit denied with canonical message — explicit first-position check."""
