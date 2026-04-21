@@ -989,8 +989,8 @@ fi
 # When a worker session (identified by TRON_WORKER_ID env var) gets an approved
 # stop, write a marker file so the daemon knows the worker finished its task.
 if [[ "${TRON_WORKER_ID:-}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-    mkdir -p /tmp/tron-logs
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "/tmp/tron-logs/tron-${TRON_WORKER_ID}.done"
+    mkdir -p /tmp/ic-logs
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "/tmp/ic-logs/ic-${TRON_WORKER_ID}.done"
 fi
 
 jq -n --arg reason "Stopping is appropriate" --arg checks "$CHECKS_RAN" '{
