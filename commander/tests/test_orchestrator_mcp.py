@@ -414,7 +414,7 @@ class TestPersistentGrader:
         assert tools._grader_ready is True
         mock_tmux.spawn_session.assert_called_once_with(
             "ic-grader",
-            "claude --model 'opus' --dangerously-skip-permissions",
+            "claude --model 'claude-opus-4-5-20251101' --dangerously-skip-permissions",
             cwd=tools._grader_home,
         )
 
@@ -2652,6 +2652,7 @@ class TestRestartWatchdog:
              patch("ironclaude.orchestrator_mcp._lock_is_free", return_value=True), \
              patch("ironclaude.orchestrator_mcp.time.time", side_effect=time_seq), \
              patch("ironclaude.orchestrator_mcp.time.sleep"), \
+             patch("ironclaude.signal_forensics.subprocess.run"), \
              patch("ironclaude.orchestrator_mcp.subprocess.Popen", return_value=mock_proc) as mock_popen:
             _restart_watchdog(12345, _signal.SIGHUP, status_file)
         mock_popen.assert_called_once()

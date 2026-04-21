@@ -24,10 +24,12 @@ DEFAULTS = {
     "brain_prompt_path": "",  # test11
     "operator_name": "Operator",
     "autonomy_level": "3",
+    "brain_model": "claude-opus-4-5-20251101",
+    "grader_model": "claude-opus-4-5-20251101",
     "advisor": {
         "enabled": True,
         "executor_model": "sonnet",
-        "advisor_model": "opus",
+        "advisor_model": "claude-opus-4-5-20251101",
     },
 }
 
@@ -37,6 +39,8 @@ ENV_OVERRIDES = {
     "HEARTBEAT_INTERVAL_SECONDS": ("heartbeat_interval_seconds", int),
     "DB_PATH": ("db_path", str),
     "BRAIN_TIMEOUT_SECONDS": ("brain_timeout_seconds", int),
+    "BRAIN_MODEL": ("brain_model", str),
+    "GRADER_MODEL": ("grader_model", str),
 }
 
 # Env vars loaded directly into config (not in JSON)

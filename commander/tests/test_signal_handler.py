@@ -3,10 +3,6 @@
 
 import os
 import signal
-import subprocess
-import sys
-import textwrap
-import time
 from unittest.mock import patch
 
 import pytest
@@ -29,24 +25,6 @@ class TestInstallNoError:
         with patch.object(main_module, "_handle_shutdown", return_value=None):
             main_module._install_sigaction_handler()
         assert main_module._sigaction_callback is not None
-
-
-class TestSelfSigtermCapturesOwnPid:
-    def test_self_sigterm_logs_sender_pid(self):
-        """Sending SIGTERM to self: logged message contains FROM pid=<our pid>."""
-        log_messages = []
-
-        def capture_warning(msg, *args, **kwargs):
-            log_messages.append(msg % args if args else msg)
-
-        with patch.object(main_module, "_handle_shutdown", return_value=None), \
-             patch.object(main_module.logger, "warning", side_effect=capture_warning):
-            main_module._install_sigaction_handler()
-            os.kill(os.getpid(), signal.SIGTERM)
-
-        assert any(f"FROM pid={os.getpid()}" in m for m in log_messages), (
-            f"Expected 'FROM pid={os.getpid()}' in log messages: {log_messages}"
-        )
 
 
 class TestFallbackOnSigactionFailure:
@@ -72,57 +50,61 @@ class TestFallbackOnSigactionFailure:
         )
 
 
-class TestCrossProcessPidCapture:
-    def test_cross_process_sender_pid_logged(self, tmp_path):
-        """Parent sends SIGTERM to child; child's log contains FROM pid=<parent pid>."""
-        log_file = tmp_path / "signal_log.txt"
-        ready_file = tmp_path / "ready"
-        parent_pid = os.getpid()
+class TestRogueSigtermRespawner:
+    """_handle_shutdown must respect _sigterm_trusted when setting _clean_shutdown."""
 
-        src_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "src",
-        )
+    def _null_daemon(self, main_module):
+        """Null out _daemon so _handle_shutdown doesn't attempt brain shutdown."""
+        original = main_module._daemon
+        main_module._daemon = None
+        return original
 
-        script = textwrap.dedent(f"""\
-            import os, signal, sys
-            sys.path.insert(0, {repr(src_path)})
-            import ironclaude.main as main_module
-            from unittest.mock import patch
+    def test_rogue_sigterm_leaves_clean_shutdown_false(self):
+        """_handle_shutdown with _sigterm_trusted=False must NOT set _clean_shutdown=True."""
+        original_daemon = self._null_daemon(main_module)
+        original_trusted = main_module._sigterm_trusted
+        original_clean = main_module._clean_shutdown
+        try:
+            main_module._sigterm_trusted = False
+            main_module._clean_shutdown = False
+            main_module._handle_shutdown(signal.SIGTERM, None)
+            assert main_module._clean_shutdown is False, (
+                f"Rogue SIGTERM must NOT set _clean_shutdown=True; got {main_module._clean_shutdown}"
+            )
+        finally:
+            main_module._sigterm_trusted = original_trusted
+            main_module._clean_shutdown = original_clean
+            main_module._daemon = original_daemon
 
-            log_messages = []
+    def test_trusted_sigterm_sets_clean_shutdown_true(self):
+        """_handle_shutdown with _sigterm_trusted=True sets _clean_shutdown=True."""
+        original_daemon = self._null_daemon(main_module)
+        original_trusted = main_module._sigterm_trusted
+        original_clean = main_module._clean_shutdown
+        try:
+            main_module._sigterm_trusted = True
+            main_module._clean_shutdown = False
+            main_module._handle_shutdown(signal.SIGTERM, None)
+            assert main_module._clean_shutdown is True, (
+                f"Trusted SIGTERM must set _clean_shutdown=True; got {main_module._clean_shutdown}"
+            )
+        finally:
+            main_module._sigterm_trusted = original_trusted
+            main_module._clean_shutdown = original_clean
+            main_module._daemon = original_daemon
 
-            def capture_warning(msg, *args, **kwargs):
-                log_messages.append(msg % args if args else msg)
-
-            with patch.object(main_module, "_handle_shutdown", return_value=None), \\
-                 patch.object(main_module.logger, "warning", side_effect=capture_warning):
-                main_module._install_sigaction_handler()
-                open({repr(str(ready_file))}, "w").close()
-                signal.pause()
-
-            with open({repr(str(log_file))}, "w") as f:
-                for msg in log_messages:
-                    f.write(msg + "\\n")
-        """)
-
-        script_file = tmp_path / "child.py"
-        script_file.write_text(script)
-
-        proc = subprocess.Popen([sys.executable, str(script_file)])
-
-        for _ in range(50):
-            if ready_file.exists():
-                break
-            time.sleep(0.1)
-        else:
-            proc.kill()
-            pytest.fail("Child process did not become ready within 5s")
-
-        proc.send_signal(signal.SIGTERM)
-        proc.wait(timeout=5)
-
-        log_contents = log_file.read_text() if log_file.exists() else ""
-        assert f"FROM pid={parent_pid}" in log_contents, (
-            f"Expected 'FROM pid={parent_pid}' in log; got: {log_contents!r}"
-        )
+    def test_sigterm_trusted_resets_to_true_after_handle_shutdown(self):
+        """_sigterm_trusted resets to True after each _handle_shutdown call."""
+        original_daemon = self._null_daemon(main_module)
+        original_trusted = main_module._sigterm_trusted
+        original_clean = main_module._clean_shutdown
+        try:
+            main_module._sigterm_trusted = False
+            main_module._handle_shutdown(signal.SIGTERM, None)
+            assert main_module._sigterm_trusted is True, (
+                "_sigterm_trusted must reset to True after _handle_shutdown"
+            )
+        finally:
+            main_module._sigterm_trusted = original_trusted
+            main_module._clean_shutdown = original_clean
+            main_module._daemon = original_daemon

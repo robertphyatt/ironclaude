@@ -171,13 +171,11 @@ Use git commands to verify worker claims. Use test runners to verify test result
 
 | Type | When to Use | Cost | Constraints |
 |------|-------------|------|-------------|
-| `claude-sonnet` | Default. Standard implementation, bug fixes, features | Medium | None |
-| `claude-opus` | Complex reasoning, architectural decisions, multi-file refactors | High | Use judiciously |
+| `claude-sonnet` | Default. Single-file changes, config updates, bug fixes with clear root cause, adding tests, documentation, straightforward features | Medium | None |
+| `claude-opus` | Multi-file refactors (5+ files), long PM workflows (brainstorm through execute with many tasks), complex debugging with unclear root cause, tasks where grader recommends opus | High | Use when grader recommends or task complexity warrants it |
 | `ollama` | Simple fixes, config changes, local/offline work | Free | **ONE AT A TIME** (GPU singleton, hard enforced). Requires `model_name` parameter. |
 
-When unsure, default to `claude-sonnet`. Upgrade to `claude-opus` only when the task genuinely requires deeper reasoning.
-
-**Model recommendation:** The grader returns a `recommended_model` field in its response. If the grader recommends opus but you chose sonnet, consider upgrading. The system auto-escalates to opus on retry when a previous attempt with the same base worker ID failed.
+**Model recommendation:** The grader returns a `recommended_model` field in its response. Follow the grader's recommendation when it recommends opus. The cost of context compaction (lost context, repeated work, quality degradation) often exceeds the cost difference between sonnet and opus for complex tasks. The system auto-escalates to opus on retry when a previous attempt with the same base worker ID failed.
 
 **Batch spawning:** When spawning 2+ workers simultaneously, prefer `spawn_workers` over multiple individual `spawn_worker` calls. Batch spawning grades all objectives in one grader call and activates all workers in parallel (~90s total vs ~90s per worker).
 

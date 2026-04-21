@@ -29,6 +29,7 @@ from pathlib import Path
 import requests
 import shlex
 
+from ironclaude.signal_forensics import _logged_kill
 from ironclaude.tmux_manager import _strip_ansi
 
 logger = logging.getLogger("ironclaude.orchestrator_mcp")
@@ -44,7 +45,7 @@ def log_worker_event(event_type: str, **fields) -> None:
 
 
 WORKER_COMMANDS = {
-    "claude-opus": "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'opus' --dangerously-skip-permissions",
+    "claude-opus": "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'claude-opus-4-5-20251101' --dangerously-skip-permissions",
     "claude-sonnet": "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'sonnet' --dangerously-skip-permissions",
 }
 
@@ -122,7 +123,7 @@ def _restart_watchdog(daemon_pid: int, sig: int, status_path: str) -> None:
 
     # Send signal
     try:
-        os.kill(daemon_pid, sig)
+        _logged_kill(daemon_pid, sig, f"restart_watchdog sig={sig} daemon_pid={daemon_pid}")
     except (ProcessLookupError, PermissionError) as e:
         _write_status("error", error=f"Failed to send signal: {e}")
         return
@@ -290,13 +291,14 @@ class OrchestratorTools:
     All methods are synchronous and raise exceptions on error.
     """
 
-    def __init__(self, registry, tmux, ledger_path: str, grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None):
+    def __init__(self, registry, tmux, ledger_path: str, grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "claude-opus-4-5-20251101"):
         self.registry = registry
         self.tmux = tmux
         self.ledger_path = ledger_path
         self._grader_session = "ic-grader"
         self._grader_ready = False
         self._grader_home = os.path.expanduser(grader_home)
+        self._grader_model = grader_model
         self._slack = slack_bot
         self._db = db_conn
         self._operator_name = operator_name
@@ -380,7 +382,7 @@ class OrchestratorTools:
         # Spawn fresh session with grader's own working directory
         success = self.tmux.spawn_session(
             self._grader_session,
-            "claude --model 'opus' --dangerously-skip-permissions",
+            f"claude --model '{self._grader_model}' --dangerously-skip-permissions",
             cwd=self._grader_home,
         )
         if not success:
@@ -1978,6 +1980,7 @@ def main():
         slack_bot=slack_bot, db_conn=conn, operator_name=operator_name,
         supabase_url=supabase_url, supabase_anon_key=supabase_anon_key,
         advisor_cfg=cfg.get("advisor", {}),
+        grader_model=cfg.get("grader_model", "claude-opus-4-5-20251101"),
     )
 
     mcp = _create_mcp_server(tools)
