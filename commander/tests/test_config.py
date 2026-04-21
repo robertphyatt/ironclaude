@@ -92,4 +92,30 @@ class TestLoadConfig:
         cfg = load_config("/nonexistent/path.json")
         assert cfg["advisor"]["enabled"] is True
         assert cfg["advisor"]["executor_model"] == "sonnet"
-        assert cfg["advisor"]["advisor_model"] == "opus"
+        assert cfg["advisor"]["advisor_model"] == "claude-opus-4-5-20251101"
+
+    def test_defaults_include_brain_model(self):
+        """brain_model defaults to claude-opus-4-5-20251101."""
+        from ironclaude.config import DEFAULTS
+        assert DEFAULTS["brain_model"] == "claude-opus-4-5-20251101"
+
+    def test_defaults_include_grader_model(self):
+        """grader_model defaults to claude-opus-4-5-20251101."""
+        from ironclaude.config import DEFAULTS
+        assert DEFAULTS["grader_model"] == "claude-opus-4-5-20251101"
+
+    def test_env_override_brain_model(self, tmp_path, monkeypatch):
+        """BRAIN_MODEL env var overrides config."""
+        config_file = tmp_path / "ironclaude.json"
+        config_file.write_text("{}")
+        monkeypatch.setenv("BRAIN_MODEL", "claude-sonnet-4-5-20241022")
+        cfg = load_config(str(config_file))
+        assert cfg["brain_model"] == "claude-sonnet-4-5-20241022"
+
+    def test_env_override_grader_model(self, tmp_path, monkeypatch):
+        """GRADER_MODEL env var overrides config."""
+        config_file = tmp_path / "ironclaude.json"
+        config_file.write_text("{}")
+        monkeypatch.setenv("GRADER_MODEL", "claude-sonnet-4-5-20241022")
+        cfg = load_config(str(config_file))
+        assert cfg["grader_model"] == "claude-sonnet-4-5-20241022"

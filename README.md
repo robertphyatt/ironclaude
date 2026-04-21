@@ -1,3 +1,8 @@
+> ⚠️ **History Rewrite Notice**
+> This repository underwent a history rewrite on 2026-04-15. If you cloned before this date, your local copy is no longer compatible with `origin/main`.
+> **Option A (recommended):** Delete your local clone and re-clone.
+> **Option B:** `git fetch --all && git reset --hard origin/main` (discards any local changes).
+
 # IronClaude
 
 **Workflow discipline and multi-agent orchestration for Claude Code.**
@@ -135,6 +140,20 @@ ollama serve
 # In Claude Code:
 /ironclaude:setup-ollama-validation
 ```
+
+### Model Configuration
+
+IronClaude defaults to Claude Opus 4.5 (`claude-opus-4-5-20251101`) for the brain and grader. Community feedback on Reddit and personal experience suggest Opus 4.5 handles agentic workflows more reliably than later releases. You can override this via environment variables:
+
+```bash
+# Use a different model for the brain
+export BRAIN_MODEL="claude-opus-4-6-20250115"
+
+# Use a different model for grading
+export GRADER_MODEL="claude-sonnet-4-5-20241022"
+```
+
+When workers use Sonnet, they automatically get an Opus 4.5 advisor for oversight. You do you — set these to whatever works best for your workflow.
 
 ### Worker Skills
 

@@ -35,6 +35,7 @@ from ironclaude.notifications import (
     format_task_progress, format_plan_ready, format_blocked,
 )
 from ironclaude.orchestrator_mcp import ensure_worker_trusted
+from ironclaude.signal_forensics import _logged_kill
 from ironclaude.plugins import PluginRegistry, discover_plugins
 
 logger = logging.getLogger("ironclaude")
@@ -46,7 +47,7 @@ def log_worker_event(event_type: str, **fields) -> None:
 
 
 WORKER_COMMANDS = {
-    "claude-opus": "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'opus' --dangerously-skip-permissions",
+    "claude-opus": "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'claude-opus-4-5-20251101' --dangerously-skip-permissions",
     "claude-sonnet": "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'sonnet' --dangerously-skip-permissions",
 }
 
@@ -79,6 +80,7 @@ PROMPT_PATTERNS = [
 _daemon = None
 _pid_lock_fd: int | None = None
 _clean_shutdown = False
+_sigterm_trusted: bool = True  # set False by _sigaction_cb for untrusted SIGTERM senders
 _sigaction_callback = None  # GC anchor for ctypes CFUNCTYPE; must outlive sigaction syscall
 
 _PID_FILE = "/tmp/ic-daemon.pid"
@@ -160,12 +162,13 @@ def _acquire_singleton_lock() -> None:
 
 def _handle_shutdown(signum, frame):
     import traceback
-    global _clean_shutdown
+    global _clean_shutdown, _sigterm_trusted
     logger.warning(
         f"Received signal {signum} — pid={os.getpid()} ppid={os.getppid()} pgid={os.getpgid(0)}"
     )
     logger.warning(f"Shutdown caller stack:\n{''.join(traceback.format_stack(frame))}")
-    _clean_shutdown = True
+    _clean_shutdown = _sigterm_trusted
+    _sigterm_trusted = True  # reset for next signal
     if _daemon:
         if _daemon.plugin_registry:
             _daemon.plugin_registry.run_lifecycle("shutdown", _daemon)
@@ -222,6 +225,16 @@ def _install_sigaction_handler() -> None:
                 f"(comm={sender_comm}) — our pid={os.getpid()} ppid={os.getppid()} "
                 f"pgid={os.getpgid(0)}"
             )
+            # Trust check: rogue senders leave _clean_shutdown=False so respawner fires
+            our_pid = os.getpid()
+            our_ppid = os.getppid()
+            global _sigterm_trusted
+            _sigterm_trusted = sender_pid in (0, 1, our_pid, our_ppid)
+            if not _sigterm_trusted:
+                logger.warning(
+                    f"Rogue SIGTERM: sender_pid={sender_pid} ({sender_comm}) not in trusted set "
+                    f"{{0, 1, {our_pid}, {our_ppid}}} — respawner will fire"
+                )
         except Exception as e:
             logger.warning(f"Received signal {signum} (siginfo parse error: {e})")
         _handle_shutdown(signum, None)
@@ -268,7 +281,7 @@ def _kill_duplicate_daemons() -> None:
             if pid == our_pid:
                 continue
             try:
-                os.kill(pid, signal.SIGTERM)
+                _logged_kill(pid, signal.SIGTERM, f"kill_duplicate_daemon pid={pid}")
                 logger.info(f"Killed duplicate daemon PID {pid} before restart")
             except (ProcessLookupError, PermissionError) as e:
                 logger.warning(f"Could not kill duplicate daemon PID {pid}: {e}")
@@ -303,7 +316,7 @@ def _kill_orphan_brains() -> None:
         pids = [int(p) for p in result.stdout.strip().split() if p.strip()]
         for pid in pids:
             try:
-                os.kill(pid, signal.SIGTERM)
+                _logged_kill(pid, signal.SIGTERM, f"kill_orphan_brain pid={pid}")
                 logger.info(f"Killed orphan brain subprocess PID {pid}")
             except (ProcessLookupError, PermissionError) as e:
                 logger.warning(f"Could not kill orphan brain PID {pid}: {e}")
@@ -364,7 +377,7 @@ def _handle_restart(signum, frame):
             brain_pid = _daemon.brain._brain_pid
             if brain_pid is not None:
                 logger.info(f"Restart step 7: targeted kill of brain PID {brain_pid}")
-                os.kill(brain_pid, signal.SIGTERM)
+                _logged_kill(brain_pid, signal.SIGTERM, "handle_restart targeted brain kill")
                 time.sleep(1)
             else:
                 logger.info("Restart step 7: no brain PID to kill")
@@ -1294,6 +1307,7 @@ def main():
     brain = BrainClient(
         timeout_seconds=config.get("brain_timeout_seconds", 600),
         operator_name=config.get("operator_name", "Operator"),
+        model=config.get("brain_model", "claude-opus-4-5-20251101"),
     )
 
     # Start brain

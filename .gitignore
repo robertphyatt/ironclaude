@@ -30,3 +30,7 @@ commander/docs/plans
 worker/docs/plans
 commander/docs
 docs
+scan
+
+# Local Claude Code settings (not committed)
+.claude/settings.local.json
