@@ -35,8 +35,24 @@ function appendErrorLog(tool: string, sessionId: string, error: string): void {
 
 // Session binding state
 let _ppidFilePath: string | null = null;
-let _sessionBound = false;
-let _sessionBindingSource: 'ppid_file' | 'none' = 'none';
+let _currentSessionId: string | null = null;
+let _initialBindComplete = false;
+
+/**
+ * Read session ID from PPID file.
+ * Returns null if file doesn't exist or contains unresolved placeholder.
+ */
+function readSessionFromPpidFile(filePath: string): string | null {
+  try {
+    const sid = fs.readFileSync(filePath, 'utf-8').trim();
+    if (sid && !sid.startsWith('${')) {
+      return sid;
+    }
+  } catch {
+    // File doesn't exist yet
+  }
+  return null;
+}
 
 import { readToolDefinitions, readToolNames, handleReadTool, setCurrentSession as setReadSession, setSessionBindingSource } from './tools/read-tools.js';
 import { writeToolDefinitions, writeToolNames, handleWriteTool, setCurrentSession as setWriteSession } from './tools/write-tools.js';
@@ -93,27 +109,37 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
-    // Lazy session binding from PPID file with retry (runs once on first tool call)
-    if (!_sessionBound && _ppidFilePath) {
-      const maxAttempts = 5;
-      const delayMs = 300;
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
-          const sid = fs.readFileSync(_ppidFilePath, 'utf-8').trim();
-          if (sid && !sid.startsWith('${')) {
+    // Session binding: first call uses retry loop, subsequent calls re-read on every call
+    if (_ppidFilePath) {
+      if (!_initialBindComplete) {
+        // First call: retry loop (PPID file may not exist yet)
+        const maxAttempts = 5;
+        const delayMs = 300;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          const sid = readSessionFromPpidFile(_ppidFilePath);
+          if (sid) {
             setReadSession(sid);
             setWriteSession(sid);
-            _sessionBound = true;
-            _sessionBindingSource = 'ppid_file';
             setSessionBindingSource('ppid_file');
+            _currentSessionId = sid;
+            _initialBindComplete = true;
             console.error(`Bound to session via PPID file: ${sid} (attempt ${attempt}/${maxAttempts})`);
             break;
           }
-        } catch {
-          // File doesn't exist yet
+          if (attempt < maxAttempts) {
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+          }
         }
-        if (attempt < maxAttempts) {
-          await new Promise(resolve => setTimeout(resolve, delayMs));
+      } else {
+        // Subsequent calls: single read, rebind if changed
+        const sid = readSessionFromPpidFile(_ppidFilePath);
+        if (sid) {
+          if (sid !== _currentSessionId) {
+            console.error(`Session rebind: ${_currentSessionId || 'none'} -> ${sid}`);
+          }
+          setReadSession(sid);
+          setWriteSession(sid);
+          _currentSessionId = sid;
         }
       }
     }

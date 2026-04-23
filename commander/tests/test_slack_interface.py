@@ -351,6 +351,24 @@ def test_directive_status_emoji_confirmed_is_thumbsup():
     assert DIRECTIVE_STATUS_EMOJI["confirmed"] == "thumbsup"
 
 
+class TestAuditCommand:
+    def test_audit_command_uppercase(self):
+        cmd = parse_inbound_command("AUDIT")
+        assert cmd == {"type": "audit"}
+
+    def test_audit_command_lowercase(self):
+        cmd = parse_inbound_command("audit")
+        assert cmd == {"type": "audit"}
+
+    def test_audit_command_with_slash(self):
+        cmd = parse_inbound_command("/audit")
+        assert cmd == {"type": "audit"}
+
+    def test_audit_in_slash_commands(self):
+        from ironclaude.slack_interface import SLASH_COMMANDS
+        assert "audit" in SLASH_COMMANDS
+
+
 class TestSummaryCommand:
     def test_summary_in_slash_commands(self):
         from ironclaude.slack_interface import SLASH_COMMANDS

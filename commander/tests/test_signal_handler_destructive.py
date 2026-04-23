@@ -43,7 +43,7 @@ class TestSelfSigtermCapturesOwnPid:
         with patch.object(main_module, "_handle_shutdown", return_value=None), \
              patch.object(main_module.logger, "warning", side_effect=capture_warning):
             main_module._install_sigaction_handler()
-            os.kill(os.getpid(), signal.SIGTERM)
+            #os.kill(os.getpid(), signal.SIGTERM) #commented out. You must uncomment before trying to use. THIS WILL KILL THE DAEMON
 
         assert any(f"FROM pid={os.getpid()}" in m for m in log_messages), (
             f"Expected 'FROM pid={os.getpid()}' in log messages: {log_messages}"
@@ -95,7 +95,7 @@ class TestCrossProcessPidCapture:
                 break
             time.sleep(0.1)
         else:
-            proc.kill()
+            #proc.kill() #commented out. You must uncomment before trying to use. THIS WILL KILL THE DAEMON
             pytest.fail("Child process did not become ready within 5s")
 
         proc.send_signal(signal.SIGTERM)

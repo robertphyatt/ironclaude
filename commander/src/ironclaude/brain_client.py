@@ -38,9 +38,11 @@ class BrainClient:
     # Orchestrator action tools that require episodic memory search first
     GATED_TOOLS = {
         "mcp__orchestrator__spawn_worker",
+        "mcp__orchestrator__spawn_workers",
         "mcp__orchestrator__approve_plan",
         "mcp__orchestrator__reject_plan",
         "mcp__orchestrator__send_to_worker",
+        "mcp__orchestrator__kill_worker",
         "mcp__ollama__pull_model",
         "mcp__ollama__remove_model",
         "mcp__ollama__create_model",

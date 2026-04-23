@@ -25,7 +25,15 @@ def _ensure_namespace(name: str, path: Path) -> None:
         sys.modules[name] = mod
 
 
-_ensure_namespace("ironclaude.plugins", _SRC / "ironclaude/plugins")
+# Load plugins.py as the actual module, then set __path__ to make it also a package
+_plugins_path = _SRC / "ironclaude/plugins.py"
+_plugins_spec = importlib.util.spec_from_file_location("ironclaude.plugins", _plugins_path)
+_plugins_mod = importlib.util.module_from_spec(_plugins_spec)  # type: ignore[arg-type]
+_plugins_mod.__path__ = [str(_SRC / "ironclaude/plugins")]  # type: ignore[attr-defined]
+sys.modules["ironclaude.plugins"] = _plugins_mod
+_plugins_spec.loader.exec_module(_plugins_mod)  # type: ignore[union-attr]
+
+# Now set up subpackage namespaces
 _ensure_namespace("ironclaude.plugins.scan", _SRC / "ironclaude/plugins/scan")
 _ensure_namespace(
     "ironclaude.plugins.scan.pipeline", _SRC / "ironclaude/plugins/scan/pipeline"
@@ -33,9 +41,10 @@ _ensure_namespace(
 
 # Load orphan_remediation directly so its inline import in tests resolves.
 _orm_path = _SRC / "ironclaude/plugins/scan/pipeline/orphan_remediation.py"
-_orm_spec = importlib.util.spec_from_file_location(
-    "ironclaude.plugins.scan.pipeline.orphan_remediation", _orm_path
-)
-_orm_mod = importlib.util.module_from_spec(_orm_spec)  # type: ignore[arg-type]
-sys.modules["ironclaude.plugins.scan.pipeline.orphan_remediation"] = _orm_mod
-_orm_spec.loader.exec_module(_orm_mod)  # type: ignore[union-attr]
+if _orm_path.exists():
+    _orm_spec = importlib.util.spec_from_file_location(
+        "ironclaude.plugins.scan.pipeline.orphan_remediation", _orm_path
+    )
+    _orm_mod = importlib.util.module_from_spec(_orm_spec)  # type: ignore[arg-type]
+    sys.modules["ironclaude.plugins.scan.pipeline.orphan_remediation"] = _orm_mod
+    _orm_spec.loader.exec_module(_orm_mod)  # type: ignore[union-attr]

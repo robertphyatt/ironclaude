@@ -385,6 +385,46 @@ class TestMemoryToggle:
         )
         assert client._memory_armed is False
 
+    def test_kill_worker_denied_when_unarmed(self):
+        """kill_worker is a gated tool — denied when memory not searched first."""
+        client = BrainClient()
+        allowed, msg = client._tool_guard_logic(
+            "mcp__orchestrator__kill_worker", {"worker_id": "w1"}
+        )
+        assert allowed is False
+        assert "search episodic memory" in msg.lower()
+
+    def test_spawn_workers_denied_when_unarmed(self):
+        """spawn_workers (plural) is a gated tool — denied when memory not searched first."""
+        client = BrainClient()
+        allowed, msg = client._tool_guard_logic(
+            "mcp__orchestrator__spawn_workers", {"requests": []}
+        )
+        assert allowed is False
+        assert "search episodic memory" in msg.lower()
+
+    def test_kill_worker_allowed_when_armed(self):
+        """kill_worker allowed and disarms toggle when memory was searched first."""
+        client = BrainClient()
+        client._memory_armed = True
+        allowed, msg = client._tool_guard_logic(
+            "mcp__orchestrator__kill_worker", {"worker_id": "w1"}
+        )
+        assert allowed is True
+        assert msg is None
+        assert client._memory_armed is False
+
+    def test_spawn_workers_allowed_when_armed(self):
+        """spawn_workers (plural) allowed and disarms toggle when memory was searched first."""
+        client = BrainClient()
+        client._memory_armed = True
+        allowed, msg = client._tool_guard_logic(
+            "mcp__orchestrator__spawn_workers", {"requests": []}
+        )
+        assert allowed is True
+        assert msg is None
+        assert client._memory_armed is False
+
     def test_query_tools_bypass_toggle(self):
         """Query tools (get_worker_status, etc.) always allowed regardless of toggle."""
         client = BrainClient()

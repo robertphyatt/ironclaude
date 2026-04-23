@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 from ironclaude.db import init_db
 from ironclaude.worker_registry import WorkerRegistry
+from ironclaude.config import make_opus_command
 from ironclaude.orchestrator_mcp import OrchestratorTools, WORKER_COMMANDS, _load_avatar_skill, _init_brain_session_background, _restart_watchdog
 from ironclaude.slack_interface import SlackBot
 
@@ -49,6 +50,7 @@ def mock_tmux():
     tmux.send_keys.return_value = True
     tmux.get_log_path.return_value = "/tmp/ic-logs/ic-test.log"
     tmux.read_log_tail.return_value = "ironclaude v1.0.33\n"
+    tmux.list_pane_pid.return_value = None
     return tmux
 
 
@@ -394,6 +396,31 @@ class TestKillWorker:
         mock_tmux.kill_session.assert_called_once_with("ic-nonexistent")
         assert isinstance(result, str)
 
+    def test_kill_worker_logs_pane_pid(self, tools, registry, mock_tmux, caplog):
+        """WORKER_KILLED log entry includes pane_pid retrieved before kill."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        mock_tmux.list_pane_pid.return_value = "55555"
+        _mock_grader_approve(tools)
+
+        with caplog.at_level(logging.INFO, logger="ironclaude.orchestrator_mcp"):
+            tools.kill_worker("w1")
+
+        killed = []
+        for r in caplog.records:
+            try:
+                data = json.loads(r.getMessage())
+                if data.get("event_type") == "WORKER_KILLED":
+                    killed.append(data)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        assert len(killed) == 1, f"Expected 1 WORKER_KILLED entry, got {len(killed)}"
+        assert killed[0]["pane_pid"] == "55555"
+
+        call_names = [c[0] for c in mock_tmux.mock_calls]
+        pid_idx = next(i for i, n in enumerate(call_names) if n == "list_pane_pid")
+        kill_idx = next(i for i, n in enumerate(call_names) if n == "kill_session")
+        assert pid_idx < kill_idx, "list_pane_pid must be called before kill_session"
+
 
 class TestPersistentGrader:
     """Tests for the persistent grader worker pattern."""
@@ -585,7 +612,7 @@ class TestPersistentGrader:
         mock_tmux.read_log_tail.side_effect = fake_read_log_tail
 
         import unittest.mock
-        with unittest.mock.patch('tron.orchestrator_mcp.time') as mock_time:
+        with unittest.mock.patch('ironclaude.orchestrator_mcp.time') as mock_time:
             mock_time.time = time.time
             mock_time.sleep = lambda x: None
             result = tools._wait_for_grader_clear()
@@ -605,7 +632,7 @@ class TestPersistentGrader:
             return original_time()
 
         import unittest.mock
-        with unittest.mock.patch('tron.orchestrator_mcp.time') as mock_time:
+        with unittest.mock.patch('ironclaude.orchestrator_mcp.time') as mock_time:
             mock_time.time = fast_time
             mock_time.sleep = lambda x: None
             result = tools._wait_for_grader_clear()
@@ -716,7 +743,7 @@ class TestPersistentGrader:
                 return original_time() + 200  # Jump past deadline
             return original_time()
 
-        with unittest.mock.patch('tron.orchestrator_mcp.time') as mock_time:
+        with unittest.mock.patch('ironclaude.orchestrator_mcp.time') as mock_time:
             mock_time.time = fast_time
             mock_time.sleep = lambda x: None
             result = tools._call_grader("sys", "usr")
@@ -2702,13 +2729,104 @@ class TestRestartMcp:
         import sys as _sys
         mock_db = MagicMock()
         with patch("os.execvp") as mock_exec, \
-             patch.object(tools, "_db", mock_db):
+             patch.object(tools, "_db", mock_db), \
+             patch.object(tools, "_cleanup_zombie_mcp_processes", return_value=[]):
             tools.restart_mcp()
 
         mock_db.close.assert_called_once()
         mock_exec.assert_called_once_with(
             _sys.executable, [_sys.executable] + _sys.argv
         )
+
+    def test_restart_mcp_calls_zombie_cleanup_before_exec(self, tools):
+        """restart_mcp calls zombie cleanup before os.execvp."""
+        call_order = []
+
+        def record_cleanup(*args, **kwargs):
+            call_order.append("cleanup")
+            return []
+
+        def record_exec(*args, **kwargs):
+            call_order.append("exec")
+
+        mock_db = MagicMock()
+        with patch("os.execvp", side_effect=record_exec), \
+             patch.object(tools, "_db", mock_db), \
+             patch.object(tools, "_cleanup_zombie_mcp_processes", side_effect=record_cleanup):
+            tools.restart_mcp()
+
+        assert call_order == ["cleanup", "exec"]
+
+    def test_cleanup_zombie_mcp_skips_own_pid(self, tools):
+        """_cleanup_zombie_mcp_processes never sends SIGTERM to the current process."""
+        import signal as _signal
+        my_pid = os.getpid()
+
+        pgrep_result = MagicMock()
+        pgrep_result.returncode = 0
+        pgrep_result.stdout = f"{my_pid}\n"
+
+        with patch("subprocess.run", return_value=pgrep_result), \
+             patch("os.kill") as mock_kill:
+            killed = tools._cleanup_zombie_mcp_processes()
+
+        assert my_pid not in killed
+        sigterm_calls = [c for c in mock_kill.call_args_list
+                         if c[0] == (my_pid, _signal.SIGTERM)]
+        assert not sigterm_calls
+
+    def test_cleanup_zombie_mcp_kills_dead_parent_process(self, tools):
+        """_cleanup_zombie_mcp_processes kills processes whose parent is dead."""
+        import signal as _signal
+        orphan_pid = 9999
+        orphan_ppid = 8888
+
+        def fake_run(args, **kwargs):
+            result = MagicMock()
+            if args[0] == "pgrep":
+                result.returncode = 0
+                result.stdout = f"{orphan_pid}\n"
+            elif args[0] == "ps":
+                result.returncode = 0
+                result.stdout = f" {orphan_ppid}\n"
+            return result
+
+        def fake_kill(pid, sig):
+            if sig == 0 and pid == orphan_ppid:
+                raise ProcessLookupError()
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("os.kill", side_effect=fake_kill), \
+             patch("os.getpid", return_value=1111):
+            killed = tools._cleanup_zombie_mcp_processes()
+
+        assert orphan_pid in killed
+
+    def test_cleanup_zombie_mcp_spares_live_parent_process(self, tools):
+        """_cleanup_zombie_mcp_processes does not kill processes with living parents."""
+        import signal as _signal
+        active_pid = 9998
+        active_ppid = 8887
+
+        def fake_run(args, **kwargs):
+            result = MagicMock()
+            if args[0] == "pgrep":
+                result.returncode = 0
+                result.stdout = f"{active_pid}\n"
+            elif args[0] == "ps":
+                result.returncode = 0
+                result.stdout = f" {active_ppid}\n"
+            return result
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("os.kill") as mock_kill, \
+             patch("os.getpid", return_value=1111):
+            killed = tools._cleanup_zombie_mcp_processes()
+
+        assert active_pid not in killed
+        sigterm_calls = [c for c in mock_kill.call_args_list
+                         if c[0] == (active_pid, _signal.SIGTERM)]
+        assert not sigterm_calls
 
 
 class TestEnsureWorkerTrustedSecurity:
@@ -2885,10 +3003,12 @@ class TestGetWorkerCommand:
         assert cmd == WORKER_COMMANDS["claude-sonnet"]
 
     def test_opus_unaffected_even_when_advisor_enabled(self, tools):
-        """Opus always returns WORKER_COMMANDS entry regardless of advisor."""
+        """Opus always uses make_opus_command with configured model, ignoring advisor."""
         tools._advisor_cfg = {"enabled": True, "executor_model": "sonnet", "advisor_model": "opus"}
         cmd = tools._get_worker_command("claude-opus")
-        assert cmd == WORKER_COMMANDS["claude-opus"]
+        assert "exec claude" in cmd
+        assert tools._opus_model in cmd
+        assert "CLAUDE_CODE_EFFORT_LEVEL=high" in cmd
 
     def test_uses_executor_model_for_sonnet_when_advisor_enabled(self, tools):
         """With advisor enabled, sonnet command uses configurable executor_model."""
@@ -2901,3 +3021,11 @@ class TestGetWorkerCommand:
         """Raises ValueError for unknown worker type."""
         with pytest.raises(ValueError, match="Invalid worker type"):
             tools._get_worker_command("bad-type")
+
+    def test_opus_command_uses_configured_model(self, tools):
+        """Opus command uses tools._opus_model, so overriding it changes the command."""
+        tools._opus_model = "claude-opus-4-7"
+        cmd = tools._get_worker_command("claude-opus")
+        assert "claude-opus-4-7" in cmd
+        assert "exec claude" in cmd
+        assert "CLAUDE_CODE_EFFORT_LEVEL=high" in cmd
