@@ -249,6 +249,7 @@ SLASH_COMMANDS = {
     "objective": "Set objective: /ironclaude objective <text>",
     "help": "Show available commands",
     "summary": "Directive status report: in-progress, blocked, completed",
+    "audit": "Reconcile Slack messages vs directives (last 72h)",
 }
 
 
@@ -309,6 +310,9 @@ def parse_inbound_command(text: str, registry=None) -> dict:
 
     if upper == "SUMMARY":
         return {"type": "summary"}
+
+    if upper == "AUDIT":
+        return {"type": "audit"}
 
     if registry is not None:
         plugin_result = registry.parse_command(text)

@@ -14959,8 +14959,18 @@ function appendErrorLog(tool, sessionId, error) {
   }
 }
 var _ppidFilePath = null;
-var _sessionBound = false;
-var _sessionBindingSource2 = "none";
+var _currentSessionId3 = null;
+var _initialBindComplete = false;
+function readSessionFromPpidFile(filePath) {
+  try {
+    const sid = fs4.readFileSync(filePath, "utf-8").trim();
+    if (sid && !sid.startsWith("${")) {
+      return sid;
+    }
+  } catch {
+  }
+  return null;
+}
 function readPluginVersion() {
   try {
     const __filename = fileURLToPath(import.meta.url);
@@ -15000,25 +15010,34 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
-    if (!_sessionBound && _ppidFilePath) {
-      const maxAttempts = 5;
-      const delayMs = 300;
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
-          const sid = fs4.readFileSync(_ppidFilePath, "utf-8").trim();
-          if (sid && !sid.startsWith("${")) {
+    if (_ppidFilePath) {
+      if (!_initialBindComplete) {
+        const maxAttempts = 5;
+        const delayMs = 300;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          const sid = readSessionFromPpidFile(_ppidFilePath);
+          if (sid) {
             setCurrentSession(sid);
             setCurrentSession2(sid);
-            _sessionBound = true;
-            _sessionBindingSource2 = "ppid_file";
             setSessionBindingSource("ppid_file");
+            _currentSessionId3 = sid;
+            _initialBindComplete = true;
             console.error(`Bound to session via PPID file: ${sid} (attempt ${attempt}/${maxAttempts})`);
             break;
           }
-        } catch {
+          if (attempt < maxAttempts) {
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+          }
         }
-        if (attempt < maxAttempts) {
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
+      } else {
+        const sid = readSessionFromPpidFile(_ppidFilePath);
+        if (sid) {
+          if (sid !== _currentSessionId3) {
+            console.error(`Session rebind: ${_currentSessionId3 || "none"} -> ${sid}`);
+          }
+          setCurrentSession(sid);
+          setCurrentSession2(sid);
+          _currentSessionId3 = sid;
         }
       }
     }

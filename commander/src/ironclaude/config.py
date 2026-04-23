@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 
 logger = logging.getLogger("ironclaude.config")
 
@@ -29,7 +30,7 @@ DEFAULTS = {
     "advisor": {
         "enabled": True,
         "executor_model": "sonnet",
-        "advisor_model": "claude-opus-4-5-20251101",
+        "advisor_model": "opus",
     },
 }
 
@@ -79,4 +80,21 @@ def load_config(config_path: str = "config/ironclaude.json") -> dict:
         if val is not None:
             cfg[cfg_key] = val
 
+    # Apply ANTHROPIC_DEFAULT_OPUS_MODEL as a lower-priority override.
+    # Specific BRAIN_MODEL / GRADER_MODEL env vars take precedence.
+    opus_env = os.environ.get("ANTHROPIC_DEFAULT_OPUS_MODEL")
+    if opus_env:
+        cfg["default_opus_model"] = opus_env
+        if "BRAIN_MODEL" not in os.environ:
+            cfg["brain_model"] = opus_env
+        if "GRADER_MODEL" not in os.environ:
+            cfg["grader_model"] = opus_env
+    else:
+        cfg["default_opus_model"] = cfg["brain_model"]
+
     return cfg
+
+
+def make_opus_command(model: str) -> str:
+    """Build the claude-opus worker command with the given model string."""
+    return f"export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model {shlex.quote(model)} --dangerously-skip-permissions"

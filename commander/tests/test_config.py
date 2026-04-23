@@ -92,7 +92,7 @@ class TestLoadConfig:
         cfg = load_config("/nonexistent/path.json")
         assert cfg["advisor"]["enabled"] is True
         assert cfg["advisor"]["executor_model"] == "sonnet"
-        assert cfg["advisor"]["advisor_model"] == "claude-opus-4-5-20251101"
+        assert cfg["advisor"]["advisor_model"] == "opus"
 
     def test_defaults_include_brain_model(self):
         """brain_model defaults to claude-opus-4-5-20251101."""
@@ -119,3 +119,32 @@ class TestLoadConfig:
         monkeypatch.setenv("GRADER_MODEL", "claude-sonnet-4-5-20241022")
         cfg = load_config(str(config_file))
         assert cfg["grader_model"] == "claude-sonnet-4-5-20241022"
+
+    def test_default_opus_model_from_env(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-4-7")
+        cfg = load_config()
+        assert cfg["default_opus_model"] == "claude-opus-4-7"
+
+    def test_default_opus_model_overrides_brain_model(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-4-7")
+        cfg = load_config()
+        assert cfg["brain_model"] == "claude-opus-4-7"
+
+    def test_default_opus_model_overrides_grader_model(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-4-7")
+        cfg = load_config()
+        assert cfg["grader_model"] == "claude-opus-4-7"
+
+    def test_brain_model_env_takes_precedence_over_default_opus(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-4-7")
+        monkeypatch.setenv("BRAIN_MODEL", "claude-sonnet-4-5")
+        cfg = load_config()
+        assert cfg["brain_model"] == "claude-sonnet-4-5"
+        assert cfg["default_opus_model"] == "claude-opus-4-7"
+
+    def test_default_opus_model_fallback_equals_brain_model(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_DEFAULT_OPUS_MODEL", raising=False)
+        monkeypatch.delenv("BRAIN_MODEL", raising=False)
+        monkeypatch.delenv("GRADER_MODEL", raising=False)
+        cfg = load_config()
+        assert cfg["default_opus_model"] == cfg["brain_model"]

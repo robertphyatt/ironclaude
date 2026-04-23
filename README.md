@@ -146,10 +146,11 @@ ollama serve
 IronClaude defaults to Claude Opus 4.5 (`claude-opus-4-5-20251101`) for the brain and grader. Community feedback on Reddit and personal experience suggest Opus 4.5 handles agentic workflows more reliably than later releases. You can override this via environment variables:
 
 ```bash
-# Use a different model for the brain
-export BRAIN_MODEL="claude-opus-4-6-20250115"
+# Override all opus-class usage (brain, grader, workers) with a single var
+export ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-4-6-20250115"
 
-# Use a different model for grading
+# Or override individually (takes precedence over ANTHROPIC_DEFAULT_OPUS_MODEL)
+export BRAIN_MODEL="claude-opus-4-6-20250115"
 export GRADER_MODEL="claude-sonnet-4-5-20241022"
 ```
 

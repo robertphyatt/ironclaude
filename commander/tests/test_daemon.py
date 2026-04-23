@@ -585,6 +585,96 @@ class TestHandleSummary:
         assert "Database not configured" in msg
 
 
+class TestHandleAudit:
+    def _make_db(self, rows):
+        """Create in-memory SQLite DB with directives table."""
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE directives ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, source_ts TEXT, "
+            "source_text TEXT, interpretation TEXT NOT NULL, "
+            "status TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')), "
+            "updated_at TEXT DEFAULT (datetime('now')))"
+        )
+        for row in rows:
+            conn.execute(
+                "INSERT INTO directives (source_ts, source_text, interpretation, status) "
+                "VALUES (?, ?, ?, ?)",
+                (row["source_ts"], row["source_text"], row["interpretation"], row["status"]),
+            )
+        conn.commit()
+        return conn
+
+    def test_audit_no_db(self, daemon):
+        """_handle_audit posts error when _db is None."""
+        daemon._db = None
+        daemon._handle_audit()
+        msg = daemon.slack.post_message.call_args[0][0]
+        assert "Database not configured" in msg
+
+    def test_audit_search_unavailable(self, daemon):
+        """_handle_audit posts error when search_operator_messages raises RuntimeError."""
+        conn = self._make_db([])
+        daemon._db = conn
+        daemon.slack.search_operator_messages.side_effect = RuntimeError("requires user_token")
+        daemon._handle_audit()
+        msg = daemon.slack.post_message.call_args[0][0]
+        assert "Audit unavailable" in msg
+        conn.close()
+
+    def test_audit_report_mapped_and_unmapped(self, daemon):
+        """_handle_audit shows mapped directive and unmapped message in correct sections."""
+        conn = self._make_db([
+            {"source_ts": "1.0", "source_text": "fix auth", "interpretation": "Fix auth bug", "status": "completed"},
+        ])
+        daemon._db = conn
+        daemon.slack.search_operator_messages.return_value = [
+            {"ts": "1.0", "text": "fix auth"},
+            {"ts": "2.0", "text": "thanks!"},
+        ]
+        daemon._handle_audit()
+        msg = daemon.slack.post_message.call_args[0][0]
+        assert "ts:1.0" in msg
+        assert "d1" in msg
+        assert "completed" in msg
+        assert "Fix auth bug" in msg
+        assert "ts:2.0" in msg
+        assert "thanks!" in msg
+        conn.close()
+
+    def test_audit_all_mapped(self, daemon):
+        """_handle_audit shows (none) in unmapped section when all messages are mapped."""
+        conn = self._make_db([
+            {"source_ts": "1.0", "source_text": "fix", "interpretation": "Fix bug", "status": "in_progress"},
+        ])
+        daemon._db = conn
+        daemon.slack.search_operator_messages.return_value = [
+            {"ts": "1.0", "text": "fix"},
+        ]
+        daemon._handle_audit()
+        msg = daemon.slack.post_message.call_args[0][0]
+        assert "Messages scanned: 1" in msg
+        assert "Mapped to directives: 1" in msg
+        assert "Unmapped: 0" in msg
+        assert "(none)" in msg
+        conn.close()
+
+    def test_audit_all_unmapped(self, daemon):
+        """_handle_audit shows (none) in mapped section when no messages match directives."""
+        conn = self._make_db([])
+        daemon._db = conn
+        daemon.slack.search_operator_messages.return_value = [
+            {"ts": "1.0", "text": "random chat"},
+        ]
+        daemon._handle_audit()
+        msg = daemon.slack.post_message.call_args[0][0]
+        assert "Messages scanned: 1" in msg
+        assert "Mapped to directives: 0" in msg
+        assert "Unmapped: 1" in msg
+        assert "random chat" in msg
+        conn.close()
+
+
 class TestHeartbeatWorkerListing:
     def test_post_heartbeat_passes_worker_details(self, daemon):
         """post_heartbeat builds worker detail list from registry + workflow stage."""
@@ -940,10 +1030,13 @@ class TestHandleRestart:
     def test_handle_restart_calls_execvp(self):
         """_handle_restart calls os.execvp with the current interpreter and module args."""
         import ironclaude.main as main_module
-        with patch.object(main_module, '_daemon', None):
-            with patch('os.execvp') as mock_exec:
-                from ironclaude.main import _handle_restart
-                _handle_restart(signal.SIGHUP, None)
+        with patch.object(main_module, '_daemon', None), \
+             patch('os.execvp') as mock_exec, \
+             patch('os.kill'), \
+             patch.object(main_module.subprocess, 'run'), \
+             patch.object(main_module.time, 'sleep'):
+            from ironclaude.main import _handle_restart
+            _handle_restart(signal.SIGHUP, None)
         mock_exec.assert_called_once_with(
             sys.executable, [sys.executable, '-m', 'ironclaude.main']
         )
@@ -952,10 +1045,13 @@ class TestHandleRestart:
         """_handle_restart calls daemon.shutdown() before os.execvp."""
         import ironclaude.main as main_module
         mock_daemon = MagicMock()
-        with patch.object(main_module, '_daemon', mock_daemon):
-            with patch('os.execvp'):
-                from ironclaude.main import _handle_restart
-                _handle_restart(signal.SIGHUP, None)
+        with patch.object(main_module, '_daemon', mock_daemon), \
+             patch('os.execvp'), \
+             patch('os.kill'), \
+             patch.object(main_module.subprocess, 'run'), \
+             patch.object(main_module.time, 'sleep'):
+            from ironclaude.main import _handle_restart
+            _handle_restart(signal.SIGHUP, None)
         mock_daemon.shutdown.assert_called_once()
 
     def test_handle_restart_stops_socket_handler_before_exec(self):
@@ -963,9 +1059,12 @@ class TestHandleRestart:
         import ironclaude.main as main_module
         mock_daemon = MagicMock()
         mock_daemon.socket_handler = MagicMock()
-        with patch.object(main_module, '_daemon', mock_daemon):
-            with patch('os.execvp'):
-                main_module._handle_restart(signal.SIGHUP, None)
+        with patch.object(main_module, '_daemon', mock_daemon), \
+             patch('os.execvp'), \
+             patch('os.kill'), \
+             patch.object(main_module.subprocess, 'run'), \
+             patch.object(main_module.time, 'sleep'):
+            main_module._handle_restart(signal.SIGHUP, None)
         mock_daemon.socket_handler.stop.assert_called_once()
 
     def test_handle_restart_kills_duplicate_daemons_before_exec(self):
@@ -1309,6 +1408,7 @@ class TestHandleSpawnWorkerSecurity:
         daemon.registry.get_running_workers_by_type.return_value = []
         daemon.tmux.spawn_session.return_value = True
         daemon.tmux.read_log_tail.return_value = "ironclaude v1.0.0"
+        daemon.tmux.list_pane_pid.return_value = None
 
         decision = {
             "worker_id": "w-test",
@@ -1327,21 +1427,25 @@ class TestHandleSpawnWorkerSecurity:
 
 class TestWorkerCommandsConsistency:
     def test_main_worker_commands_match_orchestrator(self):
-        """main.py WORKER_COMMANDS must exactly match orchestrator_mcp.py WORKER_COMMANDS."""
+        """main.py and orchestrator_mcp.py WORKER_COMMANDS share the static sonnet entry."""
         from ironclaude.main import WORKER_COMMANDS as main_cmds
         from ironclaude.orchestrator_mcp import WORKER_COMMANDS as orc_cmds
-        assert main_cmds == orc_cmds
+        assert main_cmds["claude-sonnet"] == orc_cmds["claude-sonnet"]
 
     def test_worker_commands_use_exec_prefix(self):
-        """main.py WORKER_COMMANDS must use exec prefix."""
+        """main.py worker commands must use exec prefix."""
         from ironclaude.main import WORKER_COMMANDS
-        assert "exec claude" in WORKER_COMMANDS["claude-opus"]
+        from ironclaude.config import DEFAULTS, make_opus_command
+        opus_cmd = make_opus_command(DEFAULTS["brain_model"])
+        assert "exec claude" in opus_cmd
         assert "exec claude" in WORKER_COMMANDS["claude-sonnet"]
 
     def test_worker_commands_set_effort_level_high(self):
-        """main.py WORKER_COMMANDS must set CLAUDE_CODE_EFFORT_LEVEL=high."""
+        """main.py worker commands must set CLAUDE_CODE_EFFORT_LEVEL=high."""
         from ironclaude.main import WORKER_COMMANDS
-        assert "CLAUDE_CODE_EFFORT_LEVEL=high" in WORKER_COMMANDS["claude-opus"]
+        from ironclaude.config import DEFAULTS, make_opus_command
+        opus_cmd = make_opus_command(DEFAULTS["brain_model"])
+        assert "CLAUDE_CODE_EFFORT_LEVEL=high" in opus_cmd
         assert "CLAUDE_CODE_EFFORT_LEVEL=high" in WORKER_COMMANDS["claude-sonnet"]
 
 
@@ -1352,6 +1456,7 @@ class TestDaemonWorkerTrust:
         daemon.registry.get_running_workers_by_type.return_value = []
         daemon.tmux.spawn_session.return_value = True
         daemon.tmux.read_log_tail.return_value = "ironclaude v1.0.0"
+        daemon.tmux.list_pane_pid.return_value = None
 
         decision = {
             "worker_id": "w1",
@@ -1371,6 +1476,7 @@ class TestDaemonWorkerTrust:
         daemon.registry.get_running_workers_by_type.return_value = []
         daemon.tmux.spawn_session.return_value = True
         daemon.tmux.read_log_tail.return_value = "ironclaude v1.0.0"
+        daemon.tmux.list_pane_pid.return_value = None
 
         decision = {
             "worker_id": "w1",
@@ -1408,6 +1514,7 @@ class TestWaitForReadyMarker:
         mock_wait.return_value = True
         daemon.registry.get_running_workers_by_type.return_value = []
         daemon.tmux.spawn_session.return_value = True
+        daemon.tmux.list_pane_pid.return_value = None
 
         decision = {
             "worker_id": "w1",
@@ -1557,6 +1664,7 @@ class TestHandleSpawnWorkerAdvisor:
         brain = MagicMock()
         d = IroncladeDaemon(config, slack, None, registry, tmux, brain)
         d._wait_for_ready = MagicMock(return_value=True)
+        tmux.list_pane_pid.return_value = None
 
         with patch("ironclaude.main.ensure_worker_trusted"):
             d._handle_spawn_worker({
@@ -1575,6 +1683,7 @@ class TestHandleSpawnWorkerAdvisor:
     def test_skips_advisor_when_not_in_config(self, daemon):
         """Default daemon config has no advisor key — no /advisor command sent."""
         daemon._wait_for_ready = MagicMock(return_value=True)
+        daemon.tmux.list_pane_pid.return_value = None
 
         with patch("ironclaude.main.ensure_worker_trusted"):
             daemon._handle_spawn_worker({
@@ -1586,3 +1695,31 @@ class TestHandleSpawnWorkerAdvisor:
 
         keys_sent = [call[0][1] for call in daemon.tmux.send_keys.call_args_list]
         assert not any(k.startswith("/advisor") for k in keys_sent)
+
+
+class TestSpawnWorkerPid:
+    def test_spawn_worker_logs_pane_pid(self, daemon, caplog):
+        """WORKER_SPAWNED log entry includes pane_pid from tmux."""
+        import logging
+        daemon.tmux.list_pane_pid.return_value = "99999"
+        daemon._wait_for_ready = MagicMock(return_value=True)
+
+        with patch("ironclaude.main.ensure_worker_trusted"):
+            with caplog.at_level(logging.INFO, logger="ironclaude"):
+                daemon._handle_spawn_worker({
+                    "worker_id": "w1",
+                    "type": "claude-sonnet",
+                    "repo": "/tmp",
+                    "objective": "do work",
+                })
+
+        spawned = []
+        for r in caplog.records:
+            try:
+                data = json.loads(r.getMessage())
+                if data.get("event_type") == "WORKER_SPAWNED":
+                    spawned.append(data)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        assert len(spawned) == 1, f"Expected 1 WORKER_SPAWNED entry, got {len(spawned)}"
+        assert spawned[0]["pane_pid"] == "99999"

@@ -29,6 +29,7 @@ from pathlib import Path
 import requests
 import shlex
 
+from ironclaude.config import make_opus_command
 from ironclaude.signal_forensics import _logged_kill
 from ironclaude.tmux_manager import _strip_ansi
 
@@ -45,7 +46,6 @@ def log_worker_event(event_type: str, **fields) -> None:
 
 
 WORKER_COMMANDS = {
-    "claude-opus": "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'claude-opus-4-5-20251101' --dangerously-skip-permissions",
     "claude-sonnet": "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'sonnet' --dangerously-skip-permissions",
 }
 
@@ -57,6 +57,12 @@ VALID_SUPABASE_TABLES = frozenset({"players", "sessions", "events", "feedback", 
 VALID_ORDER_BY_COLUMNS = frozenset({"id", "created_at", "updated_at", "severity"})
 RESERVED_SUPABASE_PARAMS = frozenset({"select", "limit", "order", "offset", "count", "and", "or", "not"})
 _SAFE_COLUMN_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_]*$')
+
+_MCP_CLEANUP_PATTERNS = [
+    "ironclaude/orchestrator_mcp",
+    "ironclaude-state-manager",
+    "ironclaude-episodic-memory",
+]
 
 KEY_MAP: dict[str, str] = {
     "Return": "return",
@@ -291,7 +297,7 @@ class OrchestratorTools:
     All methods are synchronous and raise exceptions on error.
     """
 
-    def __init__(self, registry, tmux, ledger_path: str, grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "claude-opus-4-5-20251101"):
+    def __init__(self, registry, tmux, ledger_path: str, grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "claude-opus-4-5-20251101", opus_model: str = "claude-opus-4-5-20251101"):
         self.registry = registry
         self.tmux = tmux
         self.ledger_path = ledger_path
@@ -299,6 +305,7 @@ class OrchestratorTools:
         self._grader_ready = False
         self._grader_home = os.path.expanduser(grader_home)
         self._grader_model = grader_model
+        self._opus_model = opus_model
         self._slack = slack_bot
         self._db = db_conn
         self._operator_name = operator_name
@@ -313,6 +320,8 @@ class OrchestratorTools:
         advisor = self._advisor_cfg
         if worker_type == "ollama":
             return f"export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
+        elif worker_type == "claude-opus":
+            return make_opus_command(self._opus_model)
         elif worker_type in WORKER_COMMANDS:
             if advisor.get("enabled") and worker_type == "claude-sonnet":
                 model = advisor.get("executor_model", "sonnet")
@@ -1178,7 +1187,9 @@ Model recommendation (include "recommended_model" for each):
             self._ensure_claude_md(repo)
             self.ensure_worker_trusted(repo)
 
-            if worker_type in WORKER_COMMANDS:
+            if worker_type == "claude-opus":
+                cmd = make_opus_command(self._opus_model)
+            elif worker_type in WORKER_COMMANDS:
                 cmd = WORKER_COMMANDS[worker_type]
             elif worker_type == "ollama" and model_name:
                 cmd = f"export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
@@ -1459,6 +1470,7 @@ Has the worker genuinely completed its objective based on the evidence?"""
             logger.warning(f"kill_worker called without objective/evidence for '{worker_id}' — skipping grader")
 
         session_name = f"ic-{worker_id}"
+        pane_pid = self.tmux.list_pane_pid(session_name)
         self.tmux.kill_session(session_name)
         self.registry.update_worker_status(worker_id, "completed")
         _wr = self.registry.get_worker(worker_id)
@@ -1474,6 +1486,7 @@ Has the worker genuinely completed its objective based on the evidence?"""
         log_worker_event(
             "WORKER_KILLED",
             worker_id=worker_id,
+            pane_pid=pane_pid,
             had_evidence=bool(original_objective and evidence),
             kill_reason=evidence[:200] if evidence else None,
             runtime_seconds=_runtime,
@@ -1636,6 +1649,74 @@ Has the worker genuinely completed its objective based on the evidence?"""
         self._game_pid = None
         return json.dumps({"status": "killed"})
 
+    def _cleanup_zombie_mcp_processes(self) -> list[int]:
+        """Find and kill orphaned MCP processes whose parent process is dead.
+
+        Returns list of killed PIDs.
+        """
+        import signal as _signal
+
+        my_pid = os.getpid()
+        killed = []
+
+        for pattern in _MCP_CLEANUP_PATTERNS:
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", pattern],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode not in (0, 1):
+                    continue
+                for line in result.stdout.strip().splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        pid = int(line)
+                    except ValueError:
+                        continue
+                    if pid == my_pid:
+                        continue
+                    ps_result = subprocess.run(
+                        ["ps", "-p", str(pid), "-o", "ppid="],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if ps_result.returncode != 0:
+                        continue
+                    try:
+                        ppid = int(ps_result.stdout.strip())
+                    except ValueError:
+                        continue
+                    try:
+                        os.kill(ppid, 0)
+                        continue  # parent alive — not an orphan
+                    except ProcessLookupError:
+                        pass  # parent dead — orphan confirmed
+                    except PermissionError:
+                        continue  # parent exists (can't signal it)
+                    try:
+                        os.kill(pid, _signal.SIGTERM)
+                        killed.append(pid)
+                        logger.info(
+                            "restart_mcp: killed orphan MCP process pid=%d pattern=%r ppid=%d",
+                            pid, pattern, ppid,
+                        )
+                    except (ProcessLookupError, PermissionError) as e:
+                        logger.debug("restart_mcp: could not kill pid=%d: %s", pid, e)
+            except Exception as e:
+                logger.warning(
+                    "restart_mcp: zombie scan error for pattern=%r: %s", pattern, e
+                )
+
+        if killed:
+            logger.info(
+                "restart_mcp: cleaned up %d orphan MCP process(es): pids=%s",
+                len(killed), killed,
+            )
+        return killed
+
     def restart_mcp(self) -> str:
         """Close DB and exec a fresh instance of this MCP server.
 
@@ -1648,6 +1729,7 @@ Has the worker genuinely completed its objective based on the evidence?"""
                 self._db.close()
             except Exception:
                 pass
+        self._cleanup_zombie_mcp_processes()
         sys.stdout.flush()
         sys.stderr.flush()
         os.execvp(sys.executable, [sys.executable] + sys.argv)
@@ -1981,6 +2063,7 @@ def main():
         supabase_url=supabase_url, supabase_anon_key=supabase_anon_key,
         advisor_cfg=cfg.get("advisor", {}),
         grader_model=cfg.get("grader_model", "claude-opus-4-5-20251101"),
+        opus_model=cfg.get("default_opus_model", "claude-opus-4-5-20251101"),
     )
 
     mcp = _create_mcp_server(tools)

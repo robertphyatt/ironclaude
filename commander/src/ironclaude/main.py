@@ -19,7 +19,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ironclaude.config import load_config
+from ironclaude.config import load_config, DEFAULTS, make_opus_command
 from ironclaude.slack_interface import SlackBot, DIRECTIVE_STATUS_EMOJI
 from ironclaude.slack_commands import SlackSocketHandler, format_help_text
 from ironclaude.db import init_db
@@ -47,7 +47,6 @@ def log_worker_event(event_type: str, **fields) -> None:
 
 
 WORKER_COMMANDS = {
-    "claude-opus": "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'claude-opus-4-5-20251101' --dangerously-skip-permissions",
     "claude-sonnet": "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'sonnet' --dangerously-skip-permissions",
 }
 
@@ -582,6 +581,8 @@ class IroncladeDaemon:
                 self.slack.post_message(f"Rejection queued for `{worker_id}`.")
             elif cmd_type == "summary":
                 self._handle_summary()
+            elif cmd_type == "audit":
+                self._handle_audit()
             elif self.plugin_registry.handle_command(self, cmd_type, parsed):
                 pass  # handled by plugin
             else:
@@ -810,6 +811,50 @@ class IroncladeDaemon:
             lines.append("(none)")
         self.slack.post_message("\n".join(lines))
 
+    def _handle_audit(self):
+        if self._db is None:
+            self.slack.post_message("Database not configured.")
+            return
+        try:
+            messages = self.slack.search_operator_messages(limit=100, hours_back=72)
+        except RuntimeError as e:
+            self.slack.post_message(f"Audit unavailable: {e}")
+            return
+        rows = self._db.execute(
+            "SELECT id, source_ts, interpretation, status FROM directives ORDER BY created_at DESC"
+        ).fetchall()
+        directive_by_ts = {row[1]: row for row in rows}
+        mapped = []
+        unmapped = []
+        for msg in messages:
+            ts = msg["ts"]
+            if ts in directive_by_ts:
+                row = directive_by_ts[ts]
+                mapped.append((ts, row[0], row[2], row[3]))
+            else:
+                unmapped.append(msg)
+        lines = ["*Slack Audit Report (72h)*", ""]
+        lines.append("📊 *Summary*")
+        lines.append(f"• Messages scanned: {len(messages)}")
+        lines.append(f"• Mapped to directives: {len(mapped)}")
+        lines.append(f"• Unmapped: {len(unmapped)}")
+        lines.append("")
+        lines.append("✅ *Mapped Messages*")
+        if mapped:
+            for ts, d_id, interpretation, status in mapped:
+                lines.append(f"• `ts:{ts}` → d{d_id} ({status}): {interpretation[:60]}")
+        else:
+            lines.append("(none)")
+        lines.append("")
+        lines.append("⚠️ *Unmapped Messages*")
+        if unmapped:
+            for msg in unmapped:
+                snippet = msg["text"][:50]
+                lines.append(f'• "{snippet}" (ts:{msg["ts"]})')
+        else:
+            lines.append("(none)")
+        self.slack.post_message("\n".join(lines))
+
     def check_brain(self):
         """Check brain health, restart if needed."""
         if self._brain_paused:
@@ -920,12 +965,14 @@ class IroncladeDaemon:
                 return
 
             cmd = f"ollama launch claude --model {shlex.quote(model_name)} -- --dangerously-skip-permissions"
+        elif worker_type == "claude-opus":
+            cmd = make_opus_command(self.config.get("default_opus_model", DEFAULTS["brain_model"]))
         elif worker_type in WORKER_COMMANDS:
             cmd = WORKER_COMMANDS[worker_type]
         else:
             self.slack.post_message(
                 f"Unknown worker type `{worker_type}`. "
-                f"Supported: ollama, {', '.join(WORKER_COMMANDS.keys())}"
+                f"Supported: ollama, claude-opus, {', '.join(WORKER_COMMANDS.keys())}"
             )
             return
 
@@ -964,7 +1011,8 @@ class IroncladeDaemon:
         log_worker_event("WORKER_OBJECTIVE_DELIVERED", worker_id=worker_id, objective=objective[:200])
         self.slack.post_message(format_worker_spawned(worker_id, worker_type, repo, objective))
         self.registry.log_event("worker_spawned", worker_id=worker_id, details=decision)
-        log_worker_event("WORKER_SPAWNED", worker_id=worker_id, worker_type=worker_type, repo=repo)
+        pane_pid = self.tmux.list_pane_pid(session_name)
+        log_worker_event("WORKER_SPAWNED", worker_id=worker_id, worker_type=worker_type, repo=repo, pane_pid=pane_pid)
 
     def _get_worker_workflow_stage(
         self, session_name: str, _claude_dir: Path | None = None
