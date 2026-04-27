@@ -102,10 +102,11 @@ class BrainClient:
             )
         return matches[-1]  # sorted() puts latest version last
 
-    def __init__(self, timeout_seconds: int = 600, operator_name: str = "Operator", model: str = "claude-opus-4-5-20251101"):
+    def __init__(self, timeout_seconds: int = 600, operator_name: str = "Operator", model: str = "claude-opus-4-5-20251101", effort_level: str = "high"):
         self.timeout_seconds = timeout_seconds
         self._operator_name = operator_name
         self._model = model
+        self._effort_level = effort_level
         self.restart_count = 0
         self._response_queue: queue.Queue[str] = queue.Queue()
         self._message_queue: asyncio.Queue | None = None
@@ -143,6 +144,7 @@ class BrainClient:
         self._expected_kill = False
         self._system_prompt = system_prompt
         self._cwd = cwd
+        os.environ["IC_ROLE"] = "brain"
         # Resolve episodic memory MCP server path (fail hard if not found)
         self._episodic_memory_path = self.discover_episodic_memory_path()
         # Resolve orchestrator MCP server path (optional — may not be installed yet)
@@ -403,8 +405,9 @@ class BrainClient:
                 mcp_servers=mcp_servers,
                 resume=resume_session_id,
                 fork_session=True,
-                effort="medium",
+                effort=self._effort_level,
                 model=self._model,
+                setting_sources=["project", "local"],
             )
         else:
             options = ClaudeAgentOptions(
@@ -416,8 +419,9 @@ class BrainClient:
                 cwd=cwd,
                 max_buffer_size=self.MAX_BUFFER_SIZE,
                 mcp_servers=mcp_servers,
-                effort="medium",
+                effort=self._effort_level,
                 model=self._model,
+                setting_sources=["project", "local"],
             )
 
         logger.info("Brain session started")

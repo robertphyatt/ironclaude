@@ -114,6 +114,11 @@ class TestWorkerCheckinNotification:
         msg = format_worker_checkin("w1", 10, "design_ready", "Ready", False)
         assert "[CHECK-IN]" in msg
 
+    def test_action_required_prefix_when_prompt_waiting(self):
+        msg = format_worker_checkin("w1", 5, "brainstorming", "Which approach?", True)
+        assert "[ACTION REQUIRED]" in msg
+        assert "[CHECK-IN]" not in msg
+
 
 class TestEscapeMrkdwn:
     def test_escape_ampersand(self):

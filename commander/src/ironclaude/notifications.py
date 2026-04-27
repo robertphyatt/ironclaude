@@ -100,7 +100,8 @@ def format_worker_checkin(
     worker_id: str, elapsed_minutes: int, stage: str,
     log_tail: str, prompt_waiting: bool,
 ) -> str:
-    msg = f"[CHECK-IN] {worker_id} {elapsed_minutes}min {stage}\n{log_tail}"
+    prefix = "[ACTION REQUIRED]" if prompt_waiting else "[CHECK-IN]"
+    msg = f"{prefix} {worker_id} {elapsed_minutes}min {stage}\n{log_tail}"
     if prompt_waiting:
         msg += "\n⚠️ Waiting for input."
     return msg

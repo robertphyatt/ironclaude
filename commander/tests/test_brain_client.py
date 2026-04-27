@@ -53,6 +53,16 @@ class TestBrainClient:
         sig = inspect.signature(BrainClient.start)
         assert "continue_session" not in sig.parameters
 
+    def test_effort_level_defaults_to_high(self):
+        """BrainClient stores effort_level, defaults to 'high'."""
+        client = BrainClient()
+        assert client._effort_level == "high"
+
+    def test_effort_level_param_stored(self):
+        """BrainClient stores provided effort_level."""
+        client = BrainClient(effort_level="medium")
+        assert client._effort_level == "medium"
+
 
 class TestBrainToolRestrictions:
     def test_allowed_tools_includes_bash(self):
@@ -1273,6 +1283,24 @@ class TestKillSubprocessDiagnostics:
         assert client._expected_kill is False
 
 
+class TestBrainIcRole:
+    """IC_ROLE=brain is set in process environment when BrainClient.start() is called."""
+
+    def test_start_sets_ic_role_brain(self, monkeypatch):
+        """start() sets IC_ROLE=brain in os.environ before spawning brain subprocess."""
+        import os
+        import unittest.mock as mock
+        monkeypatch.delenv("IC_ROLE", raising=False)
+        client = BrainClient()
+        monkeypatch.setattr(client, '_kill_brain_subprocess', lambda: None)
+        monkeypatch.setattr(BrainClient, 'discover_episodic_memory_path',
+                            staticmethod(lambda *a, **kw: '/fake/path'))
+        with mock.patch('ironclaude.brain_client.threading.Thread') as mock_thread:
+            mock_thread.return_value = mock.MagicMock()
+            client.start('test prompt')
+        assert os.environ.get("IC_ROLE") == "brain"
+
+
 class TestSigtermDiagnostics:
     def test_log_brain_pid_diagnostics_uses_ps_for_ppid(self, caplog, monkeypatch):
         """_log_brain_pid_diagnostics uses ps command for brain's ppid, not os.getppid."""
@@ -1371,6 +1399,18 @@ class TestBrainSessionOptions:
         assert captured.get("permission_mode") == "bypassPermissions"
         assert captured.get("allowed_tools") == BrainClient.ALLOWED_TOOLS
         assert captured.get("can_use_tool") is not None
+
+    def test_fresh_branch_includes_setting_sources(self):
+        """Fresh session passes setting_sources=["project", "local"] to ClaudeAgentOptions."""
+        client = BrainClient()
+        captured = self._run_and_capture(client, "my-prompt", resume_session_id=None)
+        assert captured.get("setting_sources") == ["project", "local"]
+
+    def test_resume_branch_includes_setting_sources(self):
+        """Resumed session passes setting_sources=["project", "local"] to ClaudeAgentOptions."""
+        client = BrainClient()
+        captured = self._run_and_capture(client, "my-prompt", resume_session_id="abc123")
+        assert captured.get("setting_sources") == ["project", "local"]
 
 
 class TestMutationToolFirstCheck:
