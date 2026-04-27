@@ -27,6 +27,7 @@ DEFAULTS = {
     "autonomy_level": "3",
     "brain_model": "claude-opus-4-5-20251101",
     "grader_model": "claude-opus-4-5-20251101",
+    "effort_level": "high",
     "advisor": {
         "enabled": True,
         "executor_model": "sonnet",
@@ -42,6 +43,7 @@ ENV_OVERRIDES = {
     "BRAIN_TIMEOUT_SECONDS": ("brain_timeout_seconds", int),
     "BRAIN_MODEL": ("brain_model", str),
     "GRADER_MODEL": ("grader_model", str),
+    "EFFORT_LEVEL": ("effort_level", str),
 }
 
 # Env vars loaded directly into config (not in JSON)
@@ -95,6 +97,6 @@ def load_config(config_path: str = "config/ironclaude.json") -> dict:
     return cfg
 
 
-def make_opus_command(model: str) -> str:
-    """Build the claude-opus worker command with the given model string."""
-    return f"export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model {shlex.quote(model)} --dangerously-skip-permissions"
+def make_opus_command(model: str, effort: str) -> str:
+    """Build the claude-opus worker command with the given model and effort level."""
+    return f"export CLAUDE_CODE_EFFORT_LEVEL={effort}; exec claude --model {shlex.quote(model)} --dangerously-skip-permissions"

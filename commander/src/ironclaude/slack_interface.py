@@ -127,7 +127,7 @@ class SlackBot:
             raise ValueError(f"end_date must be in YYYY-MM-DD format, got: {end_date!r}")
 
         if start_date is not None:
-            after_date = start_date
+            after_date = (datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
         else:
             after_date = (datetime.now() - timedelta(days=math.ceil(hours_back / 24))).strftime("%Y-%m-%d")
 
@@ -136,7 +136,8 @@ class SlackBot:
         else:
             query = f"in:<#{self._channel_id}> after:{after_date}"
         if end_date is not None:
-            query += f" before:{end_date}"
+            before_date = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+            query += f" before:{before_date}"
 
         count = min(limit, 100)
         all_matches: list[dict] = []
@@ -170,6 +171,28 @@ class SlackBot:
             if float(m["ts"]) >= cutoff_start
             and (cutoff_end is None or float(m["ts"]) < cutoff_end)
         ]
+
+    def get_messages_by_ts_range(
+        self,
+        oldest_ts: str,
+        latest_ts: str,
+        only_operator: bool = True,
+    ) -> list[dict]:
+        """Fetch messages in exact timestamp range using conversations.history.
+
+        Uses bot token (no user token required). Returns messages with file metadata.
+        """
+        result = self._client.conversations_history(
+            channel=self._channel_id,
+            oldest=oldest_ts,
+            latest=latest_ts,
+            inclusive=True,
+            limit=100,
+        )
+        messages = result.get("messages", [])
+        if only_operator:
+            messages = [m for m in messages if m.get("user") and not m.get("bot_id")]
+        return [_format_message(m) for m in messages]
 
     def is_reachable(self) -> bool:
         """Check if Slack API is reachable."""

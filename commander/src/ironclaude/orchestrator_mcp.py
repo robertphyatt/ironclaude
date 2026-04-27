@@ -297,7 +297,7 @@ class OrchestratorTools:
     All methods are synchronous and raise exceptions on error.
     """
 
-    def __init__(self, registry, tmux, ledger_path: str, grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "claude-opus-4-5-20251101", opus_model: str = "claude-opus-4-5-20251101"):
+    def __init__(self, registry, tmux, ledger_path: str, grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "claude-opus-4-5-20251101", opus_model: str = "claude-opus-4-5-20251101", effort_level: str = "high"):
         self.registry = registry
         self.tmux = tmux
         self.ledger_path = ledger_path
@@ -306,6 +306,7 @@ class OrchestratorTools:
         self._grader_home = os.path.expanduser(grader_home)
         self._grader_model = grader_model
         self._opus_model = opus_model
+        self._effort_level = effort_level
         self._slack = slack_bot
         self._db = db_conn
         self._operator_name = operator_name
@@ -319,14 +320,14 @@ class OrchestratorTools:
         """Build worker command, using advisor config for model selection."""
         advisor = self._advisor_cfg
         if worker_type == "ollama":
-            return f"export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
+            return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
         elif worker_type == "claude-opus":
-            return make_opus_command(self._opus_model)
+            return make_opus_command(self._opus_model, self._effort_level)
         elif worker_type in WORKER_COMMANDS:
             if advisor.get("enabled") and worker_type == "claude-sonnet":
                 model = advisor.get("executor_model", "sonnet")
-                return f"export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model {shlex.quote(model)} --dangerously-skip-permissions"
-            return WORKER_COMMANDS[worker_type]
+                return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model {shlex.quote(model)} --dangerously-skip-permissions"
+            return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model 'sonnet' --dangerously-skip-permissions"
         raise ValueError(f"Invalid worker type '{worker_type}'")
 
     def _write_brain_contact(self, worker_id: str) -> None:
@@ -384,6 +385,14 @@ class OrchestratorTools:
         log_path = self.tmux.get_log_path(self._grader_session)
         open(log_path, "w").close()
 
+        return self._spawn_grader()
+
+    def _spawn_grader(self) -> bool:
+        """Inject trust, spawn the grader session, and wait for readiness.
+
+        Called by _ensure_grader after zombie cleanup and log truncation.
+        Returns True if grader is ready, False on failure.
+        """
         # Inject trust entry immediately before spawn (lazy import avoids circular dep)
         from ironclaude.main import ensure_brain_trusted
         ensure_brain_trusted(self._grader_home)
@@ -391,7 +400,7 @@ class OrchestratorTools:
         # Spawn fresh session with grader's own working directory
         success = self.tmux.spawn_session(
             self._grader_session,
-            f"claude --model '{self._grader_model}' --dangerously-skip-permissions",
+            f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model '{self._grader_model}' --dangerously-skip-permissions",
             cwd=self._grader_home,
         )
         if not success:
@@ -555,6 +564,34 @@ class OrchestratorTools:
                         logger.warning("Failed to download Slack image %s: %s", f["name"], e)
         return messages
 
+    def get_messages_by_ts_range(
+        self,
+        oldest_ts: str,
+        latest_ts: str,
+        only_operator: bool = True,
+    ) -> list[dict]:
+        """Fetch Slack messages in exact timestamp range and download image attachments.
+
+        Uses conversations.history (bot token only — no user token required).
+        Returns [] if Slack is unavailable or not configured.
+        """
+        if self._slack is None:
+            return []
+        messages = self._slack.get_messages_by_ts_range(oldest_ts, latest_ts, only_operator)
+        _IMAGE_MIMETYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+        dl_dir = Path("/tmp/ironclaude-slack-files")
+        dl_dir.mkdir(exist_ok=True)
+        for msg in messages:
+            for f in msg.get("files", []):
+                if f.get("mimetype") in _IMAGE_MIMETYPES and f.get("url_private_download"):
+                    safe_name = Path(f["name"]).name
+                    local_path = str(dl_dir / f"{f['id']}_{safe_name}")
+                    try:
+                        self._slack.download_file(f["url_private_download"], local_path)
+                        f["local_path"] = local_path
+                    except Exception as e:
+                        logger.warning("Failed to download Slack image %s: %s", f["name"], e)
+        return messages
 
     def submit_directive(self, source_ts: str, source_text: str, interpretation: str) -> dict:
         """Submit a new directive for the operator's confirmation.
@@ -1942,6 +1979,30 @@ def _create_mcp_server(tools: OrchestratorTools):
         )
 
     @mcp.tool()
+    def get_messages_by_ts_range(
+        oldest_ts: str,
+        latest_ts: str,
+        only_operator: bool = True,
+    ) -> str:
+        """Fetch Slack messages in exact timestamp range and download image attachments.
+
+        Uses conversations.history (bot token only — no user token required).
+        Useful when you have exact Slack message timestamps from URLs.
+
+        Args:
+            oldest_ts: Unix timestamp string for the start of the range (inclusive).
+            latest_ts: Unix timestamp string for the end of the range (inclusive).
+            only_operator: If True (default), return only non-bot messages.
+
+        Returns JSON array of messages with keys: text, ts, user, files[], local_path.
+        Returns empty array if Slack is unavailable or not configured.
+        """
+        return json.dumps(
+            tools.get_messages_by_ts_range(oldest_ts, latest_ts, only_operator),
+            indent=2,
+        )
+
+    @mcp.tool()
     def submit_directive(source_ts: str, source_text: str, interpretation: str) -> str:
         """Submit a new directive for the operator's confirmation.
 
@@ -2064,6 +2125,7 @@ def main():
         advisor_cfg=cfg.get("advisor", {}),
         grader_model=cfg.get("grader_model", "claude-opus-4-5-20251101"),
         opus_model=cfg.get("default_opus_model", "claude-opus-4-5-20251101"),
+        effort_level=cfg.get("effort_level", "high"),
     )
 
     mcp = _create_mcp_server(tools)

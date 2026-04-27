@@ -124,6 +124,125 @@ class TestSlackBot:
         assert len(msgs) == 1
         assert "files" not in msgs[0]
 
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_search_operator_messages_start_date_subtracts_one_day(self, mock_client_cls):
+        mock_bot = MagicMock()
+        mock_user = MagicMock()
+        mock_user.search_messages.return_value = {"messages": {"matches": [], "paging": {"pages": 1}}}
+        mock_client_cls.side_effect = [mock_bot, mock_user]
+        bot = SlackBot(token="xoxb", channel_id="C123", user_token="xoxp", operator_user_id="U456")
+        bot.search_operator_messages(start_date="2026-04-19")
+        query = mock_user.search_messages.call_args[1]["query"]
+        assert "after:2026-04-18" in query
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_search_operator_messages_end_date_adds_one_day_in_query(self, mock_client_cls):
+        mock_bot = MagicMock()
+        mock_user = MagicMock()
+        mock_user.search_messages.return_value = {"messages": {"matches": [], "paging": {"pages": 1}}}
+        mock_client_cls.side_effect = [mock_bot, mock_user]
+        bot = SlackBot(token="xoxb", channel_id="C123", user_token="xoxp", operator_user_id="U456")
+        bot.search_operator_messages(start_date="2026-04-19", end_date="2026-04-20")
+        query = mock_user.search_messages.call_args[1]["query"]
+        assert "before:2026-04-21" in query
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_search_operator_messages_client_filter_exact_cutoff(self, mock_client_cls):
+        from datetime import datetime
+        mock_bot = MagicMock()
+        mock_user = MagicMock()
+        cutoff_start = datetime(2026, 4, 19).timestamp()
+        in_ts = str(cutoff_start)
+        out_ts = str(cutoff_start - 1)
+        mock_user.search_messages.return_value = {
+            "messages": {
+                "matches": [
+                    {"text": "in range", "ts": in_ts, "user": "U456"},
+                    {"text": "too early", "ts": out_ts, "user": "U456"},
+                ],
+                "paging": {"pages": 1},
+            }
+        }
+        mock_client_cls.side_effect = [mock_bot, mock_user]
+        bot = SlackBot(token="xoxb", channel_id="C123", user_token="xoxp", operator_user_id="U456")
+        result = bot.search_operator_messages(start_date="2026-04-19")
+        assert len(result) == 1
+        assert result[0]["text"] == "in range"
+
+
+class TestGetMessagesByTsRange:
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_get_messages_by_ts_range_calls_conversations_history(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.conversations_history.return_value = {"messages": []}
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb", channel_id="C123")
+        bot.get_messages_by_ts_range("1776657033.774459", "1776657985.900139")
+        mock_client.conversations_history.assert_called_once_with(
+            channel="C123",
+            oldest="1776657033.774459",
+            latest="1776657985.900139",
+            inclusive=True,
+            limit=100,
+        )
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_get_messages_by_ts_range_filters_bots(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.conversations_history.return_value = {
+            "messages": [
+                {"text": "human", "ts": "1.0", "user": "U123"},
+                {"text": "bot", "ts": "2.0", "bot_id": "B456"},
+            ]
+        }
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb", channel_id="C123")
+        result = bot.get_messages_by_ts_range("1.0", "2.0", only_operator=True)
+        assert len(result) == 1
+        assert result[0]["text"] == "human"
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_get_messages_by_ts_range_includes_all_when_not_operator_only(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.conversations_history.return_value = {
+            "messages": [
+                {"text": "human", "ts": "1.0", "user": "U123"},
+                {"text": "bot", "ts": "2.0", "bot_id": "B456"},
+            ]
+        }
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb", channel_id="C123")
+        result = bot.get_messages_by_ts_range("1.0", "2.0", only_operator=False)
+        assert len(result) == 2
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_get_messages_by_ts_range_returns_file_metadata(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.conversations_history.return_value = {
+            "messages": [
+                {
+                    "text": "here is the image",
+                    "ts": "1.0",
+                    "user": "U123",
+                    "files": [
+                        {
+                            "id": "F001",
+                            "name": "card.png",
+                            "mimetype": "image/png",
+                            "url_private_download": "https://files.slack.com/files-pri/T0/F001/card.png",
+                        }
+                    ],
+                }
+            ]
+        }
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb", channel_id="C123")
+        result = bot.get_messages_by_ts_range("1.0", "2.0")
+        assert len(result) == 1
+        assert "files" in result[0]
+        assert result[0]["files"][0]["id"] == "F001"
+        assert result[0]["files"][0]["mimetype"] == "image/png"
+
 
 class TestParseInboundCommand:
     def test_status(self):

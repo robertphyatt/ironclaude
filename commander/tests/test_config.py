@@ -148,3 +148,29 @@ class TestLoadConfig:
         monkeypatch.delenv("GRADER_MODEL", raising=False)
         cfg = load_config()
         assert cfg["default_opus_model"] == cfg["brain_model"]
+
+    def test_defaults_include_effort_level(self):
+        """effort_level defaults to 'high'."""
+        from ironclaude.config import DEFAULTS
+        assert DEFAULTS["effort_level"] == "high"
+
+    def test_env_override_effort_level(self, tmp_path, monkeypatch):
+        """EFFORT_LEVEL env var overrides config."""
+        config_file = tmp_path / "ironclaude.json"
+        config_file.write_text("{}")
+        monkeypatch.setenv("EFFORT_LEVEL", "medium")
+        cfg = load_config(str(config_file))
+        assert cfg["effort_level"] == "medium"
+
+    def test_make_opus_command_uses_effort_param(self):
+        """make_opus_command uses provided effort level."""
+        from ironclaude.config import make_opus_command
+        cmd = make_opus_command("claude-opus-4-5", "medium")
+        assert "CLAUDE_CODE_EFFORT_LEVEL=medium" in cmd
+        assert "claude-opus-4-5" in cmd
+
+    def test_make_opus_command_high_effort(self):
+        """make_opus_command with high effort."""
+        from ironclaude.config import make_opus_command
+        cmd = make_opus_command("claude-opus-4-5", "high")
+        assert "CLAUDE_CODE_EFFORT_LEVEL=high" in cmd

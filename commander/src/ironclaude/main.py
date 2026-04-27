@@ -1356,6 +1356,7 @@ def main():
         timeout_seconds=config.get("brain_timeout_seconds", 600),
         operator_name=config.get("operator_name", "Operator"),
         model=config.get("brain_model", "claude-opus-4-5-20251101"),
+        effort_level=config.get("effort_level", "high"),
     )
 
     # Start brain

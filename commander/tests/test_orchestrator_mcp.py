@@ -225,6 +225,70 @@ class TestWorkerCommunication:
         assert "bold red" in result
 
 
+class TestEffortLevel:
+    def test_effort_level_defaults_to_high(self, tools):
+        """OrchestratorTools defaults effort_level to 'high'."""
+        assert tools._effort_level == "high"
+
+    def test_effort_level_stored_from_param(self, registry, mock_tmux, tmp_path, db_conn):
+        """OrchestratorTools stores provided effort_level."""
+        ledger_path = str(tmp_path / "ledger.json")
+        t = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            effort_level="medium",
+        )
+        assert t._effort_level == "medium"
+
+    def test_get_worker_command_opus_effort_override(self, registry, mock_tmux, tmp_path, db_conn):
+        """Opus worker command uses configured effort_level."""
+        ledger_path = str(tmp_path / "ledger.json")
+        t = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            effort_level="medium",
+        )
+        cmd = t._get_worker_command("claude-opus")
+        assert "CLAUDE_CODE_EFFORT_LEVEL=medium" in cmd
+
+    def test_get_worker_command_sonnet_effort_override(self, registry, mock_tmux, tmp_path, db_conn):
+        """Sonnet worker command uses configured effort_level."""
+        ledger_path = str(tmp_path / "ledger.json")
+        t = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            effort_level="medium",
+        )
+        cmd = t._get_worker_command("claude-sonnet")
+        assert "CLAUDE_CODE_EFFORT_LEVEL=medium" in cmd
+
+    def test_grader_spawn_includes_effort_level(self, tools, mock_tmux):
+        """Grader spawn command includes CLAUDE_CODE_EFFORT_LEVEL."""
+        from unittest.mock import patch
+        mock_tmux.read_log_tail.return_value = ">"
+        with patch("ironclaude.main.ensure_brain_trusted"), \
+             patch.object(tools, "_deactivate_pm_via_sqlite", return_value=None):
+            result = tools._spawn_grader()
+        assert result is True
+        call_args = mock_tmux.spawn_session.call_args
+        cmd = call_args[0][1]
+        assert "CLAUDE_CODE_EFFORT_LEVEL=high" in cmd
+        assert "exec claude" in cmd
+
+    def test_grader_spawn_uses_effort_override(self, registry, mock_tmux, tmp_path, db_conn):
+        """Grader spawn uses configured effort_level override."""
+        from unittest.mock import patch
+        ledger_path = str(tmp_path / "ledger.json")
+        t = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            effort_level="medium",
+        )
+        mock_tmux.read_log_tail.return_value = ">"
+        with patch("ironclaude.main.ensure_brain_trusted"), \
+             patch.object(t, "_deactivate_pm_via_sqlite", return_value=None):
+            t._spawn_grader()
+        call_args = mock_tmux.spawn_session.call_args
+        cmd = call_args[0][1]
+        assert "CLAUDE_CODE_EFFORT_LEVEL=medium" in cmd
+
+
 class TestSpawnWorkerModelName:
     def test_ollama_requires_model_name(self, tools):
         """Ollama spawn without model_name returns error dict."""
@@ -441,7 +505,7 @@ class TestPersistentGrader:
         assert tools._grader_ready is True
         mock_tmux.spawn_session.assert_called_once_with(
             "ic-grader",
-            "claude --model 'claude-opus-4-5-20251101' --dangerously-skip-permissions",
+            "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'claude-opus-4-5-20251101' --dangerously-skip-permissions",
             cwd=tools._grader_home,
         )
 
@@ -1622,7 +1686,7 @@ class TestSearchOperatorMessages:
         assert len(result) == 1
 
     def test_search_operator_messages_start_date_in_query(self, mock_slack_with_search):
-        """start_date appears as after: in the Slack query."""
+        """start_date appears as after: (minus 1 day) in the Slack query."""
         now = time.time()
         mock_slack_with_search._user_client.search_messages.return_value = {
             "messages": {
@@ -1632,7 +1696,7 @@ class TestSearchOperatorMessages:
         }
         mock_slack_with_search.search_operator_messages(limit=20, hours_back=24, start_date="2026-03-01")
         call_kwargs = mock_slack_with_search._user_client.search_messages.call_args
-        assert "after:2026-03-01" in call_kwargs.kwargs["query"]
+        assert "after:2026-02-28" in call_kwargs.kwargs["query"]
 
     def test_search_operator_messages_end_date_filters_upper_bound(self, mock_slack_with_search):
         """Messages beyond end_date are excluded from results."""
@@ -1657,7 +1721,7 @@ class TestSearchOperatorMessages:
         assert result[0]["text"] == "within"
 
     def test_search_operator_messages_both_dates_in_query(self, mock_slack_with_search):
-        """Query contains both after: and before: when both date params are provided."""
+        """Query contains after: (minus 1 day) and before: (plus 1 day) when both date params provided."""
         mock_slack_with_search._user_client.search_messages.return_value = {
             "messages": {"paging": {"pages": 1}, "matches": []}
         }
@@ -1666,8 +1730,8 @@ class TestSearchOperatorMessages:
         )
         call_kwargs = mock_slack_with_search._user_client.search_messages.call_args
         query = call_kwargs.kwargs["query"]
-        assert "after:2026-03-01" in query
-        assert "before:2026-03-15" in query
+        assert "after:2026-02-28" in query
+        assert "before:2026-03-16" in query
 
     def test_search_operator_messages_only_operator_false_omits_from_filter(self, mock_slack_with_search):
         """When only_operator=False, query omits the from: filter."""
@@ -2994,6 +3058,41 @@ class TestGetOperatorMessages:
         result = tools.get_operator_messages()
         assert result == [{"text": "plain message", "ts": "1.0", "user": "U123"}]
         mock_slack.download_file.assert_not_called()
+
+
+class TestGetMessagesByTsRange:
+    def test_get_messages_by_ts_range_returns_empty_when_slack_none(self, tools):
+        result = tools.get_messages_by_ts_range("1776657033.774459", "1776657985.900139")
+        assert result == []
+
+    def test_get_messages_by_ts_range_downloads_images(self, tools):
+        mock_slack = MagicMock()
+        tools._slack = mock_slack
+        mock_slack.get_messages_by_ts_range.return_value = [
+            {
+                "text": "card image",
+                "ts": "1776657033.774459",
+                "user": "U123",
+                "files": [
+                    {
+                        "id": "FCARD1",
+                        "name": "card.png",
+                        "mimetype": "image/png",
+                        "url_private_download": "https://files.slack.com/FCARD1/card.png",
+                    }
+                ],
+            }
+        ]
+        mock_slack.download_file.return_value = None
+        result = tools.get_messages_by_ts_range("1776657033.774459", "1776657985.900139")
+        assert len(result) == 1
+        f = result[0]["files"][0]
+        assert "local_path" in f
+        assert f["local_path"] == "/tmp/ironclaude-slack-files/FCARD1_card.png"
+        mock_slack.download_file.assert_called_once_with(
+            "https://files.slack.com/FCARD1/card.png",
+            "/tmp/ironclaude-slack-files/FCARD1_card.png",
+        )
 
 
 class TestGetWorkerCommand:

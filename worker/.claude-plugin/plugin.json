@@ -1,6 +1,6 @@
 {
   "name": "ironclaude",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Ironclad workflow discipline for Claude Code — professional mode, systematic planning, and multi-session orchestration",
   "agents": [
     "./agents/search-conversations.md"
