@@ -275,6 +275,7 @@ export const PlanJsonSchema = z.object({
   goal: z.string().min(1),
   design_file: z.string().min(1),
   tasks: z.array(PlanTaskSchema).min(1),
+  estimated_memory_gb: z.number().positive().optional(),
 });
 
 /**

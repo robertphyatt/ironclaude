@@ -26,6 +26,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import psutil
 import requests
 import shlex
 
@@ -38,6 +39,30 @@ logger = logging.getLogger("ironclaude.orchestrator_mcp")
 _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
 
 PID_FILE = Path("/tmp/ic-daemon.pid")
+
+_ALLOWED_NAMED_KEYS = frozenset({
+    "Up", "Down", "Left", "Right", "Tab", "BTab",
+    "Space", "Enter", "Escape",
+})
+
+
+def _validate_keys(keys: list[str]) -> None:
+    """Validate each key is a known named key or printable ASCII text.
+
+    Named keys must exactly match _ALLOWED_NAMED_KEYS (case-sensitive).
+    Plain text is allowed if every character is in the printable ASCII range
+    (0x20–0x7E). Control characters (null bytes, raw escape bytes, etc.) are
+    rejected regardless of whether they resemble a named key.
+    """
+    for key in keys:
+        if key in _ALLOWED_NAMED_KEYS:
+            continue
+        if key and all(0x20 <= ord(c) <= 0x7E for c in key):
+            continue
+        raise ValueError(
+            f"Invalid key: {key!r}. Must be a named key "
+            f"{sorted(_ALLOWED_NAMED_KEYS)} or non-empty printable ASCII text."
+        )
 
 
 def log_worker_event(event_type: str, **fields) -> None:
@@ -297,7 +322,7 @@ class OrchestratorTools:
     All methods are synchronous and raise exceptions on error.
     """
 
-    def __init__(self, registry, tmux, ledger_path: str, grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "claude-opus-4-5-20251101", opus_model: str = "claude-opus-4-5-20251101", effort_level: str = "high"):
+    def __init__(self, registry, tmux, ledger_path: str, grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "claude-opus-4-6", opus_model: str = "claude-opus-4-6", effort_level: str = "high"):
         self.registry = registry
         self.tmux = tmux
         self.ledger_path = ledger_path
@@ -1415,6 +1440,34 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
 
         return f"Message sent to '{worker_id}'"
 
+    def send_keys_to_worker(self, worker_id: str, keys: list[str]) -> str:
+        """Send raw tmux key sequences to a worker session.
+
+        Use for TUI navigation: Down/Up arrows, Space to toggle, Tab, Enter, Escape.
+        Plain text strings are also allowed and are typed literally.
+        No grader evaluation — key sequences are not natural language.
+        """
+        worker = self.registry.get_worker(worker_id)
+        if not worker:
+            raise ValueError(f"Worker '{worker_id}' not found")
+
+        session_name = f"ic-{worker_id}"
+        if not self.tmux.has_session(session_name):
+            self.registry.update_worker_status(worker_id, "failed")
+            raise RuntimeError(f"Worker '{worker_id}' tmux session is dead")
+
+        _validate_keys(keys)
+
+        self.tmux.send_raw_keys(session_name, keys)
+        self.registry.log_event(
+            "keys_sent",
+            worker_id=worker_id,
+            details={"keys": keys},
+        )
+        self._write_brain_contact(worker_id)
+
+        return f"Keys sent to '{worker_id}': {keys}"
+
     def update_ledger(self, objective: str, tasks: list[dict]) -> str:
         """Update the task ledger with current objective and tasks."""
         ledger = {"objective": objective, "tasks": tasks}
@@ -1826,6 +1879,14 @@ Has the worker genuinely completed its objective based on the evidence?"""
             logger.error(f"Supabase query failed for table '{table}': {e}")
             return {"error": str(e)}
 
+    def get_system_memory(self) -> dict:
+        """Return current system memory stats in GB."""
+        mem = psutil.virtual_memory()
+        return {
+            "total_gb": round(mem.total / (1024**3), 1),
+            "available_gb": round(mem.available / (1024**3), 1),
+        }
+
 
 def _create_mcp_server(tools: OrchestratorTools):
     """Create and configure the FastMCP server wrapping OrchestratorTools."""
@@ -1874,6 +1935,11 @@ def _create_mcp_server(tools: OrchestratorTools):
     def send_to_worker(worker_id: str, message: str) -> str | dict:
         """Send a message to a running worker."""
         return tools.send_to_worker(worker_id, message)
+
+    @mcp.tool()
+    def send_keys_to_worker(worker_id: str, keys: list[str]) -> str:
+        """Send raw tmux key sequences to a worker (navigation, space, enter, etc.)."""
+        return tools.send_keys_to_worker(worker_id, keys)
 
     @mcp.tool()
     def update_ledger(objective: str, tasks: list[dict]) -> str:
@@ -2087,6 +2153,16 @@ def _create_mcp_server(tools: OrchestratorTools):
             indent=2,
         )
 
+    @mcp.tool()
+    def get_system_memory() -> str:
+        """Get current system memory information.
+
+        Returns total and available memory in GB. Use this to check whether
+        the system has enough memory before starting memory-intensive operations
+        like LLM inference.
+        """
+        return json.dumps(tools.get_system_memory())
+
     return mcp
 
 
@@ -2123,8 +2199,8 @@ def main():
         slack_bot=slack_bot, db_conn=conn, operator_name=operator_name,
         supabase_url=supabase_url, supabase_anon_key=supabase_anon_key,
         advisor_cfg=cfg.get("advisor", {}),
-        grader_model=cfg.get("grader_model", "claude-opus-4-5-20251101"),
-        opus_model=cfg.get("default_opus_model", "claude-opus-4-5-20251101"),
+        grader_model=cfg.get("grader_model", "claude-opus-4-6"),
+        opus_model=cfg.get("default_opus_model", "claude-opus-4-6"),
         effort_level=cfg.get("effort_level", "high"),
     )
 

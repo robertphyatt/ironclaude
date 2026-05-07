@@ -1,0 +1,37 @@
+{
+  "name": "Makefile Dependency Freshness Check",
+  "goal": "Auto-install missing Python packages before daemon startup so make run never crashes with ModuleNotFoundError after dependency changes",
+  "design_file": "docs/plans/2026-05-06-makefile-dep-check-design.md",
+  "estimated_memory_gb": 0.5,
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Add pip install to Makefile run target",
+      "description": "Prepend $(PIP) install -qe . to the run target recipe so missing packages are auto-installed before the daemon starts",
+      "allowed_files": ["commander/Makefile"],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Edit commander/Makefile line 16 to prepend $(PIP) install -qe . && to the run recipe",
+          "command": null,
+          "expected": "Line 16 starts with @$(PIP) install -qe . && set -a"
+        },
+        {
+          "description": "Verify the change with head -20 commander/Makefile",
+          "command": "head -20 commander/Makefile",
+          "expected": "Line 16 shows @$(PIP) install -qe . && set -a && . ./.env"
+        },
+        {
+          "description": "Verify pip install is a no-op when deps are satisfied",
+          "command": "cd commander && .venv/bin/pip install -qe . 2>&1; echo \"exit: $?\"",
+          "expected": "No output, exit code 0, completes in <2 seconds"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/Makefile",
+          "expected": "Changes staged"
+        }
+      ]
+    }
+  ]
+}

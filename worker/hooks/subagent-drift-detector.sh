@@ -23,8 +23,13 @@ if [ -n "$CHILD_SESSION" ]; then
   WORKFLOW=$(sqlite3 -cmd ".timeout 10000" "$DB_PATH" \
     "SELECT workflow_stage FROM sessions WHERE terminal_session='${SAFE_SESSION}';" 2>/dev/null || true)
   if [ "$WORKFLOW" = "executing" ]; then
-    db_write_or_fail "SUBAGENT-DRIFT-DETECTOR" \
-      "UPDATE sessions SET review_pending=1, updated_at=datetime('now') WHERE terminal_session='${SAFE_SESSION}';"
+    CHANGES=$(git status --porcelain 2>/dev/null || true)
+    if [ -n "$CHANGES" ]; then
+      db_write_or_fail "SUBAGENT-DRIFT-DETECTOR" \
+        "UPDATE sessions SET review_pending=1, updated_at=datetime('now') WHERE terminal_session='${SAFE_SESSION}';"
+    else
+      log_hook "SUBAGENT-DRIFT-DETECTOR" "Skipped" "review_pending not set — no code changes (read-only subagent)"
+    fi
   else
     log_hook "SUBAGENT-DRIFT-DETECTOR" "Skipped" "review_pending not set — workflow_stage=${WORKFLOW:-unknown} (not executing)"
   fi

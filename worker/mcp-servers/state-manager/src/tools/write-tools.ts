@@ -917,6 +917,7 @@ export function handleWriteTool(
            WHERE terminal_session = ? AND wave_number = ? AND status = 'submitted'`,
         ).run(resolvedId, session.current_wave);
         advancedCount = result.changes;
+        updateSession(db, resolvedId, { review_pending: 0 });
       }
 
       insertAuditLog(db, {

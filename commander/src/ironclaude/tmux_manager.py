@@ -111,6 +111,17 @@ class TmuxManager:
         )
         return True
 
+    def send_raw_keys(self, name: str, keys: list[str]) -> bool:
+        """Send raw key sequences to a tmux session. No auto-Enter appended."""
+        result = subprocess.run(
+            ["tmux", "send-keys", "-t", name] + keys,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            logger.error(f"Failed to send raw keys to {name}: {result.stderr.decode()}")
+            return False
+        return True
+
     def get_log_path(self, name: str) -> str:
         """Get the log file path for a session."""
         return os.path.join(self.log_dir, f"{name}.log")

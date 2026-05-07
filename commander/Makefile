@@ -13,4 +13,4 @@ test:
 	$(PYTHON) -m pytest tests/ -v
 
 run:
-	@set -a && . ./.env && set +a && $(PYTHON) -u -m ironclaude.main 2>&1 | tee -a /tmp/ironclaude-daemon.log
+	@$(PIP) install -qe . && set -a && . ./.env && set +a && $(PYTHON) -u -m ironclaude.main 2>&1 | tee -a /tmp/ironclaude-daemon.log

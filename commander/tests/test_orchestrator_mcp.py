@@ -505,7 +505,7 @@ class TestPersistentGrader:
         assert tools._grader_ready is True
         mock_tmux.spawn_session.assert_called_once_with(
             "ic-grader",
-            "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'claude-opus-4-5-20251101' --dangerously-skip-permissions",
+            "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'claude-opus-4-6' --dangerously-skip-permissions",
             cwd=tools._grader_home,
         )
 
@@ -1066,6 +1066,63 @@ class TestSendToWorkerGrader:
         assert "deactivate professional mode" in system_prompt.lower()
         assert "disable professional mode" in system_prompt.lower()
         assert "/deactivate-professional-mode" in system_prompt.lower()
+
+
+class TestSendKeysToWorker:
+    """Tests for send_keys_to_worker MCP tool."""
+
+    def test_happy_path(self, tools, registry, mock_tmux):
+        """Sends valid key sequence to existing worker with live session."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        result = tools.send_keys_to_worker("w1", ["Down", "Space", "Enter"])
+        assert isinstance(result, str)
+        assert "w1" in result
+        mock_tmux.send_raw_keys.assert_called_once_with("ic-w1", ["Down", "Space", "Enter"])
+
+    def test_invalid_worker(self, tools, registry):
+        """Raises ValueError when worker_id is not registered."""
+        with pytest.raises(ValueError, match="not found"):
+            tools.send_keys_to_worker("nonexistent", ["Enter"])
+
+    def test_dead_session(self, tools, registry, mock_tmux):
+        """Raises RuntimeError when tmux session is dead."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        mock_tmux.has_session.return_value = False
+        with pytest.raises(RuntimeError, match="tmux session is dead"):
+            tools.send_keys_to_worker("w1", ["Enter"])
+
+    def test_rejects_nonprintable(self, tools, registry, mock_tmux):
+        """Raises ValueError when key contains non-printable characters."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        with pytest.raises(ValueError, match="Invalid key"):
+            tools.send_keys_to_worker("w1", ["hel\x00lo"])
+
+    def test_rejects_control_chars(self, tools, registry, mock_tmux):
+        """Raises ValueError when key is a raw control character."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        with pytest.raises(ValueError, match="Invalid key"):
+            tools.send_keys_to_worker("w1", ["\x1b"])  # raw escape byte, not named "Escape"
+
+    def test_allows_shell_metacharacters_as_text(self, tools, registry, mock_tmux):
+        """Shell metacharacters in plain text are typed literally — no shell, no injection risk."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        result = tools.send_keys_to_worker("w1", ["$(evil)"])
+        assert isinstance(result, str)
+        mock_tmux.send_raw_keys.assert_called_once_with("ic-w1", ["$(evil)"])
+
+    def test_allows_plain_text_mix(self, tools, registry, mock_tmux):
+        """Plain text strings alongside named keys are allowed."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        result = tools.send_keys_to_worker("w1", ["hello", "Enter"])
+        assert isinstance(result, str)
+        mock_tmux.send_raw_keys.assert_called_once_with("ic-w1", ["hello", "Enter"])
+
+    def test_no_grader_called(self, tools, registry, mock_tmux):
+        """send_keys_to_worker does not invoke the grader."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        tools._call_grader = MagicMock()
+        tools.send_keys_to_worker("w1", ["Down", "Enter"])
+        tools._call_grader.assert_not_called()
 
 
 class TestSpawnGraderPmDeactivation:

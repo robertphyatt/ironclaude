@@ -92,6 +92,24 @@ case "$TOOL_NAME" in
     exit 0
     ;;
   Skill)
+    skill_name=$(echo "$INPUT" | jq -r '.tool_input.skill // empty' 2>/dev/null || true)
+    if [ "$skill_name" = "ironclaude:executing-plans" ]; then
+      estimated_mem=$(db_read "professional-mode-guard" \
+        "SELECT json_extract(plan_json, '\$.estimated_memory_gb') FROM sessions WHERE terminal_session='${SAFE_SESSION}';")
+      if [ -z "$estimated_mem" ] || [ "$estimated_mem" = "null" ]; then
+        block_pretooluse "professional-mode-guard" "BLOCKED — MISSING MEMORY ESTIMATE
+
+Plan is missing estimated_memory_gb. You must add a memory estimate before executing.
+
+Call create_plan again with estimated_memory_gb in the plan JSON. Examples:
+  0.5  — standard code changes (editing, linting, formatting)
+  4.0  — running tests that use LLM inference indirectly
+  8.0  — loading a medium Ollama model for direct inference
+  14.0 — loading a large Ollama model (e.g. qwen3:32b)
+
+Do NOT invoke executing-plans without estimated_memory_gb in the plan."
+      fi
+    fi
     log_hook "professional-mode-guard" "Allowed" "skill tool"
     exit 0
     ;;

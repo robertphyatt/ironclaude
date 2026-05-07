@@ -203,6 +203,32 @@ Worker executes the plan task-by-task with review gates.
 - **Step failures** ("Task N Step X failed. Debug/Skip/Abort?") — Usually choose "Debug and fix". Choose "Abort" only if the approach is fundamentally wrong.
 - **Code review findings** ("Important issues found. Fix/TODO/Proceed?") — Usually choose "Fix issues now" for important issues. Critical issues are always fix-first.
 
+### 5a. Memory Pressure Check (Before Execution)
+
+When a worker transitions to executing plans and its plan includes `estimated_memory_gb`, you MUST check system memory before allowing execution to proceed.
+
+**Protocol:**
+
+1. Call `get_system_memory()` MCP tool to get `{total_gb, available_gb}`
+2. Compare the worker's `estimated_memory_gb` against available memory with a 2 GB safety margin
+3. Decide:
+
+| Condition | Decision | Action |
+|---|---|---|
+| `available_gb - estimated_memory_gb >= 2.0` | **Continue** | Tell worker to proceed with execution |
+| `available_gb - estimated_memory_gb < 2.0` AND `estimated_memory_gb <= total_gb - 2.0` | **Pause** | Tell worker to wait. Re-check memory on next attention sweep. |
+| `estimated_memory_gb > total_gb - 2.0` | **Reject** | Tell worker this plan cannot run on this machine. Worker must revise the plan to reduce memory usage or abort. |
+
+**Context for memory estimates:**
+- Standard code changes (edit, lint, format): ~0.5 GB
+- Test suites with indirect LLM inference (e.g., pytest calling llama.cpp): ~4-8 GB
+- Direct Ollama inference (model loaded in VRAM): ~4-14 GB depending on model size
+- Apple Silicon unified memory: GPU memory IS system memory — Ollama model footprint directly competes with all processes
+
+**When multiple workers are running:** Sum the `estimated_memory_gb` of all currently-executing workers. A new worker's estimate must fit within `available_gb - 2.0` alongside existing workers. Do not approve a second inference-heavy worker if the first is still running.
+
+**Re-evaluation cadence for paused workers:** Check `get_system_memory()` on every attention sweep. If available memory has increased (e.g., another worker finished), transition the paused worker to continue.
+
 ### 6. Execution Complete — Ship Workflow
 
 Worker has finished all tasks, staged changes, and suggests a commit message.
