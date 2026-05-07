@@ -131,4 +131,5 @@ export interface PlanJson {
   goal: string;
   design_file: string;
   tasks: PlanTask[];
+  estimated_memory_gb?: number;
 }

@@ -143,7 +143,7 @@ ollama serve
 
 ### Model Configuration
 
-IronClaude defaults to Claude Opus 4.5 (`claude-opus-4-5-20251101`) for the brain and grader. Community feedback on Reddit and personal experience suggest Opus 4.5 handles agentic workflows more reliably than later releases. You can override this via environment variables:
+IronClaude defaults to Claude Opus 4.6 (`claude-opus-4-6`) for the brain and grader. You can override this via environment variables:
 
 ```bash
 # Override all opus-class usage (brain, grader, workers) with a single var
@@ -154,7 +154,7 @@ export BRAIN_MODEL="claude-opus-4-6-20250115"
 export GRADER_MODEL="claude-sonnet-4-5-20241022"
 ```
 
-When workers use Sonnet, they automatically get an Opus 4.5 advisor for oversight. You do you — set these to whatever works best for your workflow.
+When workers use Sonnet, they automatically get an Opus 4.6 advisor for oversight. You do you — set these to whatever works best for your workflow.
 
 ### Worker Skills
 

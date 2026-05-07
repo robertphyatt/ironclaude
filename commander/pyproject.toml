@@ -1,7 +1,7 @@
 # pyproject.toml
 [project]
 name = "ironclaude-commander"
-version = "1.0.5"
+version = "1.0.6"
 description = "AI orchestrator that manages Claude Code workers via Slack"
 requires-python = ">=3.11"
 dependencies = [
@@ -12,6 +12,7 @@ dependencies = [
     "duckduckgo_search>=7.0.0",
     "markdownify>=0.14.1",
     "requests>=2.31.0",
+    "psutil>=5.9.0",
 ]
 
 [project.optional-dependencies]

@@ -102,7 +102,7 @@ class BrainClient:
             )
         return matches[-1]  # sorted() puts latest version last
 
-    def __init__(self, timeout_seconds: int = 600, operator_name: str = "Operator", model: str = "claude-opus-4-5-20251101", effort_level: str = "high"):
+    def __init__(self, timeout_seconds: int = 600, operator_name: str = "Operator", model: str = "claude-opus-4-6", effort_level: str = "high"):
         self.timeout_seconds = timeout_seconds
         self._operator_name = operator_name
         self._model = model

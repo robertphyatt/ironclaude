@@ -88,10 +88,10 @@ class TestBrainToolRestrictions:
 
 
 class TestBrainModelParameter:
-    def test_default_model_is_opus_4_5(self):
-        """BrainClient defaults to claude-opus-4-5-20251101."""
+    def test_default_model_is_opus_4_6(self):
+        """BrainClient defaults to claude-opus-4-6."""
         client = BrainClient()
-        assert client._model == "claude-opus-4-5-20251101"
+        assert client._model == "claude-opus-4-6"
 
     def test_model_parameter_accepted(self):
         """BrainClient accepts custom model parameter."""

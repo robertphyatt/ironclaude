@@ -65,6 +65,25 @@ class TestTmuxManager:
         assert isinstance(enter_call.args[0], list), "Enter keypress must use list form, not shell string"
         assert enter_call.kwargs.get("shell", False) is False
 
+    @patch("ironclaude.tmux_manager.subprocess.run")
+    def test_send_raw_keys_single_call(self, mock_run):
+        """send_raw_keys sends all keys in a single subprocess call."""
+        mock_run.return_value = MagicMock(returncode=0)
+        mgr = TmuxManager(log_dir="/tmp/ic-logs")
+        mgr.send_raw_keys("worker-1", ["Down", "Space", "Enter"])
+        assert mock_run.call_count == 1
+        call_args = mock_run.call_args[0][0]
+        assert call_args == ["tmux", "send-keys", "-t", "worker-1", "Down", "Space", "Enter"]
+
+    @patch("ironclaude.tmux_manager.subprocess.run")
+    def test_send_raw_keys_list_form_not_shell(self, mock_run):
+        """send_raw_keys must use list form, not shell=True, to prevent injection."""
+        mock_run.return_value = MagicMock(returncode=0)
+        mgr = TmuxManager(log_dir="/tmp/ic-logs")
+        mgr.send_raw_keys("worker-1", ["Down"])
+        assert isinstance(mock_run.call_args[0][0], list), "Must use list form, not shell string"
+        assert mock_run.call_args.kwargs.get("shell", False) is False
+
 
 class TestSpawnSessionPathTraversal:
     @patch("ironclaude.tmux_manager.subprocess.run")
