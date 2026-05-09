@@ -1,0 +1,25 @@
+# Remote machine definitions for IronClaude worker spawning.
+# Copy to config/machines.yaml and customize for your environment.
+# Each machine must have Claude Code + ironclaude plugin pre-installed.
+
+machines:
+  - name: my-server
+    host: my-server            # SSH config alias or user@hostname
+    purpose: "General purpose development server"
+    claude_path: ~/.claude/local/claude
+    log_dir: /tmp/ic-logs      # remote log/marker directory (default: /tmp/ic-logs)
+    repos:
+      - /home/user/Code/my-project
+    max_workers: 4             # optional: max concurrent workers (default: no limit)
+    env:                       # optional: env vars for remote claude sessions
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+
+  # - name: gpu-box
+  #   host: user@gpu.internal
+  #   purpose: "ML training and inference"
+  #   claude_path: /usr/local/bin/claude
+  #   repos:
+  #     - /opt/ml/training-repo
+  #   env:
+  #     ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+  #     CUDA_VISIBLE_DEVICES: "0,1"

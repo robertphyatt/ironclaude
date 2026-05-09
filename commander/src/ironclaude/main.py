@@ -19,7 +19,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ironclaude.config import load_config, DEFAULTS, make_opus_command
+from ironclaude.config import load_config, load_machines_config, DEFAULTS, make_opus_command
 from ironclaude.slack_interface import SlackBot, DIRECTIVE_STATUS_EMOJI
 from ironclaude.slack_commands import SlackSocketHandler, format_help_text
 from ironclaude.db import init_db
@@ -65,6 +65,11 @@ CHECKIN_CADENCE = {
     "execution_complete": 120,
 }
 DEFAULT_CADENCE = 300
+
+OSCILLATION_WINDOW = 900.0
+OSCILLATION_THRESHOLD = 3
+OSCILLATING_STAGES = frozenset({"executing", "reviewing"})
+OSCILLATION_CADENCE = 900
 
 PROMPT_PATTERNS = [
     "AskUserQuestion",
@@ -453,7 +458,7 @@ def ensure_brain_trusted(brain_cwd: str) -> None:
 class IroncladeDaemon:
     def __init__(self, config: dict, slack: SlackBot, socket_handler: SlackSocketHandler | None,
                  registry: WorkerRegistry, tmux_manager: TmuxManager, brain: BrainClient,
-                 db_conn=None, plugin_registry=None):
+                 db_conn=None, plugin_registry=None, ssh_manager=None):
         self.config = config
         self.slack = slack
         self.socket_handler = socket_handler
@@ -470,9 +475,12 @@ class IroncladeDaemon:
         self._db = db_conn
         self._last_checkin_sent: dict[str, float] = {}
         self._last_checkin_stage: dict[str, str | None] = {}
+        self._last_stage_seen: dict[str, str | None] = {}
+        self._stage_history: dict[str, list[tuple[float, str]]] = {}
         self._claude_dir: Path | None = None
         self._last_maintenance = 0.0
         self._state_manager_db_path = os.path.expanduser("~/.claude/ironclaude.db")
+        self._ssh_manager = ssh_manager
 
     def shutdown(self):
         self._running = False
@@ -529,7 +537,8 @@ class IroncladeDaemon:
             # Check for reaction events
             if item.get("type") == "reaction":
                 logger.info("routing reaction: emoji=%r ts=%r", item["emoji"], item["message_ts"])
-                self._handle_directive_reaction(item["emoji"], item["message_ts"])
+                if not self._handle_directive_reaction(item["emoji"], item["message_ts"]):
+                    self._handle_push_reaction(item["emoji"], item["message_ts"])
                 continue
             # Check for plugin event types
             if "parsed" not in item and item.get("type"):
@@ -744,6 +753,86 @@ class IroncladeDaemon:
         new_status = "confirmed" if emoji in ("thumbsup", "+1", "thumbs_up") else "rejected"
         logger.info("Directive #%d %s via reaction %r", directive_id, new_status, emoji)
         return True
+
+    def _handle_push_reaction(self, emoji: str, message_ts: str) -> bool:
+        """Handle ✅/❌ reaction on a push request confirmation message.
+
+        Returns True if the reaction matched a push request (handled), False otherwise.
+        """
+        if self._db is None:
+            return False
+        if emoji not in ("white_check_mark", "x"):
+            return False
+
+        row = self._db.execute(
+            "SELECT id, repo, remote, branch FROM push_requests"
+            " WHERE message_ts=? AND status='pending' LIMIT 1",
+            (message_ts,),
+        ).fetchone()
+        if row is None:
+            return False
+
+        push_id, repo, remote, branch = row[0], row[1], row[2], row[3]
+
+        expired = self._db.execute(
+            "SELECT COUNT(*) FROM push_requests WHERE id=? AND expires_at < datetime('now')",
+            (push_id,),
+        ).fetchone()[0]
+        if expired:
+            self._db.execute(
+                "UPDATE push_requests SET status='expired' WHERE id=?", (push_id,)
+            )
+            self._db.commit()
+            self.slack.post_message(f"Push request `{push_id[:8]}` expired before confirmation.")
+            logger.info("Push %s expired — no push executed", push_id[:8])
+            return True
+
+        if emoji == "x":
+            self._db.execute(
+                "UPDATE push_requests SET status='rejected' WHERE id=?", (push_id,)
+            )
+            self._db.commit()
+            self.slack.post_message(f"Push request `{push_id[:8]}` rejected.")
+            self.brain.send_message(f"Push {push_id[:8]} was rejected by the operator.")
+            logger.info("Push %s rejected", push_id[:8])
+            return True
+
+        result = subprocess.run(
+            ["git", "push", remote, branch],
+            cwd=repo, capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            self._db.execute(
+                "UPDATE push_requests SET status='completed' WHERE id=?", (push_id,)
+            )
+            self._db.commit()
+            self.slack.post_message(
+                f"Push request `{push_id[:8]}` completed: `{remote}/{branch}` pushed successfully."
+            )
+            self.brain.send_message(
+                f"Push {push_id[:8]} completed: {remote}/{branch} pushed successfully."
+            )
+            logger.info("Push %s completed: %s/%s", push_id[:8], remote, branch)
+        else:
+            self._db.execute(
+                "UPDATE push_requests SET status='failed' WHERE id=?", (push_id,)
+            )
+            self._db.commit()
+            err = result.stderr.strip()
+            self.slack.post_message(f"Push request `{push_id[:8]}` failed: {err}")
+            self.brain.send_message(f"Push {push_id[:8]} failed: {err}")
+            logger.warning("Push %s failed: %s", push_id[:8], err)
+        return True
+
+    def _sweep_expired_push_requests(self):
+        """Mark pending push requests past their TTL as expired."""
+        if self._db is None:
+            return
+        self._db.execute(
+            "UPDATE push_requests SET status='expired'"
+            " WHERE status='pending' AND expires_at < datetime('now')"
+        )
+        self._db.commit()
 
     def poll_brain_responses(self):
         """Drain brain responses and post to Slack."""
@@ -1014,14 +1103,32 @@ class IroncladeDaemon:
         pane_pid = self.tmux.list_pane_pid(session_name)
         log_worker_event("WORKER_SPAWNED", worker_id=worker_id, worker_type=worker_type, repo=repo, pane_pid=pane_pid)
 
+    def _resolve_worker_ssh(self, worker: dict) -> tuple[str | None, str | None]:
+        """Resolve SSH host and remote log dir for a worker.
+
+        Returns (ssh_host, remote_log_dir) — both None for local workers.
+        """
+        machine_name = worker.get("machine")
+        if not machine_name or not self._ssh_manager:
+            return None, None
+        machine_cfg = self._ssh_manager.get_machine(machine_name)
+        if not machine_cfg:
+            return None, None
+        return machine_cfg.host, machine_cfg.log_dir
+
     def _get_worker_workflow_stage(
-        self, session_name: str, _claude_dir: Path | None = None
+        self, session_name: str, _claude_dir: Path | None = None,
+        ssh_host: str | None = None,
     ) -> str | None:
         """Read worker's workflow stage from ironclaude.db.
 
         Follows the pane_pid → session_id file → DB query pattern.
         Returns the workflow_stage string, or None if any step fails.
+        For remote workers, uses tmux SSH helpers instead of local file access.
         """
+        if ssh_host:
+            return self._get_worker_workflow_stage_remote(session_name, ssh_host)
+
         claude_dir = _claude_dir if _claude_dir is not None else Path("~/.claude").expanduser()
 
         # Step 1: Get pane PID
@@ -1052,6 +1159,26 @@ class IroncladeDaemon:
         except sqlite3.Error:
             return None
 
+    def _get_worker_workflow_stage_remote(
+        self, session_name: str, ssh_host: str,
+    ) -> str | None:
+        """Read remote worker's workflow stage via SSH."""
+        pane_pid = self.tmux.list_pane_pid(session_name, ssh_host=ssh_host)
+        if not pane_pid:
+            return None
+        session_id_file = f"~/.claude/ironclaude-session-{pane_pid}.id"
+        content = self.tmux.read_file(session_id_file, ssh_host=ssh_host)
+        if not content or len(content.strip()) != 36:
+            return None
+        session_id = content.strip()
+        db_path = "~/.claude/ironclaude.db"
+        result = self.tmux.run_sqlite_query(
+            db_path,
+            f"SELECT workflow_stage FROM sessions WHERE terminal_session='{session_id}';",
+            ssh_host=ssh_host,
+        )
+        return result if result else None
+
     def _detect_prompt_waiting(self, log_tail: str) -> bool:
         """Heuristic: scan log tail for patterns indicating worker awaits input."""
         for pattern in PROMPT_PATTERNS:
@@ -1062,33 +1189,54 @@ class IroncladeDaemon:
                 return True
         return False
 
+    def _is_oscillating(self, worker_id: str) -> bool:
+        """Return True if worker is oscillating between executing/reviewing."""
+        now = time.time()
+        cutoff = now - OSCILLATION_WINDOW
+        history = self._stage_history.get(worker_id, [])
+        pruned = [(ts, s) for ts, s in history if ts >= cutoff]
+        self._stage_history[worker_id] = pruned
+        if len(pruned) < OSCILLATION_THRESHOLD:
+            return False
+        return all(s in OSCILLATING_STAGES for _, s in pruned)
+
     def check_workers(self):
         """Check running workers for completion signals."""
         for worker in self.registry.get_running_workers():
             worker_id = worker["id"]
             session_name = worker["tmux_session"]
+            ssh_host, remote_log_dir = self._resolve_worker_ssh(worker)
 
             # Primary: check for .done marker from stop hook
-            marker_path = os.path.join(self.tmux.log_dir, f"{session_name}.done")
-            if os.path.exists(marker_path):
-                # Do NOT kill session or update registry — brain controls lifecycle
+            if ssh_host:
+                log_dir = remote_log_dir or self.tmux.log_dir
+                marker_path = os.path.join(log_dir, f"{session_name}.done")
+                marker_exists = self.tmux.file_exists(marker_path, ssh_host=ssh_host)
+            else:
+                marker_path = os.path.join(self.tmux.log_dir, f"{session_name}.done")
+                marker_exists = os.path.exists(marker_path)
+
+            if marker_exists:
                 log_worker_event("WORKER_IDLE", worker_id=worker_id)
                 self.slack.post_message(format_worker_idle(worker_id))
                 delivered = self.brain.send_message(
                     f"Worker {worker_id} idle."
                 )
                 if delivered:
-                    try:
-                        os.remove(marker_path)
-                    except FileNotFoundError:
-                        pass  # Already cleaned up
+                    if ssh_host:
+                        self.tmux.remove_file(marker_path, ssh_host=ssh_host)
+                    else:
+                        try:
+                            os.remove(marker_path)
+                        except FileNotFoundError:
+                            pass
                     logger.info(f"Idle notification delivered for {worker_id}, marker removed")
                 else:
                     logger.warning(f"Brain unreachable, keeping marker for {worker_id} (will retry)")
                 continue
 
             # Fallback: session died (crash, OOM, etc.)
-            if not self.tmux.has_session(session_name):
+            if not self.tmux.has_session(session_name, ssh_host=ssh_host):
                 self.registry.update_worker_status(worker_id, "completed")
                 self.registry.log_event("worker_finished", worker_id=worker_id)
                 log_worker_event("WORKER_DEAD", worker_id=worker_id)
@@ -1100,7 +1248,7 @@ class IroncladeDaemon:
 
             # Proactive check-in: notify brain when cadence elapses
             claude_dir = self._claude_dir if self._claude_dir is not None else Path("~/.claude").expanduser()
-            stage = self._get_worker_workflow_stage(session_name, _claude_dir=claude_dir)
+            stage = self._get_worker_workflow_stage(session_name, _claude_dir=claude_dir, ssh_host=ssh_host)
 
             cadence = CHECKIN_CADENCE.get(stage, DEFAULT_CADENCE) if stage else DEFAULT_CADENCE
 
@@ -1119,6 +1267,15 @@ class IroncladeDaemon:
             last_stage_sent = self._last_checkin_stage.get(worker_id)
             stage_changed = (last_stage_sent is not None and stage != last_stage_sent)
 
+            # Track transitions independently of notification sends
+            last_seen = self._last_stage_seen.get(worker_id)
+            if stage != last_seen:
+                self._stage_history.setdefault(worker_id, []).append((time.time(), stage))
+                self._last_stage_seen[worker_id] = stage
+            if self._is_oscillating(worker_id):
+                stage_changed = False
+                cadence = OSCILLATION_CADENCE
+
             if not stage_changed:
                 if last_sent > 0:
                     brain_acknowledged = last_contact > last_sent
@@ -1133,7 +1290,7 @@ class IroncladeDaemon:
 
             # Cadence expired — send proactive notification
             try:
-                log_tail = self.tmux.capture_pane(session_name, lines=5)
+                log_tail = self.tmux.capture_pane(session_name, lines=5, ssh_host=ssh_host)
             except Exception:
                 log_tail = "(could not capture output)"
 
@@ -1223,6 +1380,7 @@ class IroncladeDaemon:
         while self._running:
             self.poll_slack_commands()
             self.poll_brain_responses()
+            self._sweep_expired_push_requests()
             if not self._paused:
                 self.check_brain()
                 self.process_brain_decisions()
@@ -1350,7 +1508,19 @@ def main():
         logger.warning("SLACK_APP_TOKEN not set — slash commands disabled")
 
     conn = init_db(config.get("db_path", "data/db/ic.db"))
-    tmux = TmuxManager(log_dir=config.get("log_dir", "/tmp/ic-logs"))
+
+    # SSH remote machines
+    from ironclaude.ssh_manager import SSHConnectionManager
+    ssh_manager = None
+    machines = load_machines_config()
+    if machines:
+        ssh_manager = SSHConnectionManager()
+        ssh_manager.register_machines(machines)
+        for name in ssh_manager.list_machine_names():
+            health = ssh_manager.health_check(name)
+            logger.info(f"Remote machine '{name}': {'healthy' if health.ok else health.details}")
+
+    tmux = TmuxManager(log_dir=config.get("log_dir", "/tmp/ic-logs"), ssh_manager=ssh_manager)
     registry = WorkerRegistry(conn)
     brain = BrainClient(
         timeout_seconds=config.get("brain_timeout_seconds", 600),
@@ -1374,6 +1544,7 @@ def main():
         config=config, slack=slack, socket_handler=socket_handler,
         registry=registry, tmux_manager=tmux, brain=brain,
         db_conn=conn, plugin_registry=plugin_registry,
+        ssh_manager=ssh_manager,
     )
     plugin_registry.run_lifecycle("init", daemon)
 
@@ -1395,6 +1566,8 @@ def main():
             pass
     brain.shutdown()
     conn.close()
+    if ssh_manager:
+        ssh_manager.teardown_all()
     if socket_handler:
         socket_handler.stop()
     slack.post_message("IronClaude Commander daemon stopped.")

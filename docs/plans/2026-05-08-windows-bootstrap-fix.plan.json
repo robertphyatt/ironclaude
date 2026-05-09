@@ -1,0 +1,85 @@
+{
+  "name": "Windows Bootstrap Fix",
+  "goal": "Fix bootstrap deadlock on Windows: cross-platform ensureSqlite3() in MCP wrappers + self-bootstrapping schema in session-init.sh",
+  "design_file": "docs/plans/2026-05-08-windows-bootstrap-fix-design.md",
+  "estimated_memory_gb": 0.5,
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Cross-platform ensureSqlite3() in state-manager wrapper",
+      "description": "Replace command -v sqlite3 with platform-conditional check (where.exe on Windows) and add Windows install hint",
+      "allowed_files": ["worker/mcp-servers/state-manager/cli/mcp-server-wrapper.js"],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Replace ensureSqlite3() function (lines 28-41) with cross-platform version using process.platform check",
+          "command": "edit worker/mcp-servers/state-manager/cli/mcp-server-wrapper.js",
+          "expected": "Function uses where.exe on win32, command -v elsewhere, includes Windows install hint"
+        },
+        {
+          "description": "Verify the change",
+          "command": "head -45 worker/mcp-servers/state-manager/cli/mcp-server-wrapper.js",
+          "expected": "Lines 28-42 show new ensureSqlite3() with process.platform === win32 check"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add worker/mcp-servers/state-manager/cli/mcp-server-wrapper.js",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Cross-platform ensureSqlite3() in episodic-memory wrapper",
+      "description": "Same cross-platform ensureSqlite3() fix as task 1, applied to episodic-memory wrapper",
+      "allowed_files": ["worker/mcp-servers/episodic-memory/cli/mcp-server-wrapper.js"],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Replace ensureSqlite3() function (lines 28-41) with cross-platform version using process.platform check",
+          "command": "edit worker/mcp-servers/episodic-memory/cli/mcp-server-wrapper.js",
+          "expected": "Function uses where.exe on win32, command -v elsewhere, includes Windows install hint"
+        },
+        {
+          "description": "Verify the change",
+          "command": "head -45 worker/mcp-servers/episodic-memory/cli/mcp-server-wrapper.js",
+          "expected": "Lines 28-42 show new ensureSqlite3() with process.platform === win32 check"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add worker/mcp-servers/episodic-memory/cli/mcp-server-wrapper.js",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Self-bootstrapping schema in session-init.sh",
+      "description": "Add full schema bootstrap (all 8 tables + indexes + WAL mode) before the session INSERT so hooks work even when MCP servers havent started. Also add cross-reference comment to db.ts.",
+      "allowed_files": ["worker/hooks/session-init.sh", "worker/mcp-servers/state-manager/src/db.ts"],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Insert schema bootstrap block between PROJECT_HASH line and session INSERT comment in session-init.sh",
+          "command": "edit worker/hooks/session-init.sh",
+          "expected": "Bootstrap block with PRAGMA journal_mode=wal + all 8 CREATE TABLE IF NOT EXISTS + indexes appears before session INSERT"
+        },
+        {
+          "description": "Add cross-reference comment to db.ts before the db.exec call at line 199",
+          "command": "edit worker/mcp-servers/state-manager/src/db.ts",
+          "expected": "Comment referencing session-init.sh appears before db.exec"
+        },
+        {
+          "description": "Verify session-init.sh changes",
+          "command": "head -130 worker/hooks/session-init.sh",
+          "expected": "Schema bootstrap block visible with all 8 CREATE TABLE statements and indexes"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add worker/hooks/session-init.sh worker/mcp-servers/state-manager/src/db.ts",
+          "expected": "Changes staged"
+        }
+      ]
+    }
+  ]
+}

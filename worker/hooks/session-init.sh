@@ -14,6 +14,117 @@ init_session_id
 
 PROJECT_HASH=$(echo "$PWD" | portable_md5)
 
+# ═══ Schema bootstrap (self-bootstrapping for first-run / MCP-not-yet-started) ═══
+# Creates all tables + WAL mode so hooks work even before MCP servers finish building.
+# Idempotent: CREATE TABLE IF NOT EXISTS is a no-op when MCP server already created schema.
+# MAINTENANCE: Keep in sync with worker/mcp-servers/state-manager/src/db.ts initDb().
+if command -v sqlite3 &>/dev/null; then
+  sqlite3 "$DB_PATH" "
+    PRAGMA journal_mode=wal;
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      terminal_session TEXT PRIMARY KEY,
+      professional_mode TEXT NOT NULL DEFAULT 'undecided',
+      workflow_stage TEXT NOT NULL DEFAULT 'idle',
+      active_skill TEXT,
+      brainstorming_active INTEGER NOT NULL DEFAULT 0,
+      plan_name TEXT,
+      plan_json TEXT,
+      current_wave INTEGER NOT NULL DEFAULT 0,
+      review_pending INTEGER NOT NULL DEFAULT 0,
+      review_block_count INTEGER NOT NULL DEFAULT 0,
+      circuit_breaker INTEGER NOT NULL DEFAULT 0,
+      memory_search_required INTEGER NOT NULL DEFAULT 0,
+      testing_theatre_checked INTEGER NOT NULL DEFAULT 0,
+      project_hash TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS wave_tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      terminal_session TEXT NOT NULL,
+      task_id INTEGER NOT NULL,
+      wave_number INTEGER NOT NULL,
+      task_name TEXT NOT NULL,
+      description TEXT,
+      allowed_files TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS plan_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      terminal_session TEXT NOT NULL,
+      plan_name TEXT NOT NULL,
+      design_file TEXT NOT NULL,
+      completed_tasks TEXT,
+      total_tasks INTEGER NOT NULL,
+      retreat_reason TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      terminal_session TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      action TEXT NOT NULL,
+      old_value TEXT,
+      new_value TEXT,
+      context TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS registered_designs (
+      design_file TEXT PRIMARY KEY,
+      registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+      terminal_session TEXT NOT NULL,
+      consumed INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS subagent_sessions (
+      child_session TEXT PRIMARY KEY,
+      parent_session TEXT NOT NULL,
+      task_number INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS pending_subagent_parents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      parent_session TEXT NOT NULL,
+      task_number INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS review_grades (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      terminal_session TEXT NOT NULL,
+      wave_number      INTEGER NOT NULL,
+      task_ids         TEXT NOT NULL,
+      grade            TEXT NOT NULL,
+      task_boundary    INTEGER NOT NULL DEFAULT 0,
+      created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_wave_tasks_session
+      ON wave_tasks(terminal_session);
+    CREATE INDEX IF NOT EXISTS idx_wave_tasks_session_wave
+      ON wave_tasks(terminal_session, wave_number);
+    CREATE INDEX IF NOT EXISTS idx_plan_history_design
+      ON plan_history(design_file);
+    CREATE INDEX IF NOT EXISTS idx_audit_log_session
+      ON audit_log(terminal_session);
+    CREATE INDEX IF NOT EXISTS idx_audit_log_created
+      ON audit_log(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_subagent_parent
+      ON subagent_sessions(parent_session);
+    CREATE INDEX IF NOT EXISTS idx_pending_parents_session
+      ON pending_subagent_parents(parent_session);
+    CREATE INDEX IF NOT EXISTS idx_review_grades_session_wave
+      ON review_grades(terminal_session, wave_number, task_boundary);
+  " 2>/dev/null || true
+fi
+
 # Ensure session row exists via direct sqlite3
 SAFE_SESSION=$(echo "$SESSION_TAG" | sed "s/'/''/g")
 SAFE_PROJECT_HASH=$(echo "$PROJECT_HASH" | sed "s/'/''/g")

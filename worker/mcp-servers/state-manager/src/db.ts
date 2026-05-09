@@ -158,6 +158,7 @@ export function migrateSchema(db: Database.Database): void {
     const expectedColumns: Array<{name: string; type: string; dflt: string}> = [
       { name: 'memory_search_required', type: 'INTEGER NOT NULL', dflt: '0' },
       { name: 'testing_theatre_checked', type: 'INTEGER NOT NULL', dflt: '0' },
+      { name: 'review_block_count', type: 'INTEGER NOT NULL', dflt: '0' },
     ];
 
     const currentColumns = db.prepare(`PRAGMA table_info(sessions)`).all() as Array<{name: string}>;
@@ -195,6 +196,9 @@ export function initDb(dbPath?: string): Database.Database {
   migrateSchema(db);
 
   // Create tables
+  // MAINTENANCE: Schema is also bootstrapped in worker/hooks/session-init.sh
+  // for first-run scenarios where hooks fire before MCP servers finish building.
+  // Keep both in sync when adding new tables.
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions (
       terminal_session TEXT PRIMARY KEY,
@@ -206,6 +210,7 @@ export function initDb(dbPath?: string): Database.Database {
       plan_json TEXT,
       current_wave INTEGER NOT NULL DEFAULT 0,
       review_pending INTEGER NOT NULL DEFAULT 0,
+      review_block_count INTEGER NOT NULL DEFAULT 0,
       circuit_breaker INTEGER NOT NULL DEFAULT 0,
       memory_search_required INTEGER NOT NULL DEFAULT 0,
       testing_theatre_checked INTEGER NOT NULL DEFAULT 0,

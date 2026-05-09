@@ -26,6 +26,7 @@ function createTestDb(): Database.Database {
       plan_json TEXT,
       current_wave INTEGER NOT NULL DEFAULT 0,
       review_pending INTEGER NOT NULL DEFAULT 0,
+      review_block_count INTEGER NOT NULL DEFAULT 0,
       circuit_breaker INTEGER NOT NULL DEFAULT 0,
       memory_search_required INTEGER NOT NULL DEFAULT 0,
       testing_theatre_checked INTEGER NOT NULL DEFAULT 0,
@@ -111,5 +112,104 @@ describe('mark_executing requires passing review verdict (R10 L2)', () => {
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.error).toBeUndefined();
     expect(parsed.workflow_stage).toBe('executing');
+  });
+});
+
+describe('review_block_count resets', () => {
+  let db: Database.Database;
+
+  beforeEach(() => {
+    db = createTestDb();
+  });
+
+  it('submit_task resets review_block_count to 0', () => {
+    db.prepare(
+      `INSERT INTO sessions (terminal_session, workflow_stage, review_block_count, current_wave)
+       VALUES ('test-rbc', 'executing', 3, 1)`,
+    ).run();
+    db.prepare(
+      `INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status)
+       VALUES ('test-rbc', 1, 1, 'Test Task', 'in_progress')`,
+    ).run();
+
+    const result = handleWriteTool('submit_task', { task_id: 1 }, db, 'test-rbc');
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeUndefined();
+
+    const row = db.prepare(
+      'SELECT review_block_count FROM sessions WHERE terminal_session = ?',
+    ).get('test-rbc') as { review_block_count: number };
+    expect(row.review_block_count).toBe(0);
+  });
+
+  it('record_review_verdict with passing grade resets review_block_count to 0', () => {
+    db.prepare(
+      `INSERT INTO sessions (terminal_session, workflow_stage, review_block_count, current_wave, review_pending)
+       VALUES ('test-rbc', 'reviewing', 4, 1, 1)`,
+    ).run();
+    db.prepare(
+      `INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status)
+       VALUES ('test-rbc', 1, 1, 'Test Task', 'submitted')`,
+    ).run();
+
+    const result = handleWriteTool(
+      'record_review_verdict',
+      { grade: 'A', task_boundary: true },
+      db,
+      'test-rbc',
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeUndefined();
+
+    const row = db.prepare(
+      'SELECT review_block_count FROM sessions WHERE terminal_session = ?',
+    ).get('test-rbc') as { review_block_count: number };
+    expect(row.review_block_count).toBe(0);
+  });
+
+  it('record_review_verdict with failing grade does not reset review_block_count', () => {
+    db.prepare(
+      `INSERT INTO sessions (terminal_session, workflow_stage, review_block_count, current_wave, review_pending)
+       VALUES ('test-rbc', 'reviewing', 4, 1, 1)`,
+    ).run();
+    db.prepare(
+      `INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status)
+       VALUES ('test-rbc', 1, 1, 'Test Task', 'submitted')`,
+    ).run();
+
+    const result = handleWriteTool(
+      'record_review_verdict',
+      { grade: 'C', task_boundary: true },
+      db,
+      'test-rbc',
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeUndefined();
+
+    const row = db.prepare(
+      'SELECT review_block_count FROM sessions WHERE terminal_session = ?',
+    ).get('test-rbc') as { review_block_count: number };
+    expect(row.review_block_count).toBe(4);
+  });
+
+  it('mark_executing resets review_block_count to 0', () => {
+    db.prepare(
+      `INSERT INTO sessions (terminal_session, workflow_stage, review_block_count, current_wave, review_pending)
+       VALUES ('test-rbc', 'reviewing', 2, 1, 1)`,
+    ).run();
+    db.prepare(
+      `INSERT INTO review_grades (terminal_session, wave_number, task_ids, grade, task_boundary)
+       VALUES ('test-rbc', 1, '[]', 'A', 1)`,
+    ).run();
+
+    const result = handleWriteTool('mark_executing', {}, db, 'test-rbc');
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeUndefined();
+    expect(parsed.workflow_stage).toBe('executing');
+
+    const row = db.prepare(
+      'SELECT review_block_count FROM sessions WHERE terminal_session = ?',
+    ).get('test-rbc') as { review_block_count: number };
+    expect(row.review_block_count).toBe(0);
   });
 });

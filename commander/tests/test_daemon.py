@@ -1723,3 +1723,221 @@ class TestSpawnWorkerPid:
                 pass
         assert len(spawned) == 1, f"Expected 1 WORKER_SPAWNED entry, got {len(spawned)}"
         assert spawned[0]["pane_pid"] == "99999"
+
+
+class TestIsOscillating:
+    def test_returns_false_when_no_history(self, daemon):
+        """No history → not oscillating."""
+        assert daemon._is_oscillating("w1") is False
+
+    def test_returns_false_below_threshold(self, daemon):
+        """Two transitions → below threshold of 3."""
+        now = time.time()
+        daemon._stage_history["w1"] = [(now - 20, "executing"), (now - 10, "reviewing")]
+        assert daemon._is_oscillating("w1") is False
+
+    def test_returns_true_at_threshold(self, daemon):
+        """Three transitions, all executing/reviewing → oscillating."""
+        now = time.time()
+        daemon._stage_history["w1"] = [
+            (now - 30, "executing"),
+            (now - 20, "reviewing"),
+            (now - 10, "executing"),
+        ]
+        assert daemon._is_oscillating("w1") is True
+
+    def test_returns_false_with_non_oscillating_stage(self, daemon):
+        """Any non-executing/reviewing stage in history → not oscillating."""
+        now = time.time()
+        daemon._stage_history["w1"] = [
+            (now - 20, "executing"),
+            (now - 10, "reviewing"),
+            (now - 5, "idle"),
+        ]
+        assert daemon._is_oscillating("w1") is False
+
+    def test_returns_false_when_all_entries_expired(self, daemon):
+        """Three transitions older than 900s window → pruned → not oscillating."""
+        old = time.time() - 1000
+        daemon._stage_history["w1"] = [
+            (old, "executing"),
+            (old + 1, "reviewing"),
+            (old + 2, "executing"),
+        ]
+        assert daemon._is_oscillating("w1") is False
+
+    def test_prunes_expired_entries(self, daemon):
+        """_is_oscillating removes entries older than 900s from history in place."""
+        now = time.time()
+        old = now - 1000
+        daemon._stage_history["w1"] = [
+            (old, "executing"),
+            (old + 1, "reviewing"),
+            (now - 10, "executing"),
+        ]
+        result = daemon._is_oscillating("w1")
+        assert result is False
+        assert len(daemon._stage_history["w1"]) == 1
+
+    def test_returns_false_with_none_stage(self, daemon):
+        """None stage (DB miss) in history breaks oscillation check."""
+        now = time.time()
+        daemon._stage_history["w1"] = [
+            (now - 20, "executing"),
+            (now - 10, None),
+            (now - 5, "executing"),
+        ]
+        assert daemon._is_oscillating("w1") is False
+
+
+class TestOscillationSuppression:
+    def _setup_worker(self, daemon):
+        worker = {"id": "w1", "tmux_session": "ic-w1", "spawned_at": "2026-01-01 00:00:00"}
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        daemon.tmux.capture_pane.return_value = "output"
+        daemon.brain.send_message.return_value = True
+
+    def test_stage_changed_suppressed_during_oscillation(self, daemon, tmp_path):
+        """After 3+ ex/rev oscillations, stage_changed bypass is suppressed."""
+        self._setup_worker(daemon)
+        contact_file = os.path.join(daemon.tmux.log_dir, "ic-w1.brain_contact")
+
+        with patch.object(daemon, "_get_worker_workflow_stage") as mock_stage:
+            # Call 1: executing — initial send (no last_sent, cadence check passes)
+            mock_stage.return_value = "executing"
+            daemon.check_workers()
+            assert daemon.brain.send_message.call_count == 1
+
+            # Ack: set brain_contact just after last send
+            with open(contact_file, "w") as f:
+                f.write(str(daemon._last_checkin_sent["w1"] + 1))
+
+            # Call 2: reviewing — stage_changed fires immediately
+            mock_stage.return_value = "reviewing"
+            daemon.check_workers()
+            assert daemon.brain.send_message.call_count == 2
+
+            # Ack: update brain_contact
+            with open(contact_file, "w") as f:
+                f.write(str(daemon._last_checkin_sent["w1"] + 1))
+
+            # Call 3: executing — oscillation detected (3 transitions), suppressed
+            mock_stage.return_value = "executing"
+            daemon.check_workers()
+            assert daemon.brain.send_message.call_count == 2  # not incremented
+
+            # Call 4: reviewing — still oscillating, still suppressed
+            mock_stage.return_value = "reviewing"
+            daemon.check_workers()
+            assert daemon.brain.send_message.call_count == 2  # still not incremented
+
+    def test_genuine_stage_change_fires_after_oscillation(self, daemon, tmp_path):
+        """plan_ready transition fires immediately once oscillation exits."""
+        self._setup_worker(daemon)
+        contact_file = os.path.join(daemon.tmux.log_dir, "ic-w1.brain_contact")
+
+        with patch.object(daemon, "_get_worker_workflow_stage") as mock_stage:
+            # Build oscillation: 3 transitions (calls 1, 2, 3)
+            for stage in ["executing", "reviewing", "executing"]:
+                mock_stage.return_value = stage
+                daemon.check_workers()
+                if "w1" in daemon._last_checkin_sent:
+                    with open(contact_file, "w") as f:
+                        f.write(str(daemon._last_checkin_sent["w1"] + 1))
+
+            pre_count = daemon.brain.send_message.call_count
+
+            # Genuine stage change: plan_ready — stage_changed=True, fires immediately
+            mock_stage.return_value = "plan_ready"
+            daemon.check_workers()
+
+            assert daemon.brain.send_message.call_count == pre_count + 1
+            msg = daemon.brain.send_message.call_args[0][0]
+            assert "plan_ready" in msg
+
+
+class TestCheckWorkersRemote:
+    """Tests for check_workers handling remote (SSH) workers."""
+
+    def _make_remote_worker(self):
+        return {
+            "id": "w-remote",
+            "tmux_session": "ic-w-remote",
+            "machine": "kandice",
+            "spawned_at": "2026-01-01 00:00:00",
+        }
+
+    def _make_local_worker(self):
+        return {"id": "w-local", "tmux_session": "ic-w-local", "machine": None}
+
+    def test_remote_done_marker_via_ssh(self, daemon):
+        """Remote worker .done marker is detected via tmux.file_exists over SSH."""
+        worker = self._make_remote_worker()
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon._ssh_manager = MagicMock()
+        machine_cfg = MagicMock()
+        machine_cfg.host = "kandice"
+        machine_cfg.log_dir = "/tmp/ic-logs"
+        daemon._ssh_manager.get_machine.return_value = machine_cfg
+        daemon.tmux.file_exists.return_value = True
+        daemon.brain.send_message.return_value = True
+        daemon.tmux.remove_file.return_value = True
+
+        daemon.check_workers()
+
+        daemon.tmux.file_exists.assert_called_once()
+        call_args = daemon.tmux.file_exists.call_args
+        assert call_args[0][0].endswith("ic-w-remote.done")
+        assert call_args[1].get("ssh_host") == "kandice" or call_args[0][1] == "kandice"
+
+    def test_remote_dead_session_via_ssh(self, daemon):
+        """Remote worker dead session is detected via tmux.has_session over SSH."""
+        worker = self._make_remote_worker()
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon._ssh_manager = MagicMock()
+        machine_cfg = MagicMock()
+        machine_cfg.host = "kandice"
+        machine_cfg.log_dir = "/tmp/ic-logs"
+        daemon._ssh_manager.get_machine.return_value = machine_cfg
+        daemon.tmux.file_exists.return_value = False
+        daemon.tmux.has_session.return_value = False
+
+        daemon.check_workers()
+
+        daemon.tmux.has_session.assert_called_once()
+        call_args = daemon.tmux.has_session.call_args
+        assert call_args[0][0] == "ic-w-remote"
+        assert call_args[1].get("ssh_host") == "kandice" or (len(call_args[0]) > 1 and call_args[0][1] == "kandice")
+        daemon.registry.update_worker_status.assert_called_with("w-remote", "completed")
+
+    def test_local_worker_unaffected(self, daemon):
+        """Local worker (machine=None) uses local file checks, not SSH."""
+        worker = self._make_local_worker()
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = False
+        marker = os.path.join(daemon.tmux.log_dir, "ic-w-local.done")
+
+        daemon.check_workers()
+
+        daemon.registry.update_worker_status.assert_called_with("w-local", "completed")
+
+    def test_get_worker_workflow_stage_remote(self, daemon):
+        """_get_worker_workflow_stage queries remote DB via tmux.run_sqlite_query."""
+        daemon.tmux.list_pane_pid.return_value = "12345"
+        daemon.tmux.read_file.return_value = "abcdef01-2345-6789-abcd-ef0123456789"
+        daemon.tmux.run_sqlite_query.return_value = "executing"
+
+        result = daemon._get_worker_workflow_stage("ic-w1", ssh_host="kandice")
+
+        daemon.tmux.list_pane_pid.assert_called_with("ic-w1", ssh_host="kandice")
+        daemon.tmux.read_file.assert_called_once()
+        daemon.tmux.run_sqlite_query.assert_called_once()
+        assert result == "executing"
+
+    def test_get_worker_workflow_stage_remote_no_pid(self, daemon):
+        """Returns None when remote pane PID cannot be retrieved."""
+        daemon.tmux.list_pane_pid.return_value = None
+
+        result = daemon._get_worker_workflow_stage("ic-w1", ssh_host="kandice")
+        assert result is None

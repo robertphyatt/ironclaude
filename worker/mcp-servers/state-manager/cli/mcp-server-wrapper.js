@@ -27,7 +27,8 @@ function log(msg) {
 
 function ensureSqlite3() {
   try {
-    execSync('command -v sqlite3', { stdio: 'pipe' });
+    const cmd = process.platform === 'win32' ? 'where.exe sqlite3' : 'command -v sqlite3';
+    execSync(cmd, { stdio: 'pipe' });
   } catch {
     log('[startup] FATAL: sqlite3 CLI not found in PATH.');
     log('[startup] IronClaude hooks require the sqlite3 command-line tool.');
@@ -36,6 +37,7 @@ function ensureSqlite3() {
     log('[startup]   Ubuntu/Debian: sudo apt install sqlite3');
     log('[startup]   Alpine:        apk add sqlite');
     log('[startup]   Fedora/RHEL:   sudo dnf install sqlite');
+    log('[startup]   Windows:       choco install sqlite  OR  winget install SQLite.SQLite');
     process.exit(1);
   }
 }

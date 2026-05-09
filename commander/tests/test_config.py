@@ -1,8 +1,9 @@
 # tests/test_config.py
+"""Tests for config loading — ironclaude.json and machines.yaml."""
 import json
 import os
 import pytest
-from ironclaude.config import load_config
+from ironclaude.config import load_config, load_machines_config
 
 
 class TestLoadConfig:
@@ -174,3 +175,93 @@ class TestLoadConfig:
         from ironclaude.config import make_opus_command
         cmd = make_opus_command("claude-opus-4-5", "high")
         assert "CLAUDE_CODE_EFFORT_LEVEL=high" in cmd
+
+
+# ── machines.yaml tests ──────────────────────────────────────────────
+
+
+@pytest.fixture
+def machines_yaml(tmp_path):
+    path = tmp_path / "machines.yaml"
+    path.write_text("""
+machines:
+  - name: server1
+    host: server1
+    purpose: "Test server"
+    claude_path: /usr/bin/claude
+    repos:
+      - /home/user/repo1
+      - /home/user/repo2
+    max_workers: 2
+    env:
+      API_KEY: "test-key"
+  - name: server2
+    host: user@server2.example.com
+    claude_path: ~/.claude/local/claude
+    repos:
+      - /opt/project
+""")
+    return str(path)
+
+
+class TestLoadMachinesConfig:
+    def test_load_valid_config(self, machines_yaml):
+        machines = load_machines_config(machines_yaml)
+        assert len(machines) == 2
+        assert machines[0]["name"] == "server1"
+        assert machines[0]["repos"] == ["/home/user/repo1", "/home/user/repo2"]
+        assert machines[0]["max_workers"] == 2
+
+    def test_defaults_for_optional_fields(self, machines_yaml):
+        machines = load_machines_config(machines_yaml)
+        s2 = machines[1]
+        assert s2.get("purpose", "") == ""
+        assert s2.get("log_dir", "/tmp/ic-logs") == "/tmp/ic-logs"
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        machines = load_machines_config(str(tmp_path / "nonexistent.yaml"))
+        assert machines == []
+
+    def test_env_var_interpolation(self, machines_yaml, monkeypatch):
+        path = os.path.dirname(machines_yaml)
+        p = os.path.join(path, "interp.yaml")
+        with open(p, "w") as f:
+            f.write("""
+machines:
+  - name: s
+    host: s
+    claude_path: /c
+    repos: [/r]
+    env:
+      KEY: "${MY_TEST_VAR}"
+""")
+        monkeypatch.setenv("MY_TEST_VAR", "secret123")
+        machines = load_machines_config(p)
+        assert machines[0]["env"]["KEY"] == "secret123"
+
+    def test_duplicate_names_raises(self, tmp_path):
+        p = tmp_path / "dup.yaml"
+        p.write_text("""
+machines:
+  - name: same
+    host: a
+    claude_path: /c
+    repos: [/r]
+  - name: same
+    host: b
+    claude_path: /c
+    repos: [/r]
+""")
+        with pytest.raises(ValueError, match="Duplicate"):
+            load_machines_config(str(p))
+
+    def test_missing_required_field_raises(self, tmp_path):
+        p = tmp_path / "bad.yaml"
+        p.write_text("""
+machines:
+  - name: nohost
+    claude_path: /c
+    repos: [/r]
+""")
+        with pytest.raises(ValueError, match="host"):
+            load_machines_config(str(p))

@@ -23,7 +23,8 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import psutil
@@ -37,6 +38,7 @@ from ironclaude.tmux_manager import _strip_ansi
 logger = logging.getLogger("ironclaude.orchestrator_mcp")
 
 _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+_SAFE_PUSH_NAME_RE = re.compile(r'^[a-zA-Z0-9/_.-]+$')
 
 PID_FILE = Path("/tmp/ic-daemon.pid")
 
@@ -322,7 +324,7 @@ class OrchestratorTools:
     All methods are synchronous and raise exceptions on error.
     """
 
-    def __init__(self, registry, tmux, ledger_path: str, grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "claude-opus-4-6", opus_model: str = "claude-opus-4-6", effort_level: str = "high"):
+    def __init__(self, registry, tmux, ledger_path: str, grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "claude-opus-4-6", opus_model: str = "claude-opus-4-6", effort_level: str = "high", ssh_manager=None, config: dict | None = None):
         self.registry = registry
         self.tmux = tmux
         self.ledger_path = ledger_path
@@ -340,6 +342,8 @@ class OrchestratorTools:
         self._failed_worker_bases: set[str] = set()
         self._game_pid: int | None = None
         self._advisor_cfg = advisor_cfg or {}
+        self._ssh_manager = ssh_manager
+        self._config = config or {}
 
     def _get_worker_command(self, worker_type: str, model_name: str = "") -> str:
         """Build worker command, using advisor config for model selection."""
@@ -368,6 +372,34 @@ class OrchestratorTools:
                 f.write(str(time.time()))
         except OSError:
             logger.warning(f"Could not write brain contact file for {worker_id}")
+
+    def _resolve_ssh_host(self, worker_id: str) -> str | None:
+        """Resolve SSH host for a worker from its machine field."""
+        worker = self.registry.get_worker(worker_id)
+        if not worker or not worker.get("machine"):
+            return None
+        machine = self._ssh_manager.get_machine(worker["machine"]) if self._ssh_manager else None
+        return machine.host if machine else None
+
+    def list_machines(self) -> dict:
+        """List configured remote machines with health status and active worker counts."""
+        if not self._ssh_manager:
+            return {"machines": []}
+        result = []
+        running = self.registry.get_running_workers()
+        for name in self._ssh_manager.list_machine_names():
+            machine = self._ssh_manager.get_machine(name)
+            active = sum(1 for w in running if w.get("machine") == name)
+            result.append({
+                "name": machine.name,
+                "host": machine.host,
+                "purpose": machine.purpose,
+                "repos": machine.repos,
+                "healthy": self._ssh_manager.is_healthy(name),
+                "active_workers": active,
+                "max_workers": machine.max_workers,
+            })
+        return {"machines": result}
 
     def _is_grader_alive(self) -> bool:
         """Check if grader tmux session has a live process."""
@@ -658,6 +690,90 @@ class OrchestratorTools:
             self._slack.add_reaction("hourglass_flowing_sand", source_ts)
         return {"id": directive_id, "status": "pending_confirmation"}
 
+    def push_repo(self, repo: str, remote: str = "origin", branch: str = "") -> dict | str:
+        """Submit a git push request for operator confirmation via Slack.
+
+        Returns a dict with status/id/expires_at on success, or an error string.
+        The push is NOT executed here — operator must react ✅ to confirm.
+        """
+        if not self._config.get("push_enabled", False):
+            return "push disabled: push_enabled is False in config"
+
+        if not _SAFE_PUSH_NAME_RE.match(remote):
+            return f"invalid remote: {remote!r} — only [a-zA-Z0-9/_.-] allowed"
+        if not _SAFE_PUSH_NAME_RE.match(branch):
+            return f"invalid branch: {branch!r} — only [a-zA-Z0-9/_.-] allowed"
+
+        rev = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        if rev.returncode != 0:
+            return f"not a git repo: {repo}"
+
+        remote_check = subprocess.run(
+            ["git", "remote", "get-url", remote],
+            cwd=repo, capture_output=True, text=True,
+        )
+        if remote_check.returncode != 0:
+            return f"remote {remote!r} not found in {repo}"
+
+        branch_check = subprocess.run(
+            ["git", "show-ref", "--verify", f"refs/heads/{branch}"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        if branch_check.returncode != 0:
+            return f"branch {branch!r} not found in {repo}"
+
+        if self._db is not None:
+            max_per_hour = self._config.get("push_max_per_hour", 5)
+            count = self._db.execute(
+                "SELECT COUNT(*) FROM push_requests WHERE status='completed'"
+                " AND created_at > datetime('now', '-1 hour')"
+            ).fetchone()[0]
+            if count >= max_per_hour:
+                return f"rate limit: {count} pushes in last hour (max {max_per_hour})"
+
+        log_result = subprocess.run(
+            ["git", "log", "--oneline", "-5"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        diff_result = subprocess.run(
+            ["git", "diff", "--stat", "HEAD"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        commit_summary = log_result.stdout.strip() or "no commits"
+        diff_stats = diff_result.stdout.strip() or "no diff"
+
+        push_id = str(uuid.uuid4())
+        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+
+        if self._db is not None:
+            self._db.execute(
+                "INSERT INTO push_requests"
+                " (id, repo, remote, branch, commit_summary, diff_stats, status, expires_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+                (push_id, repo, remote, branch, commit_summary, diff_stats, expires_at),
+            )
+            self._db.commit()
+
+        message_ts = None
+        if self._slack is not None:
+            msg = (
+                f"Push request `{push_id[:8]}`: `{remote}/{branch}` in `{repo}`\n"
+                f"Recent commits:\n```{commit_summary}```\n"
+                f"React ✅ to confirm or ❌ to reject. Expires in 5 minutes."
+            )
+            message_ts = self._slack.post_message(msg)
+            if message_ts and self._db is not None:
+                self._db.execute(
+                    "UPDATE push_requests SET message_ts=? WHERE id=?",
+                    (message_ts, push_id),
+                )
+                self._db.commit()
+
+        return {"status": "pending", "id": push_id, "expires_at": expires_at}
+
     def get_directives(self, status: str | None = None) -> list[dict]:
         """Retrieve directives, optionally filtered by status.
 
@@ -838,7 +954,8 @@ class OrchestratorTools:
         except OSError as e:
             logger.warning(f"Failed to write CLAUDE.md to {repo}: {e}")
 
-    def _wait_for_ready(self, session_name: str, timeout: int = 30) -> bool:
+    def _wait_for_ready(self, session_name: str, timeout: int = 30,
+                        ssh_host: str | None = None) -> bool:
         """Poll tmux log until the worker is ready or timeout exceeded.
 
         Returns True if a ready indicator ("ironclaude v") is found,
@@ -847,11 +964,11 @@ class OrchestratorTools:
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
-            output = self.tmux.read_log_tail(session_name, lines=50)
+            output = self.tmux.read_log_tail(session_name, lines=50, ssh_host=ssh_host)
             if output:
                 lower = output.lower()
                 if "trust this folder" in lower:
-                    self.tmux.send_keys(session_name, "")
+                    self.tmux.send_keys(session_name, "", ssh_host=ssh_host)
                 if "ironclaude v" in output:
                     return True
             time.sleep(1)
@@ -1016,6 +1133,91 @@ class OrchestratorTools:
             logger.warning(f"{reason} for {session_name}")
             return reason
 
+    def _ensure_claude_md_remote(self, repo: str, ssh_host: str) -> None:
+        """Ensure remote repo has a CLAUDE.md for clean PM activation."""
+        if self.tmux.file_exists(os.path.join(repo, "CLAUDE.md"), ssh_host=ssh_host):
+            logger.info(f"CLAUDE.md already exists in {repo} on {ssh_host}")
+            return
+        template_path = Path(__file__).parent / "templates" / "worker_claude_md.md"
+        try:
+            content = template_path.read_text()
+        except FileNotFoundError:
+            logger.warning(f"Worker CLAUDE.md template not found at {template_path}")
+            return
+        if not self.tmux.write_file(os.path.join(repo, "CLAUDE.md"), content, ssh_host=ssh_host):
+            logger.warning(f"Failed to write CLAUDE.md to {repo} on {ssh_host}")
+        else:
+            logger.info(f"Injected CLAUDE.md into {repo} on {ssh_host}")
+
+    def _ensure_worker_trusted_remote(self, repo: str, ssh_host: str) -> None:
+        """Ensure remote repo is trusted in ~/.claude.json on the remote host."""
+        claude_json = "~/.claude.json"
+        content = self.tmux.read_file(claude_json, ssh_host=ssh_host)
+        if content is None:
+            logger.warning(f"{claude_json} not found on {ssh_host}")
+            return
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            logger.warning(f"Could not parse {claude_json} on {ssh_host}")
+            return
+        projects = data.get("projects", {})
+        if projects.get(repo, {}).get("hasTrustDialogAccepted") is True:
+            logger.info(f"Worker directory already trusted on {ssh_host}: {repo}")
+            return
+        project = projects.get(repo, {})
+        project["hasTrustDialogAccepted"] = True
+        project.setdefault("allowedTools", [])
+        projects[repo] = project
+        data["projects"] = projects
+        if self.tmux.write_file(claude_json, json.dumps(data, indent=2), ssh_host=ssh_host):
+            logger.info(f"Added trust entry for {repo} on {ssh_host}")
+        else:
+            logger.warning(f"Failed to write trust entry on {ssh_host}")
+
+    def _activate_pm_remote(self, session_name: str, ssh_host: str,
+                            timeout: int = 30) -> str | None:
+        """Activate professional mode on a remote worker via sqlite3 over SSH.
+
+        Returns None on success, or a failure reason string.
+        """
+        pane_pid = self.tmux.list_pane_pid(session_name, ssh_host=ssh_host)
+        if not pane_pid:
+            reason = f"could not get pane PID for {session_name} on {ssh_host}"
+            logger.warning(reason)
+            return reason
+
+        session_id_file = f"~/.claude/ironclaude-session-{pane_pid}.id"
+        deadline = time.time() + timeout
+        session_uuid = None
+        while time.time() < deadline:
+            content = self.tmux.read_file(session_id_file, ssh_host=ssh_host)
+            if content and len(content.strip()) == 36:
+                session_uuid = content.strip()
+                break
+            time.sleep(1)
+
+        if session_uuid is None:
+            reason = f"session ID file timeout after {timeout}s on {ssh_host}"
+            logger.warning(reason)
+            return reason
+
+        db_path = "~/.claude/ironclaude.db"
+        query = (
+            f"INSERT OR IGNORE INTO sessions (terminal_session, professional_mode) "
+            f"VALUES ('{session_uuid}', 'on'); "
+            f"UPDATE sessions SET professional_mode='on', updated_at=datetime('now') "
+            f"WHERE terminal_session='{session_uuid}';"
+        )
+        result = self.tmux.run_sqlite_query(db_path, query, ssh_host=ssh_host)
+        if result is None:
+            reason = f"sqlite3 command failed on {ssh_host}"
+            logger.warning(reason)
+            return reason
+
+        logger.info(f"PM activated via remote sqlite3 for {session_name} on {ssh_host}")
+        return None
+
     def spawn_worker(
         self,
         worker_id: str,
@@ -1024,8 +1226,9 @@ class OrchestratorTools:
         objective: str,
         allowed_paths: list[str] | None = None,
         model_name: str = "",
+        machine: str | None = None,
     ) -> str | dict:
-        """Spawn a new worker with the given objective."""
+        """Spawn a new worker with the given objective. Set machine to target a remote host."""
         # Retry escalation: auto-upgrade to opus if previous attempt with same base ID failed
         base_id = re.sub(r'[-_]?\d*[a-z]?$', '', worker_id)
         if base_id and base_id in self._failed_worker_bases and worker_type == "claude-sonnet":
@@ -1085,6 +1288,22 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             }
         logger.info(f"Grader approved spawn for '{worker_id}' (grade {grade_result['grade']})")
 
+        # Resolve remote machine if specified
+        ssh_host = None
+        machine_cfg = None
+        if machine:
+            if not self._ssh_manager:
+                return {"error": "No SSH manager configured — cannot spawn remote workers"}
+            machine_cfg = self._ssh_manager.get_machine(machine)
+            if not machine_cfg:
+                return {"error": f"Unknown machine '{machine}'. Available: {self._ssh_manager.list_machine_names()}"}
+            if repo not in machine_cfg.repos:
+                return {"error": f"Repo '{repo}' not in machine '{machine}' repos: {machine_cfg.repos}"}
+            health = self._ssh_manager.health_check(machine)
+            if not health.ok:
+                return {"error": f"Machine '{machine}' unhealthy: {health.details}"}
+            ssh_host = machine_cfg.host
+
         # Handle ollama dynamic command construction
         if worker_type == "ollama":
             if not model_name:
@@ -1099,47 +1318,65 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 )
 
             cmd = f"ollama launch claude --model {shlex.quote(model_name)} -- --dangerously-skip-permissions"
+        elif machine_cfg:
+            cmd_parts = [f"export IC_WORKER_ID={shlex.quote(worker_id)}"]
+            for k, v in machine_cfg.env.items():
+                cmd_parts.append(f"export {k}={shlex.quote(v)}")
+            model = model_name or self._opus_model
+            cmd_parts.append(f"{machine_cfg.claude_path} --model {shlex.quote(model)} --dangerously-skip-permissions")
+            cmd = "; ".join(cmd_parts)
         else:
             cmd = self._get_worker_command(worker_type, model_name)
 
-        # Inject worker ID for stop hook completion detection
-        cmd = f"export IC_WORKER_ID={shlex.quote(worker_id)}; {cmd}"
+        # Inject worker ID for stop hook completion detection (local only — remote handled above)
+        if not machine_cfg:
+            cmd = f"export IC_WORKER_ID={shlex.quote(worker_id)}; {cmd}"
 
         session_name = f"ic-{worker_id}"
 
         # Stage 0: ensure CLAUDE.md exists for clean PM activation
-        self._ensure_claude_md(repo)
+        if ssh_host:
+            self._ensure_claude_md_remote(repo, ssh_host)
+        else:
+            self._ensure_claude_md(repo)
 
         # Stage 1: ensure trust
-        self.ensure_worker_trusted(repo)
+        if ssh_host:
+            self._ensure_worker_trusted_remote(repo, ssh_host)
+        else:
+            self.ensure_worker_trusted(repo)
 
         # Stage 2: spawn tmux session
-        success = self.tmux.spawn_session(session_name, cmd, cwd=repo)
+        remote_log_dir = machine_cfg.log_dir if machine_cfg else None
+        success = self.tmux.spawn_session(session_name, cmd, cwd=repo,
+                                          ssh_host=ssh_host, remote_log_dir=remote_log_dir)
         if not success:
             raise RuntimeError(
                 f"Failed to spawn tmux session for worker '{worker_id}'"
             )
 
         # Stage 3: wait for ready
-        self._wait_for_ready(session_name, timeout=30)
+        self._wait_for_ready(session_name, timeout=30, ssh_host=ssh_host)
 
-        # Stages 4-5: activate professional mode via direct SQLite write
-        # timeout raised from 120→300 because session-init.sh hook can be slow
-        # when ~/.claude/session-env/ has many files (find without -maxdepth)
-        pm_failure = self._activate_pm_via_sqlite(session_name, timeout=300)
+        # Stages 4-5: activate professional mode
+        if ssh_host:
+            pm_failure = self._activate_pm_remote(session_name, ssh_host)
+        else:
+            pm_failure = self._activate_pm_via_sqlite(session_name, timeout=300)
         if pm_failure is not None:
-            self.tmux.kill_session(session_name)
+            self.tmux.kill_session(session_name, ssh_host=ssh_host)
             return {"error": f"PM activation failed for worker '{worker_id}': {pm_failure}"}
 
         # Stage 5.5: enable advisor if configured
         if self._advisor_cfg.get("enabled"):
             advisor_model = self._advisor_cfg.get("advisor_model", "opus")
-            self.tmux.send_keys(session_name, f"/advisor {advisor_model}")
+            self.tmux.send_keys(session_name, f"/advisor {advisor_model}", ssh_host=ssh_host)
             time.sleep(3)
 
         # Stage 6: send objective
-        self.registry.register_worker(worker_id, worker_type, session_name, repo=repo, description=objective)
-        self.tmux.send_keys(session_name, objective)
+        self.registry.register_worker(worker_id, worker_type, session_name, repo=repo,
+                                       machine=machine, description=objective)
+        self.tmux.send_keys(session_name, objective, ssh_host=ssh_host)
         self.registry.log_event(
             "worker_spawned",
             worker_id=worker_id,
@@ -1149,11 +1386,13 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 "objective": objective,
                 "allowed_paths": allowed_paths,
                 "model_name": model_name,
+                "machine": machine,
             },
         )
 
         recommended = grade_result.get('recommended_model', worker_type)
-        return f"Worker '{worker_id}' spawned ({worker_type}) in {repo}. Model recommendation: {recommended}"
+        loc = f" on {machine}" if machine else ""
+        return f"Worker '{worker_id}' spawned ({worker_type}) in {repo}{loc}. Model recommendation: {recommended}"
 
     def spawn_workers(self, requests: list[dict]) -> list[dict]:
         """Spawn multiple workers with batch grading and parallel PM activation.
@@ -1348,12 +1587,13 @@ Model recommendation (include "recommended_model" for each):
         if not worker:
             raise ValueError(f"Worker '{worker_id}' not found")
 
+        ssh_host = self._resolve_ssh_host(worker_id)
         session_name = f"ic-{worker_id}"
-        if not self.tmux.has_session(session_name):
+        if not self.tmux.has_session(session_name, ssh_host=ssh_host):
             self.registry.update_worker_status(worker_id, "failed")
             raise RuntimeError(f"Worker '{worker_id}' tmux session is dead")
 
-        self.tmux.send_keys(session_name, "yes")
+        self.tmux.send_keys(session_name, "yes", ssh_host=ssh_host)
         self.registry.log_event(
             "plan_approved",
             worker_id=worker_id,
@@ -1368,12 +1608,13 @@ Model recommendation (include "recommended_model" for each):
         if not worker:
             raise ValueError(f"Worker '{worker_id}' not found")
 
+        ssh_host = self._resolve_ssh_host(worker_id)
         session_name = f"ic-{worker_id}"
-        if not self.tmux.has_session(session_name):
+        if not self.tmux.has_session(session_name, ssh_host=ssh_host):
             self.registry.update_worker_status(worker_id, "failed")
             raise RuntimeError(f"Worker '{worker_id}' tmux session is dead")
 
-        self.tmux.send_keys(session_name, f"no: {reason}")
+        self.tmux.send_keys(session_name, f"no: {reason}", ssh_host=ssh_host)
         self.registry.log_event(
             "plan_rejected",
             worker_id=worker_id,
@@ -1388,8 +1629,9 @@ Model recommendation (include "recommended_model" for each):
         if not worker:
             raise ValueError(f"Worker '{worker_id}' not found")
 
+        ssh_host = self._resolve_ssh_host(worker_id)
         session_name = f"ic-{worker_id}"
-        if not self.tmux.has_session(session_name):
+        if not self.tmux.has_session(session_name, ssh_host=ssh_host):
             self.registry.update_worker_status(worker_id, "failed")
             raise RuntimeError(f"Worker '{worker_id}' tmux session is dead")
 
@@ -1430,7 +1672,7 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
             }
         logger.info(f"Grader approved message to '{worker_id}' (grade {grade_result['grade']})")
 
-        self.tmux.send_keys(session_name, message)
+        self.tmux.send_keys(session_name, message, ssh_host=ssh_host)
         self.registry.log_event(
             "message_sent",
             worker_id=worker_id,
@@ -1451,14 +1693,15 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
         if not worker:
             raise ValueError(f"Worker '{worker_id}' not found")
 
+        ssh_host = self._resolve_ssh_host(worker_id)
         session_name = f"ic-{worker_id}"
-        if not self.tmux.has_session(session_name):
+        if not self.tmux.has_session(session_name, ssh_host=ssh_host):
             self.registry.update_worker_status(worker_id, "failed")
             raise RuntimeError(f"Worker '{worker_id}' tmux session is dead")
 
         _validate_keys(keys)
 
-        self.tmux.send_raw_keys(session_name, keys)
+        self.tmux.send_raw_keys(session_name, keys, ssh_host=ssh_host)
         self.registry.log_event(
             "keys_sent",
             worker_id=worker_id,
@@ -1503,13 +1746,22 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
 
     def get_worker_log(self, worker_id: str, lines: int = 50) -> str:
         """Read the last N lines of a worker's log."""
+        ssh_host = self._resolve_ssh_host(worker_id)
         session_name = f"ic-{worker_id}"
         try:
-            result = self.tmux.capture_pane(session_name, lines=lines)
+            result = self.tmux.capture_pane(session_name, lines=lines, ssh_host=ssh_host)
             self._write_brain_contact(worker_id)
             return result
         except subprocess.CalledProcessError:
             pass
+        if ssh_host:
+            worker = self.registry.get_worker(worker_id)
+            machine = self._ssh_manager.get_machine(worker["machine"]) if self._ssh_manager and worker else None
+            remote_log_dir = machine.log_dir if machine else None
+            log_tail = self.tmux.read_log_tail(session_name, lines=lines,
+                                               ssh_host=ssh_host, remote_log_dir=remote_log_dir)
+            self._write_brain_contact(worker_id)
+            return log_tail
         log_path = self.tmux.get_log_path(session_name)
         try:
             with open(log_path) as f:
@@ -1559,9 +1811,10 @@ Has the worker genuinely completed its objective based on the evidence?"""
         else:
             logger.warning(f"kill_worker called without objective/evidence for '{worker_id}' — skipping grader")
 
+        ssh_host = self._resolve_ssh_host(worker_id)
         session_name = f"ic-{worker_id}"
-        pane_pid = self.tmux.list_pane_pid(session_name)
-        self.tmux.kill_session(session_name)
+        pane_pid = self.tmux.list_pane_pid(session_name, ssh_host=ssh_host)
+        self.tmux.kill_session(session_name, ssh_host=ssh_host)
         self.registry.update_worker_status(worker_id, "completed")
         _wr = self.registry.get_worker(worker_id)
         _runtime = None
@@ -1902,15 +2155,35 @@ def _create_mcp_server(tools: OrchestratorTools):
         objective: str,
         allowed_paths: list[str] | None = None,
         model_name: str = "",
+        machine: str | None = None,
     ) -> str:
-        """Spawn a new worker with the given objective."""
+        """Spawn a new worker with the given objective.
+
+        Args:
+            worker_id: Unique identifier for the worker.
+            worker_type: Model type (e.g. claude-opus, claude-sonnet).
+            repo: Repository path for the worker to operate in.
+            objective: The task objective for the worker.
+            allowed_paths: Optional list of file paths the worker may edit.
+            model_name: Optional explicit model name override.
+            machine: Optional remote machine name from machines.yaml. If set, worker spawns on that machine via SSH.
+        """
         result = tools.spawn_worker(
             worker_id, worker_type, repo, objective,
-            allowed_paths, model_name,
+            allowed_paths, model_name, machine=machine,
         )
         if isinstance(result, dict):
             return json.dumps(result)
         return result
+
+    @mcp.tool()
+    def list_machines() -> str:
+        """List configured remote machines with health status and active worker counts.
+
+        Returns JSON with a 'machines' array. Each entry has: name, host, purpose,
+        repos, healthy, active_workers, max_workers.
+        """
+        return json.dumps(tools.list_machines(), indent=2)
 
     @mcp.tool()
     def spawn_workers(requests: list[dict]) -> str:
@@ -2082,6 +2355,26 @@ def _create_mcp_server(tools: OrchestratorTools):
         return json.dumps(tools.submit_directive(source_ts, source_text, interpretation))
 
     @mcp.tool()
+    def push_repo(repo: str, remote: str = "origin", branch: str = "") -> str:
+        """Submit a git push request for operator confirmation via Slack.
+
+        The push is NOT executed immediately. A message is posted to Slack where the operator
+        must react ✅ (white_check_mark) to confirm or ❌ (x) to cancel. The request expires
+        in 5 minutes. At most 5 pushes are allowed per hour.
+
+        Args:
+            repo: Absolute path to the git repository.
+            remote: Remote name to push to (default: origin).
+            branch: Local branch name to push. Must exist in the repository.
+
+        Returns JSON dict with status/id/expires_at on success, or error string on failure.
+        """
+        result = tools.push_repo(repo, remote, branch)
+        if isinstance(result, dict):
+            return json.dumps(result)
+        return result
+
+    @mcp.tool()
     def get_directives(status: str | None = None) -> str:
         """Retrieve directives, optionally filtered by status.
 
@@ -2171,16 +2464,28 @@ def main():
     from ironclaude.db import init_db
     from ironclaude.worker_registry import WorkerRegistry
     from ironclaude.tmux_manager import TmuxManager
+    from ironclaude.ssh_manager import SSHConnectionManager
 
     db_path = sys.argv[1] if len(sys.argv) > 1 else "data/db/ironclaude.db"
     log_dir = os.environ.get("IC_LOG_DIR", "/tmp/ic-logs")
     ledger_path = os.environ.get("IC_LEDGER_PATH", "/tmp/ic/task-ledger.json")
-    from ironclaude.config import load_config
+    from ironclaude.config import load_config, load_machines_config
     cfg = load_config()
 
     conn = init_db(db_path)
     registry = WorkerRegistry(conn)
-    tmux = TmuxManager(log_dir=log_dir)
+
+    ssh_manager = None
+    machines_cfg = load_machines_config()
+    if machines_cfg:
+        ssh_manager = SSHConnectionManager()
+        ssh_manager.register_machines(machines_cfg)
+        for name in ssh_manager.list_machine_names():
+            health = ssh_manager.health_check(name)
+            level = logging.INFO if health.ok else logging.WARNING
+            logger.log(level, f"Machine {name}: {health.details}")
+
+    tmux = TmuxManager(log_dir=log_dir, ssh_manager=ssh_manager)
 
     slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
     slack_channel = os.environ.get("SLACK_CHANNEL_ID", "")
@@ -2202,6 +2507,7 @@ def main():
         grader_model=cfg.get("grader_model", "claude-opus-4-6"),
         opus_model=cfg.get("default_opus_model", "claude-opus-4-6"),
         effort_level=cfg.get("effort_level", "high"),
+        ssh_manager=ssh_manager,
     )
 
     mcp = _create_mcp_server(tools)

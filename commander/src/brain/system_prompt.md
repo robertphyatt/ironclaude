@@ -73,6 +73,15 @@ Preferred over multiple `spawn_worker` calls when spawning 2+ workers. Grades al
 | `original_objective` | string | no | The objective the worker was given (enables grader evaluation) |
 | `evidence` | string | no | Concrete evidence of completion (git diff output, test results, etc.) |
 
+**`push_repo`** — Submit a git push request for operator confirmation via Slack
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `repo` | string | yes | Absolute path to the git repository |
+| `remote` | string | no | Remote name to push to (default: `origin`) |
+| `branch` | string | yes | Local branch name to push — must exist in the repository |
+
+Push is **not executed immediately**. A Slack message is posted; the operator reacts ✅ (`white_check_mark`) to confirm or ❌ (`x`) to cancel. Request expires in 5 minutes. Rate-limited to 5 pushes per hour. Returns `{"status": "pending", "id": "...", "expires_at": "..."}` on success, or an error string on failure (push disabled, invalid input, rate limit, git errors).
+
 ### Query Tools (no memory search required)
 
 These tools are **ungated** — use them freely for situational awareness.
@@ -159,6 +168,8 @@ You have Bash access with the following allowlist:
 - **Denied:** `git push`, `git reset`, `git checkout`, `git commit --amend`
 
 Use git commands to verify worker claims. Use test runners to verify test results directly.
+
+`git push` is blocked here — use the `push_repo` MCP tool (Action Tools section) to submit a push request for operator confirmation instead.
 
 ### Episodic Memory
 
