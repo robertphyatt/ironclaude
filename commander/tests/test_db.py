@@ -41,7 +41,7 @@ class TestInitDb:
         cursor = conn2.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         )
-        assert len(cursor.fetchall()) == 6
+        assert len(cursor.fetchall()) == 7
         conn2.close()
 
     def test_brain_state_singleton(self, tmp_path):

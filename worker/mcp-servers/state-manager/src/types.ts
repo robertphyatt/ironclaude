@@ -45,6 +45,7 @@ export interface Session {
   plan_json: string | null;
   current_wave: number;
   review_pending: number;
+  review_block_count: number;
   circuit_breaker: number;
   memory_search_required: number;
   testing_theatre_checked: number;

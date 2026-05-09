@@ -9,6 +9,7 @@ __pycache__/
 *.pyc
 commander/src/ironclaude/plugins/scan/
 commander/.env
+config/machines.yaml
 commander/data/db/*.db
 commander/data/db/*.db-shm
 commander/data/db/*.db-wal

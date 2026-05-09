@@ -807,8 +807,8 @@ export function handleWriteTool(
       // Update status to submitted using the DB row id
       updateWaveTaskStatus(db, waveTask.id, 'submitted');
 
-      // Set review_pending
-      updateSession(db, resolvedId, { review_pending: 1 });
+      // Set review_pending and reset deadlock counter
+      updateSession(db, resolvedId, { review_pending: 1, review_block_count: 0 });
 
       insertAuditLog(db, {
         terminal_session: resolvedId,
@@ -917,7 +917,7 @@ export function handleWriteTool(
            WHERE terminal_session = ? AND wave_number = ? AND status = 'submitted'`,
         ).run(resolvedId, session.current_wave);
         advancedCount = result.changes;
-        updateSession(db, resolvedId, { review_pending: 0 });
+        updateSession(db, resolvedId, { review_pending: 0, review_block_count: 0 });
       }
 
       insertAuditLog(db, {
@@ -1081,7 +1081,7 @@ export function handleWriteTool(
         );
       }
 
-      updateSession(db, resolvedId, { workflow_stage: 'executing', review_pending: 0 });
+      updateSession(db, resolvedId, { workflow_stage: 'executing', review_pending: 0, review_block_count: 0 });
 
       insertAuditLog(db, {
         terminal_session: resolvedId,

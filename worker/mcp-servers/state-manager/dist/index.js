@@ -12752,7 +12752,8 @@ function migrateSchema(db) {
   if (sessionsExists2) {
     const expectedColumns = [
       { name: "memory_search_required", type: "INTEGER NOT NULL", dflt: "0" },
-      { name: "testing_theatre_checked", type: "INTEGER NOT NULL", dflt: "0" }
+      { name: "testing_theatre_checked", type: "INTEGER NOT NULL", dflt: "0" },
+      { name: "review_block_count", type: "INTEGER NOT NULL", dflt: "0" }
     ];
     const currentColumns = db.prepare(`PRAGMA table_info(sessions)`).all();
     const columnNames = new Set(currentColumns.map((c) => c.name));
@@ -12786,6 +12787,7 @@ function initDb(dbPath) {
       plan_json TEXT,
       current_wave INTEGER NOT NULL DEFAULT 0,
       review_pending INTEGER NOT NULL DEFAULT 0,
+      review_block_count INTEGER NOT NULL DEFAULT 0,
       circuit_breaker INTEGER NOT NULL DEFAULT 0,
       memory_search_required INTEGER NOT NULL DEFAULT 0,
       testing_theatre_checked INTEGER NOT NULL DEFAULT 0,
@@ -13218,7 +13220,8 @@ var PlanJsonSchema = external_exports.object({
   name: external_exports.string().min(1),
   goal: external_exports.string().min(1),
   design_file: external_exports.string().min(1),
-  tasks: external_exports.array(PlanTaskSchema).min(1)
+  tasks: external_exports.array(PlanTaskSchema).min(1),
+  estimated_memory_gb: external_exports.number().positive().optional()
 });
 function validatePlanJson(json) {
   const errors = [];
@@ -14667,6 +14670,7 @@ function handleWriteTool(name, args, db, sessionId) {
            WHERE terminal_session = ? AND wave_number = ? AND status = 'submitted'`
         ).run(resolvedId, session.current_wave);
         advancedCount = result.changes;
+        updateSession(db, resolvedId, { review_pending: 0 });
       }
       insertAuditLog(db, {
         terminal_session: resolvedId,

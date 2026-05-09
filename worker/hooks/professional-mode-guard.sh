@@ -226,6 +226,13 @@ Allowed commands: sqlite3, git diff/status/log/show/blame/ls-files, pytest, make
 
 Do NOT run commands with shell operators during the reviewing stage."
       elif echo "$FILE_PATH" | grep -qE '^\s*(sqlite3|git\s+(diff|status|log|show|blame|ls-files)|pytest|make\s+test|cat|head|tail|wc|grep|rg|find|ls)\b'; then
+        if echo "$FILE_PATH" | grep -qE '^\s*sqlite3\b' && echo "$FILE_PATH" | grep -qiE '\b(UPDATE|INSERT|DELETE|DROP|ALTER|CREATE|REPLACE)\b'; then
+          block_pretooluse "professional-mode-guard" "BLOCKED — SQLITE WRITE OPERATIONS NOT ALLOWED DURING REVIEW
+
+You cannot modify database state during code review. Only SELECT and read-only operations are permitted.
+
+Do NOT attempt to modify the database directly. The MCP state manager is the only authorized path to update session state."
+        fi
         log_hook "professional-mode-guard" "Allowed" "safe bash during code review"
         exit 0
       else
@@ -328,7 +335,20 @@ Do NOT run git commit, git push, git merge, or git rebase."
     "SELECT review_pending FROM sessions WHERE terminal_session='${SAFE_SESSION}';" 2>/dev/null || echo "0")
   if [ "$REVIEW_PENDING" = "1" ]; then
     if [[ "$TOOL_NAME" == "Edit" || "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "MultiEdit" || "$TOOL_NAME" == "Bash" || "$TOOL_NAME" == "NotebookEdit" ]]; then
-      block_pretooluse "professional-mode-guard" "BLOCKED — CODE REVIEW PENDING
+      sqlite3 "$DB_PATH" ".timeout 5000" \
+        "UPDATE sessions SET review_block_count = review_block_count + 1 WHERE terminal_session='${SAFE_SESSION}';" 2>/dev/null || true
+      REVIEW_BLOCK_COUNT=$(sqlite3 "$DB_PATH" ".timeout 5000" \
+        "SELECT review_block_count FROM sessions WHERE terminal_session='${SAFE_SESSION}';" 2>/dev/null || echo "0")
+      if [ "${REVIEW_BLOCK_COUNT:-0}" -ge 5 ]; then
+        block_pretooluse "professional-mode-guard" "HARD FAILURE — REVIEW DEADLOCK DETECTED
+
+review_pending=1 has blocked 5+ tool calls. You cannot complete the pending code review (likely lost context due to compaction).
+
+DO NOT attempt to modify the database. DO NOT attempt workarounds.
+
+Stop all work immediately. The orchestrator will detect your idle state and take corrective action."
+      else
+        block_pretooluse "professional-mode-guard" "BLOCKED — CODE REVIEW PENDING
 
 You submitted work for review but code review has not completed yet. Write tools are blocked.
 
@@ -337,6 +357,7 @@ Call the Skill tool with:
   args: \"--task-boundary\"
 
 Do NOT use Edit, Write, MultiEdit, or Bash until code review completes."
+      fi
     fi
   fi
 

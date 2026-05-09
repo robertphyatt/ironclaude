@@ -68,6 +68,19 @@ CREATE TABLE IF NOT EXISTS directives (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS push_requests (
+    id TEXT PRIMARY KEY,
+    repo TEXT NOT NULL,
+    remote TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    commit_summary TEXT NOT NULL,
+    diff_stats TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    message_ts TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at TEXT NOT NULL
+);
 """
 
 

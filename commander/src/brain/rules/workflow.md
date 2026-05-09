@@ -229,6 +229,55 @@ When a worker transitions to executing plans and its plan includes `estimated_me
 
 **Re-evaluation cadence for paused workers:** Check `get_system_memory()` on every attention sweep. If available memory has increased (e.g., another worker finished), transition the paused worker to continue.
 
+### 5b. Remote Workers
+
+Some machines in the fleet are accessible via SSH and configured in `config/machines.yaml`. Remote workers are identical to local workers in lifecycle — same PM workflow, same monitoring, same review gates — but run on a different host.
+
+**Discovering remote machines:**
+
+Call `list_machines()` to see available remote hosts. Each entry includes:
+- `name` — machine identifier (used in `spawn_worker`)
+- `host` — SSH config alias or hostname
+- `purpose` — what this machine is for
+- `repos` — repository paths available on that machine
+- `healthy` — whether the last health check passed
+- `active_workers` — how many workers are currently running there
+- `max_workers` — capacity limit (null = unlimited)
+
+**Spawning on a remote machine:**
+
+Pass `machine="<name>"` to `spawn_worker`:
+
+```
+spawn_worker(
+    worker_id="fix-auth",
+    worker_type="claude-opus",
+    repo="/home/robert/Code/myproject",
+    objective="...",
+    machine="remote-worker"
+)
+```
+
+The system validates that the machine is healthy, the repo is in its allowed repos list, and the machine has capacity. If any check fails, spawn returns an error.
+
+**When to use remote workers:**
+
+| Scenario | Decision |
+|---|---|
+| Directive references a repo only available on a remote machine | Spawn on that machine |
+| Local machine is resource-constrained and remote has capacity | Spawn remotely |
+| Task has no machine preference | Spawn locally (default) |
+
+**Monitoring remote workers:**
+
+No difference from local workers. `get_worker_log`, `send_to_worker`, `send_keys_to_worker`, `kill_worker`, `approve_plan`, and `reject_plan` all work transparently — SSH is handled internally. The daemon's `check_workers` also monitors remote workers for idle markers and dead sessions.
+
+**Failure modes:**
+
+- SSH connection drops: worker appears as dead session on next daemon sweep, gets cleaned up
+- Remote machine reboots: same as above — tmux session is lost, daemon detects and cleans up
+- Health check fails at spawn time: spawn returns an error, choose a different machine or spawn locally
+
 ### 6. Execution Complete — Ship Workflow
 
 Worker has finished all tasks, staged changes, and suggests a commit message.
@@ -263,8 +312,31 @@ Worker has finished all tasks, staged changes, and suggests a commit message.
 **Do NOT:**
 - Commit without reading the diff (rubber-stamping)
 - Let the worker commit (workers stage only, Brain commits)
-- Push (Brain does not have push access — {OPERATOR_NAME} pushes manually)
+- Run `git push` via Bash (blocked) — use `push_repo` MCP tool instead (see section 6a)
 - Amend previous commits (git commit --amend is blocked)
+
+### 6a. Git Push Workflow
+
+Brain cannot run `git push` directly (Bash allowlist blocks it). Use the `push_repo` MCP tool to request a push:
+
+1. **Verify `push_enabled`** — `push_repo` returns an error string if `push_enabled: false` in daemon config. Confirm with {OPERATOR_NAME} before attempting if you're unsure.
+2. **Call `push_repo`** with `repo` (absolute path), `remote`, and `branch`
+   - Returns `{"status": "pending", "id": "...", "expires_at": "..."}` on success
+   - Returns an error string on failure (disabled, invalid input, rate limit, git error)
+3. **Daemon posts to Slack automatically** — a message appears with ✅/❌ reaction prompts
+4. **{OPERATOR_NAME} reacts within 5 minutes** — ✅ to confirm, ❌ to cancel
+5. **Daemon executes** `git push <remote> <branch>` if confirmed; marks the request rejected otherwise
+6. **Brain receives notification** of the outcome (completed/rejected/failed/expired)
+
+**Constraints:**
+- TTL: 5 minutes — request expires if {OPERATOR_NAME} does not react in time
+- Rate limit: 5 pushes per hour — don't submit multiple requests for the same branch
+- Gate: `push_enabled` must be `true` in daemon config
+
+**Do NOT:**
+- Call `push_repo` before confirming `push_enabled: true` is set
+- Submit a second push request for the same repo before the first resolves
+- Use Bash `git push` (blocked — will return an error)
 
 ## Context Recovery Priority
 
