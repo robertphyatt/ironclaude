@@ -348,6 +348,17 @@ The Grader catches these patterns because it evaluates each decision against a s
 
 ---
 
+## Wiki Knowledge Layer
+
+IronClaude implements [Andrej Karpathy's LLM wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) as a synthesis layer between episodic memory (raw conversation archives) and rules (CLAUDE.md + behavioral directives). The Brain maintains a persistent wiki of markdown pages at `~/.ironclaude/brain/wiki/`, automatically synthesizing patterns and decisions from episodic memory into structured, queryable knowledge.
+
+Three convergence mechanisms keep the wiki current:
+- **Post-directive ingest** — captures learnings after each completed directive
+- **Periodic sweeps** — fills gaps by searching episodic memory for uncaptured patterns
+- **Search-triggered synthesis** — evaluates every episodic memory search for wiki-worthy knowledge
+
+---
+
 ## Security Model
 
 Commander workers run with `--dangerously-skip-permissions`. This is intentional.

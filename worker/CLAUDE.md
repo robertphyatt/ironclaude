@@ -52,3 +52,12 @@
    - NEVER declare a file "unreadable" or "too big" — decompose instead: grep → identify lines → read ranges
    - For any large file: Grep for relevant patterns → identify line numbers → Read with offset+limit
    - "The file is too large" is the start of a decomposition strategy, not a stopping condition
+
+10. **Monitor Background Processes with Scheduled Wakeups**
+   - NEVER poll: launch → re-check immediately → try to stop → re-check → wasted token loop
+   - CORRECT pattern: launch → schedule wakeup (15 min minimum) → on wakeup: READ output → assess → act
+   - On each heartbeat: READ the background output — parse for errors, progress rate, completion; do NOT just check if the process is alive
+   - If working (output flowing, no errors): let it cook — no intervention, schedule next wakeup
+   - If problem detected (errors, stalls, process died): call it out immediately, do NOT wait for next heartbeat
+   - Use `/loop` or ScheduleWakeup — do NOT repeatedly stop and restart the process
+   - Report to Brain only on: errors detected, process died, or pipeline completed

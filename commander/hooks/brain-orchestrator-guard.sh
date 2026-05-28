@@ -1,12 +1,11 @@
 #!/bin/bash
-# brain-orchestrator-guard.sh — PreToolUse hook for IronClaude Brain session.
+# brain-orchestrator-guard.sh — PreToolUse hook for IronClaude Brain session only.
 # Hard-blocks Edit, Write, NotebookEdit, MultiEdit, and non-allowlisted Bash commands.
-# The Brain is an orchestrator — all code changes must go through workers.
+# Workers (IC_ROLE=worker) and direct sessions pass through — only Brain is restricted.
 
-# Require IC_ROLE to be set — daemon sets it; direct sessions are blocked.
-if [ -z "$IC_ROLE" ]; then
-  echo "BLOCKED — Brain requires IC_ROLE. Start via daemon." >&2
-  exit 2
+# Only apply restrictions to the Brain session.
+if [ "$IC_ROLE" != "brain" ]; then
+  exit 0
 fi
 
 INPUT=$(cat)

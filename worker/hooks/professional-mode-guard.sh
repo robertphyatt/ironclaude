@@ -40,6 +40,20 @@ if [ "$prof_mode" = "undecided" ]; then
       exit 0
     fi
   fi
+  # .claude/rules/: allow Write/Edit during undecided setup (activation skill writes behavioral.md)
+  if [[ "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "Edit" ]]; then
+    if [[ "$FILE_PATH" == *"/.claude/rules/"* ]] || [[ "$FILE_PATH" == ".claude/rules/"* ]]; then
+      log_hook "professional-mode-guard" "Allowed" ".claude/rules/ write during undecided setup"
+      exit 0
+    fi
+  fi
+  # Bash mkdir .claude/rules/: allow during undecided setup (activation skill creates directory)
+  if [[ "$TOOL_NAME" == "Bash" ]]; then
+    if [[ "$FILE_PATH" =~ mkdir.*\.claude/rules ]]; then
+      log_hook "professional-mode-guard" "Allowed" "mkdir .claude/rules during undecided setup"
+      exit 0
+    fi
+  fi
   case "$TOOL_NAME" in
     Read|Grep|Glob)
       log_hook "professional-mode-guard" "Allowed" "read-only tool (undecided)"

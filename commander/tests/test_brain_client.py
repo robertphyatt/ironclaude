@@ -1,7 +1,10 @@
 # tests/test_brain_client.py
 import asyncio
+import os
 import threading
 import time
+import json
+from datetime import datetime, timezone, timedelta
 import pytest
 from ironclaude.brain_client import BrainClient, _backoff_seconds
 
@@ -88,10 +91,10 @@ class TestBrainToolRestrictions:
 
 
 class TestBrainModelParameter:
-    def test_default_model_is_opus_4_6(self):
-        """BrainClient defaults to claude-opus-4-6."""
+    def test_default_model_is_opus_4_6_1m(self):
+        """BrainClient defaults to claude-opus-4."""
         client = BrainClient()
-        assert client._model == "claude-opus-4-6"
+        assert client._model == "claude-opus-4"
 
     def test_model_parameter_accepted(self):
         """BrainClient accepts custom model parameter."""
@@ -354,7 +357,7 @@ class TestMemoryToggle:
             "mcp__orchestrator__spawn_worker", {"worker_id": "w1"}
         )
         assert allowed is False
-        assert "search episodic memory" in msg.lower()
+        assert "episodic memory search" in msg.lower()
         assert "Operator" in msg  # default operator_name
 
     def test_gated_tool_denied_uses_operator_name(self):
@@ -380,6 +383,7 @@ class TestMemoryToggle:
         """Gated tool passes when memory was searched first."""
         client = BrainClient()
         client._memory_armed = True
+        client._wiki_queried = True
         allowed, msg = client._tool_guard_logic(
             "mcp__orchestrator__approve_plan", {"worker_id": "w1", "rationale": "ok"}
         )
@@ -390,10 +394,12 @@ class TestMemoryToggle:
         """Using a gated tool resets _memory_armed to False."""
         client = BrainClient()
         client._memory_armed = True
+        client._wiki_queried = True
         client._tool_guard_logic(
             "mcp__orchestrator__reject_plan", {"worker_id": "w1", "reason": "bad"}
         )
         assert client._memory_armed is False
+        assert client._wiki_queried is False
 
     def test_kill_worker_denied_when_unarmed(self):
         """kill_worker is a gated tool — denied when memory not searched first."""
@@ -402,7 +408,7 @@ class TestMemoryToggle:
             "mcp__orchestrator__kill_worker", {"worker_id": "w1"}
         )
         assert allowed is False
-        assert "search episodic memory" in msg.lower()
+        assert "episodic memory search" in msg.lower()
 
     def test_spawn_workers_denied_when_unarmed(self):
         """spawn_workers (plural) is a gated tool — denied when memory not searched first."""
@@ -411,29 +417,33 @@ class TestMemoryToggle:
             "mcp__orchestrator__spawn_workers", {"requests": []}
         )
         assert allowed is False
-        assert "search episodic memory" in msg.lower()
+        assert "episodic memory search" in msg.lower()
 
     def test_kill_worker_allowed_when_armed(self):
         """kill_worker allowed and disarms toggle when memory was searched first."""
         client = BrainClient()
         client._memory_armed = True
+        client._wiki_queried = True
         allowed, msg = client._tool_guard_logic(
             "mcp__orchestrator__kill_worker", {"worker_id": "w1"}
         )
         assert allowed is True
         assert msg is None
         assert client._memory_armed is False
+        assert client._wiki_queried is False
 
     def test_spawn_workers_allowed_when_armed(self):
         """spawn_workers (plural) allowed and disarms toggle when memory was searched first."""
         client = BrainClient()
         client._memory_armed = True
+        client._wiki_queried = True
         allowed, msg = client._tool_guard_logic(
             "mcp__orchestrator__spawn_workers", {"requests": []}
         )
         assert allowed is True
         assert msg is None
         assert client._memory_armed is False
+        assert client._wiki_queried is False
 
     def test_query_tools_bypass_toggle(self):
         """Query tools (get_worker_status, etc.) always allowed regardless of toggle."""
@@ -688,7 +698,7 @@ class TestResearchOllamaToolGuard:
             assert "memory" in msg.lower()
 
     def test_ollama_mutation_tools_allowed_when_armed(self):
-        """Ollama mutation tools allowed when _memory_armed is True."""
+        """Ollama mutation tools allowed when both flags are set."""
         client = BrainClient()
         for tool_name in [
             "mcp__ollama__pull_model",
@@ -696,16 +706,19 @@ class TestResearchOllamaToolGuard:
             "mcp__ollama__create_model",
         ]:
             client._memory_armed = True
+            client._wiki_queried = True
             allowed, msg = client._tool_guard_logic(tool_name, {})
             assert allowed is True, f"{tool_name} should be allowed when armed"
             assert msg is None
 
     def test_ollama_mutation_disarms_toggle(self):
-        """Using an ollama mutation tool resets _memory_armed to False."""
+        """Using an ollama mutation tool resets both flags to False."""
         client = BrainClient()
         client._memory_armed = True
+        client._wiki_queried = True
         client._tool_guard_logic("mcp__ollama__pull_model", {})
         assert client._memory_armed is False
+        assert client._wiki_queried is False
 
 
 class TestDefaultDenyGuard:
@@ -1444,3 +1457,479 @@ class TestMutationToolFirstCheck:
         allowed, msg = client._tool_guard_logic("Edit", {})
         assert allowed is False
         assert msg == "Brain cannot use mutation tools — route through workers"
+
+
+class TestWikiGate:
+    """Dual-flag gate: both episodic memory search AND wiki_query required before gated tools."""
+
+    def test_wiki_queried_initial_state(self):
+        client = BrainClient()
+        assert client._wiki_queried is False
+
+    def test_wiki_query_sets_flag(self):
+        client = BrainClient()
+        allowed, msg = client._tool_guard_logic(
+            "mcp__orchestrator__wiki_query", {"keywords": "test"}
+        )
+        assert allowed is True
+        assert client._wiki_queried is True
+
+    def test_gated_denied_memory_only(self):
+        """Gated tool denied when only memory is armed (wiki not queried)."""
+        client = BrainClient()
+        client._memory_armed = True
+        client._wiki_queried = False
+        allowed, msg = client._tool_guard_logic(
+            "mcp__orchestrator__spawn_worker", {"worker_id": "w1"}
+        )
+        assert allowed is False
+        assert "wiki" in msg.lower()
+
+    def test_gated_denied_wiki_only(self):
+        """Gated tool denied when only wiki is queried (memory not searched)."""
+        client = BrainClient()
+        client._memory_armed = False
+        client._wiki_queried = True
+        allowed, msg = client._tool_guard_logic(
+            "mcp__orchestrator__spawn_worker", {"worker_id": "w1"}
+        )
+        assert allowed is False
+
+    def test_gated_allowed_both_flags(self):
+        """Gated tool allowed when both flags are set."""
+        client = BrainClient()
+        client._memory_armed = True
+        client._wiki_queried = True
+        allowed, msg = client._tool_guard_logic(
+            "mcp__orchestrator__spawn_worker", {"worker_id": "w1"}
+        )
+        assert allowed is True
+
+    def test_both_flags_reset_after_gated(self):
+        """Both flags reset to False after gated tool fires."""
+        client = BrainClient()
+        client._memory_armed = True
+        client._wiki_queried = True
+        client._tool_guard_logic(
+            "mcp__orchestrator__approve_plan", {"worker_id": "w1", "rationale": "ok"}
+        )
+        assert client._memory_armed is False
+        assert client._wiki_queried is False
+
+    def test_wiki_query_is_orchestrator_tool(self):
+        """wiki_query itself is allowed as an orchestrator tool (not gated)."""
+        client = BrainClient()
+        assert client._memory_armed is False
+        allowed, msg = client._tool_guard_logic(
+            "mcp__orchestrator__wiki_query", {"keywords": "test"}
+        )
+        assert allowed is True
+
+    def test_wiki_write_ungated(self):
+        """wiki_write is a regular orchestrator tool — ungated, doesn't set flags."""
+        client = BrainClient()
+        allowed, msg = client._tool_guard_logic(
+            "mcp__orchestrator__wiki_write", {"page": "test", "title": "Test", "content": "c"}
+        )
+        assert allowed is True
+        assert client._wiki_queried is False
+
+    def test_full_gate_sequence(self):
+        """Full flow: search episodic → query wiki → gated action allowed → flags reset."""
+        client = BrainClient()
+        client._tool_guard_logic("mcp__episodic-memory__search", {"query": "test"})
+        assert client._memory_armed is True
+        assert client._wiki_queried is False
+        client._tool_guard_logic("mcp__orchestrator__wiki_query", {"keywords": "test"})
+        assert client._wiki_queried is True
+        allowed, _ = client._tool_guard_logic(
+            "mcp__orchestrator__kill_worker", {"worker_id": "w1"}
+        )
+        assert allowed is True
+        assert client._memory_armed is False
+        assert client._wiki_queried is False
+
+
+class TestLedgerStale:
+    def test_returns_none_when_cwd_not_set(self):
+        client = BrainClient()
+        assert client._ledger_stale() is None
+
+    def test_returns_none_when_tasks_md_absent(self, tmp_path):
+        client = BrainClient()
+        client._cwd = str(tmp_path)
+        assert client._ledger_stale() is None
+
+    def test_returns_none_when_no_in_progress_tasks(self, tmp_path):
+        client = BrainClient()
+        client._cwd = str(tmp_path)
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+        (wiki_dir / "tasks.md").write_text('{"status": "completed"}')
+        assert client._ledger_stale() is None
+
+    def test_returns_none_when_recently_updated(self, tmp_path):
+        client = BrainClient()
+        client._cwd = str(tmp_path)
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+        (wiki_dir / "tasks.md").write_text('"status": "in_progress"')
+        # mtime defaults to now — not stale
+        assert client._ledger_stale() is None
+
+    def test_returns_age_when_stale_with_in_progress(self, tmp_path):
+        client = BrainClient()
+        client._cwd = str(tmp_path)
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+        tasks_md = wiki_dir / "tasks.md"
+        tasks_md.write_text('"status": "in_progress"')
+        old_mtime = time.time() - 35 * 60
+        os.utime(str(tasks_md), (old_mtime, old_mtime))
+        result = client._ledger_stale()
+        assert result is not None
+        assert result >= 35
+
+
+class TestLedgerFreshnessEnforcement:
+    def test_gated_tool_blocked_when_ledger_stale(self, tmp_path):
+        client = BrainClient()
+        client._cwd = str(tmp_path)
+        client._memory_armed = True
+        client._wiki_queried = True
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+        tasks_md = wiki_dir / "tasks.md"
+        tasks_md.write_text('"status": "in_progress"')
+        old_mtime = time.time() - 35 * 60
+        os.utime(str(tasks_md), (old_mtime, old_mtime))
+        allowed, msg = client._tool_guard_logic("mcp__orchestrator__spawn_worker", {})
+        assert not allowed
+        assert "stale" in msg.lower()
+
+    def test_gated_tool_allowed_when_ledger_fresh(self, tmp_path):
+        client = BrainClient()
+        client._cwd = str(tmp_path)
+        client._memory_armed = True
+        client._wiki_queried = True
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+        (wiki_dir / "tasks.md").write_text('"status": "in_progress"')
+        # mtime defaults to now — fresh
+        allowed, msg = client._tool_guard_logic("mcp__orchestrator__spawn_worker", {})
+        assert allowed
+        assert msg is None
+
+    def test_gates_not_consumed_when_ledger_stale(self, tmp_path):
+        """When ledger is stale, _memory_armed and _wiki_queried stay True."""
+        client = BrainClient()
+        client._cwd = str(tmp_path)
+        client._memory_armed = True
+        client._wiki_queried = True
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+        tasks_md = wiki_dir / "tasks.md"
+        tasks_md.write_text('"status": "in_progress"')
+        old_mtime = time.time() - 35 * 60
+        os.utime(str(tasks_md), (old_mtime, old_mtime))
+        client._tool_guard_logic("mcp__orchestrator__spawn_worker", {})
+        assert client._memory_armed is True
+        assert client._wiki_queried is True
+
+
+class TestLedgerStalePerTask:
+    def _write_tasks_md(self, path, status_set_at, status="in_progress"):
+        """Write a tasks.md with one task and the given status_set_at."""
+        blob = json.dumps({
+            "objective": "Test",
+            "tasks": [{"id": "t1", "description": "T1", "status": status, "status_set_at": status_set_at}]
+        })
+        path.write_text(
+            f'**Objective:** Test\n\n## Tasks\n\n| ID | Description | Status |\n'
+            f'|----|-------------|--------|\n| t1 | T1 | {status} |\n\n'
+            f'## Data\n\n```json\n{blob}\n```\n'
+        )
+
+    def test_blocks_when_in_progress_task_exceeds_threshold(self, tmp_path):
+        """_ledger_stale returns age when in_progress task exceeds task_staleness_threshold_hours."""
+        client = BrainClient()
+        client._cwd = str(tmp_path)
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+        old_ts = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+        self._write_tasks_md(wiki_dir / "tasks.md", old_ts)
+        result = client._ledger_stale()
+        assert result is not None
+        assert result >= 4 * 60  # default 4h threshold × 60 min/h
+
+    def test_allows_when_in_progress_task_within_threshold(self, tmp_path):
+        """_ledger_stale returns None when in_progress task is recent."""
+        client = BrainClient()
+        client._cwd = str(tmp_path)
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+        recent_ts = datetime.now(timezone.utc).isoformat()
+        self._write_tasks_md(wiki_dir / "tasks.md", recent_ts)
+        result = client._ledger_stale()
+        assert result is None
+
+    def test_allows_when_status_set_at_absent(self, tmp_path):
+        """Tasks without status_set_at are skipped (fail-open for backward compat)."""
+        client = BrainClient()
+        client._cwd = str(tmp_path)
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+        blob = json.dumps({
+            "objective": "Test",
+            "tasks": [{"id": "t1", "description": "T1", "status": "in_progress"}]
+        })
+        (wiki_dir / "tasks.md").write_text(f'## Data\n\n```json\n{blob}\n```\n')
+        assert client._ledger_stale() is None
+
+    def test_ignores_non_in_progress_statuses(self, tmp_path):
+        """pending tasks with old status_set_at do not trigger the per-task check."""
+        client = BrainClient()
+        client._cwd = str(tmp_path)
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+        old_ts = (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat()
+        blob = json.dumps({
+            "objective": "Test",
+            "tasks": [{"id": "t1", "description": "T1", "status": "pending", "status_set_at": old_ts}]
+        })
+        # Inject "in_progress" in objective text so the early string check passes
+        content = (
+            f'**Objective:** ignore in_progress ref\n\n## Data\n\n```json\n{blob}\n```\n'
+        )
+        (wiki_dir / "tasks.md").write_text(content)
+        assert client._ledger_stale() is None
+
+
+class TestTokenUsageAccumulation:
+    def test_get_token_usage_initial_zeros(self):
+        """Fresh BrainClient returns all-zero usage."""
+        client = BrainClient()
+        usage = client.get_token_usage()
+        assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
+
+    def test_get_token_usage_reflects_accumulated_state(self):
+        """get_token_usage() reads directly from accumulator attributes."""
+        client = BrainClient()
+        client._total_input_tokens = 42100
+        client._total_output_tokens = 108100
+        client._total_cost_usd = 0.12
+        usage = client.get_token_usage()
+        assert usage["input_tokens"] == 42100
+        assert usage["output_tokens"] == 108100
+        assert usage["total_tokens"] == 150200
+        assert usage["cost_usd"] == 0.12
+
+    def test_restart_resets_token_accumulators(self):
+        """restart() resets token accumulators to zero before starting new session."""
+        client = BrainClient()
+        client._total_input_tokens = 50000
+        client._total_output_tokens = 100000
+        client._total_cost_usd = 0.75
+        client.start = lambda *a, **kw: setattr(client, '_running', True)
+        client.restart("test prompt")
+        assert client._total_input_tokens == 0
+        assert client._total_output_tokens == 0
+        assert client._total_cost_usd == 0.0
+
+
+class TestSessionLogRotation:
+    def test_keeps_last_10_logs(self, tmp_path, monkeypatch):
+        """_init_session_log deletes oldest logs when count exceeds SESSION_LOG_KEEP."""
+        monkeypatch.setattr(BrainClient, 'SESSION_LOG_DIR', str(tmp_path))
+        for i in range(12):
+            (tmp_path / f"20260524-{i:06d}-000000.log").write_text(f"session {i}")
+        client = BrainClient()
+        client._init_session_log()
+        logs = sorted(tmp_path.glob("*.log"))
+        assert len(logs) == 10
+        assert not (tmp_path / "20260524-000000-000000.log").exists()
+        assert not (tmp_path / "20260524-000001-000000.log").exists()
+
+    def test_no_deletion_below_limit(self, tmp_path, monkeypatch):
+        """_init_session_log does not delete when under SESSION_LOG_KEEP."""
+        monkeypatch.setattr(BrainClient, 'SESSION_LOG_DIR', str(tmp_path))
+        for i in range(5):
+            (tmp_path / f"20260524-{i:06d}-000000.log").write_text(f"session {i}")
+        client = BrainClient()
+        client._init_session_log()
+        logs = list(tmp_path.glob("*.log"))
+        assert len(logs) == 6  # 5 existing + 1 new
+
+    def test_creates_new_log_file(self, tmp_path, monkeypatch):
+        """_init_session_log creates a new .log file and sets _session_log_path."""
+        monkeypatch.setattr(BrainClient, 'SESSION_LOG_DIR', str(tmp_path))
+        client = BrainClient()
+        client._init_session_log()
+        assert client._session_log_path is not None
+        from pathlib import Path
+        assert Path(client._session_log_path).exists()
+
+
+class TestPreviousSessionTail:
+    def test_returns_last_20_lines(self, tmp_path):
+        """_read_previous_session_tail returns last 20 lines of file."""
+        log_file = tmp_path / "session.log"
+        lines = [f"line {i}" for i in range(25)]
+        log_file.write_text("\n".join(lines) + "\n")
+        client = BrainClient()
+        result = client._read_previous_session_tail(str(log_file))
+        assert result == "\n".join(lines[-20:])
+
+    def test_returns_empty_for_nonexistent_file(self):
+        """_read_previous_session_tail returns '' for missing file."""
+        client = BrainClient()
+        assert client._read_previous_session_tail("/nonexistent/path.log") == ""
+
+    def test_returns_all_lines_when_fewer_than_20(self, tmp_path):
+        """Returns all lines when file has fewer than 20."""
+        log_file = tmp_path / "session.log"
+        lines = [f"line {i}" for i in range(5)]
+        log_file.write_text("\n".join(lines) + "\n")
+        client = BrainClient()
+        result = client._read_previous_session_tail(str(log_file))
+        assert result == "\n".join(lines)
+
+
+class TestLogEntryFormat:
+    def test_entry_has_iso8601z_prefix(self, tmp_path):
+        """_session_log_write writes entry with ISO8601Z timestamp prefix."""
+        import re
+        client = BrainClient()
+        client._session_log_path = str(tmp_path / "session.log")
+        client._session_log_write("MSG_RECV chars=10 preview='hello'")
+        content = (tmp_path / "session.log").read_text()
+        assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z MSG_RECV", content)
+
+    def test_entry_appends_to_file(self, tmp_path):
+        """_session_log_write appends, does not overwrite."""
+        client = BrainClient()
+        client._session_log_path = str(tmp_path / "session.log")
+        client._session_log_write("ENTRY_ONE")
+        client._session_log_write("ENTRY_TWO")
+        content = (tmp_path / "session.log").read_text()
+        assert "ENTRY_ONE" in content
+        assert "ENTRY_TWO" in content
+
+    def test_write_safe_when_path_none(self):
+        """_session_log_write is safe when _session_log_path is None."""
+        client = BrainClient()
+        assert client._session_log_path is None
+        client._session_log_write("should not raise")  # must not raise
+
+    def test_session_start_written_on_init(self, tmp_path, monkeypatch):
+        """_init_session_log writes SESSION_START entry."""
+        monkeypatch.setattr(BrainClient, 'SESSION_LOG_DIR', str(tmp_path))
+        client = BrainClient()
+        client._init_session_log()
+        from pathlib import Path
+        content = Path(client._session_log_path).read_text()
+        assert "SESSION_START" in content
+
+
+class TestFreshStartNoHistory:
+    def test_no_error_on_empty_dir(self, tmp_path, monkeypatch):
+        """_init_session_log succeeds with empty brain-sessions dir."""
+        monkeypatch.setattr(BrainClient, 'SESSION_LOG_DIR', str(tmp_path))
+        client = BrainClient()
+        client._init_session_log()  # must not raise
+        assert client._session_log_path is not None
+
+    def test_previous_context_none_after_init(self):
+        """_previous_session_context is None after __init__."""
+        client = BrainClient()
+        assert client._previous_session_context is None
+
+    def test_session_log_path_none_after_init(self):
+        """_session_log_path is None after __init__ (not yet started)."""
+        client = BrainClient()
+        assert client._session_log_path is None
+
+
+class TestSessionLogLifecycle:
+    """Session log wiring: start() creates log, restart() injects diagnostic."""
+
+    def _patch_start(self, client, tmp_path, monkeypatch):
+        """Make start() complete fast: no process management, real session log."""
+        import asyncio
+        monkeypatch.setattr(BrainClient, 'SESSION_LOG_DIR', str(tmp_path))
+        monkeypatch.setattr(client, '_kill_brain_subprocess', lambda: None)
+        monkeypatch.setattr(
+            BrainClient, 'discover_episodic_memory_path',
+            staticmethod(lambda *a, **kw: '/fake/path'),
+        )
+
+        def _fake_event_loop(system_prompt, cwd):
+            client._loop = asyncio.new_event_loop()
+
+        monkeypatch.setattr(client, '_run_event_loop', _fake_event_loop)
+
+    def test_start_creates_session_log(self, tmp_path, monkeypatch):
+        """start() initializes a session log file via _init_session_log()."""
+        from pathlib import Path
+        client = BrainClient()
+        self._patch_start(client, tmp_path, monkeypatch)
+        client.start('test prompt')
+        assert client._session_log_path is not None
+        assert Path(client._session_log_path).exists()
+
+    def test_restart_sends_diagnostic_when_previous_log_exists(self, tmp_path, monkeypatch):
+        """restart() sends [DIAGNOSTIC] message when previous session log exists."""
+        log_file = tmp_path / "prev-session.log"
+        log_file.write_text("line1\nline2\nline3\n")
+        client = BrainClient()
+        client._session_log_path = str(log_file)
+
+        sent_messages = []
+        monkeypatch.setattr(client, 'shutdown', lambda: None)
+        monkeypatch.setattr(client, 'start', lambda *a, **kw: None)
+        monkeypatch.setattr(client, 'is_alive', lambda: True)
+        monkeypatch.setattr(client, 'send_message',
+                            lambda text: sent_messages.append(text) or True)
+
+        client.restart('test prompt')
+
+        assert any('[DIAGNOSTIC]' in m for m in sent_messages)
+
+    def test_restart_no_diagnostic_when_no_previous_log(self, monkeypatch):
+        """restart() does not send [DIAGNOSTIC] when no previous session log."""
+        client = BrainClient()
+        assert client._session_log_path is None
+
+        sent_messages = []
+        monkeypatch.setattr(client, 'shutdown', lambda: None)
+        monkeypatch.setattr(client, 'start', lambda *a, **kw: None)
+        monkeypatch.setattr(client, 'is_alive', lambda: True)
+        monkeypatch.setattr(client, 'send_message',
+                            lambda text: sent_messages.append(text) or True)
+
+        client.restart('test prompt')
+
+        assert not any('[DIAGNOSTIC]' in m for m in sent_messages)
+
+    def test_restart_diagnostic_includes_previous_log_content(self, tmp_path, monkeypatch):
+        """restart() diagnostic message contains last 20 lines of previous session log."""
+        lines = [f"2026-05-24T10:00:{i:02d}.000000Z TOOL_INVOKE name=mcp__test" for i in range(25)]
+        log_file = tmp_path / "prev-session.log"
+        log_file.write_text("\n".join(lines) + "\n")
+
+        client = BrainClient()
+        client._session_log_path = str(log_file)
+
+        sent_messages = []
+        monkeypatch.setattr(client, 'shutdown', lambda: None)
+        monkeypatch.setattr(client, 'start', lambda *a, **kw: None)
+        monkeypatch.setattr(client, 'is_alive', lambda: True)
+        monkeypatch.setattr(client, 'send_message',
+                            lambda text: sent_messages.append(text) or True)
+
+        client.restart('test prompt')
+
+        diagnostic = next((m for m in sent_messages if '[DIAGNOSTIC]' in m), None)
+        assert diagnostic is not None
+        assert lines[-1] in diagnostic     # last line present
+        assert lines[0] not in diagnostic  # oldest line dropped (only last 20 kept)

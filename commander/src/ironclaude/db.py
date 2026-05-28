@@ -89,7 +89,7 @@ def init_db(db_path: str) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=1000")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
     # Ensure brain_state singleton row exists
     conn.execute(

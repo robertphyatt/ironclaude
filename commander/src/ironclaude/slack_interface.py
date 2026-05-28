@@ -177,13 +177,14 @@ class SlackBot:
         oldest_ts: str,
         latest_ts: str,
         only_operator: bool = True,
+        channel: str | None = None,
     ) -> list[dict]:
         """Fetch messages in exact timestamp range using conversations.history.
 
         Uses bot token (no user token required). Returns messages with file metadata.
         """
         result = self._client.conversations_history(
-            channel=self._channel_id,
+            channel=channel or self._channel_id,
             oldest=oldest_ts,
             latest=latest_ts,
             inclusive=True,
@@ -227,6 +228,28 @@ class SlackBot:
             if hasattr(e, "response") and e.response.data.get("error") == "no_reaction":
                 return True
             logger.warning(f"Slack remove_reaction failed: {e}")
+            return False
+
+    def pin_message(self, timestamp: str) -> bool:
+        """Pin a message in the channel. Returns True on success or if already pinned."""
+        try:
+            self._client.pins_add(channel=self._channel_id, timestamp=timestamp)
+            return True
+        except Exception as e:
+            if hasattr(e, "response") and e.response.data.get("error") == "already_pinned":
+                return True
+            logger.warning(f"Slack pin_message failed: {e}")
+            return False
+
+    def unpin_message(self, timestamp: str) -> bool:
+        """Unpin a message in the channel. Returns True on success or if not pinned."""
+        try:
+            self._client.pins_remove(channel=self._channel_id, timestamp=timestamp)
+            return True
+        except Exception as e:
+            if hasattr(e, "response") and e.response.data.get("error") == "no_pin":
+                return True
+            logger.warning(f"Slack unpin_message failed: {e}")
             return False
 
     def get_reactions(self, timestamp: str) -> list[dict]:

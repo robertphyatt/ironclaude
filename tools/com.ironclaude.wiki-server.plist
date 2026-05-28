@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ironclaude.wiki-server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>REPO_DIR/commander/.venv/bin/python</string>
+        <string>REPO_DIR/tools/wiki_server.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>REPO_DIR</string>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/ic/wiki-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/ic/wiki-server.log</string>
+</dict>
+</plist>

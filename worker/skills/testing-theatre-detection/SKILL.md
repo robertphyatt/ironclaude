@@ -463,3 +463,16 @@ All issues must be fixed before production readiness.
 - Provide problem description, risk, and fix guidance
 - Add code examples for concrete fixes (no assertions, skipped tests)
 - Add bullet points for conceptual fixes (over-mocking, architecture)
+
+## Signal Completion
+
+After generating the report (regardless of whether issues were found), signal completion to the workflow state manager:
+
+```
+Use MCP tool: mcp__plugin_ironclaude_state-manager__set_testing_theatre_checked
+(no parameters required)
+```
+
+This sets `testing_theatre_checked=1` in the database for the current session. The code-review skill reads this flag at Step 6.5 to determine whether testing-theatre-detection was invoked before assigning a final grade. Without this call, code-review caps the grade at C and the worker cannot advance.
+
+If the MCP tool returns an error, display the error message — do NOT silently proceed.

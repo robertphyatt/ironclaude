@@ -140,7 +140,9 @@ assert_eq "cat chain exfil: blocked" "blocked" "$(is_reviewing_allowed 'cat /etc
 
 # ─── M2 TESTS: Memory File Path Traversal ───
 echo "=== M2: Memory File Path Traversal ==="
-PROJ_MEMORY="$HOME/.claude/projects/-project-dir/memory"
+_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+_PROJECT_SLUG="${_REPO_ROOT//\//-}"
+PROJ_MEMORY="$HOME/.claude/projects/$_PROJECT_SLUG/memory"
 
 assert_eq "valid memory file: allowed" "allowed" "$(is_safe_memory_path "$PROJ_MEMORY/user_profile.md")"
 assert_eq "MEMORY.md index: allowed" "allowed" "$(is_safe_memory_path "$PROJ_MEMORY/MEMORY.md")"

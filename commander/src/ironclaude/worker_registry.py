@@ -138,3 +138,16 @@ class WorkerRegistry:
             "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_events_for_worker(self, worker_id: str, event_type: str | None = None) -> list[dict]:
+        if event_type:
+            rows = self._conn.execute(
+                "SELECT * FROM events WHERE worker_id = ? AND event_type = ? ORDER BY id",
+                (worker_id, event_type),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM events WHERE worker_id = ? ORDER BY id",
+                (worker_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
