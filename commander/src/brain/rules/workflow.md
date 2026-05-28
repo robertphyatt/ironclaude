@@ -109,6 +109,29 @@ If you can spawn 5 workers, spawn 5. The sweep protocol ensures you review ALL o
 
 **Anti-recency-bias rule:** The sweep order is the INVENTORY order (from `get_worker_status`), not the order of most recent notifications. Do not skip earlier workers because a later notification arrived.
 
+**Step 4 — Directive staleness check:**
+
+Cross-reference `in_progress` and `pending_confirmation` directives against evidence of completion:
+
+For each `in_progress` directive:
+1. Check `get_worker_status()` — is a worker still running for this directive's work?
+2. Check `git log --oneline -20` for a commit message that addresses this directive
+3. Check `get_task_ledger()` for completed tasks matching this directive's work
+4. If no active worker AND (matching commit OR matching completed ledger tasks) → directive is stale
+   → `update_directive_status(id, 'completed')` + notify {OPERATOR_NAME}:
+   `"Directive #N auto-marked completed — evidence: [commit SHA or ledger tasks] + no active worker"`
+
+For each `pending_confirmation` directive:
+1. Check `git log --oneline -20` for a commit that implements the work in the interpretation
+2. Check `get_task_ledger()` for completed tasks matching this directive's interpretation
+3. If matching commit OR matching completed ledger tasks found → directive is stale
+   → `update_directive_status(id, 'completed')` + notify {OPERATOR_NAME}:
+   `"Directive #N auto-marked completed — work already committed/logged: [evidence]"`
+
+**Conservative rule:** Only auto-update when evidence is direct and unambiguous. When uncertain,
+flag to {OPERATOR_NAME} for manual resolution: `"Directive #N may be stale — please verify
+and update status manually if complete."` Never auto-update on ambiguous signals.
+
 ### Project-Specific Brain Notes
 
 Before spawning a worker for a repo, read `<repo>/.ironclaude/brain-notes.md` via the Read tool if it exists. Include relevant constraints in the worker's objective. If the file doesn't exist, proceed without project-specific context.
@@ -306,8 +329,10 @@ Worker has finished all tasks, staged changes, and suggests a commit message.
 6. **Kill the worker** — `kill_worker` with evidence (the commit hash and a summary
    of what was verified).
 
-7. **Update directive status** — `update_directive_status(id, 'completed')` if this
-   commit completes the directive.
+7. **Update directive status** — `update_directive_status(id, 'completed')`. **MANDATORY —
+   never skip.** Call this for every directive whose work is addressed by this commit.
+   Skipping causes directives to remain stuck at `in_progress` indefinitely — that is the
+   bug this step prevents.
 
 **Do NOT:**
 - Commit without reading the diff (rubber-stamping)
@@ -383,6 +408,23 @@ The daemon will post your interpretation to Slack for {OPERATOR_NAME}'s confirma
 ### Handling Forwarded Operator Messages
 
 When you receive a message prefixed with "OPERATOR MESSAGE (ts=...):", evaluate it:
+
+**Step 0 — Confirmation check (before directive submission)**
+
+Before determining whether this message is a new directive, check for pending ones:
+
+1. Call `get_directives(status='pending_confirmation')` to list any awaiting confirmation
+2. If any exist, evaluate these signals against each pending directive:
+   - **Content similarity**: message text closely matches or paraphrases the interpretation
+   - **No new requirements**: message adds nothing not already in the interpretation
+   - **Timing**: message was sent within 30 minutes of the directive's `interpretation_ts`
+3. Confirm if: all three signals present, OR content similarity + one other signal present
+4. If confirmed → `update_directive_status(id, 'confirmed')` + post to Slack:
+   `"Directive #N confirmed via text message: [interpretation]"`
+5. If uncertain → do NOT auto-confirm. Proceed to the normal actionability check below.
+
+**Conservative rule: false positives are worse than false negatives.** When in doubt, leave
+`pending_confirmation` as-is and treat the message normally.
 
 1. **Is this actionable?** Does it contain a task, instruction, request, or decision?
    - YES → Call `submit_directive(source_ts, source_text, interpretation)` with your interpretation

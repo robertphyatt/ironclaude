@@ -55,9 +55,10 @@ class TestLoadConfig:
         cfg = load_config(str(config_file))
         assert cfg["operator_name"] == "Alice"
 
-    def test_operator_name_default(self, tmp_path):
+    def test_operator_name_default(self, tmp_path, monkeypatch):
         config_file = tmp_path / "ironclaude.json"
         config_file.write_text("{}")
+        monkeypatch.delenv("OPERATOR_NAME", raising=False)
         cfg = load_config(str(config_file))
         assert cfg["operator_name"] == "Operator"
 
@@ -96,14 +97,14 @@ class TestLoadConfig:
         assert cfg["advisor"]["advisor_model"] == "opus"
 
     def test_defaults_include_brain_model(self):
-        """brain_model defaults to claude-opus-4-6."""
+        """brain_model defaults to claude-opus-4."""
         from ironclaude.config import DEFAULTS
-        assert DEFAULTS["brain_model"] == "claude-opus-4-6"
+        assert DEFAULTS["brain_model"] == "claude-opus-4"
 
     def test_defaults_include_grader_model(self):
-        """grader_model defaults to claude-opus-4-6."""
+        """grader_model defaults to claude-opus-4."""
         from ironclaude.config import DEFAULTS
-        assert DEFAULTS["grader_model"] == "claude-opus-4-6"
+        assert DEFAULTS["grader_model"] == "claude-opus-4"
 
     def test_env_override_brain_model(self, tmp_path, monkeypatch):
         """BRAIN_MODEL env var overrides config."""

@@ -243,6 +243,21 @@ class TestGetMessagesByTsRange:
         assert result[0]["files"][0]["id"] == "F001"
         assert result[0]["files"][0]["mimetype"] == "image/png"
 
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_get_messages_by_ts_range_uses_custom_channel(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.conversations_history.return_value = {"messages": []}
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb", channel_id="C123")
+        bot.get_messages_by_ts_range("1.0", "2.0", channel="C999")
+        mock_client.conversations_history.assert_called_once_with(
+            channel="C999",
+            oldest="1.0",
+            latest="2.0",
+            inclusive=True,
+            limit=100,
+        )
+
 
 class TestParseInboundCommand:
     def test_status(self):
@@ -385,6 +400,76 @@ class TestSlackBotReactions:
         result = bot.get_reactions("123.456")
         assert len(result) == 1
         assert result[0]["name"] == "eyes"
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_pin_message_calls_api(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        result = bot.pin_message("123.456")
+        assert result is True
+        mock_client.pins_add.assert_called_once_with(
+            channel="C123", timestamp="123.456",
+        )
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_pin_message_ignores_already_pinned(self, mock_client_cls):
+        from slack_sdk.errors import SlackApiError
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.data = {"error": "already_pinned"}
+        mock_client.pins_add.side_effect = SlackApiError(
+            message="already_pinned", response=mock_response,
+        )
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        result = bot.pin_message("123.456")
+        assert result is True
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_pin_message_returns_false_on_failure(self, mock_client_cls, caplog):
+        mock_client = MagicMock()
+        mock_client.pins_add.side_effect = Exception("api error")
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        with caplog.at_level(logging.WARNING, logger="ironclaude.slack"):
+            result = bot.pin_message("123.456")
+        assert result is False
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_unpin_message_calls_api(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        result = bot.unpin_message("123.456")
+        assert result is True
+        mock_client.pins_remove.assert_called_once_with(
+            channel="C123", timestamp="123.456",
+        )
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_unpin_message_ignores_no_pin(self, mock_client_cls):
+        from slack_sdk.errors import SlackApiError
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.data = {"error": "no_pin"}
+        mock_client.pins_remove.side_effect = SlackApiError(
+            message="no_pin", response=mock_response,
+        )
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        result = bot.unpin_message("123.456")
+        assert result is True
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_unpin_message_returns_false_on_failure(self, mock_client_cls, caplog):
+        mock_client = MagicMock()
+        mock_client.pins_remove.side_effect = Exception("api error")
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        with caplog.at_level(logging.WARNING, logger="ironclaude.slack"):
+            result = bot.unpin_message("123.456")
+        assert result is False
 
 
 class TestSlackBotGetMessage:

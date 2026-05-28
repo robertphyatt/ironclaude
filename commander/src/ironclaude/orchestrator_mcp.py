@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import psutil
@@ -33,7 +33,7 @@ import shlex
 
 from ironclaude.config import make_opus_command
 from ironclaude.signal_forensics import _logged_kill
-from ironclaude.tmux_manager import _strip_ansi
+from ironclaude.tmux_manager import _strip_ansi, detect_ask_user_menu
 
 logger = logging.getLogger("ironclaude.orchestrator_mcp")
 
@@ -65,6 +65,21 @@ def _validate_keys(keys: list[str]) -> None:
             f"Invalid key: {key!r}. Must be a named key "
             f"{sorted(_ALLOWED_NAMED_KEYS)} or non-empty printable ASCII text."
         )
+
+
+_ALLOWED_LOG_PREFIXES = ("/tmp/", "/var/log/", str(Path.home()) + "/")
+
+
+def _validate_log_path(path: str) -> None:
+    """Validate a log file path against traversal and allowlist policy.
+
+    Raises ValueError if path contains '..' or is not under an allowed prefix.
+    """
+    if ".." in path:
+        raise ValueError("path traversal not allowed")
+    if not any(path.startswith(prefix) for prefix in _ALLOWED_LOG_PREFIXES):
+        allowed = ", ".join(_ALLOWED_LOG_PREFIXES)
+        raise ValueError(f"path not in allowed directories ({allowed})")
 
 
 def log_worker_event(event_type: str, **fields) -> None:
@@ -309,6 +324,20 @@ def _init_brain_session_background(
                 (session_uuid,),
             )
             conn.commit()
+            conn.execute(
+                "INSERT INTO audit_log"
+                " (terminal_session, actor, action, old_value, new_value, context)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    session_uuid,
+                    "daemon:brain_init",
+                    "professional_mode_off",
+                    None,
+                    "off",
+                    "Brain session init via _init_brain_session_background",
+                ),
+            )
+            conn.commit()
         logger.info(
             f"Brain session initialized: professional_mode='off' "
             f"(session {session_uuid[:8]}...)"
@@ -324,12 +353,15 @@ class OrchestratorTools:
     All methods are synchronous and raise exceptions on error.
     """
 
-    def __init__(self, registry, tmux, ledger_path: str, grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "claude-opus-4-6", opus_model: str = "claude-opus-4-6", effort_level: str = "high", ssh_manager=None, config: dict | None = None):
+    GRADER_TIMEOUT_SECONDS = 300
+
+    def __init__(self, registry, tmux, ledger_path: str = "", grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "claude-opus-4", opus_model: str = "claude-opus-4", effort_level: str = "high", ssh_manager=None, config: dict | None = None):
         self.registry = registry
         self.tmux = tmux
         self.ledger_path = ledger_path
         self._grader_session = "ic-grader"
         self._grader_ready = False
+        self._grader_lock = threading.Lock()
         self._grader_home = os.path.expanduser(grader_home)
         self._grader_model = grader_model
         self._opus_model = opus_model
@@ -344,6 +376,12 @@ class OrchestratorTools:
         self._advisor_cfg = advisor_cfg or {}
         self._ssh_manager = ssh_manager
         self._config = config or {}
+        brain_cwd = (
+            os.environ.get("IC_BRAIN_CWD")
+            or self._config.get("brain_cwd")
+            or "~/.ironclaude/brain"
+        )
+        self._wiki_dir = os.path.join(os.path.expanduser(brain_cwd), "wiki")
 
     def _get_worker_command(self, worker_type: str, model_name: str = "") -> str:
         """Build worker command, using advisor config for model selection."""
@@ -496,24 +534,14 @@ class OrchestratorTools:
         logger.warning("Grader /clear timed out after %ds", timeout)
         return False
 
-    def _call_grader(self, system_prompt: str, user_prompt: str) -> dict:
-        """Send grading prompt to persistent grader worker, read response.
+    def _do_grader_send_and_poll(self, system_prompt: str, user_prompt: str, batch: bool = False) -> dict | list | None:
+        """Send prompt to grader tmux session and poll for JSON response.
 
-        Sends the prompt to the ic-grader tmux session, polls the log
-        for a JSON response, then sends /clear to reset context.
-
-        Returns {"grade": str, "approved": bool, "feedback": str}.
-        Falls back to grade F on any error or timeout.
+        Called from _call_grader with _grader_lock already held. Returns parsed
+        result dict/list on success, or None on timeout. Sends /clear in both cases.
         """
-        import re
-
-        if not self._ensure_grader():
-            return {"grade": "F", "approved": False, "feedback": "Grader session failed to start"}
-
-        # Capture baseline log output before sending prompt
         baseline = self.tmux.read_log_tail(self._grader_session, lines=200)
 
-        # Send the combined prompt with nonce delimiter to prevent echo injection
         nonce = secrets.token_hex(8)
         combined = (
             f"{system_prompt}\n\n---\n\n{user_prompt}\n\n"
@@ -523,8 +551,8 @@ class OrchestratorTools:
         )
         self.tmux.send_keys(self._grader_session, combined)
 
-        # Poll for JSON response in new log output (120s timeout)
-        deadline = time.time() + 120
+        start_time = time.time()
+        deadline = start_time + self.GRADER_TIMEOUT_SECONDS
         delimiter = f"GRADER_RESPONSE_{nonce}"
         while time.time() < deadline:
             current = self.tmux.read_log_tail(self._grader_session, lines=200)
@@ -543,6 +571,20 @@ class OrchestratorTools:
                 continue
             post_delimiter = delta[delimiter_pos + len(delimiter):]
 
+            # Batch mode: extract JSON array of grade objects
+            if batch:
+                array_match = re.search(r'\[.*\]', post_delimiter, re.DOTALL)
+                if array_match:
+                    try:
+                        results = json.loads(array_match.group())
+                        if isinstance(results, list) and results:
+                            self.tmux.send_keys(self._grader_session, "/clear")
+                            self._wait_for_grader_clear()
+                            logger.debug("Grader responded in %.1fs", time.time() - start_time)
+                            return results
+                    except json.JSONDecodeError:
+                        pass
+
             # Look for JSON with grade/approved/feedback fields
             json_match = re.search(
                 r'\{[^{}]*"grade"\s*:\s*"[ABCDF]"[^{}]*"approved"\s*:\s*(?:true|false)[^{}]*"feedback"\s*:\s*"[^"]*"[^{}]*\}',
@@ -551,9 +593,9 @@ class OrchestratorTools:
             if json_match:
                 try:
                     result = json.loads(json_match.group())
-                    # Send /clear to reset context for next use
                     self.tmux.send_keys(self._grader_session, "/clear")
                     self._wait_for_grader_clear()
+                    logger.debug("Grader responded in %.1fs", time.time() - start_time)
                     return {
                         "grade": result.get("grade", "F"),
                         "approved": result.get("approved", False),
@@ -569,6 +611,7 @@ class OrchestratorTools:
                     if grade_m and approved_m:
                         self.tmux.send_keys(self._grader_session, "/clear")
                         self._wait_for_grader_clear()
+                        logger.debug("Grader responded in %.1fs", time.time() - start_time)
                         return {
                             "grade": grade_m.group(1),
                             "approved": approved_m.group(1) == "true",
@@ -577,11 +620,43 @@ class OrchestratorTools:
 
             time.sleep(2)
 
-        # Timeout — send /clear anyway to avoid stale context
         self.tmux.send_keys(self._grader_session, "/clear")
         self._wait_for_grader_clear()
-        logger.warning("Grader timed out after 120s")
-        return {"grade": "F", "approved": False, "feedback": "Grader timed out after 120s"}
+        return None
+
+    def _call_grader(self, system_prompt: str, user_prompt: str, batch: bool = False) -> dict | list:
+        """Send grading prompt to persistent grader worker, read response.
+
+        Sends the prompt to the ic-grader tmux session, polls the log
+        for a JSON response, then sends /clear to reset context.
+        Retries once with a fresh grader session on timeout.
+
+        When batch=True, expects a JSON array response and returns a list of
+        grade dicts. Falls back to grade F dict on any error or timeout.
+        """
+        with self._grader_lock:
+            if not self._ensure_grader():
+                return {"grade": "F", "approved": False, "feedback": "Grader session failed to start"}
+
+            attempt_start = time.time()
+            result = self._do_grader_send_and_poll(system_prompt, user_prompt, batch)
+            if result is not None:
+                return result
+
+            elapsed = time.time() - attempt_start
+            self._grader_ready = False
+            logger.warning("Grader timed out after %.1fs, retrying with fresh session", elapsed)
+            if not self._ensure_grader():
+                return {"grade": "F", "approved": False, "feedback": "Grader session failed to restart after timeout"}
+
+            attempt_start = time.time()
+            result = self._do_grader_send_and_poll(system_prompt, user_prompt, batch)
+            if result is not None:
+                return result
+
+            self._grader_ready = False
+            logger.warning("Grader timed out on retry after %ds", self.GRADER_TIMEOUT_SECONDS)
+            return {"grade": "F", "approved": False, "feedback": f"Grader timed out after {self.GRADER_TIMEOUT_SECONDS}s"}
 
     def get_operator_messages(
         self,
@@ -626,6 +701,7 @@ class OrchestratorTools:
         oldest_ts: str,
         latest_ts: str,
         only_operator: bool = True,
+        channel: str | None = None,
     ) -> list[dict]:
         """Fetch Slack messages in exact timestamp range and download image attachments.
 
@@ -634,7 +710,7 @@ class OrchestratorTools:
         """
         if self._slack is None:
             return []
-        messages = self._slack.get_messages_by_ts_range(oldest_ts, latest_ts, only_operator)
+        messages = self._slack.get_messages_by_ts_range(oldest_ts, latest_ts, only_operator, channel=channel)
         _IMAGE_MIMETYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
         dl_dir = Path("/tmp/ironclaude-slack-files")
         dl_dir.mkdir(exist_ok=True)
@@ -676,6 +752,7 @@ class OrchestratorTools:
                     (interpretation_ts, directive_id),
                 )
                 self._db.commit()
+                self._slack.pin_message(interpretation_ts)
                 logger.info(
                     "Directive #%d: interpretation_ts=%r stored (source_ts=%r)",
                     directive_id, interpretation_ts, source_ts,
@@ -771,6 +848,7 @@ class OrchestratorTools:
                     (message_ts, push_id),
                 )
                 self._db.commit()
+                self._slack.pin_message(message_ts)
 
         return {"status": "pending", "id": push_id, "expires_at": expires_at}
 
@@ -974,16 +1052,15 @@ class OrchestratorTools:
             time.sleep(1)
         return False
 
-    def _activate_pm_via_sqlite(
-        self, session_name: str, timeout: int = 30, _claude_dir: Path | None = None
+    def _set_pm_via_sqlite(
+        self, session_name: str, value: str,
+        timeout: int = 30, _claude_dir: Path | None = None,
     ) -> str | None:
-        """Activate professional mode by writing directly to ironclaude.db.
-
-        Gets the tmux pane PID, reads the session ID file written by the Claude
-        CLI during init, and writes professional_mode='on' to the sessions table.
+        """Shared implementation for activate/deactivate PM via direct SQLite write.
 
         Args:
             session_name: tmux session name (e.g. 'ic-w1')
+            value: 'on' or 'off'
             timeout: seconds to wait for session ID file to appear
             _claude_dir: override ~/.claude path (for testing)
 
@@ -1029,109 +1106,62 @@ class OrchestratorTools:
             logger.warning(f"{reason} for {session_name}")
             return reason
 
-        # Step 3: Write professional_mode='on' to DB
+        # Step 3: Write PM value and audit log to DB
+        actor = "daemon:pm_activate" if value == "on" else "daemon:pm_deactivate"
+        action = "professional_mode_on" if value == "on" else "professional_mode_off"
         db_path = claude_dir / "ironclaude.db"
+        conn = sqlite3.connect(str(db_path), timeout=5)
         try:
-            conn = sqlite3.connect(str(db_path), timeout=5)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 "INSERT OR IGNORE INTO sessions (terminal_session, professional_mode)"
-                " VALUES (?, 'on')",
-                (session_uuid,),
+                " VALUES (?, ?)",
+                (session_uuid, value),
             )
             conn.execute(
-                "UPDATE sessions SET professional_mode='on', updated_at=datetime('now')"
+                "UPDATE sessions SET professional_mode=?, updated_at=datetime('now')"
                 " WHERE terminal_session=?",
-                (session_uuid,),
+                (value, session_uuid),
             )
             conn.commit()
-            conn.close()
-            logger.info(
-                f"PM activated via SQLite for {session_name} "
-                f"(session {session_uuid[:8]}...)"
+            conn.execute(
+                "INSERT INTO audit_log"
+                " (terminal_session, actor, action, old_value, new_value, context)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    session_uuid,
+                    actor,
+                    action,
+                    None,
+                    value,
+                    f"PM set to '{value}' via _set_pm_via_sqlite for {session_name}",
+                ),
             )
-            return None
+            conn.commit()
         except sqlite3.Error as e:
             reason = f"sqlite error: {e}"
             logger.warning(f"{reason} for {session_name}")
             return reason
+        finally:
+            conn.close()
+
+        logger.info(
+            f"PM set to '{value}' via SQLite for {session_name} "
+            f"(session {session_uuid[:8]}...)"
+        )
+        return None
+
+    def _activate_pm_via_sqlite(
+        self, session_name: str, timeout: int = 30, _claude_dir: Path | None = None
+    ) -> str | None:
+        """Activate professional mode by writing directly to ironclaude.db."""
+        return self._set_pm_via_sqlite(session_name, "on", timeout, _claude_dir)
 
     def _deactivate_pm_via_sqlite(
         self, session_name: str, timeout: int = 30, _claude_dir: Path | None = None
     ) -> str | None:
-        """Deactivate professional mode by writing 'off' to ironclaude.db.
-
-        Mirror of _activate_pm_via_sqlite but writes professional_mode='off'.
-        Used for the grader session which must not have hooks active.
-
-        Returns None on success, or a failure reason string on any failure.
-        """
-        claude_dir = _claude_dir if _claude_dir is not None else Path("~/.claude").expanduser()
-
-        # Step 1: Get pane PID via tmux
-        try:
-            result = subprocess.run(
-                ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_pid}"],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                reason = f"tmux list-panes failed: {result.stderr.strip()}"
-                logger.warning(f"{reason} for {session_name}")
-                return reason
-            pane_pid = result.stdout.strip()
-            if not pane_pid.isdigit():
-                reason = f"invalid pane PID: {pane_pid}"
-                logger.warning(f"{reason} for {session_name}")
-                return reason
-        except Exception as e:
-            reason = f"pane PID error: {e}"
-            logger.warning(f"{reason} for {session_name}")
-            return reason
-
-        # Step 2: Poll for session ID file
-        session_id_file = claude_dir / f"ironclaude-session-{pane_pid}.id"
-        deadline = time.time() + timeout
-        session_uuid = None
-        while time.time() < deadline:
-            if session_id_file.exists():
-                candidate = session_id_file.read_text().strip()
-                if len(candidate) == 36:
-                    session_uuid = candidate
-                    break
-            time.sleep(1)
-
-        if session_uuid is None:
-            reason = f"session ID file timeout after {timeout}s"
-            logger.warning(f"{reason} for {session_name}")
-            return reason
-
-        # Step 3: Write professional_mode='off' to DB
-        db_path = claude_dir / "ironclaude.db"
-        try:
-            conn = sqlite3.connect(str(db_path), timeout=5)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute(
-                "INSERT OR IGNORE INTO sessions (terminal_session, professional_mode)"
-                " VALUES (?, 'off')",
-                (session_uuid,),
-            )
-            conn.execute(
-                "UPDATE sessions SET professional_mode='off', updated_at=datetime('now')"
-                " WHERE terminal_session=?",
-                (session_uuid,),
-            )
-            conn.commit()
-            conn.close()
-            logger.info(
-                f"PM deactivated via SQLite for {session_name} "
-                f"(session {session_uuid[:8]}...)"
-            )
-            return None
-        except sqlite3.Error as e:
-            reason = f"sqlite error: {e}"
-            logger.warning(f"{reason} for {session_name}")
-            return reason
+        """Deactivate professional mode by writing 'off' to ironclaude.db."""
+        return self._set_pm_via_sqlite(session_name, "off", timeout, _claude_dir)
 
     def _ensure_claude_md_remote(self, repo: str, ssh_host: str) -> None:
         """Ensure remote repo has a CLAUDE.md for clean PM activation."""
@@ -1199,6 +1229,18 @@ class OrchestratorTools:
 
         if session_uuid is None:
             reason = f"session ID file timeout after {timeout}s on {ssh_host}"
+            logger.warning(reason)
+            return reason
+
+        # Validate UUID format before interpolating into SQL.
+        # TODO: replace with parameterized query when run_sqlite_query supports
+        #       bind params over SSH — this regex is a forced workaround for the
+        #       CLI sqlite3 interface which cannot use ? placeholders.
+        if not re.fullmatch(
+            r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',
+            session_uuid,
+        ):
+            reason = f"invalid session UUID format: {session_uuid!r}"
             logger.warning(reason)
             return reason
 
@@ -1319,7 +1361,7 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
 
             cmd = f"ollama launch claude --model {shlex.quote(model_name)} -- --dangerously-skip-permissions"
         elif machine_cfg:
-            cmd_parts = [f"export IC_WORKER_ID={shlex.quote(worker_id)}"]
+            cmd_parts = ["export IC_ROLE=worker", f"export IC_WORKER_ID={shlex.quote(worker_id)}"]
             for k, v in machine_cfg.env.items():
                 cmd_parts.append(f"export {k}={shlex.quote(v)}")
             model = model_name or self._opus_model
@@ -1330,7 +1372,7 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
 
         # Inject worker ID for stop hook completion detection (local only — remote handled above)
         if not machine_cfg:
-            cmd = f"export IC_WORKER_ID={shlex.quote(worker_id)}; {cmd}"
+            cmd = f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; {cmd}"
 
         session_name = f"ic-{worker_id}"
 
@@ -1449,7 +1491,7 @@ Model recommendation (include "recommended_model" for each):
         user_prompt = f"Evaluate these {len(requests)} spawn decisions:{decisions_text}"
 
         # Try batch grading
-        grade_results = self._call_grader(system_prompt, user_prompt)
+        grade_results = self._call_grader(system_prompt, user_prompt, batch=True)
 
         # Validate batch response — must be a list with correct length
         if not isinstance(grade_results, list) or len(grade_results) != len(requests):
@@ -1489,7 +1531,7 @@ Model recommendation (include "recommended_model" for each):
             self.ensure_worker_trusted(repo)
 
             if worker_type == "claude-opus":
-                cmd = make_opus_command(self._opus_model)
+                cmd = make_opus_command(self._opus_model, self._effort_level)
             elif worker_type in WORKER_COMMANDS:
                 cmd = WORKER_COMMANDS[worker_type]
             elif worker_type == "ollama" and model_name:
@@ -1499,7 +1541,7 @@ Model recommendation (include "recommended_model" for each):
                 results[idx] = {"worker_id": worker_id, "error": f"Unknown worker type: {worker_type}"}
                 continue
 
-            cmd = f"export IC_WORKER_ID={shlex.quote(worker_id)}; {cmd}"
+            cmd = f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; {cmd}"
             session_name = f"ic-{worker_id}"
 
             success = self.tmux.spawn_session(session_name, cmd, cwd=repo)
@@ -1581,7 +1623,7 @@ Model recommendation (include "recommended_model" for each):
 
         return results
 
-    def approve_plan(self, worker_id: str, rationale: str) -> str:
+    def approve_plan(self, worker_id: str, rationale: str, engagement_evidence: dict | None = None) -> str | dict:
         """Approve a worker's plan with documented rationale."""
         worker = self.registry.get_worker(worker_id)
         if not worker:
@@ -1592,6 +1634,60 @@ Model recommendation (include "recommended_model" for each):
         if not self.tmux.has_session(session_name, ssh_host=ssh_host):
             self.registry.update_worker_status(worker_id, "failed")
             raise RuntimeError(f"Worker '{worker_id}' tmux session is dead")
+
+        # Grader gate: evaluate Brain's engagement quality before approving
+        message_events = self.registry.get_events_for_worker(worker_id, event_type="message_sent")
+        transcript_lines = []
+        for i, event in enumerate(message_events, 1):
+            try:
+                msg = json.loads(event["details"] or "{}").get("message", "(no message)")
+            except (json.JSONDecodeError, TypeError):
+                msg = "(unparseable)"
+            transcript_lines.append(f"[{i}] {msg}")
+        transcript = "\n".join(transcript_lines) if transcript_lines else "(no messages sent to this worker)"
+
+        avatar_skill = _load_avatar_skill().replace("{OPERATOR_NAME}", self._operator_name)
+        system_prompt = f"""{avatar_skill}
+
+You are grading a plan approval request. Respond with valid JSON only — no markdown, no explanation:
+{{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "specific feedback"}}
+
+Grading criteria — evaluate philosophical depth of engagement, not message count:
+- A: Brain demonstrated genuine avatar engagement — challenged design assumptions, evaluated alternatives, made architectural decisions, drew on project knowledge. approved=true
+- B: Brain engaged meaningfully but could have gone deeper on some aspects. approved=true
+- C: Brain engagement was shallow — relayed information but didn't challenge or steer the design. approved=false
+- D: Brain rubber-stamped — minimal interaction, no substantive questions or challenges. approved=false
+- F: Brain completely absent from brainstorming — zero or near-zero interaction. approved=false
+
+Edge case: If zero messages were sent, consider task complexity when assigning grade. The approval threshold (A/B required) does not change — but a purely mechanical task with zero brainstorming may warrant B if the rationale demonstrates the Brain evaluated the task and consciously determined brainstorming dialogue was unnecessary.
+
+When engagement_evidence is provided in the user prompt, treat it as Brain's self-report and cross-reference claims against the interaction transcript. Evidence not corroborated by the transcript should be weighted lower."""
+
+        worker_objective = worker["description"] or "(not set)"
+        evidence_section = ""
+        if engagement_evidence:
+            evidence_json = json.dumps(engagement_evidence, indent=2)
+            evidence_section = f"\nEngagement evidence (self-reported by Brain — cross-reference against transcript):\n{evidence_json}\n"
+
+        user_prompt = f"""Brain is requesting plan approval for worker '{worker_id}'.
+
+Worker objective: {worker_objective}
+
+Rationale provided by Brain:
+{rationale}
+{evidence_section}
+Interaction transcript (messages Brain sent to this worker during brainstorming):
+{transcript}
+
+Did the Brain act as {self._operator_name}'s avatar during brainstorming? Did it challenge, question, and steer — or did it rubber-stamp?"""
+
+        grade_result = self._call_grader(system_prompt, user_prompt)
+        if not grade_result["approved"]:
+            return {
+                "error": f"Plan approval rejected by grader (grade {grade_result['grade']}). {grade_result['feedback']}",
+                "action": "deepen brainstorming engagement with the worker and try again",
+            }
+        logger.info(f"Grader approved plan for '{worker_id}' (grade {grade_result['grade']})")
 
         self.tmux.send_keys(session_name, "yes", ssh_host=ssh_host)
         self.registry.log_event(
@@ -1672,7 +1768,31 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
             }
         logger.info(f"Grader approved message to '{worker_id}' (grade {grade_result['grade']})")
 
-        self.tmux.send_keys(session_name, message, ssh_host=ssh_host)
+        # Detect AskUserQuestion menu before sending
+        try:
+            pane_text = self.tmux.capture_pane(session_name, ssh_host=ssh_host)
+            menu = detect_ask_user_menu(pane_text)
+        except subprocess.CalledProcessError:
+            menu = {"detected": False}
+
+        if menu["detected"] and menu.get("free_text_option") is not None:
+            current = menu.get("current_selection") or 1
+            target = menu["free_text_option"]
+            steps = target - current
+            key = "Down" if steps > 0 else "Up"
+            for _ in range(abs(steps)):
+                self.tmux.send_raw_keys(session_name, [key], ssh_host=ssh_host)
+                time.sleep(0.3)
+            self.tmux.send_raw_keys(session_name, ["Enter"], ssh_host=ssh_host)
+            time.sleep(0.5)
+            self.tmux.send_keys(session_name, message, ssh_host=ssh_host)
+        elif menu["detected"]:
+            return {
+                "error": "Worker is at a menu prompt with no free-text option. Use send_keys_to_worker for manual navigation.",
+                "action": "use send_keys_to_worker with arrow keys to select the appropriate option",
+            }
+        else:
+            self.tmux.send_keys(session_name, message, ssh_host=ssh_host)
         self.registry.log_event(
             "message_sent",
             worker_id=worker_id,
@@ -1712,20 +1832,53 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
         return f"Keys sent to '{worker_id}': {keys}"
 
     def update_ledger(self, objective: str, tasks: list[dict]) -> str:
-        """Update the task ledger with current objective and tasks."""
-        ledger = {"objective": objective, "tasks": tasks}
-        Path(self.ledger_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(self.ledger_path, "w") as f:
-            json.dump(ledger, f, indent=2)
-        return f"Ledger updated: {len(tasks)} tasks"
+        """Update the task ledger by persisting to wiki/tasks.md."""
+        try:
+            existing = self.get_task_ledger()
+            prev = {
+                (t.get("id"), t.get("status")): t["status_set_at"]
+                for t in existing.get("tasks", [])
+                if t.get("status_set_at")
+            }
+        except Exception:
+            prev = {}
+        now = datetime.utcnow().isoformat() + "Z"
+        enriched = []
+        for task in tasks:
+            t = dict(task)
+            key = (t.get("id"), t.get("status"))
+            t["status_set_at"] = prev.get(key, now)
+            enriched.append(t)
+        lines = [f"**Objective:** {objective}", "", "## Tasks", ""]
+        lines.append("| ID | Description | Status |")
+        lines.append("|----|-------------|--------|")
+        for task in enriched:
+            lines.append(f"| {task.get('id', '')} | {task.get('description', '')} | {task.get('status', '')} |")
+        lines.extend(["", "## Data", "", "```json", json.dumps({"objective": objective, "tasks": enriched}), "```"])
+        self.wiki_write("tasks", "Task Ledger", "\n".join(lines))
+        return f"Ledger updated: {len(enriched)} tasks"
 
     def get_task_ledger(self) -> dict:
-        """Read the current task ledger."""
-        try:
-            with open(self.ledger_path) as f:
-                return json.load(f)
-        except FileNotFoundError:
-            return {"objective": None, "tasks": []}
+        """Read the current task ledger from wiki storage, migrating from JSON file if needed."""
+        wiki_page_path = os.path.join(self._wiki_dir, "tasks.md")
+        if os.path.exists(wiki_page_path):
+            with open(wiki_page_path) as f:
+                raw = f.read()
+            _, _, body = self._parse_wiki_frontmatter(raw)
+            return self._extract_ledger_json(body)
+        if self.ledger_path and os.path.exists(self.ledger_path):
+            try:
+                with open(self.ledger_path) as f:
+                    data = json.load(f)
+                objective = data.get("objective") or ""
+                tasks = data.get("tasks", [])
+                if objective or tasks:
+                    self.update_ledger(objective, tasks)
+                    return data
+            except json.JSONDecodeError:
+                os.makedirs(self._wiki_dir, exist_ok=True)
+                self._wiki_log_append(f"Migration failed: malformed ledger JSON at {self.ledger_path}")
+        return {"objective": None, "tasks": []}
 
     def get_worker_status(self, worker_id: str | None = None) -> dict | list[dict]:
         """Get status of a specific worker or all running workers."""
@@ -2140,6 +2293,292 @@ Has the worker genuinely completed its objective based on the evidence?"""
             "available_gb": round(mem.available / (1024**3), 1),
         }
 
+    def get_process_info(self) -> dict:
+        """Return per-process resource usage for relevant local processes.
+
+        Filters to: ollama, python/python3 scripts, claude, node/nodejs MCP
+        servers, and the IronClaude daemon. Sorts by RSS memory descending.
+        cpu_percent uses interval=None (fast; may return 0.0 on first call).
+        """
+        _FILTER_NAMES = frozenset({"ollama", "python", "python3", "Python", "claude", "node", "nodejs"})
+        _FILTER_CMDLINE_KEYWORDS = ("ironclaude", "ollama", "claude", "mcp")
+
+        now = time.time()
+        results = []
+
+        for proc in psutil.process_iter(["pid", "name", "cmdline", "memory_info", "cpu_percent", "create_time"]):
+            try:
+                info = proc.info
+                name = info.get("name") or ""
+                cmdline = info.get("cmdline") or []
+                cmdline_str = " ".join(cmdline)
+
+                if name not in _FILTER_NAMES and not any(kw in cmdline_str for kw in _FILTER_CMDLINE_KEYWORDS):
+                    continue
+
+                mem = info.get("memory_info")
+                rss_gb = round(mem.rss / (1024 ** 3), 2) if mem else 0.0
+
+                create_time = info.get("create_time") or 0
+                elapsed_seconds = int(now - create_time) if create_time else None
+
+                if name in ("python", "python3", "Python") and cmdline:
+                    try:
+                        m_idx = cmdline.index("-m")
+                        short_name = f"{name} ({cmdline[m_idx + 1]})"
+                    except (ValueError, IndexError):
+                        script = next((a for a in cmdline[1:] if not a.startswith("-")), None)
+                        short_name = f"{name} ({Path(script).name})" if script else name
+                else:
+                    short_name = name
+
+                results.append({
+                    "pid": info["pid"],
+                    "name": short_name,
+                    "rss_gb": rss_gb,
+                    "cpu_percent": info.get("cpu_percent") or 0.0,
+                    "elapsed_seconds": elapsed_seconds,
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+
+        results.sort(key=lambda p: p["rss_gb"], reverse=True)
+        return {"processes": results}
+
+    # ── Wiki helpers ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_wiki_frontmatter(raw: str) -> tuple[str, str, str]:
+        """Parse YAML frontmatter from a wiki page, returning (title, updated, body)."""
+        if not raw.startswith("---"):
+            return ("", "", raw)
+        parts = raw.split("---", 2)
+        if len(parts) < 3:
+            return ("", "", raw)
+        title, updated = "", ""
+        for line in parts[1].strip().splitlines():
+            if line.startswith("title:"):
+                title = line[len("title:"):].strip()
+            elif line.startswith("updated:"):
+                updated = line[len("updated:"):].strip()
+        return (title, updated, parts[2].strip())
+
+    @staticmethod
+    def _extract_summary(body: str) -> str:
+        """Extract first sentence (up to 120 chars) from wiki body text."""
+        if not body:
+            return ""
+        first_line = body.split("\n")[0].strip()
+        summary = first_line
+        for i, ch in enumerate(first_line):
+            if ch in ".!?" and i > 0:
+                summary = first_line[:i + 1]
+                break
+        if len(summary) > 120:
+            summary = summary[:117] + "..."
+        return summary
+
+    @staticmethod
+    def _extract_ledger_json(body: str) -> dict:
+        """Extract ledger JSON from the ## Data code fence in a wiki page body."""
+        parts = body.split("## Data")
+        if len(parts) < 2:
+            return {"objective": None, "tasks": []}
+        data_section = parts[1]
+        fence_start = data_section.find("```")
+        if fence_start == -1:
+            return {"objective": None, "tasks": []}
+        after_fence = data_section[fence_start + 3:]
+        first_newline = after_fence.find("\n")
+        if first_newline == -1:
+            return {"objective": None, "tasks": []}
+        json_content = after_fence[first_newline + 1:]
+        fence_end = json_content.find("```")
+        if fence_end == -1:
+            return {"objective": None, "tasks": []}
+        try:
+            return json.loads(json_content[:fence_end].strip())
+        except (json.JSONDecodeError, ValueError):
+            return {"objective": None, "tasks": []}
+
+    def _rebuild_wiki_index(self) -> None:
+        """Rebuild wiki/index.md from all page files (derived state)."""
+        wiki_dir = self._wiki_dir
+        entries = []
+        for fname in sorted(os.listdir(wiki_dir)):
+            if not fname.endswith(".md") or fname in ("index.md", "log.md"):
+                continue
+            fpath = os.path.join(wiki_dir, fname)
+            with open(fpath) as f:
+                raw = f.read()
+            title, updated, body = self._parse_wiki_frontmatter(raw)
+            if not title:
+                title = fname[:-3]
+            summary = self._extract_summary(body)
+            entries.append((fname[:-3], title, summary, updated))
+
+        lines = ["# Wiki Index\n"]
+        if entries:
+            lines.append("| Page | Summary | Updated |")
+            lines.append("|------|---------|---------|")
+            for page_name, title, summary, updated in entries:
+                lines.append(f"| [{title}]({page_name}.md) | {summary} | {updated} |")
+        else:
+            lines.append("*No wiki pages yet.*")
+        lines.append("")
+
+        with open(os.path.join(wiki_dir, "index.md"), "w") as f:
+            f.write("\n".join(lines))
+
+    def _wiki_log_append(self, entry: str) -> None:
+        """Append a timestamped entry to wiki/log.md."""
+        log_path = os.path.join(self._wiki_dir, "log.md")
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if not os.path.exists(log_path):
+            with open(log_path, "w") as f:
+                f.write("# Wiki Log\n\n")
+        with open(log_path, "a") as f:
+            f.write(f"- {timestamp} — {entry}\n")
+
+    # ── Wiki tools ───────────────────────────────────────────────────
+
+    def wiki_write(self, page: str, title: str, content: str) -> str:
+        """Create or update a wiki page with frontmatter, rebuild index, append log."""
+        wiki_dir = self._wiki_dir
+        os.makedirs(wiki_dir, exist_ok=True)
+
+        page_path = os.path.join(wiki_dir, f"{page}.md")
+        if not Path(page_path).resolve().is_relative_to(Path(wiki_dir).resolve()):
+            return f"Path traversal rejected: {page}"
+        is_update = os.path.exists(page_path)
+
+        today = date.today().isoformat()
+        page_content = f"---\ntitle: {title}\nupdated: {today}\n---\n\n{content}\n"
+        with open(page_path, "w") as f:
+            f.write(page_content)
+
+        self._rebuild_wiki_index()
+        action = "Updated" if is_update else "Created"
+        self._wiki_log_append(f"{action} {page}.md")
+
+        repo_root = os.path.dirname(self._wiki_dir)
+        verb = "updated" if is_update else "created"
+        r_add = subprocess.run(["git", "add", "wiki/"], cwd=repo_root, capture_output=True, text=True)
+        if r_add.returncode != 0:
+            return f"{page_path} (git commit failed: {r_add.stderr.strip()})"
+        r_commit = subprocess.run(
+            ["git", "commit", "-m", f"wiki: {verb} {page}"],
+            cwd=repo_root, capture_output=True, text=True,
+        )
+        if r_commit.returncode != 0:
+            return f"{page_path} (git commit failed: {r_commit.stderr.strip()})"
+        return page_path
+
+    def wiki_delete(self, page: str) -> str:
+        """Delete a wiki page, rebuild index, append log. Idempotent for missing pages."""
+        wiki_dir = self._wiki_dir
+        page_path = os.path.join(wiki_dir, f"{page}.md")
+        if not Path(page_path).resolve().is_relative_to(Path(wiki_dir).resolve()):
+            return f"Path traversal rejected: {page}"
+        if not os.path.exists(page_path):
+            return f"Page {page}.md not found, no action taken."
+        os.remove(page_path)
+        self._rebuild_wiki_index()
+        self._wiki_log_append(f"Deleted {page}.md")
+
+        repo_root = os.path.dirname(self._wiki_dir)
+        r_add = subprocess.run(["git", "add", "wiki/"], cwd=repo_root, capture_output=True, text=True)
+        if r_add.returncode != 0:
+            return f"Deleted {page}.md (git commit failed: {r_add.stderr.strip()})"
+        r_commit = subprocess.run(
+            ["git", "commit", "-m", f"wiki: delete {page}"],
+            cwd=repo_root, capture_output=True, text=True,
+        )
+        if r_commit.returncode != 0:
+            return f"Deleted {page}.md (git commit failed: {r_commit.stderr.strip()})"
+        return f"Deleted {page}.md"
+
+    def wiki_query(self, keywords: str, limit: int = 20) -> str:
+        """Search wiki pages by keywords. Returns JSON array of matches."""
+        wiki_dir = self._wiki_dir
+        if not os.path.isdir(wiki_dir):
+            return json.dumps([])
+
+        kw_list = keywords.lower().split()
+        if not kw_list:
+            return json.dumps([])
+
+        results: dict[str, dict] = {}
+
+        # Phase 1: scan index for matches (match_source=index)
+        index_path = os.path.join(wiki_dir, "index.md")
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                for line in f:
+                    if not line.startswith("| ["):
+                        continue
+                    lower_line = line.lower()
+                    if any(kw in lower_line for kw in kw_list):
+                        parts = [p.strip() for p in line.split("|")[1:-1]]
+                        if len(parts) >= 3:
+                            m = re.match(r"\[(.+?)\]\((.+?)\.md\)", parts[0])
+                            if m:
+                                results[m.group(2)] = {
+                                    "path": f"{m.group(2)}.md",
+                                    "title": m.group(1),
+                                    "summary": parts[1],
+                                    "updated": parts[2],
+                                    "match_source": "index",
+                                }
+
+        # Phase 2: scan page content for matches not already found in index
+        for fname in sorted(os.listdir(wiki_dir)):
+            if not fname.endswith(".md") or fname in ("index.md", "log.md"):
+                continue
+            page_name = fname[:-3]
+            if page_name in results:
+                continue
+            fpath = os.path.join(wiki_dir, fname)
+            with open(fpath) as f:
+                raw = f.read()
+            if any(kw in raw.lower() for kw in kw_list):
+                title, updated, body = self._parse_wiki_frontmatter(raw)
+                if not title:
+                    title = page_name
+                results[page_name] = {
+                    "path": fname,
+                    "title": title,
+                    "summary": self._extract_summary(body),
+                    "updated": updated,
+                    "match_source": "content",
+                }
+
+        sorted_results = sorted(
+            results.values(),
+            key=lambda r: (0 if r["match_source"] == "index" else 1, r["path"]),
+        )
+        return json.dumps(sorted_results[:limit], indent=2)
+
+    def wiki_log(self, entry: str) -> str:
+        """Append a free-form entry to the wiki log."""
+        os.makedirs(self._wiki_dir, exist_ok=True)
+        self._wiki_log_append(entry)
+        return "Log entry appended."
+
+    def pin_message(self, timestamp: str) -> str:
+        """Pin a Slack message in the brain channel."""
+        if self._slack is None:
+            return "Error: Slack not configured"
+        success = self._slack.pin_message(timestamp)
+        return json.dumps({"success": success})
+
+    def unpin_message(self, timestamp: str) -> str:
+        """Unpin a Slack message in the brain channel."""
+        if self._slack is None:
+            return "Error: Slack not configured"
+        success = self._slack.unpin_message(timestamp)
+        return json.dumps({"success": success})
+
 
 def _create_mcp_server(tools: OrchestratorTools):
     """Create and configure the FastMCP server wrapping OrchestratorTools."""
@@ -2195,9 +2634,21 @@ def _create_mcp_server(tools: OrchestratorTools):
         return json.dumps(results)
 
     @mcp.tool()
-    def approve_plan(worker_id: str, rationale: str) -> str:
-        """Approve a worker's plan with documented rationale."""
-        return tools.approve_plan(worker_id, rationale)
+    def approve_plan(worker_id: str, rationale: str, engagement_evidence: dict | None = None) -> str:
+        """Approve a worker's plan with documented rationale.
+
+        engagement_evidence: optional self-report from Brain with suggested shape:
+          {
+            "questions_asked": ["What are the constraints?", ...],
+            "memory_searches": ["searched: auth middleware patterns", ...],
+            "key_decisions": ["Chose event-driven over synchronous for failure isolation", ...]
+          }
+        Grader cross-references this against the actual transcript.
+        """
+        result = tools.approve_plan(worker_id, rationale, engagement_evidence)
+        if isinstance(result, dict):
+            return json.dumps(result)
+        return result
 
     @mcp.tool()
     def reject_plan(worker_id: str, reason: str) -> str:
@@ -2205,9 +2656,12 @@ def _create_mcp_server(tools: OrchestratorTools):
         return tools.reject_plan(worker_id, reason)
 
     @mcp.tool()
-    def send_to_worker(worker_id: str, message: str) -> str | dict:
+    def send_to_worker(worker_id: str, message: str) -> str:
         """Send a message to a running worker."""
-        return tools.send_to_worker(worker_id, message)
+        result = tools.send_to_worker(worker_id, message)
+        if isinstance(result, dict):
+            return json.dumps(result)
+        return result
 
     @mcp.tool()
     def send_keys_to_worker(worker_id: str, keys: list[str]) -> str:
@@ -2322,6 +2776,7 @@ def _create_mcp_server(tools: OrchestratorTools):
         oldest_ts: str,
         latest_ts: str,
         only_operator: bool = True,
+        channel: str = "",
     ) -> str:
         """Fetch Slack messages in exact timestamp range and download image attachments.
 
@@ -2332,12 +2787,13 @@ def _create_mcp_server(tools: OrchestratorTools):
             oldest_ts: Unix timestamp string for the start of the range (inclusive).
             latest_ts: Unix timestamp string for the end of the range (inclusive).
             only_operator: If True (default), return only non-bot messages.
+            channel: Optional Slack channel ID to read from. If empty, uses the default brain channel.
 
         Returns JSON array of messages with keys: text, ts, user, files[], local_path.
         Returns empty array if Slack is unavailable or not configured.
         """
         return json.dumps(
-            tools.get_messages_by_ts_range(oldest_ts, latest_ts, only_operator),
+            tools.get_messages_by_ts_range(oldest_ts, latest_ts, only_operator, channel=channel or None),
             indent=2,
         )
 
@@ -2456,6 +2912,193 @@ def _create_mcp_server(tools: OrchestratorTools):
         """
         return json.dumps(tools.get_system_memory())
 
+    @mcp.tool()
+    def wiki_write(page: str, title: str, content: str) -> str:
+        """Write or update a wiki page.
+
+        Creates the page with YAML frontmatter (title + updated date),
+        rebuilds the wiki index, and appends to the wiki log.
+
+        Args:
+            page: Page name (kebab-case, no .md extension).
+            title: Human-readable page title.
+            content: Markdown content for the page body.
+        """
+        return tools.wiki_write(page, title, content)
+
+    @mcp.tool()
+    def wiki_delete(page: str) -> str:
+        """Delete a wiki page.
+
+        Removes the page file, rebuilds the index, and logs the deletion.
+        Idempotent — returns success if page doesn't exist.
+
+        Args:
+            page: Page name (kebab-case, no .md extension).
+        """
+        return tools.wiki_delete(page)
+
+    @mcp.tool()
+    def wiki_query(keywords: str) -> str:
+        """Search wiki pages by keywords.
+
+        Two-pass search: first matches against index.md entries (title + summary),
+        then greps page file content for keywords not found in the index.
+        Results are deduplicated and ranked (index matches first).
+
+        Returns JSON array of {path, title, summary, updated, match_source}.
+
+        Args:
+            keywords: Space-separated search keywords.
+        """
+        return tools.wiki_query(keywords)
+
+    @mcp.tool()
+    def wiki_log(entry: str) -> str:
+        """Append a timestamped entry to the wiki log.
+
+        Args:
+            entry: Log message to append.
+        """
+        return tools.wiki_log(entry)
+
+    @mcp.tool()
+    def pin_message(timestamp: str) -> str:
+        """Pin a Slack message in the brain channel.
+
+        Args:
+            timestamp: The Slack message timestamp (ts) to pin.
+
+        Returns JSON {"success": true/false}, or error string if Slack is not configured.
+        """
+        return tools.pin_message(timestamp)
+
+    @mcp.tool()
+    def unpin_message(timestamp: str) -> str:
+        """Unpin a Slack message in the brain channel.
+
+        Args:
+            timestamp: The Slack message timestamp (ts) to unpin.
+
+        Returns JSON {"success": true/false}, or error string if Slack is not configured.
+        """
+        return tools.unpin_message(timestamp)
+
+    # --- Process Detective Tools ---
+
+    @mcp.tool()
+    def check_process(pid: int) -> str:
+        """Check if a local process is running by PID.
+
+        Runs: ps -p <pid> -o pid,comm,etime,state
+        Returns process info if alive, or 'not running' if dead.
+
+        Args:
+            pid: Process ID to inspect.
+        """
+        if pid <= 0:
+            return "Error: pid must be a positive integer"
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "pid,comm,etime,state"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                return "not running"
+            return result.stdout
+        except subprocess.TimeoutExpired:
+            return "Error: command timed out after 5s"
+
+    @mcp.tool()
+    def pgrep_processes(pattern: str) -> str:
+        """Find local processes whose command line matches a pattern.
+
+        Runs: pgrep -fl <pattern>
+        Returns first 20 matches (PID + command line), or 'no matches'.
+
+        Args:
+            pattern: String pattern to match against full command lines.
+        """
+        try:
+            result = subprocess.run(
+                ["pgrep", "-fl", pattern],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 1:
+                return "no matches"
+            lines = result.stdout.strip().splitlines()[:20]
+            return "\n".join(lines)
+        except subprocess.TimeoutExpired:
+            return "Error: command timed out after 5s"
+
+    @mcp.tool()
+    def get_process_info() -> str:
+        """Get per-process memory and CPU usage for relevant local processes.
+
+        Returns structured JSON with PID, command name (short), RSS memory in GB,
+        CPU percent (may be 0.0 on first call — instantaneous measurement), and
+        elapsed seconds since process start. Covers: Ollama (serve + runner),
+        Python scripts/daemons, Claude Code sessions, Node MCP servers, and the
+        IronClaude daemon. System processes and kernel threads are excluded.
+
+        Results are sorted by rss_gb descending — highest memory consumer first.
+        """
+        return json.dumps(tools.get_process_info(), indent=2)
+
+    @mcp.tool()
+    def tail_log(path: str, lines: int = 50) -> str:
+        """Read the last N lines of a log file.
+
+        Path must be under /tmp/, /var/log/, or the current user's home directory.
+        Rejects paths containing '..'.
+
+        Args:
+            path: Absolute path to the log file.
+            lines: Number of lines to return (1-10000, default 50).
+        """
+        try:
+            _validate_log_path(path)
+        except ValueError as e:
+            return f"Error: {e}"
+        if not Path(path).is_file():
+            return f"Error: not a regular file: {path}"
+        lines = max(1, min(lines, 10000))
+        try:
+            result = subprocess.run(
+                ["tail", "-n", str(lines), path],
+                capture_output=True, text=True, timeout=5,
+            )
+            return result.stdout
+        except subprocess.TimeoutExpired:
+            return "Error: command timed out after 5s"
+
+    @mcp.tool()
+    def head_log(path: str, lines: int = 50) -> str:
+        """Read the first N lines of a log file.
+
+        Path must be under /tmp/, /var/log/, or the current user's home directory.
+        Rejects paths containing '..'.
+
+        Args:
+            path: Absolute path to the log file.
+            lines: Number of lines to return (1-10000, default 50).
+        """
+        try:
+            _validate_log_path(path)
+        except ValueError as e:
+            return f"Error: {e}"
+        if not Path(path).is_file():
+            return f"Error: not a regular file: {path}"
+        lines = max(1, min(lines, 10000))
+        try:
+            result = subprocess.run(
+                ["head", "-n", str(lines), path],
+                capture_output=True, text=True, timeout=5,
+            )
+            return result.stdout
+        except subprocess.TimeoutExpired:
+            return "Error: command timed out after 5s"
+
     return mcp
 
 
@@ -2504,10 +3147,11 @@ def main():
         slack_bot=slack_bot, db_conn=conn, operator_name=operator_name,
         supabase_url=supabase_url, supabase_anon_key=supabase_anon_key,
         advisor_cfg=cfg.get("advisor", {}),
-        grader_model=cfg.get("grader_model", "claude-opus-4-6"),
-        opus_model=cfg.get("default_opus_model", "claude-opus-4-6"),
+        grader_model=cfg.get("grader_model", "claude-opus-4"),
+        opus_model=cfg.get("default_opus_model", "claude-opus-4"),
         effort_level=cfg.get("effort_level", "high"),
         ssh_manager=ssh_manager,
+        config=cfg,
     )
 
     mcp = _create_mcp_server(tools)

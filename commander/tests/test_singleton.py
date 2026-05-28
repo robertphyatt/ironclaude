@@ -140,7 +140,7 @@ class TestHandleRestartReleasesLock:
         fake_daemon.shutdown.assert_called_once()
         fake_daemon.brain.shutdown.assert_called_once()
         fake_daemon._db.close.assert_called_once()
-        assert any(cmd[0] == "pkill" for cmd in pkill_called), "pkill -P should be called"
+        assert any(cmd[0] == "pgrep" for cmd in pkill_called), "pgrep should verify no brain subprocesses remain"
         assert fake_fd in truncated, "fd should be truncated before exec"
         assert fake_fd in closed, "fd should be closed before exec"
         assert main_module._pid_lock_fd is None, "_pid_lock_fd should be cleared"

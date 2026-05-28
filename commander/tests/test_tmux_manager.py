@@ -61,6 +61,24 @@ class TestTmuxManager:
         )
 
     @patch("ironclaude.tmux_manager.subprocess.run")
+    def test_list_sessions_filters_by_prefix(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="ic-abc\nic-def\nother-session\n")
+        mgr = TmuxManager(log_dir="/tmp/ic-logs")
+        result = mgr.list_sessions(prefix="ic-")
+        assert result == ["ic-abc", "ic-def"]
+        mock_run.assert_called_once_with(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True,
+        )
+
+    @patch("ironclaude.tmux_manager.subprocess.run")
+    def test_list_sessions_returns_empty_on_nonzero_returncode(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stdout="")
+        mgr = TmuxManager(log_dir="/tmp/ic-logs")
+        result = mgr.list_sessions(prefix="ic-")
+        assert result == []
+
+    @patch("ironclaude.tmux_manager.subprocess.run")
     def test_send_keys(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
         mgr = TmuxManager(log_dir="/tmp/ic-logs")
@@ -482,3 +500,122 @@ class TestFileOperations:
         """run_sqlite_query returns None without ssh_host (remote-only operation)."""
         result = tmux_ssh.run_sqlite_query("/some/db", "SELECT 1")
         assert result is None
+
+
+# --- Menu detection fixtures and tests ---
+
+from ironclaude.tmux_manager import detect_ask_user_menu
+
+
+MENU_WITH_OTHER = """\
+──────────────────────────────────────────────────────────────────────────
+ ☐ Approach
+
+Which approach fits your needs?
+
+❯ 1. Event-driven
+     Loose coupling, handles failures.
+  2. Direct calls
+     Simple, easy to debug.
+  3. Other
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+MENU_WITH_TYPE_SOMETHING = """\
+──────────────────────────────────────────────────────────────────────────
+ ☐ Goal
+
+What is the primary goal?
+
+❯ 1. Improve performance
+     Optimize existing code paths.
+  2. Add new functionality
+     Build something new.
+  3. Type something.
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+MENU_NO_FREE_TEXT = """\
+──────────────────────────────────────────────────────────────────────────
+ ☐ Features
+
+Which features to enable?
+
+❯ 1. Logging
+     Enable debug logging.
+  2. Metrics
+     Enable performance metrics.
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+MENU_CURSOR_ON_OPTION_2 = """\
+──────────────────────────────────────────────────────────────────────────
+ ☐ Approach
+
+Which approach fits your needs?
+
+  1. Event-driven
+     Loose coupling, handles failures.
+❯ 2. Direct calls
+     Simple, easy to debug.
+  3. Other
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+NO_MENU_OUTPUT = """\
+ironclaude v1.0.8 | Professional Mode: ON | Status: executing
+
+ Reading file src/main.py...
+ Editing src/main.py...
+
+$
+"""
+
+
+class TestDetectAskUserMenu:
+    def test_detects_menu_with_other_option(self):
+        """Detects menu and identifies 'Other' as the free-text option."""
+        result = detect_ask_user_menu(MENU_WITH_OTHER)
+        assert result["detected"] is True
+        assert result["free_text_option"] == 3
+        assert result["current_selection"] == 1
+        assert len(result["options"]) == 3
+
+    def test_detects_menu_with_type_something(self):
+        """Detects menu and identifies 'Type something.' as the free-text option."""
+        result = detect_ask_user_menu(MENU_WITH_TYPE_SOMETHING)
+        assert result["detected"] is True
+        assert result["free_text_option"] == 3
+        assert result["current_selection"] == 1
+
+    def test_detects_menu_without_free_text(self):
+        """Detects menu but free_text_option is None when no Other/Type option."""
+        result = detect_ask_user_menu(MENU_NO_FREE_TEXT)
+        assert result["detected"] is True
+        assert result["free_text_option"] is None
+        assert len(result["options"]) == 2
+
+    def test_no_menu_returns_not_detected(self):
+        """Normal terminal output returns detected=False."""
+        result = detect_ask_user_menu(NO_MENU_OUTPUT)
+        assert result["detected"] is False
+        assert result["options"] == []
+        assert result["free_text_option"] is None
+        assert result["current_selection"] is None
+
+    def test_current_selection_detected(self):
+        """Cursor position (❯) is correctly identified."""
+        result = detect_ask_user_menu(MENU_CURSOR_ON_OPTION_2)
+        assert result["current_selection"] == 2
+
+    def test_parses_option_labels(self):
+        """All option labels are correctly extracted."""
+        result = detect_ask_user_menu(MENU_WITH_OTHER)
+        labels = [label for _, label in result["options"]]
+        assert "Event-driven" in labels
+        assert "Direct calls" in labels
+        assert "Other" in labels

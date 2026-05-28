@@ -5,13 +5,14 @@ import os
 import shlex
 import sqlite3
 import subprocess
+from ironclaude.db import init_db
 import time
 import json
 
 import pytest
 from unittest.mock import MagicMock, patch
 
-from ironclaude.main import IroncladeDaemon, ensure_brain_trusted
+from ironclaude.main import CHECKIN_CADENCE, IroncladeDaemon, ensure_brain_trusted
 
 
 @pytest.fixture
@@ -24,6 +25,9 @@ def daemon(tmp_path):
     tmux.log_dir = str(tmp_path / "logs")
     os.makedirs(tmux.log_dir, exist_ok=True)
     brain = MagicMock()
+    brain.get_token_usage.return_value = {
+        "total_tokens": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0
+    }
     d = IroncladeDaemon(config, slack, None, registry, tmux, brain)
     return d
 
@@ -500,6 +504,106 @@ class TestProactiveCheckinDedup:
         daemon.brain.send_message.assert_not_called()
 
 
+class TestCheckinHashDedup:
+    def test_hash_dedup_suppresses_identical_log_tail(self, daemon, tmp_path):
+        """No check-in when log_tail content matches last-sent hash."""
+        worker = {
+            "id": "w1", "tmux_session": "ic-w1",
+            "spawned_at": "2026-03-08 00:00:00",
+        }
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        daemon.tmux.capture_pane.return_value = "same output"
+        daemon.tmux.list_pane_pid.return_value = "12345"
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        _setup_ironclaude_db(claude_dir, "12345", "abcdef01-2345-6789-abcd-ef0123456789", "executing")
+        daemon._claude_dir = claude_dir
+        daemon.brain.send_message.return_value = True
+
+        daemon._last_checkin_hash["w1"] = hash("same output")
+
+        daemon.check_workers()
+        daemon.brain.send_message.assert_not_called()
+
+    def test_hash_dedup_allows_changed_log_tail(self, daemon, tmp_path):
+        """Check-in fires when log_tail content differs from last-sent hash."""
+        worker = {
+            "id": "w1", "tmux_session": "ic-w1",
+            "spawned_at": "2026-03-08 00:00:00",
+        }
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        daemon.tmux.capture_pane.return_value = "new output"
+        daemon.tmux.list_pane_pid.return_value = "12345"
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        _setup_ironclaude_db(claude_dir, "12345", "abcdef01-2345-6789-abcd-ef0123456789", "executing")
+        daemon._claude_dir = claude_dir
+        daemon.brain.send_message.return_value = True
+
+        daemon._last_checkin_hash["w1"] = hash("old output")
+
+        daemon.check_workers()
+        daemon.brain.send_message.assert_called_once()
+        assert daemon._last_checkin_hash["w1"] == hash("new output")
+
+    def test_stage_change_bypasses_hash_dedup(self, daemon, tmp_path):
+        """Stage transition fires check-in even when log_tail content is identical."""
+        worker = {
+            "id": "w1", "tmux_session": "ic-w1",
+            "spawned_at": "2026-03-08 00:00:00",
+        }
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        daemon.tmux.capture_pane.return_value = "same output"
+        daemon.tmux.list_pane_pid.return_value = "12345"
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        _setup_ironclaude_db(claude_dir, "12345", "abcdef01-2345-6789-abcd-ef0123456789", "reviewing")
+        daemon._claude_dir = claude_dir
+        daemon.brain.send_message.return_value = True
+
+        daemon._last_checkin_hash["w1"] = hash("same output")
+        daemon._last_checkin_stage["w1"] = "executing"
+        daemon._last_checkin_sent["w1"] = time.time()
+
+        daemon.check_workers()
+        daemon.brain.send_message.assert_called_once()
+
+    def test_hash_not_updated_on_hash_skip(self, daemon, tmp_path):
+        """When hash gate suppresses send, _last_checkin_sent and _last_checkin_hash are not updated."""
+        worker = {
+            "id": "w1", "tmux_session": "ic-w1",
+            "spawned_at": "2026-03-08 00:00:00",
+        }
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        daemon.tmux.capture_pane.return_value = "same output"
+        daemon.tmux.list_pane_pid.return_value = "12345"
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        _setup_ironclaude_db(claude_dir, "12345", "abcdef01-2345-6789-abcd-ef0123456789", "executing")
+        daemon._claude_dir = claude_dir
+
+        original_hash = hash("same output")
+        daemon._last_checkin_hash["w1"] = original_hash
+
+        daemon.check_workers()
+
+        assert daemon._last_checkin_sent.get("w1", 0.0) == 0.0
+        assert daemon._last_checkin_hash["w1"] == original_hash
+
+
+class TestCheckinCadenceValues:
+    def test_execution_complete_cadence_is_900(self):
+        assert CHECKIN_CADENCE["execution_complete"] == 900
+
+
 class TestDirectiveConfirmation:
     def test_confirmed_directive_uses_operator_name(self, daemon):
         """Directive confirmation message uses operator_name from config, not hardcoded 'Robert'."""
@@ -508,7 +612,7 @@ class TestDirectiveConfirmation:
         conn = sqlite3.connect(":memory:")
         conn.execute(
             "CREATE TABLE directives (id INTEGER PRIMARY KEY, interpretation TEXT, "
-            "status TEXT, created_at TEXT, updated_at TEXT)"
+            "interpretation_ts TEXT, status TEXT, created_at TEXT, updated_at TEXT)"
         )
         conn.execute(
             "INSERT INTO directives (interpretation, status, created_at) "
@@ -679,7 +783,7 @@ class TestHeartbeatWorkerListing:
     def test_post_heartbeat_passes_worker_details(self, daemon):
         """post_heartbeat builds worker detail list from registry + workflow stage."""
         daemon.registry.get_running_workers.return_value = [
-            {"id": "w-1", "tmux_session": "ic-w-1", "description": "Fix auth bug"},
+            {"id": "w-1", "tmux_session": "ic-w-1", "description": "Your task: Fix auth bug"},
         ]
         daemon._last_heartbeat = 0
         with patch.object(daemon, '_get_worker_workflow_stage', return_value='executing'):
@@ -700,7 +804,7 @@ class TestHeartbeatWorkerListing:
     def test_post_heartbeat_includes_worker_description(self, daemon):
         """post_heartbeat reads description directly from worker row."""
         daemon.registry.get_running_workers.return_value = [
-            {"id": "w-1", "tmux_session": "ic-w-1", "description": "Fix the bug"},
+            {"id": "w-1", "tmux_session": "ic-w-1", "description": "Your task: Fix the bug"},
         ]
         daemon._last_heartbeat = 0
         with patch.object(daemon, '_get_worker_workflow_stage', return_value='brainstorming'):
@@ -1436,7 +1540,7 @@ class TestWorkerCommandsConsistency:
         """main.py worker commands must use exec prefix."""
         from ironclaude.main import WORKER_COMMANDS
         from ironclaude.config import DEFAULTS, make_opus_command
-        opus_cmd = make_opus_command(DEFAULTS["brain_model"])
+        opus_cmd = make_opus_command(DEFAULTS["brain_model"], "high")
         assert "exec claude" in opus_cmd
         assert "exec claude" in WORKER_COMMANDS["claude-sonnet"]
 
@@ -1444,7 +1548,7 @@ class TestWorkerCommandsConsistency:
         """main.py worker commands must set CLAUDE_CODE_EFFORT_LEVEL=high."""
         from ironclaude.main import WORKER_COMMANDS
         from ironclaude.config import DEFAULTS, make_opus_command
-        opus_cmd = make_opus_command(DEFAULTS["brain_model"])
+        opus_cmd = make_opus_command(DEFAULTS["brain_model"], "high")
         assert "CLAUDE_CODE_EFFORT_LEVEL=high" in opus_cmd
         assert "CLAUDE_CODE_EFFORT_LEVEL=high" in WORKER_COMMANDS["claude-sonnet"]
 
@@ -1536,10 +1640,10 @@ class TestWaitForReadyMarker:
 
 
 class TestEnsureBrainTrusted:
-    """Tests for M2 fix: ensure_brain_trusted uses realpath + .git check, mirroring ensure_worker_trusted."""
+    """Tests for ensure_brain_trusted — trusts any directory unconditionally."""
 
-    def test_rejects_path_without_git_dir(self, tmp_path):
-        """ensure_brain_trusted writes no trust entry for a non-git directory."""
+    def test_trusts_path_without_git_dir(self, tmp_path):
+        """ensure_brain_trusted trusts directories even without .git."""
         non_git_dir = tmp_path / "brain_repo"
         non_git_dir.mkdir()
         claude_json = tmp_path / "claude.json"
@@ -1548,11 +1652,12 @@ class TestEnsureBrainTrusted:
             ensure_brain_trusted(str(non_git_dir))
         data = json.loads(claude_json.read_text())
         projects = data.get("projects", {})
-        assert str(non_git_dir) not in projects
-        assert os.path.realpath(str(non_git_dir)) not in projects
+        abs_path = os.path.abspath(str(non_git_dir))
+        assert abs_path in projects
+        assert projects[abs_path]["hasTrustDialogAccepted"] is True
 
-    def test_resolves_symlinks_and_rejects_non_git(self, tmp_path):
-        """ensure_brain_trusted resolves symlinks and rejects if resolved path has no .git."""
+    def test_trusts_symlinked_path(self, tmp_path):
+        """ensure_brain_trusted resolves symlinks and trusts the absolute path."""
         real_dir = tmp_path / "real_brain"
         real_dir.mkdir()
         link_dir = tmp_path / "link_brain"
@@ -1563,8 +1668,9 @@ class TestEnsureBrainTrusted:
             ensure_brain_trusted(str(link_dir))
         data = json.loads(claude_json.read_text())
         projects = data.get("projects", {})
-        assert str(real_dir) not in projects
-        assert str(link_dir) not in projects
+        abs_path = os.path.abspath(str(link_dir))
+        assert abs_path in projects
+        assert projects[abs_path]["hasTrustDialogAccepted"] is True
 
     def test_accepts_valid_git_repo(self, tmp_path):
         """ensure_brain_trusted adds trust entry using real_cwd as the dict key."""
@@ -1941,3 +2047,80 @@ class TestCheckWorkersRemote:
 
         result = daemon._get_worker_workflow_stage("ic-w1", ssh_host="kandice")
         assert result is None
+
+
+class TestDirectiveUnpin:
+    """Tests for unpin calls on directive confirmation/rejection."""
+
+    @pytest.fixture
+    def db_conn(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        conn = init_db(db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    @pytest.fixture
+    def daemon_db(self, tmp_path, db_conn):
+        from ironclaude.main import IroncladeDaemon
+        config = {"tmp_dir": str(tmp_path), "operator_name": "TestOp"}
+        slack = MagicMock()
+        slack.post_message.return_value = "reply-ts"
+        registry = MagicMock()
+        tmux = MagicMock()
+        tmux.log_dir = str(tmp_path / "logs")
+        os.makedirs(str(tmp_path / "logs"), exist_ok=True)
+        brain = MagicMock()
+        d = IroncladeDaemon(
+            config=config, slack=slack, socket_handler=None,
+            registry=registry, tmux_manager=tmux, brain=brain, db_conn=db_conn,
+        )
+        return d, db_conn
+
+    def _insert_directive(self, db, interpretation_ts="interp-ts-001"):
+        db.execute(
+            "INSERT INTO directives (source_ts, source_text, interpretation, status, interpretation_ts)"
+            " VALUES ('src-ts-001', 'fix bug', 'Fix the login bug', 'pending_confirmation', ?)",
+            (interpretation_ts,),
+        )
+        db.commit()
+
+    def test_reaction_confirm_unpins(self, daemon_db):
+        """thumbsup reaction calls unpin_message with interpretation_ts."""
+        daemon, db = daemon_db
+        self._insert_directive(db)
+        daemon._handle_directive_reaction("thumbsup", "interp-ts-001")
+        daemon.slack.unpin_message.assert_called_once_with("interp-ts-001")
+
+    def test_reaction_reject_unpins(self, daemon_db):
+        """thumbsdown reaction calls unpin_message with interpretation_ts."""
+        daemon, db = daemon_db
+        self._insert_directive(db)
+        daemon._handle_directive_reaction("thumbsdown", "interp-ts-001")
+        daemon.slack.unpin_message.assert_called_once_with("interp-ts-001")
+
+    def test_reaction_skips_unpin_when_ts_null(self, daemon_db):
+        """No unpin_message call when interpretation_ts is NULL."""
+        daemon, db = daemon_db
+        db.execute(
+            "INSERT INTO directives (source_ts, source_text, interpretation, status)"
+            " VALUES ('src-ts-001', 'fix bug', 'Fix the login bug', 'pending_confirmation')"
+        )
+        db.commit()
+        daemon._handle_directive_reaction("thumbsup", "src-ts-001")
+        daemon.slack.unpin_message.assert_not_called()
+
+    def test_text_confirm_unpins(self, daemon_db):
+        """Text 'yes' confirmation calls unpin_message with interpretation_ts."""
+        daemon, db = daemon_db
+        self._insert_directive(db)
+        daemon._handle_directive_confirmation("yes")
+        daemon.slack.unpin_message.assert_called_once_with("interp-ts-001")
+
+    def test_text_reject_unpins(self, daemon_db):
+        """Text 'no' rejection calls unpin_message with interpretation_ts."""
+        daemon, db = daemon_db
+        self._insert_directive(db)
+        daemon._handle_directive_confirmation("no")
+        daemon.slack.unpin_message.assert_called_once_with("interp-ts-001")
+
+

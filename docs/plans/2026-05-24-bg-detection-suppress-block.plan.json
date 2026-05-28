@@ -1,0 +1,87 @@
+{
+  "name": "Background Job Detection — Suppress Block",
+  "goal": "Prevent workers monitoring long-running pipelines from getting blocked in re-check loops",
+  "design_file": "docs/plans/2026-05-24-bg-detection-suppress-block-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Add bg-detection preamble to get-back-to-work hook",
+      "description": "Insert background job detection block inside the elif branch at line 290 to approve stops when run_in_background=true is found in recent turns. Fail-open: transcript missing or jq failure falls through to existing block_stop.",
+      "allowed_files": [
+        "worker/hooks/get-back-to-work-claude.sh"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Edit get-back-to-work-claude.sh — insert detection preamble before increment_block_counter in the elif IN_PROGRESS_OR_PENDING_COUNT branch"
+        },
+        {
+          "description": "Verify syntax",
+          "command": "bash -n worker/hooks/get-back-to-work-claude.sh",
+          "expected": "no output (exit 0)"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add worker/hooks/get-back-to-work-claude.sh",
+          "expected": "changes staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Add monitoring-pattern test case to test-bg-detection.sh",
+      "description": "Add Fixture 6 (monitoring pattern: bg job launched then monitoring turns) and new assert_eq under Core Detection. Run full suite — all 8 tests must pass.",
+      "allowed_files": [
+        "worker/hooks/test-bg-detection.sh"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Add Fixture 6 definition after Fixture 5's EOF line"
+        },
+        {
+          "description": "Add monitoring-pattern assertion after the stale_bg assertion"
+        },
+        {
+          "description": "Run test suite",
+          "command": "bash worker/hooks/test-bg-detection.sh",
+          "expected": "Results: 8 passed, 0 failed"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add worker/hooks/test-bg-detection.sh",
+          "expected": "changes staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Commit repo changes and deploy installed hook",
+      "description": "Stage plan files, commit all changes, copy updated hook to ~/.claude/ironclaude-hooks/, verify installed copy matches repo.",
+      "allowed_files": [],
+      "depends_on": [1, 2],
+      "steps": [
+        {
+          "description": "Stage plan files",
+          "command": "git add docs/plans/2026-05-24-bg-detection-suppress-block-design.md docs/plans/2026-05-24-bg-detection-suppress-block.md docs/plans/2026-05-24-bg-detection-suppress-block.plan.json",
+          "expected": "changes staged"
+        },
+        {
+          "description": "Commit with descriptive message",
+          "command": "git commit -m 'feat(hooks): suppress get-back-to-work block when worker has active background shell'",
+          "expected": "commit succeeds"
+        },
+        {
+          "description": "Copy updated hook to installed path",
+          "command": "cp worker/hooks/get-back-to-work-claude.sh ~/.claude/ironclaude-hooks/get-back-to-work-claude.sh",
+          "expected": "no output (exit 0)"
+        },
+        {
+          "description": "Verify installed copy matches repo",
+          "command": "diff worker/hooks/get-back-to-work-claude.sh ~/.claude/ironclaude-hooks/get-back-to-work-claude.sh",
+          "expected": "no output (files identical)"
+        }
+      ]
+    }
+  ]
+}

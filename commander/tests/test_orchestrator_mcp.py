@@ -9,10 +9,12 @@ import os
 import sqlite3
 import subprocess
 import time
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pytest
-from unittest.mock import MagicMock, patch
+import psutil
+from unittest.mock import MagicMock, patch, PropertyMock
 
 from ironclaude.db import init_db
 from ironclaude.worker_registry import WorkerRegistry
@@ -48,6 +50,7 @@ def mock_tmux():
     tmux.has_session.return_value = True
     tmux.spawn_session.return_value = True
     tmux.send_keys.return_value = True
+    tmux.capture_pane.return_value = ""
     tmux.get_log_path.return_value = "/tmp/ic-logs/ic-test.log"
     tmux.read_log_tail.return_value = "ironclaude v1.0.33\n"
     tmux.list_pane_pid.return_value = None
@@ -75,8 +78,10 @@ class TestSpawnWorker:
         assert "w1" in result
         mock_tmux.spawn_session.assert_called_once_with(
             "ic-w1",
-            f"export IC_WORKER_ID=w1; {WORKER_COMMANDS['claude-sonnet']}",
+            f"export IC_ROLE=worker; export IC_WORKER_ID=w1; {WORKER_COMMANDS['claude-sonnet']}",
             cwd="/tmp/repo",
+            ssh_host=None,
+            remote_log_dir=None,
         )
         send_keys_calls = mock_tmux.send_keys.call_args_list
         keys_sent = [call[0][1] for call in send_keys_calls]
@@ -176,19 +181,115 @@ class TestWorkerCommunication:
     def test_approve_plan_logs_rationale(self, tools, registry, mock_tmux):
         """Approve sends 'yes' to tmux and logs rationale."""
         registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        _mock_grader_approve(tools)
         result = tools.approve_plan("w1", "Plan matches objective scope")
-        mock_tmux.send_keys.assert_called_once_with("ic-w1", "yes")
+        mock_tmux.send_keys.assert_called_once_with("ic-w1", "yes", ssh_host=None)
         assert "approved" in result.lower()
         events = registry.get_recent_events(limit=1)
         assert events[0]["event_type"] == "plan_approved"
         details = json.loads(events[0]["details"])
         assert details["rationale"] == "Plan matches objective scope"
 
+    def test_approve_plan_grader_rejection(self, tools, registry, mock_tmux):
+        """approve_plan returns error dict when grader rejects engagement quality."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        tools._call_grader = MagicMock(return_value={
+            "grade": "D", "approved": False, "feedback": "Brain rubber-stamped without challenging the design"
+        })
+        result = tools.approve_plan("w1", "Looks good")
+        assert isinstance(result, dict)
+        assert "error" in result
+        assert "grade D" in result["error"]
+        assert "Brain rubber-stamped" in result["error"]
+        mock_tmux.send_keys.assert_not_called()
+        events = registry.get_recent_events(limit=5)
+        assert not any(e["event_type"] == "plan_approved" for e in events)
+
+    def test_approve_plan_grader_uses_message_transcript(self, tools, registry, mock_tmux):
+        """approve_plan builds transcript, includes worker objective, and passes all to grader."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp", description="Refactor auth middleware for compliance")
+        registry.log_event("message_sent", worker_id="w1", details={"message": "What is the architectural goal?"})
+        registry.log_event("message_sent", worker_id="w1", details={"message": "Consider using event sourcing here."})
+        tools._call_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "Strong engagement"
+        })
+        tools.approve_plan("w1", "Brain challenged design assumptions")
+        call_args = tools._call_grader.call_args
+        user_prompt = call_args[0][1]
+        assert "What is the architectural goal?" in user_prompt
+        assert "Consider using event sourcing here." in user_prompt
+        assert "Brain challenged design assumptions" in user_prompt
+        assert "Refactor auth middleware for compliance" in user_prompt
+
+    def test_approve_plan_with_engagement_evidence(self, tools, registry, mock_tmux):
+        """approve_plan includes engagement_evidence content in grader user_prompt when provided."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp", description="Build event pipeline")
+        tools._call_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "Strong evidence of engagement"
+        })
+        evidence = {
+            "questions_asked": ["Why event-driven?", "What are the throughput requirements?"],
+            "key_decisions": ["Rejected caching in favor of stream processing"],
+        }
+        tools.approve_plan("w1", "Brain deeply engaged", evidence)
+        call_args = tools._call_grader.call_args
+        user_prompt = call_args[0][1]
+        assert "Why event-driven?" in user_prompt
+        assert "Rejected caching in favor of stream processing" in user_prompt
+
+    def test_approve_plan_no_engagement_evidence_omitted(self, tools, registry, mock_tmux):
+        """approve_plan omits the engagement evidence section when engagement_evidence is not provided."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        tools._call_grader = MagicMock(return_value={
+            "grade": "B", "approved": True, "feedback": "Good engagement"
+        })
+        tools.approve_plan("w1", "Solid rationale")
+        call_args = tools._call_grader.call_args
+        user_prompt = call_args[0][1]
+        assert "Engagement evidence" not in user_prompt
+
+    def test_approve_plan_mcp_wrapper_returns_str_on_rejection(self, tools, registry, mock_tmux):
+        """MCP wrapper must return str, not dict — FastMCP Pydantic validation requires it."""
+        from ironclaude.orchestrator_mcp import _create_mcp_server
+
+        mcp_server = _create_mcp_server(tools)
+
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        tools._call_grader = MagicMock(return_value={
+            "grade": "D", "approved": False, "feedback": "Brain rubber-stamped"
+        })
+
+        wrapper_fn = mcp_server._tool_manager.get_tool("approve_plan").fn
+        result = wrapper_fn("w1", "Looks good")
+        assert isinstance(result, str), f"MCP wrapper must return str for Pydantic; got {type(result)}"
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "grade D" in parsed["error"]
+
+    def test_send_to_worker_mcp_wrapper_returns_str_on_rejection(self, tools, registry, mock_tmux):
+        """MCP wrapper must return str — str | dict annotation was wrong and causes FastMCP Pydantic errors."""
+        from ironclaude.orchestrator_mcp import _create_mcp_server
+
+        mcp_server = _create_mcp_server(tools)
+
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        mock_tmux.has_session.return_value = True
+        tools._call_grader = MagicMock(return_value={
+            "grade": "F", "approved": False, "feedback": "Tells worker to skip planning"
+        })
+
+        wrapper_fn = mcp_server._tool_manager.get_tool("send_to_worker").fn
+        result = wrapper_fn("w1", "just make the change directly")
+        assert isinstance(result, str), f"MCP wrapper must return str for Pydantic; got {type(result)}"
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "grade F" in parsed["error"]
+
     def test_reject_plan_sends_reason(self, tools, registry, mock_tmux):
         """Reject sends reason to tmux and logs event."""
         registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
         result = tools.reject_plan("w1", "Missing test coverage")
-        mock_tmux.send_keys.assert_called_once_with("ic-w1", "no: Missing test coverage")
+        mock_tmux.send_keys.assert_called_once_with("ic-w1", "no: Missing test coverage", ssh_host=None)
         assert "rejected" in result.lower()
         events = registry.get_recent_events(limit=1)
         assert events[0]["event_type"] == "plan_rejected"
@@ -358,25 +459,125 @@ class TestEnsureClaudeMd:
 
 
 class TestTaskLedger:
-    def test_update_ledger_writes_file(self, tools):
-        """update_ledger writes JSON to ledger path."""
+    def test_update_ledger_writes_wiki_page(self, wiki_tools, tmp_path):
+        """update_ledger writes to wiki/tasks.md with objective and tasks."""
         tasks = [
             {"id": 1, "description": "Task 1", "status": "completed"},
             {"id": 2, "description": "Task 2", "status": "in_progress"},
         ]
-        tools.update_ledger("Build feature X", tasks)
-        with open(tools.ledger_path) as f:
-            data = json.load(f)
-        assert data["objective"] == "Build feature X"
-        assert len(data["tasks"]) == 2
+        wiki_tools.update_ledger("Build feature X", tasks)
+        result = wiki_tools.get_task_ledger()
+        assert result["objective"] == "Build feature X"
+        assert len(result["tasks"]) == 2
+        wiki_page = tmp_path / "brain" / "wiki" / "tasks.md"
+        assert wiki_page.exists()
 
-    def test_get_task_ledger_reads_file(self, tools):
+    def test_get_task_ledger_reads_back_data(self, wiki_tools):
         """get_task_ledger reads back what update_ledger wrote."""
         tasks = [{"id": 1, "description": "Task 1", "status": "pending"}]
-        tools.update_ledger("Objective A", tasks)
-        result = tools.get_task_ledger()
+        wiki_tools.update_ledger("Objective A", tasks)
+        result = wiki_tools.get_task_ledger()
         assert result["objective"] == "Objective A"
         assert len(result["tasks"]) == 1
+
+    def test_get_task_ledger_returns_empty_when_no_state(self, wiki_tools):
+        """get_task_ledger returns empty dict when no wiki page and no JSON file."""
+        result = wiki_tools.get_task_ledger()
+        assert result == {"objective": None, "tasks": []}
+
+    def test_get_task_ledger_migrates_from_json_file(self, wiki_tools, tmp_path):
+        """get_task_ledger seeds wiki from old JSON file if wiki page absent."""
+        data = {"objective": "Old Goal", "tasks": [{"id": 1, "description": "Old task", "status": "pending"}]}
+        with open(wiki_tools.ledger_path, "w") as f:
+            json.dump(data, f)
+        result = wiki_tools.get_task_ledger()
+        assert result["objective"] == "Old Goal"
+        wiki_page = tmp_path / "brain" / "wiki" / "tasks.md"
+        assert wiki_page.exists()
+
+    def test_migration_does_not_run_twice(self, wiki_tools, tmp_path):
+        """After wiki is seeded, removing old JSON file doesn't lose data."""
+        data = {"objective": "Old Goal", "tasks": []}
+        with open(wiki_tools.ledger_path, "w") as f:
+            json.dump(data, f)
+        wiki_tools.get_task_ledger()  # seeds wiki from JSON file
+        os.remove(wiki_tools.ledger_path)
+        result = wiki_tools.get_task_ledger()  # reads from wiki, not empty
+        assert result["objective"] == "Old Goal"
+
+    def test_update_ledger_page_is_queryable(self, wiki_tools):
+        """wiki_query finds the task ledger after update_ledger is called."""
+        tasks = [{"id": 1, "description": "Task 1", "status": "pending"}]
+        wiki_tools.update_ledger("Goal X", tasks)
+        results = json.loads(wiki_tools.wiki_query("task ledger"))
+        assert any("tasks" in r["path"] for r in results)
+
+    def test_update_ledger_formats_human_readable_table(self, wiki_tools, tmp_path):
+        """update_ledger writes markdown table and ## Data fence to wiki page."""
+        tasks = [{"id": 1, "description": "Task 1", "status": "pending"}]
+        wiki_tools.update_ledger("Goal X", tasks)
+        content = (tmp_path / "brain" / "wiki" / "tasks.md").read_text()
+        assert "| ID |" in content
+        assert "## Data" in content
+        assert "Task 1" in content
+
+    def test_get_task_ledger_malformed_json_returns_empty(self, wiki_tools, tmp_path):
+        """get_task_ledger returns empty dict when wiki/tasks.md has malformed JSON."""
+        wiki_dir = tmp_path / "brain" / "wiki"
+        wiki_dir.mkdir(parents=True, exist_ok=True)
+        (wiki_dir / "tasks.md").write_text(
+            "---\ntitle: Task Ledger\nupdated: 2026-05-14\n---\n\n## Data\n\n```json\n{bad json}\n```\n"
+        )
+        result = wiki_tools.get_task_ledger()
+        assert result == {"objective": None, "tasks": []}
+
+    def test_migration_malformed_json_logs_and_returns_empty(self, wiki_tools, tmp_path):
+        """Migration with malformed old JSON logs warning and returns empty dict."""
+        with open(wiki_tools.ledger_path, "w") as f:
+            f.write("{bad json}")
+        result = wiki_tools.get_task_ledger()
+        assert result == {"objective": None, "tasks": []}
+        log_path = tmp_path / "brain" / "wiki" / "log.md"
+        assert log_path.exists()
+        assert "Migration failed" in log_path.read_text()
+
+
+class TestTaskLedgerStatusSetAt:
+    def test_new_task_gets_status_set_at(self, wiki_tools):
+        """First call sets status_set_at on all tasks."""
+        tasks = [{"id": "t1", "description": "Task 1", "status": "in_progress"}]
+        wiki_tools.update_ledger("Objective", tasks)
+        result = wiki_tools.get_task_ledger()
+        assert result["tasks"][0].get("status_set_at") is not None
+
+    def test_unchanged_id_status_carries_over_timestamp(self, wiki_tools):
+        """Same id+status across calls preserves the original status_set_at."""
+        tasks = [{"id": "t1", "description": "Task 1", "status": "in_progress"}]
+        wiki_tools.update_ledger("Objective", tasks)
+        original_ts = wiki_tools.get_task_ledger()["tasks"][0]["status_set_at"]
+        wiki_tools.update_ledger("Updated objective", tasks)
+        result = wiki_tools.get_task_ledger()
+        assert result["tasks"][0]["status_set_at"] == original_ts
+
+    def test_status_change_resets_timestamp(self, wiki_tools):
+        """When task status changes, old status_set_at is not carried over."""
+        tasks = [{"id": "t1", "description": "Task 1", "status": "in_progress"}]
+        wiki_tools.update_ledger("Objective", tasks)
+        original_ts = wiki_tools.get_task_ledger()["tasks"][0]["status_set_at"]
+        tasks[0]["status"] = "completed"
+        wiki_tools.update_ledger("Objective", tasks)
+        result = wiki_tools.get_task_ledger()
+        # New (id, status) key → new status_set_at assigned, not the old one
+        assert result["tasks"][0]["status_set_at"] != original_ts
+
+    def test_get_task_ledger_failure_sets_status_set_at_to_now(self, wiki_tools, tmp_path, monkeypatch):
+        """When get_task_ledger raises, update_ledger sets all status_set_at to now (no crash)."""
+        monkeypatch.setattr(wiki_tools, "get_task_ledger", lambda: (_ for _ in ()).throw(RuntimeError("fail")))
+        tasks = [{"id": "t1", "description": "Task 1", "status": "in_progress"}]
+        result_str = wiki_tools.update_ledger("Objective", tasks)
+        assert "Ledger updated" in result_str
+        tasks_md = tmp_path / "brain" / "wiki" / "tasks.md"
+        assert "status_set_at" in tasks_md.read_text()
 
 
 class TestSpawnWorkerPmRetry:
@@ -409,7 +610,7 @@ class TestSpawnWorkerPmRetry:
         assert "error" in result
         assert "session_id_timeout" in result["error"]
         assert registry.get_worker("w1") is None
-        mock_tmux.kill_session.assert_called_with("ic-w1")
+        mock_tmux.kill_session.assert_called_with("ic-w1", ssh_host=None)
 
 
 class TestSpawnWorkerEnvVar:
@@ -424,7 +625,7 @@ class TestSpawnWorkerEnvVar:
             objective="Do work",
         )
         cmd = mock_tmux.spawn_session.call_args[0][1]
-        assert cmd.startswith("export IC_WORKER_ID=test-1; ")
+        assert cmd.startswith("export IC_ROLE=worker; export IC_WORKER_ID=test-1; ")
 
     def test_ollama_worker_has_tron_worker_id(self, tools, mock_tmux):
         """Ollama worker command includes IC_WORKER_ID env var."""
@@ -438,7 +639,7 @@ class TestSpawnWorkerEnvVar:
             model_name="qwen3:8b",
         )
         cmd = mock_tmux.spawn_session.call_args[0][1]
-        assert cmd.startswith("export IC_WORKER_ID=ollama-1; ")
+        assert cmd.startswith("export IC_ROLE=worker; export IC_WORKER_ID=ollama-1; ")
 
 
 class TestKillWorker:
@@ -447,7 +648,7 @@ class TestKillWorker:
         registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
         _mock_grader_approve(tools)
         result = tools.kill_worker("w1")
-        mock_tmux.kill_session.assert_called_once_with("ic-w1")
+        mock_tmux.kill_session.assert_called_once_with("ic-w1", ssh_host=None)
         assert registry.get_worker("w1")["status"] == "completed"
         events = registry.get_recent_events(limit=1)
         assert events[0]["event_type"] == "worker_finished"
@@ -457,7 +658,7 @@ class TestKillWorker:
         """kill_worker on unknown worker_id succeeds silently (idempotent)."""
         _mock_grader_approve(tools)
         result = tools.kill_worker("nonexistent")
-        mock_tmux.kill_session.assert_called_once_with("ic-nonexistent")
+        mock_tmux.kill_session.assert_called_once_with("ic-nonexistent", ssh_host=None)
         assert isinstance(result, str)
 
     def test_kill_worker_logs_pane_pid(self, tools, registry, mock_tmux, caplog):
@@ -505,7 +706,7 @@ class TestPersistentGrader:
         assert tools._grader_ready is True
         mock_tmux.spawn_session.assert_called_once_with(
             "ic-grader",
-            "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'claude-opus-4-6' --dangerously-skip-permissions",
+            "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'claude-opus-4' --dangerously-skip-permissions",
             cwd=tools._grader_home,
         )
 
@@ -604,6 +805,12 @@ class TestPersistentGrader:
         conn.execute(
             "INSERT INTO sessions (terminal_session, professional_mode)"
             " VALUES ('test-uuid-234-5678-9012-123456789012', 'on')"
+        )
+        conn.execute(
+            "CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " terminal_session TEXT, actor TEXT, action TEXT,"
+            " old_value TEXT, new_value TEXT, context TEXT,"
+            " created_at TEXT DEFAULT (datetime('now')))"
         )
         conn.commit()
         conn.close()
@@ -787,33 +994,40 @@ class TestPersistentGrader:
         tools._call_grader("sys", "usr")
         assert "/clear" in calls
 
-    def test_call_grader_returns_f_on_timeout(self, tools, mock_tmux, tmp_path):
-        """_call_grader returns grade F when grader times out."""
-        tools._grader_ready = True
-        tools._is_grader_alive = MagicMock(return_value=True)
-        mock_tmux.has_session.return_value = True
+    def test_call_grader_returns_f_on_timeout(self, tools):
+        """_call_grader returns grade F when grader times out on both attempts."""
+        tools._ensure_grader = MagicMock(return_value=True)
+        tools._do_grader_send_and_poll = MagicMock(return_value=None)
 
-        # read_log_tail always returns same baseline — no new output
-        mock_tmux.read_log_tail.return_value = "Unchanged baseline\n"
-        mock_tmux.send_keys.return_value = True
-
-        # Patch time to speed up timeout
-        import unittest.mock
-        original_time = time.time
-        call_count = [0]
-        def fast_time():
-            call_count[0] += 1
-            if call_count[0] > 2:
-                return original_time() + 200  # Jump past deadline
-            return original_time()
-
-        with unittest.mock.patch('ironclaude.orchestrator_mcp.time') as mock_time:
-            mock_time.time = fast_time
-            mock_time.sleep = lambda x: None
-            result = tools._call_grader("sys", "usr")
+        result = tools._call_grader("sys", "usr")
 
         assert result["grade"] == "F"
         assert "timed out" in result["feedback"].lower()
+
+    def test_call_grader_retries_once_on_timeout(self, tools):
+        """_call_grader retries with fresh grader session on timeout; returns result if retry succeeds."""
+        success_result = {"grade": "A", "approved": True, "feedback": "passed on retry"}
+        tools._ensure_grader = MagicMock(return_value=True)
+        tools._do_grader_send_and_poll = MagicMock(side_effect=[None, success_result])
+
+        result = tools._call_grader("sys", "usr")
+
+        assert result["grade"] == "A"
+        assert result["feedback"] == "passed on retry"
+        assert tools._do_grader_send_and_poll.call_count == 2
+        assert tools._ensure_grader.call_count == 2
+
+    def test_call_grader_fails_on_double_timeout(self, tools):
+        """_call_grader returns F after both grader attempts timeout."""
+        tools._ensure_grader = MagicMock(return_value=True)
+        tools._do_grader_send_and_poll = MagicMock(return_value=None)
+
+        result = tools._call_grader("sys", "usr")
+
+        assert result["grade"] == "F"
+        assert "timed out" in result["feedback"].lower()
+        assert tools._do_grader_send_and_poll.call_count == 2
+        assert tools._grader_ready is False
 
     def test_call_grader_fails_if_grader_not_available(self, tools, mock_tmux):
         """_call_grader returns grade F if grader session cannot start."""
@@ -1068,6 +1282,79 @@ class TestSendToWorkerGrader:
         assert "/deactivate-professional-mode" in system_prompt.lower()
 
 
+class TestSendToWorkerMenuDetection:
+    """Tests for AskUserQuestion menu detection in send_to_worker."""
+
+    def test_send_navigates_to_free_text_on_menu(self, tools, registry, mock_tmux):
+        """When menu detected with free-text option, navigates to it and types message."""
+        from tests.test_tmux_manager import MENU_WITH_OTHER
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        _mock_grader_approve(tools)
+        mock_tmux.capture_pane.return_value = MENU_WITH_OTHER
+
+        result = tools.send_to_worker("w1", "Use approach B instead")
+
+        assert isinstance(result, str)
+        assert "w1" in result
+        raw_key_calls = mock_tmux.send_raw_keys.call_args_list
+        down_calls = [c for c in raw_key_calls if c[0][1] == ["Down"]]
+        assert len(down_calls) == 2
+        enter_calls = [c for c in raw_key_calls if c[0][1] == ["Enter"]]
+        assert len(enter_calls) == 1
+        mock_tmux.send_keys.assert_called_once_with("ic-w1", "Use approach B instead", ssh_host=None)
+
+    def test_send_returns_error_on_menu_without_free_text(self, tools, registry, mock_tmux):
+        """When menu detected without free-text option, returns error dict."""
+        from tests.test_tmux_manager import MENU_NO_FREE_TEXT
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        _mock_grader_approve(tools)
+        mock_tmux.capture_pane.return_value = MENU_NO_FREE_TEXT
+
+        result = tools.send_to_worker("w1", "Some message")
+
+        assert isinstance(result, dict)
+        assert "error" in result
+        assert "send_keys_to_worker" in result["error"]
+        mock_tmux.send_keys.assert_not_called()
+
+    def test_send_normal_when_no_menu(self, tools, registry, mock_tmux):
+        """When no menu detected, sends message normally via send_keys."""
+        from tests.test_tmux_manager import NO_MENU_OUTPUT
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        _mock_grader_approve(tools)
+        mock_tmux.capture_pane.return_value = NO_MENU_OUTPUT
+
+        result = tools.send_to_worker("w1", "Proceed with the plan")
+
+        assert isinstance(result, str)
+        mock_tmux.send_keys.assert_called_once_with("ic-w1", "Proceed with the plan", ssh_host=None)
+        mock_tmux.send_raw_keys.assert_not_called()
+
+    def test_send_navigates_correct_number_of_downs(self, tools, registry, mock_tmux):
+        """Navigation sends exactly (free_text - current) Down key presses."""
+        from tests.test_tmux_manager import MENU_CURSOR_ON_OPTION_2
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        _mock_grader_approve(tools)
+        mock_tmux.capture_pane.return_value = MENU_CURSOR_ON_OPTION_2
+
+        tools.send_to_worker("w1", "Some message")
+
+        raw_key_calls = mock_tmux.send_raw_keys.call_args_list
+        down_calls = [c for c in raw_key_calls if c[0][1] == ["Down"]]
+        assert len(down_calls) == 1
+
+    def test_send_falls_through_on_capture_failure(self, tools, registry, mock_tmux):
+        """When capture_pane raises, falls through to normal send_keys."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        _mock_grader_approve(tools)
+        mock_tmux.capture_pane.side_effect = subprocess.CalledProcessError(1, "tmux")
+
+        result = tools.send_to_worker("w1", "Some message")
+
+        assert isinstance(result, str)
+        mock_tmux.send_keys.assert_called_once()
+
+
 class TestSendKeysToWorker:
     """Tests for send_keys_to_worker MCP tool."""
 
@@ -1077,7 +1364,7 @@ class TestSendKeysToWorker:
         result = tools.send_keys_to_worker("w1", ["Down", "Space", "Enter"])
         assert isinstance(result, str)
         assert "w1" in result
-        mock_tmux.send_raw_keys.assert_called_once_with("ic-w1", ["Down", "Space", "Enter"])
+        mock_tmux.send_raw_keys.assert_called_once_with("ic-w1", ["Down", "Space", "Enter"], ssh_host=None)
 
     def test_invalid_worker(self, tools, registry):
         """Raises ValueError when worker_id is not registered."""
@@ -1108,14 +1395,14 @@ class TestSendKeysToWorker:
         registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
         result = tools.send_keys_to_worker("w1", ["$(evil)"])
         assert isinstance(result, str)
-        mock_tmux.send_raw_keys.assert_called_once_with("ic-w1", ["$(evil)"])
+        mock_tmux.send_raw_keys.assert_called_once_with("ic-w1", ["$(evil)"], ssh_host=None)
 
     def test_allows_plain_text_mix(self, tools, registry, mock_tmux):
         """Plain text strings alongside named keys are allowed."""
         registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
         result = tools.send_keys_to_worker("w1", ["hello", "Enter"])
         assert isinstance(result, str)
-        mock_tmux.send_raw_keys.assert_called_once_with("ic-w1", ["hello", "Enter"])
+        mock_tmux.send_raw_keys.assert_called_once_with("ic-w1", ["hello", "Enter"], ssh_host=None)
 
     def test_no_grader_called(self, tools, registry, mock_tmux):
         """send_keys_to_worker does not invoke the grader."""
@@ -1168,6 +1455,19 @@ class TestActivatePmViaSqlite:
         )
     """
 
+    AUDIT_LOG_SCHEMA = """
+        CREATE TABLE audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            terminal_session TEXT,
+            actor TEXT,
+            action TEXT,
+            old_value TEXT,
+            new_value TEXT,
+            context TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """
+
     def _setup_claude_dir(self, tmp_path, pid, session_uuid, create_db=True, prefill_row=None):
         """Create a temp ~/.claude dir with session file and optional DB."""
         claude_dir = tmp_path / ".claude"
@@ -1177,6 +1477,7 @@ class TestActivatePmViaSqlite:
             db_path = claude_dir / "ironclaude.db"
             conn = sqlite3.connect(str(db_path))
             conn.execute(self.SESSIONS_SCHEMA)
+            conn.execute(self.AUDIT_LOG_SCHEMA)
             if prefill_row:
                 conn.execute(
                     "INSERT INTO sessions (terminal_session, professional_mode) VALUES (?, ?)",
@@ -1264,6 +1565,37 @@ class TestActivatePmViaSqlite:
             result = tools._activate_pm_via_sqlite("ic-w1", timeout=2, _claude_dir=claude_dir)
         assert isinstance(result, str)
         assert "tmux" in result.lower()
+
+    def test_activate_writes_audit_log(self, tools, tmp_path):
+        """_activate_pm_via_sqlite writes actor='daemon:pm_activate' to audit_log."""
+        pid, uuid = "12345", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        claude_dir = self._setup_claude_dir(tmp_path, pid, uuid)
+        db_path = claude_dir / "ironclaude.db"
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = self._mock_tmux_run(pid)
+            tools._activate_pm_via_sqlite("ic-w1", timeout=2, _claude_dir=claude_dir)
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT actor, action FROM audit_log WHERE terminal_session=?", (uuid,)
+        ).fetchone()
+        conn.close()
+        assert row is not None, "audit_log must have a row after activation"
+        assert row[0] == "daemon:pm_activate"
+        assert row[1] == "professional_mode_on"
+
+    def test_connection_closed_on_sqlite_error(self, tools, tmp_path):
+        """DB connection is closed via finally even when sqlite3.Error is raised."""
+        pid, uuid = "12345", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        claude_dir = self._setup_claude_dir(tmp_path, pid, uuid, create_db=False)
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = sqlite3.Error("forced error")
+        with patch("subprocess.run") as mock_run, \
+             patch("ironclaude.orchestrator_mcp.sqlite3.connect", return_value=mock_conn):
+            mock_run.return_value = self._mock_tmux_run(pid)
+            result = tools._activate_pm_via_sqlite("ic-w1", timeout=2, _claude_dir=claude_dir)
+        assert isinstance(result, str)
+        assert "sqlite" in result.lower()
+        mock_conn.close.assert_called_once()
 
 
 class TestInitBrainSessionBackground:
@@ -1459,6 +1791,26 @@ class TestDirectiveLifecycle:
         )
         assert "id" in result
         assert result["status"] == "pending_confirmation"
+
+    def test_submit_directive_pins_interpretation_ts(self, tools_with_slack, mock_slack):
+        """submit_directive pins the posted confirmation message."""
+        mock_slack.post_message.return_value = "1700000099.0"
+        tools_with_slack.submit_directive(
+            source_ts="1700000001.0",
+            source_text="fix the bug",
+            interpretation="Fix the login bug",
+        )
+        mock_slack.pin_message.assert_called_once_with("1700000099.0")
+
+    def test_submit_directive_skips_pin_when_post_fails(self, tools_with_slack, mock_slack):
+        """submit_directive does not pin if post_message returns None."""
+        mock_slack.post_message.return_value = None
+        tools_with_slack.submit_directive(
+            source_ts="1700000001.0",
+            source_text="fix the bug",
+            interpretation="Fix the login bug",
+        )
+        mock_slack.pin_message.assert_not_called()
 
     def test_get_directives_no_filter(self, tools_with_slack, db_conn):
         """get_directives returns all directives when no status filter."""
@@ -1839,7 +2191,7 @@ class TestGetWorkerLogCapture:
         tools = OrchestratorTools(registry, mock_tmux, ledger_path, db_conn=db_conn)
         result = tools.get_worker_log("w1", lines=50)
         assert result == "Clean rendered output\n"
-        mock_tmux.capture_pane.assert_called_once_with("ic-w1", lines=50)
+        mock_tmux.capture_pane.assert_called_once_with("ic-w1", lines=50, ssh_host=None)
 
     def test_falls_back_to_raw_log(self, registry, mock_tmux, tmp_path, db_conn):
         """get_worker_log falls back to raw log when session is dead."""
@@ -2606,7 +2958,7 @@ class TestBatchSpawn:
     def test_batch_grader_fallback(self, tools, mock_tmux):
         """Malformed batch response falls back to individual grading."""
         call_count = [0]
-        def mock_grader(system_prompt, user_prompt):
+        def mock_grader(system_prompt, user_prompt, batch=False):
             call_count[0] += 1
             if call_count[0] == 1:
                 return "malformed"
@@ -3151,6 +3503,13 @@ class TestGetMessagesByTsRange:
             "/tmp/ironclaude-slack-files/FCARD1_card.png",
         )
 
+    def test_get_messages_by_ts_range_passes_channel_to_slack(self, tools):
+        mock_slack = MagicMock()
+        tools._slack = mock_slack
+        mock_slack.get_messages_by_ts_range.return_value = []
+        tools.get_messages_by_ts_range("1.0", "2.0", channel="C999")
+        mock_slack.get_messages_by_ts_range.assert_called_once_with("1.0", "2.0", True, channel="C999")
+
 
 class TestGetWorkerCommand:
     def test_returns_worker_commands_fallback_when_no_advisor(self, tools):
@@ -3185,3 +3544,517 @@ class TestGetWorkerCommand:
         assert "claude-opus-4-7" in cmd
         assert "exec claude" in cmd
         assert "CLAUDE_CODE_EFFORT_LEVEL=high" in cmd
+
+
+@pytest.fixture
+def wiki_tools(registry, mock_tmux, tmp_path, db_conn):
+    """Create OrchestratorTools with wiki-enabled config."""
+    ledger_path = str(tmp_path / "task-ledger.json")
+    brain_dir = tmp_path / "brain"
+    brain_dir.mkdir()
+    subprocess.run(["git", "init"], cwd=str(brain_dir), capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=str(brain_dir), capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(brain_dir), capture_output=True)
+    return OrchestratorTools(
+        registry, mock_tmux, ledger_path, db_conn=db_conn,
+        config={"brain_cwd": str(brain_dir)},
+    )
+
+
+class TestWikiTools:
+    """Wiki tool business logic: write, delete, query, log."""
+
+    def test_wiki_write_creates_page(self, wiki_tools, tmp_path):
+        brain_dir = tmp_path / "brain"
+        result = wiki_tools.wiki_write("test-page", "Test Page", "Some content here.")
+        page_path = brain_dir / "wiki" / "test-page.md"
+        assert page_path.exists()
+        assert "test-page.md" in result
+
+    def test_wiki_write_frontmatter(self, wiki_tools, tmp_path):
+        wiki_tools.wiki_write("test-page", "Test Page", "Content.")
+        page_path = tmp_path / "brain" / "wiki" / "test-page.md"
+        content = page_path.read_text()
+        assert content.startswith("---\n")
+        assert "title: Test Page" in content
+        assert "updated:" in content
+
+    def test_wiki_write_rebuilds_index(self, wiki_tools, tmp_path):
+        wiki_tools.wiki_write("alpha", "Alpha Page", "Alpha content.")
+        wiki_tools.wiki_write("beta", "Beta Page", "Beta content.")
+        index_path = tmp_path / "brain" / "wiki" / "index.md"
+        index_content = index_path.read_text()
+        assert "Alpha Page" in index_content
+        assert "Beta Page" in index_content
+
+    def test_wiki_write_appends_log(self, wiki_tools, tmp_path):
+        wiki_tools.wiki_write("test-page", "Test Page", "Content.")
+        log_path = tmp_path / "brain" / "wiki" / "log.md"
+        log_content = log_path.read_text()
+        assert "Created test-page.md" in log_content
+
+    def test_wiki_write_update_existing(self, wiki_tools, tmp_path):
+        wiki_tools.wiki_write("test-page", "Test Page", "Original.")
+        wiki_tools.wiki_write("test-page", "Test Page", "Updated.")
+        page_path = tmp_path / "brain" / "wiki" / "test-page.md"
+        assert "Updated." in page_path.read_text()
+        log_path = tmp_path / "brain" / "wiki" / "log.md"
+        log_content = log_path.read_text()
+        assert "Created test-page.md" in log_content
+        assert "Updated test-page.md" in log_content
+
+    def test_wiki_write_creates_wiki_dir(self, wiki_tools, tmp_path):
+        wiki_dir = tmp_path / "brain" / "wiki"
+        assert not wiki_dir.exists()
+        wiki_tools.wiki_write("first", "First", "Content.")
+        assert wiki_dir.exists()
+
+    def test_wiki_delete_removes_page(self, wiki_tools, tmp_path):
+        wiki_tools.wiki_write("doomed", "Doomed Page", "Content.")
+        result = wiki_tools.wiki_delete("doomed")
+        assert "Deleted" in result
+        assert not (tmp_path / "brain" / "wiki" / "doomed.md").exists()
+
+    def test_wiki_delete_updates_index(self, wiki_tools, tmp_path):
+        wiki_tools.wiki_write("keep", "Keep", "Content.")
+        wiki_tools.wiki_write("remove", "Remove", "Content.")
+        wiki_tools.wiki_delete("remove")
+        index_content = (tmp_path / "brain" / "wiki" / "index.md").read_text()
+        assert "Keep" in index_content
+        assert "Remove" not in index_content
+
+    def test_wiki_delete_appends_log(self, wiki_tools, tmp_path):
+        wiki_tools.wiki_write("doomed", "Doomed", "Content.")
+        wiki_tools.wiki_delete("doomed")
+        log_content = (tmp_path / "brain" / "wiki" / "log.md").read_text()
+        assert "Deleted doomed.md" in log_content
+
+    def test_wiki_delete_nonexistent_idempotent(self, wiki_tools):
+        result = wiki_tools.wiki_delete("nonexistent")
+        assert "not found" in result.lower()
+
+    def test_wiki_query_matches_index(self, wiki_tools):
+        wiki_tools.wiki_write("grader-arch", "Grader Architecture", "How the grader evaluates worker output.")
+        results = json.loads(wiki_tools.wiki_query("grader"))
+        assert len(results) >= 1
+        assert results[0]["title"] == "Grader Architecture"
+        assert results[0]["match_source"] == "index"
+
+    def test_wiki_query_matches_content(self, wiki_tools):
+        wiki_tools.wiki_write("worker-lifecycle", "Worker Lifecycle", "Workers are spawned via tmux. The grader timeout is 30 seconds.")
+        results = json.loads(wiki_tools.wiki_query("timeout"))
+        assert len(results) >= 1
+        assert any(r["match_source"] == "content" for r in results)
+
+    def test_wiki_query_deduplicates(self, wiki_tools):
+        wiki_tools.wiki_write("grader-arch", "Grader Architecture", "The grader evaluates worker output using grading criteria.")
+        results = json.loads(wiki_tools.wiki_query("grader"))
+        page_paths = [r["path"] for r in results]
+        assert len(page_paths) == len(set(page_paths))
+
+    def test_wiki_query_empty_wiki(self, wiki_tools):
+        results = json.loads(wiki_tools.wiki_query("anything"))
+        assert results == []
+
+    def test_wiki_query_no_match(self, wiki_tools):
+        wiki_tools.wiki_write("alpha", "Alpha", "Content about alpha.")
+        results = json.loads(wiki_tools.wiki_query("zzzznotfound"))
+        assert results == []
+
+    def test_wiki_query_caps_at_default_limit(self, wiki_tools):
+        """wiki_query returns at most 20 results when more matches exist."""
+        wiki_dir = Path(wiki_tools._wiki_dir)
+        wiki_dir.mkdir(parents=True, exist_ok=True)
+        lines = ["# Wiki Index\n\n| Page | Summary | Updated |\n|---|---|---|\n"]
+        for i in range(25):
+            lines.append(
+                f"| [Page {i:02d}](page-{i:02d}.md) | Robotics summary {i} | 2026-05-25 |\n"
+            )
+        (wiki_dir / "index.md").write_text("".join(lines))
+
+        results = json.loads(wiki_tools.wiki_query("robotics"))
+        assert len(results) == 20
+
+    def test_wiki_query_respects_custom_limit(self, wiki_tools):
+        """wiki_query accepts a limit parameter and returns at most that many results."""
+        wiki_dir = Path(wiki_tools._wiki_dir)
+        wiki_dir.mkdir(parents=True, exist_ok=True)
+        lines = ["# Wiki Index\n\n| Page | Summary | Updated |\n|---|---|---|\n"]
+        for i in range(10):
+            lines.append(
+                f"| [Page {i:02d}](page-{i:02d}.md) | Robotics summary {i} | 2026-05-25 |\n"
+            )
+        (wiki_dir / "index.md").write_text("".join(lines))
+
+        results = json.loads(wiki_tools.wiki_query("robotics", limit=3))
+        assert len(results) == 3
+
+    def test_wiki_query_returns_all_when_under_limit(self, wiki_tools):
+        """wiki_query returns all matches when count is below the limit."""
+        wiki_dir = Path(wiki_tools._wiki_dir)
+        wiki_dir.mkdir(parents=True, exist_ok=True)
+        lines = ["# Wiki Index\n\n| Page | Summary | Updated |\n|---|---|---|\n"]
+        for i in range(5):
+            lines.append(
+                f"| [Page {i:02d}](page-{i:02d}.md) | Robotics summary {i} | 2026-05-25 |\n"
+            )
+        (wiki_dir / "index.md").write_text("".join(lines))
+
+        results = json.loads(wiki_tools.wiki_query("robotics"))
+        assert len(results) == 5
+
+    def test_wiki_log_appends_entry(self, wiki_tools, tmp_path):
+        wiki_tools.wiki_write("setup", "Setup", "Content.")
+        wiki_tools.wiki_log("Periodic sweep: created 3 pages")
+        log_content = (tmp_path / "brain" / "wiki" / "log.md").read_text()
+        assert "Periodic sweep: created 3 pages" in log_content
+
+    def test_wiki_log_creates_log_if_missing(self, wiki_tools, tmp_path):
+        wiki_dir = tmp_path / "brain" / "wiki"
+        wiki_dir.mkdir(parents=True)
+        wiki_tools.wiki_log("First entry")
+        log_path = wiki_dir / "log.md"
+        assert log_path.exists()
+        assert "First entry" in log_path.read_text()
+
+    def test_rebuild_index_derived_state(self, wiki_tools, tmp_path):
+        wiki_tools.wiki_write("page-a", "Page A", "Content A.")
+        wiki_tools.wiki_write("page-b", "Page B", "Content B.")
+        index_path = tmp_path / "brain" / "wiki" / "index.md"
+        index_path.unlink()
+        assert not index_path.exists()
+        wiki_tools.wiki_write("page-c", "Page C", "Content C.")
+        index_content = index_path.read_text()
+        assert "Page A" in index_content
+        assert "Page B" in index_content
+        assert "Page C" in index_content
+
+    def test_wiki_write_hard_failure(self, wiki_tools, tmp_path):
+        wiki_dir = tmp_path / "brain" / "wiki"
+        wiki_dir.mkdir(parents=True)
+        bad_path = wiki_dir / "test.md"
+        bad_path.mkdir()
+        with pytest.raises(OSError):
+            wiki_tools.wiki_write("test", "Test", "Content.")
+
+    def test_wiki_write_creates_git_commit(self, wiki_tools, tmp_path):
+        """wiki_write commits the new page to git."""
+        brain_dir = tmp_path / "brain"
+        wiki_tools.wiki_write("test-page", "Test Page", "Some content.")
+        result = subprocess.run(
+            ["git", "log", "--oneline"],
+            cwd=str(brain_dir),
+            capture_output=True,
+            text=True,
+        )
+        assert "wiki: created test-page" in result.stdout
+
+    def test_wiki_write_update_commits_to_git(self, wiki_tools, tmp_path):
+        """Second wiki_write to same page commits with 'updated'."""
+        brain_dir = tmp_path / "brain"
+        wiki_tools.wiki_write("test-page", "Test Page", "Version 1.")
+        wiki_tools.wiki_write("test-page", "Test Page", "Version 2.")
+        result = subprocess.run(
+            ["git", "log", "--oneline"],
+            cwd=str(brain_dir),
+            capture_output=True,
+            text=True,
+        )
+        assert "wiki: updated test-page" in result.stdout
+
+    def test_wiki_delete_commits_to_git(self, wiki_tools, tmp_path):
+        """wiki_delete commits the deletion to git."""
+        brain_dir = tmp_path / "brain"
+        wiki_tools.wiki_write("test-page", "Test Page", "Content.")
+        wiki_tools.wiki_delete("test-page")
+        result = subprocess.run(
+            ["git", "log", "--oneline"],
+            cwd=str(brain_dir),
+            capture_output=True,
+            text=True,
+        )
+        assert "wiki: delete test-page" in result.stdout
+
+    def test_wiki_write_rejects_path_traversal(self, wiki_tools, tmp_path):
+        """wiki_write rejects page names that escape the wiki directory."""
+        result = wiki_tools.wiki_write("../etc/passwd", "Title", "Content")
+        assert result == "Path traversal rejected: ../etc/passwd"
+        assert not (tmp_path / "etc" / "passwd.md").exists()
+
+    def test_wiki_delete_rejects_path_traversal(self, wiki_tools, tmp_path):
+        """wiki_delete rejects page names that escape the wiki directory."""
+        result = wiki_tools.wiki_delete("../etc/passwd")
+        assert result == "Path traversal rejected: ../etc/passwd"
+
+
+def test_constructor_ledger_path_optional(registry, mock_tmux, db_conn):
+    """OrchestratorTools can be instantiated without ledger_path argument."""
+    t = OrchestratorTools(registry, mock_tmux, db_conn=db_conn)
+    assert t.ledger_path == ""
+
+
+class TestExtractLedgerJson:
+    """Unit tests for _extract_ledger_json static helper."""
+
+    def test_extracts_json_from_data_section(self):
+        body = '**Objective:** Foo\n\n## Data\n\n```json\n{"objective": "Foo", "tasks": []}\n```'
+        result = OrchestratorTools._extract_ledger_json(body)
+        assert result == {"objective": "Foo", "tasks": []}
+
+    def test_returns_empty_when_no_data_section(self):
+        result = OrchestratorTools._extract_ledger_json("Some content without a data section.")
+        assert result == {"objective": None, "tasks": []}
+
+    def test_returns_empty_when_no_fence(self):
+        result = OrchestratorTools._extract_ledger_json("**Obj:** Foo\n\n## Data\n\nNo fence here.")
+        assert result == {"objective": None, "tasks": []}
+
+    def test_returns_empty_on_malformed_json(self):
+        body = "**Obj:** Foo\n\n## Data\n\n```json\n{bad json}\n```"
+        result = OrchestratorTools._extract_ledger_json(body)
+        assert result == {"objective": None, "tasks": []}
+
+    def test_handles_tasks_list(self):
+        body = '## Data\n\n```json\n{"objective": "X", "tasks": [{"id": 1, "status": "done"}]}\n```'
+        result = OrchestratorTools._extract_ledger_json(body)
+        assert result["objective"] == "X"
+        assert len(result["tasks"]) == 1
+
+
+class TestCallGraderLocking:
+    def test_grader_lock_attribute_exists(self, tools):
+        """OrchestratorTools must have a _grader_lock threading.Lock attribute."""
+        assert hasattr(tools, '_grader_lock')
+        lock = tools._grader_lock
+        acquired = lock.acquire(blocking=False)
+        assert acquired, "_grader_lock must be acquirable when uncontested"
+        lock.release()
+
+    def test_grader_ready_reset_on_timeout(self, tools):
+        """_grader_ready is set to False when _call_grader times out on both attempts."""
+        tools._ensure_grader = MagicMock(return_value=True)
+        tools._do_grader_send_and_poll = MagicMock(return_value=None)
+        tools._grader_ready = True
+
+        result = tools._call_grader("system prompt", "user prompt")
+
+        assert result == {
+            "grade": "F",
+            "approved": False,
+            "feedback": f"Grader timed out after {OrchestratorTools.GRADER_TIMEOUT_SECONDS}s",
+        }
+        assert tools._grader_ready is False, "_grader_ready must be False after timeout"
+
+
+class TestValidateLogPath:
+    def test_accepts_home_relative_path(self):
+        """Home-relative log paths must be accepted on any machine."""
+        from pathlib import Path
+        from ironclaude.orchestrator_mcp import _validate_log_path
+        _validate_log_path(str(Path.home() / "ironclaude.log"))
+
+    def test_rejects_tmp_traversal(self):
+        from ironclaude.orchestrator_mcp import _validate_log_path
+        with pytest.raises(ValueError, match="path traversal"):
+            _validate_log_path("/tmp/../etc/passwd")
+
+    def test_rejects_disallowed_prefix(self):
+        from ironclaude.orchestrator_mcp import _validate_log_path
+        with pytest.raises(ValueError, match="allowed directories"):
+            _validate_log_path("/etc/shadow")
+
+
+def _make_proc(pid, name, cmdline, rss, cpu_percent=0.0, create_time=None):
+    """Create a mock psutil.Process-like object for get_process_info tests."""
+    proc = MagicMock()
+    mem = MagicMock()
+    mem.rss = rss
+    proc.info = {
+        "pid": pid,
+        "name": name,
+        "cmdline": cmdline,
+        "memory_info": mem,
+        "cpu_percent": cpu_percent,
+        "create_time": create_time if create_time is not None else (time.time() - 3600),
+    }
+    return proc
+
+
+class TestGetProcessInfo:
+    def test_filters_relevant_excludes_system(self, tools):
+        """Ollama and python3 processes included; systemd excluded."""
+        proc_fixtures = [
+            _make_proc(pid=1, name="ollama", cmdline=["ollama", "serve"], rss=500 * 1024 * 1024),
+            _make_proc(pid=2, name="python3", cmdline=["python3", "-m", "ironclaude.main"], rss=300 * 1024 * 1024),
+            _make_proc(pid=3, name="systemd", cmdline=["systemd"], rss=10 * 1024 * 1024),
+        ]
+        with patch("ironclaude.orchestrator_mcp.psutil.process_iter", return_value=proc_fixtures):
+            result = tools.get_process_info()
+        pids = [p["pid"] for p in result["processes"]]
+        assert 1 in pids
+        assert 2 in pids
+        assert 3 not in pids
+
+    def test_sorted_by_rss_descending(self, tools):
+        """Process with highest RSS appears first."""
+        proc_fixtures = [
+            _make_proc(pid=10, name="python3", cmdline=["python3"], rss=100 * 1024 * 1024),
+            _make_proc(pid=11, name="ollama", cmdline=["ollama", "runner"], rss=9 * 1024 ** 3),
+        ]
+        with patch("ironclaude.orchestrator_mcp.psutil.process_iter", return_value=proc_fixtures):
+            result = tools.get_process_info()
+        assert result["processes"][0]["pid"] == 11
+        assert result["processes"][0]["rss_gb"] == 9.0
+
+    def test_python_name_includes_module(self, tools):
+        """python3 -m module → 'python3 (module)'."""
+        proc_fixtures = [
+            _make_proc(pid=20, name="python3", cmdline=["python3", "-m", "ironclaude.main"], rss=0),
+        ]
+        with patch("ironclaude.orchestrator_mcp.psutil.process_iter", return_value=proc_fixtures):
+            result = tools.get_process_info()
+        assert result["processes"][0]["name"] == "python3 (ironclaude.main)"
+
+    def test_python_name_includes_script(self, tools):
+        """python3 /path/script.py → 'python3 (script.py)'."""
+        proc_fixtures = [
+            _make_proc(pid=21, name="python3", cmdline=["python3", "/path/to/scan_pipeline.py"], rss=0),
+        ]
+        with patch("ironclaude.orchestrator_mcp.psutil.process_iter", return_value=proc_fixtures):
+            result = tools.get_process_info()
+        assert result["processes"][0]["name"] == "python3 (scan_pipeline.py)"
+
+    def test_no_such_process_skipped(self, tools):
+        """NoSuchProcess during iteration is swallowed; other processes still returned."""
+        good_proc = _make_proc(pid=30, name="claude", cmdline=["claude"], rss=200 * 1024 * 1024)
+        bad_proc = MagicMock()
+        type(bad_proc).info = PropertyMock(side_effect=psutil.NoSuchProcess(999))
+        with patch("ironclaude.orchestrator_mcp.psutil.process_iter", return_value=[bad_proc, good_proc]):
+            result = tools.get_process_info()
+        assert len(result["processes"]) == 1
+        assert result["processes"][0]["pid"] == 30
+
+    def test_cmdline_keyword_match_includes_mcp_node(self, tools):
+        """node process with 'mcp' in cmdline is included even if name not in filter set."""
+        proc_fixtures = [
+            _make_proc(pid=40, name="node", cmdline=["node", "/path/to/mcp-server.js"], rss=80 * 1024 * 1024),
+        ]
+        with patch("ironclaude.orchestrator_mcp.psutil.process_iter", return_value=proc_fixtures):
+            result = tools.get_process_info()
+        assert result["processes"][0]["pid"] == 40
+
+    def test_rss_converted_to_gb(self, tools):
+        """RSS bytes are converted to GB rounded to 2 decimal places."""
+        proc_fixtures = [
+            _make_proc(pid=50, name="ollama", cmdline=["ollama"], rss=int(9.6 * 1024 ** 3)),
+        ]
+        with patch("ironclaude.orchestrator_mcp.psutil.process_iter", return_value=proc_fixtures):
+            result = tools.get_process_info()
+        assert result["processes"][0]["rss_gb"] == 9.6
+
+
+class TestActivatePmRemote:
+    def test_rejects_non_uuid_session_id(self, tools, mock_tmux):
+        """_activate_pm_remote returns error if session UUID fails UUID format check."""
+        # 36-char string that passes the len==36 check but contains SQL injection characters
+        malicious = "a' OR 'x'='x'; INSERT INTO evil;!xxx"
+        assert len(malicious) == 36
+        mock_tmux.list_pane_pid.return_value = "12345"
+        mock_tmux.read_file.return_value = malicious
+        result = tools._activate_pm_remote("ic-w1", "remote-host")
+        assert isinstance(result, str)
+        assert "invalid" in result.lower()
+        mock_tmux.run_sqlite_query.assert_not_called()
+
+    def test_accepts_valid_uuid(self, tools, mock_tmux):
+        """_activate_pm_remote succeeds when session UUID matches UUID format."""
+        mock_tmux.list_pane_pid.return_value = "12345"
+        mock_tmux.read_file.return_value = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        mock_tmux.run_sqlite_query.return_value = ""
+        result = tools._activate_pm_remote("ic-w1", "remote-host")
+        assert result is None
+        mock_tmux.run_sqlite_query.assert_called_once()
+
+
+class TestCallGraderBatch:
+    def _setup_grader(self, tools):
+        tools._ensure_grader = MagicMock(return_value=True)
+        tools._wait_for_grader_clear = MagicMock()
+        tools._grader_ready = True
+
+    def test_batch_param_returns_list(self, tools, mock_tmux):
+        self._setup_grader(tools)
+        array_json = '[{"grade":"A","approved":true,"feedback":"G1"},{"grade":"B","approved":true,"feedback":"G2"}]'
+        with patch("ironclaude.orchestrator_mcp.secrets.token_hex", return_value="abc12345"):
+            delimiter = "GRADER_RESPONSE_abc12345"
+            tools.tmux.read_log_tail.side_effect = ["", f"{delimiter}\n{array_json}"]
+            with patch("ironclaude.orchestrator_mcp.time.sleep"):
+                result = tools._call_grader("sys prompt", "user prompt", batch=True)
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert result[0]["grade"] == "A"
+        assert result[1]["grade"] == "B"
+
+    def test_non_batch_still_returns_dict(self, tools, mock_tmux):
+        self._setup_grader(tools)
+        single_json = '{"grade":"A","approved":true,"feedback":"Good","recommended_model":"claude-sonnet"}'
+        with patch("ironclaude.orchestrator_mcp.secrets.token_hex", return_value="abc12345"):
+            delimiter = "GRADER_RESPONSE_abc12345"
+            tools.tmux.read_log_tail.side_effect = ["", f"{delimiter}\n{single_json}"]
+            with patch("ironclaude.orchestrator_mcp.time.sleep"):
+                result = tools._call_grader("sys prompt", "user prompt")
+        assert isinstance(result, dict)
+        assert result["grade"] == "A"
+
+
+class TestWorkerCommandsImport:
+    def test_main_uses_same_worker_commands_as_orchestrator(self):
+        """main.WORKER_COMMANDS must be the same object as orchestrator_mcp.WORKER_COMMANDS."""
+        import ironclaude.main as main_mod
+        import ironclaude.orchestrator_mcp as orc_mod
+        assert main_mod.WORKER_COMMANDS is orc_mod.WORKER_COMMANDS
+
+
+class TestPinUnpinMessage:
+    """Tests for pin_message and unpin_message MCP tools."""
+
+    @pytest.fixture
+    def mock_slack(self):
+        """Create a mock SlackBot."""
+        return MagicMock()
+
+    @pytest.fixture
+    def tools_with_slack(self, registry, mock_tmux, tmp_path, mock_slack):
+        """Create OrchestratorTools with a mock SlackBot."""
+        ledger_path = str(tmp_path / "task-ledger.json")
+        return OrchestratorTools(registry, mock_tmux, ledger_path, slack_bot=mock_slack)
+
+    def test_pin_message_calls_slack_with_timestamp(self, tools_with_slack, mock_slack):
+        """pin_message delegates to SlackBot.pin_message with the given timestamp."""
+        mock_slack.pin_message.return_value = True
+        tools_with_slack.pin_message("1700000001.000001")
+        mock_slack.pin_message.assert_called_once_with("1700000001.000001")
+
+    def test_pin_message_returns_success_json(self, tools_with_slack, mock_slack):
+        """pin_message returns JSON {"success": true} on success."""
+        mock_slack.pin_message.return_value = True
+        result = tools_with_slack.pin_message("1700000001.000001")
+        assert json.loads(result) == {"success": True}
+
+    def test_pin_message_slack_unavailable(self, tools):
+        """pin_message returns error string when Slack is not configured."""
+        assert tools._slack is None
+        result = tools.pin_message("1700000001.000001")
+        assert "Error" in result
+
+    def test_unpin_message_calls_slack_with_timestamp(self, tools_with_slack, mock_slack):
+        """unpin_message delegates to SlackBot.unpin_message with the given timestamp."""
+        mock_slack.unpin_message.return_value = True
+        tools_with_slack.unpin_message("1700000001.000001")
+        mock_slack.unpin_message.assert_called_once_with("1700000001.000001")
+
+    def test_unpin_message_slack_unavailable(self, tools):
+        """unpin_message returns error string when Slack is not configured."""
+        assert tools._slack is None
+        result = tools.unpin_message("1700000001.000001")
+        assert "Error" in result

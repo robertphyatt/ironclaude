@@ -20,6 +20,7 @@ jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 lxml==6.0.2
 markdownify==1.2.2
+markdown==3.10.2
 mcp==1.26.0
 packaging==26.0
 pluggy==1.6.0

@@ -8,6 +8,8 @@ provides clean JSON communication instead of ANSI terminal output.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
+import json
 import logging
 import os
 import signal
@@ -34,6 +36,8 @@ class BrainClient:
 
     ALLOWED_TOOLS = ["Read", "Grep", "Glob", "Bash"]
     MAX_BUFFER_SIZE = 50 * 1024 * 1024  # 50MB — prevent SDK transport buffer overflow
+    SESSION_LOG_DIR = str(Path.home() / ".ironclaude" / "brain-sessions")
+    SESSION_LOG_KEEP = 10
 
     # Orchestrator action tools that require episodic memory search first
     GATED_TOOLS = {
@@ -102,7 +106,7 @@ class BrainClient:
             )
         return matches[-1]  # sorted() puts latest version last
 
-    def __init__(self, timeout_seconds: int = 600, operator_name: str = "Operator", model: str = "claude-opus-4-6", effort_level: str = "high"):
+    def __init__(self, timeout_seconds: int = 600, operator_name: str = "Operator", model: str = "claude-opus-4", effort_level: str = "high"):
         self.timeout_seconds = timeout_seconds
         self._operator_name = operator_name
         self._model = model
@@ -123,6 +127,7 @@ class BrainClient:
         self._last_message_time: float = 0.0
         self._last_restart_time = 0.0
         self._memory_armed: bool = False
+        self._wiki_queried: bool = False
         self._system_prompt: str = ""
         self._cwd: str | None = None
         self._episodic_memory_path: str | None = None
@@ -136,6 +141,12 @@ class BrainClient:
         self._permission_correction_timestamps: list[float] = []
         self._brain_pid: int | None = None
         self._expected_kill: bool = False
+        self._total_input_tokens: int = 0
+        self._total_output_tokens: int = 0
+        self._total_cost_usd: float = 0.0
+        self._session_log_path: str | None = None
+        self._session_log_lock = threading.Lock()
+        self._previous_session_context: str | None = None
 
     def start(self, system_prompt: str, cwd: str | None = None) -> None:
         """Start the brain SDK client in a background thread."""
@@ -161,6 +172,7 @@ class BrainClient:
         if ollama_candidate.exists():
             self._ollama_mcp_path = str(ollama_candidate)
         logger.info(f"MCP servers discovered: orchestrator={self._orchestrator_path}, research={self._research_mcp_path}, ollama={self._ollama_mcp_path}")
+        self._init_session_log()
         self._stop_event.clear()
         self._running = True
         self._thread = threading.Thread(
@@ -197,11 +209,25 @@ class BrainClient:
             self._memory_armed = True
             return (True, None)
 
-        # Gated orchestrator action tools require memory search first
+        # Wiki query arms the wiki toggle
+        if tool_name == "mcp__orchestrator__wiki_query":
+            self._wiki_queried = True
+            return (True, None)
+
+        # Gated orchestrator action tools require BOTH memory search and wiki query
         if tool_name in self.GATED_TOOLS:
-            if not self._memory_armed:
-                return (False, f"Search episodic memory first. What would {self._operator_name} do?")
+            if not self._memory_armed or not self._wiki_queried:
+                missing = []
+                if not self._memory_armed:
+                    missing.append("episodic memory search")
+                if not self._wiki_queried:
+                    missing.append("wiki query")
+                return (False, f"Required before acting: {', '.join(missing)}. What would {self._operator_name} do?")
+            stale_age = self._ledger_stale()
+            if stale_age is not None:
+                return (False, f"Ledger stale ({stale_age}m without update). Call update_ledger to sync current state.")
             self._memory_armed = False
+            self._wiki_queried = False
             return (True, None)
 
         # Bash: only git read-only commands allowed
@@ -248,6 +274,117 @@ class BrainClient:
             f"To make changes, spawn a worker via spawn_worker."
         )
 
+    def _ledger_stale(self) -> int | None:
+        """Return age in minutes if stale, else None.
+
+        Two checks:
+        1. File mtime > ledger_staleness_threshold_minutes (stale snapshot)
+        2. Any in_progress task has status_set_at > task_staleness_threshold_hours (stuck task)
+        Returns None when: cwd unset, file absent, no in_progress tasks, all checks pass.
+        """
+        if not self._cwd:
+            return None
+        tasks_md = os.path.join(self._cwd, "wiki", "tasks.md")
+        if not os.path.exists(tasks_md):
+            return None
+        try:
+            with open(tasks_md) as f:
+                content = f.read()
+        except OSError:
+            return None
+        if '"status": "in_progress"' not in content:
+            return None
+        threshold_minutes = 30
+        task_threshold_hours = 4
+        config_path = os.path.expanduser("~/.claude/ironclaude-hooks-config.json")
+        try:
+            with open(config_path) as f:
+                cfg = json.load(f)
+            threshold_minutes = int(cfg.get("ledger_staleness_threshold_minutes", 30))
+            task_threshold_hours = int(cfg.get("task_staleness_threshold_hours", 4))
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            pass
+        # Check 1: file mtime (stale snapshot failure mode)
+        try:
+            mtime = os.path.getmtime(tasks_md)
+        except OSError:
+            return None
+        age_minutes = int((time.time() - mtime) / 60)
+        if age_minutes > threshold_minutes:
+            return age_minutes
+        # Check 2: per-task status_set_at (stuck task failure mode)
+        try:
+            parts = content.split("## Data")
+            if len(parts) >= 2:
+                fence = parts[1].find("```")
+                if fence != -1:
+                    after = parts[1][fence + 3:]
+                    nl = after.find("\n")
+                    if nl != -1:
+                        json_str = after[nl + 1:]
+                        end = json_str.find("```")
+                        if end != -1:
+                            data = json.loads(json_str[:end].strip())
+                            now = time.time()
+                            for task in data.get("tasks", []):
+                                if task.get("status") != "in_progress":
+                                    continue
+                                ssa = task.get("status_set_at")
+                                if not ssa:
+                                    continue
+                                dt = datetime.fromisoformat(ssa.replace("Z", "+00:00"))
+                                task_age_hours = (now - dt.timestamp()) / 3600
+                                if task_age_hours > task_threshold_hours:
+                                    return int(task_age_hours * 60)
+        except Exception:
+            pass
+        return None
+
+    def _init_session_log(self) -> None:
+        """Create a new session log file and run retention cleanup."""
+        try:
+            log_dir = Path(self.SESSION_LOG_DIR)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            existing = sorted(log_dir.glob("*.log"))
+            to_delete = existing[:max(0, len(existing) - (self.SESSION_LOG_KEEP - 1))]
+            for old in to_delete:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+            filename = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f") + ".log"
+            self._session_log_path = str(log_dir / filename)
+            self._session_log_write(f"SESSION_START restart_count={self.restart_count}")
+        except Exception as e:
+            logger.error(f"Failed to initialize session log: {e}")
+            self._session_log_path = None
+
+    def _session_log_write(self, entry: str) -> None:
+        """Append an entry to the session log. Thread-safe. Never raises."""
+        if self._session_log_path is None:
+            return
+        try:
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+            with self._session_log_lock:
+                with open(self._session_log_path, "a") as f:
+                    f.write(f"{ts} {entry}\n")
+        except Exception:
+            pass
+
+    def _close_session_log(self, reason: str) -> None:
+        """Write SESSION_END and clear the session log path."""
+        self._session_log_write(f"SESSION_END reason={reason}")
+        self._session_log_path = None
+
+    def _read_previous_session_tail(self, log_path: str) -> str:
+        """Read the last 20 lines of a session log file. Returns '' on any error."""
+        try:
+            with open(log_path) as f:
+                lines = f.read().splitlines()
+            return "\n".join(lines[-20:])
+        except Exception:
+            return ""
+
     def _run_event_loop(self, system_prompt: str, cwd: str | None) -> None:
         """Run the async event loop in a background thread with retry."""
         loop = asyncio.new_event_loop()
@@ -277,6 +414,7 @@ class BrainClient:
                     # No session_id captured — fall back to fresh restart behavior
                     break
                 except Exception as e:
+                    self._session_log_write(f"ERROR: {e}")
                     self._compacting = False  # Clear on error to allow restart
                     if self._stop_event.is_set():
                         break
@@ -308,6 +446,8 @@ class BrainClient:
                     self._stop_event.wait(timeout=delay)
         finally:
             self._running = False
+            reason = "stop" if self._stop_event.is_set() else "error"
+            self._close_session_log(reason)
             loop.close()
 
     def _check_permission_seeking(self, text: str) -> str | None:
@@ -362,6 +502,9 @@ class BrainClient:
         async def _tool_guard(tool_name, tool_input, context):
             from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
             allowed, msg = self._tool_guard_logic(tool_name, tool_input, context)
+            self._session_log_write(
+                f"TOOL_INVOKE name={tool_name} input={json.dumps(tool_input)[:200]}"
+            )
             if allowed:
                 return PermissionResultAllow()
             return PermissionResultDeny(message=msg)
@@ -379,6 +522,7 @@ class BrainClient:
                 "env": {
                     "SUPABASE_URL": os.environ.get("SUPABASE_URL", ""),
                     "SUPABASE_ANON_KEY": os.environ.get("SUPABASE_ANON_KEY", ""),
+                    "IC_BRAIN_CWD": self._cwd or "",
                 },
             }
         if self._research_mcp_path:
@@ -437,6 +581,7 @@ class BrainClient:
                         "type": "user",
                         "message": {"role": "user", "content": msg},
                     }
+                    self._session_log_write(f"MSG_RECV chars={len(msg)} preview={msg[:100]!r}")
                 except asyncio.TimeoutError:
                     continue
 
@@ -463,6 +608,11 @@ class BrainClient:
             async for message in query(prompt=message_generator(), options=options):
                 if isinstance(message, ResultMessage):
                     self._session_id = message.session_id
+                    if message.usage:
+                        self._total_input_tokens += message.usage.get("input_tokens", 0) or 0
+                        self._total_output_tokens += message.usage.get("output_tokens", 0) or 0
+                    if message.total_cost_usd is not None:
+                        self._total_cost_usd += message.total_cost_usd
                 if isinstance(message, AssistantMessage):
                     text_parts = []
                     for block in message.content:
@@ -472,6 +622,7 @@ class BrainClient:
                         full_text = "\n\n".join(text_parts)
                         self._response_queue.put(full_text)
                         self._last_response_time = time.time()
+                        self._session_log_write(f"MSG_SEND chars={len(full_text)} preview={full_text[:100]!r}")
                         logger.info(f"Brain response received ({len(full_text)} chars)")
                         correction = self._check_permission_seeking(full_text)
                         if correction is not None:
@@ -555,6 +706,11 @@ class BrainClient:
 
     def restart(self, system_prompt: str, cwd: str | None = None) -> bool:
         """Restart the brain session."""
+        prev_log = self._session_log_path
+        context = self._read_previous_session_tail(prev_log) if prev_log else ""
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
+        self._total_cost_usd = 0.0
         self._resume_session_id = None
         self._session_id = None
         self.shutdown()
@@ -566,9 +722,21 @@ class BrainClient:
             self._last_restart_time = time.time()
             self._restart_timestamps.append(time.time())
             logger.info(f"Brain restarted (count: {self.restart_count})")
+            if context:
+                self.send_message(f"[DIAGNOSTIC] Previous session log (last 20 entries):\n{context}")
             return True
         logger.error("Failed to restart brain session")
         return False
+
+    def get_token_usage(self) -> dict:
+        """Return accumulated token usage since last restart."""
+        total = self._total_input_tokens + self._total_output_tokens
+        return {
+            "input_tokens": self._total_input_tokens,
+            "output_tokens": self._total_output_tokens,
+            "total_tokens": total,
+            "cost_usd": self._total_cost_usd,
+        }
 
     def _kill_brain_subprocess(self) -> None:
         """Kill any running brain subprocess. Three-tier lookup: instance var → PID file → pgrep.

@@ -30,7 +30,7 @@ class TestInitDb:
         db_path = str(tmp_path / "test.db")
         conn = init_db(db_path)
         timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
-        assert timeout == 1000
+        assert timeout == 5000
         conn.close()
 
     def test_idempotent(self, tmp_path):

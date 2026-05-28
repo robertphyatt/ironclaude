@@ -34,7 +34,7 @@ from ironclaude.notifications import (
     format_objective_received,
     format_task_progress, format_plan_ready, format_blocked,
 )
-from ironclaude.orchestrator_mcp import ensure_worker_trusted
+from ironclaude.orchestrator_mcp import ensure_worker_trusted, WORKER_COMMANDS
 from ironclaude.signal_forensics import _logged_kill
 from ironclaude.plugins import PluginRegistry, discover_plugins
 
@@ -45,10 +45,6 @@ def log_worker_event(event_type: str, **fields) -> None:
     payload = {"event_type": event_type, "timestamp": datetime.now(timezone.utc).isoformat(), **fields}
     logger.info(json.dumps(payload))
 
-
-WORKER_COMMANDS = {
-    "claude-sonnet": "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'sonnet' --dangerously-skip-permissions",
-}
 
 CHECKIN_CADENCE = {
     "idle": 60,
@@ -62,7 +58,7 @@ CHECKIN_CADENCE = {
     "final_plan_prep": 300,
     "executing": 600,
     "reviewing": 600,
-    "execution_complete": 120,
+    "execution_complete": 900,
 }
 DEFAULT_CADENCE = 300
 
@@ -135,6 +131,7 @@ def _acquire_singleton_lock() -> None:
             pid_info = ""
         os.close(fd)
         logger.error(f"Another ironclaude daemon is already running{pid_info}. Exiting.")
+        logger.info("To stop the existing process: make stop  |  To follow its output: make follow-run")
         sys.exit(1)
 
     # Lock acquired — check for a live PID from an older (non-locking) daemon
@@ -146,10 +143,12 @@ def _acquire_singleton_lock() -> None:
                 os.kill(old_pid, 0)
                 os.close(fd)
                 logger.error(f"Another ironclaude daemon is already running (PID {old_pid}). Exiting.")
+                logger.info("To stop the existing process: make stop  |  To follow its output: make follow-run")
                 sys.exit(1)
             except PermissionError:
                 os.close(fd)
                 logger.error(f"Another ironclaude daemon is already running (PID {existing}). Exiting.")
+                logger.info("To stop the existing process: make stop  |  To follow its output: make follow-run")
                 sys.exit(1)
             except ProcessLookupError:
                 logger.warning(f"Removing stale PID file from dead process {existing}.")
@@ -310,6 +309,25 @@ def _spawn_respawner() -> None:
     # Parent: continues to exit normally
 
 
+_BRAIN_SESSION = "ic-brain"
+
+
+def _kill_orphan_workers(tmux: TmuxManager, registry: WorkerRegistry) -> None:
+    """Kill ic-* tmux sessions not in the worker registry (orphans from prior daemon lifecycle)."""
+    try:
+        sessions = tmux.list_sessions(prefix="ic-")
+        registered = {w["tmux_session"] for w in registry.get_running_workers()}
+        for name in sessions:
+            if name == _BRAIN_SESSION:
+                continue
+            if name in registered:
+                continue
+            tmux.kill_session(name)
+            logger.info(f"Killed orphan worker session: {name}")
+    except Exception as e:
+        logger.error(f"Failed to kill orphan worker sessions: {e}")
+
+
 def _kill_orphan_brains() -> None:
     """Kill any orphaned brain claude subprocesses surviving daemon restart."""
     try:
@@ -361,6 +379,12 @@ def _handle_restart(signum, frame):
         try:
             logger.info("Restart step 5: _kill_orphan_brains()")
             _kill_orphan_brains()
+        except Exception:
+            pass
+        # Kill orphaned worker tmux sessions from previous daemon lifecycle
+        try:
+            logger.info("Restart step 5b: _kill_orphan_workers()")
+            _kill_orphan_workers(_daemon.tmux, _daemon.registry)
         except Exception:
             pass
         # Verify no brain subprocesses remain
@@ -475,6 +499,7 @@ class IroncladeDaemon:
         self._db = db_conn
         self._last_checkin_sent: dict[str, float] = {}
         self._last_checkin_stage: dict[str, str | None] = {}
+        self._last_checkin_hash: dict[str, int] = {}
         self._last_stage_seen: dict[str, str | None] = {}
         self._stage_history: dict[str, list[tuple[float, str]]] = {}
         self._claude_dir: Path | None = None
@@ -608,8 +633,8 @@ class IroncladeDaemon:
         if normalized not in ("yes", "no"):
             return False
         row = self._db.execute(
-            "SELECT id, interpretation FROM directives WHERE status='pending_confirmation' "
-            "ORDER BY created_at DESC LIMIT 1"
+            "SELECT id, interpretation, interpretation_ts FROM directives "
+            "WHERE status='pending_confirmation' ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
         if row is None:
             return False
@@ -631,6 +656,8 @@ class IroncladeDaemon:
             )
             self._db.commit()
             self.slack.post_message(f"Directive #{directive_id} rejected.")
+        if row[2]:
+            self.slack.unpin_message(row[2])
         return True
 
     def _match_directive_by_content(self, message_text: str) -> tuple | None:
@@ -724,6 +751,10 @@ class IroncladeDaemon:
 
         directive_id = row[0]
         interpretation = row[1]
+        ts_row = self._db.execute(
+            "SELECT interpretation_ts FROM directives WHERE id=?", (directive_id,)
+        ).fetchone()
+        interpretation_ts = ts_row[0] if ts_row else None
         if emoji in ("thumbsup", "+1", "thumbs_up"):
             self._db.execute(
                 "UPDATE directives SET status='confirmed', updated_at=datetime('now') WHERE id=?",
@@ -750,6 +781,8 @@ class IroncladeDaemon:
             ).fetchone()[0]
             self.slack.remove_reaction("hourglass_flowing_sand", source_ts)
             self.slack.add_reaction(DIRECTIVE_STATUS_EMOJI.get("rejected", "x"), source_ts)
+        if interpretation_ts:
+            self.slack.unpin_message(interpretation_ts)
         new_status = "confirmed" if emoji in ("thumbsup", "+1", "thumbs_up") else "rejected"
         logger.info("Directive #%d %s via reaction %r", directive_id, new_status, emoji)
         return True
@@ -784,6 +817,7 @@ class IroncladeDaemon:
             )
             self._db.commit()
             self.slack.post_message(f"Push request `{push_id[:8]}` expired before confirmation.")
+            self.slack.unpin_message(message_ts)
             logger.info("Push %s expired — no push executed", push_id[:8])
             return True
 
@@ -793,6 +827,7 @@ class IroncladeDaemon:
             )
             self._db.commit()
             self.slack.post_message(f"Push request `{push_id[:8]}` rejected.")
+            self.slack.unpin_message(message_ts)
             self.brain.send_message(f"Push {push_id[:8]} was rejected by the operator.")
             logger.info("Push %s rejected", push_id[:8])
             return True
@@ -822,17 +857,28 @@ class IroncladeDaemon:
             self.slack.post_message(f"Push request `{push_id[:8]}` failed: {err}")
             self.brain.send_message(f"Push {push_id[:8]} failed: {err}")
             logger.warning("Push %s failed: %s", push_id[:8], err)
+        self.slack.unpin_message(message_ts)
         return True
 
     def _sweep_expired_push_requests(self):
         """Mark pending push requests past their TTL as expired."""
         if self._db is None:
             return
-        self._db.execute(
-            "UPDATE push_requests SET status='expired'"
-            " WHERE status='pending' AND expires_at < datetime('now')"
-        )
-        self._db.commit()
+        try:
+            rows = self._db.execute(
+                "SELECT message_ts FROM push_requests"
+                " WHERE status='pending' AND expires_at < datetime('now')"
+            ).fetchall()
+            self._db.execute(
+                "UPDATE push_requests SET status='expired'"
+                " WHERE status='pending' AND expires_at < datetime('now')"
+            )
+            self._db.commit()
+            for row in rows:
+                if row[0]:
+                    self.slack.unpin_message(row[0])
+        except sqlite3.OperationalError as e:
+            logger.warning("push_requests sweep skipped (db locked): %s", e)
 
     def poll_brain_responses(self):
         """Drain brain responses and post to Slack."""
@@ -1055,7 +1101,7 @@ class IroncladeDaemon:
 
             cmd = f"ollama launch claude --model {shlex.quote(model_name)} -- --dangerously-skip-permissions"
         elif worker_type == "claude-opus":
-            cmd = make_opus_command(self.config.get("default_opus_model", DEFAULTS["brain_model"]))
+            cmd = make_opus_command(self.config.get("default_opus_model", DEFAULTS["brain_model"]), self.config.get("effort_level", "high"))
         elif worker_type in WORKER_COMMANDS:
             cmd = WORKER_COMMANDS[worker_type]
         else:
@@ -1294,6 +1340,10 @@ class IroncladeDaemon:
             except Exception:
                 log_tail = "(could not capture output)"
 
+            current_hash = hash(log_tail)
+            if not stage_changed and current_hash == self._last_checkin_hash.get(worker_id):
+                continue
+
             prompt_waiting = self._detect_prompt_waiting(log_tail)
 
             spawned_at = worker.get("spawned_at", "")
@@ -1304,10 +1354,11 @@ class IroncladeDaemon:
             except (ValueError, TypeError):
                 elapsed = 0
 
-            message = format_worker_checkin(worker_id, elapsed, stage or "unknown", log_tail, prompt_waiting)
-            self.brain.send_message(message)
+            brain_message = format_worker_checkin(worker_id, elapsed, stage or "unknown", log_tail, prompt_waiting)
+            self.brain.send_message(brain_message)
             self._last_checkin_sent[worker_id] = time.time()
             self._last_checkin_stage[worker_id] = stage
+            self._last_checkin_hash[worker_id] = current_hash
 
     def _handle_detail(self, parsed: dict):
         """Handle /detail command — show worker status and log."""
@@ -1354,7 +1405,8 @@ class IroncladeDaemon:
                 "workflow_stage": stage,
             })
 
-        self.slack.post_message(format_heartbeat(worker_details))
+        brain_usage = self.brain.get_token_usage() if self.brain is not None else None
+        self.slack.post_message(format_heartbeat(worker_details, brain_usage=brain_usage))
 
         # Grader enforcement: if no workers but directives exist, nudge the Brain
         if not running and self._db is not None:
@@ -1429,6 +1481,18 @@ def main():
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     brain_cwd = os.path.expanduser(config.get("brain_cwd", "~/.ironclaude/brain"))
     os.makedirs(brain_cwd, exist_ok=True)
+
+    wiki_dir = os.path.join(brain_cwd, "wiki")
+    os.makedirs(wiki_dir, exist_ok=True)
+    for wiki_file, wiki_content in [
+        ("index.md", "# Wiki Index\n\n*No wiki pages yet.*\n"),
+        ("log.md", "# Wiki Log\n\n"),
+    ]:
+        wiki_path = os.path.join(wiki_dir, wiki_file)
+        if not os.path.exists(wiki_path):
+            with open(wiki_path, "w") as f:
+                f.write(wiki_content)
+            logger.info(f"Initialized wiki file: {wiki_path}")
 
     # Sync orchestrator CLAUDE.md from source control to brain home (with template substitution)
     orchestrator_claude_md_src = os.path.join(repo_root, "src", "brain", "orchestrator_claude.md")
@@ -1522,10 +1586,11 @@ def main():
 
     tmux = TmuxManager(log_dir=config.get("log_dir", "/tmp/ic-logs"), ssh_manager=ssh_manager)
     registry = WorkerRegistry(conn)
+    _kill_orphan_workers(tmux, registry)
     brain = BrainClient(
         timeout_seconds=config.get("brain_timeout_seconds", 600),
         operator_name=config.get("operator_name", "Operator"),
-        model=config.get("brain_model", "claude-opus-4-6"),
+        model=config.get("brain_model", "claude-opus-4"),
         effort_level=config.get("effort_level", "high"),
     )
 

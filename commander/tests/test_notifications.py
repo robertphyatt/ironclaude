@@ -2,6 +2,7 @@
 import pytest
 from ironclaude.notifications import (
     _escape_mrkdwn,
+    _fmt_tokens,
     format_worker_spawned,
     format_worker_completed,
     format_worker_failed,
@@ -11,6 +12,7 @@ from ironclaude.notifications import (
     format_objective_received,
     format_task_progress,
     format_worker_checkin,
+    format_worker_checkin_slack,
 )
 
 
@@ -34,9 +36,10 @@ class TestWorkerNotifications:
 
 class TestSystemNotifications:
     def test_heartbeat_with_workers(self):
+        prefix = "Professional mode is active. You must follow the workflow.\n\nYour task: "
         workers = [
-            {"id": "worker-abc", "description": "Implement auth flow", "workflow_stage": "executing"},
-            {"id": "worker-def", "description": "Fix CSS layout", "workflow_stage": "brainstorming"},
+            {"id": "worker-abc", "description": prefix + "Implement auth flow", "workflow_stage": "executing"},
+            {"id": "worker-def", "description": prefix + "Fix CSS layout", "workflow_stage": "brainstorming"},
         ]
         msg = format_heartbeat(workers)
         assert "worker-abc" in msg
@@ -51,7 +54,7 @@ class TestSystemNotifications:
         assert "No active workers" in msg
 
     def test_heartbeat_truncates_long_description(self):
-        workers = [{"id": "w1", "description": "A" * 80, "workflow_stage": "executing"}]
+        workers = [{"id": "w1", "description": "Your task: " + "A" * 80, "workflow_stage": "executing"}]
         msg = format_heartbeat(workers)
         assert "A" * 60 in msg
         assert "..." in msg
@@ -63,7 +66,7 @@ class TestSystemNotifications:
         assert "no task" in msg
 
     def test_heartbeat_none_stage(self):
-        workers = [{"id": "w1", "description": "Do stuff", "workflow_stage": None}]
+        workers = [{"id": "w1", "description": "Your task: Do stuff", "workflow_stage": None}]
         msg = format_heartbeat(workers)
         assert "unknown" in msg
 
@@ -84,6 +87,60 @@ class TestSystemNotifications:
         assert "5" in msg
         assert "3" in msg
         assert "circuit breaker" in msg.lower() or "paused" in msg.lower()
+
+
+class TestHeartbeatTaskExtraction:
+    def test_extracts_task_from_pm_preamble(self):
+        preamble = (
+            "Professional mode is active. You must follow the brainstorm → "
+            "write-plans → execute-plans workflow before making any code changes. "
+            "Start by invoking /brainstorming --scope=hold.\n\n"
+            "Your task: Consolidate HAL audio daemon"
+        )
+        workers = [{"id": "w1", "description": preamble, "workflow_stage": "executing"}]
+        msg = format_heartbeat(workers)
+        assert "Consolidate HAL audio daemon" in msg
+        assert "Professional mode" not in msg
+
+    def test_no_marker_uses_first_line(self):
+        workers = [{"id": "w1", "description": "Do some work without proper format", "workflow_stage": "executing"}]
+        msg = format_heartbeat(workers)
+        assert "Do some work" in msg
+        assert "[malformed objective]" not in msg
+
+    def test_extracts_only_first_line_after_marker(self):
+        description = "Your task: First line of task\nMore details on second line"
+        workers = [{"id": "w1", "description": description, "workflow_stage": "executing"}]
+        msg = format_heartbeat(workers)
+        assert "First line of task" in msg
+        assert "More details" not in msg
+
+    def test_none_description_is_no_task_not_malformed(self):
+        workers = [{"id": "w1", "description": None, "workflow_stage": "executing"}]
+        msg = format_heartbeat(workers)
+        assert "no task" in msg
+        assert "[malformed objective]" not in msg
+
+    def test_empty_after_marker_shows_malformed(self):
+        workers = [{"id": "w1", "description": "Your task: \n", "workflow_stage": "executing"}]
+        msg = format_heartbeat(workers)
+        assert "[malformed objective]" in msg
+
+    def test_no_marker_multiline_uses_first_line(self):
+        workers = [{"id": "w1", "description": "First line task\nSecond line details", "workflow_stage": "executing"}]
+        msg = format_heartbeat(workers)
+        assert "First line task" in msg
+        assert "Second line" not in msg
+
+    def test_empty_string_shows_malformed(self):
+        workers = [{"id": "w1", "description": "", "workflow_stage": "executing"}]
+        msg = format_heartbeat(workers)
+        assert "[malformed objective]" in msg
+
+    def test_whitespace_only_shows_malformed(self):
+        workers = [{"id": "w1", "description": "   \n  ", "workflow_stage": "executing"}]
+        msg = format_heartbeat(workers)
+        assert "[malformed objective]" in msg
 
 
 class TestBrainNotifications:
@@ -156,25 +213,25 @@ class TestMrkdwnInjectionPrevention:
         assert "&amp;" in msg
 
     def test_heartbeat_escapes_lt_gt(self):
-        workers = [{"id": "w1", "description": "<script>evil</script>", "workflow_stage": "executing"}]
+        workers = [{"id": "w1", "description": "Your task: <script>evil</script>", "workflow_stage": "executing"}]
         msg = format_heartbeat(workers)
         assert "<script>" not in msg
         assert "&lt;script&gt;" in msg
 
     def test_heartbeat_escapes_ampersand(self):
-        workers = [{"id": "w1", "description": "foo & bar", "workflow_stage": "executing"}]
+        workers = [{"id": "w1", "description": "Your task: foo & bar", "workflow_stage": "executing"}]
         msg = format_heartbeat(workers)
         assert "foo & bar" not in msg
         assert "&amp;" in msg
 
     def test_heartbeat_escapes_url_link(self):
-        workers = [{"id": "w1", "description": "<https://evil.com|click>", "workflow_stage": "executing"}]
+        workers = [{"id": "w1", "description": "Your task: <https://evil.com|click>", "workflow_stage": "executing"}]
         msg = format_heartbeat(workers)
         assert "<https://evil.com|click>" not in msg
         assert "&lt;https://evil.com|click&gt;" in msg
 
     def test_heartbeat_escapes_user_mention(self):
-        workers = [{"id": "w1", "description": "<@U_ADMIN> do this", "workflow_stage": "executing"}]
+        workers = [{"id": "w1", "description": "Your task: <@U_ADMIN> do this", "workflow_stage": "executing"}]
         msg = format_heartbeat(workers)
         assert "<@U_ADMIN>" not in msg
         assert "&lt;@U_ADMIN&gt;" in msg
@@ -185,3 +242,73 @@ class TestMrkdwnInjectionPrevention:
         assert "&lt;alert&gt;" in msg
         assert "&amp;" in msg
         assert "&gt;" in msg
+
+
+class TestFmtTokens:
+    def test_below_1000(self):
+        assert _fmt_tokens(500) == "500"
+
+    def test_exact_1000(self):
+        assert _fmt_tokens(1000) == "1.0k"
+
+    def test_thousands(self):
+        assert _fmt_tokens(150200) == "150.2k"
+
+    def test_millions(self):
+        assert _fmt_tokens(1500000) == "1.5M"
+
+    def test_zero(self):
+        assert _fmt_tokens(0) == "0"
+
+
+class TestHeartbeatBrainLine:
+    def test_heartbeat_with_brain_usage_appends_line(self):
+        workers = [{"id": "w-1", "description": "Your task: Fix auth", "workflow_stage": "executing"}]
+        brain_usage = {"total_tokens": 150200, "input_tokens": 42100, "output_tokens": 108100, "cost_usd": 0.12}
+        msg = format_heartbeat(workers, brain_usage=brain_usage)
+        assert "🧠 Brain:" in msg
+        assert "150.2k" in msg
+        assert "42.1k" in msg
+        assert "108.1k" in msg
+
+    def test_heartbeat_without_brain_usage_no_brain_line(self):
+        workers = [{"id": "w-1", "description": "Your task: Fix auth", "workflow_stage": "executing"}]
+        msg = format_heartbeat(workers, brain_usage=None)
+        assert "🧠" not in msg
+        assert "Brain:" not in msg
+
+    def test_heartbeat_no_workers_no_brain_line(self):
+        """Early-return path must not include brain line even with brain_usage provided."""
+        brain_usage = {"total_tokens": 5000, "input_tokens": 2000, "output_tokens": 3000, "cost_usd": 0.0}
+        msg = format_heartbeat([], brain_usage=brain_usage)
+        assert "No active workers" in msg
+        assert "🧠" not in msg
+
+
+class TestWorkerCheckinSlackNotification:
+    def test_action_required_format(self):
+        msg = format_worker_checkin_slack("w1", 5, "brainstorming", True)
+        assert "[ACTION REQUIRED]" in msg
+        assert "w1" in msg
+        assert "5min" in msg
+        assert "brainstorming" in msg
+        assert "waiting for input" in msg
+
+    def test_action_required_has_no_log_tail(self):
+        msg = format_worker_checkin_slack("w1", 5, "brainstorming", True)
+        assert "\n" not in msg
+
+    def test_normal_checkin_format(self):
+        msg = format_worker_checkin_slack("w1", 12, "executing", False)
+        assert "[CHECK-IN]" in msg
+        assert "w1" in msg
+        assert "12min" in msg
+        assert "executing" in msg
+
+    def test_normal_checkin_no_waiting_phrase(self):
+        msg = format_worker_checkin_slack("w1", 12, "executing", False)
+        assert "waiting for input" not in msg
+
+    def test_normal_checkin_has_no_log_tail(self):
+        msg = format_worker_checkin_slack("w1", 12, "executing", False)
+        assert "\n" not in msg

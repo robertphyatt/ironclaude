@@ -28,8 +28,8 @@ DEFAULTS = {
     "brain_prompt_path": "",  # test11
     "operator_name": "Operator",
     "autonomy_level": "3",
-    "brain_model": "claude-opus-4-6",
-    "grader_model": "claude-opus-4-6",
+    "brain_model": "claude-opus-4",
+    "grader_model": "claude-opus-4",
     "effort_level": "high",
     "advisor": {
         "enabled": True,

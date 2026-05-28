@@ -130,6 +130,21 @@ def test_push_rate_limit(tools, db_conn, git_repo):
     assert new_count == 0
 
 
+def test_push_pins_message(db_conn, mock_slack, tools, git_repo):
+    """push_repo() pins the confirmation message after posting."""
+    result = tools.push_repo(str(git_repo), "origin", "main")
+    assert isinstance(result, dict)
+    mock_slack.pin_message.assert_called_once_with("1234567890.123456")
+
+
+def test_push_skips_pin_when_post_fails(db_conn, tools, git_repo):
+    """push_repo() does not pin if post_message returns None."""
+    tools._slack.post_message.return_value = None
+    result = tools.push_repo(str(git_repo), "origin", "main")
+    assert isinstance(result, dict)
+    tools._slack.pin_message.assert_not_called()
+
+
 # ─── reaction handler tests ───────────────────────────────────────────────────
 
 
@@ -184,6 +199,7 @@ def test_confirm_executes(daemon, db_conn, git_repo, push_row):
     assert mock_run.call_args[0][0] == ["git", "push", "origin", "main"]
     row = db_conn.execute("SELECT status FROM push_requests WHERE id=?", (push_row,)).fetchone()
     assert row["status"] == "completed"
+    daemon.slack.unpin_message.assert_called_once_with("msg-ts-001")
 
 
 def test_reject(daemon, db_conn, push_row):
@@ -195,6 +211,7 @@ def test_reject(daemon, db_conn, push_row):
     mock_run.assert_not_called()
     row = db_conn.execute("SELECT status FROM push_requests WHERE id=?", (push_row,)).fetchone()
     assert row["status"] == "rejected"
+    daemon.slack.unpin_message.assert_called_once_with("msg-ts-001")
 
 
 def test_confirm_expired(daemon, db_conn):
@@ -216,6 +233,7 @@ def test_confirm_expired(daemon, db_conn):
     mock_run.assert_not_called()
     row = db_conn.execute("SELECT status FROM push_requests WHERE id=?", (push_id,)).fetchone()
     assert row["status"] == "expired"
+    daemon.slack.unpin_message.assert_called_once_with("msg-ts-exp")
 
 
 def test_already_consumed(daemon, db_conn):
@@ -243,6 +261,7 @@ def test_git_failure(daemon, db_conn, git_repo, push_row):
     assert result is True
     row = db_conn.execute("SELECT status FROM push_requests WHERE id=?", (push_row,)).fetchone()
     assert row["status"] == "failed"
+    daemon.slack.unpin_message.assert_called_once_with("msg-ts-001")
 
 
 def test_unrelated_emoji_ignored(daemon, db_conn, push_row):
@@ -277,3 +296,54 @@ def test_sweep_expires_pending(daemon, db_conn):
     ).fetchone()
     assert old_row["status"] == "expired"
     assert valid_row["status"] == "pending"
+
+
+def test_sweep_handles_db_lock(daemon):
+    """_sweep_expired_push_requests must not raise on sqlite3.OperationalError."""
+    import sqlite3 as _sqlite3
+    from unittest.mock import MagicMock
+    original_db = daemon._db
+    mock_db = MagicMock()
+    mock_db.execute.side_effect = _sqlite3.OperationalError("database is locked")
+    daemon._db = mock_db
+    try:
+        daemon._sweep_expired_push_requests()  # must not raise
+    finally:
+        daemon._db = original_db
+
+
+def test_sweep_unpins_expired_messages(daemon, db_conn):
+    """_sweep_expired_push_requests calls unpin_message for each expired row with a message_ts."""
+    db_conn.execute(
+        "INSERT INTO push_requests"
+        " (id, repo, remote, branch, commit_summary, diff_stats, status, message_ts, expires_at)"
+        " VALUES ('exp-1', '/tmp', 'origin', 'main', 'log', 'stats', 'pending', 'ts-exp-1',"
+        " datetime('now', '-10 minutes'))"
+    )
+    db_conn.execute(
+        "INSERT INTO push_requests"
+        " (id, repo, remote, branch, commit_summary, diff_stats, status, message_ts, expires_at)"
+        " VALUES ('exp-2', '/tmp', 'origin', 'main', 'log', 'stats', 'pending', 'ts-exp-2',"
+        " datetime('now', '-5 minutes'))"
+    )
+    db_conn.commit()
+
+    daemon._sweep_expired_push_requests()
+
+    calls = {c.args[0] for c in daemon.slack.unpin_message.call_args_list}
+    assert calls == {"ts-exp-1", "ts-exp-2"}
+
+
+def test_sweep_skips_null_message_ts(daemon, db_conn):
+    """_sweep_expired_push_requests does not call unpin_message for rows with NULL message_ts."""
+    db_conn.execute(
+        "INSERT INTO push_requests"
+        " (id, repo, remote, branch, commit_summary, diff_stats, status, expires_at)"
+        " VALUES ('exp-null', '/tmp', 'origin', 'main', 'log', 'stats', 'pending',"
+        " datetime('now', '-10 minutes'))"
+    )
+    db_conn.commit()
+
+    daemon._sweep_expired_push_requests()
+
+    daemon.slack.unpin_message.assert_not_called()

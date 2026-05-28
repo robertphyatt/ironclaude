@@ -41,16 +41,47 @@ def format_worker_failed(worker_id: str, error: str, attempts: int) -> str:
     )
 
 
-def format_heartbeat(workers: list[dict]) -> str:
+def _extract_task_snippet(raw: str | None) -> str:
+    if raw is None:
+        return "no task"
+    idx = raw.find("Your task:")
+    if idx != -1:
+        after = raw[idx + len("Your task:"):].lstrip()
+        end = after.find("\n")
+        if end != -1:
+            after = after[:end]
+        return after.strip() or "[malformed objective]"
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return "[malformed objective]"
+
+
+def _fmt_tokens(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def format_heartbeat(workers: list[dict], brain_usage: dict | None = None) -> str:
     if not workers:
         return "*Heartbeat* | No active workers"
     lines = ["*Heartbeat*"]
     for w in workers:
-        desc = _escape_mrkdwn(w.get("description") or "no task")
+        snippet = _extract_task_snippet(w.get("description"))
+        desc = _escape_mrkdwn(snippet)
         if len(desc) > 60:
             desc = desc[:60] + "..."
         stage = w.get("workflow_stage") or "unknown"
         lines.append(f'• {w["id"]} — "{desc}" ({stage})')
+    if brain_usage is not None:
+        inp = brain_usage.get("input_tokens", 0)
+        out = brain_usage.get("output_tokens", 0)
+        total = brain_usage.get("total_tokens", 0)
+        lines.append(f"🧠 Brain: {_fmt_tokens(total)} tokens ({_fmt_tokens(inp)} in + {_fmt_tokens(out)} out)")
     return "\n".join(lines)
 
 
@@ -104,4 +135,14 @@ def format_worker_checkin(
     msg = f"{prefix} {worker_id} {elapsed_minutes}min {stage}\n{log_tail}"
     if prompt_waiting:
         msg += "\n⚠️ Waiting for input."
+    return msg
+
+
+def format_worker_checkin_slack(
+    worker_id: str, elapsed_minutes: int, stage: str, prompt_waiting: bool,
+) -> str:
+    prefix = "[ACTION REQUIRED]" if prompt_waiting else "[CHECK-IN]"
+    msg = f"{prefix} {worker_id} ({elapsed_minutes}min) — {stage}"
+    if prompt_waiting:
+        msg += ": waiting for input"
     return msg

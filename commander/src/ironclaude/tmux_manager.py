@@ -18,6 +18,38 @@ logger = logging.getLogger("ironclaude.tmux")
 
 _ANSI_RE = re.compile(r'\x1b\[[?!>]*[0-9;]*[a-zA-Z~]|\x1b\].*?\x07|\r')
 _SPINNER_RE = re.compile(r'^\s*[^\w\s]{0,3}\w[\w\s]{0,28}\u2026\s*$', re.MULTILINE)
+_MENU_FOOTER_RE = re.compile(r'Enter to select|\u2191/\u2193 to navigate', re.MULTILINE)
+_MENU_OPTION_RE = re.compile(r'([\u276f\s])\s*(\d+)\.\s+(.+)')
+_FREE_TEXT_RE = re.compile(r'(?i)^(other|type\s+something)')
+
+
+def detect_ask_user_menu(pane_text: str) -> dict:
+    """Detect an AskUserQuestion menu in capture_pane output."""
+    if not _MENU_FOOTER_RE.search(pane_text):
+        return {"detected": False, "options": [], "free_text_option": None, "current_selection": None}
+
+    options = []
+    current_selection = None
+    free_text_option = None
+
+    for match in _MENU_OPTION_RE.finditer(pane_text):
+        cursor_char, num_str, label = match.group(1), match.group(2), match.group(3).strip()
+        num = int(num_str)
+        options.append((num, label))
+        if '\u276f' in cursor_char:
+            current_selection = num
+        if _FREE_TEXT_RE.match(label):
+            free_text_option = num
+
+    if not options:
+        return {"detected": False, "options": [], "free_text_option": None, "current_selection": None}
+
+    return {
+        "detected": True,
+        "options": options,
+        "free_text_option": free_text_option,
+        "current_selection": current_selection,
+    }
 
 
 def _strip_ansi(text: str) -> str:
@@ -74,6 +106,19 @@ class TmuxManager:
             ["tmux", "has-session", "-t", name], ssh_host=ssh_host, capture_output=True
         )
         return result.returncode == 0
+
+    def list_sessions(self, prefix: str = "ic-") -> list[str]:
+        """Return session names matching prefix. Returns [] if tmux server isn't running."""
+        result = self._run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return []
+        return [
+            name for name in result.stdout.strip().splitlines()
+            if name.startswith(prefix)
+        ]
 
     def spawn_session(self, name: str, command: str, cwd: str | None = None,
                       ssh_host: str | None = None, remote_log_dir: str | None = None) -> bool:

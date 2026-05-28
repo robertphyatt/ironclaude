@@ -1,0 +1,325 @@
+{
+  "name": "Adversarial Review v1.0.8 Security Fixes",
+  "goal": "Fix all 8 findings from the adversarial security review of IronClaude v1.0.8: SQL injection, path traversal, XSS, dead batch grading, asymmetric audit trail, connection leak, and two DRY violations. BUG-02 and BUG-03 land in-place (Task 4) before DRY-01 extraction (Task 7) so bug fixes survive a DRY revert.",
+  "design_file": "docs/plans/2026-05-22-adversarial-review-v108-security-fixes-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "SEC-01: UUID Validation in _activate_pm_remote",
+      "description": "Add UUID format regex validation before the f-string SQL query in _activate_pm_remote. Validates session_uuid against ^[0-9a-fA-F]{8}-...-[0-9a-fA-F]{12}$ before constructing the SQL string. Include TODO comment documenting that this regex guard is a forced workaround for the SSH CLI interface — replace with parameterized query when run_sqlite_query supports bind params. TDD: write TestActivatePmRemote class, run RED, implement, run GREEN.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add TestActivatePmRemote class at end of test_orchestrator_mcp.py with two tests: rejects 36-char SQL injection UUID, accepts valid UUID format",
+          "command": null,
+          "expected": "Two new tests written"
+        },
+        {
+          "description": "Run new tests — verify RED",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestActivatePmRemote -v",
+          "expected": "FAIL: test_rejects_non_uuid_session_id fails (returns None instead of error string)"
+        },
+        {
+          "description": "Insert UUID regex validation in _activate_pm_remote after session_uuid is confirmed non-None and before db_path assignment (line ~1262)",
+          "command": null,
+          "expected": "re.fullmatch validation + early return on invalid UUID added"
+        },
+        {
+          "description": "Run new tests — verify GREEN",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestActivatePmRemote -v",
+          "expected": "PASS: both tests pass"
+        },
+        {
+          "description": "Run full suite for regressions",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py -x -q 2>&1 | tail -20",
+          "expected": "No new failures"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "SEC-02: Path Traversal Guard in wiki_write and wiki_delete",
+      "description": "Add Path.resolve().is_relative_to() guard after page_path is computed in both wiki_write and wiki_delete. Returns 'Path traversal rejected: {page}' error string if check fails. TDD: add two tests to TestWikiTools, run RED, implement, run GREEN.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Add test_wiki_write_rejects_path_traversal and test_wiki_delete_rejects_path_traversal to TestWikiTools class",
+          "command": null,
+          "expected": "Two new tests written in TestWikiTools"
+        },
+        {
+          "description": "Run new tests — verify RED",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_rejects_path_traversal tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_delete_rejects_path_traversal -v",
+          "expected": "FAIL: wiki_write creates file rather than returning error"
+        },
+        {
+          "description": "Add traversal guard to wiki_write: after page_path computed (~line 2466), insert if not Path(page_path).resolve().is_relative_to(Path(wiki_dir).resolve()): return f'Path traversal rejected: {page}'",
+          "command": null,
+          "expected": "Guard inserted before is_update assignment"
+        },
+        {
+          "description": "Add traversal guard to wiki_delete: after page_path computed (~line 2494), insert same guard before the os.path.exists check",
+          "command": null,
+          "expected": "Guard inserted before existence check"
+        },
+        {
+          "description": "Run TestWikiTools — verify GREEN",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestWikiTools -v",
+          "expected": "PASS: all TestWikiTools tests pass"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "SEC-03: XSS Escaping in wiki_server.py",
+      "description": "Add import html; html.escape(title) in _parse_md return; html.escape(p) in _send_404 list comprehension. New test file commander/tests/test_wiki_server.py. TDD: create test file, run RED, implement, run GREEN.",
+      "allowed_files": [
+        "tools/wiki_server.py",
+        "commander/tests/test_wiki_server.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Create commander/tests/test_wiki_server.py with test_parse_md_escapes_xss_in_title and test_parse_md_preserves_html_body",
+          "command": null,
+          "expected": "New test file created with sys.path insert for tools/"
+        },
+        {
+          "description": "Run new tests — verify RED",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_wiki_server.py -v",
+          "expected": "FAIL: test_parse_md_escapes_xss_in_title fails (title returned unescaped)"
+        },
+        {
+          "description": "Add 'import html' after 'import re' in tools/wiki_server.py",
+          "command": null,
+          "expected": "import html added"
+        },
+        {
+          "description": "Change _parse_md return to: return html.escape(title), md.convert(body)",
+          "command": null,
+          "expected": "Title escaped, body untouched"
+        },
+        {
+          "description": "Update _send_404 list comprehension to use html.escape(p) for both href and link text",
+          "command": null,
+          "expected": "f-string updated with html.escape(p)"
+        },
+        {
+          "description": "Run tests — verify GREEN",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_wiki_server.py -v",
+          "expected": "PASS: both tests pass"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add tools/wiki_server.py commander/tests/test_wiki_server.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "BUG-02+BUG-03: Audit Trail and Connection Safety (In-Place)",
+      "description": "Fix BUG-02 (add audit_log INSERT to _activate_pm_via_sqlite) and BUG-03 (move conn=sqlite3.connect() before try, add finally: conn.close() in both methods). Fixes land in existing duplicate methods — no structural consolidation yet. Update TestActivatePmViaSqlite fixture to create audit_log table.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "Add AUDIT_LOG_SCHEMA class constant to TestActivatePmViaSqlite and write test_activate_writes_audit_log",
+          "command": null,
+          "expected": "New test written"
+        },
+        {
+          "description": "Add test_connection_closed_on_sqlite_error to TestActivatePmViaSqlite",
+          "command": null,
+          "expected": "New test written"
+        },
+        {
+          "description": "Run RED tests",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestActivatePmViaSqlite::test_activate_writes_audit_log tests/test_orchestrator_mcp.py::TestActivatePmViaSqlite::test_connection_closed_on_sqlite_error -v",
+          "expected": "FAIL: both new tests fail"
+        },
+        {
+          "description": "Fix _activate_pm_via_sqlite: move conn before try, add audit_log INSERT after first commit, add finally: conn.close()",
+          "command": null,
+          "expected": "Method updated in place"
+        },
+        {
+          "description": "Fix _deactivate_pm_via_sqlite: move conn before try, add finally: conn.close() (audit_log INSERT already present)",
+          "command": null,
+          "expected": "Method updated in place"
+        },
+        {
+          "description": "Update _setup_claude_dir: add conn.execute(self.AUDIT_LOG_SCHEMA) after SESSIONS_SCHEMA",
+          "command": null,
+          "expected": "Fixture creates both tables"
+        },
+        {
+          "description": "Run all TestActivatePmViaSqlite tests — verify GREEN",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestActivatePmViaSqlite -v",
+          "expected": "PASS: all tests including new ones"
+        },
+        {
+          "description": "Run deactivate test — verify no regression",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py -k 'deactivate_pm' -v",
+          "expected": "PASS"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "name": "DRY-01: Extract _set_pm_via_sqlite",
+      "description": "Consolidate the now-fixed _activate_pm_via_sqlite and _deactivate_pm_via_sqlite into a shared _set_pm_via_sqlite(session_name, value, timeout, _claude_dir). Wrappers delegate to it. No new tests needed — existing TestActivatePmViaSqlite tests verify correctness.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py"
+      ],
+      "depends_on": [4],
+      "steps": [
+        {
+          "description": "Verify baseline: all TestActivatePmViaSqlite tests pass before touching the region",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestActivatePmViaSqlite -v 2>&1 | tail -10",
+          "expected": "All pass"
+        },
+        {
+          "description": "Replace _activate_pm_via_sqlite and _deactivate_pm_via_sqlite (lines ~1021-1192, post-Task-4 content) with _set_pm_via_sqlite shared method plus two thin wrapper methods",
+          "command": null,
+          "expected": "Three methods replace two"
+        },
+        {
+          "description": "Run all TestActivatePmViaSqlite tests — verify all still pass",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestActivatePmViaSqlite -v",
+          "expected": "PASS: behavior identical to Task 4 output"
+        },
+        {
+          "description": "Run deactivate regression check",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py -k 'deactivate_pm' -v",
+          "expected": "PASS"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/orchestrator_mcp.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "BUG-01: Batch Grading in _call_grader",
+      "description": "Add batch=False parameter to _call_grader. When batch=True, try array extraction (re.search r'\\[.*\\]' with DOTALL + json.loads + validate list of grade dicts) before single-object path. Update spawn_workers call to pass batch=True. TDD: add TestCallGraderBatch class.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [7],
+      "steps": [
+        {
+          "description": "Add TestCallGraderBatch class with test_batch_param_returns_list (patches secrets.token_hex, sets read_log_tail side_effect with delimiter+JSON array, asserts list returned) and test_non_batch_still_returns_dict (same setup with single JSON, no batch param, asserts dict returned)",
+          "command": null,
+          "expected": "New TestCallGraderBatch class with two tests"
+        },
+        {
+          "description": "Run RED tests",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestCallGraderBatch -v",
+          "expected": "FAIL: test_batch_param_returns_list fails (TypeError: unexpected keyword argument 'batch')"
+        },
+        {
+          "description": "Update _call_grader signature: def _call_grader(self, system_prompt: str, user_prompt: str, batch: bool = False) -> dict | list",
+          "command": null,
+          "expected": "Signature updated"
+        },
+        {
+          "description": "After post_delimiter assignment (~line 584), insert batch array extraction block: if batch: re.search r'\\[.*\\]' DOTALL, json.loads, validate list of grade dicts, return list if valid, otherwise fall through",
+          "command": null,
+          "expected": "Batch path inserted before single-object regex"
+        },
+        {
+          "description": "Update spawn_workers call at ~line 1510: add batch=True argument",
+          "command": null,
+          "expected": "self._call_grader(system_prompt, user_prompt, batch=True)"
+        },
+        {
+          "description": "Run TestCallGraderBatch — verify GREEN",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestCallGraderBatch -v",
+          "expected": "PASS: both tests pass"
+        },
+        {
+          "description": "Verify TestBatchSpawn still passes",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestBatchSpawn -v",
+          "expected": "PASS: all TestBatchSpawn tests unchanged"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "name": "DRY-02: WORKER_COMMANDS Single Definition",
+      "description": "Remove duplicate WORKER_COMMANDS dict from main.py and replace with import from orchestrator_mcp. TDD: add TestWorkerCommandsImport, run RED, implement, run GREEN.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [5],
+      "steps": [
+        {
+          "description": "Add TestWorkerCommandsImport class with test_worker_commands_is_same_object_in_main_and_orchestrator — imports both modules and asserts main.WORKER_COMMANDS is orchestrator_mcp.WORKER_COMMANDS",
+          "command": null,
+          "expected": "New test class added"
+        },
+        {
+          "description": "Run RED test",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestWorkerCommandsImport -v",
+          "expected": "FAIL: main.WORKER_COMMANDS is not orchestrator_mcp.WORKER_COMMANDS (two separate dicts)"
+        },
+        {
+          "description": "In main.py, replace WORKER_COMMANDS = {...} dict literal (lines ~49-51) with: from ironclaude.orchestrator_mcp import WORKER_COMMANDS",
+          "command": null,
+          "expected": "Duplicate dict removed, import added"
+        },
+        {
+          "description": "Run GREEN test",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestWorkerCommandsImport -v",
+          "expected": "PASS"
+        },
+        {
+          "description": "Run full test suite",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/ -x -q 2>&1 | tail -20",
+          "expected": "No new failures"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/main.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "Changes staged"
+        }
+      ]
+    }
+  ]
+}

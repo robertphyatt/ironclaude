@@ -429,6 +429,24 @@ export const writeToolDefinitions = [
       idempotentHint: true,
     },
   },
+  {
+    name: 'set_testing_theatre_checked',
+    description:
+      'Sets testing_theatre_checked=1 for the current session. ' +
+      'Called by the testing-theatre-detection skill after completing its analysis. ' +
+      'Signals to code-review that testing-theatre detection ran so the grade cap is lifted.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {},
+      required: [] as string[],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -1255,6 +1273,31 @@ export function handleWriteTool(
         success: true,
         log_session_ids: value,
         previous,
+      });
+    }
+
+    // ----- set_testing_theatre_checked -----
+    case 'set_testing_theatre_checked': {
+      const session = getSession(db, resolvedId);
+      if (!session) {
+        return err('Session not found', { session_id: resolvedId });
+      }
+
+      updateSession(db, resolvedId, { testing_theatre_checked: 1 });
+
+      insertAuditLog(db, {
+        terminal_session: resolvedId,
+        actor: 'claude',
+        action: 'set_testing_theatre_checked',
+        old_value: String(session.testing_theatre_checked),
+        new_value: '1',
+        context: 'Testing theatre detection completed',
+      });
+
+      return ok({
+        success: true,
+        testing_theatre_checked: 1,
+        session_id: resolvedId,
       });
     }
 
