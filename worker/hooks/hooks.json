@@ -67,6 +67,15 @@
           }
         ],
         "matcher": "Task"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/poll-dedup.sh"
+          }
+        ],
+        "matcher": "Read|Bash|Grep|Glob"
       }
     ],
     "PostToolUse": [
@@ -114,6 +123,15 @@
           }
         ],
         "matcher": "mcp__plugin_ironclaude_state-manager__mark_design_ready|mcp__plugin_ironclaude_state-manager__mark_plan_ready|mcp__plugin_ironclaude_state-manager__mark_brainstorming|mcp__plugin_ironclaude_state-manager__mark_executing|mcp__plugin_ironclaude_state-manager__mark_debugging|mcp__plugin_ironclaude_state-manager__create_plan|mcp__plugin_ironclaude_state-manager__start_execution|mcp__plugin_ironclaude_state-manager__retreat"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/poll-dedup.sh"
+          }
+        ],
+        "matcher": "Read|Bash|Grep|Glob"
       }
     ],
     "UserPromptSubmit": [

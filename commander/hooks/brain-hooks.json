@@ -17,6 +17,14 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/brain-permission-seeker-guard.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/brain-stop-hook.sh"
           }
         ]

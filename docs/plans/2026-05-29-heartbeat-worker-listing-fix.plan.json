@@ -1,0 +1,123 @@
+{
+  "name": "Heartbeat Worker Listing Fix",
+  "goal": "Fix the heartbeat to list all workers with live tmux sessions, not just those with status='running' in the DB",
+  "design_file": "docs/plans/2026-05-29-heartbeat-worker-listing-fix-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Add get_recent_workers() to WorkerRegistry",
+      "description": "Add a new method that queries running workers plus recently-finished workers within a lookback window, so the heartbeat can find alive workers even if incorrectly marked completed",
+      "allowed_files": [
+        "commander/src/ironclaude/worker_registry.py",
+        "commander/tests/test_daemon.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Write TestGetRecentWorkers test class in test_daemon.py",
+          "command": null,
+          "expected": "Tests added to file"
+        },
+        {
+          "description": "Run tests to verify they fail (method does not exist yet)",
+          "command": "cd commander && .venv/bin/python -m pytest tests/test_daemon.py::TestGetRecentWorkers -v",
+          "expected": "5 failures — AttributeError: 'WorkerRegistry' object has no attribute 'get_recent_workers'"
+        },
+        {
+          "description": "Implement get_recent_workers() in worker_registry.py after get_running_workers_by_type",
+          "command": null,
+          "expected": "Method added"
+        },
+        {
+          "description": "Run tests to verify they pass",
+          "command": "cd commander && .venv/bin/python -m pytest tests/test_daemon.py::TestGetRecentWorkers -v",
+          "expected": "5 passed"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/worker_registry.py commander/tests/test_daemon.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Harden _get_worker_workflow_stage against TOCTOU crash",
+      "description": "Wrap session_id_file.read_text() in try/except OSError so a file-vanished race does not abort the heartbeat loop mid-iteration",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_daemon.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Write test_returns_none_when_session_file_disappears_before_read in TestGetWorkerWorkflowStage",
+          "command": null,
+          "expected": "Test added to file"
+        },
+        {
+          "description": "Run test to verify it fails (FileNotFoundError propagates currently)",
+          "command": "cd commander && .venv/bin/python -m pytest tests/test_daemon.py::TestGetWorkerWorkflowStage::test_returns_none_when_session_file_disappears_before_read -v",
+          "expected": "FAIL — FileNotFoundError raised"
+        },
+        {
+          "description": "Wrap read_text() in try/except OSError in _get_worker_workflow_stage in main.py",
+          "command": null,
+          "expected": "Code change made"
+        },
+        {
+          "description": "Run full TestGetWorkerWorkflowStage to verify all tests pass",
+          "command": "cd commander && .venv/bin/python -m pytest tests/test_daemon.py::TestGetWorkerWorkflowStage -v",
+          "expected": "All tests pass including new one"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/main.py commander/tests/test_daemon.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Rewrite post_heartbeat() to use tmux_alive as ground truth",
+      "description": "Replace get_running_workers() with get_recent_workers() in the heartbeat loop, add has_session() check per candidate with proper ssh_host, and fix the grader-check condition from 'if not running' to 'if not worker_details'",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_daemon.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Write TestPostHeartbeat class with 4 tests in test_daemon.py",
+          "command": null,
+          "expected": "Tests added to file"
+        },
+        {
+          "description": "Run tests to verify they fail",
+          "command": "cd commander && .venv/bin/python -m pytest tests/test_daemon.py::TestPostHeartbeat -v",
+          "expected": "4 failures"
+        },
+        {
+          "description": "Rewrite the heartbeat candidate loop and grader-check condition in post_heartbeat() in main.py",
+          "command": null,
+          "expected": "Code changed"
+        },
+        {
+          "description": "Run TestPostHeartbeat to verify pass",
+          "command": "cd commander && .venv/bin/python -m pytest tests/test_daemon.py::TestPostHeartbeat -v",
+          "expected": "4 passed"
+        },
+        {
+          "description": "Run full test suite to check for regressions",
+          "command": "cd commander && .venv/bin/python -m pytest tests/ -v",
+          "expected": "All tests pass (no new failures)"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/main.py commander/tests/test_daemon.py",
+          "expected": "Changes staged"
+        }
+      ]
+    }
+  ]
+}

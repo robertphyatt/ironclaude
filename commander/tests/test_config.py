@@ -97,14 +97,14 @@ class TestLoadConfig:
         assert cfg["advisor"]["advisor_model"] == "opus"
 
     def test_defaults_include_brain_model(self):
-        """brain_model defaults to claude-opus-4."""
+        """brain_model defaults to opus."""
         from ironclaude.config import DEFAULTS
-        assert DEFAULTS["brain_model"] == "claude-opus-4"
+        assert DEFAULTS["brain_model"] == "opus"
 
     def test_defaults_include_grader_model(self):
-        """grader_model defaults to claude-opus-4."""
+        """grader_model defaults to opus."""
         from ironclaude.config import DEFAULTS
-        assert DEFAULTS["grader_model"] == "claude-opus-4"
+        assert DEFAULTS["grader_model"] == "opus"
 
     def test_env_override_brain_model(self, tmp_path, monkeypatch):
         """BRAIN_MODEL env var overrides config."""
@@ -170,12 +170,14 @@ class TestLoadConfig:
         cmd = make_opus_command("claude-opus-4-5", "medium")
         assert "CLAUDE_CODE_EFFORT_LEVEL=medium" in cmd
         assert "claude-opus-4-5" in cmd
+        assert "[1m]" not in cmd
 
     def test_make_opus_command_high_effort(self):
         """make_opus_command with high effort."""
         from ironclaude.config import make_opus_command
         cmd = make_opus_command("claude-opus-4-5", "high")
         assert "CLAUDE_CODE_EFFORT_LEVEL=high" in cmd
+        assert "[1m]" not in cmd
 
 
 # ── machines.yaml tests ──────────────────────────────────────────────

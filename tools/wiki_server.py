@@ -69,6 +69,12 @@ class WikiHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
 
+        if path == PATH_PREFIX:
+            self.send_response(301)
+            self.send_header("Location", PATH_PREFIX + "/")
+            self.end_headers()
+            return
+
         if path.startswith(PATH_PREFIX):
             path = path[len(PATH_PREFIX):]
 

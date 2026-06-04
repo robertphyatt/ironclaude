@@ -106,7 +106,7 @@ class BrainClient:
             )
         return matches[-1]  # sorted() puts latest version last
 
-    def __init__(self, timeout_seconds: int = 600, operator_name: str = "Operator", model: str = "claude-opus-4", effort_level: str = "high"):
+    def __init__(self, timeout_seconds: int = 600, operator_name: str = "Operator", model: str = "opus", effort_level: str = "high"):
         self.timeout_seconds = timeout_seconds
         self._operator_name = operator_name
         self._model = model
@@ -523,6 +523,7 @@ class BrainClient:
                     "SUPABASE_URL": os.environ.get("SUPABASE_URL", ""),
                     "SUPABASE_ANON_KEY": os.environ.get("SUPABASE_ANON_KEY", ""),
                     "IC_BRAIN_CWD": self._cwd or "",
+                    "IC_MACHINES_CONFIG": str(Path(__file__).parents[3] / "config" / "machines.yaml"),
                 },
             }
         if self._research_mcp_path:
@@ -550,7 +551,8 @@ class BrainClient:
                 resume=resume_session_id,
                 fork_session=True,
                 effort=self._effort_level,
-                model=self._model,
+                model=f"{self._model}[1m]",
+                betas=["context-1m-2025-08-07"],
                 setting_sources=["project", "local"],
             )
         else:
@@ -564,7 +566,8 @@ class BrainClient:
                 max_buffer_size=self.MAX_BUFFER_SIZE,
                 mcp_servers=mcp_servers,
                 effort=self._effort_level,
-                model=self._model,
+                model=f"{self._model}[1m]",
+                betas=["context-1m-2025-08-07"],
                 setting_sources=["project", "local"],
             )
 

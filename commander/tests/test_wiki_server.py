@@ -26,3 +26,27 @@ def test_parse_md_preserves_html_body(tmp_path):
     _, body = _parse_md(md_file)
     assert "<h1>" in body
     assert "&lt;h1&gt;" not in body
+
+
+def test_wiki_prefix_no_slash_redirects(tmp_path, monkeypatch):
+    """GET /wiki (no trailing slash) returns 301 to /wiki/."""
+    import http.client
+    import threading
+
+    import wiki_server
+    monkeypatch.setattr(wiki_server, "WIKI_DIR", tmp_path)
+    (tmp_path / "index.md").write_text("# Index\n")
+
+    server = wiki_server.ThreadingHTTPServer(("127.0.0.1", 0), wiki_server.WikiHandler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.handle_request, daemon=True)
+    t.start()
+
+    conn = http.client.HTTPConnection("127.0.0.1", port)
+    conn.request("GET", "/wiki")
+    resp = conn.getresponse()
+
+    assert resp.status == 301
+    assert resp.getheader("Location") == "/wiki/"
+    t.join(timeout=2)
+    server.server_close()

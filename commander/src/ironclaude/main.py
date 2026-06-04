@@ -479,6 +479,12 @@ def ensure_brain_trusted(brain_cwd: str) -> None:
         logger.warning(f"Could not update {claude_json_path}: {e}")
 
 
+def _worker_matches_directive(worker: dict, directive_id: int) -> bool:
+    description = worker.get("description") or ""
+    worker_id = worker.get("id") or ""
+    return f"#{directive_id}" in description or worker_id.startswith(f"d{directive_id}-")
+
+
 class IroncladeDaemon:
     def __init__(self, config: dict, slack: SlackBot, socket_handler: SlackSocketHandler | None,
                  registry: WorkerRegistry, tmux_manager: TmuxManager, brain: BrainClient,
@@ -502,6 +508,7 @@ class IroncladeDaemon:
         self._last_checkin_hash: dict[str, int] = {}
         self._last_stage_seen: dict[str, str | None] = {}
         self._stage_history: dict[str, list[tuple[float, str]]] = {}
+        self._directive_reminder_sent: dict[int, float] = {}
         self._claude_dir: Path | None = None
         self._last_maintenance = 0.0
         self._state_manager_db_path = os.path.expanduser("~/.claude/ironclaude.db")
@@ -763,7 +770,16 @@ class IroncladeDaemon:
             self._db.commit()
             self.slack.post_message(f"Directive #{directive_id} confirmed: {interpretation}")
             operator = self.config.get("operator_name", "Operator")
-            self.brain.send_message(f"Directive #{directive_id} confirmed by {operator}: {interpretation}")
+            delivered = self.brain.send_message(
+                f"Directive #{directive_id} confirmed by {operator}: {interpretation}"
+            )
+            if delivered:
+                self._directive_reminder_sent[directive_id] = time.time()
+            else:
+                logger.warning(
+                    "Brain unreachable; directive #%d confirmation will retry via check_confirmed_directives",
+                    directive_id,
+                )
             source_ts = self._db.execute(
                 "SELECT source_ts FROM directives WHERE id=?", (directive_id,)
             ).fetchone()[0]
@@ -878,6 +894,7 @@ class IroncladeDaemon:
                 if row[0]:
                     self.slack.unpin_message(row[0])
         except sqlite3.OperationalError as e:
+            self._db.rollback()
             logger.warning("push_requests sweep skipped (db locked): %s", e)
 
     def poll_brain_responses(self):
@@ -1112,7 +1129,7 @@ class IroncladeDaemon:
             return
 
         # Inject worker ID for stop hook completion detection
-        cmd = f"IC_WORKER_ID={shlex.quote(worker_id)} {cmd}"
+        cmd = f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; export ENABLE_STOP_REVIEW=0; {cmd}"
 
         # Stage 1: ensure trust
         ensure_worker_trusted(repo)
@@ -1186,7 +1203,10 @@ class IroncladeDaemon:
         session_id_file = claude_dir / f"ironclaude-session-{pane_pid}.id"
         if not session_id_file.exists():
             return None
-        session_id = session_id_file.read_text().strip()
+        try:
+            session_id = session_id_file.read_text().strip()
+        except OSError:
+            return None
         if len(session_id) != 36:
             return None
 
@@ -1360,6 +1380,44 @@ class IroncladeDaemon:
             self._last_checkin_stage[worker_id] = stage
             self._last_checkin_hash[worker_id] = current_hash
 
+    def check_confirmed_directives(self):
+        """Send reminder to Brain for confirmed directives with no worker spawned within 5 minutes.
+
+        Runs every poll cycle. Queries all confirmed directives. For each with no matching
+        running worker, fires immediately if never notified (_directive_reminder_sent absent),
+        or fires an ACTION REQUIRED reminder if 10+ minutes have elapsed since last notification.
+        """
+        if self._db is None:
+            return
+        REMINDER_INTERVAL = 600  # 10 minutes between reminders per directive
+        now = time.time()
+        try:
+            rows = self._db.execute(
+                "SELECT id, interpretation FROM directives WHERE status='confirmed'"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+        running_workers = self.registry.get_running_workers()
+        for directive_id, interpretation in rows:
+            worker_found = any(_worker_matches_directive(w, directive_id) for w in running_workers)
+            if worker_found:
+                continue
+            last_sent = self._directive_reminder_sent.get(directive_id, 0.0)
+            if last_sent == 0.0:
+                msg = (
+                    f"Directive #{directive_id} confirmed — no worker spawned yet. Act on it now."
+                )
+            elif now - last_sent < REMINDER_INTERVAL:
+                continue
+            else:
+                msg = (
+                    f"[ACTION REQUIRED] Directive #{directive_id} confirmed but no worker spawned. "
+                    f"Act on it now."
+                )
+            delivered = self.brain.send_message(msg)
+            if delivered:
+                self._directive_reminder_sent[directive_id] = now
+
     def _handle_detail(self, parsed: dict):
         """Handle /detail command — show worker status and log."""
         worker_id = parsed.get("target", "")
@@ -1395,10 +1453,13 @@ class IroncladeDaemon:
             return
         self._last_heartbeat = now
 
-        running = self.registry.get_running_workers()
+        candidates = self.registry.get_recent_workers()
         worker_details = []
-        for w in running:
-            stage = self._get_worker_workflow_stage(w["tmux_session"])
+        for w in candidates:
+            ssh_host, _ = self._resolve_worker_ssh(w)
+            if not self.tmux.has_session(w["tmux_session"], ssh_host=ssh_host):
+                continue
+            stage = self._get_worker_workflow_stage(w["tmux_session"], ssh_host=ssh_host)
             worker_details.append({
                 "id": w["id"],
                 "description": w.get("description"),
@@ -1408,8 +1469,8 @@ class IroncladeDaemon:
         brain_usage = self.brain.get_token_usage() if self.brain is not None else None
         self.slack.post_message(format_heartbeat(worker_details, brain_usage=brain_usage))
 
-        # Grader enforcement: if no workers but directives exist, nudge the Brain
-        if not running and self._db is not None:
+        # Grader enforcement: if no alive workers but directives exist, nudge the Brain
+        if not worker_details and self._db is not None:
             try:
                 unworked = self._db.execute(
                     "SELECT count(*) FROM directives WHERE status IN ('confirmed', 'in_progress')"
@@ -1437,6 +1498,7 @@ class IroncladeDaemon:
                 self.check_brain()
                 self.process_brain_decisions()
                 self.check_workers()
+                self.check_confirmed_directives()
             self.post_heartbeat()
             self._run_maintenance()
             self.slack.flush_queue()
@@ -1590,7 +1652,7 @@ def main():
     brain = BrainClient(
         timeout_seconds=config.get("brain_timeout_seconds", 600),
         operator_name=config.get("operator_name", "Operator"),
-        model=config.get("brain_model", "claude-opus-4"),
+        model=config.get("brain_model", "opus"),
         effort_level=config.get("effort_level", "high"),
     )
 

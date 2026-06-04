@@ -106,6 +106,16 @@ if command -v sqlite3 &>/dev/null; then
       created_at       TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS tool_poll_state (
+      terminal_session TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      input_hash TEXT NOT NULL,
+      last_output_hash TEXT NOT NULL DEFAULT '',
+      consecutive_count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (terminal_session, tool_name, input_hash)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_wave_tasks_session
       ON wave_tasks(terminal_session);
     CREATE INDEX IF NOT EXISTS idx_wave_tasks_session_wave
@@ -122,19 +132,25 @@ if command -v sqlite3 &>/dev/null; then
       ON pending_subagent_parents(parent_session);
     CREATE INDEX IF NOT EXISTS idx_review_grades_session_wave
       ON review_grades(terminal_session, wave_number, task_boundary);
+    CREATE INDEX IF NOT EXISTS idx_poll_state_session
+      ON tool_poll_state(terminal_session);
   " 2>/dev/null || true
 fi
 
 # Ensure session row exists via direct sqlite3
 SAFE_SESSION=$(echo "$SESSION_TAG" | sed "s/'/''/g")
 SAFE_PROJECT_HASH=$(echo "$PROJECT_HASH" | sed "s/'/''/g")
+PM_DEFAULT="${IRONCLAUDE_PM:-undecided}"
+if [[ "$PM_DEFAULT" != "on" && "$PM_DEFAULT" != "off" && "$PM_DEFAULT" != "undecided" ]]; then
+  PM_DEFAULT="undecided"
+fi
 ROWS_BEFORE=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM sessions WHERE terminal_session = '${SAFE_SESSION}';" 2>/dev/null || echo "0")
 sqlite3 "$DB_PATH" "INSERT OR IGNORE INTO sessions (terminal_session, professional_mode, workflow_stage, project_hash, updated_at)
-  VALUES ('${SAFE_SESSION}', 'undecided', 'idle', '${SAFE_PROJECT_HASH}', datetime('now'));" 2>/dev/null || true
+  VALUES ('${SAFE_SESSION}', '${PM_DEFAULT}', 'idle', '${SAFE_PROJECT_HASH}', datetime('now'));" 2>/dev/null || true
 
 # Log if we just created a new session (fallback INSERT succeeded)
 if [ "$ROWS_BEFORE" = "0" ]; then
-  log_hook "session-init" "State" "workflow_stage: null -> idle, professional_mode: null -> undecided (fallback INSERT)"
+  log_hook "session-init" "State" "workflow_stage: null -> idle, professional_mode: null -> ${PM_DEFAULT} (fallback INSERT)"
 fi
 
 log_hook "session-init" "Allowed" "Session registered"
@@ -151,6 +167,15 @@ if [ -d "$HOOK_SRC_DIR" ]; then
   # Preserve executable permissions
   chmod +x "$STABLE_DIR"/*.sh 2>/dev/null || true
   log_hook "session-init" "Stable" "hooks copied to $STABLE_DIR"
+fi
+
+# ═══ Security-guidance plugin check ═══
+SG_FOUND=0
+for d in "$HOME/.claude/plugins/cache"/*/security-guidance; do
+  [ -d "$d" ] && SG_FOUND=1 && break
+done
+if [ "$SG_FOUND" = "0" ]; then
+  log_hook "session-init" "Security" "WARN: security-guidance plugin not installed. Run: /plugin install security-guidance@claude-plugins-official"
 fi
 
 # ═══ Absolute statusline path ═══

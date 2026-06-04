@@ -133,6 +133,7 @@ class TestHandleRestartReleasesLock:
         monkeypatch.setattr(os, "execvp", fake_execvp)
         monkeypatch.setattr(main_module.subprocess, "run", fake_subprocess_run)
         monkeypatch.setattr(main_module.time, "sleep", lambda _: None)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: None)
 
         with pytest.raises(SystemExit):
             main_module._handle_restart(signal.SIGHUP, None)

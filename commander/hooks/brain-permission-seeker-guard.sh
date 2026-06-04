@@ -1,16 +1,13 @@
 #!/bin/bash
-# brain-stop-hook.sh — Claude Code Stop hook for IronClaude worker sessions.
-# Blocks the session from stopping if:
-#   1. The last response contains permission-seeking language, OR
-#   2. The worker (via IC_WORKER_ID) has incomplete tasks in ironclaude.db,
-#      or any workers have status != 'completed' (brain context fallback).
-# Throttle: max 3 blocks per 5 minutes per session.
+# brain-permission-seeker-guard.sh — Stop hook for IronClaude Brain session.
+# Blocks the Brain from sending permission-seeking messages to the operator.
+# Brain must act on confirmed directives immediately, not seek approval.
+#
+# Owns the complete 13-pattern permission-seeking check.
+# brain-stop-hook.sh handles the DB incomplete-tasks check.
 #
 # Input (stdin): JSON with transcript_path, stop_hook_active, session_id
 # Output (stdout): JSON with decision ("approve"/"block"), reason, systemMessage
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DB_PATH="${IC_DB_PATH:-${SCRIPT_DIR}/../data/db/ironclaude.db}"
 
 # --- Parse stdin ---
 INPUT=$(cat)
@@ -18,7 +15,7 @@ TRANSCRIPT_PATH=$(printf '%s' "$INPUT" | jq -r '.transcript_path // ""' 2>/dev/n
 STOP_HOOK_ACTIVE=$(printf '%s' "$INPUT" | jq -r '.stop_hook_active // false' 2>/dev/null || true)
 SESSION_ID=$(printf '%s' "$INPUT" | jq -r '.session_id // .conversation_id // "unknown"' 2>/dev/null || true)
 SAFE_SESSION_ID=$(printf '%s' "$SESSION_ID" | tr -cd 'a-zA-Z0-9_-')
-THROTTLE_FILE="/tmp/ic-stop-hook-${SAFE_SESSION_ID}"
+THROTTLE_FILE="/tmp/ic-perm-seeker-${SAFE_SESSION_ID}"
 NOW=$(date +%s)
 
 # --- Throttle check (only when stop_hook_active=true) ---
@@ -60,7 +57,6 @@ block() {
 # --- Extract last assistant text from transcript ---
 LAST_TEXT=""
 if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
-    # Find last assistant requestId, then extract text blocks for that request
     LAST_REQ_ID=$(
         tail -n 500 "$TRANSCRIPT_PATH" 2>/dev/null | \
         jq -r 'select(.type == "assistant") | .requestId // empty' 2>/dev/null | \
@@ -82,31 +78,44 @@ if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
     fi
 fi
 
-# --- DB check ---
-if command -v sqlite3 >/dev/null 2>&1 && [ -f "$DB_PATH" ]; then
-    if [ -n "${IC_WORKER_ID:-}" ]; then
-        SAFE_WORKER_ID=$(printf '%s' "$IC_WORKER_ID" | sed "s/'/''/g")
-        PENDING=$(sqlite3 -cmd ".timeout 1000" "$DB_PATH" \
-            "SELECT description FROM tasks WHERE worker_id='${SAFE_WORKER_ID}' AND status != 'completed' LIMIT 3;" \
-            2>/dev/null || true)
-        if [ -n "$PENDING" ]; then
-            TASK_LIST=$(printf '%s' "$PENDING" | tr '\n' '; ' | sed 's/; $//')
-            block \
-                "Worker ${IC_WORKER_ID} has incomplete tasks" \
-                "You have incomplete tasks: ${TASK_LIST} Complete them before stopping."
-        fi
-    else
-        RUNNING=$(sqlite3 -cmd ".timeout 1000" "$DB_PATH" \
-            "SELECT id FROM workers WHERE status != 'completed' LIMIT 5;" \
-            2>/dev/null || true)
-        if [ -n "$RUNNING" ]; then
-            WORKER_LIST=$(printf '%s' "$RUNNING" | tr '\n' ', ' | sed 's/, $//')
-            block \
-                "Workers still running: ${WORKER_LIST}" \
-                "Workers are still running: ${WORKER_LIST}. Check on them with get_worker_log before stopping."
-        fi
+# Fail-open: no text to scan
+if [ -z "$LAST_TEXT" ]; then
+    printf '{"decision": "approve", "reason": "No text content to scan"}\n'
+    exit 0
+fi
+
+# --- Permission-seeking pattern check ---
+# Fixed-string patterns (case-insensitive, -F for speed and safety).
+# Loop reports the first matched pattern in the block message.
+FIXED_PATTERNS=(
+    "awaiting confirmation"
+    "awaiting operator"
+    "awaiting your"
+    "shall i"
+    "should i"
+    "would you like"
+    "want me to"
+    "do you want"
+    "ready for you to"
+    "let me know if"
+    "let me know when"
+    "at your convenience"
+)
+
+for pattern in "${FIXED_PATTERNS[@]}"; do
+    if printf '%s' "$LAST_TEXT" | grep -qiF "$pattern" 2>/dev/null; then
+        block \
+            "Permission-seeking language detected: '${pattern}'" \
+            "BLOCKED — Permission-seeking language detected: '${pattern}'. Act on confirmed directives immediately. If you need guidance, use the decision format (explain issue, options with pros/cons, recommendation, prediction, pin)."
     fi
+done
+
+# Regex pattern: optional apostrophe handles "you're" and "youre"
+if printf '%s' "$LAST_TEXT" | grep -qiE "when you'?re ready" 2>/dev/null; then
+    block \
+        "Permission-seeking language detected: 'when you're ready'" \
+        "BLOCKED — Permission-seeking language detected: 'when you're ready'. Act on confirmed directives immediately. If you need guidance, use the decision format (explain issue, options with pros/cons, recommendation, prediction, pin)."
 fi
 
 # --- Approve ---
-printf '{"decision": "approve", "reason": "No pending work detected"}\n'
+printf '{"decision": "approve", "reason": "No permission-seeking language detected"}\n'

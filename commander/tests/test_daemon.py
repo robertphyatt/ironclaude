@@ -221,6 +221,28 @@ class TestGetWorkerWorkflowStage:
         result = daemon._get_worker_workflow_stage("ic-w1", _claude_dir=claude_dir)
         assert result is None
 
+    def test_returns_none_when_session_file_disappears_before_read(self, daemon, tmp_path):
+        """Returns None (no exception) when session file exists() but read_text() raises OSError."""
+        from pathlib import Path
+        from unittest.mock import patch
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        session_id = "abcdef01-2345-6789-abcd-ef0123456789"
+        session_file = claude_dir / "ironclaude-session-12345.id"
+        session_file.write_text(session_id)
+        daemon.tmux.list_pane_pid.return_value = "12345"
+
+        original_read_text = Path.read_text
+        def patched_read_text(self_path, *args, **kwargs):
+            if self_path == session_file:
+                raise FileNotFoundError("file vanished")
+            return original_read_text(self_path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", patched_read_text):
+            result = daemon._get_worker_workflow_stage("ic-w1", _claude_dir=claude_dir)
+
+        assert result is None
+
 
 class TestDetectPromptWaiting:
     def test_detects_ask_user_question(self, daemon):
@@ -1553,6 +1575,7 @@ class TestWorkerCommandsConsistency:
         assert "CLAUDE_CODE_EFFORT_LEVEL=high" in WORKER_COMMANDS["claude-sonnet"]
 
 
+
 class TestDaemonWorkerTrust:
     @patch("ironclaude.main.ensure_worker_trusted")
     def test_spawn_worker_calls_ensure_worker_trusted(self, mock_trust, daemon):
@@ -2122,5 +2145,114 @@ class TestDirectiveUnpin:
         self._insert_directive(db)
         daemon._handle_directive_confirmation("no")
         daemon.slack.unpin_message.assert_called_once_with("interp-ts-001")
+
+
+class TestPostHeartbeat:
+    def test_heartbeat_includes_all_alive_workers(self, daemon):
+        """Heartbeat posts message containing all workers with live tmux sessions."""
+        workers = [
+            {"id": f"w{i}", "tmux_session": f"ic-w{i}", "description": f"task {i}", "machine": None}
+            for i in range(1, 7)
+        ]
+        daemon.registry.get_recent_workers.return_value = workers
+        daemon.tmux.has_session.return_value = True
+        daemon._last_heartbeat = 0
+        daemon.post_heartbeat()
+        daemon.slack.post_message.assert_called_once()
+        msg = daemon.slack.post_message.call_args[0][0]
+        for i in range(1, 7):
+            assert f"w{i}" in msg
+
+    def test_heartbeat_excludes_dead_sessions(self, daemon):
+        """Heartbeat excludes workers where has_session returns False."""
+        workers = [
+            {"id": "w1", "tmux_session": "ic-w1", "description": "task 1", "machine": None},
+            {"id": "w2", "tmux_session": "ic-w2", "description": "task 2", "machine": None},
+        ]
+        daemon.registry.get_recent_workers.return_value = workers
+        daemon.tmux.has_session.side_effect = lambda name, ssh_host=None: name == "ic-w1"
+        daemon._last_heartbeat = 0
+        daemon.post_heartbeat()
+        msg = daemon.slack.post_message.call_args[0][0]
+        assert "w1" in msg
+        assert "w2" not in msg
+
+    def test_heartbeat_no_workers_posts_no_active(self, daemon):
+        """Heartbeat posts 'No active workers' when all sessions are dead."""
+        daemon.registry.get_recent_workers.return_value = [
+            {"id": "w1", "tmux_session": "ic-w1", "description": "done", "machine": None}
+        ]
+        daemon.tmux.has_session.return_value = False
+        daemon._last_heartbeat = 0
+        daemon.post_heartbeat()
+        msg = daemon.slack.post_message.call_args[0][0]
+        assert "No active workers" in msg
+
+    def test_heartbeat_respects_interval(self, daemon):
+        """Heartbeat does not fire before interval elapses."""
+        daemon._last_heartbeat = time.time()
+        daemon.post_heartbeat()
+        daemon.slack.post_message.assert_not_called()
+
+
+class TestGetRecentWorkers:
+    def _make_registry(self, tmp_path):
+        from ironclaude.db import init_db
+        from ironclaude.worker_registry import WorkerRegistry
+        conn = init_db(str(tmp_path / "ic.db"))
+        return WorkerRegistry(conn)
+
+    def test_returns_running_workers(self, tmp_path):
+        """Returns workers with status='running'."""
+        reg = self._make_registry(tmp_path)
+        reg.register_worker("w1", "claude-sonnet", "ic-w1", repo="/repo")
+        results = reg.get_recent_workers()
+        assert len(results) == 1
+        assert results[0]["id"] == "w1"
+
+    def test_returns_recently_finished_workers(self, tmp_path):
+        """Returns workers finished within lookback window."""
+        reg = self._make_registry(tmp_path)
+        reg.register_worker("w1", "claude-sonnet", "ic-w1", repo="/repo")
+        reg._conn.execute(
+            "UPDATE workers SET status='completed', finished_at=datetime('now', '-30 minutes') WHERE id='w1'"
+        )
+        reg._conn.commit()
+        results = reg.get_recent_workers(lookback_hours=1)
+        assert len(results) == 1
+        assert results[0]["id"] == "w1"
+
+    def test_excludes_old_finished_workers(self, tmp_path):
+        """Excludes workers finished outside the lookback window."""
+        reg = self._make_registry(tmp_path)
+        reg.register_worker("w1", "claude-sonnet", "ic-w1", repo="/repo")
+        reg._conn.execute(
+            "UPDATE workers SET status='completed', finished_at=datetime('now', '-2 hours') WHERE id='w1'"
+        )
+        reg._conn.commit()
+        results = reg.get_recent_workers(lookback_hours=1)
+        assert len(results) == 0
+
+    def test_excludes_finished_null_timestamp(self, tmp_path):
+        """Excludes workers with status='completed' but NULL finished_at."""
+        reg = self._make_registry(tmp_path)
+        reg.register_worker("w1", "claude-sonnet", "ic-w1", repo="/repo")
+        reg._conn.execute("UPDATE workers SET status='completed' WHERE id='w1'")
+        reg._conn.commit()
+        results = reg.get_recent_workers(lookback_hours=1)
+        assert len(results) == 0
+
+    def test_returns_both_running_and_recent_finished(self, tmp_path):
+        """Returns mix of running and recently-finished workers."""
+        reg = self._make_registry(tmp_path)
+        reg.register_worker("w1", "claude-sonnet", "ic-w1", repo="/repo")
+        reg.register_worker("w2", "claude-sonnet", "ic-w2", repo="/repo")
+        reg._conn.execute(
+            "UPDATE workers SET status='completed', finished_at=datetime('now', '-10 minutes') WHERE id='w2'"
+        )
+        reg._conn.commit()
+        results = reg.get_recent_workers(lookback_hours=1)
+        ids = {r["id"] for r in results}
+        assert ids == {"w1", "w2"}
 
 

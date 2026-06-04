@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 from ironclaude.db import init_db
 from ironclaude.worker_registry import WorkerRegistry
 from ironclaude.config import make_opus_command
+from ironclaude.ollama_inventory import OllamaInventory
 from ironclaude.orchestrator_mcp import OrchestratorTools, WORKER_COMMANDS, _load_avatar_skill, _init_brain_session_background, _restart_watchdog
 from ironclaude.slack_interface import SlackBot
 
@@ -57,11 +58,79 @@ def mock_tmux():
     return tmux
 
 
+def test_ensure_ssh_manager_lazy_init(tmp_path, db_conn, registry, mock_tmux):
+    """_ensure_ssh_manager() loads config and creates SSHConnectionManager on first call."""
+    machines_yaml = tmp_path / "machines.yaml"
+    machines_yaml.write_text(
+        "machines:\n"
+        "  - name: testbox\n"
+        "    host: test.example.com\n"
+        "    claude_path: /usr/local/bin/claude\n"
+        "    repos: [/home/user/project]\n"
+    )
+    tools = OrchestratorTools(registry, mock_tmux, ssh_manager=None)
+    tools._machines_config_path = str(machines_yaml)
+
+    assert tools._ssh_manager is None
+
+    mock_health = MagicMock()
+    mock_health.ok = True
+    mock_health.details = "ok"
+    with patch("ironclaude.ssh_manager.SSHConnectionManager") as MockSSH:
+        mock_mgr = MagicMock()
+        MockSSH.return_value = mock_mgr
+        mock_mgr.list_machine_names.return_value = ["testbox"]
+        mock_mgr.health_check.return_value = mock_health
+        tools._ensure_ssh_manager()
+
+    assert tools._ssh_manager is mock_mgr
+    mock_mgr.register_machines.assert_called_once()
+
+
+def test_ensure_ssh_manager_no_config(db_conn, registry, mock_tmux):
+    """_ensure_ssh_manager() leaves _ssh_manager as None when config file missing."""
+    tools = OrchestratorTools(registry, mock_tmux, ssh_manager=None)
+    tools._machines_config_path = "/nonexistent/machines.yaml"
+
+    tools._ensure_ssh_manager()
+
+    assert tools._ssh_manager is None
+
+
+def test_ensure_ssh_manager_idempotent(tmp_path, db_conn, registry, mock_tmux):
+    """_ensure_ssh_manager() calls register_machines exactly once (fast path on repeat)."""
+    machines_yaml = tmp_path / "machines.yaml"
+    machines_yaml.write_text(
+        "machines:\n"
+        "  - name: testbox\n"
+        "    host: test.example.com\n"
+        "    claude_path: /usr/local/bin/claude\n"
+        "    repos: [/home/user/project]\n"
+    )
+    tools = OrchestratorTools(registry, mock_tmux, ssh_manager=None)
+    tools._machines_config_path = str(machines_yaml)
+
+    mock_health = MagicMock()
+    mock_health.ok = True
+    mock_health.details = "ok"
+    with patch("ironclaude.ssh_manager.SSHConnectionManager") as MockSSH:
+        mock_mgr = MagicMock()
+        MockSSH.return_value = mock_mgr
+        mock_mgr.list_machine_names.return_value = ["testbox"]
+        mock_mgr.health_check.return_value = mock_health
+        tools._ensure_ssh_manager()
+        tools._ensure_ssh_manager()
+
+    mock_mgr.register_machines.assert_called_once()
+
+
 @pytest.fixture
 def tools(registry, mock_tmux, tmp_path, db_conn):
     """Create OrchestratorTools with test dependencies."""
     ledger_path = str(tmp_path / "task-ledger.json")
-    return OrchestratorTools(registry, mock_tmux, ledger_path, db_conn=db_conn)
+    t = OrchestratorTools(registry, mock_tmux, ledger_path, db_conn=db_conn)
+    t._get_ollama_vram = MagicMock(return_value=(0.0, []))
+    return t
 
 
 class TestSpawnWorker:
@@ -78,7 +147,7 @@ class TestSpawnWorker:
         assert "w1" in result
         mock_tmux.spawn_session.assert_called_once_with(
             "ic-w1",
-            f"export IC_ROLE=worker; export IC_WORKER_ID=w1; {WORKER_COMMANDS['claude-sonnet']}",
+            f"export IC_ROLE=worker; export IC_WORKER_ID=w1; export ENABLE_STOP_REVIEW=0; {WORKER_COMMANDS['claude-sonnet']}",
             cwd="/tmp/repo",
             ssh_host=None,
             remote_log_dir=None,
@@ -349,6 +418,7 @@ class TestEffortLevel:
         )
         cmd = t._get_worker_command("claude-opus")
         assert "CLAUDE_CODE_EFFORT_LEVEL=medium" in cmd
+        assert "[1m]" not in cmd
 
     def test_get_worker_command_sonnet_effort_override(self, registry, mock_tmux, tmp_path, db_conn):
         """Sonnet worker command uses configured effort_level."""
@@ -541,6 +611,59 @@ class TestTaskLedger:
         assert log_path.exists()
         assert "Migration failed" in log_path.read_text()
 
+    def test_update_ledger_unpins_escalation_on_unblock(self, wiki_tools_with_slack):
+        """update_ledger calls unpin_message when a task transitions out of blocked."""
+        wiki_tools_with_slack.update_ledger("Goal", [
+            {"id": "T1", "description": "Task 1", "status": "blocked", "escalation_ts": "111.222"},
+        ])
+        wiki_tools_with_slack.update_ledger("Goal", [
+            {"id": "T1", "description": "Task 1", "status": "pending"},
+        ])
+        wiki_tools_with_slack._slack.unpin_message.assert_called_once_with("111.222")
+
+    def test_update_ledger_no_unpin_if_escalation_ts_missing(self, wiki_tools_with_slack):
+        """update_ledger skips unpin when blocked task has no escalation_ts."""
+        wiki_tools_with_slack.update_ledger("Goal", [
+            {"id": "T1", "description": "Task 1", "status": "blocked"},
+        ])
+        wiki_tools_with_slack.update_ledger("Goal", [
+            {"id": "T1", "description": "Task 1", "status": "pending"},
+        ])
+        wiki_tools_with_slack._slack.unpin_message.assert_not_called()
+
+    def test_update_ledger_no_unpin_if_still_blocked(self, wiki_tools_with_slack):
+        """update_ledger does not call unpin_message when task remains blocked."""
+        wiki_tools_with_slack.update_ledger("Goal", [
+            {"id": "T1", "description": "Task 1", "status": "blocked", "escalation_ts": "111.222"},
+        ])
+        wiki_tools_with_slack.update_ledger("Goal", [
+            {"id": "T1", "description": "Task 1", "status": "blocked", "escalation_ts": "111.222"},
+        ])
+        wiki_tools_with_slack._slack.unpin_message.assert_not_called()
+
+    def test_update_ledger_unpin_no_slack(self, wiki_tools):
+        """update_ledger does not raise when slack is unavailable."""
+        wiki_tools.update_ledger("Goal", [
+            {"id": "T1", "description": "Task 1", "status": "blocked", "escalation_ts": "111.222"},
+        ])
+        wiki_tools.update_ledger("Goal", [
+            {"id": "T1", "description": "Task 1", "status": "pending"},
+        ])
+
+    def test_update_ledger_unpins_multiple_tasks_on_unblock(self, wiki_tools_with_slack):
+        """update_ledger unpins escalation for each task transitioning out of blocked."""
+        wiki_tools_with_slack.update_ledger("Goal", [
+            {"id": "T1", "description": "Task 1", "status": "blocked", "escalation_ts": "111.111"},
+            {"id": "T2", "description": "Task 2", "status": "blocked", "escalation_ts": "222.222"},
+        ])
+        wiki_tools_with_slack.update_ledger("Goal", [
+            {"id": "T1", "description": "Task 1", "status": "pending"},
+            {"id": "T2", "description": "Task 2", "status": "pending"},
+        ])
+        assert wiki_tools_with_slack._slack.unpin_message.call_count == 2
+        wiki_tools_with_slack._slack.unpin_message.assert_any_call("111.111")
+        wiki_tools_with_slack._slack.unpin_message.assert_any_call("222.222")
+
 
 class TestTaskLedgerStatusSetAt:
     def test_new_task_gets_status_set_at(self, wiki_tools):
@@ -582,7 +705,7 @@ class TestTaskLedgerStatusSetAt:
 
 class TestSpawnWorkerPmRetry:
     def test_activate_pm_called_once(self, tools, mock_tmux, registry):
-        """spawn_worker calls _activate_pm_via_sqlite exactly once (no retry loop)."""
+        """spawn_worker calls _activate_pm_via_sqlite exactly once; retry logic is inside that method."""
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
         _mock_grader_approve(tools)
         result = tools.spawn_worker(
@@ -613,6 +736,64 @@ class TestSpawnWorkerPmRetry:
         mock_tmux.kill_session.assert_called_with("ic-w1", ssh_host=None)
 
 
+class TestSpawnWorkerPmParams:
+    """Tests for pm_timeout and pm_max_retries parameter threading in spawn_worker."""
+
+    def test_passes_pm_timeout_to_activate_pm(self, tools, mock_tmux, registry):
+        """spawn_worker threads pm_timeout and pm_max_retries through to _activate_pm_via_sqlite."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        tools.spawn_worker(
+            worker_id="w1",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="Do work",
+            pm_timeout=600,
+            pm_max_retries=5,
+        )
+        tools._activate_pm_via_sqlite.assert_called_once_with(
+            "ic-w1", timeout=600, max_retries=5
+        )
+
+    def test_default_pm_params(self, tools, mock_tmux, registry):
+        """spawn_worker uses pm_timeout=300 and pm_max_retries=3 by default."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        tools.spawn_worker(
+            worker_id="w1",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="Do work",
+        )
+        tools._activate_pm_via_sqlite.assert_called_once_with(
+            "ic-w1", timeout=300, max_retries=3
+        )
+
+    def test_raises_on_zero_max_retries(self, tools):
+        """spawn_worker raises ValueError when pm_max_retries=0."""
+        _mock_grader_approve(tools)
+        with pytest.raises(ValueError, match="pm_max_retries must be >= 1"):
+            tools.spawn_worker(
+                worker_id="w1",
+                worker_type="claude-sonnet",
+                repo="/tmp/repo",
+                objective="Do work",
+                pm_max_retries=0,
+            )
+
+    def test_raises_on_negative_max_retries(self, tools):
+        """spawn_worker raises ValueError when pm_max_retries is negative."""
+        _mock_grader_approve(tools)
+        with pytest.raises(ValueError, match="pm_max_retries must be >= 1"):
+            tools.spawn_worker(
+                worker_id="w1",
+                worker_type="claude-sonnet",
+                repo="/tmp/repo",
+                objective="Do work",
+                pm_max_retries=-1,
+            )
+
+
 class TestSpawnWorkerEnvVar:
     def test_claude_worker_has_tron_worker_id(self, tools, mock_tmux):
         """Claude worker command includes IC_WORKER_ID env var."""
@@ -625,7 +806,7 @@ class TestSpawnWorkerEnvVar:
             objective="Do work",
         )
         cmd = mock_tmux.spawn_session.call_args[0][1]
-        assert cmd.startswith("export IC_ROLE=worker; export IC_WORKER_ID=test-1; ")
+        assert cmd.startswith("export IC_ROLE=worker; export IC_WORKER_ID=test-1; export ENABLE_STOP_REVIEW=0; ")
 
     def test_ollama_worker_has_tron_worker_id(self, tools, mock_tmux):
         """Ollama worker command includes IC_WORKER_ID env var."""
@@ -639,7 +820,7 @@ class TestSpawnWorkerEnvVar:
             model_name="qwen3:8b",
         )
         cmd = mock_tmux.spawn_session.call_args[0][1]
-        assert cmd.startswith("export IC_ROLE=worker; export IC_WORKER_ID=ollama-1; ")
+        assert cmd.startswith("export IC_ROLE=worker; export IC_WORKER_ID=ollama-1; export ENABLE_STOP_REVIEW=0; ")
 
 
 class TestKillWorker:
@@ -706,7 +887,7 @@ class TestPersistentGrader:
         assert tools._grader_ready is True
         mock_tmux.spawn_session.assert_called_once_with(
             "ic-grader",
-            "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'claude-opus-4' --dangerously-skip-permissions",
+            "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'opus[1m]' --dangerously-skip-permissions",
             cwd=tools._grader_home,
         )
 
@@ -1592,10 +1773,82 @@ class TestActivatePmViaSqlite:
         with patch("subprocess.run") as mock_run, \
              patch("ironclaude.orchestrator_mcp.sqlite3.connect", return_value=mock_conn):
             mock_run.return_value = self._mock_tmux_run(pid)
-            result = tools._activate_pm_via_sqlite("ic-w1", timeout=2, _claude_dir=claude_dir)
+            # max_retries=1 — single attempt; verifies finally-block closes connection
+            result = tools._activate_pm_via_sqlite("ic-w1", timeout=2, max_retries=1,
+                                                   _claude_dir=claude_dir)
         assert isinstance(result, str)
         assert "sqlite" in result.lower()
         mock_conn.close.assert_called_once()
+
+
+class TestActivatePmViaSqliteRetry:
+    """Tests for retry logic in _activate_pm_via_sqlite."""
+
+    def test_retries_on_sqlite_error(self, tools, mock_tmux):
+        """Retries up to max_retries times on sqlite errors, returns None on eventual success."""
+        call_count = 0
+
+        def side_effect(session_name, value, timeout, _claude_dir=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                return "sqlite error: database is locked"
+            return None
+
+        with patch.object(tools, '_set_pm_via_sqlite', side_effect=side_effect):
+            result = tools._activate_pm_via_sqlite("ic-w1", timeout=2, max_retries=3)
+        assert result is None
+        assert call_count == 3
+
+    def test_does_not_retry_session_id_timeout(self, tools, mock_tmux):
+        """Session ID timeout is not retryable — returns immediately after 1 attempt."""
+        with patch.object(tools, '_set_pm_via_sqlite',
+                          return_value="session ID file timeout after 2s") as mock_set:
+            result = tools._activate_pm_via_sqlite("ic-w1", timeout=2, max_retries=3)
+        assert result == "session ID file timeout after 2s"
+        assert mock_set.call_count == 1
+
+    def test_does_not_retry_tmux_failure(self, tools, mock_tmux):
+        """tmux failure is not retryable — returns immediately after 1 attempt."""
+        with patch.object(tools, '_set_pm_via_sqlite',
+                          return_value="tmux list-panes failed: no server running") as mock_set:
+            result = tools._activate_pm_via_sqlite("ic-w1", timeout=2, max_retries=3)
+        assert mock_set.call_count == 1
+        assert "tmux list-panes failed" in result
+
+    def test_exhausts_max_retries(self, tools, mock_tmux):
+        """Returns last error after exhausting all attempts."""
+        with patch.object(tools, '_set_pm_via_sqlite',
+                          return_value="sqlite error: database is locked") as mock_set:
+            result = tools._activate_pm_via_sqlite("ic-w1", timeout=2, max_retries=3)
+        assert result == "sqlite error: database is locked"
+        assert mock_set.call_count == 3
+
+    def test_single_attempt_on_max_retries_1(self, tools, mock_tmux):
+        """max_retries=1 means exactly one attempt."""
+        with patch.object(tools, '_set_pm_via_sqlite', return_value=None) as mock_set:
+            result = tools._activate_pm_via_sqlite("ic-w1", timeout=2, max_retries=1)
+        assert result is None
+        assert mock_set.call_count == 1
+
+    def test_logs_retry_warning(self, tools, mock_tmux, caplog):
+        """Logs a warning on each sqlite retry attempt."""
+        call_count = 0
+
+        def side_effect(session_name, value, timeout, _claude_dir=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                return "sqlite error: locked"
+            return None
+
+        with caplog.at_level(logging.WARNING):
+            with patch.object(tools, '_set_pm_via_sqlite', side_effect=side_effect):
+                tools._activate_pm_via_sqlite("ic-w1", timeout=2, max_retries=3)
+        assert any(
+            "retry" in r.message.lower() or "attempt" in r.message.lower()
+            for r in caplog.records
+        )
 
 
 class TestInitBrainSessionBackground:
@@ -1833,6 +2086,62 @@ class TestDirectiveLifecycle:
         assert confirmed[0]["interpretation"] == "interp2"
         pending = tools_with_slack.get_directives(status="pending_confirmation")
         assert len(pending) == 1
+
+    def test_get_directives_limit(self, tools_with_slack, db_conn):
+        """get_directives respects limit param."""
+        for i in range(5):
+            tools_with_slack.submit_directive(f"ts{i}", f"msg{i}", f"interp{i}")
+        result = tools_with_slack.get_directives(limit=3)
+        assert len(result) == 3
+
+    def test_get_directives_offset(self, tools_with_slack, db_conn):
+        """get_directives respects offset param."""
+        for i in range(5):
+            tools_with_slack.submit_directive(f"ts{i}", f"msg{i}", f"interp{i}")
+        all_results = tools_with_slack.get_directives()
+        offset_results = tools_with_slack.get_directives(offset=2)
+        assert len(offset_results) == 3
+        assert offset_results[0]["id"] == all_results[2]["id"]
+
+    def test_get_directives_after(self, tools_with_slack, db_conn):
+        """get_directives filters by after date."""
+        d = tools_with_slack.submit_directive("ts1", "msg1", "interp1")
+        db_conn.execute(
+            "UPDATE directives SET created_at='2026-01-01 00:00:00' WHERE id=?",
+            (d["id"],),
+        )
+        db_conn.commit()
+        result = tools_with_slack.get_directives(after="2026-05-01")
+        for directive in result:
+            assert directive["created_at"] >= "2026-05-01"
+
+    def test_get_directives_before(self, tools_with_slack, db_conn):
+        """get_directives filters by before date."""
+        d = tools_with_slack.submit_directive("ts1", "msg1", "interp1")
+        db_conn.execute(
+            "UPDATE directives SET created_at='2026-01-01 00:00:00' WHERE id=?",
+            (d["id"],),
+        )
+        db_conn.commit()
+        result = tools_with_slack.get_directives(before="2026-05-01")
+        assert len(result) >= 1
+        for directive in result:
+            assert directive["created_at"] < "2026-05-01"
+
+    def test_get_directives_search(self, tools_with_slack, db_conn):
+        """get_directives filters by text search across source_text and interpretation."""
+        tools_with_slack.submit_directive("ts1", "find me please", "interp1")
+        tools_with_slack.submit_directive("ts2", "other message", "find me here")
+        tools_with_slack.submit_directive("ts3", "no match", "no match either")
+        result = tools_with_slack.get_directives(search="find me")
+        assert len(result) == 2
+
+    def test_get_directives_combined_filters(self, tools_with_slack, db_conn):
+        """get_directives combines multiple filters correctly."""
+        for i in range(5):
+            tools_with_slack.submit_directive(f"ts{i}", f"msg{i}", f"interp{i}")
+        result = tools_with_slack.get_directives(limit=2, search="msg")
+        assert len(result) == 2
 
     def test_update_directive_status_valid(self, tools_with_slack, db_conn):
         """update_directive_status updates status and updated_at."""
@@ -2971,6 +3280,65 @@ class TestBatchSpawn:
         assert call_count[0] > 1
 
 
+class TestSpawnWorkersBatchPmTimeout:
+    """Tests for pm_timeout per-request deadline in spawn_workers."""
+
+    def test_pm_timeout_in_request_accepted(self, tools, mock_tmux):
+        """spawn_workers accepts pm_timeout in request dict without TypeError."""
+        tools._call_grader = MagicMock(return_value=[
+            {"worker_id": "w1", "grade": "F", "approved": False,
+             "feedback": "Bad", "recommended_model": "claude-sonnet"},
+        ])
+        results = tools.spawn_workers([
+            {"worker_id": "w1", "worker_type": "claude-sonnet", "repo": "/tmp/repo",
+             "objective": "Task 1", "pm_timeout": 600, "pm_max_retries": 5},
+        ])
+        assert len(results) == 1
+        assert "error" in results[0]
+
+    def test_deadline_uses_max_pm_timeout(self, tools, mock_tmux):
+        """spawn_workers deadline equals max per-request pm_timeout, not hardcoded 300."""
+        import ironclaude.orchestrator_mcp as orc_mcp
+
+        tools._call_grader = MagicMock(return_value=[
+            {"worker_id": "w1", "grade": "A", "approved": True,
+             "feedback": "Good", "recommended_model": "claude-sonnet"},
+        ])
+        mock_tmux.spawn_session.return_value = True
+
+        # Patch subprocess.run so tmux list-panes returns a valid PID,
+        # causing w1 to enter `pending` so the while-loop actually evaluates the deadline.
+        mock_run_result = MagicMock()
+        mock_run_result.stdout = "99999\n"
+
+        # Time sequence:
+        #   call 1 → 1000.0  (deadline = 1000 + max_pm_timeout)
+        #   call 2 → 1350.0  (loop condition: past hardcoded-300 deadline of 1300,
+        #                      but NOT past pm_timeout=600 deadline of 1600)
+        # With OLD code (hardcoded 300): deadline=1300, 1350>=1300 → exit → timeout error
+        # With NEW code (pm_timeout=600): deadline=1600, 1350<1600 → iterate → sleep
+        #   call 3 → 1700.0  (now past 1600 deadline → exit → timeout error)
+        time_calls = iter([1000.0, 1350.0, 1700.0])
+        sleep_calls = []
+
+        with patch("subprocess.run", return_value=mock_run_result):
+            with patch.object(orc_mcp, "time") as mock_time_mod:
+                mock_time_mod.time.side_effect = lambda: next(time_calls)
+                mock_time_mod.sleep.side_effect = lambda s: sleep_calls.append(s)
+                results = tools.spawn_workers([
+                    {"worker_id": "w1", "worker_type": "claude-sonnet", "repo": "/tmp/repo",
+                     "objective": "Task 1", "pm_timeout": 600},
+                ])
+
+        # With pm_timeout=600, loop ran at least one full iteration (slept once)
+        # before the deadline at t=1700 expired. With hardcoded 300, no sleep occurs.
+        assert len(sleep_calls) >= 1, (
+            "expected at least one sleep() — pm_timeout=600 deadline should not have "
+            "expired at t=1350; hardcoded 300s deadline would expire at t=1300"
+        )
+        assert results[0].get("error") == "PM activation timed out (batch)"
+
+
 class TestRestartDaemon:
     """Tests for restart_daemon MCP tool — detached watchdog pattern."""
 
@@ -3561,18 +3929,38 @@ def wiki_tools(registry, mock_tmux, tmp_path, db_conn):
     )
 
 
+@pytest.fixture
+def wiki_tools_with_slack(registry, mock_tmux, tmp_path, db_conn):
+    """OrchestratorTools with wiki-enabled config and mock Slack."""
+    ledger_path = str(tmp_path / "task-ledger.json")
+    brain_dir = tmp_path / "brain"
+    brain_dir.mkdir()
+    subprocess.run(["git", "init"], cwd=str(brain_dir), capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=str(brain_dir), capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(brain_dir), capture_output=True)
+    mock_slack = MagicMock()
+    mock_slack.unpin_message.return_value = True
+    return OrchestratorTools(
+        registry, mock_tmux, ledger_path, db_conn=db_conn,
+        slack_bot=mock_slack,
+        config={"brain_cwd": str(brain_dir)},
+    )
+
+
 class TestWikiTools:
     """Wiki tool business logic: write, delete, query, log."""
 
+    VALID_CONTENT = "A" * 60
+
     def test_wiki_write_creates_page(self, wiki_tools, tmp_path):
         brain_dir = tmp_path / "brain"
-        result = wiki_tools.wiki_write("test-page", "Test Page", "Some content here.")
+        result = wiki_tools.wiki_write("test-page", "Test Page", self.VALID_CONTENT)
         page_path = brain_dir / "wiki" / "test-page.md"
         assert page_path.exists()
         assert "test-page.md" in result
 
     def test_wiki_write_frontmatter(self, wiki_tools, tmp_path):
-        wiki_tools.wiki_write("test-page", "Test Page", "Content.")
+        wiki_tools.wiki_write("test-page", "Test Page", self.VALID_CONTENT)
         page_path = tmp_path / "brain" / "wiki" / "test-page.md"
         content = page_path.read_text()
         assert content.startswith("---\n")
@@ -3580,24 +3968,24 @@ class TestWikiTools:
         assert "updated:" in content
 
     def test_wiki_write_rebuilds_index(self, wiki_tools, tmp_path):
-        wiki_tools.wiki_write("alpha", "Alpha Page", "Alpha content.")
-        wiki_tools.wiki_write("beta", "Beta Page", "Beta content.")
+        wiki_tools.wiki_write("alpha", "Alpha Page", self.VALID_CONTENT)
+        wiki_tools.wiki_write("beta", "Beta Page", self.VALID_CONTENT)
         index_path = tmp_path / "brain" / "wiki" / "index.md"
         index_content = index_path.read_text()
         assert "Alpha Page" in index_content
         assert "Beta Page" in index_content
 
     def test_wiki_write_appends_log(self, wiki_tools, tmp_path):
-        wiki_tools.wiki_write("test-page", "Test Page", "Content.")
+        wiki_tools.wiki_write("test-page", "Test Page", self.VALID_CONTENT)
         log_path = tmp_path / "brain" / "wiki" / "log.md"
         log_content = log_path.read_text()
         assert "Created test-page.md" in log_content
 
     def test_wiki_write_update_existing(self, wiki_tools, tmp_path):
-        wiki_tools.wiki_write("test-page", "Test Page", "Original.")
-        wiki_tools.wiki_write("test-page", "Test Page", "Updated.")
+        wiki_tools.wiki_write("test-page", "Test Page", self.VALID_CONTENT)
+        wiki_tools.wiki_write("test-page", "Test Page", self.VALID_CONTENT)
         page_path = tmp_path / "brain" / "wiki" / "test-page.md"
-        assert "Updated." in page_path.read_text()
+        assert self.VALID_CONTENT in page_path.read_text()
         log_path = tmp_path / "brain" / "wiki" / "log.md"
         log_content = log_path.read_text()
         assert "Created test-page.md" in log_content
@@ -3606,25 +3994,25 @@ class TestWikiTools:
     def test_wiki_write_creates_wiki_dir(self, wiki_tools, tmp_path):
         wiki_dir = tmp_path / "brain" / "wiki"
         assert not wiki_dir.exists()
-        wiki_tools.wiki_write("first", "First", "Content.")
+        wiki_tools.wiki_write("first", "First", self.VALID_CONTENT)
         assert wiki_dir.exists()
 
     def test_wiki_delete_removes_page(self, wiki_tools, tmp_path):
-        wiki_tools.wiki_write("doomed", "Doomed Page", "Content.")
+        wiki_tools.wiki_write("doomed", "Doomed Page", self.VALID_CONTENT)
         result = wiki_tools.wiki_delete("doomed")
         assert "Deleted" in result
         assert not (tmp_path / "brain" / "wiki" / "doomed.md").exists()
 
     def test_wiki_delete_updates_index(self, wiki_tools, tmp_path):
-        wiki_tools.wiki_write("keep", "Keep", "Content.")
-        wiki_tools.wiki_write("remove", "Remove", "Content.")
+        wiki_tools.wiki_write("keep", "Keep", self.VALID_CONTENT)
+        wiki_tools.wiki_write("remove", "Remove", self.VALID_CONTENT)
         wiki_tools.wiki_delete("remove")
         index_content = (tmp_path / "brain" / "wiki" / "index.md").read_text()
         assert "Keep" in index_content
         assert "Remove" not in index_content
 
     def test_wiki_delete_appends_log(self, wiki_tools, tmp_path):
-        wiki_tools.wiki_write("doomed", "Doomed", "Content.")
+        wiki_tools.wiki_write("doomed", "Doomed", self.VALID_CONTENT)
         wiki_tools.wiki_delete("doomed")
         log_content = (tmp_path / "brain" / "wiki" / "log.md").read_text()
         assert "Deleted doomed.md" in log_content
@@ -3634,7 +4022,7 @@ class TestWikiTools:
         assert "not found" in result.lower()
 
     def test_wiki_query_matches_index(self, wiki_tools):
-        wiki_tools.wiki_write("grader-arch", "Grader Architecture", "How the grader evaluates worker output.")
+        wiki_tools.wiki_write("grader-arch", "Grader Architecture", self.VALID_CONTENT)
         results = json.loads(wiki_tools.wiki_query("grader"))
         assert len(results) >= 1
         assert results[0]["title"] == "Grader Architecture"
@@ -3657,7 +4045,7 @@ class TestWikiTools:
         assert results == []
 
     def test_wiki_query_no_match(self, wiki_tools):
-        wiki_tools.wiki_write("alpha", "Alpha", "Content about alpha.")
+        wiki_tools.wiki_write("alpha", "Alpha", self.VALID_CONTENT)
         results = json.loads(wiki_tools.wiki_query("zzzznotfound"))
         assert results == []
 
@@ -3704,7 +4092,7 @@ class TestWikiTools:
         assert len(results) == 5
 
     def test_wiki_log_appends_entry(self, wiki_tools, tmp_path):
-        wiki_tools.wiki_write("setup", "Setup", "Content.")
+        wiki_tools.wiki_write("setup", "Setup", self.VALID_CONTENT)
         wiki_tools.wiki_log("Periodic sweep: created 3 pages")
         log_content = (tmp_path / "brain" / "wiki" / "log.md").read_text()
         assert "Periodic sweep: created 3 pages" in log_content
@@ -3718,12 +4106,12 @@ class TestWikiTools:
         assert "First entry" in log_path.read_text()
 
     def test_rebuild_index_derived_state(self, wiki_tools, tmp_path):
-        wiki_tools.wiki_write("page-a", "Page A", "Content A.")
-        wiki_tools.wiki_write("page-b", "Page B", "Content B.")
+        wiki_tools.wiki_write("page-a", "Page A", self.VALID_CONTENT)
+        wiki_tools.wiki_write("page-b", "Page B", self.VALID_CONTENT)
         index_path = tmp_path / "brain" / "wiki" / "index.md"
         index_path.unlink()
         assert not index_path.exists()
-        wiki_tools.wiki_write("page-c", "Page C", "Content C.")
+        wiki_tools.wiki_write("page-c", "Page C", self.VALID_CONTENT)
         index_content = index_path.read_text()
         assert "Page A" in index_content
         assert "Page B" in index_content
@@ -3735,12 +4123,12 @@ class TestWikiTools:
         bad_path = wiki_dir / "test.md"
         bad_path.mkdir()
         with pytest.raises(OSError):
-            wiki_tools.wiki_write("test", "Test", "Content.")
+            wiki_tools.wiki_write("test", "Test", self.VALID_CONTENT)
 
     def test_wiki_write_creates_git_commit(self, wiki_tools, tmp_path):
         """wiki_write commits the new page to git."""
         brain_dir = tmp_path / "brain"
-        wiki_tools.wiki_write("test-page", "Test Page", "Some content.")
+        wiki_tools.wiki_write("test-page", "Test Page", self.VALID_CONTENT)
         result = subprocess.run(
             ["git", "log", "--oneline"],
             cwd=str(brain_dir),
@@ -3752,8 +4140,8 @@ class TestWikiTools:
     def test_wiki_write_update_commits_to_git(self, wiki_tools, tmp_path):
         """Second wiki_write to same page commits with 'updated'."""
         brain_dir = tmp_path / "brain"
-        wiki_tools.wiki_write("test-page", "Test Page", "Version 1.")
-        wiki_tools.wiki_write("test-page", "Test Page", "Version 2.")
+        wiki_tools.wiki_write("test-page", "Test Page", self.VALID_CONTENT)
+        wiki_tools.wiki_write("test-page", "Test Page", self.VALID_CONTENT)
         result = subprocess.run(
             ["git", "log", "--oneline"],
             cwd=str(brain_dir),
@@ -3765,7 +4153,7 @@ class TestWikiTools:
     def test_wiki_delete_commits_to_git(self, wiki_tools, tmp_path):
         """wiki_delete commits the deletion to git."""
         brain_dir = tmp_path / "brain"
-        wiki_tools.wiki_write("test-page", "Test Page", "Content.")
+        wiki_tools.wiki_write("test-page", "Test Page", self.VALID_CONTENT)
         wiki_tools.wiki_delete("test-page")
         result = subprocess.run(
             ["git", "log", "--oneline"],
@@ -3780,6 +4168,79 @@ class TestWikiTools:
         result = wiki_tools.wiki_write("../etc/passwd", "Title", "Content")
         assert result == "Path traversal rejected: ../etc/passwd"
         assert not (tmp_path / "etc" / "passwd.md").exists()
+
+    def test_wiki_write_rejects_directive_prefix(self, wiki_tools, tmp_path):
+        """wiki_write rejects page names with directive-number prefixes (d<N>)."""
+        result = wiki_tools.wiki_write("d807-state-update", "Title", "Content")
+        assert "directive-number" in result
+        assert not (tmp_path / "brain" / "wiki" / "d807-state-update.md").exists()
+
+    def test_wiki_write_rejects_bare_directive_number(self, wiki_tools, tmp_path):
+        """wiki_write rejects bare directive numbers like d1."""
+        result = wiki_tools.wiki_write("d1", "Title", "Content")
+        assert "directive-number" in result
+        assert not (tmp_path / "brain" / "wiki" / "d1.md").exists()
+
+    def test_wiki_write_rejects_directive_suffix(self, wiki_tools, tmp_path):
+        """wiki_write rejects page names with directive-number suffixes (-d<N>)."""
+        result = wiki_tools.wiki_write("sqlite-contention-fix-d681", "Title", self.VALID_CONTENT)
+        assert "directive-number" in result
+        assert not (tmp_path / "brain" / "wiki" / "sqlite-contention-fix-d681.md").exists()
+
+    def test_wiki_write_rejects_directive_suffix_short(self, wiki_tools, tmp_path):
+        """wiki_write rejects page names ending in short directive suffixes like -d12."""
+        result = wiki_tools.wiki_write("state-d12", "Title", self.VALID_CONTENT)
+        assert "directive-number" in result
+        assert not (tmp_path / "brain" / "wiki" / "state-d12.md").exists()
+
+    def test_wiki_write_rejects_date_stamped_name(self, wiki_tools, tmp_path):
+        """wiki_write rejects page names containing YYYY-MM-DD date patterns."""
+        result = wiki_tools.wiki_write("2026-05-14-deployment", "Title", "Content")
+        assert "date-stamped" in result
+        assert not (tmp_path / "brain" / "wiki" / "2026-05-14-deployment.md").exists()
+
+    def test_wiki_write_rejects_year_month_pattern(self, wiki_tools, tmp_path):
+        """wiki_write rejects page names with YYYY-MM date patterns (no full date required)."""
+        result = wiki_tools.wiki_write("ideaservice-adversarial-review-2026-05", "Title", self.VALID_CONTENT)
+        assert "date-stamped" in result
+        assert not (tmp_path / "brain" / "wiki" / "ideaservice-adversarial-review-2026-05.md").exists()
+
+    def test_wiki_write_rejects_month_year_pattern(self, wiki_tools, tmp_path):
+        """wiki_write rejects page names with month-name+year patterns like may2026."""
+        result = wiki_tools.wiki_write("ironclaude-releases-may2026", "Title", self.VALID_CONTENT)
+        assert "date-stamped" in result
+        assert not (tmp_path / "brain" / "wiki" / "ironclaude-releases-may2026.md").exists()
+
+    def test_wiki_write_accepts_concept_names(self, wiki_tools):
+        """wiki_write accepts concept-focused kebab-case names."""
+        for page in ["pf2e-pipeline-status", "worker-lifecycle", "operator-preferences"]:
+            result = wiki_tools.wiki_write(page, "Title", self.VALID_CONTENT)
+            assert not result.startswith("Invalid page name"), f"Page {page} was incorrectly rejected: {result}"
+            assert page in result, f"Expected page path in result for {page}, got: {result}"
+
+    def test_wiki_write_rejects_empty_content(self, wiki_tools, tmp_path):
+        """wiki_write rejects empty content strings."""
+        result = wiki_tools.wiki_write("valid-page", "Title", "")
+        assert "content" in result.lower()
+        assert not (tmp_path / "brain" / "wiki" / "valid-page.md").exists()
+
+    def test_wiki_write_rejects_whitespace_content(self, wiki_tools, tmp_path):
+        """wiki_write rejects whitespace-only content."""
+        result = wiki_tools.wiki_write("valid-page", "Title", "   \n\t  ")
+        assert "content" in result.lower()
+        assert not (tmp_path / "brain" / "wiki" / "valid-page.md").exists()
+
+    def test_wiki_write_rejects_short_content(self, wiki_tools, tmp_path):
+        """wiki_write rejects content under 50 characters after stripping whitespace."""
+        result = wiki_tools.wiki_write("valid-page", "Title", "x" * 49)
+        assert "content" in result.lower()
+        assert not (tmp_path / "brain" / "wiki" / "valid-page.md").exists()
+
+    def test_wiki_write_accepts_minimum_content(self, wiki_tools, tmp_path):
+        """wiki_write accepts content of exactly 50 characters after stripping whitespace."""
+        result = wiki_tools.wiki_write("valid-page", "Title", "x" * 50)
+        assert "valid-page" in result
+        assert (tmp_path / "brain" / "wiki" / "valid-page.md").exists()
 
     def test_wiki_delete_rejects_path_traversal(self, wiki_tools, tmp_path):
         """wiki_delete rejects page names that escape the wiki directory."""
@@ -3953,6 +4414,206 @@ class TestGetProcessInfo:
         assert result["processes"][0]["rss_gb"] == 9.6
 
 
+class TestGetOllamaVram:
+    """Tests for _get_ollama_vram() Ollama VRAM query helper."""
+
+    @pytest.fixture
+    def tools(self, registry, mock_tmux, tmp_path, db_conn):
+        """Override to keep real _get_ollama_vram for testing."""
+        ledger_path = str(tmp_path / "task-ledger.json")
+        return OrchestratorTools(registry, mock_tmux, ledger_path, db_conn=db_conn)
+
+    def test_returns_vram_sum_and_model_names(self, tools):
+        """Loaded models return total VRAM and formatted names."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "models": [
+                {"name": "gemma4:31b", "size": int(17.2 * 1024**3)},
+                {"name": "qwen3.5:9b", "size": int(6.6 * 1024**3)},
+            ]
+        }
+        with patch("ironclaude.orchestrator_mcp.requests.get", return_value=mock_resp):
+            vram, names = tools._get_ollama_vram()
+        assert vram == 23.8
+        assert len(names) == 2
+        assert "gemma4:31b (17.2GB)" in names
+        assert "qwen3.5:9b (6.6GB)" in names
+
+    def test_returns_zero_when_no_models_loaded(self, tools):
+        """Empty models list returns (0.0, [])."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"models": []}
+        with patch("ironclaude.orchestrator_mcp.requests.get", return_value=mock_resp):
+            vram, names = tools._get_ollama_vram()
+        assert vram == 0.0
+        assert names == []
+
+    def test_returns_zero_when_ollama_unreachable(self, tools):
+        """ConnectionError returns (0.0, []) — no false-positive blocking."""
+        with patch("ironclaude.orchestrator_mcp.requests.get", side_effect=ConnectionError):
+            vram, names = tools._get_ollama_vram()
+        assert vram == 0.0
+        assert names == []
+
+    def test_returns_zero_on_timeout(self, tools):
+        """Timeout returns (0.0, []) — safe default."""
+        import requests as req_lib
+        with patch("ironclaude.orchestrator_mcp.requests.get", side_effect=req_lib.Timeout):
+            vram, names = tools._get_ollama_vram()
+        assert vram == 0.0
+        assert names == []
+
+    def test_single_model_returns_correct_vram(self, tools):
+        """Single loaded model returns its size."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "models": [{"name": "gemma4:31b", "size": int(17.0 * 1024**3)}]
+        }
+        with patch("ironclaude.orchestrator_mcp.requests.get", return_value=mock_resp):
+            vram, names = tools._get_ollama_vram()
+        assert vram == 17.0
+        assert names == ["gemma4:31b (17.0GB)"]
+
+
+class TestCheckSpawnPreconditions:
+    """Tests for _check_spawn_preconditions() resource gating."""
+
+    def test_rejects_when_worker_count_exceeded(self, tools, registry):
+        """Existing behavior: reject when active workers >= max."""
+        tools._config = {"max_concurrent_workers": 2}
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp/r")
+        registry.register_worker("w2", "claude-sonnet", "ic-w2", repo="/tmp/r")
+        result = tools._check_spawn_preconditions()
+        assert result is not None
+        assert "Spawn rejected" in result["error"]
+        assert result["active_workers"] == 2
+
+    def test_rejects_when_ollama_vram_exceeds_threshold(self, tools):
+        """NEW: hard-block when Ollama VRAM > threshold."""
+        tools._config = {
+            "max_concurrent_workers": 6,
+            "ollama_vram_block_threshold_gb": 8.0,
+            "min_available_memory_gb": 8.0,
+            "ollama_memory_safety_margin_gb": 4.0,
+        }
+        tools._get_ollama_vram = MagicMock(return_value=(17.2, ["gemma4:31b (17.2GB)"]))
+        result = tools._check_spawn_preconditions()
+        assert result is not None
+        assert "Ollama VRAM too high" in result["error"]
+        assert result["ollama_vram_gb"] == 17.2
+        assert result["threshold_gb"] == 8.0
+        assert "gemma4:31b" in result["loaded_models"][0]
+
+    def test_passes_when_ollama_vram_below_threshold(self, tools):
+        """Ollama loaded but under threshold — allow spawn."""
+        tools._config = {
+            "max_concurrent_workers": 6,
+            "ollama_vram_block_threshold_gb": 8.0,
+            "min_available_memory_gb": 8.0,
+            "ollama_memory_safety_margin_gb": 4.0,
+        }
+        tools._get_ollama_vram = MagicMock(return_value=(4.0, ["qwen3.5:4b (4.0GB)"]))
+        mock_mem = MagicMock()
+        mock_mem.total = int(48 * 1024**3)
+        mock_mem.available = int(30 * 1024**3)
+        with patch("ironclaude.orchestrator_mcp.psutil.virtual_memory", return_value=mock_mem):
+            result = tools._check_spawn_preconditions()
+        assert result is None
+
+    def test_dynamic_memory_threshold_with_ollama(self, tools):
+        """When Ollama loaded, memory threshold = base + margin."""
+        tools._config = {
+            "max_concurrent_workers": 6,
+            "ollama_vram_block_threshold_gb": 20.0,
+            "min_available_memory_gb": 8.0,
+            "ollama_memory_safety_margin_gb": 4.0,
+        }
+        tools._get_ollama_vram = MagicMock(return_value=(6.0, ["qwen3.5:9b (6.0GB)"]))
+        mock_mem = MagicMock()
+        mock_mem.total = int(48 * 1024**3)
+        mock_mem.available = int(10 * 1024**3)  # 10GB < 12GB (8+4)
+        with patch("ironclaude.orchestrator_mcp.psutil.virtual_memory", return_value=mock_mem):
+            result = tools._check_spawn_preconditions()
+        assert result is not None
+        assert "system memory too low" in result["error"]
+        assert result["threshold_gb"] == 12.0
+        assert result["base_threshold_gb"] == 8.0
+        assert result["ollama_margin_gb"] == 4.0
+
+    def test_no_ollama_margin_when_no_models_loaded(self, tools):
+        """Without Ollama, memory threshold = base only."""
+        tools._config = {
+            "max_concurrent_workers": 6,
+            "ollama_vram_block_threshold_gb": 8.0,
+            "min_available_memory_gb": 8.0,
+            "ollama_memory_safety_margin_gb": 4.0,
+        }
+        tools._get_ollama_vram = MagicMock(return_value=(0.0, []))
+        mock_mem = MagicMock()
+        mock_mem.total = int(48 * 1024**3)
+        mock_mem.available = int(10 * 1024**3)  # 10GB > 8GB base
+        with patch("ironclaude.orchestrator_mcp.psutil.virtual_memory", return_value=mock_mem):
+            result = tools._check_spawn_preconditions()
+        assert result is None
+
+    def test_ollama_unreachable_allows_spawn(self, tools):
+        """When Ollama API fails, _get_ollama_vram returns (0, []) — spawn allowed."""
+        tools._config = {
+            "max_concurrent_workers": 6,
+            "ollama_vram_block_threshold_gb": 8.0,
+            "min_available_memory_gb": 8.0,
+            "ollama_memory_safety_margin_gb": 4.0,
+        }
+        tools._get_ollama_vram = MagicMock(return_value=(0.0, []))
+        mock_mem = MagicMock()
+        mock_mem.total = int(48 * 1024**3)
+        mock_mem.available = int(20 * 1024**3)
+        with patch("ironclaude.orchestrator_mcp.psutil.virtual_memory", return_value=mock_mem):
+            result = tools._check_spawn_preconditions()
+        assert result is None
+
+    def test_logs_rejection_at_info_level(self, tools, caplog):
+        """Rejections are logged at INFO with decision details."""
+        tools._config = {
+            "max_concurrent_workers": 6,
+            "ollama_vram_block_threshold_gb": 8.0,
+            "min_available_memory_gb": 8.0,
+            "ollama_memory_safety_margin_gb": 4.0,
+        }
+        tools._get_ollama_vram = MagicMock(return_value=(17.2, ["gemma4:31b (17.2GB)"]))
+        with caplog.at_level(logging.INFO, logger="ironclaude.orchestrator_mcp"):
+            tools._check_spawn_preconditions()
+        assert "Spawn rejected" in caplog.text
+        assert "17.2" in caplog.text
+
+    def test_logs_pass_at_info_level(self, tools, caplog):
+        """Successful precondition checks are also logged at INFO."""
+        tools._config = {
+            "max_concurrent_workers": 6,
+            "ollama_vram_block_threshold_gb": 20.0,
+            "min_available_memory_gb": 8.0,
+            "ollama_memory_safety_margin_gb": 4.0,
+        }
+        tools._get_ollama_vram = MagicMock(return_value=(0.0, []))
+        mock_mem = MagicMock()
+        mock_mem.total = int(48 * 1024**3)
+        mock_mem.available = int(30 * 1024**3)
+        with patch("ironclaude.orchestrator_mcp.psutil.virtual_memory", return_value=mock_mem):
+            with caplog.at_level(logging.INFO, logger="ironclaude.orchestrator_mcp"):
+                result = tools._check_spawn_preconditions()
+        assert result is None
+        assert "preconditions passed" in caplog.text
+
+    def test_batch_size_respected(self, tools, registry):
+        """Batch spawn checks active + batch_size against max."""
+        tools._config = {"max_concurrent_workers": 6}
+        for i in range(4):
+            registry.register_worker(f"w{i}", "claude-sonnet", f"ic-w{i}", repo="/tmp/r")
+        result = tools._check_spawn_preconditions(batch_size=3)
+        assert result is not None
+        assert result["active_workers"] == 4
+
+
 class TestActivatePmRemote:
     def test_rejects_non_uuid_session_id(self, tools, mock_tmux):
         """_activate_pm_remote returns error if session UUID fails UUID format check."""
@@ -4058,3 +4719,164 @@ class TestPinUnpinMessage:
         assert tools._slack is None
         result = tools.unpin_message("1700000001.000001")
         assert "Error" in result
+
+
+class TestGetOllamaInventory:
+    def test_delegates_to_inventory(self, tools):
+        """get_ollama_inventory delegates to OllamaInventory.get_inventory."""
+        mock_inv = MagicMock(spec=OllamaInventory)
+        mock_inv.get_inventory.return_value = {
+            "ollama_reachable": True,
+            "models": [{"name": "test:7b", "capability_tier": "moderate"}],
+        }
+        tools._ollama_inventory = mock_inv
+
+        result = tools.get_ollama_inventory()
+
+        mock_inv.get_inventory.assert_called_once_with(False)
+        assert result["ollama_reachable"] is True
+        assert len(result["models"]) == 1
+
+    def test_force_refresh_passed_through(self, tools):
+        """force_refresh parameter is forwarded to OllamaInventory."""
+        mock_inv = MagicMock(spec=OllamaInventory)
+        mock_inv.get_inventory.return_value = {"ollama_reachable": True, "models": []}
+        tools._ollama_inventory = mock_inv
+
+        tools.get_ollama_inventory(force_refresh=True)
+
+        mock_inv.get_inventory.assert_called_once_with(True)
+
+    def test_returns_error_when_not_configured(self, tools):
+        """Returns error dict when ollama_inventory is None."""
+        tools._ollama_inventory = None
+        result = tools.get_ollama_inventory()
+        assert "error" in result
+
+
+class TestSpawnPreconditions:
+    def test_spawn_worker_rejected_at_max_workers(self, tools, registry, mock_tmux):
+        """spawn_worker returns error when max_concurrent_workers reached."""
+        tools._config = {"max_concurrent_workers": 2, "min_available_memory_gb": 1.0}
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        registry.register_worker("existing1", "claude-sonnet", "ic-existing1", repo="/tmp")
+        registry.register_worker("existing2", "claude-sonnet", "ic-existing2", repo="/tmp")
+        result = tools.spawn_worker(
+            worker_id="w3",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="Should be rejected",
+        )
+        assert isinstance(result, dict)
+        assert "error" in result
+        assert "max_concurrent_workers" in result["error"]
+        assert result["active_workers"] == 2
+        assert result["max"] == 2
+        tools._call_grader.assert_not_called()
+
+    def test_spawn_worker_rejected_low_memory(self, tools, registry, mock_tmux):
+        """spawn_worker returns error when available memory below threshold."""
+        tools._config = {"max_concurrent_workers": 6, "min_available_memory_gb": 8.0}
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        mock_mem = MagicMock()
+        mock_mem.total = 48 * (1024**3)
+        mock_mem.available = 3 * (1024**3)
+        with patch("psutil.virtual_memory", return_value=mock_mem):
+            result = tools.spawn_worker(
+                worker_id="w1",
+                worker_type="claude-sonnet",
+                repo="/tmp/repo",
+                objective="Should be rejected",
+            )
+        assert isinstance(result, dict)
+        assert "error" in result
+        assert "memory" in result["error"].lower()
+        assert result["available_gb"] == 3.0
+        assert result["threshold_gb"] == 8.0
+        tools._call_grader.assert_not_called()
+
+    def test_spawn_worker_passes_preconditions(self, tools, registry, mock_tmux):
+        """spawn_worker proceeds to grader when preconditions pass."""
+        tools._config = {"max_concurrent_workers": 6, "min_available_memory_gb": 8.0}
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        mock_mem = MagicMock()
+        mock_mem.total = 48 * (1024**3)
+        mock_mem.available = 20 * (1024**3)
+        with patch("psutil.virtual_memory", return_value=mock_mem):
+            result = tools.spawn_worker(
+                worker_id="w1",
+                worker_type="claude-sonnet",
+                repo="/tmp/repo",
+                objective="Should proceed",
+            )
+        assert isinstance(result, str)
+        assert "w1" in result
+        tools._call_grader.assert_called_once()
+
+    def test_spawn_workers_batch_rejected_exceeds_limit(self, tools, registry, mock_tmux):
+        """spawn_workers rejects entire batch when current + batch > max."""
+        tools._config = {"max_concurrent_workers": 6, "min_available_memory_gb": 1.0}
+        _mock_grader_approve(tools)
+        for i in range(4):
+            registry.register_worker(f"existing{i}", "claude-sonnet", f"ic-existing{i}", repo="/tmp")
+        requests = [
+            {"worker_id": "b1", "worker_type": "claude-sonnet", "repo": "/tmp/repo", "objective": "Task 1"},
+            {"worker_id": "b2", "worker_type": "claude-sonnet", "repo": "/tmp/repo", "objective": "Task 2"},
+            {"worker_id": "b3", "worker_type": "claude-sonnet", "repo": "/tmp/repo", "objective": "Task 3"},
+        ]
+        result = tools.spawn_workers(requests)
+        assert isinstance(result, dict)
+        assert "error" in result
+        assert "max_concurrent_workers" in result["error"]
+
+    def test_spawn_workers_batch_passes(self, tools, registry, mock_tmux):
+        """spawn_workers proceeds when current + batch <= max."""
+        tools._config = {"max_concurrent_workers": 6, "min_available_memory_gb": 1.0}
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        registry.register_worker("existing1", "claude-sonnet", "ic-existing1", repo="/tmp")
+        registry.register_worker("existing2", "claude-sonnet", "ic-existing2", repo="/tmp")
+        mock_mem = MagicMock()
+        mock_mem.total = 48 * (1024**3)
+        mock_mem.available = 20 * (1024**3)
+        requests = [
+            {"worker_id": "b1", "worker_type": "claude-sonnet", "repo": "/tmp/repo", "objective": "Task 1"},
+            {"worker_id": "b2", "worker_type": "claude-sonnet", "repo": "/tmp/repo", "objective": "Task 2"},
+        ]
+        with patch("psutil.virtual_memory", return_value=mock_mem):
+            result = tools.spawn_workers(requests)
+        assert isinstance(result, list)
+
+
+class TestOllamaConflictWarning:
+    def test_spawn_worker_blocked_by_ollama_vram(self, tools, registry, mock_tmux):
+        """spawn_worker rejects pre-spawn when Ollama VRAM exceeds threshold."""
+        tools._config = {
+            "max_concurrent_workers": 6,
+            "min_available_memory_gb": 1.0,
+            "ollama_vram_block_threshold_gb": 8.0,
+            "ollama_memory_safety_margin_gb": 4.0,
+        }
+        tools._get_ollama_vram = MagicMock(return_value=(17.4, ["gemma4:31b (17.4GB)"]))
+        result = tools.spawn_worker(
+            worker_id="w1",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="Do something",
+        )
+        assert isinstance(result, dict)
+        assert "Ollama VRAM too high" in result["error"]
+        assert "gemma4:31b" in result["loaded_models"][0]
+
+
+class TestConfigDefaults:
+    def test_config_defaults_include_spawn_safeguard_keys(self):
+        """DEFAULTS includes max_concurrent_workers and min_available_memory_gb."""
+        from ironclaude.config import DEFAULTS
+        assert "max_concurrent_workers" in DEFAULTS
+        assert DEFAULTS["max_concurrent_workers"] == 6
+        assert "min_available_memory_gb" in DEFAULTS
+        assert DEFAULTS["min_available_memory_gb"] == 8.0

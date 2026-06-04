@@ -15,16 +15,6 @@ if ! source "$SCRIPT_DIR/hook-logger.sh" 2>/dev/null; then
 fi
 run_hook "EPISODIC-MEMORY-SYNC"
 
-# Professional mode gate — read from SQLite (not flag file)
-INPUT=$(cat)
-init_session_id
-PROF_MODE=$(db_read_or_fail "EPISODIC-MEMORY-SYNC" \
-  "SELECT professional_mode FROM sessions WHERE terminal_session='$(echo "$SESSION_TAG" | sed "s/'/''/g")';")
-if [ "$PROF_MODE" != "on" ]; then
-    log_hook "EPISODIC-MEMORY-SYNC" "Disabled" "professional mode ${PROF_MODE}"
-    exit 0
-fi
-
 # Check if already running
 if [ -f "$PID_FILE" ]; then
   OLD_PID=$(cat "$PID_FILE")

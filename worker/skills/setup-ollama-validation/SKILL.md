@@ -102,7 +102,8 @@ ollama list
 Analyze the output and recommend the fastest model that's at least Haiku-quality.
 
 Known good models (in order of preference for this task):
-- qwen3.5:9b (recommended for scan pipeline, fast on GPU)
+- gemma4:e4b (recommended — MoE 4.5B active, 9.6 GB, outperforms qwen3.5:9b on structured validation)
+- qwen3.5:9b (reliable, fast on GPU)
 - qwen3:8b (reliable JSON output, fast on GPU)
 - llama3.2:3b (fast, good quality)
 - gemma2:2b (good quality)
@@ -115,7 +116,8 @@ If no suitable models found, display:
 ⚠️ No suitable models found for hook validation.
 
 Recommended models:
-  • ollama pull qwen3:8b       (5.2 GB, recommended, reliable JSON)
+  • ollama pull gemma4:e4b     (9.6 GB, recommended, best validation quality)
+  • ollama pull qwen3:8b       (5.2 GB, reliable JSON)
   • ollama pull llama3.2:3b    (2.0 GB, fast, good quality)
   • ollama pull gemma2:2b      (1.6 GB, lightweight, good quality)
 

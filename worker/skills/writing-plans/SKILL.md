@@ -325,6 +325,8 @@ Three execution options:
    - Maximum control, no subagent drift possible
 
 Which approach? (1/2/3)
+
+SUGGESTED_NEXT_ACTION: Skill(skill="ironclaude:executing-plans", args="docs/plans/YYYY-MM-DD-<feature-name>.plan.json --mode=inline")
 ```
 
 (Move the "(Recommended)" label to whichever option is recommended for this specific plan.)

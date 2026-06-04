@@ -462,6 +462,15 @@ When a task cannot proceed, mark it as `"blocked"` in the ledger with a reason i
 
 The sweep skips blocked tasks. The Brain does NOT spawn workers for blocked tasks.
 
+**Pin requirement:** When transitioning any task to `"blocked"` status, you MUST post and pin a decision-format escalation message. Follow this sequence:
+
+1. Compose a decision-format escalation message (see [Decision Format](#decision-format) below)
+2. Call `post_message(content)` → capture the returned `ts`
+3. Call `pin_message(ts)` → message is now pinned in the brain channel
+4. Call `update_ledger(...)` with `status: "blocked"` and `escalation_ts: <ts captured in step 2>`
+
+{OPERATOR_NAME} will not see this blocker unless a pinned message exists. The PostToolUse hook on `update_ledger` will remind you if you skip the pin step.
+
 **When to block:**
 - Dependency failed and can't proceed
 - Resource constraint prevents execution
@@ -469,6 +478,33 @@ The sweep skips blocked tasks. The Brain does NOT spawn workers for blocked task
 - External dependency not yet available
 
 **When to unblock:** When the blocking condition resolves, change status back to `"pending"`. The next sweep will pick it up.
+
+#### Decision Format
+
+Every blocked-task escalation message posted to Slack MUST follow this template. No ad-hoc prose — use the structure:
+
+```
+[BLOCKED] Task <ID>: <Task description>
+
+**Problem:** <1–2 sentences stating what is blocked and why>
+
+**Options:**
+1. **<Option A>** — <description>
+   - Pro: <benefit>
+   - Con: <drawback>
+2. **<Option B>** — <description>
+   - Pro: <benefit>
+   - Con: <drawback>
+(2–4 options total)
+
+**Recommendation:** Option <N> — <reasoning tied to known project priorities>
+
+**Prediction:** {OPERATOR_NAME} will likely choose Option <N> because <reasoning from episodic memory and known preferences>.
+
+**To unblock:** <specific action {OPERATOR_NAME} needs to take>
+```
+
+Predictions must be grounded in episodic memory. Search for how {OPERATOR_NAME} has resolved similar blockers before composing the prediction.
 
 ### Debugging Slack
 If `get_operator_messages` returns empty, call `debug_slack_connection()` to

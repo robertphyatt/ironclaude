@@ -122,6 +122,20 @@ class WorkerRegistry:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_recent_workers(self, lookback_hours: int = 1) -> list[dict]:
+        """Running workers + recently-finished within lookback window.
+
+        Used by heartbeat to find workers alive even if incorrectly marked
+        completed by check_workers() due to transient tmux check failures.
+        """
+        rows = self._conn.execute(
+            """SELECT * FROM workers
+               WHERE status = 'running'
+               OR (finished_at IS NOT NULL AND finished_at > datetime('now', ?))""",
+            (f"-{lookback_hours} hours",)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     # --- Events ---
 
     def log_event(

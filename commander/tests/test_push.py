@@ -312,6 +312,20 @@ def test_sweep_handles_db_lock(daemon):
         daemon._db = original_db
 
 
+def test_sweep_rollback_on_db_lock(daemon):
+    """_sweep_expired_push_requests calls rollback() on lock error to clear stale transaction."""
+    import sqlite3 as _sqlite3
+    original_db = daemon._db
+    mock_db = MagicMock()
+    mock_db.execute.side_effect = _sqlite3.OperationalError("database is locked")
+    daemon._db = mock_db
+    try:
+        daemon._sweep_expired_push_requests()
+    finally:
+        daemon._db = original_db
+    mock_db.rollback.assert_called_once()
+
+
 def test_sweep_unpins_expired_messages(daemon, db_conn):
     """_sweep_expired_push_requests calls unpin_message for each expired row with a message_ts."""
     db_conn.execute(

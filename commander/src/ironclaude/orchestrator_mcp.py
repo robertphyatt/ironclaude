@@ -355,7 +355,7 @@ class OrchestratorTools:
 
     GRADER_TIMEOUT_SECONDS = 300
 
-    def __init__(self, registry, tmux, ledger_path: str = "", grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "claude-opus-4", opus_model: str = "claude-opus-4", effort_level: str = "high", ssh_manager=None, config: dict | None = None):
+    def __init__(self, registry, tmux, ledger_path: str = "", grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "opus", opus_model: str = "opus", effort_level: str = "high", ssh_manager=None, config: dict | None = None, ollama_inventory=None):
         self.registry = registry
         self.tmux = tmux
         self.ledger_path = ledger_path
@@ -375,7 +375,10 @@ class OrchestratorTools:
         self._game_pid: int | None = None
         self._advisor_cfg = advisor_cfg or {}
         self._ssh_manager = ssh_manager
+        self._machines_config_path = os.environ.get("IC_MACHINES_CONFIG", "config/machines.yaml")
+        self._ssh_lock = threading.Lock()
         self._config = config or {}
+        self._ollama_inventory = ollama_inventory
         brain_cwd = (
             os.environ.get("IC_BRAIN_CWD")
             or self._config.get("brain_cwd")
@@ -392,10 +395,16 @@ class OrchestratorTools:
             return make_opus_command(self._opus_model, self._effort_level)
         elif worker_type in WORKER_COMMANDS:
             if advisor.get("enabled") and worker_type == "claude-sonnet":
-                model = advisor.get("executor_model", "sonnet")
+                model = advisor.get("executor_model", "sonnet")  # CLI routing only — not a model selection decision
                 return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model {shlex.quote(model)} --dangerously-skip-permissions"
             return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model 'sonnet' --dangerously-skip-permissions"
         raise ValueError(f"Invalid worker type '{worker_type}'")
+
+    def get_ollama_inventory(self, force_refresh: bool = False) -> dict:
+        """Return classified Ollama model inventory."""
+        if self._ollama_inventory is None:
+            return {"error": "Ollama inventory not configured"}
+        return self._ollama_inventory.get_inventory(force_refresh)
 
     def _write_brain_contact(self, worker_id: str) -> None:
         """Write brain contact timestamp for daemon to read."""
@@ -419,8 +428,33 @@ class OrchestratorTools:
         machine = self._ssh_manager.get_machine(worker["machine"]) if self._ssh_manager else None
         return machine.host if machine else None
 
+    def _ensure_ssh_manager(self) -> None:
+        """Lazily initialize SSH manager on first use. Thread-safe via double-checked locking.
+
+        Health checks may block up to 90s on first call — intentional, avoids blocking
+        MCP startup (see commits 0b4c835, e5fe85c which were reverted for this reason).
+        """
+        if self._ssh_manager is not None:
+            return
+        with self._ssh_lock:
+            if self._ssh_manager is not None:
+                return
+            from ironclaude.ssh_manager import SSHConnectionManager
+            from ironclaude.config import load_machines_config
+            machines_cfg = load_machines_config(self._machines_config_path)
+            if not machines_cfg:
+                return
+            mgr = SSHConnectionManager()
+            mgr.register_machines(machines_cfg)
+            for name in mgr.list_machine_names():
+                health = mgr.health_check(name)
+                level = logging.INFO if health.ok else logging.WARNING
+                logger.log(level, f"Machine {name}: {health.details}")
+            self._ssh_manager = mgr
+
     def list_machines(self) -> dict:
         """List configured remote machines with health status and active worker counts."""
+        self._ensure_ssh_manager()
         if not self._ssh_manager:
             return {"machines": []}
         result = []
@@ -431,6 +465,7 @@ class OrchestratorTools:
             result.append({
                 "name": machine.name,
                 "host": machine.host,
+                "role": machine.role,
                 "purpose": machine.purpose,
                 "repos": machine.repos,
                 "healthy": self._ssh_manager.is_healthy(name),
@@ -495,7 +530,7 @@ class OrchestratorTools:
         # Spawn fresh session with grader's own working directory
         success = self.tmux.spawn_session(
             self._grader_session,
-            f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model '{self._grader_model}' --dangerously-skip-permissions",
+            f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model '{self._grader_model}[1m]' --dangerously-skip-permissions",
             cwd=self._grader_home,
         )
         if not success:
@@ -852,19 +887,64 @@ class OrchestratorTools:
 
         return {"status": "pending", "id": push_id, "expires_at": expires_at}
 
-    def get_directives(self, status: str | None = None) -> list[dict]:
-        """Retrieve directives, optionally filtered by status.
+    def get_directives(
+        self,
+        status: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        after: str | None = None,
+        before: str | None = None,
+        search: str | None = None,
+    ) -> list[dict]:
+        """Retrieve directives, optionally filtered by status, date range, text search.
+
+        Args:
+            status: Filter by status (pending_confirmation, confirmed, rejected,
+                    in_progress, completed). If None, returns all statuses.
+            limit: Maximum number of directives to return.
+            offset: Number of directives to skip (for pagination with limit).
+            after: ISO date string (YYYY-MM-DD); only return directives created
+                   on or after this date.
+            before: ISO date string (YYYY-MM-DD); only return directives created
+                    strictly before this date.
+            search: Case-insensitive substring match against source_text and
+                    interpretation fields.
 
         Returns list of directive dicts ordered by created_at descending.
         """
         if self._db is None:
             raise RuntimeError("Database connection required for directive operations")
+
+        conditions: list[str] = []
+        params: list = []
+
         if status:
-            rows = self._db.execute(
-                "SELECT * FROM directives WHERE status=? ORDER BY created_at DESC", (status,),
-            ).fetchall()
-        else:
-            rows = self._db.execute("SELECT * FROM directives ORDER BY created_at DESC").fetchall()
+            conditions.append("status=?")
+            params.append(status)
+        if after:
+            conditions.append("created_at >= ?")
+            params.append(after)
+        if before:
+            conditions.append("created_at < ?")
+            params.append(before)
+        if search:
+            conditions.append("(source_text LIKE ? OR interpretation LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%"])
+
+        where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        sql = f"SELECT * FROM directives {where_clause} ORDER BY created_at DESC"
+
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+            if offset is not None:
+                sql += " OFFSET ?"
+                params.append(offset)
+        elif offset is not None:
+            sql += " LIMIT -1 OFFSET ?"
+            params.append(offset)
+
+        rows = self._db.execute(sql, params).fetchall()
         directives = [dict(row) for row in rows]
         # Reconcile emoji on recent directives
         if self._slack is not None:
@@ -1152,10 +1232,29 @@ class OrchestratorTools:
         return None
 
     def _activate_pm_via_sqlite(
-        self, session_name: str, timeout: int = 30, _claude_dir: Path | None = None
+        self, session_name: str, timeout: int = 30,
+        max_retries: int = 3, _claude_dir: Path | None = None
     ) -> str | None:
-        """Activate professional mode by writing directly to ironclaude.db."""
-        return self._set_pm_via_sqlite(session_name, "on", timeout, _claude_dir)
+        """Activate professional mode by writing directly to ironclaude.db.
+
+        Retries up to max_retries times on transient sqlite errors.
+        Session ID timeout and tmux failures are not retryable.
+        """
+        last_error: str | None = None
+        for attempt in range(max_retries):
+            result = self._set_pm_via_sqlite(session_name, "on", timeout, _claude_dir)
+            if result is None:
+                return None
+            last_error = result
+            if not result.startswith("sqlite error:"):
+                return result
+            if attempt < max_retries - 1:
+                logger.warning(
+                    f"PM activation attempt {attempt + 1}/{max_retries} failed for "
+                    f"{session_name}: {result}, retrying in 1s"
+                )
+                time.sleep(1)
+        return last_error
 
     def _deactivate_pm_via_sqlite(
         self, session_name: str, timeout: int = 30, _claude_dir: Path | None = None
@@ -1260,6 +1359,100 @@ class OrchestratorTools:
         logger.info(f"PM activated via remote sqlite3 for {session_name} on {ssh_host}")
         return None
 
+    def _check_spawn_preconditions(self, batch_size: int = 1) -> dict | None:
+        """Pre-spawn resource checks. Returns None if OK, error dict if rejected.
+
+        Checks worker count (cheap DB query), Ollama VRAM (HTTP), then
+        memory with dynamic threshold (psutil). Fails on first violation.
+        """
+        # 1. Worker count check
+        max_workers = self._config.get("max_concurrent_workers", 6)
+        running = self.registry.get_running_workers()
+        active_count = len(running)
+        if active_count + batch_size > max_workers:
+            return {
+                "error": (
+                    f"Spawn rejected: {active_count}/{max_workers} workers running "
+                    f"(max_concurrent_workers={max_workers}). "
+                    f"Wait for a worker to finish or increase the limit."
+                ),
+                "active_workers": active_count,
+                "max": max_workers,
+            }
+
+        # 2. Ollama VRAM check
+        ollama_vram_gb, loaded_models = self._get_ollama_vram()
+        vram_threshold = self._config.get("ollama_vram_block_threshold_gb", 8.0)
+        if ollama_vram_gb > vram_threshold:
+            logger.info(
+                "Spawn rejected: Ollama VRAM %.1fGB exceeds threshold %.1fGB. "
+                "Loaded models: %s", ollama_vram_gb, vram_threshold, loaded_models
+            )
+            return {
+                "error": (
+                    f"Spawn rejected: Ollama VRAM too high "
+                    f"(loaded: {ollama_vram_gb}GB, threshold: {vram_threshold}GB). "
+                    f"Wait for Ollama workload to finish or kill loaded models."
+                ),
+                "ollama_vram_gb": ollama_vram_gb,
+                "threshold_gb": vram_threshold,
+                "loaded_models": loaded_models,
+            }
+
+        # 3. Memory floor check (dynamic threshold when Ollama active)
+        base_threshold = self._config.get("min_available_memory_gb", 8.0)
+        ollama_margin = self._config.get("ollama_memory_safety_margin_gb", 4.0)
+        effective_margin = ollama_margin if ollama_vram_gb > 0 else 0
+        effective_threshold = base_threshold + effective_margin
+        mem = self.get_system_memory()
+        if mem["available_gb"] < effective_threshold:
+            logger.info(
+                "Spawn rejected: available memory %.1fGB < threshold %.1fGB "
+                "(base %.1f + Ollama margin %.1f).",
+                mem["available_gb"], effective_threshold, base_threshold, effective_margin
+            )
+            return {
+                "error": (
+                    f"Spawn rejected: system memory too low "
+                    f"(available: {mem['available_gb']}GB, "
+                    f"threshold: {effective_threshold}GB "
+                    f"[base {base_threshold} + Ollama safety margin {effective_margin}]). "
+                    f"Check get_process_info() for memory consumers."
+                ),
+                "available_gb": mem["available_gb"],
+                "threshold_gb": effective_threshold,
+                "base_threshold_gb": base_threshold,
+                "ollama_margin_gb": effective_margin,
+            }
+
+        logger.info(
+            "Spawn preconditions passed: workers %d/%d, Ollama VRAM %.1fGB (threshold %.1f), "
+            "memory %.1fGB available (threshold %.1f)",
+            active_count, max_workers, ollama_vram_gb, vram_threshold,
+            mem["available_gb"], effective_threshold
+        )
+        return None
+
+    def _get_ollama_vram(self) -> tuple[float, list[str]]:
+        """Query Ollama for total loaded model VRAM. Returns (total_gb, model_names).
+        Returns (0.0, []) if Ollama is unreachable or has no loaded models.
+        """
+        try:
+            resp = requests.get("http://localhost:11434/api/ps", timeout=2)
+            resp.raise_for_status()
+            models = resp.json().get("models", [])
+            if not models:
+                return 0.0, []
+            total = 0.0
+            names = []
+            for m in models:
+                size_gb = round(m.get("size", 0) / (1024**3), 1)
+                total += size_gb
+                names.append(f"{m.get('name', 'unknown')} ({size_gb}GB)")
+            return round(total, 1), names
+        except Exception:
+            return 0.0, []
+
     def spawn_worker(
         self,
         worker_id: str,
@@ -1269,13 +1462,22 @@ class OrchestratorTools:
         allowed_paths: list[str] | None = None,
         model_name: str = "",
         machine: str | None = None,
+        pm_timeout: int = 300,
+        pm_max_retries: int = 3,
     ) -> str | dict:
         """Spawn a new worker with the given objective. Set machine to target a remote host."""
+        if pm_max_retries < 1:
+            raise ValueError("pm_max_retries must be >= 1")
         # Retry escalation: auto-upgrade to opus if previous attempt with same base ID failed
         base_id = re.sub(r'[-_]?\d*[a-z]?$', '', worker_id)
         if base_id and base_id in self._failed_worker_bases and worker_type == "claude-sonnet":
             logger.info(f"Escalating {worker_id} to claude-opus (previous failure on {base_id})")
             worker_type = "claude-opus"
+
+        # Pre-spawn resource checks (fail-fast before expensive grader call)
+        precondition_error = self._check_spawn_preconditions()
+        if precondition_error is not None:
+            return precondition_error
 
         # Inline grader enforcement — MCP grades automatically
         avatar_skill = _load_avatar_skill().replace("{OPERATOR_NAME}", self._operator_name)
@@ -1330,6 +1532,7 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             }
         logger.info(f"Grader approved spawn for '{worker_id}' (grade {grade_result['grade']})")
 
+        self._ensure_ssh_manager()
         # Resolve remote machine if specified
         ssh_host = None
         machine_cfg = None
@@ -1339,6 +1542,8 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             machine_cfg = self._ssh_manager.get_machine(machine)
             if not machine_cfg:
                 return {"error": f"Unknown machine '{machine}'. Available: {self._ssh_manager.list_machine_names()}"}
+            if machine_cfg.role != "worker":
+                return {"error": f"Machine '{machine}' has role '{machine_cfg.role}' — only worker-role machines can spawn workers"}
             if repo not in machine_cfg.repos:
                 return {"error": f"Repo '{repo}' not in machine '{machine}' repos: {machine_cfg.repos}"}
             health = self._ssh_manager.health_check(machine)
@@ -1372,7 +1577,7 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
 
         # Inject worker ID for stop hook completion detection (local only — remote handled above)
         if not machine_cfg:
-            cmd = f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; {cmd}"
+            cmd = f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; export ENABLE_STOP_REVIEW=0; {cmd}"
 
         session_name = f"ic-{worker_id}"
 
@@ -1404,7 +1609,9 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
         if ssh_host:
             pm_failure = self._activate_pm_remote(session_name, ssh_host)
         else:
-            pm_failure = self._activate_pm_via_sqlite(session_name, timeout=300)
+            pm_failure = self._activate_pm_via_sqlite(
+                session_name, timeout=pm_timeout, max_retries=pm_max_retries
+            )
         if pm_failure is not None:
             self.tmux.kill_session(session_name, ssh_host=ssh_host)
             return {"error": f"PM activation failed for worker '{worker_id}': {pm_failure}"}
@@ -1434,7 +1641,9 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
 
         recommended = grade_result.get('recommended_model', worker_type)
         loc = f" on {machine}" if machine else ""
-        return f"Worker '{worker_id}' spawned ({worker_type}) in {repo}{loc}. Model recommendation: {recommended}"
+        result = f"Worker '{worker_id}' spawned ({worker_type}) in {repo}{loc}. Model recommendation: {recommended}"
+
+        return result
 
     def spawn_workers(self, requests: list[dict]) -> list[dict]:
         """Spawn multiple workers with batch grading and parallel PM activation.
@@ -1451,6 +1660,11 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             if base_id and base_id in self._failed_worker_bases and req.get("worker_type") == "claude-sonnet":
                 logger.info(f"Escalating {req['worker_id']} to claude-opus (previous failure on {base_id})")
                 req["worker_type"] = "claude-opus"
+
+        # Pre-spawn resource checks (fail-fast before batch grading)
+        precondition_error = self._check_spawn_preconditions(batch_size=len(requests))
+        if precondition_error is not None:
+            return precondition_error
 
         # Hard-enforce brain-notes for each request
         for req in requests:
@@ -1541,7 +1755,7 @@ Model recommendation (include "recommended_model" for each):
                 results[idx] = {"worker_id": worker_id, "error": f"Unknown worker type: {worker_type}"}
                 continue
 
-            cmd = f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; {cmd}"
+            cmd = f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; export ENABLE_STOP_REVIEW=0; {cmd}"
             session_name = f"ic-{worker_id}"
 
             success = self.tmux.spawn_session(session_name, cmd, cwd=repo)
@@ -1553,10 +1767,14 @@ Model recommendation (include "recommended_model" for each):
             spawned.append((req, grade, session_name))
 
         # Parallel PM activation: poll all PPID files in a single loop
-        # timeout raised from 120→300 because session-init.sh hook can be slow
+        # timeout raised from 120→300; now configurable via pm_timeout per request
         # when ~/.claude/session-env/ has many files (find without -maxdepth)
         claude_dir = Path("~/.claude").expanduser()
-        deadline = time.time() + 300
+        max_pm_timeout = max(
+            (req.get("pm_timeout", 300) for req, grade in approved),
+            default=300,
+        )
+        deadline = time.time() + max_pm_timeout
         pending = {}
         for req, grade, session_name in spawned:
             try:
@@ -1840,8 +2058,10 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
                 for t in existing.get("tasks", [])
                 if t.get("status_set_at")
             }
+            prev_tasks_by_id = {t.get("id"): t for t in existing.get("tasks", [])}
         except Exception:
             prev = {}
+            prev_tasks_by_id = {}
         now = datetime.utcnow().isoformat() + "Z"
         enriched = []
         for task in tasks:
@@ -1849,6 +2069,18 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
             key = (t.get("id"), t.get("status"))
             t["status_set_at"] = prev.get(key, now)
             enriched.append(t)
+        if self._slack is not None:
+            for task in tasks:
+                old_task = prev_tasks_by_id.get(task.get("id"), {})
+                if old_task.get("status") == "blocked" and task.get("status") != "blocked":
+                    escalation_ts = old_task.get("escalation_ts")
+                    if escalation_ts:
+                        if not self._slack.unpin_message(escalation_ts):
+                            logger.warning(
+                                "update_ledger: failed to unpin escalation ts=%r for task %r",
+                                escalation_ts,
+                                task.get("id"),
+                            )
         lines = [f"**Objective:** {objective}", "", "## Tasks", ""]
         lines.append("| ID | Description | Status |")
         lines.append("|----|-------------|--------|")
@@ -1899,6 +2131,9 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
 
     def get_worker_log(self, worker_id: str, lines: int = 50) -> str:
         """Read the last N lines of a worker's log."""
+        _w = self.registry.get_worker(worker_id)
+        if _w and _w.get("machine"):
+            self._ensure_ssh_manager()
         ssh_host = self._resolve_ssh_host(worker_id)
         session_name = f"ic-{worker_id}"
         try:
@@ -1964,6 +2199,9 @@ Has the worker genuinely completed its objective based on the evidence?"""
         else:
             logger.warning(f"kill_worker called without objective/evidence for '{worker_id}' — skipping grader")
 
+        _kw = self.registry.get_worker(worker_id)
+        if _kw and _kw.get("machine"):
+            self._ensure_ssh_manager()
         ssh_host = self._resolve_ssh_host(worker_id)
         session_name = f"ic-{worker_id}"
         pane_pid = self.tmux.list_pane_pid(session_name, ssh_host=ssh_host)
@@ -2447,9 +2685,39 @@ Has the worker genuinely completed its objective based on the evidence?"""
         wiki_dir = self._wiki_dir
         os.makedirs(wiki_dir, exist_ok=True)
 
+        if re.match(r'^d\d+', page):
+            return (
+                f"Invalid page name '{page}': directive-number prefixes (d<N>) are not allowed. "
+                "Wiki pages must be concept-focused, not directive logs. "
+                "Use a descriptive name like 'worker-lifecycle' or 'state-update-patterns'."
+            )
+        if re.search(r'-d\d{1,4}(?:-|$)', page):
+            return (
+                f"Invalid page name '{page}': directive-number suffixes (-d<N>) are not allowed. "
+                "Wiki pages must be concept-focused, not directive logs. "
+                "Use a descriptive name like 'worker-lifecycle' or 'state-update-patterns'."
+            )
+        if re.search(r'\d{4}-\d{2}', page):
+            return (
+                f"Invalid page name '{page}': date-stamped names are not allowed. "
+                "Wiki pages are persistent concepts, not log entries. "
+                "Use a descriptive name like 'deployment-patterns' or 'rollout-strategy'."
+            )
+        if re.search(r'(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\d{4}', page, re.IGNORECASE):
+            return (
+                f"Invalid page name '{page}': date-stamped names are not allowed. "
+                "Wiki pages are persistent concepts, not log entries. "
+                "Use a descriptive name like 'deployment-patterns' or 'rollout-strategy'."
+            )
+
         page_path = os.path.join(wiki_dir, f"{page}.md")
         if not Path(page_path).resolve().is_relative_to(Path(wiki_dir).resolve()):
             return f"Path traversal rejected: {page}"
+        if len(content.strip()) < 50:
+            return (
+                f"Invalid content for '{page}': content must be at least 50 characters after stripping whitespace. "
+                "Placeholder pages are not allowed."
+            )
         is_update = os.path.exists(page_path)
 
         today = date.today().isoformat()
@@ -2595,6 +2863,8 @@ def _create_mcp_server(tools: OrchestratorTools):
         allowed_paths: list[str] | None = None,
         model_name: str = "",
         machine: str | None = None,
+        pm_timeout: int = 300,
+        pm_max_retries: int = 3,
     ) -> str:
         """Spawn a new worker with the given objective.
 
@@ -2606,10 +2876,13 @@ def _create_mcp_server(tools: OrchestratorTools):
             allowed_paths: Optional list of file paths the worker may edit.
             model_name: Optional explicit model name override.
             machine: Optional remote machine name from machines.yaml. If set, worker spawns on that machine via SSH.
+            pm_timeout: Seconds to wait per PM activation attempt (default: 300). Increase for slow-booting models like ollama/gemma4:31b (~600).
+            pm_max_retries: Total PM activation attempts before returning error (default: 3). Each attempt waits up to pm_timeout seconds for the session ID file.
         """
         result = tools.spawn_worker(
             worker_id, worker_type, repo, objective,
             allowed_paths, model_name, machine=machine,
+            pm_timeout=pm_timeout, pm_max_retries=pm_max_retries,
         )
         if isinstance(result, dict):
             return json.dumps(result)
@@ -2831,16 +3104,33 @@ def _create_mcp_server(tools: OrchestratorTools):
         return result
 
     @mcp.tool()
-    def get_directives(status: str | None = None) -> str:
-        """Retrieve directives, optionally filtered by status.
+    def get_directives(
+        status: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        after: str | None = None,
+        before: str | None = None,
+        search: str | None = None,
+    ) -> str:
+        """Retrieve directives, optionally filtered by status, date range, and text search.
 
         Args:
-            status: Filter by status (pending_confirmation, confirmed, rejected, in_progress, completed).
-                    If None, returns all directives.
+            status: Filter by status (pending_confirmation, confirmed, rejected,
+                    in_progress, completed). If None, returns all statuses.
+            limit: Maximum number of directives to return.
+            offset: Number of directives to skip (for pagination with limit).
+            after: ISO date string (YYYY-MM-DD); only return directives created
+                   on or after this date.
+            before: ISO date string (YYYY-MM-DD); only return directives created
+                    strictly before this date.
+            search: Case-insensitive substring match against source_text and
+                    interpretation fields.
 
-        Returns JSON array of directive dicts.
+        Returns JSON array of directive dicts ordered by created_at descending.
         """
-        return json.dumps(tools.get_directives(status), indent=2)
+        return json.dumps(
+            tools.get_directives(status, limit, offset, after, before, search), indent=2
+        )
 
     @mcp.tool()
     def get_status_summary() -> str:
@@ -2918,6 +3208,10 @@ def _create_mcp_server(tools: OrchestratorTools):
 
         Creates the page with YAML frontmatter (title + updated date),
         rebuilds the wiki index, and appends to the wiki log.
+
+        Page names must be concept-focused kebab-case (e.g. 'worker-lifecycle',
+        'operator-preferences'). Directive-number prefixes (d<N>-...) and
+        date-stamped names (YYYY-MM-DD-...) are rejected with an error string.
 
         Args:
             page: Page name (kebab-case, no .md extension).
@@ -3099,6 +3393,18 @@ def _create_mcp_server(tools: OrchestratorTools):
         except subprocess.TimeoutExpired:
             return "Error: command timed out after 5s"
 
+    @mcp.tool()
+    def get_ollama_inventory(force_refresh: bool = False) -> str:
+        """Get classified inventory of available Ollama models with capability tiers.
+
+        Returns model names, parameter counts, capability tiers (simple/moderate/complex),
+        architecture (dense/moe), and known strengths. Call before spawning ollama workers.
+
+        Args:
+            force_refresh: Re-probe Ollama instead of returning cached results.
+        """
+        return json.dumps(tools.get_ollama_inventory(force_refresh), indent=2)
+
     return mcp
 
 
@@ -3107,26 +3413,17 @@ def main():
     from ironclaude.db import init_db
     from ironclaude.worker_registry import WorkerRegistry
     from ironclaude.tmux_manager import TmuxManager
-    from ironclaude.ssh_manager import SSHConnectionManager
 
     db_path = sys.argv[1] if len(sys.argv) > 1 else "data/db/ironclaude.db"
     log_dir = os.environ.get("IC_LOG_DIR", "/tmp/ic-logs")
     ledger_path = os.environ.get("IC_LEDGER_PATH", "/tmp/ic/task-ledger.json")
-    from ironclaude.config import load_config, load_machines_config
+    from ironclaude.config import load_config
     cfg = load_config()
 
     conn = init_db(db_path)
     registry = WorkerRegistry(conn)
 
     ssh_manager = None
-    machines_cfg = load_machines_config()
-    if machines_cfg:
-        ssh_manager = SSHConnectionManager()
-        ssh_manager.register_machines(machines_cfg)
-        for name in ssh_manager.list_machine_names():
-            health = ssh_manager.health_check(name)
-            level = logging.INFO if health.ok else logging.WARNING
-            logger.log(level, f"Machine {name}: {health.details}")
 
     tmux = TmuxManager(log_dir=log_dir, ssh_manager=ssh_manager)
 
@@ -3142,16 +3439,27 @@ def main():
     operator_name = os.environ.get("OPERATOR_NAME", "Operator")
     supabase_url = os.environ.get("SUPABASE_URL", "")
     supabase_anon_key = os.environ.get("SUPABASE_ANON_KEY", "")
+
+    from ironclaude.ollama_inventory import OllamaInventory
+    ollama_inv = OllamaInventory()
+    inv_result = ollama_inv.get_inventory()
+    logger.info(
+        "Ollama inventory: reachable=%s, models=%d",
+        inv_result.get("ollama_reachable"),
+        len(inv_result.get("models", [])),
+    )
+
     tools = OrchestratorTools(
         registry, tmux, ledger_path,
         slack_bot=slack_bot, db_conn=conn, operator_name=operator_name,
         supabase_url=supabase_url, supabase_anon_key=supabase_anon_key,
         advisor_cfg=cfg.get("advisor", {}),
-        grader_model=cfg.get("grader_model", "claude-opus-4"),
-        opus_model=cfg.get("default_opus_model", "claude-opus-4"),
+        grader_model=cfg.get("grader_model", "opus"),
+        opus_model=cfg.get("default_opus_model", "opus"),
         effort_level=cfg.get("effort_level", "high"),
         ssh_manager=ssh_manager,
         config=cfg,
+        ollama_inventory=ollama_inv,
     )
 
     mcp = _create_mcp_server(tools)

@@ -90,6 +90,10 @@ The Worker is a Claude Code plugin that enforces the brainstorm-plan-execute wor
 # From within Claude Code:
 /plugin marketplace add robertphyatt/ironclaude
 /reload-plugins
+
+# Security vulnerability detection (recommended):
+/plugin install security-guidance@claude-plugins-official
+/reload-plugins
 ```
 
 > **First run:** The first time MCP servers start (~10-30s), they auto-build platform-specific binaries. Subsequent starts are instant. If startup fails, check `~/.claude/ironclaude-mcp-state-manager.log` and `~/.claude/ironclaude-mcp-episodic-memory.log`.
@@ -143,7 +147,7 @@ ollama serve
 
 ### Model Configuration
 
-IronClaude defaults to Claude Opus 4.6 (`claude-opus-4-6`) for the brain and grader. You can override this via environment variables:
+IronClaude defaults to Claude Opus (`opus`) for the brain and grader. You can override this via environment variables to pin a specific model version:
 
 ```bash
 # Override all opus-class usage (brain, grader, workers) with a single var
@@ -154,7 +158,7 @@ export BRAIN_MODEL="claude-opus-4-6-20250115"
 export GRADER_MODEL="claude-sonnet-4-5-20241022"
 ```
 
-When workers use Sonnet, they automatically get an Opus 4.6 advisor for oversight. You do you — set these to whatever works best for your workflow.
+When workers use Sonnet, they automatically get an Opus 4 advisor for oversight. You do you — set these to whatever works best for your workflow.
 
 ### Worker Skills
 

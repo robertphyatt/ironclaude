@@ -44,6 +44,24 @@ class TestRegisterMachines:
         assert m.max_workers is None
         assert m.env == {}
 
+    def test_role_defaults_to_worker(self, ssh_mgr):
+        machines = [{"name": "x", "host": "x", "claude_path": "/c", "repos": ["/r"]}]
+        ssh_mgr.register_machines(machines)
+        m = ssh_mgr.get_machine("x")
+        assert m.role == "worker"
+
+    def test_role_explicit_monitor(self, ssh_mgr):
+        machines = [{"name": "x", "host": "x", "claude_path": "/c", "repos": ["/r"], "role": "monitor"}]
+        ssh_mgr.register_machines(machines)
+        m = ssh_mgr.get_machine("x")
+        assert m.role == "monitor"
+
+    def test_role_explicit_worker(self, ssh_mgr):
+        machines = [{"name": "x", "host": "x", "claude_path": "/c", "repos": ["/r"], "role": "worker"}]
+        ssh_mgr.register_machines(machines)
+        m = ssh_mgr.get_machine("x")
+        assert m.role == "worker"
+
 
 class TestGetSSHArgs:
     def test_returns_correct_args(self, ssh_mgr):
@@ -82,6 +100,24 @@ class TestHealthCheck:
     def test_health_check_unknown_machine(self, ssh_mgr):
         result = ssh_mgr.health_check("ghost")
         assert result.ok is False
+
+    @patch("ironclaude.ssh_manager.subprocess.run")
+    def test_monitor_skips_tmux_check(self, mock_run, ssh_mgr):
+        machines = [{"name": "k", "host": "k", "claude_path": "/c", "repos": ["/r"], "role": "monitor"}]
+        ssh_mgr.register_machines(machines)
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok\n")
+        result = ssh_mgr.health_check("k")
+        assert result.ok is True
+        assert mock_run.call_count == 2  # SSH + claude only, no tmux
+
+    @patch("ironclaude.ssh_manager.subprocess.run")
+    def test_worker_checks_tmux(self, mock_run, ssh_mgr):
+        machines = [{"name": "k", "host": "k", "claude_path": "/c", "repos": ["/r"], "role": "worker"}]
+        ssh_mgr.register_machines(machines)
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok\n")
+        result = ssh_mgr.health_check("k")
+        assert result.ok is True
+        assert mock_run.call_count == 3  # SSH + claude + tmux
 
 
 class TestTeardown:

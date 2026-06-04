@@ -1,0 +1,144 @@
+{
+  "name": "Wiki Write Validation Strengthening",
+  "goal": "Add three validation guard clauses to wiki_write (directive suffixes, YYYY-MM date patterns, content minimum) and update existing test fixtures to use a VALID_CONTENT constant.",
+  "design_file": "docs/plans/2026-05-30-wiki-write-validation-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Update Existing Test Fixtures with VALID_CONTENT Constant",
+      "description": "Add VALID_CONTENT = 'A' * 60 class constant to TestWikiTools and replace all short content strings (< 50 chars) in tests that successfully create wiki pages. Pure refactor — no behavior change, all tests must pass before and after.",
+      "allowed_files": [
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add VALID_CONTENT = 'A' * 60 as a class constant on TestWikiTools, immediately before the first test method."
+        },
+        {
+          "description": "Replace all content strings shorter than 50 chars in tests that successfully create pages with self.VALID_CONTENT. See plan markdown for exhaustive list of 17 test methods to update."
+        },
+        {
+          "description": "Run full TestWikiTools suite to verify all tests still pass.",
+          "command": "cd commander && .venv/bin/python -m pytest tests/test_orchestrator_mcp.py::TestWikiTools -v",
+          "expected": "All tests pass — same count as before, zero failures."
+        },
+        {
+          "description": "Stage changes.",
+          "command": "git add commander/tests/test_orchestrator_mcp.py"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Directive Suffix Validation",
+      "description": "TDD: add two tests for -d<N> suffix rejection, implement re.search(r'-d\\d{1,4}(?:-|$)', page) guard clause in wiki_write after the existing directive prefix check.",
+      "allowed_files": [
+        "commander/tests/test_orchestrator_mcp.py",
+        "commander/src/ironclaude/orchestrator_mcp.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Add test_wiki_write_rejects_directive_suffix and test_wiki_write_rejects_directive_suffix_short to TestWikiTools after test_wiki_write_rejects_bare_directive_number."
+        },
+        {
+          "description": "Run new tests to confirm RED.",
+          "command": "cd commander && .venv/bin/python -m pytest tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_rejects_directive_suffix tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_rejects_directive_suffix_short -v",
+          "expected": "Both FAIL."
+        },
+        {
+          "description": "Add directive suffix guard clause to wiki_write in orchestrator_mcp.py immediately after the existing directive prefix check. Pattern: re.search(r'-d\\d{1,4}(?:-|$)', page)."
+        },
+        {
+          "description": "Run new tests to confirm GREEN.",
+          "command": "cd commander && .venv/bin/python -m pytest tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_rejects_directive_suffix tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_rejects_directive_suffix_short -v",
+          "expected": "Both PASS."
+        },
+        {
+          "description": "Run full TestWikiTools suite to verify no regressions.",
+          "command": "cd commander && .venv/bin/python -m pytest tests/test_orchestrator_mcp.py::TestWikiTools -v",
+          "expected": "All tests pass."
+        },
+        {
+          "description": "Stage changes.",
+          "command": "git add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Expanded Date Validation",
+      "description": "TDD: add two tests for YYYY-MM and month+year patterns, widen existing YYYY-MM-DD regex to YYYY-MM, and add separate month-name+year guard clause.",
+      "allowed_files": [
+        "commander/tests/test_orchestrator_mcp.py",
+        "commander/src/ironclaude/orchestrator_mcp.py"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "Add test_wiki_write_rejects_year_month_pattern and test_wiki_write_rejects_month_year_pattern to TestWikiTools after test_wiki_write_rejects_date_stamped_name."
+        },
+        {
+          "description": "Run new tests to confirm RED.",
+          "command": "cd commander && .venv/bin/python -m pytest tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_rejects_year_month_pattern tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_rejects_month_year_pattern -v",
+          "expected": "Both FAIL."
+        },
+        {
+          "description": "In wiki_write, replace the existing date check regex r'\\d{4}-\\d{2}-\\d{2}' with r'\\d{4}-\\d{2}'. Then add a second guard clause for r'(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\\d{4}' with re.IGNORECASE."
+        },
+        {
+          "description": "Run new tests to confirm GREEN.",
+          "command": "cd commander && .venv/bin/python -m pytest tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_rejects_year_month_pattern tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_rejects_month_year_pattern -v",
+          "expected": "Both PASS."
+        },
+        {
+          "description": "Run full TestWikiTools suite to verify no regressions.",
+          "command": "cd commander && .venv/bin/python -m pytest tests/test_orchestrator_mcp.py::TestWikiTools -v",
+          "expected": "All tests pass."
+        },
+        {
+          "description": "Stage changes.",
+          "command": "git add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Content Minimum Validation",
+      "description": "TDD: add four tests for empty/whitespace/short/minimum content, implement len(content.strip()) < 50 guard clause in wiki_write between path traversal check and is_update.",
+      "allowed_files": [
+        "commander/tests/test_orchestrator_mcp.py",
+        "commander/src/ironclaude/orchestrator_mcp.py"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {
+          "description": "Add test_wiki_write_rejects_empty_content, test_wiki_write_rejects_whitespace_content, test_wiki_write_rejects_short_content, and test_wiki_write_accepts_minimum_content to TestWikiTools after test_wiki_write_accepts_concept_names."
+        },
+        {
+          "description": "Run new tests to confirm RED (first three fail, fourth passes).",
+          "command": "cd commander && .venv/bin/python -m pytest tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_rejects_empty_content tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_rejects_whitespace_content tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_rejects_short_content tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_accepts_minimum_content -v",
+          "expected": "First three FAIL, test_wiki_write_accepts_minimum_content PASS."
+        },
+        {
+          "description": "In wiki_write in orchestrator_mcp.py, add content minimum guard clause between the path traversal return and is_update = os.path.exists(page_path). Check: if len(content.strip()) < 50: return error string."
+        },
+        {
+          "description": "Run all four new tests to confirm GREEN.",
+          "command": "cd commander && .venv/bin/python -m pytest tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_rejects_empty_content tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_rejects_whitespace_content tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_rejects_short_content tests/test_orchestrator_mcp.py::TestWikiTools::test_wiki_write_accepts_minimum_content -v",
+          "expected": "All four PASS."
+        },
+        {
+          "description": "Run full TestWikiTools suite to verify no regressions. Count should be original + 8 new tests.",
+          "command": "cd commander && .venv/bin/python -m pytest tests/test_orchestrator_mcp.py::TestWikiTools -v",
+          "expected": "All tests pass."
+        },
+        {
+          "description": "Stage changes.",
+          "command": "git add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py"
+        }
+      ]
+    }
+  ]
+}

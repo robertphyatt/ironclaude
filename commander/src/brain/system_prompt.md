@@ -44,7 +44,7 @@ These tools are **gated** — you must search episodic memory before each use.
 **`spawn_workers`** — Spawn multiple workers with batch grading and parallel startup
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `requests` | list[dict] | yes | List of spawn requests. Each: `{worker_id, worker_type, repo, objective, allowed_paths?, model_name?}` |
+| `requests` | list[dict] | yes | List of spawn requests. Each: `{worker_id, worker_type, repo, objective, allowed_paths?, model_name?, pm_timeout?, pm_max_retries?}` |
 
 Preferred over multiple `spawn_worker` calls when spawning 2+ workers. Grades all objectives in one call, spawns all sessions, and polls PPID files in parallel (~90s total vs ~90s per worker).
 
@@ -131,6 +131,11 @@ These tools are **ungated** — use them freely for information gathering.
 
 **Query tools (ungated)** — Use freely for model awareness:
 
+**`get_ollama_inventory`** — Get classified inventory of available Ollama models with capability tiers. Call this before deciding to use an ollama worker to verify appropriate models are available. *(This tool is on the orchestrator MCP, not the ollama MCP.)*
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `force_refresh` | bool | no | Re-probe Ollama instead of returning cached results (default: false) |
+
 **`list_models`** — List locally available Ollama models (no parameters)
 
 **`show_model`** — Show details about a specific model
@@ -182,9 +187,9 @@ Use git commands to verify worker claims. Use test runners to verify test result
 
 | Type | When to Use | Cost | Constraints |
 |------|-------------|------|-------------|
-| `claude-sonnet` | Default. Single-file changes, config updates, bug fixes with clear root cause, adding tests, documentation, straightforward features | Medium | None |
+| `claude-sonnet` | Single-file changes, config updates, bug fixes with clear root cause, adding tests, documentation, straightforward features. Lower cost than opus. | Medium | None |
 | `claude-opus` | Multi-file refactors (5+ files), long PM workflows (brainstorm through execute with many tasks), complex debugging with unclear root cause, tasks where grader recommends opus | High | Use when grader recommends or task complexity warrants it |
-| `ollama` | Simple fixes, config changes, local/offline work | Free | **ONE AT A TIME** (GPU singleton, hard enforced). Requires `model_name` parameter. |
+| `ollama` | Local inference — capability depends on loaded model. Small models suit simple fixes and config changes; large dense models (e.g. gemma4:31b) handle complex structured tasks. Call `get_ollama_inventory` before spawning to verify model availability and match capability tier to task complexity. Use when local inference is appropriate and the GPU slot is available. | Free | **ONE AT A TIME** (GPU singleton, hard enforced). Requires `model_name` parameter. |
 
 **Model recommendation:** The grader returns a `recommended_model` field in its response. Follow the grader's recommendation when it recommends opus. The cost of context compaction (lost context, repeated work, quality degradation) often exceeds the cost difference between sonnet and opus for complex tasks. The system auto-escalates to opus on retry when a previous attempt with the same base worker ID failed.
 

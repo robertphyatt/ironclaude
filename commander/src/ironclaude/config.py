@@ -18,6 +18,10 @@ DEFAULTS = {
     "brain_heartbeat_timeout_seconds": 60,
     "brain_timeout_seconds": 600,
     "max_worker_retries": 3,
+    "max_concurrent_workers": 6,
+    "min_available_memory_gb": 8.0,
+    "ollama_vram_block_threshold_gb": 8.0,
+    "ollama_memory_safety_margin_gb": 4.0,
     "machines": [],
     "push_enabled": False,
     "push_max_per_hour": 5,
@@ -28,12 +32,12 @@ DEFAULTS = {
     "brain_prompt_path": "",  # test11
     "operator_name": "Operator",
     "autonomy_level": "3",
-    "brain_model": "claude-opus-4",
-    "grader_model": "claude-opus-4",
+    "brain_model": "opus",
+    "grader_model": "opus",
     "effort_level": "high",
     "advisor": {
         "enabled": True,
-        "executor_model": "sonnet",
+        "executor_model": "sonnet",  # CLI routing only — sets --model flag for sonnet workers; not a Brain model selection input
         "advisor_model": "opus",
     },
 }

@@ -283,6 +283,16 @@ export function initDb(dbPath?: string): Database.Database {
       task_boundary    INTEGER NOT NULL DEFAULT 0,
       created_at       TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS tool_poll_state (
+      terminal_session TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      input_hash TEXT NOT NULL,
+      last_output_hash TEXT NOT NULL DEFAULT '',
+      consecutive_count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (terminal_session, tool_name, input_hash)
+    );
   `);
 
   // Create indexes for common queries
@@ -303,6 +313,8 @@ export function initDb(dbPath?: string): Database.Database {
       ON pending_subagent_parents(parent_session);
     CREATE INDEX IF NOT EXISTS idx_review_grades_session_wave
       ON review_grades(terminal_session, wave_number, task_boundary);
+    CREATE INDEX IF NOT EXISTS idx_poll_state_session
+      ON tool_poll_state(terminal_session);
   `);
 
   _db = db;

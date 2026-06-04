@@ -20,6 +20,7 @@ class MachineConfig:
     log_dir: str = "/tmp/ic-logs"
     max_workers: int | None = None
     env: dict[str, str] = field(default_factory=dict)
+    role: str = "worker"
 
 
 @dataclass
@@ -48,6 +49,7 @@ class SSHConnectionManager:
                 log_dir=m.get("log_dir", "/tmp/ic-logs"),
                 max_workers=m.get("max_workers"),
                 env=m.get("env", {}),
+                role=m.get("role", "worker"),
             )
             self._machines[cfg.name] = cfg
 
@@ -77,8 +79,9 @@ class SSHConnectionManager:
         checks = [
             (["true"], "SSH connectivity"),
             (["which", machine.claude_path.replace("~", "$HOME")], "Claude binary"),
-            (["tmux", "-V"], "tmux available"),
         ]
+        if machine.role == "worker":
+            checks.append((["tmux", "-V"], "tmux available"))
         for cmd, label in checks:
             try:
                 result = subprocess.run(

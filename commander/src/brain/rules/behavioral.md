@@ -57,3 +57,9 @@
      4. **Decompose tasks:** "Read this conversation" → grep for keywords → identify line numbers → read ±50 lines around matches
    - Pattern: grep for concept → identify line ranges → read those ranges → synthesize
    - "The file is too large" is the BEGINNING of a decomposition strategy, not a stopping condition
+19. **Never Auto-Switch to Usage Credits on Rate Limit** — When a worker hits a Claude rate limit and the rate-limit-options menu appears, always stop and wait; never auto-switch to usage credits.
+   - NEVER select "Switch to usage credits" (option 2) automatically
+   - ALWAYS select "Stop and wait for limit to reset" (option 1) — this is the safe default
+   - Notify the operator that the worker is paused due to rate limit
+   - Only switch to usage credits if the operator explicitly instructs it
+   - Usage credits have cost implications that require operator approval

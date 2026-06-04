@@ -1,0 +1,137 @@
+{
+  "name": "Polling Deduplication Hook",
+  "goal": "Add a SQLite-backed poll-dedup.sh hook that blocks workers from reading the same resource 3+ consecutive times when output is unchanged, with a 5-minute cooldown.",
+  "design_file": "docs/plans/2026-05-31-polling-dedup-hook-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Schema migration",
+      "description": "Add tool_poll_state table and index to session-init.sh schema bootstrap and db.ts initDb(). Idempotent CREATE TABLE IF NOT EXISTS.",
+      "allowed_files": [
+        "worker/hooks/session-init.sh",
+        "worker/mcp-servers/state-manager/src/db.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add tool_poll_state CREATE TABLE to session-init.sh before the CREATE INDEX block",
+          "command": null,
+          "expected": "Table DDL inserted inside the sqlite3 quoted string, after review_grades closing );"
+        },
+        {
+          "description": "Add idx_poll_state_session CREATE INDEX to session-init.sh",
+          "command": null,
+          "expected": "Index DDL inserted before the closing quote of the sqlite3 call"
+        },
+        {
+          "description": "Add tool_poll_state CREATE TABLE to db.ts initDb() after review_grades table",
+          "command": null,
+          "expected": "Table DDL inserted before the closing backtick of the first db.exec block"
+        },
+        {
+          "description": "Add idx_poll_state_session CREATE INDEX to db.ts index block",
+          "command": null,
+          "expected": "Index DDL inserted before the closing backtick of the second db.exec block"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add worker/hooks/session-init.sh worker/mcp-servers/state-manager/src/db.ts",
+          "expected": "Exit 0, changes staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Create poll-dedup.sh hook",
+      "description": "New dual-mode bash hook: PostToolUse tracks output hash and consecutive count, PreToolUse blocks if count >= 3 and cooldown not elapsed. Uses portable_md5 from hook-logger.sh and SQLite for state.",
+      "allowed_files": [
+        "worker/hooks/poll-dedup.sh"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Create worker/hooks/poll-dedup.sh with complete dual-mode hook implementation",
+          "command": null,
+          "expected": "File created with all functions: compute_input_hash, age_seconds, PreToolUse branch, PostToolUse branch"
+        },
+        {
+          "description": "Make executable",
+          "command": "chmod +x worker/hooks/poll-dedup.sh",
+          "expected": "Exit 0"
+        },
+        {
+          "description": "Syntax check",
+          "command": "bash -n worker/hooks/poll-dedup.sh",
+          "expected": "No output, exit 0"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add worker/hooks/poll-dedup.sh",
+          "expected": "Exit 0, changes staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Register hook in hooks.json",
+      "description": "Add PreToolUse and PostToolUse registrations for poll-dedup.sh matching Read|Bash|Grep|Glob. Uses stable path $HOME/.claude/ironclaude-hooks/poll-dedup.sh (auto-copied by session-init.sh).",
+      "allowed_files": [
+        "worker/hooks/hooks.json"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "Add PreToolUse registration for Read|Bash|Grep|Glob after the Task matcher entry",
+          "command": null,
+          "expected": "New JSON object with poll-dedup.sh command and Read|Bash|Grep|Glob matcher added to PreToolUse array"
+        },
+        {
+          "description": "Add PostToolUse registration for Read|Bash|Grep|Glob after the mcp-state-logger entry",
+          "command": null,
+          "expected": "New JSON object with poll-dedup.sh command and Read|Bash|Grep|Glob matcher added to PostToolUse array"
+        },
+        {
+          "description": "Validate JSON syntax",
+          "command": "jq . worker/hooks/hooks.json > /dev/null",
+          "expected": "No output, exit 0"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add worker/hooks/hooks.json",
+          "expected": "Exit 0, changes staged"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Write and run test-poll-dedup.sh",
+      "description": "Logic unit tests for poll-dedup.sh. Tests isolated functions (block decision, count update, input key construction) without a live DB. Follows test-guard-security.sh pattern.",
+      "allowed_files": [
+        "worker/hooks/test-poll-dedup.sh"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {
+          "description": "Create worker/hooks/test-poll-dedup.sh with 15 test cases covering block decision, count update, and input key construction",
+          "command": null,
+          "expected": "File created with assert_eq helper, three logic function replicas, and 15 assertions"
+        },
+        {
+          "description": "Make executable",
+          "command": "chmod +x worker/hooks/test-poll-dedup.sh",
+          "expected": "Exit 0"
+        },
+        {
+          "description": "Run tests — all 15 must pass",
+          "command": "bash worker/hooks/test-poll-dedup.sh",
+          "expected": "Results: 15 passed, 0 failed"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add worker/hooks/test-poll-dedup.sh",
+          "expected": "Exit 0, changes staged"
+        }
+      ]
+    }
+  ]
+}

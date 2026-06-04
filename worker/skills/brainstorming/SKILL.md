@@ -353,6 +353,8 @@ Display design completion status:
 Design complete and saved to docs/plans/YYYY-MM-DD-<topic>-design.md.
 
 Professional mode is ACTIVE - changes staged for your review.
+
+SUGGESTED_NEXT_ACTION: Skill(skill="ironclaude:writing-plans", args="docs/plans/YYYY-MM-DD-<topic>-design.md")
 ```
 
 Use AskUserQuestion tool:

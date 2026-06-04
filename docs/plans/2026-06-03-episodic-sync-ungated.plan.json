@@ -1,0 +1,52 @@
+{
+  "name": "Episodic Memory Sync — Remove PM Gate",
+  "goal": "Remove professional mode gate from episodic-memory-sync.sh so conversation indexing runs for all sessions",
+  "design_file": "docs/plans/2026-06-03-episodic-sync-ungated-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Remove PM gate from hook",
+      "description": "Delete lines 18-35 (PM gate comment, INPUT/init_session_id, session pre-flight, PROF_MODE check) from worker/hooks/episodic-memory-sync.sh",
+      "allowed_files": ["worker/hooks/episodic-memory-sync.sh"],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Delete lines 18-35 from worker/hooks/episodic-memory-sync.sh using Edit tool with exact old_string match",
+          "expected": "Lines 18-35 removed; run_hook line flows directly to singleton check"
+        },
+        {
+          "description": "Stage the edited hook",
+          "command": "git add worker/hooks/episodic-memory-sync.sh",
+          "expected": "File staged with 18-line deletion"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Add deploy-hooks Makefile target and deploy",
+      "description": "Add PHONY + variables + deploy-hooks target to Makefile, run make deploy-hooks, verify both locations match source, stage all plan files",
+      "allowed_files": ["Makefile"],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Edit Makefile: extend .PHONY line and add PLUGIN_CACHE_HOOK_DIR, STABLE_HOOK_DIR variables and deploy-hooks target"
+        },
+        {
+          "description": "Run make deploy-hooks to copy hook to both deployed locations",
+          "command": "make deploy-hooks",
+          "expected": "Two cp commands execute and 'Deployed episodic-memory-sync.sh to plugin cache and stable hooks dir' printed"
+        },
+        {
+          "description": "Verify both deployed files match source",
+          "command": "diff worker/hooks/episodic-memory-sync.sh ~/.claude/plugins/cache/ironclaude/ironclaude/1.0.8/hooks/episodic-memory-sync.sh && diff worker/hooks/episodic-memory-sync.sh ~/.claude/ironclaude-hooks/episodic-memory-sync.sh && echo 'Both locations match source'",
+          "expected": "Both locations match source (no diff output)"
+        },
+        {
+          "description": "Stage Makefile and all plan docs",
+          "command": "git add Makefile docs/plans/2026-06-03-episodic-sync-ungated-design.md docs/plans/2026-06-03-episodic-sync-ungated.md docs/plans/2026-06-03-episodic-sync-ungated.plan.json",
+          "expected": "All four files staged"
+        }
+      ]
+    }
+  ]
+}

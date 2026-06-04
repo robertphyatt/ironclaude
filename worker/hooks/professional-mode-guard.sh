@@ -16,6 +16,19 @@ FILE_PATH=$(normalize_path "$FILE_PATH")
 
 SAFE_SESSION=$(echo "$SESSION_TAG" | sed "s/'/''/g")
 
+# ─── Helper: query design/plan paths for SUGGESTED_NEXT_ACTION ───
+get_design_file() {
+  sqlite3 "$DB_PATH" ".timeout 5000" \
+    "SELECT file FROM registered_designs WHERE terminal_session='${SAFE_SESSION}' ORDER BY rowid DESC LIMIT 1;" 2>/dev/null || true
+}
+get_plan_json_path() {
+  local design_file
+  design_file=$(get_design_file)
+  if [ -n "$design_file" ]; then
+    echo "${design_file%-design.md}.plan.json"
+  fi
+}
+
 # ─── Read professional_mode from sqlite3 ───
 prof_mode=$(db_read_or_fail "professional-mode-guard" \
   "SELECT professional_mode FROM sessions WHERE terminal_session='${SAFE_SESSION}';") || {
@@ -266,6 +279,26 @@ Do NOT run destructive or write commands during the reviewing stage."
         exit 0
       fi
     fi
+    # Build SUGGESTED_NEXT_ACTION based on current workflow stage
+    NEXT_ACTION=""
+    case "$WORKFLOW" in
+      idle|brainstorming)
+        NEXT_ACTION="SUGGESTED_NEXT_ACTION: Skill(skill=\"ironclaude:brainstorming\", args=\"\")"
+        ;;
+      design_ready)
+        _DESIGN_PATH=$(get_design_file)
+        if [ -n "$_DESIGN_PATH" ]; then
+          NEXT_ACTION="SUGGESTED_NEXT_ACTION: Skill(skill=\"ironclaude:writing-plans\", args=\"${_DESIGN_PATH}\")"
+        fi
+        ;;
+      plan_ready)
+        _PLAN_PATH=$(get_plan_json_path)
+        if [ -n "$_PLAN_PATH" ]; then
+          NEXT_ACTION="SUGGESTED_NEXT_ACTION: Skill(skill=\"ironclaude:executing-plans\", args=\"${_PLAN_PATH} --mode=inline\")"
+        fi
+        ;;
+    esac
+
     block_pretooluse "professional-mode-guard" "BLOCKED — WRITE TOOLS NOT ALLOWED
 
 The current workflow stage is '${WORKFLOW}'. Write tools (Edit, Write, Bash) are only allowed during plan execution.
@@ -275,7 +308,9 @@ To reach execution, follow the workflow:
 2. Call Skill tool with skill: \"ironclaude:writing-plans\" to plan
 3. Call Skill tool with skill: \"ironclaude:executing-plans\" to execute
 
-Do NOT use Edit, Write, or Bash until you are in the executing stage."
+Do NOT use Edit, Write, or Bash until you are in the executing stage.
+
+${NEXT_ACTION}"
   fi
 
   # Executing + Edit/Write/MultiEdit/NotebookEdit: check allowed_files

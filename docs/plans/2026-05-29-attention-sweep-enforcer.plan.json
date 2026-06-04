@@ -1,0 +1,77 @@
+{
+  "name": "Attention Sweep Enforcer",
+  "goal": "Add PostToolUse arm hook and PreToolUse gate hook to the Brain's Claude Code session, enforcing full-fleet sweeps before gated worker actions",
+  "design_file": "docs/plans/2026-05-29-attention-sweep-enforcer-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Create attention-sweep-arm.sh (PostToolUse arm hook)",
+      "description": "Write the PostToolUse hook that arms the sweep flag only when get_worker_status(all) returns a valid JSON array response. Fails open if response is not an array (daemon error).",
+      "allowed_files": [
+        "~/.claude/ironclaude-hooks/attention-sweep-arm.sh"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Create ~/.claude/ironclaude-hooks/attention-sweep-arm.sh with the complete hook script (see plan markdown for full content)"
+        },
+        {
+          "description": "Make the script executable",
+          "command": "chmod +x ~/.claude/ironclaude-hooks/attention-sweep-arm.sh",
+          "expected": "no output (success)"
+        },
+        {
+          "description": "Verify script syntax",
+          "command": "bash -n ~/.claude/ironclaude-hooks/attention-sweep-arm.sh",
+          "expected": "no output (clean parse)"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Create attention-sweep-enforcer.sh (PreToolUse gate hook)",
+      "description": "Write the PreToolUse hook that blocks gated worker actions when the sweep flag is missing or older than 3 minutes. Fails closed on TOOL_NAME parse failure. Flag is armed by attention-sweep-arm.sh, not here.",
+      "allowed_files": [
+        "~/.claude/ironclaude-hooks/attention-sweep-enforcer.sh"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Create ~/.claude/ironclaude-hooks/attention-sweep-enforcer.sh with the complete hook script (see plan markdown for full content)"
+        },
+        {
+          "description": "Make the script executable",
+          "command": "chmod +x ~/.claude/ironclaude-hooks/attention-sweep-enforcer.sh",
+          "expected": "no output (success)"
+        },
+        {
+          "description": "Verify script syntax",
+          "command": "bash -n ~/.claude/ironclaude-hooks/attention-sweep-enforcer.sh",
+          "expected": "no output (clean parse)"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Register both hooks in Brain's settings.json",
+      "description": "Add attention-sweep-enforcer.sh as a fourth PreToolUse entry (matcher: '') and attention-sweep-arm.sh as the first PostToolUse entry (matcher: 'mcp__orchestrator__get_worker_status') in ~/.ironclaude/brain/.claude/settings.json",
+      "allowed_files": [
+        "~/.ironclaude/brain/.claude/settings.json"
+      ],
+      "depends_on": [1, 2],
+      "steps": [
+        {
+          "description": "Read current settings.json to confirm structure before editing"
+        },
+        {
+          "description": "Write updated settings.json adding PreToolUse entry for attention-sweep-enforcer.sh and PostToolUse entry for attention-sweep-arm.sh (see plan markdown for complete final content)"
+        },
+        {
+          "description": "Verify JSON is valid",
+          "command": "python3 -m json.tool ~/.ironclaude/brain/.claude/settings.json > /dev/null",
+          "expected": "no output (valid JSON)"
+        }
+      ]
+    }
+  ]
+}

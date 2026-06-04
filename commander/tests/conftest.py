@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
+
+import pytest
 
 collect_ignore = ["test_signal_handler_destructive.py"]
 
@@ -48,3 +51,25 @@ if _orm_path.exists():
     _orm_mod = importlib.util.module_from_spec(_orm_spec)  # type: ignore[arg-type]
     sys.modules["ironclaude.plugins.scan.pipeline.orphan_remediation"] = _orm_mod
     _orm_spec.loader.exec_module(_orm_mod)  # type: ignore[union-attr]
+
+
+@pytest.fixture(autouse=True)
+def _guard_os_kill(monkeypatch):
+    def _blocked_kill(pid, sig):
+        raise RuntimeError(
+            f"os.kill({pid!r}, {sig!r}) called without a mock. "
+            f"Real signals are banned in tests — a MagicMock PID converts to 0 via __index__ "
+            f"and kills the entire process group. "
+            f"Add: monkeypatch.setattr(os, 'kill', lambda pid, sig: None) "
+            f"or: with patch('os.kill', ...)"
+        )
+
+    def _blocked_killpg(pgid, sig):
+        raise RuntimeError(
+            f"os.killpg({pgid!r}, {sig!r}) called without a mock — "
+            f"same ban applies to killpg. Mock it explicitly."
+        )
+
+    monkeypatch.setattr(os, "kill", _blocked_kill)
+    if hasattr(os, "killpg"):
+        monkeypatch.setattr(os, "killpg", _blocked_killpg)

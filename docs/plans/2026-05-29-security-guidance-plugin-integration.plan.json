@@ -1,0 +1,92 @@
+{
+  "name": "Security-Guidance Plugin Integration",
+  "goal": "Integrate Anthropic's security-guidance plugin for all IronClaude workers with Stage 2 disabled via ENABLE_STOP_REVIEW=0",
+  "design_file": "docs/plans/2026-05-29-security-guidance-plugin-integration-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Add ENABLE_STOP_REVIEW=0 to worker spawn env vars",
+      "description": "Add export ENABLE_STOP_REVIEW=0 to both worker spawn sites (orchestrator_mcp.py and main.py) alongside existing IC_ROLE/IC_WORKER_ID env vars. Update tests to assert the new env var is present in spawn commands.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Update test assertions in test_orchestrator_mcp.py to expect ENABLE_STOP_REVIEW=0 in spawn commands (3 locations: line 82, 630, 644)",
+          "command": null,
+          "expected": "Test file updated with new assertions"
+        },
+        {
+          "description": "Run tests to verify they fail (RED)",
+          "command": "cd commander && python -m pytest tests/test_orchestrator_mcp.py::TestSpawnWorkerEnvVar -v && python -m pytest tests/test_orchestrator_mcp.py -k test_spawn_worker_registers -v",
+          "expected": "FAIL — command strings don't contain ENABLE_STOP_REVIEW=0 yet"
+        },
+        {
+          "description": "Add export ENABLE_STOP_REVIEW=0 to orchestrator_mcp.py:1596 spawn site",
+          "command": null,
+          "expected": "Spawn command includes ENABLE_STOP_REVIEW=0 for all worker types"
+        },
+        {
+          "description": "Add export ENABLE_STOP_REVIEW=0 to main.py:1115 spawn site (also add export IC_ROLE=worker to align with orchestrator pattern)",
+          "command": null,
+          "expected": "Both spawn sites now include ENABLE_STOP_REVIEW=0"
+        },
+        {
+          "description": "Run tests to verify they pass (GREEN)",
+          "command": "cd commander && python -m pytest tests/test_orchestrator_mcp.py::TestSpawnWorkerEnvVar -v && python -m pytest tests/test_orchestrator_mcp.py -k test_spawn_worker_registers -v",
+          "expected": "PASS"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/orchestrator_mcp.py commander/src/ironclaude/main.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Add plugin presence check to session-init.sh",
+      "description": "Add non-blocking check in session-init.sh that verifies security-guidance plugin is installed in ~/.claude/plugins/cache/. Logs warning if missing. No test framework for shell hooks.",
+      "allowed_files": [
+        "worker/hooks/session-init.sh"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add security-guidance plugin check block after stable hook directory block (~line 154), before statusline path block",
+          "command": null,
+          "expected": "session-init.sh logs warning when plugin not found in cache"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add worker/hooks/session-init.sh",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Update README with security-guidance install instructions",
+      "description": "Add security-guidance plugin install step to README Quick Start section after existing ironclaude plugin install. Documentation only.",
+      "allowed_files": [
+        "README.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add security-guidance install step after /reload-plugins in Quick Start section",
+          "command": null,
+          "expected": "README includes security-guidance install instructions"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add README.md",
+          "expected": "Changes staged"
+        }
+      ]
+    }
+  ]
+}
