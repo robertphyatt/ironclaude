@@ -13,6 +13,7 @@ from ironclaude.notifications import (
     format_task_progress,
     format_worker_checkin,
     format_worker_checkin_slack,
+    format_worker_gate_stuck_slack,
 )
 
 
@@ -141,6 +142,27 @@ class TestHeartbeatTaskExtraction:
         workers = [{"id": "w1", "description": "   \n  ", "workflow_stage": "executing"}]
         msg = format_heartbeat(workers)
         assert "[malformed objective]" in msg
+
+    def test_pm_preamble_extracts_task_marker(self):
+        preamble = (
+            "Professional mode is active. Start with /brainstorming --scope=hold.\n"
+            "\n"
+            "Task: Debug ONNX TTS AR decode loop"
+        )
+        workers = [{"id": "w1", "description": preamble, "workflow_stage": "brainstorming"}]
+        msg = format_heartbeat(workers)
+        assert "Professional mode" not in msg
+        assert "Debug ONNX TTS AR decode loop" in msg
+
+    def test_pm_preamble_no_marker_extracts_directive(self):
+        description = (
+            "Professional mode is active. Start with /brainstorming --scope=hold.\n\n"
+            "d1142: Fix heartbeat worker summaries to show useful descriptions"
+        )
+        workers = [{"id": "w1", "description": description, "workflow_stage": "brainstorming"}]
+        msg = format_heartbeat(workers)
+        assert "d1142: Fix heartbeat worker summaries" in msg
+        assert "Professional mode" not in msg
 
 
 class TestBrainNotifications:
@@ -312,3 +334,15 @@ class TestWorkerCheckinSlackNotification:
     def test_normal_checkin_has_no_log_tail(self):
         msg = format_worker_checkin_slack("w1", 12, "executing", False)
         assert "\n" not in msg
+
+
+class TestWorkerGateStuckSlack:
+    def test_format_includes_worker_id_and_stage(self):
+        msg = format_worker_gate_stuck_slack("w-1", 30, "plan_ready")
+        assert "w-1" in msg
+        assert "plan_ready" in msg
+        assert "30" in msg
+
+    def test_format_includes_alert_prefix(self):
+        msg = format_worker_gate_stuck_slack("w-1", 15, "design_ready")
+        assert "[ALERT]" in msg

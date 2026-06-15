@@ -123,7 +123,7 @@ Continue to Step 3.5.
 
 **If CLAUDE.md exists:**
 
-Perform semantic concept analysis. First, use the Glob tool to find any `.claude/rules/*.md` files in the project, then Read each one that exists. For each of the 8 concepts below, check the entire CLAUDE.md AND all `.claude/rules/*.md` files and determine whether it's already covered — regardless of heading text, section structure, or wording. A concept is "covered" if CLAUDE.md or any rules file contains instructions, rules, or guidance that address the same intent, even if expressed differently. When uncertain, err on the side of "covered" (don't add) rather than "missing" (add redundant content).
+Perform semantic concept analysis. Use the Read tool to check `.claude/rules/behavioral.md` directly (this is the only rules file written by the activation skill). For each of the 8 concepts below, check the entire CLAUDE.md AND `.claude/rules/behavioral.md` (if it exists) and determine whether it's already covered — regardless of heading text, section structure, or wording. A concept is "covered" if CLAUDE.md or `.claude/rules/behavioral.md` contains instructions, rules, or guidance that address the same intent, even if expressed differently. When uncertain, err on the side of "covered" (don't add) rather than "missing" (add redundant content).
 
 | # | Concept | Covered if the file contains... |
 |---|---------|----------------------------------|
@@ -136,7 +136,7 @@ Perform semantic concept analysis. First, use the Glob tool to find any `.claude
 | 7 | Subagent Discipline | Instructions about keeping subagent prompts focused, setting max_turns, or avoiding orchestration in subagents |
 | 8 | No Sycophantic Responses | Instructions to avoid performative agreement, push back with evidence when disagreeing, or verify corrections before implementing them |
 
-Also check whether the workflow requirement concept (all changes must follow brainstorm → write-plans → execute-plans, no exceptions) is expressed anywhere in CLAUDE.md or any rules file.
+Also check whether the workflow requirement concept (all changes must follow brainstorm → write-plans → execute-plans, no exceptions) is expressed anywhere in CLAUDE.md or `.claude/rules/behavioral.md`.
 
 **If all concepts and workflow requirement are covered:** No changes needed. Continue to Step 3.5.
 
@@ -262,6 +262,8 @@ Run /setup-ollama-validation for faster validation (~1s vs ~12-15s)
 ```
 
 ### Step 4: Activate and confirm
+
+⚠️ ORDERING REQUIREMENT: Steps 3 and 3.5 must be fully complete before calling `set_professional_mode`. Once professional mode flips to "on", the undecided-state write exceptions disappear — file writes then require the executing workflow stage.
 
 **First:** Call `mcp__plugin_ironclaude_state-manager__set_professional_mode` MCP tool with `value: "on"` to activate professional mode.
 

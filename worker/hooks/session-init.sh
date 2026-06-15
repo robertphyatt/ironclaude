@@ -14,6 +14,34 @@ init_session_id
 
 PROJECT_HASH=$(echo "$PWD" | portable_md5)
 
+# ═══ Dependency preflight (warn-not-block) ═══
+# Checks critical tools and emits warnings if missing. Session continues
+# in degraded mode — blocking here would deadlock new users who haven't
+# installed prerequisites yet.
+PLATFORM=$(uname -s)
+
+if ! command -v jq &>/dev/null; then
+  case "$PLATFORM" in
+    MINGW*|MSYS*) JQ_HINT="choco install jq" ;;
+    Darwin)       JQ_HINT="brew install jq" ;;
+    *)            JQ_HINT="sudo apt install jq" ;;
+  esac
+  log_warning "session-init" "jq not found — hooks will degrade silently. Install: ${JQ_HINT}. See WINDOWS_SETUP.md for full setup."
+fi
+
+if ! command -v sqlite3 &>/dev/null; then
+  case "$PLATFORM" in
+    MINGW*|MSYS*) SQLITE_HINT="choco install sqlite" ;;
+    Darwin)       SQLITE_HINT="sqlite3 is usually pre-installed on macOS" ;;
+    *)            SQLITE_HINT="sudo apt install sqlite3" ;;
+  esac
+  log_warning "session-init" "sqlite3 not found — state management disabled. Install: ${SQLITE_HINT}. See WINDOWS_SETUP.md for full setup."
+fi
+
+if [ "${BASH_VERSINFO[0]}" -lt 4 ] 2>/dev/null; then
+  log_warning "session-init" "bash ${BASH_VERSION} detected — hooks require bash 4+. Upgrade or use Git Bash on Windows."
+fi
+
 # ═══ Schema bootstrap (self-bootstrapping for first-run / MCP-not-yet-started) ═══
 # Creates all tables + WAL mode so hooks work even before MCP servers finish building.
 # Idempotent: CREATE TABLE IF NOT EXISTS is a no-op when MCP server already created schema.

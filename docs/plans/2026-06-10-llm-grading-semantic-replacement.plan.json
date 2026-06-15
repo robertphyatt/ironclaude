@@ -1,0 +1,225 @@
+{
+  "name": "LLM Grading: Replace Regex/Keyword Semantic Judgment",
+  "goal": "Replace three semantic keyword/regex patterns in main.py and brain_client.py with LLM grading calls, extracting Ollama logic into a new shared grader.py module.",
+  "design_file": "docs/plans/2026-06-10-llm-grading-semantic-replacement-design.md",
+  "estimated_memory_gb": 0.5,
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Create grader.py — LocalGrader foundation",
+      "description": "New LocalGrader class extracted from OrchestratorTools._call_local_grader. Handles Ollama HTTP call, config loading, think-tag stripping, schema validation. Returns infrastructure_error dict on any failure, never raises. TDD: write test_grader.py first.",
+      "allowed_files": [
+        "commander/src/ironclaude/grader.py",
+        "commander/tests/test_grader.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Write tests/test_grader.py (12 tests covering happy path, OllamaError, empty/non-JSON response, think-tag stripping, schema validation, config-absent defaults, consistent error shape)",
+          "command": "",
+          "expected": "File created"
+        },
+        {
+          "description": "Run tests to verify RED (import error expected)",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && make test -k test_grader 2>&1 | head -30",
+          "expected": "ImportError: No module named 'ironclaude.grader'"
+        },
+        {
+          "description": "Create commander/src/ironclaude/grader.py with LocalGrader class",
+          "command": "",
+          "expected": "File created"
+        },
+        {
+          "description": "Run tests to verify GREEN (all 12 tests pass)",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && make test -k test_grader 2>&1 | tail -20",
+          "expected": "12 passed"
+        },
+        {
+          "description": "Stage grader.py and test_grader.py",
+          "command": "git add commander/src/ironclaude/grader.py commander/tests/test_grader.py",
+          "expected": "Files staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Refactor orchestrator_mcp.py — delegate _call_local_grader",
+      "description": "Add LocalGrader import and self._local_grader to OrchestratorTools.__init__. Replace _call_local_grader body with single delegation call to self._local_grader.grade(). No behavior change at existing 7 call sites. TDD: add delegation test first.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Append TestCallLocalGraderDelegation test class to test_orchestrator_mcp.py",
+          "command": "",
+          "expected": "Test class added"
+        },
+        {
+          "description": "Run delegation test to verify RED (AttributeError on _local_grader)",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && make test -k TestCallLocalGraderDelegation 2>&1 | tail -20",
+          "expected": "AttributeError: 'OrchestratorTools' object has no attribute '_local_grader'"
+        },
+        {
+          "description": "Add 'from ironclaude.grader import LocalGrader' import to orchestrator_mcp.py after line 35",
+          "command": "",
+          "expected": "Import added"
+        },
+        {
+          "description": "Add self._local_grader = LocalGrader(config_path=self._ollama_config_path) to OrchestratorTools.__init__ after self._ollama_config_path assignment",
+          "command": "",
+          "expected": "Attribute added to __init__"
+        },
+        {
+          "description": "Replace _call_local_grader body (lines 729-777) with single delegation: return self._local_grader.grade(system_prompt, user_prompt, format_schema)",
+          "command": "",
+          "expected": "Method body replaced"
+        },
+        {
+          "description": "Run all orchestrator tests to verify GREEN (delegation test passes, no regressions)",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && make test -k test_orchestrator_mcp 2>&1 | tail -20",
+          "expected": "All tests pass including TestCallLocalGraderDelegation"
+        },
+        {
+          "description": "Stage orchestrator_mcp.py and test_orchestrator_mcp.py",
+          "command": "git add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "Files staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Replace semantic checks in main.py",
+      "description": "Replace _validate_brain_message (directive-ref regex + keyword frozenset) and _detect_prompt_waiting (PROMPT_PATTERNS list) with LocalGrader.grade() calls. Add cache dict. Remove old constants. TDD: write test_main_validate.py first.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_main_validate.py",
+        "commander/tests/test_daemon.py",
+        "commander/tests/test_enforcement.py",
+        "commander/tests/test_stuck_detection.py",
+        "commander/tests/test_local_grader.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Create tests/test_main_validate.py with TestValidateBrainMessage (6 tests) and TestDetectPromptWaiting (7 tests)",
+          "command": "",
+          "expected": "File created with 13 tests"
+        },
+        {
+          "description": "Run tests to verify RED (AttributeError on _grader)",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && make test -k test_main_validate 2>&1 | tail -20",
+          "expected": "AttributeError or collection error"
+        },
+        {
+          "description": "Add 'from ironclaude.grader import LocalGrader' import to main.py after line 41",
+          "command": "",
+          "expected": "Import added"
+        },
+        {
+          "description": "Add _BRAIN_MSG_VALIDATION_SYSTEM, _BRAIN_MSG_SCHEMA, _PROMPT_WAITING_SYSTEM, _PROMPT_WAITING_SCHEMA, PROMPT_WAITING_CACHE_TTL constants after logger line in main.py",
+          "command": "",
+          "expected": "Constants added"
+        },
+        {
+          "description": "Delete PROMPT_PATTERNS, _DIRECTIVE_REF_RE, _REASON_KEYWORDS constants (lines 86-103) from main.py",
+          "command": "",
+          "expected": "Old constants removed"
+        },
+        {
+          "description": "Add self._grader = LocalGrader() and self._prompt_waiting_cache = {} to IroncladeDaemon.__init__ before self._load_staleness_state()",
+          "command": "",
+          "expected": "Attributes added"
+        },
+        {
+          "description": "Replace _validate_brain_message (lines 590-603) with LLM grading version using _BRAIN_MSG_VALIDATION_SYSTEM and _BRAIN_MSG_SCHEMA, fail-open on infrastructure_error",
+          "command": "",
+          "expected": "Method replaced"
+        },
+        {
+          "description": "Replace _detect_prompt_waiting (lines 1411-1419) with LLM grading version using _PROMPT_WAITING_SYSTEM and _PROMPT_WAITING_SCHEMA, 120s TTL cache on hash(log_tail), fail-safe returns False",
+          "command": "",
+          "expected": "Method replaced"
+        },
+        {
+          "description": "Run test_main_validate.py tests to verify GREEN",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && make test -k test_main_validate 2>&1 | tail -20",
+          "expected": "All 13 tests pass"
+        },
+        {
+          "description": "Run full test suite to verify no regressions",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && make test 2>&1 | tail -30",
+          "expected": "All tests pass"
+        },
+        {
+          "description": "Stage main.py and test_main_validate.py",
+          "command": "git add commander/src/ironclaude/main.py commander/tests/test_main_validate.py",
+          "expected": "Files staged"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Replace semantic check in brain_client.py",
+      "description": "Replace _check_permission_seeking (_PERMISSION_SEEKING_RE regex) with LocalGrader.grade() call. Preserve throttle logic unchanged. Remove _PERMISSION_SEEKING_RE class constant. TDD: add TestCheckPermissionSeeking to test_brain_client.py first.",
+      "allowed_files": [
+        "commander/src/ironclaude/brain_client.py",
+        "commander/tests/test_brain_client.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Append TestCheckPermissionSeeking class (6 tests) to tests/test_brain_client.py",
+          "command": "",
+          "expected": "Test class added"
+        },
+        {
+          "description": "Run tests to verify RED (AttributeError on _grader)",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && make test -k TestCheckPermissionSeeking 2>&1 | tail -20",
+          "expected": "AttributeError: 'BrainClient' object has no attribute '_grader'"
+        },
+        {
+          "description": "Add 'from ironclaude.grader import LocalGrader' import to brain_client.py after line 23",
+          "command": "",
+          "expected": "Import added"
+        },
+        {
+          "description": "Add _PERMISSION_SEEKING_SYSTEM and _PERMISSION_SEEKING_SCHEMA module-level constants to brain_client.py after logger line",
+          "command": "",
+          "expected": "Constants added"
+        },
+        {
+          "description": "Delete _PERMISSION_SEEKING_RE class constant (lines 66-77) from BrainClient",
+          "command": "",
+          "expected": "Constant removed"
+        },
+        {
+          "description": "Add self._grader = LocalGrader() to BrainClient.__init__ after self._previous_session_context (line 151)",
+          "command": "",
+          "expected": "Attribute added"
+        },
+        {
+          "description": "Replace _check_permission_seeking (lines 479-504) with LLM grading version using _PERMISSION_SEEKING_SYSTEM and _PERMISSION_SEEKING_SCHEMA, fail-open returns None on infrastructure_error, throttle logic preserved",
+          "command": "",
+          "expected": "Method replaced"
+        },
+        {
+          "description": "Run TestCheckPermissionSeeking tests to verify GREEN",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && make test -k TestCheckPermissionSeeking 2>&1 | tail -20",
+          "expected": "All 6 tests pass"
+        },
+        {
+          "description": "Run full test suite to verify no regressions",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && make test 2>&1 | tail -30",
+          "expected": "All tests pass"
+        },
+        {
+          "description": "Stage brain_client.py and test_brain_client.py",
+          "command": "git add commander/src/ironclaude/brain_client.py commander/tests/test_brain_client.py",
+          "expected": "Files staged"
+        }
+      ]
+    }
+  ]
+}

@@ -55,10 +55,11 @@ const EPISODIC_MEMORY_ROOT = join(__dirname, '..');
 function ensureBuildComplete() {
   const nodeModules = join(EPISODIC_MEMORY_ROOT, 'node_modules');
   const distFile = join(EPISODIC_MEMORY_ROOT, 'dist', 'mcp-server.js');
+  const syncCliFile = join(EPISODIC_MEMORY_ROOT, 'dist', 'sync-cli.js');
   const sqliteBinding = join(EPISODIC_MEMORY_ROOT, 'node_modules', 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node');
   const sharpBinding = join(EPISODIC_MEMORY_ROOT, 'node_modules', 'sharp', 'build', 'Release');
 
-  if (existsSync(nodeModules) && existsSync(distFile) && existsSync(sqliteBinding) && existsSync(sharpBinding)) return;
+  if (existsSync(nodeModules) && existsSync(distFile) && existsSync(syncCliFile) && existsSync(sqliteBinding) && existsSync(sharpBinding)) return;
 
   log('[auto-build] First run detected — building artifacts...');
 
@@ -89,6 +90,22 @@ function ensureBuildComplete() {
       log('[auto-build] dist/mcp-server.js built successfully');
     } catch (err) {
       log(`[auto-build] FAILED to build dist/mcp-server.js: ${err.message}`);
+      if (err.stderr) log(`[auto-build] stderr: ${err.stderr.toString().slice(0, 2000)}`);
+      process.exit(1);
+    }
+  }
+
+  // Build dist/sync-cli.js bundle if missing
+  if (!existsSync(syncCliFile)) {
+    log('[auto-build] Building dist/sync-cli.js with esbuild...');
+    try {
+      execSync(
+        'npx esbuild src/sync-cli.ts --bundle --platform=node --format=esm --outfile=dist/sync-cli.js --external:fsevents --external:@anthropic-ai/claude-agent-sdk --external:sharp --external:onnxruntime-node --external:better-sqlite3 --external:@xenova/transformers --external:sqlite-vec',
+        { cwd: EPISODIC_MEMORY_ROOT, stdio: 'pipe', timeout: 60000 }
+      );
+      log('[auto-build] dist/sync-cli.js built successfully');
+    } catch (err) {
+      log(`[auto-build] FAILED to build dist/sync-cli.js: ${err.message}`);
       if (err.stderr) log(`[auto-build] stderr: ${err.stderr.toString().slice(0, 2000)}`);
       process.exit(1);
     }
@@ -202,6 +219,12 @@ async function main() {
 
     child.on('exit', (code, signal) => {
       log(`MCP server exited: code=${code} signal=${signal}`);
+      if (code && code !== 0) {
+        log(`[diagnostic] Node ${process.version}, platform=${process.platform}, arch=${process.arch}`);
+        log(`[diagnostic] dist/ exists: ${existsSync(join(EPISODIC_MEMORY_ROOT, 'dist'))}`);
+        log(`[diagnostic] node_modules/ exists: ${existsSync(join(EPISODIC_MEMORY_ROOT, 'node_modules'))}`);
+        log(`[diagnostic] Check full log at: ${LOG_FILE}`);
+      }
       if (signal) process.kill(process.pid, signal);
       else process.exit(code || 0);
     });

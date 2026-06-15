@@ -41,17 +41,26 @@ def format_worker_failed(worker_id: str, error: str, attempts: int) -> str:
     )
 
 
+PREAMBLE_START = "Professional mode is active."
+
+
 def _extract_task_snippet(raw: str | None) -> str:
     if raw is None:
         return "no task"
-    idx = raw.find("Your task:")
-    if idx != -1:
-        after = raw[idx + len("Your task:"):].lstrip()
-        end = after.find("\n")
-        if end != -1:
-            after = after[:end]
-        return after.strip() or "[malformed objective]"
-    for line in raw.splitlines():
+    text = raw.lstrip()
+    if text.startswith(PREAMBLE_START):
+        sep = text.find("\n\n")
+        if sep != -1:
+            text = text[sep:].lstrip()
+    for marker in ("Task:", "Your task:"):
+        idx = text.find(marker)
+        if idx != -1:
+            after = text[idx + len(marker):].lstrip()
+            end = after.find("\n")
+            if end != -1:
+                after = after[:end]
+            return after.strip() or "[malformed objective]"
+    for line in text.splitlines():
         stripped = line.strip()
         if stripped:
             return stripped
@@ -146,3 +155,23 @@ def format_worker_checkin_slack(
     if prompt_waiting:
         msg += ": waiting for input"
     return msg
+
+
+def format_worker_gate_stuck_slack(
+    worker_id: str, minutes: int, stage: str,
+) -> str:
+    return (
+        f"[ALERT] Worker {worker_id} stuck at {stage} for {minutes}min — "
+        f"waiting for input. Brain may be unresponsive."
+    )
+
+
+def format_worker_stuck_killed(
+    worker_id: str, minutes: int, stage: str, prompt_waiting: bool,
+) -> str:
+    return (
+        f"*Worker Stuck-Killed:* `{worker_id}` was idle for {minutes}min\n"
+        f"Stage: {stage} | Prompt waiting: {'yes' if prompt_waiting else 'no'}\n"
+        f"Liveness: confirmed stuck (0% CPU across process tree)\n"
+        f"Brain notified to respawn."
+    )

@@ -16,6 +16,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+
+import psutil
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,7 +25,7 @@ from ironclaude.config import load_config, load_machines_config, DEFAULTS, make_
 from ironclaude.slack_interface import SlackBot, DIRECTIVE_STATUS_EMOJI
 from ironclaude.slack_commands import SlackSocketHandler, format_help_text
 from ironclaude.db import init_db
-from ironclaude.tmux_manager import TmuxManager
+from ironclaude.tmux_manager import TmuxManager, _strip_ansi
 from ironclaude.brain_client import BrainClient
 from ironclaude.worker_registry import WorkerRegistry
 from ironclaude.protocol import read_pending_decisions, read_task_ledger, write_decision
@@ -34,11 +36,41 @@ from ironclaude.notifications import (
     format_objective_received,
     format_task_progress, format_plan_ready, format_blocked,
 )
+from ironclaude.grader import LocalGrader
 from ironclaude.orchestrator_mcp import ensure_worker_trusted, WORKER_COMMANDS
 from ironclaude.signal_forensics import _logged_kill
 from ironclaude.plugins import PluginRegistry, discover_plugins
 
 logger = logging.getLogger("ironclaude")
+
+_BRAIN_MSG_VALIDATION_SYSTEM = (
+    "You validate Brain messages before they are posted to Slack.\n\n"
+    "A valid Brain message must have BOTH of the following:\n"
+    "1. A directive reference — any of: #N, dN, or 'directive N' (e.g. #1083, d1076, directive 42)\n"
+    "2. A reason clause — text explaining what the Brain is reporting (status, update, result, error, etc.)\n\n"
+    'Respond ONLY with valid JSON: {"valid": true} or {"valid": false, "reason": "..."}'
+)
+_BRAIN_MSG_SCHEMA = {
+    "type": "object",
+    "properties": {"valid": {"type": "boolean"}, "reason": {"type": "string"}},
+    "required": ["valid"],
+}
+_DIRECTIVE_REF_RE = re.compile(r'(?:#\d+|d\d+|directive\s+\d+)', re.IGNORECASE)
+_BLOCKED_NO_DIRECTIVE = "no_directive_ref"
+
+_PROMPT_WAITING_SYSTEM = (
+    "You detect whether a worker process is waiting for user input based on its log tail.\n\n"
+    "Signs of waiting: AskUserQuestion UI, numbered option lists, 'Which approach', 'How would you like', etc.\n"
+    "Signs of working: editing files, running tests, reading code, thinking.\n\n"
+    'Respond ONLY with valid JSON: {"waiting": true} or {"waiting": false}'
+)
+_PROMPT_WAITING_SCHEMA = {
+    "type": "object",
+    "properties": {"waiting": {"type": "boolean"}},
+    "required": ["waiting"],
+}
+
+PROMPT_WAITING_CACHE_TTL = 120
 
 
 def log_worker_event(event_type: str, **fields) -> None:
@@ -67,15 +99,23 @@ OSCILLATION_THRESHOLD = 3
 OSCILLATING_STAGES = frozenset({"executing", "reviewing"})
 OSCILLATION_CADENCE = 900
 
-PROMPT_PATTERNS = [
-    "AskUserQuestion",
-    "Submit answers",
-    "options:",
-    "Which approach",
-    "How would you like",
-    "question:",
-    re.compile(r"^\s*[1-4]\.", re.MULTILINE),
-]
+STALENESS_ALERT_SECONDS = 1800
+STALENESS_KILL_SECONDS = 3600
+STALENESS_PROMPT_ALERT = 900
+STALENESS_PROMPT_KILL = 1800
+STALENESS_CHECK_INTERVAL = 60
+STALENESS_LIVENESS_EXTENSION = 900
+
+PM_GATE_STAGES = frozenset({"plan_ready", "design_ready"})
+PM_GATE_SLACK_SECONDS = 1800
+MAX_LIVENESS_DEFERRALS = 2
+
+STAGE_STALENESS_MULTIPLIER = {
+    "executing": 1.5,
+    "reviewing": 1.5,
+    "brainstorming": 0.75,
+    "debugging": 0.75,
+}
 
 _daemon = None
 _pid_lock_fd: int | None = None
@@ -513,9 +553,147 @@ class IroncladeDaemon:
         self._last_maintenance = 0.0
         self._state_manager_db_path = os.path.expanduser("~/.claude/ironclaude.db")
         self._ssh_manager = ssh_manager
+        # Idle enforcement state
+        self._idle_enforcement_start = 0.0
+        self._idle_escalation_tier = 0
+        self._last_idle_check = 0.0
+        self._operator_notified_idle = False
+        # Post-kill sweep state
+        self._last_kill_sweep_check: float = time.time()
+        # Message aging state
+        self._last_message_aging_check: float = 0.0
+        self._message_aging_alerted: set[str] = set()
+        # Stuck worker detection state
+        self._stuck_hash: dict[str, int] = {}
+        self._stuck_since: dict[str, float] = {}
+        self._stuck_alert_sent: dict[str, bool] = {}
+        self._stuck_kill_deferred: dict[str, float] = {}
+        self._last_stuck_check: float = 0.0
+        self._grader = LocalGrader()
+        self._prompt_waiting_cache: dict[int, tuple[float, bool]] = {}
+        self._stuck_liveness_count: dict[str, int] = {}
+        self._pm_gate_slack_sent: dict[str, bool] = {}
+        self._stage_entered_at: dict[str, float] = {}
+        self._load_staleness_state()
 
     def shutdown(self):
         self._running = False
+
+    def _get_unprocessed_messages(self, max_age_seconds: int = 1800) -> list[dict]:
+        """Find operator messages older than max_age with no matching directive source_ts."""
+        operator_user_id = self.config.get("slack_operator_user_id", "")
+        if not operator_user_id or self._db is None:
+            return []
+        try:
+            oldest = str(time.time() - 7200)
+            messages = self.slack.get_recent_messages(limit=50, oldest=oldest)
+        except Exception:
+            return []
+        now = time.time()
+        try:
+            directive_ts_rows = self._db.execute("SELECT source_ts FROM directives").fetchall()
+            directive_ts_set = {row[0] for row in directive_ts_rows}
+        except Exception:
+            return []
+        result = []
+        for msg in messages:
+            if msg.get("user") != operator_user_id:
+                continue
+            msg_age = now - float(msg["ts"])
+            if msg_age < max_age_seconds:
+                continue
+            if msg["ts"] in directive_ts_set:
+                continue
+            result.append(msg)
+        return result
+
+    def _validate_brain_message(self, text: str) -> tuple[bool, str]:
+        """Validate Brain message has directive reference and reason clause via LLM."""
+        if not text.strip():
+            return False, "Empty message"
+        if not _DIRECTIVE_REF_RE.search(text):
+            return False, _BLOCKED_NO_DIRECTIVE
+        result = self._grader.grade(
+            _BRAIN_MSG_VALIDATION_SYSTEM,
+            f"Validate this Brain message:\n{text}",
+            _BRAIN_MSG_SCHEMA,
+        )
+        if result.get("infrastructure_error"):
+            logger.warning(
+                "Brain message validator unavailable: %s — allowing through",
+                result.get("error_detail"),
+            )
+            return True, ""
+        if result.get("valid", True):
+            return True, ""
+        return False, result.get("reason", "Message does not meet Brain message requirements")
+
+    def check_post_kill_sweep(self):
+        """Send mandatory sweep message to Brain after each kill_worker event."""
+        if self._db is None:
+            return
+        try:
+            rows = self._db.execute(
+                "SELECT worker_id FROM events "
+                "WHERE event_type = 'worker_finished' "
+                "AND timestamp > datetime(?, 'unixepoch')",
+                (self._last_kill_sweep_check,),
+            ).fetchall()
+        except Exception:
+            return
+        self._last_kill_sweep_check = time.time()
+        if not rows:
+            return
+        try:
+            directives = self._db.execute(
+                "SELECT id, interpretation FROM directives "
+                "WHERE status IN ('confirmed', 'in_progress')"
+            ).fetchall()
+        except Exception:
+            return
+        if not directives:
+            return
+        directive_list = ", ".join(f"#{r[0]}: {r[1][:60]}" for r in directives)
+        for row in rows:
+            worker_id = row[0] or "unknown"
+            self.brain.send_message(
+                f"[MANDATORY SWEEP] Worker {worker_id} completed. "
+                f"{len(directives)} directive(s) remain unworked: {directive_list}. "
+                f"Run full attention sweep — spawn workers for all unblocked "
+                f"directives before doing anything else."
+            )
+
+    def check_message_aging(self):
+        """Alert Brain about operator messages >30min old without directives."""
+        now = time.time()
+        if now - self._last_message_aging_check < 300:
+            return
+        self._last_message_aging_check = now
+
+        unprocessed = self._get_unprocessed_messages()
+
+        if self._message_aging_alerted and self._db is not None:
+            try:
+                directive_ts_rows = self._db.execute(
+                    "SELECT source_ts FROM directives"
+                ).fetchall()
+                directive_ts_set = {row[0] for row in directive_ts_rows}
+                self._message_aging_alerted -= directive_ts_set
+            except Exception:
+                pass
+
+        for msg in unprocessed:
+            ts = msg["ts"]
+            if ts in self._message_aging_alerted:
+                continue
+            minutes_ago = int((now - float(ts)) / 60)
+            self.brain.send_message(
+                f"[UNPROCESSED MESSAGE] Operator message from {minutes_ago} minutes ago "
+                f"has not been processed into a directive. "
+                f'Message: "{msg["text"][:100]}..." '
+                f"(ts: {ts}). Read this message and submit_directive() or acknowledge it."
+            )
+            self._message_aging_alerted.add(ts)
 
     def _run_maintenance(self):
         """Run periodic maintenance: clean old logs and prune DB tables.
@@ -898,9 +1076,23 @@ class IroncladeDaemon:
             logger.warning("push_requests sweep skipped (db locked): %s", e)
 
     def poll_brain_responses(self):
-        """Drain brain responses and post to Slack."""
+        """Drain brain responses, validate context, and post to Slack."""
         for text in self.brain.get_pending_responses():
             logger.info(f"Brain response: {text[:100]}...")
+            valid, reason = self._validate_brain_message(text)
+            if not valid:
+                if reason == _BLOCKED_NO_DIRECTIVE:
+                    logger.info("Brain response dropped (no directive ref): %s", text[:100])
+                    continue
+                logger.warning(f"Brain message blocked: {reason} | text={text[:200]}")
+                self.brain.send_message(
+                    f"[CONTEXT REQUIRED] Your message was blocked from Slack. "
+                    f"Reason: {reason}. Restate your message with: "
+                    f"(1) a directive reference (#N or dN), and "
+                    f"(2) why you are reporting this (status/update/result). "
+                    f'Original message: "{text[:200]}..."'
+                )
+                continue
             if len(text) > 39000:
                 chunks = [text[i:i+39000] for i in range(0, len(text), 39000)]
                 for chunk in chunks:
@@ -1116,7 +1308,13 @@ class IroncladeDaemon:
                 )
                 return
 
-            cmd = f"ollama launch claude --model {shlex.quote(model_name)} -- --dangerously-skip-permissions"
+            _hooks_cfg_path = Path.home() / ".claude" / "ironclaude-hooks-config.json"
+            try:
+                with open(_hooks_cfg_path) as _f:
+                    _ollama_url = json.load(_f).get("ollama", {}).get("url", "http://localhost:11434")
+            except (FileNotFoundError, json.JSONDecodeError):
+                _ollama_url = "http://localhost:11434"
+            cmd = f"export CLAUDE_CODE_ATTRIBUTION_HEADER=0; export ANTHROPIC_BASE_URL={shlex.quote(_ollama_url)}; export ANTHROPIC_AUTH_TOKEN=ollama; export ANTHROPIC_API_KEY=; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
         elif worker_type == "claude-opus":
             cmd = make_opus_command(self.config.get("default_opus_model", DEFAULTS["brain_model"]), self.config.get("effort_level", "high"))
         elif worker_type in WORKER_COMMANDS:
@@ -1246,14 +1444,74 @@ class IroncladeDaemon:
         return result if result else None
 
     def _detect_prompt_waiting(self, log_tail: str) -> bool:
-        """Heuristic: scan log tail for patterns indicating worker awaits input."""
-        for pattern in PROMPT_PATTERNS:
-            if isinstance(pattern, re.Pattern):
-                if pattern.search(log_tail):
-                    return True
-            elif pattern in log_tail:
-                return True
-        return False
+        """Detect whether a worker is waiting for user input via LLM grading."""
+        cache_key = hash(log_tail)
+        cached = self._prompt_waiting_cache.get(cache_key)
+        if cached is not None:
+            ts, result = cached
+            if time.time() - ts < PROMPT_WAITING_CACHE_TTL:
+                return result
+        result_dict = self._grader.grade(
+            _PROMPT_WAITING_SYSTEM,
+            f"Worker log tail:\n{log_tail[-2000:]}",
+            _PROMPT_WAITING_SCHEMA,
+        )
+        if result_dict.get("infrastructure_error"):
+            logger.debug(
+                "Prompt-waiting check unavailable: %s — defaulting to False",
+                result_dict.get("error_detail"),
+            )
+            return False
+        waiting = bool(result_dict.get("waiting", False))
+        self._prompt_waiting_cache[cache_key] = (time.time(), waiting)
+        return waiting
+
+    def _load_staleness_state(self):
+        """Load stuck worker state from DB for restart persistence."""
+        if self._db is None:
+            return
+        try:
+            rows = self._db.execute(
+                "SELECT worker_id, hash_value, stale_since, alert_sent "
+                "FROM worker_staleness"
+            ).fetchall()
+            for row in rows:
+                wid = row[0]
+                self._stuck_hash[wid] = row[1]
+                self._stuck_since[wid] = row[2]
+                self._stuck_alert_sent[wid] = bool(row[3])
+        except sqlite3.OperationalError:
+            pass
+
+    def _persist_staleness_state(self, worker_id: str):
+        """Persist single worker's staleness state to DB."""
+        if self._db is None:
+            return
+        if worker_id not in self._stuck_since:
+            try:
+                self._db.execute(
+                    "DELETE FROM worker_staleness WHERE worker_id = ?",
+                    (worker_id,),
+                )
+                self._db.commit()
+            except sqlite3.Error as e:
+                logger.warning(f"Failed to delete staleness state for {worker_id}: {e}")
+            return
+        try:
+            self._db.execute(
+                "INSERT OR REPLACE INTO worker_staleness "
+                "(worker_id, hash_value, stale_since, alert_sent, updated_at) "
+                "VALUES (?, ?, ?, ?, datetime('now'))",
+                (
+                    worker_id,
+                    self._stuck_hash.get(worker_id, 0),
+                    self._stuck_since[worker_id],
+                    int(self._stuck_alert_sent.get(worker_id, False)),
+                ),
+            )
+            self._db.commit()
+        except sqlite3.Error as e:
+            logger.warning(f"Failed to persist staleness state for {worker_id}: {e}")
 
     def _is_oscillating(self, worker_id: str) -> bool:
         """Return True if worker is oscillating between executing/reviewing."""
@@ -1265,6 +1523,176 @@ class IroncladeDaemon:
         if len(pruned) < OSCILLATION_THRESHOLD:
             return False
         return all(s in OSCILLATING_STAGES for _, s in pruned)
+
+    def check_stuck_workers(self):
+        """Detect workers with unchanged output and escalate/kill."""
+        now = time.time()
+        if now - self._last_stuck_check < STALENESS_CHECK_INTERVAL:
+            return
+        self._last_stuck_check = now
+
+        running_ids = set()
+        for worker in self.registry.get_running_workers():
+            worker_id = worker["id"]
+            session_name = worker["tmux_session"]
+            running_ids.add(worker_id)
+            ssh_host, _ = self._resolve_worker_ssh(worker)
+
+            if not self.tmux.has_session(session_name, ssh_host=ssh_host):
+                continue
+
+            try:
+                raw = self.tmux.capture_pane(session_name, lines=20, ssh_host=ssh_host)
+                log_tail = _strip_ansi(raw)
+            except Exception:
+                continue
+
+            current_hash = hash(log_tail)
+
+            if current_hash != self._stuck_hash.get(worker_id):
+                self._stuck_hash[worker_id] = current_hash
+                self._stuck_since[worker_id] = now
+                self._stuck_alert_sent[worker_id] = False
+                self._stuck_kill_deferred.pop(worker_id, None)
+                self._persist_staleness_state(worker_id)
+                continue
+
+            if worker_id not in self._stuck_since:
+                self._stuck_hash[worker_id] = current_hash
+                self._stuck_since[worker_id] = now
+                self._stuck_alert_sent[worker_id] = False
+                self._persist_staleness_state(worker_id)
+                continue
+
+            duration = now - self._stuck_since[worker_id]
+            stage = self._get_worker_workflow_stage(session_name, ssh_host=ssh_host)
+            prompt_waiting = self._detect_prompt_waiting(log_tail)
+
+            if prompt_waiting:
+                alert_threshold = STALENESS_PROMPT_ALERT
+                kill_threshold = STALENESS_PROMPT_KILL
+            else:
+                multiplier = STAGE_STALENESS_MULTIPLIER.get(stage, 1.0)
+                alert_threshold = STALENESS_ALERT_SECONDS * multiplier
+                kill_threshold = STALENESS_KILL_SECONDS * multiplier
+
+            if duration >= kill_threshold:
+                deferred_until = self._stuck_kill_deferred.get(worker_id, 0)
+                if now < deferred_until:
+                    continue
+                self._confirm_and_kill_stuck_worker(
+                    worker_id, session_name, duration,
+                    stage, prompt_waiting, ssh_host,
+                )
+            elif duration >= alert_threshold and not self._stuck_alert_sent.get(worker_id, False):
+                minutes = int(duration / 60)
+                self.brain.send_message(
+                    f"[STUCK] Worker {worker_id} output unchanged for {minutes}min. "
+                    f"{'Prompt waiting — respond or kill.' if prompt_waiting else 'Check worker status.'}"
+                )
+                if prompt_waiting:
+                    from ironclaude.notifications import format_worker_gate_stuck_slack
+                    self.slack.post_message(
+                        format_worker_gate_stuck_slack(worker_id, minutes, stage or "unknown")
+                    )
+                self._stuck_alert_sent[worker_id] = True
+                self._persist_staleness_state(worker_id)
+
+        for wid in list(self._stuck_since.keys()):
+            if wid not in running_ids:
+                del self._stuck_since[wid]
+                self._stuck_hash.pop(wid, None)
+                self._stuck_alert_sent.pop(wid, None)
+                self._stuck_kill_deferred.pop(wid, None)
+                self._stuck_liveness_count.pop(wid, None)
+                self._persist_staleness_state(wid)
+
+    def _confirm_and_kill_stuck_worker(
+        self, worker_id: str, session_name: str, duration: float,
+        stage: str | None, prompt_waiting: bool, ssh_host: str | None,
+    ):
+        """Liveness confirmation gate + kill action for stuck worker."""
+        if ssh_host is None:
+            pane_pid = self.tmux.list_pane_pid(session_name)
+            if pane_pid:
+                try:
+                    parent = psutil.Process(int(pane_pid))
+                    children = parent.children(recursive=True)
+                    if children:
+                        for child in children:
+                            try:
+                                child.cpu_percent()
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                pass
+                        time.sleep(2)
+                        for child in children:
+                            try:
+                                if child.cpu_percent() > 1.0:
+                                    deferral_count = self._stuck_liveness_count.get(worker_id, 0) + 1
+                                    self._stuck_liveness_count[worker_id] = deferral_count
+                                    if prompt_waiting and deferral_count > MAX_LIVENESS_DEFERRALS:
+                                        logger.info(
+                                            f"Worker {worker_id} liveness deferred {deferral_count} times "
+                                            f"but prompt_waiting=True — proceeding with kill"
+                                        )
+                                        break
+                                    self._stuck_kill_deferred[worker_id] = (
+                                        time.time() + STALENESS_LIVENESS_EXTENSION
+                                    )
+                                    logger.info(
+                                        f"Worker {worker_id} liveness check passed "
+                                        f"(CPU active, deferral {deferral_count}), deferring kill by "
+                                        f"{STALENESS_LIVENESS_EXTENSION}s"
+                                    )
+                                    return
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                pass
+                except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError) as e:
+                    logger.warning(f"Liveness check failed for {worker_id}: {e}")
+
+        self.tmux.kill_session(session_name, ssh_host=ssh_host)
+        self.registry.update_worker_status(worker_id, "completed")
+        self.registry.log_event("worker_finished", worker_id=worker_id)
+
+        minutes = int(duration / 60)
+        log_worker_event(
+            "WORKER_STUCK_KILLED", worker_id=worker_id,
+            duration_minutes=minutes, stage=stage or "unknown",
+            prompt_waiting=prompt_waiting,
+        )
+
+        from ironclaude.notifications import format_worker_stuck_killed
+        self.slack.post_message(format_worker_stuck_killed(
+            worker_id, minutes, stage or "unknown", prompt_waiting,
+        ))
+
+        directive_list = ""
+        if self._db is not None:
+            try:
+                rows = self._db.execute(
+                    "SELECT id, interpretation FROM directives "
+                    "WHERE status IN ('confirmed', 'in_progress')"
+                ).fetchall()
+                if rows:
+                    directive_list = " Remaining: " + ", ".join(
+                        f"#{r[0]}: {r[1][:60]}" for r in rows
+                    )
+            except Exception:
+                pass
+
+        self.brain.send_message(
+            f"[MANDATORY SWEEP] Worker {worker_id} killed (stuck {minutes}min, "
+            f"stage={stage or 'unknown'}, "
+            f"prompt={'yes' if prompt_waiting else 'no'})."
+            f"{directive_list} Spawn replacement if needed."
+        )
+
+        self._stuck_since.pop(worker_id, None)
+        self._stuck_hash.pop(worker_id, None)
+        self._stuck_alert_sent.pop(worker_id, None)
+        self._stuck_kill_deferred.pop(worker_id, None)
+        self._stuck_liveness_count.pop(worker_id, None)
+        self._persist_staleness_state(worker_id)
 
     def check_workers(self):
         """Check running workers for completion signals."""
@@ -1338,6 +1766,8 @@ class IroncladeDaemon:
             if stage != last_seen:
                 self._stage_history.setdefault(worker_id, []).append((time.time(), stage))
                 self._last_stage_seen[worker_id] = stage
+                self._pm_gate_slack_sent.pop(worker_id, None)
+                self._stage_entered_at[worker_id] = time.time()
             if self._is_oscillating(worker_id):
                 stage_changed = False
                 cadence = OSCILLATION_CADENCE
@@ -1360,11 +1790,12 @@ class IroncladeDaemon:
             except Exception:
                 log_tail = "(could not capture output)"
 
+            prompt_waiting = self._detect_prompt_waiting(log_tail)
+
             current_hash = hash(log_tail)
             if not stage_changed and current_hash == self._last_checkin_hash.get(worker_id):
-                continue
-
-            prompt_waiting = self._detect_prompt_waiting(log_tail)
+                if not prompt_waiting:
+                    continue
 
             spawned_at = worker.get("spawned_at", "")
             try:
@@ -1379,6 +1810,17 @@ class IroncladeDaemon:
             self._last_checkin_sent[worker_id] = time.time()
             self._last_checkin_stage[worker_id] = stage
             self._last_checkin_hash[worker_id] = current_hash
+
+            if prompt_waiting and stage in PM_GATE_STAGES:
+                entered_at = self._stage_entered_at.get(worker_id)
+                if entered_at:
+                    time_at_stage = time.time() - entered_at
+                    if time_at_stage >= PM_GATE_SLACK_SECONDS and not self._pm_gate_slack_sent.get(worker_id):
+                        from ironclaude.notifications import format_worker_gate_stuck_slack
+                        self.slack.post_message(
+                            format_worker_gate_stuck_slack(worker_id, int(time_at_stage / 60), stage)
+                        )
+                        self._pm_gate_slack_sent[worker_id] = True
 
     def check_confirmed_directives(self):
         """Send reminder to Brain for confirmed directives with no worker spawned within 5 minutes.
@@ -1417,6 +1859,106 @@ class IroncladeDaemon:
             delivered = self.brain.send_message(msg)
             if delivered:
                 self._directive_reminder_sent[directive_id] = now
+
+    def check_idle_enforcement(self):
+        """Escalate when Brain is idle with pending work.
+
+        Throttled to 60s. Three tiers: INFO (0-60s), WARNING (60-360s),
+        CRITICAL (360s+) with operator notification.
+        """
+        now = time.time()
+        if now - self._last_idle_check < 60:
+            return
+        self._last_idle_check = now
+
+        alive_workers = []
+        for w in self.registry.get_recent_workers():
+            ssh_host, _ = self._resolve_worker_ssh(w)
+            if self.tmux.has_session(w["tmux_session"], ssh_host=ssh_host):
+                alive_workers.append(w)
+
+        if alive_workers:
+            self._idle_enforcement_start = 0.0
+            self._idle_escalation_tier = 0
+            self._operator_notified_idle = False
+            return
+
+        unworked_directives = []
+        if self._db is not None:
+            try:
+                rows = self._db.execute(
+                    "SELECT id, status, interpretation FROM directives "
+                    "WHERE status IN ('confirmed', 'in_progress')"
+                ).fetchall()
+                unworked_directives = rows
+            except Exception:
+                pass
+
+        pending_tasks = []
+        try:
+            ledger = read_task_ledger(self._ledger_path)
+            if ledger and isinstance(ledger, dict):
+                pending_tasks = [
+                    t for t in ledger.get("tasks", [])
+                    if isinstance(t, dict) and t.get("status") in ("pending", "in_progress")
+                ]
+        except Exception:
+            pass
+
+        unprocessed_msgs = self._get_unprocessed_messages()
+
+        if not unworked_directives and not pending_tasks and not unprocessed_msgs:
+            self._idle_enforcement_start = 0.0
+            self._idle_escalation_tier = 0
+            self._operator_notified_idle = False
+            return
+
+        if self._idle_enforcement_start == 0.0:
+            self._idle_enforcement_start = now
+
+        idle_duration = now - self._idle_enforcement_start
+
+        if idle_duration < 60:
+            if self._idle_escalation_tier < 1:
+                self._idle_escalation_tier = 1
+                self.brain.send_message(
+                    f"You have {len(unworked_directives)} unworked directive(s), "
+                    f"{len(pending_tasks)} pending ledger task(s), and "
+                    f"{len(unprocessed_msgs)} unprocessed operator message(s) "
+                    f"with no active workers. Spawn workers now."
+                )
+        elif idle_duration < 360:
+            if self._idle_escalation_tier < 2:
+                self._idle_escalation_tier = 2
+                directive_list = ", ".join(
+                    f"#{r[0]} ({r[1]}): {r[2][:60]}" for r in unworked_directives
+                )
+                task_list = ", ".join(
+                    t.get("description", "unknown")[:40] for t in pending_tasks[:5]
+                )
+                parts = [f"[WARNING] Idle for {int(idle_duration)}s with pending work."]
+                if directive_list:
+                    parts.append(f"Directives: {directive_list}.")
+                if task_list:
+                    parts.append(f"Ledger tasks: {task_list}.")
+                if unprocessed_msgs:
+                    parts.append(f"{len(unprocessed_msgs)} unprocessed message(s).")
+                parts.append("Act immediately.")
+                self.brain.send_message(" ".join(parts))
+        else:
+            if self._idle_escalation_tier < 3:
+                self._idle_escalation_tier = 3
+                self.brain.send_message(
+                    f"[CRITICAL] Idle for {int(idle_duration)}s with pending work. "
+                    f"This is a hard enforcement escalation. Spawn workers NOW."
+                )
+            if not self._operator_notified_idle:
+                self._operator_notified_idle = True
+                total = len(unworked_directives) + len(pending_tasks) + len(unprocessed_msgs)
+                self.slack.post_message(
+                    f"[ALERT] Brain idle for {int(idle_duration // 60)} minutes "
+                    f"with {total} pending item(s). Manual intervention may be needed."
+                )
 
     def _handle_detail(self, parsed: dict):
         """Handle /detail command — show worker status and log."""
@@ -1499,6 +2041,9 @@ class IroncladeDaemon:
                 self.process_brain_decisions()
                 self.check_workers()
                 self.check_confirmed_directives()
+                self.check_idle_enforcement()
+                self.check_post_kill_sweep()
+                self.check_message_aging()
             self.post_heartbeat()
             self._run_maintenance()
             self.slack.flush_queue()

@@ -63,3 +63,4 @@
    - Notify the operator that the worker is paused due to rate limit
    - Only switch to usage credits if the operator explicitly instructs it
    - Usage credits have cost implications that require operator approval
+20. **Fix Before Reporting** — When you discover a problem, attempt a fix first (spawn a worker, run a command, restart a service). If the fix requires operator action, pin a decision-format escalation with options. Never post a message that identifies a problem without either (a) an action you already took or (b) a pinned escalation with actionable next steps. Pure problem reports are rejected by the grader.

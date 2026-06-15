@@ -21,6 +21,9 @@
   ],
   "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.22.0",
     "better-sqlite3": "^12.4.1",

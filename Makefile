@@ -1,14 +1,20 @@
 .PHONY: tailscale-serve-setup deploy-hooks
 
-PLUGIN_CACHE_HOOK_DIR := $(HOME)/.claude/plugins/cache/ironclaude/ironclaude/1.0.8/hooks
+PLUGIN_CACHE_HOOK_DIR := $(HOME)/.claude/plugins/cache/ironclaude/ironclaude/1.0.10/hooks
 STABLE_HOOK_DIR := $(HOME)/.claude/ironclaude-hooks
 
-# Deploys updated hooks to both active runtime locations (plugin cache + stable dir).
+# Deploys ALL worker hooks to the runtime locations (stable dir + plugin cache).
 # Run after editing any file in worker/hooks/.
 deploy-hooks:
-	cp worker/hooks/episodic-memory-sync.sh $(PLUGIN_CACHE_HOOK_DIR)/episodic-memory-sync.sh
-	cp worker/hooks/episodic-memory-sync.sh $(STABLE_HOOK_DIR)/episodic-memory-sync.sh
-	@echo "Deployed episodic-memory-sync.sh to plugin cache and stable hooks dir"
+	@mkdir -p "$(STABLE_HOOK_DIR)"
+	cp worker/hooks/*.sh "$(STABLE_HOOK_DIR)/"
+	@if [ -d "$(PLUGIN_CACHE_HOOK_DIR)" ]; then \
+	  cp worker/hooks/*.sh "$(PLUGIN_CACHE_HOOK_DIR)/"; \
+	  echo "Deployed to plugin cache $(PLUGIN_CACHE_HOOK_DIR)"; \
+	else \
+	  echo "WARN: plugin cache $(PLUGIN_CACHE_HOOK_DIR) absent — stable dir updated only"; \
+	fi
+	@echo "Deployed $$(ls worker/hooks/*.sh | wc -l | tr -d ' ') hooks to $(STABLE_HOOK_DIR)"
 
 
 # Path to music_review directory (machine-specific — not committed).

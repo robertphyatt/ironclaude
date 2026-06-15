@@ -31,6 +31,11 @@ DB_PATH="$HOME/.claude/ironclaude.db"
 # Error sideband log (MCP tool errors written here, surfaced by hooks)
 MCP_ERROR_LOG="$HOME/.claude/ironclaude-errors.log"
 
+# Per-invocation DB validation sentinel — avoids redundant WAL + session checks on repeated db calls.
+# Uses a file (not a variable) because db functions are called via $() subshells; file writes propagate.
+export _IC_DB_VALIDATED="/tmp/.ic-db-validated-$$"
+trap "rm -f '${_IC_DB_VALIDATED}' 2>/dev/null" EXIT
+
 # portable_md5 - Cross-platform MD5 hash (macOS uses md5, Linux/Windows use md5sum)
 # Reads from stdin, outputs raw hex hash to stdout
 portable_md5() {
@@ -260,21 +265,25 @@ db_read_or_fail() {
     hard_fail "$hook" "DB file does not exist: $DB_PATH"
   fi
 
-  # Layer 2: WAL mode check
-  local journal
-  journal=$(sqlite3 "$DB_PATH" ".timeout 10000" "PRAGMA journal_mode;" 2>&1)
-  if [ "$journal" != "wal" ]; then
-    hard_fail "$hook" "Journal mode is '$journal', expected 'wal'. DB: $DB_PATH"
-  fi
+  # Layers 2-3: WAL + session check (cached per hook invocation via sentinel file)
+  if [ ! -f "${_IC_DB_VALIDATED:-/nonexistent}" ]; then
+    # Layer 2: WAL mode check
+    local journal
+    journal=$(sqlite3 "$DB_PATH" ".timeout 10000" "PRAGMA journal_mode;" 2>&1)
+    if [ "$journal" != "wal" ]; then
+      hard_fail "$hook" "Journal mode is '$journal', expected 'wal'. DB: $DB_PATH"
+    fi
 
-  # Layer 3: Session existence
-  local safe_session
-  safe_session=$(echo "$SESSION_TAG" | sed "s/'/''/g")
-  local row_count
-  row_count=$(sqlite3 "$DB_PATH" ".timeout 10000" \
-    "SELECT COUNT(*) FROM sessions WHERE terminal_session='${safe_session}';" 2>&1)
-  if [ "$row_count" = "0" ] || [ -z "$row_count" ]; then
-    hard_fail "$hook" "Session not found in DB: $SESSION_TAG (count=${row_count:-empty})"
+    # Layer 3: Session existence
+    local safe_session
+    safe_session=$(echo "$SESSION_TAG" | sed "s/'/''/g")
+    local row_count
+    row_count=$(sqlite3 "$DB_PATH" ".timeout 10000" \
+      "SELECT COUNT(*) FROM sessions WHERE terminal_session='${safe_session}';" 2>&1)
+    if [ "$row_count" = "0" ] || [ -z "$row_count" ]; then
+      hard_fail "$hook" "Session not found in DB: $SESSION_TAG (count=${row_count:-empty})"
+    fi
+    touch "$_IC_DB_VALIDATED"
   fi
 
   # Layer 4: Actual query with stderr captured
@@ -309,21 +318,25 @@ db_read() {
     hard_fail "$hook" "DB file does not exist: $DB_PATH"
   fi
 
-  # Layer 2: WAL mode check
-  local journal
-  journal=$(sqlite3 "$DB_PATH" ".timeout 10000" "PRAGMA journal_mode;" 2>&1)
-  if [ "$journal" != "wal" ]; then
-    hard_fail "$hook" "Journal mode is '$journal', expected 'wal'. DB: $DB_PATH"
-  fi
+  # Layers 2-3: WAL + session check (cached per hook invocation via sentinel file)
+  if [ ! -f "${_IC_DB_VALIDATED:-/nonexistent}" ]; then
+    # Layer 2: WAL mode check
+    local journal
+    journal=$(sqlite3 "$DB_PATH" ".timeout 10000" "PRAGMA journal_mode;" 2>&1)
+    if [ "$journal" != "wal" ]; then
+      hard_fail "$hook" "Journal mode is '$journal', expected 'wal'. DB: $DB_PATH"
+    fi
 
-  # Layer 3: Session existence
-  local safe_session
-  safe_session=$(echo "$SESSION_TAG" | sed "s/'/''/g")
-  local row_count
-  row_count=$(sqlite3 "$DB_PATH" ".timeout 10000" \
-    "SELECT COUNT(*) FROM sessions WHERE terminal_session='${safe_session}';" 2>&1)
-  if [ "$row_count" = "0" ] || [ -z "$row_count" ]; then
-    hard_fail "$hook" "Session not found in DB: $SESSION_TAG (count=${row_count:-empty})"
+    # Layer 3: Session existence
+    local safe_session
+    safe_session=$(echo "$SESSION_TAG" | sed "s/'/''/g")
+    local row_count
+    row_count=$(sqlite3 "$DB_PATH" ".timeout 10000" \
+      "SELECT COUNT(*) FROM sessions WHERE terminal_session='${safe_session}';" 2>&1)
+    if [ "$row_count" = "0" ] || [ -z "$row_count" ]; then
+      hard_fail "$hook" "Session not found in DB: $SESSION_TAG (count=${row_count:-empty})"
+    fi
+    touch "$_IC_DB_VALIDATED"
   fi
 
   # Layer 4: Query with timeout — return default on empty
@@ -387,7 +400,7 @@ db_audit_log() {
   local safe_session
   safe_session=$(echo "$SESSION_TAG" | sed "s/'/''/g")
   sqlite3 "$DB_PATH" ".timeout 10000" \
-    "INSERT INTO audit_log (timestamp, terminal_session, actor, action, old_value, new_value, context) VALUES (datetime('now'), '${safe_session}', '${actor}', '${action}', '${old_val}', '${new_val}', '${context}');" 2>/dev/null || true
+    "INSERT INTO audit_log (created_at, terminal_session, actor, action, old_value, new_value, context) VALUES (datetime('now'), '${safe_session}', '${actor}', '${action}', '${old_val}', '${new_val}', '${context}');" 2>/dev/null || true
 }
 
 # surface_mcp_errors - Read and display MCP error sideband log

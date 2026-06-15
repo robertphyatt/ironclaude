@@ -140,6 +140,25 @@ Do NOT invoke executing-plans without estimated_memory_gb in the plan."
     log_hook "professional-mode-guard" "Allowed" "skill tool"
     exit 0
     ;;
+esac
+
+# ─── Debug mode: allow config writes when debug_allow_config_writes is set ───
+if [[ "$TOOL_NAME" == "Edit" || "$TOOL_NAME" == "Write" ]]; then
+  CONFIG_FILE="$HOME/.claude/ironclaude-hooks-config.json"
+  DEBUG_WRITES="false"
+  if [ -f "$CONFIG_FILE" ] && command -v jq &>/dev/null; then
+    DEBUG_WRITES=$(jq -r '.debug_allow_config_writes // false' "$CONFIG_FILE" 2>/dev/null || echo "false")
+  fi
+  if [ "$DEBUG_WRITES" = "true" ]; then
+    CANONICAL_PATH=$(realpath -m "$FILE_PATH" 2>/dev/null || echo "$FILE_PATH")
+    if [[ "$CANONICAL_PATH" == "$HOME/.claude/"* ]]; then
+      log_warning "professional-mode-guard" "DEBUG BYPASS — config write allowed: ${FILE_PATH}"
+      exit 0
+    fi
+  fi
+fi
+
+case "$TOOL_NAME" in
   EnterPlanMode|ExitPlanMode)
     block_pretooluse "professional-mode-guard" "BLOCKED — USE BRAINSTORMING INSTEAD
 
@@ -152,20 +171,25 @@ Do NOT use EnterPlanMode or ExitPlanMode. Use the brainstorming skill for all de
     ;;
 esac
 
+# Read workflow_stage once for all write-tool decisions (eliminates duplicate reads — see P5)
+if [[ "$TOOL_NAME" == "Edit" || "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "MultiEdit" || \
+      "$TOOL_NAME" == "Bash" || "$TOOL_NAME" == "NotebookEdit" ]]; then
+  WORKFLOW=$(db_read_or_fail "professional-mode-guard" \
+    "SELECT workflow_stage FROM sessions WHERE terminal_session='${SAFE_SESSION}';") || {
+    block_pretooluse "professional-mode-guard" "BLOCKED — DATABASE ERROR
+
+Cannot read workflow_stage from the database. This is a temporary error.
+
+Try your action again. If this persists, report the error to the user."
+  }
+fi
+
 # docs/ path whitelist (design + plan gate)
 if [[ "$TOOL_NAME" == "Edit" || "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "MultiEdit" || "$TOOL_NAME" == "NotebookEdit" ]]; then
   if [[ "$FILE_PATH" == *"/docs/"* ]] || [[ "$FILE_PATH" == "docs/"* ]]; then
     # Design documents require active brainstorming
     if [[ "$FILE_PATH" == *-design.md ]]; then
-      workflow=$(db_read_or_fail "professional-mode-guard" \
-        "SELECT workflow_stage FROM sessions WHERE terminal_session='${SAFE_SESSION}';") || {
-        block_pretooluse "professional-mode-guard" "BLOCKED — DATABASE ERROR
-
-Cannot read workflow_stage from the database. This is a temporary error.
-
-Try your action again. If this persists, report the error to the user."
-      }
-      if [ "$workflow" != "brainstorming" ] && [ "$workflow" != "design_ready" ]; then
+      if [ "$WORKFLOW" != "brainstorming" ] && [ "$WORKFLOW" != "design_ready" ] && ! ([ "$WORKFLOW" = "executing" ] && [ -f "$FILE_PATH" ]); then
         block_pretooluse "professional-mode-guard" "BLOCKED — BRAINSTORMING REQUIRED FIRST
 
 Design documents can only be created during the brainstorming skill.
@@ -210,16 +234,6 @@ fi
 
 # Edit/Write/MultiEdit/Bash/NotebookEdit: inline access check (replaces HTTP check-access)
 if [[ "$TOOL_NAME" == "Edit" || "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "MultiEdit" || "$TOOL_NAME" == "Bash" || "$TOOL_NAME" == "NotebookEdit" ]]; then
-  # Read workflow_stage
-  WORKFLOW=$(db_read_or_fail "professional-mode-guard" \
-    "SELECT workflow_stage FROM sessions WHERE terminal_session='${SAFE_SESSION}';") || {
-    block_pretooluse "professional-mode-guard" "BLOCKED — DATABASE ERROR
-
-Cannot read workflow_stage from the database. This is a temporary error.
-
-Try your action again. If this persists, report the error to the user."
-  }
-
   # Not executing: block write tools (architect mode)
   if [ "$WORKFLOW" != "executing" ]; then
     # Deny-first: block dangerous git commands before any allow-exception
@@ -238,7 +252,7 @@ Do NOT run git commit, git push, git merge, or git rebase outside of plan execut
       fi
     fi
     # Exception: allow read-only git commands at any workflow stage
-    if [ "$TOOL_NAME" = "Bash" ] && echo "$FILE_PATH" | grep -qE '\bgit\s+(diff|status|log|show|blame|branch)\b'; then
+    if [ "$TOOL_NAME" = "Bash" ] && echo "$FILE_PATH" | grep -qE '\bgit\s+(diff|status|log|show|blame|branch|rev-list|ls-files|ls-tree|tag|remote|reflog|stash)\b'; then
       log_hook "professional-mode-guard" "Allowed" "read-only git command"
       exit 0
     fi
@@ -272,6 +286,21 @@ Only the following commands are allowed during code review:
 Do NOT run destructive or write commands during the reviewing stage."
       fi
     fi
+    # Exception: allow read-only commands during brainstorming/idle
+    if [ "$TOOL_NAME" = "Bash" ] && [[ "$WORKFLOW" == "brainstorming" || "$WORKFLOW" == "idle" ]]; then
+      if echo "$FILE_PATH" | grep -qE '[;&|`]|\$\('; then
+        block_pretooluse "professional-mode-guard" "BLOCKED — COMMAND CHAINING NOT ALLOWED
+
+Shell chaining operators (; && || | backtick \$()) are not permitted during brainstorming/idle.
+
+Allowed commands: cat, head, tail, wc, grep, rg, find, ls
+
+Do NOT run commands with shell operators during brainstorming or idle stages."
+      elif echo "$FILE_PATH" | grep -qE '^\s*(cat|head|tail|wc|grep|rg|find|ls)\b'; then
+        log_hook "professional-mode-guard" "Allowed" "safe bash during brainstorming/idle"
+        exit 0
+      fi
+    fi
     # Exception: allow make test* commands at any workflow stage — anchored, no chaining
     if [ "$TOOL_NAME" = "Bash" ]; then
       if ! echo "$FILE_PATH" | grep -qE '[;&|`]|\$\(' && echo "$FILE_PATH" | grep -qE '^\s*make\s+test'; then
@@ -302,6 +331,8 @@ Do NOT run destructive or write commands during the reviewing stage."
     block_pretooluse "professional-mode-guard" "BLOCKED — WRITE TOOLS NOT ALLOWED
 
 The current workflow stage is '${WORKFLOW}'. Write tools (Edit, Write, Bash) are only allowed during plan execution.
+
+Professional mode enforces a brainstorm → plan → execute workflow. Write tools are restricted to the execution phase to ensure all changes are planned and reviewed.
 
 To reach execution, follow the workflow:
 1. Call Skill tool with skill: \"ironclaude:brainstorming\" to design
@@ -354,6 +385,8 @@ ${NEXT_ACTION}"
 
 The file '${FILE_PATH}' is not in the allowed_files list for the current wave's tasks.
 
+Each task specifies which files it may modify. This prevents unplanned changes from slipping in.
+
 You can only modify files listed in the plan. Check the plan for allowed_files.
 
 Do NOT modify files outside the plan. If you need this file, update the plan first."
@@ -384,6 +417,19 @@ Do NOT run git commit, git push, git merge, or git rebase."
     "SELECT review_pending FROM sessions WHERE terminal_session='${SAFE_SESSION}';" 2>/dev/null || echo "0")
   if [ "$REVIEW_PENDING" = "1" ]; then
     if [[ "$TOOL_NAME" == "Edit" || "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "MultiEdit" || "$TOOL_NAME" == "Bash" || "$TOOL_NAME" == "NotebookEdit" ]]; then
+      # Dual-check: verify a submitted task actually exists in the current wave.
+      # Stale flags occur when get-back-to-work advances tasks to review_passed without
+      # clearing sessions.review_pending, or after worker compaction loses review context.
+      CURRENT_WAVE=$(sqlite3 "$DB_PATH" ".timeout 5000" \
+        "SELECT current_wave FROM sessions WHERE terminal_session='${SAFE_SESSION}';" 2>/dev/null || echo "0")
+      SUBMITTED_COUNT=$(sqlite3 "$DB_PATH" ".timeout 5000" \
+        "SELECT COUNT(*) FROM wave_tasks WHERE terminal_session='${SAFE_SESSION}' AND wave_number='${CURRENT_WAVE}' AND status='submitted';" 2>/dev/null || echo "0")
+      if [ "${SUBMITTED_COUNT:-0}" = "0" ]; then
+        sqlite3 "$DB_PATH" ".timeout 5000" \
+          "UPDATE sessions SET review_pending=0, review_block_count=0 WHERE terminal_session='${SAFE_SESSION}';" 2>/dev/null || true
+        log_hook "professional-mode-guard" "Auto-cleared" "stale review_pending — 0 submitted tasks in wave ${CURRENT_WAVE}"
+        exit 0
+      fi
       sqlite3 "$DB_PATH" ".timeout 5000" \
         "UPDATE sessions SET review_block_count = review_block_count + 1 WHERE terminal_session='${SAFE_SESSION}';" 2>/dev/null || true
       REVIEW_BLOCK_COUNT=$(sqlite3 "$DB_PATH" ".timeout 5000" \

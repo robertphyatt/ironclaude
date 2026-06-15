@@ -21,14 +21,47 @@ import threading
 import time
 from glob import glob
 from pathlib import Path
+from ironclaude.grader import LocalGrader
 from ironclaude.signal_forensics import _logged_kill
 
 logger = logging.getLogger("ironclaude.brain")
+
+_PERMISSION_SEEKING_SYSTEM = (
+    "You detect whether a message contains permission-seeking language — "
+    "phrases that ask the user for permission rather than acting autonomously.\n\n"
+    "Permission-seeking phrases include: 'Shall I', 'Should I', 'Would you like me to', "
+    "'Do you want', 'Want me to', 'Let me know if', 'Would you like', 'Shall we', 'Should we'.\n\n"
+    "Check ONLY the text provided — it is already the final sentence or clause.\n\n"
+    'Respond ONLY with valid JSON: {"permission_seeking": true} or {"permission_seeking": false}'
+)
+_PERMISSION_SEEKING_SCHEMA = {
+    "type": "object",
+    "properties": {"permission_seeking": {"type": "boolean"}},
+    "required": ["permission_seeking"],
+}
 
 
 def _backoff_seconds(attempt: int, max_seconds: float = 300.0) -> float:
     """Exponential backoff: min(2^attempt, max_seconds)."""
     return min(2 ** attempt, max_seconds)
+
+
+def _is_model_unavailable(exc: Exception) -> bool:
+    """Return True if exc signals the configured model is unavailable or inaccessible."""
+    stderr = getattr(exc, "stderr", None)
+    if not hasattr(exc, "exit_code") or stderr is None:
+        return False
+    stderr_lower = stderr.lower()
+    return (
+        "selected model" in stderr_lower
+        or (
+            "model" in stderr_lower
+            and (
+                "not available" in stderr_lower
+                or "not have access" in stderr_lower
+            )
+        )
+    )
 
 
 class BrainClient:
@@ -63,19 +96,6 @@ class BrainClient:
         "'shall I', 'should I', 'would you like me to', or "
         "similar questions — just proceed with the implied task."
     )
-    _PERMISSION_SEEKING_RE = re.compile(
-        r'\bshall I\b'
-        r'|\bshould I\b'
-        r'|\bwould you like me to\b'
-        r'|\bdo you want\b'
-        r'|\bwant me to\b'
-        r'|\blet me know if\b'
-        r'|\bwould you like\b'
-        r'|\bshall we\b'
-        r'|\bshould we\b',
-        re.IGNORECASE,
-    )
-
     @staticmethod
     def discover_episodic_memory_path(
         plugin_base: str | None = None,
@@ -128,6 +148,8 @@ class BrainClient:
         self._last_restart_time = 0.0
         self._memory_armed: bool = False
         self._wiki_queried: bool = False
+        self._lookback_slack: bool = False
+        self._lookback_ledger: bool = False
         self._system_prompt: str = ""
         self._cwd: str | None = None
         self._episodic_memory_path: str | None = None
@@ -147,12 +169,20 @@ class BrainClient:
         self._session_log_path: str | None = None
         self._session_log_lock = threading.Lock()
         self._previous_session_context: str | None = None
+        self._grader = LocalGrader()
 
     def start(self, system_prompt: str, cwd: str | None = None) -> None:
         """Start the brain SDK client in a background thread."""
         self._expected_kill = True
         self._kill_brain_subprocess()   # singleton guard — kill any pre-existing brain
         self._expected_kill = False
+        self._lookback_slack = False
+        self._lookback_ledger = False
+        for f in glob("/tmp/ic/lookback-slack-*") + glob("/tmp/ic/lookback-ledger-*"):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
         self._system_prompt = system_prompt
         self._cwd = cwd
         os.environ["IC_ROLE"] = "brain"
@@ -214,8 +244,25 @@ class BrainClient:
             self._wiki_queried = True
             return (True, None)
 
+        # Lookback detection: Slack lookback (≥48h) and ledger update
+        if tool_name == "mcp__orchestrator__get_operator_messages":
+            if tool_input.get("hours_back", 0) >= 48:
+                self._lookback_slack = True
+            return (True, None)
+
+        if tool_name == "mcp__orchestrator__update_ledger":
+            self._lookback_ledger = True
+            return (True, None)
+
         # Gated orchestrator action tools require BOTH memory search and wiki query
         if tool_name in self.GATED_TOOLS:
+            if not self._lookback_slack or not self._lookback_ledger:
+                missing = []
+                if not self._lookback_slack:
+                    missing.append("Slack lookback (≥48h)")
+                if not self._lookback_ledger:
+                    missing.append("ledger update")
+                return (False, f"Required before acting: {', '.join(missing)}. Complete startup lookback first.")
             if not self._memory_armed or not self._wiki_queried:
                 missing = []
                 if not self._memory_armed:
@@ -451,17 +498,24 @@ class BrainClient:
             loop.close()
 
     def _check_permission_seeking(self, text: str) -> str | None:
-        """Detect permission-seeking language in the final sentence of a brain response.
-
-        Extracts the final sentence (split on sentence-ending punctuation + whitespace),
-        matches against known permission-seeking patterns, enforces a 3-per-10-minute
-        throttle, logs all outcomes, and returns the correction string if action should
-        be taken or None otherwise.
-        """
+        """Detect permission-seeking language in the final sentence via LLM grading."""
         parts = re.split(r'[.!?]\s+', text.rstrip())
         final_sentence = parts[-1] if parts else text
 
-        if not self._PERMISSION_SEEKING_RE.search(final_sentence):
+        result = self._grader.grade(
+            _PERMISSION_SEEKING_SYSTEM,
+            f"Check this text for permission-seeking language:\n{final_sentence}",
+            _PERMISSION_SEEKING_SCHEMA,
+        )
+
+        if result.get("infrastructure_error"):
+            logger.debug(
+                "Permission-seeking check unavailable: %s — skipping correction",
+                result.get("error_detail"),
+            )
+            return None
+
+        if not result.get("permission_seeking", False):
             return None
 
         now = time.time()
@@ -538,25 +592,8 @@ class BrainClient:
             }
         logger.info(f"MCP servers configured for brain session: {list(mcp_servers.keys())}")
 
-        if resume_session_id:
-            options = ClaudeAgentOptions(
-                system_prompt=system_prompt,
-                permission_mode="bypassPermissions",
-                include_partial_messages=False,
-                allowed_tools=self.ALLOWED_TOOLS,
-                can_use_tool=_tool_guard,
-                cwd=cwd,
-                max_buffer_size=self.MAX_BUFFER_SIZE,
-                mcp_servers=mcp_servers,
-                resume=resume_session_id,
-                fork_session=True,
-                effort=self._effort_level,
-                model=f"{self._model}[1m]",
-                betas=["context-1m-2025-08-07"],
-                setting_sources=["project", "local"],
-            )
-        else:
-            options = ClaudeAgentOptions(
+        def _build_options(model_str: str) -> ClaudeAgentOptions:
+            common = dict(
                 system_prompt=system_prompt,
                 permission_mode="bypassPermissions",
                 include_partial_messages=False,
@@ -566,10 +603,17 @@ class BrainClient:
                 max_buffer_size=self.MAX_BUFFER_SIZE,
                 mcp_servers=mcp_servers,
                 effort=self._effort_level,
-                model=f"{self._model}[1m]",
+                model=f"{model_str}[1m]",
                 betas=["context-1m-2025-08-07"],
                 setting_sources=["project", "local"],
             )
+            if resume_session_id:
+                return ClaudeAgentOptions(
+                    **common,
+                    resume=resume_session_id,
+                    fork_session=True,
+                )
+            return ClaudeAgentOptions(**common)
 
         logger.info("Brain session started")
 
@@ -606,36 +650,50 @@ class BrainClient:
             except Exception as e:
                 logger.warning(f"Failed to discover brain subprocess PID: {e}")
 
-        pid_task = asyncio.create_task(_discover_and_write_pid())
-        try:
-            async for message in query(prompt=message_generator(), options=options):
-                if isinstance(message, ResultMessage):
-                    self._session_id = message.session_id
-                    if message.usage:
-                        self._total_input_tokens += message.usage.get("input_tokens", 0) or 0
-                        self._total_output_tokens += message.usage.get("output_tokens", 0) or 0
-                    if message.total_cost_usd is not None:
-                        self._total_cost_usd += message.total_cost_usd
-                if isinstance(message, AssistantMessage):
-                    text_parts = []
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            text_parts.append(block.text)
-                    if text_parts:
-                        full_text = "\n\n".join(text_parts)
-                        self._response_queue.put(full_text)
-                        self._last_response_time = time.time()
-                        self._session_log_write(f"MSG_SEND chars={len(full_text)} preview={full_text[:100]!r}")
-                        logger.info(f"Brain response received ({len(full_text)} chars)")
-                        correction = self._check_permission_seeking(full_text)
-                        if correction is not None:
-                            await self._message_queue.put(correction)
-        finally:
-            pid_task.cancel()
+        async def _run_session(opts: ClaudeAgentOptions) -> None:
+            pid_task = asyncio.create_task(_discover_and_write_pid())
             try:
-                await pid_task
-            except (asyncio.CancelledError, Exception):
-                pass
+                async for message in query(prompt=message_generator(), options=opts):
+                    if isinstance(message, ResultMessage):
+                        self._session_id = message.session_id
+                        if message.usage:
+                            self._total_input_tokens += message.usage.get("input_tokens", 0) or 0
+                            self._total_output_tokens += message.usage.get("output_tokens", 0) or 0
+                        if message.total_cost_usd is not None:
+                            self._total_cost_usd += message.total_cost_usd
+                    if isinstance(message, AssistantMessage):
+                        text_parts = []
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                text_parts.append(block.text)
+                        if text_parts:
+                            full_text = "\n\n".join(text_parts)
+                            self._response_queue.put(full_text)
+                            self._last_response_time = time.time()
+                            self._session_log_write(f"MSG_SEND chars={len(full_text)} preview={full_text[:100]!r}")
+                            logger.info(f"Brain response received ({len(full_text)} chars)")
+                            correction = self._check_permission_seeking(full_text)
+                            if correction is not None:
+                                await self._message_queue.put(correction)
+            finally:
+                pid_task.cancel()
+                try:
+                    await pid_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        try:
+            await _run_session(_build_options(self._model))
+        except Exception as exc:
+            if _is_model_unavailable(exc):
+                resolved = "opus"
+                logger.error(
+                    f"BRAIN MODEL '{self._model}' NOT AVAILABLE — resolving to '{resolved}'"
+                )
+                self._model = resolved
+                await _run_session(_build_options(resolved))
+            else:
+                raise
 
     def send_message(self, text: str) -> bool:
         """Send a message to the brain. Thread-safe."""

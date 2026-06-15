@@ -6,7 +6,7 @@ import time
 import json
 from datetime import datetime, timezone, timedelta
 import pytest
-from ironclaude.brain_client import BrainClient, _backoff_seconds
+from ironclaude.brain_client import BrainClient, _backoff_seconds, _is_model_unavailable
 
 
 class TestBrainClient:
@@ -47,6 +47,7 @@ class TestBrainClient:
     def test_shutdown_when_not_started(self):
         """shutdown is safe to call when not started."""
         client = BrainClient()
+        client._kill_brain_subprocess = lambda: None
         client.shutdown()  # should not raise
         assert client.is_alive() is False
 
@@ -100,6 +101,153 @@ class TestBrainModelParameter:
         """BrainClient accepts custom model parameter."""
         client = BrainClient(model="claude-sonnet-4-5-20241022")
         assert client._model == "claude-sonnet-4-5-20241022"
+
+
+class TestIsModelUnavailable:
+    def _proc_error(self, stderr, exit_code=1):
+        """Duck-typed ProcessError for testing — matches the real SDK's attribute shape."""
+        exc = Exception(stderr)
+        exc.exit_code = exit_code
+        exc.stderr = stderr
+        return exc
+
+    def test_returns_true_for_selected_model_error(self):
+        exc = self._proc_error(
+            "There's an issue with the selected model (claude-fable-5). "
+            "It may not exist or you may not have access to it."
+        )
+        assert _is_model_unavailable(exc) is True
+
+    def test_returns_true_for_not_available_phrase(self):
+        exc = self._proc_error("model not available")
+        assert _is_model_unavailable(exc) is True
+
+    def test_returns_true_for_not_have_access_phrase(self):
+        exc = self._proc_error("model: you do not have access to it")
+        assert _is_model_unavailable(exc) is True
+
+    def test_returns_false_for_network_error(self):
+        exc = self._proc_error("connection refused: network error")
+        assert _is_model_unavailable(exc) is False
+
+    def test_returns_false_for_exception_without_stderr(self):
+        assert _is_model_unavailable(RuntimeError("something went wrong")) is False
+
+    def test_returns_false_for_exception_without_exit_code(self):
+        exc = Exception("selected model")
+        exc.stderr = "selected model"
+        # no exit_code attribute — not a ProcessError
+        assert _is_model_unavailable(exc) is False
+
+
+class TestBrainModelFallback:
+    def _proc_error(self, stderr, exit_code=1):
+        exc = Exception(stderr)
+        exc.exit_code = exit_code
+        exc.stderr = stderr
+        return exc
+
+    def _run_session(self, client, prompt="sys", cwd="/tmp", resume_id=None):
+        from unittest.mock import MagicMock, patch
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = ""
+        with patch("ironclaude.brain_client.subprocess.run", return_value=mock_proc):
+            asyncio.run(client._brain_session(prompt, cwd, resume_id))
+
+    def test_model_updates_to_opus_on_unavailable_error(self):
+        from unittest.mock import patch
+        model_error = self._proc_error(
+            "There's an issue with the selected model (fable[1m]). "
+            "It may not exist or you may not have access to it."
+        )
+        call_count = 0
+
+        async def mock_query(prompt, options):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise model_error
+            return
+            yield  # makes this an async generator
+
+        client = BrainClient(model="fable")
+        client._running = False
+        client._message_queue = asyncio.Queue()
+
+        with patch("claude_agent_sdk.query", new=mock_query):
+            self._run_session(client)
+
+        assert client._model == "opus"
+
+    def test_error_logged_on_fallback(self, caplog):
+        import logging
+        from unittest.mock import patch
+        model_error = self._proc_error(
+            "There's an issue with the selected model (fable[1m])."
+        )
+        call_count = 0
+
+        async def mock_query(prompt, options):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise model_error
+            return
+            yield
+
+        client = BrainClient(model="fable")
+        client._running = False
+        client._message_queue = asyncio.Queue()
+
+        with patch("claude_agent_sdk.query", new=mock_query):
+            with caplog.at_level(logging.ERROR, logger="ironclaude.brain"):
+                self._run_session(client)
+
+        error_messages = [r.message for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("NOT AVAILABLE" in m and "opus" in m for m in error_messages)
+
+    def test_non_model_process_error_propagates(self):
+        from unittest.mock import patch
+        network_error = self._proc_error("connection refused: network down")
+
+        async def mock_query(prompt, options):
+            raise network_error
+            yield
+
+        client = BrainClient(model="fable")
+        client._running = False
+        client._message_queue = asyncio.Queue()
+
+        with patch("claude_agent_sdk.query", new=mock_query):
+            with pytest.raises(Exception) as exc_info:
+                self._run_session(client)
+
+        assert exc_info.value is network_error
+
+    def test_second_attempt_failure_propagates(self):
+        from unittest.mock import patch
+        model_error = self._proc_error("selected model not available")
+        second_error = RuntimeError("API completely down")
+        call_count = 0
+
+        async def mock_query(prompt, options):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise model_error
+            raise second_error
+            yield
+
+        client = BrainClient(model="fable")
+        client._running = False
+        client._message_queue = asyncio.Queue()
+
+        with patch("claude_agent_sdk.query", new=mock_query):
+            with pytest.raises(RuntimeError) as exc_info:
+                self._run_session(client)
+
+        assert exc_info.value is second_error
 
 
 class TestBrainBufferAndMemory:
@@ -204,6 +352,7 @@ class TestBrainLivenessTimeout:
         client._last_response_time = client._last_message_time - 10
         # Mock start() to avoid real SDK session
         client.start = lambda *a, **kw: setattr(client, '_running', True)
+        client._kill_brain_subprocess = lambda: None
         client.restart("test prompt")
         assert client._last_message_time == 0.0
         assert client._last_response_time == 0.0
@@ -226,6 +375,7 @@ class TestBrainLivenessTimeout:
             client._thread.start()
             client._stop_event = new_stop
         client.start = fake_start
+        client._kill_brain_subprocess = lambda: None
         client.restart("test prompt")
         assert client.needs_restart() is False
         client._stop_event.set()  # Clean up new thread
@@ -272,6 +422,7 @@ class TestCircuitBreaker:
             client._thread.start()
             client._stop_event = stop
         client.start = fake_start
+        client._kill_brain_subprocess = lambda: None
         assert len(client._restart_timestamps) == 0
         client.restart("test prompt")
         assert len(client._restart_timestamps) == 1
@@ -353,6 +504,8 @@ class TestMemoryToggle:
     def test_gated_tool_denied_when_unarmed(self):
         """Gated orchestrator action denied when memory not searched first."""
         client = BrainClient()
+        client._lookback_slack = True
+        client._lookback_ledger = True
         allowed, msg = client._tool_guard_logic(
             "mcp__orchestrator__spawn_worker", {"worker_id": "w1"}
         )
@@ -363,6 +516,8 @@ class TestMemoryToggle:
     def test_gated_tool_denied_uses_operator_name(self):
         """Denial message includes configured operator_name."""
         client = BrainClient(operator_name="Alice")
+        client._lookback_slack = True
+        client._lookback_ledger = True
         allowed, msg = client._tool_guard_logic(
             "mcp__orchestrator__spawn_worker", {"worker_id": "w1"}
         )
@@ -384,6 +539,8 @@ class TestMemoryToggle:
         client = BrainClient()
         client._memory_armed = True
         client._wiki_queried = True
+        client._lookback_slack = True
+        client._lookback_ledger = True
         allowed, msg = client._tool_guard_logic(
             "mcp__orchestrator__approve_plan", {"worker_id": "w1", "rationale": "ok"}
         )
@@ -395,6 +552,8 @@ class TestMemoryToggle:
         client = BrainClient()
         client._memory_armed = True
         client._wiki_queried = True
+        client._lookback_slack = True
+        client._lookback_ledger = True
         client._tool_guard_logic(
             "mcp__orchestrator__reject_plan", {"worker_id": "w1", "reason": "bad"}
         )
@@ -404,6 +563,8 @@ class TestMemoryToggle:
     def test_kill_worker_denied_when_unarmed(self):
         """kill_worker is a gated tool — denied when memory not searched first."""
         client = BrainClient()
+        client._lookback_slack = True
+        client._lookback_ledger = True
         allowed, msg = client._tool_guard_logic(
             "mcp__orchestrator__kill_worker", {"worker_id": "w1"}
         )
@@ -413,6 +574,8 @@ class TestMemoryToggle:
     def test_spawn_workers_denied_when_unarmed(self):
         """spawn_workers (plural) is a gated tool — denied when memory not searched first."""
         client = BrainClient()
+        client._lookback_slack = True
+        client._lookback_ledger = True
         allowed, msg = client._tool_guard_logic(
             "mcp__orchestrator__spawn_workers", {"requests": []}
         )
@@ -424,6 +587,8 @@ class TestMemoryToggle:
         client = BrainClient()
         client._memory_armed = True
         client._wiki_queried = True
+        client._lookback_slack = True
+        client._lookback_ledger = True
         allowed, msg = client._tool_guard_logic(
             "mcp__orchestrator__kill_worker", {"worker_id": "w1"}
         )
@@ -437,6 +602,8 @@ class TestMemoryToggle:
         client = BrainClient()
         client._memory_armed = True
         client._wiki_queried = True
+        client._lookback_slack = True
+        client._lookback_ledger = True
         allowed, msg = client._tool_guard_logic(
             "mcp__orchestrator__spawn_workers", {"requests": []}
         )
@@ -688,6 +855,8 @@ class TestResearchOllamaToolGuard:
         """Ollama mutation tools denied when _memory_armed is False."""
         client = BrainClient()
         assert client._memory_armed is False
+        client._lookback_slack = True
+        client._lookback_ledger = True
         for tool_name in [
             "mcp__ollama__pull_model",
             "mcp__ollama__remove_model",
@@ -707,6 +876,8 @@ class TestResearchOllamaToolGuard:
         ]:
             client._memory_armed = True
             client._wiki_queried = True
+            client._lookback_slack = True
+            client._lookback_ledger = True
             allowed, msg = client._tool_guard_logic(tool_name, {})
             assert allowed is True, f"{tool_name} should be allowed when armed"
             assert msg is None
@@ -716,6 +887,8 @@ class TestResearchOllamaToolGuard:
         client = BrainClient()
         client._memory_armed = True
         client._wiki_queried = True
+        client._lookback_slack = True
+        client._lookback_ledger = True
         client._tool_guard_logic("mcp__ollama__pull_model", {})
         assert client._memory_armed is False
         assert client._wiki_queried is False
@@ -887,6 +1060,7 @@ class TestMCPDiscovery:
         client.discover_episodic_memory_path = staticmethod(lambda **kw: "/fake/memory.js")
         # Patch _run_event_loop to prevent actual threading
         client._run_event_loop = lambda *a, **kw: None
+        client._kill_brain_subprocess = lambda: None
         client._running = False
         client.start("test prompt", "/tmp")
         assert client._research_mcp_path is not None
@@ -896,6 +1070,7 @@ class TestMCPDiscovery:
         client = BrainClient()
         client.discover_episodic_memory_path = staticmethod(lambda **kw: "/fake/memory.js")
         client._run_event_loop = lambda *a, **kw: None
+        client._kill_brain_subprocess = lambda: None
         client._running = False
         client.start("test prompt", "/tmp")
         assert client._ollama_mcp_path is not None
@@ -907,6 +1082,7 @@ class TestMCPDiscovery:
         client = BrainClient()
         client.discover_episodic_memory_path = staticmethod(lambda **kw: "/fake/memory.js")
         client._run_event_loop = lambda *a, **kw: None
+        client._kill_brain_subprocess = lambda: None
         client._running = False
         client.start("test prompt", "/tmp")
         assert client._research_mcp_path == expected
@@ -922,9 +1098,14 @@ class TestBrainPIDTracking:
 
     def test_kill_subprocess_safe_when_no_pid(self, tmp_path, monkeypatch):
         """_kill_brain_subprocess is safe when no PID is known and no PID file exists."""
+        from unittest.mock import patch, MagicMock
         client = BrainClient()
+        client._brain_pid = None  # Reset any PID read from real brain.pid on disk
         monkeypatch.setattr(BrainClient, 'BRAIN_PID_FILE', str(tmp_path / 'brain.pid'))
-        client._kill_brain_subprocess()  # Must not raise
+        # Prevent pgrep fallback from finding a real running brain process
+        with patch('ironclaude.brain_client.subprocess.run') as mock_run:
+            mock_run.return_value = MagicMock(stdout='', returncode=1)
+            client._kill_brain_subprocess()  # Must not raise
         assert client._brain_pid is None
 
     def test_kill_subprocess_cleans_up_stale_pid_file(self, tmp_path, monkeypatch):
@@ -992,6 +1173,7 @@ class TestBrainPIDTracking:
         client = BrainClient()
         client.discover_episodic_memory_path = staticmethod(lambda **kw: "/fake/memory.js")
         client._run_event_loop = lambda *a, **kw: None
+        client._kill_brain_subprocess = lambda: None
         client._running = False
         client.start("test prompt", "/tmp")
         assert client._ollama_mcp_path == expected
@@ -1011,9 +1193,16 @@ class TestBrainPIDTracking:
 class TestPermissionSeekingFilter:
     """_check_permission_seeking detects permission-seeking language and throttles corrections."""
 
+    def _mk(self, seeking: bool = False):
+        from unittest.mock import MagicMock
+        client = BrainClient()
+        client._grader = MagicMock()
+        client._grader.grade.return_value = {"permission_seeking": seeking}
+        return client
+
     def test_clean_text_returns_none(self):
         """Clean response with no permission-seeking returns None."""
-        client = BrainClient()
+        client = self._mk(seeking=False)
         result = client._check_permission_seeking(
             "I analyzed the problem and found the root cause."
         )
@@ -1021,7 +1210,7 @@ class TestPermissionSeekingFilter:
 
     def test_detects_shall_i(self):
         """'Shall I' in final sentence triggers correction."""
-        client = BrainClient()
+        client = self._mk(seeking=True)
         result = client._check_permission_seeking(
             "I analyzed the issue. Shall I proceed?"
         )
@@ -1029,7 +1218,7 @@ class TestPermissionSeekingFilter:
 
     def test_detects_should_i(self):
         """'Should I' in final sentence triggers correction."""
-        client = BrainClient()
+        client = self._mk(seeking=True)
         result = client._check_permission_seeking(
             "Found the bug. Should I implement the fix?"
         )
@@ -1037,7 +1226,7 @@ class TestPermissionSeekingFilter:
 
     def test_detects_would_you_like_me_to(self):
         """'Would you like me to' triggers correction."""
-        client = BrainClient()
+        client = self._mk(seeking=True)
         result = client._check_permission_seeking(
             "Would you like me to make these changes?"
         )
@@ -1045,7 +1234,7 @@ class TestPermissionSeekingFilter:
 
     def test_detects_do_you_want(self):
         """'Do you want' triggers correction."""
-        client = BrainClient()
+        client = self._mk(seeking=True)
         result = client._check_permission_seeking(
             "Do you want me to proceed with the implementation?"
         )
@@ -1053,13 +1242,13 @@ class TestPermissionSeekingFilter:
 
     def test_detects_want_me_to(self):
         """'Want me to' triggers correction."""
-        client = BrainClient()
+        client = self._mk(seeking=True)
         result = client._check_permission_seeking("Want me to fix this now?")
         assert result is not None
 
     def test_detects_let_me_know_if(self):
         """'Let me know if' triggers correction."""
-        client = BrainClient()
+        client = self._mk(seeking=True)
         result = client._check_permission_seeking(
             "Let me know if you'd like me to continue."
         )
@@ -1067,8 +1256,7 @@ class TestPermissionSeekingFilter:
 
     def test_pattern_in_middle_only_returns_none(self):
         """Pattern only in middle sentence (clean final) returns None."""
-        client = BrainClient()
-        # 'Shall I?' is the first sentence; final sentence is clean
+        client = self._mk(seeking=False)
         result = client._check_permission_seeking(
             "Shall I? Actually I will just do it."
         )
@@ -1076,34 +1264,30 @@ class TestPermissionSeekingFilter:
 
     def test_case_insensitive(self):
         """Pattern matching is case insensitive."""
-        client = BrainClient()
+        client = self._mk(seeking=True)
         result = client._check_permission_seeking("SHALL I PROCEED?")
         assert result is not None
 
     def test_throttled_after_limit(self):
         """Returns None after MAX_PERMISSION_CORRECTIONS corrections in window."""
-        client = BrainClient()
-        # Use up the 3-correction budget
+        client = self._mk(seeking=True)
         for _ in range(BrainClient.MAX_PERMISSION_CORRECTIONS):
             r = client._check_permission_seeking("Shall I proceed?")
             assert r is not None
-        # 4th should be throttled
         result = client._check_permission_seeking("Shall I proceed?")
         assert result is None
 
     def test_throttle_window_prunes_old_timestamps(self):
         """Timestamps older than PERMISSION_CORRECTION_WINDOW are pruned, allowing new corrections."""
-        client = BrainClient()
+        client = self._mk(seeking=True)
         old = time.time() - client.PERMISSION_CORRECTION_WINDOW - 100
-        # Pre-load 3 old (expired) timestamps
         client._permission_correction_timestamps = [old, old - 10, old - 20]
-        # Should NOT be throttled — all timestamps are expired
         result = client._check_permission_seeking("Shall I proceed?")
         assert result is not None
 
     def test_correction_message_content(self):
         """Returned correction message tells brain to continue without asking."""
-        client = BrainClient()
+        client = self._mk(seeking=True)
         result = client._check_permission_seeking("Shall I proceed?")
         assert result is not None
         assert "Continue without asking" in result
@@ -1111,7 +1295,7 @@ class TestPermissionSeekingFilter:
     def test_logs_on_correction(self, caplog):
         """logger.info is called when a correction is sent."""
         import logging
-        client = BrainClient()
+        client = self._mk(seeking=True)
         with caplog.at_level(logging.INFO, logger="ironclaude.brain"):
             result = client._check_permission_seeking("Shall I proceed?")
         assert result is not None
@@ -1120,11 +1304,9 @@ class TestPermissionSeekingFilter:
     def test_logs_on_throttle(self, caplog):
         """logger.info is called when correction is throttled."""
         import logging
-        client = BrainClient()
-        # Use up the budget
+        client = self._mk(seeking=True)
         for _ in range(BrainClient.MAX_PERMISSION_CORRECTIONS):
             client._check_permission_seeking("Shall I proceed?")
-        # Next call is throttled — check log
         with caplog.at_level(logging.INFO, logger="ironclaude.brain"):
             result = client._check_permission_seeking("Shall I proceed?")
         assert result is None
@@ -1193,6 +1375,7 @@ class TestShutdownWakesOrphanedThreads:
         """shutdown() must set _stop_event to interrupt backoff sleeps."""
         client = BrainClient()
         assert not client._stop_event.is_set()
+        client._kill_brain_subprocess = lambda: None
         client.shutdown()
         assert client._stop_event.is_set()
 
@@ -1217,6 +1400,7 @@ class TestShutdownWakesOrphanedThreads:
         assert started.wait(timeout=2.0), "Thread did not start"
 
         thread_ref = client._thread  # Save before shutdown() nullifies it
+        client._kill_brain_subprocess = lambda: None
         client.shutdown()  # Already joins with timeout=10
         thread_ref.join(timeout=2.0)
 
@@ -1235,6 +1419,7 @@ class TestShutdownWakesOrphanedThreads:
 
         client._run_event_loop = fake_run_loop
         client.discover_episodic_memory_path = lambda: str(tmp_path / "fake.js")
+        client._kill_brain_subprocess = lambda: None
 
         client.start("test prompt")
         deadline = time.time() + 2.0
@@ -1252,7 +1437,8 @@ class TestKillSubprocessDiagnostics:
         """_kill_brain_subprocess logs its call stack."""
         from unittest.mock import patch
         client = BrainClient()
-        with patch('ironclaude.brain_client.logger') as mock_logger:
+        with patch('ironclaude.brain_client.logger') as mock_logger, \
+             patch('ironclaude.brain_client.os.kill', lambda pid, sig: None):
             client._kill_brain_subprocess()
         info_calls = [str(c) for c in mock_logger.info.call_args_list]
         assert any("_kill_brain_subprocess called from:" in c for c in info_calls)
@@ -1479,6 +1665,8 @@ class TestWikiGate:
         client = BrainClient()
         client._memory_armed = True
         client._wiki_queried = False
+        client._lookback_slack = True
+        client._lookback_ledger = True
         allowed, msg = client._tool_guard_logic(
             "mcp__orchestrator__spawn_worker", {"worker_id": "w1"}
         )
@@ -1490,6 +1678,8 @@ class TestWikiGate:
         client = BrainClient()
         client._memory_armed = False
         client._wiki_queried = True
+        client._lookback_slack = True
+        client._lookback_ledger = True
         allowed, msg = client._tool_guard_logic(
             "mcp__orchestrator__spawn_worker", {"worker_id": "w1"}
         )
@@ -1500,6 +1690,8 @@ class TestWikiGate:
         client = BrainClient()
         client._memory_armed = True
         client._wiki_queried = True
+        client._lookback_slack = True
+        client._lookback_ledger = True
         allowed, msg = client._tool_guard_logic(
             "mcp__orchestrator__spawn_worker", {"worker_id": "w1"}
         )
@@ -1510,6 +1702,8 @@ class TestWikiGate:
         client = BrainClient()
         client._memory_armed = True
         client._wiki_queried = True
+        client._lookback_slack = True
+        client._lookback_ledger = True
         client._tool_guard_logic(
             "mcp__orchestrator__approve_plan", {"worker_id": "w1", "rationale": "ok"}
         )
@@ -1537,6 +1731,8 @@ class TestWikiGate:
     def test_full_gate_sequence(self):
         """Full flow: search episodic → query wiki → gated action allowed → flags reset."""
         client = BrainClient()
+        client._lookback_slack = True
+        client._lookback_ledger = True
         client._tool_guard_logic("mcp__episodic-memory__search", {"query": "test"})
         assert client._memory_armed is True
         assert client._wiki_queried is False
@@ -1548,6 +1744,162 @@ class TestWikiGate:
         assert allowed is True
         assert client._memory_armed is False
         assert client._wiki_queried is False
+
+
+class TestLookbackGate:
+    """Startup lookback enforcement: Slack lookback + ledger update required before gated tools."""
+
+    def test_lookback_initial_state(self):
+        """_lookback_slack and _lookback_ledger start False."""
+        client = BrainClient()
+        assert client._lookback_slack is False
+        assert client._lookback_ledger is False
+
+    def test_slack_lookback_arms_flag(self):
+        """get_operator_messages with hours_back >= 48 sets _lookback_slack."""
+        client = BrainClient()
+        allowed, msg = client._tool_guard_logic(
+            "mcp__orchestrator__get_operator_messages", {"hours_back": 72}
+        )
+        assert allowed is True
+        assert msg is None
+        assert client._lookback_slack is True
+
+    def test_slack_lookback_threshold_boundary(self):
+        """hours_back == 48 is the minimum to arm the flag."""
+        client = BrainClient()
+        client._tool_guard_logic(
+            "mcp__orchestrator__get_operator_messages", {"hours_back": 48}
+        )
+        assert client._lookback_slack is True
+
+    def test_slack_lookback_below_threshold(self):
+        """hours_back < 48 does not arm the flag."""
+        client = BrainClient()
+        client._tool_guard_logic(
+            "mcp__orchestrator__get_operator_messages", {"hours_back": 47}
+        )
+        assert client._lookback_slack is False
+
+    def test_slack_lookback_missing_hours_back(self):
+        """Missing hours_back defaults to 0 — no arming."""
+        client = BrainClient()
+        client._tool_guard_logic(
+            "mcp__orchestrator__get_operator_messages", {}
+        )
+        assert client._lookback_slack is False
+
+    def test_ledger_update_arms_flag(self):
+        """update_ledger sets _lookback_ledger."""
+        client = BrainClient()
+        allowed, msg = client._tool_guard_logic(
+            "mcp__orchestrator__update_ledger", {"objective": "test", "tasks": []}
+        )
+        assert allowed is True
+        assert msg is None
+        assert client._lookback_ledger is True
+
+    def test_gated_denied_neither_lookback(self):
+        """Gated tool denied when neither lookback flag is set."""
+        client = BrainClient()
+        allowed, msg = client._tool_guard_logic(
+            "mcp__orchestrator__spawn_worker", {"worker_id": "w1"}
+        )
+        assert allowed is False
+        assert "slack lookback" in msg.lower()
+        assert "ledger update" in msg.lower()
+
+    def test_gated_denied_slack_only(self):
+        """Gated tool denied when only slack lookback done (ledger missing)."""
+        client = BrainClient()
+        client._lookback_slack = True
+        allowed, msg = client._tool_guard_logic(
+            "mcp__orchestrator__spawn_worker", {"worker_id": "w1"}
+        )
+        assert allowed is False
+        assert "ledger" in msg.lower()
+        assert "slack" not in msg.lower()
+
+    def test_gated_denied_ledger_only(self):
+        """Gated tool denied when only ledger updated (slack lookback missing)."""
+        client = BrainClient()
+        client._lookback_ledger = True
+        allowed, msg = client._tool_guard_logic(
+            "mcp__orchestrator__spawn_worker", {"worker_id": "w1"}
+        )
+        assert allowed is False
+        assert "slack" in msg.lower()
+        assert "ledger" not in msg.lower()
+
+    def test_gated_allowed_both_lookback(self):
+        """Gated tool proceeds to memory/wiki check when both lookback flags set."""
+        client = BrainClient()
+        client._lookback_slack = True
+        client._lookback_ledger = True
+        allowed, msg = client._tool_guard_logic(
+            "mcp__orchestrator__spawn_worker", {"worker_id": "w1"}
+        )
+        assert allowed is False
+        assert "memory" in msg.lower() or "wiki" in msg.lower()
+
+    def test_lookback_flags_persistent(self):
+        """Lookback flags persist after gated tool passes (unlike memory/wiki)."""
+        client = BrainClient()
+        client._lookback_slack = True
+        client._lookback_ledger = True
+        client._memory_armed = True
+        client._wiki_queried = True
+        allowed, _ = client._tool_guard_logic(
+            "mcp__orchestrator__spawn_worker", {"worker_id": "w1"}
+        )
+        assert allowed is True
+        assert client._lookback_slack is True
+        assert client._lookback_ledger is True
+        assert client._memory_armed is False
+        assert client._wiki_queried is False
+
+    def test_start_resets_lookback(self, tmp_path, monkeypatch):
+        """start() resets lookback flags and cleans up flag files."""
+        import asyncio
+        client = BrainClient()
+        client._lookback_slack = True
+        client._lookback_ledger = True
+        monkeypatch.setattr(BrainClient, 'SESSION_LOG_DIR', str(tmp_path))
+        monkeypatch.setattr(client, '_kill_brain_subprocess', lambda: None)
+        monkeypatch.setattr(
+            BrainClient, 'discover_episodic_memory_path',
+            staticmethod(lambda *a, **kw: '/fake/path'),
+        )
+        def _fake_event_loop(system_prompt, cwd):
+            client._loop = asyncio.new_event_loop()
+        monkeypatch.setattr(client, '_run_event_loop', _fake_event_loop)
+        client.start('test prompt')
+        assert client._lookback_slack is False
+        assert client._lookback_ledger is False
+
+    def test_full_lookback_sequence(self):
+        """Complete flow: lookback → memory → wiki → gated tool → allow, lookback persists."""
+        client = BrainClient()
+        client._tool_guard_logic(
+            "mcp__orchestrator__get_operator_messages", {"hours_back": 72}
+        )
+        assert client._lookback_slack is True
+        client._tool_guard_logic(
+            "mcp__orchestrator__update_ledger", {"objective": "test", "tasks": []}
+        )
+        assert client._lookback_ledger is True
+        client._tool_guard_logic("mcp__episodic-memory__search", {"query": "test"})
+        assert client._memory_armed is True
+        client._tool_guard_logic("mcp__orchestrator__wiki_query", {"keywords": "test"})
+        assert client._wiki_queried is True
+        allowed, _ = client._tool_guard_logic(
+            "mcp__orchestrator__spawn_worker", {"worker_id": "w1"}
+        )
+        assert allowed is True
+        assert client._memory_armed is False
+        assert client._wiki_queried is False
+        assert client._lookback_slack is True
+        assert client._lookback_ledger is True
 
 
 class TestLedgerStale:
@@ -1597,6 +1949,8 @@ class TestLedgerFreshnessEnforcement:
         client._cwd = str(tmp_path)
         client._memory_armed = True
         client._wiki_queried = True
+        client._lookback_slack = True
+        client._lookback_ledger = True
         wiki_dir = tmp_path / "wiki"
         wiki_dir.mkdir()
         tasks_md = wiki_dir / "tasks.md"
@@ -1612,6 +1966,8 @@ class TestLedgerFreshnessEnforcement:
         client._cwd = str(tmp_path)
         client._memory_armed = True
         client._wiki_queried = True
+        client._lookback_slack = True
+        client._lookback_ledger = True
         wiki_dir = tmp_path / "wiki"
         wiki_dir.mkdir()
         (wiki_dir / "tasks.md").write_text('"status": "in_progress"')
@@ -1626,6 +1982,8 @@ class TestLedgerFreshnessEnforcement:
         client._cwd = str(tmp_path)
         client._memory_armed = True
         client._wiki_queried = True
+        client._lookback_slack = True
+        client._lookback_ledger = True
         wiki_dir = tmp_path / "wiki"
         wiki_dir.mkdir()
         tasks_md = wiki_dir / "tasks.md"
@@ -1731,6 +2089,7 @@ class TestTokenUsageAccumulation:
         client._total_output_tokens = 100000
         client._total_cost_usd = 0.75
         client.start = lambda *a, **kw: setattr(client, '_running', True)
+        client._kill_brain_subprocess = lambda: None
         client.restart("test prompt")
         assert client._total_input_tokens == 0
         assert client._total_output_tokens == 0
@@ -1933,3 +2292,64 @@ class TestSessionLogLifecycle:
         assert diagnostic is not None
         assert lines[-1] in diagnostic     # last line present
         assert lines[0] not in diagnostic  # oldest line dropped (only last 20 kept)
+
+
+class TestCheckPermissionSeeking:
+    """_check_permission_seeking delegates to _grader.grade and preserves throttle logic."""
+
+    def _make_client(self):
+        from unittest.mock import MagicMock
+        client = BrainClient()
+        client._grader = MagicMock()
+        client._permission_correction_timestamps = []
+        return client
+
+    def test_permission_seeking_detected_returns_correction(self):
+        """grader reports permission_seeking=True → correction message returned."""
+        client = self._make_client()
+        client._grader.grade.return_value = {"permission_seeking": True}
+        result = client._check_permission_seeking("I fixed the bug.")
+        assert result is not None
+        assert "Continue without asking" in result
+
+    def test_no_permission_seeking_returns_none(self):
+        """grader reports permission_seeking=False → None."""
+        client = self._make_client()
+        client._grader.grade.return_value = {"permission_seeking": False}
+        result = client._check_permission_seeking("Shall I proceed?")
+        assert result is None
+
+    def test_infrastructure_error_fails_open(self):
+        """infrastructure_error from grader → None (fail-open, no correction)."""
+        client = self._make_client()
+        client._grader.grade.return_value = {"infrastructure_error": True, "error_detail": "Ollama down"}
+        result = client._check_permission_seeking("Shall I proceed?")
+        assert result is None
+
+    def test_throttle_still_applies_when_seeking(self):
+        """Throttle enforced after MAX_PERMISSION_CORRECTIONS within window."""
+        client = self._make_client()
+        client._grader.grade.return_value = {"permission_seeking": True}
+        for _ in range(BrainClient.MAX_PERMISSION_CORRECTIONS):
+            r = client._check_permission_seeking("I fixed the bug.")
+            assert r is not None
+        result = client._check_permission_seeking("I fixed the bug.")
+        assert result is None
+
+    def test_final_sentence_extracted_for_grader(self):
+        """Grader is called with only the final sentence, not the full text."""
+        client = self._make_client()
+        client._grader.grade.return_value = {"permission_seeking": False}
+        client._check_permission_seeking("I analyzed the issue. Shall I proceed?")
+        call_args = client._grader.grade.call_args
+        user_prompt = call_args[0][1]
+        assert "Shall I proceed?" in user_prompt
+        assert "I analyzed the issue." not in user_prompt
+
+    def test_infrastructure_error_not_throttled(self):
+        """infrastructure_error does not add timestamp — subsequent calls still allowed."""
+        client = self._make_client()
+        client._grader.grade.return_value = {"infrastructure_error": True, "error_detail": "Ollama down"}
+        for _ in range(BrainClient.MAX_PERMISSION_CORRECTIONS):
+            client._check_permission_seeking("Shall I proceed?")
+        assert client._permission_correction_timestamps == []

@@ -447,6 +447,24 @@ export const writeToolDefinitions = [
       idempotentHint: true,
     },
   },
+  {
+    name: 'clear_stale_review_pending',
+    description:
+      'Detects and clears a stale review_pending flag — set to 1 but no submitted tasks exist ' +
+      'in the current wave. Safe to call speculatively: returns {cleared: false} if flag is ' +
+      'already 0 or tasks are genuinely submitted. Idempotent.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {},
+      required: [] as string[],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -773,7 +791,7 @@ export function handleWriteTool(
       }
 
       // Update session wave counter
-      updateSession(db, resolvedId, { current_wave: nextWaveNumber });
+      updateSession(db, resolvedId, { current_wave: nextWaveNumber, review_pending: 0 });
 
       return ok({
         status: 'next_wave',
@@ -857,6 +875,13 @@ export function handleWriteTool(
       const session = getSession(db, resolvedId);
       if (!session) {
         return err('Session not found', { session_id: resolvedId });
+      }
+
+      const validClaimStages: WorkflowStage[] = ['executing', 'reviewing'];
+      if (!validClaimStages.includes(session.workflow_stage)) {
+        return err(
+          `Cannot claim task: workflow_stage must be 'executing' or 'reviewing', got '${session.workflow_stage}'`,
+        );
       }
 
       const currentWave = session.current_wave;
@@ -1080,10 +1105,28 @@ export function handleWriteTool(
         return err('Session not found', { session_id: resolvedId });
       }
 
+      let recovered = false;
       if (session.workflow_stage !== 'reviewing') {
-        return err(
-          `Cannot mark executing: workflow_stage must be 'reviewing', got '${session.workflow_stage}'`,
-        );
+        const activeTaskCount = (db.prepare(
+          `SELECT COUNT(*) as count FROM wave_tasks
+           WHERE terminal_session = ? AND status IN ('pending', 'in_progress', 'review_pending')`,
+        ).get(resolvedId) as { count: number }).count;
+
+        if (activeTaskCount > 0) {
+          insertAuditLog(db, {
+            terminal_session: resolvedId,
+            actor: 'system:state-correction',
+            action: 'workflow_stage_recovery',
+            old_value: session.workflow_stage,
+            new_value: 'executing',
+            context: `Force-corrected workflow_stage from '${session.workflow_stage}' to 'executing' — ${activeTaskCount} active wave_tasks prove execution is in progress`,
+          });
+          recovered = true;
+        } else {
+          return err(
+            `Cannot mark executing: workflow_stage must be 'reviewing', got '${session.workflow_stage}'`,
+          );
+        }
       }
 
       const passingReview = db.prepare(
@@ -1105,12 +1148,14 @@ export function handleWriteTool(
         terminal_session: resolvedId,
         actor: 'claude',
         action: 'mark_executing',
-        old_value: 'reviewing',
+        old_value: recovered ? session.workflow_stage : 'reviewing',
         new_value: 'executing',
-        context: 'Code review complete, returning to executing',
+        context: recovered
+          ? `Code review complete, returning to executing (recovered from '${session.workflow_stage}')`
+          : 'Code review complete, returning to executing',
       });
 
-      return ok({ success: true, workflow_stage: 'executing', session_id: resolvedId });
+      return ok({ success: true, workflow_stage: 'executing', session_id: resolvedId, ...(recovered && { recovered: true }) });
     }
 
     // ----- retreat -----
@@ -1299,6 +1344,43 @@ export function handleWriteTool(
         testing_theatre_checked: 1,
         session_id: resolvedId,
       });
+    }
+
+    // ----- clear_stale_review_pending -----
+    case 'clear_stale_review_pending': {
+      const session = getSession(db, resolvedId);
+      if (!session) {
+        return err('Session not found', { session_id: resolvedId });
+      }
+
+      if (session.review_pending !== 1) {
+        return ok({ cleared: false, reason: 'review_pending already 0', session_id: resolvedId });
+      }
+
+      const submittedCount = (db.prepare(
+        `SELECT COUNT(*) as count FROM wave_tasks
+         WHERE terminal_session = ? AND wave_number = ? AND status = 'submitted'`,
+      ).get(resolvedId, session.current_wave) as { count: number }).count;
+
+      if (submittedCount > 0) {
+        return ok({
+          cleared: false,
+          reason: `${submittedCount} task(s) still submitted in wave ${session.current_wave} — review genuinely pending`,
+          session_id: resolvedId,
+        });
+      }
+
+      updateSession(db, resolvedId, { review_pending: 0, review_block_count: 0 });
+      insertAuditLog(db, {
+        terminal_session: resolvedId,
+        actor: 'system:stale-flag-heal',
+        action: 'clear_stale_review_pending',
+        old_value: '1',
+        new_value: '0',
+        context: `Cleared stale review_pending — 0 submitted tasks in wave ${session.current_wave}`,
+      });
+
+      return ok({ cleared: true, wave: session.current_wave, session_id: resolvedId });
     }
 
     default:

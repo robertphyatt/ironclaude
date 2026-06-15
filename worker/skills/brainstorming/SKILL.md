@@ -43,15 +43,7 @@ Whenever soliciting user input — choices, confirmations, or selections — ALW
 
 **Step 0: Look for existing design document**
 
-If the user references an existing design or you find a recent design document:
-
-Use the Glob tool with pattern `docs/plans/*-design.md` to find design documents.
-
-If a relevant design exists and the user wants to proceed with it:
-1. Acknowledge: "Found existing design at docs/plans/X-design.md"
-2. Skip to: "Ready to create an implementation plan? Use /writing-plans docs/plans/X-design.md"
-
-If no existing design or user wants a new one, proceed with Phase 1.
+If the user references a specific design document by name, use the Read tool to open it directly. Otherwise, proceed with Phase 1.
 
 ### Phase 1: Understand the Idea
 

@@ -9,10 +9,11 @@ from ironclaude.db import init_db
 import time
 import json
 
+import psutil
 import pytest
 from unittest.mock import MagicMock, patch
 
-from ironclaude.main import CHECKIN_CADENCE, IroncladeDaemon, ensure_brain_trusted
+from ironclaude.main import CHECKIN_CADENCE, PM_GATE_STAGES, PM_GATE_SLACK_SECONDS, IroncladeDaemon, ensure_brain_trusted
 
 
 @pytest.fixture
@@ -246,27 +247,35 @@ class TestGetWorkerWorkflowStage:
 
 class TestDetectPromptWaiting:
     def test_detects_ask_user_question(self, daemon):
+        daemon._grader.grade = MagicMock(return_value={"waiting": True})
         assert daemon._detect_prompt_waiting("Tool use: AskUserQuestion\nWhat do you want?") is True
 
     def test_detects_submit_answers(self, daemon):
+        daemon._grader.grade = MagicMock(return_value={"waiting": True})
         assert daemon._detect_prompt_waiting("Submit answers to continue") is True
 
     def test_detects_options_menu(self, daemon):
+        daemon._grader.grade = MagicMock(return_value={"waiting": True})
         assert daemon._detect_prompt_waiting("options:\n1. Fix now\n2. Skip") is True
 
     def test_detects_which_approach(self, daemon):
+        daemon._grader.grade = MagicMock(return_value={"waiting": True})
         assert daemon._detect_prompt_waiting("Which approach would you prefer?") is True
 
     def test_detects_how_would_you_like(self, daemon):
+        daemon._grader.grade = MagicMock(return_value={"waiting": True})
         assert daemon._detect_prompt_waiting("How would you like to proceed?") is True
 
     def test_detects_numbered_menu(self, daemon):
+        daemon._grader.grade = MagicMock(return_value={"waiting": True})
         assert daemon._detect_prompt_waiting("  1. Option A\n  2. Option B") is True
 
     def test_no_false_positive_normal_output(self, daemon):
+        daemon._grader.grade = MagicMock(return_value={"waiting": False})
         assert daemon._detect_prompt_waiting("Running tests...\nAll 5 passed") is False
 
     def test_no_false_positive_empty(self, daemon):
+        daemon._grader.grade = MagicMock(return_value={"waiting": False})
         assert daemon._detect_prompt_waiting("") is False
 
 
@@ -804,7 +813,7 @@ class TestHandleAudit:
 class TestHeartbeatWorkerListing:
     def test_post_heartbeat_passes_worker_details(self, daemon):
         """post_heartbeat builds worker detail list from registry + workflow stage."""
-        daemon.registry.get_running_workers.return_value = [
+        daemon.registry.get_recent_workers.return_value = [
             {"id": "w-1", "tmux_session": "ic-w-1", "description": "Your task: Fix auth bug"},
         ]
         daemon._last_heartbeat = 0
@@ -825,7 +834,7 @@ class TestHeartbeatWorkerListing:
 
     def test_post_heartbeat_includes_worker_description(self, daemon):
         """post_heartbeat reads description directly from worker row."""
-        daemon.registry.get_running_workers.return_value = [
+        daemon.registry.get_recent_workers.return_value = [
             {"id": "w-1", "tmux_session": "ic-w-1", "description": "Your task: Fix the bug"},
         ]
         daemon._last_heartbeat = 0
@@ -2256,3 +2265,375 @@ class TestGetRecentWorkers:
         assert ids == {"w1", "w2"}
 
 
+class TestHashDedupBypassPromptWaiting:
+    def test_prompt_waiting_bypasses_hash_dedup(self, daemon, tmp_path):
+        """Check-in fires for prompt-waiting worker even when hash is unchanged."""
+        worker = {
+            "id": "w1", "tmux_session": "ic-w1",
+            "spawned_at": "2026-03-08 00:00:00",
+        }
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        daemon.tmux.capture_pane.return_value = "1. Sequential\n2. Parallel\n3. Inline"
+        daemon.tmux.list_pane_pid.return_value = "12345"
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        _setup_ironclaude_db(claude_dir, "12345", "abcdef01-2345-6789-abcd-ef0123456789", "plan_ready")
+        daemon._claude_dir = claude_dir
+        daemon.brain.send_message.return_value = True
+
+        daemon._last_checkin_hash["w1"] = hash("1. Sequential\n2. Parallel\n3. Inline")
+        daemon._last_checkin_sent["w1"] = time.time() - 1000
+        daemon._last_checkin_stage["w1"] = "plan_ready"
+
+        daemon._grader.grade = MagicMock(return_value={"waiting": True})
+
+        daemon.check_workers()
+        daemon.brain.send_message.assert_called_once()
+        msg = daemon.brain.send_message.call_args[0][0]
+        assert "[ACTION REQUIRED]" in msg
+
+    def test_non_prompt_waiting_still_blocked_by_hash(self, daemon, tmp_path):
+        """Hash dedup still blocks when prompt_waiting is False."""
+        worker = {
+            "id": "w1", "tmux_session": "ic-w1",
+            "spawned_at": "2026-03-08 00:00:00",
+        }
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        daemon.tmux.capture_pane.return_value = "same output"
+        daemon.tmux.list_pane_pid.return_value = "12345"
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        _setup_ironclaude_db(claude_dir, "12345", "abcdef01-2345-6789-abcd-ef0123456789", "executing")
+        daemon._claude_dir = claude_dir
+
+        daemon._last_checkin_hash["w1"] = hash("same output")
+        daemon._last_checkin_sent["w1"] = time.time() - 1000
+        daemon._last_checkin_stage["w1"] = "executing"
+
+        daemon._grader.grade = MagicMock(return_value={"waiting": False})
+
+        daemon.check_workers()
+        daemon.brain.send_message.assert_not_called()
+
+    def test_pm_gate_slack_fires_at_threshold(self, daemon, tmp_path):
+        """Slack notification fires when prompt-waiting at PM gate stage for >30 min."""
+        worker = {
+            "id": "w1", "tmux_session": "ic-w1",
+            "spawned_at": "2026-03-08 00:00:00",
+        }
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        daemon.tmux.capture_pane.return_value = "1. Sequential\n2. Parallel"
+        daemon.tmux.list_pane_pid.return_value = "12345"
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        _setup_ironclaude_db(claude_dir, "12345", "abcdef01-2345-6789-abcd-ef0123456789", "plan_ready")
+        daemon._claude_dir = claude_dir
+        daemon.brain.send_message.return_value = True
+
+        daemon._last_checkin_sent["w1"] = time.time() - 2000
+        daemon._last_checkin_stage["w1"] = "plan_ready"
+
+        daemon._stage_entered_at["w1"] = time.time() - 1860
+        daemon._last_stage_seen["w1"] = "plan_ready"
+
+        daemon._grader.grade = MagicMock(return_value={"waiting": True})
+
+        daemon.check_workers()
+        daemon.slack.post_message.assert_called_once()
+        msg = daemon.slack.post_message.call_args[0][0]
+        assert "[ALERT]" in msg
+        assert "plan_ready" in msg
+
+    def test_pm_gate_slack_deduped(self, daemon, tmp_path):
+        """PM gate Slack notification only fires once per worker per stage."""
+        worker = {
+            "id": "w1", "tmux_session": "ic-w1",
+            "spawned_at": "2026-03-08 00:00:00",
+        }
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        daemon.tmux.capture_pane.return_value = "1. Sequential\n2. Parallel"
+        daemon.tmux.list_pane_pid.return_value = "12345"
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        _setup_ironclaude_db(claude_dir, "12345", "abcdef01-2345-6789-abcd-ef0123456789", "plan_ready")
+        daemon._claude_dir = claude_dir
+        daemon.brain.send_message.return_value = True
+
+        daemon._last_checkin_sent["w1"] = time.time() - 2000
+        daemon._last_checkin_stage["w1"] = "plan_ready"
+        daemon._stage_entered_at["w1"] = time.time() - 1860
+        daemon._last_stage_seen["w1"] = "plan_ready"
+        daemon._pm_gate_slack_sent["w1"] = True
+
+        daemon._grader.grade = MagicMock(return_value={"waiting": True})
+
+        daemon.check_workers()
+        daemon.slack.post_message.assert_not_called()
+
+
+class TestStuckWorkerSlackAlert:
+    def test_slack_fires_for_prompt_waiting_stuck_alert(self, daemon):
+        """Slack notification fires alongside Brain message when prompt_waiting at stuck alert."""
+        worker = {"id": "w1", "tmux_session": "ic-w1"}
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        daemon.tmux.capture_pane.return_value = "1. Option A\n2. Option B"
+
+        daemon._stuck_hash["w1"] = hash("1. Option A\n2. Option B")
+        daemon._stuck_since["w1"] = time.time() - 960
+        daemon._stuck_alert_sent["w1"] = False
+
+        daemon._grader.grade = MagicMock(return_value={"waiting": True})
+        daemon._last_stuck_check = 0
+
+        daemon.check_stuck_workers()
+
+        daemon.brain.send_message.assert_called_once()
+        assert "[STUCK]" in daemon.brain.send_message.call_args[0][0]
+        daemon.slack.post_message.assert_called_once()
+        assert "[ALERT]" in daemon.slack.post_message.call_args[0][0]
+
+    def test_no_slack_for_non_prompt_waiting_stuck_alert(self, daemon):
+        """Slack notification does NOT fire when prompt_waiting is False at stuck alert."""
+        worker = {"id": "w1", "tmux_session": "ic-w1"}
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        daemon.tmux.capture_pane.return_value = "Running tests..."
+
+        daemon._stuck_hash["w1"] = hash("Running tests...")
+        daemon._stuck_since["w1"] = time.time() - 1900
+        daemon._stuck_alert_sent["w1"] = False
+
+        daemon._grader.grade = MagicMock(return_value={"waiting": False})
+        daemon._last_stuck_check = 0
+
+        daemon.check_stuck_workers()
+
+        daemon.brain.send_message.assert_called_once()
+        daemon.slack.post_message.assert_not_called()
+
+
+class TestLivenessDeferralCap:
+    def test_prompt_waiting_kill_after_max_deferrals(self, daemon):
+        """Kill proceeds for prompt-waiting worker after MAX_LIVENESS_DEFERRALS."""
+        daemon._stuck_liveness_count["w1"] = 2
+        daemon._stuck_since["w1"] = time.time() - 3600
+        daemon._stuck_hash["w1"] = 12345
+        daemon._stuck_alert_sent["w1"] = True
+
+        with patch('ironclaude.main.psutil.Process') as mock_process_cls:
+            mock_child = MagicMock()
+            mock_child.cpu_percent.return_value = 5.0
+            mock_parent = MagicMock()
+            mock_parent.children.return_value = [mock_child]
+            mock_process_cls.return_value = mock_parent
+
+            daemon.tmux.list_pane_pid.return_value = "12345"
+            daemon._confirm_and_kill_stuck_worker(
+                "w1", "ic-w1", 3600.0, "plan_ready", True, None,
+            )
+
+        daemon.tmux.kill_session.assert_called_once_with("ic-w1", ssh_host=None)
+
+    def test_non_prompt_waiting_still_defers(self, daemon):
+        """Non-prompt-waiting worker still defers on liveness check regardless of count."""
+        daemon._stuck_liveness_count["w1"] = 5
+
+        with patch('ironclaude.main.psutil.Process') as mock_process_cls:
+            mock_child = MagicMock()
+            mock_child.cpu_percent.return_value = 5.0
+            mock_parent = MagicMock()
+            mock_parent.children.return_value = [mock_child]
+            mock_process_cls.return_value = mock_parent
+
+            daemon.tmux.list_pane_pid.return_value = "12345"
+            daemon._confirm_and_kill_stuck_worker(
+                "w1", "ic-w1", 3600.0, "plan_ready", False, None,
+            )
+
+        daemon.tmux.kill_session.assert_not_called()
+        assert daemon._stuck_kill_deferred.get("w1", 0) > 0
+
+    def test_deferral_count_increments(self, daemon):
+        """Liveness deferral increments the counter."""
+        daemon._stuck_liveness_count["w1"] = 0
+
+        with patch('ironclaude.main.psutil.Process') as mock_process_cls:
+            mock_child = MagicMock()
+            mock_child.cpu_percent.return_value = 5.0
+            mock_parent = MagicMock()
+            mock_parent.children.return_value = [mock_child]
+            mock_process_cls.return_value = mock_parent
+
+            daemon.tmux.list_pane_pid.return_value = "12345"
+            daemon._confirm_and_kill_stuck_worker(
+                "w1", "ic-w1", 3600.0, "plan_ready", False, None,
+            )
+
+        assert daemon._stuck_liveness_count["w1"] == 1
+
+    def test_cleanup_removes_liveness_count(self, daemon):
+        """After kill, liveness count is cleaned up."""
+        daemon._stuck_liveness_count["w1"] = 3
+        daemon._stuck_since["w1"] = time.time() - 3600
+        daemon._stuck_hash["w1"] = 12345
+        daemon._stuck_alert_sent["w1"] = True
+
+        daemon.tmux.list_pane_pid.return_value = None
+        daemon._confirm_and_kill_stuck_worker(
+            "w1", "ic-w1", 3600.0, "plan_ready", True, None,
+        )
+
+        assert "w1" not in daemon._stuck_liveness_count
+
+
+import ironclaude.main as _ic_main
+
+
+class TestBrainMessageFilter:
+    """Tests for _validate_brain_message directive-reference pre-filter."""
+
+    _NO_DIR = "no_directive_ref"
+
+    @pytest.mark.parametrize("text", [
+        "#123 fixed the bug",
+        "d456 update with reason",
+        "D789 status",
+        "directive 10 completed",
+        "DIRECTIVE 42 done",
+        "Directive 9 resolved",
+    ])
+    def test_directive_ref_re_matches(self, text):
+        """_DIRECTIVE_REF_RE matches valid directive reference patterns."""
+        assert _ic_main._DIRECTIVE_REF_RE.search(text) is not None
+
+    @pytest.mark.parametrize("text", [
+        "directive no number",
+        "dSomething not a directive",
+        "#abc not numeric",
+        "d_none underscore",
+        "",
+        "plain conversational text",
+    ])
+    def test_directive_ref_re_no_match(self, text):
+        """_DIRECTIVE_REF_RE does not match non-directive text."""
+        assert _ic_main._DIRECTIVE_REF_RE.search(text) is None
+
+    def test_no_directive_ref_blocked_without_grader_call(self, daemon):
+        """Message without directive ref: blocked as no_directive_ref, grader not called."""
+        daemon._grader = MagicMock()
+        valid, reason = daemon._validate_brain_message("That was conversational output")
+        assert valid is False
+        assert reason == self._NO_DIR
+        daemon._grader.grade.assert_not_called()
+
+    def test_context_required_ack_blocked_without_grader_call(self, daemon):
+        """Brain ack to CONTEXT_REQUIRED has no directive ref; blocked before grader."""
+        daemon._grader = MagicMock()
+        valid, reason = daemon._validate_brain_message(
+            "[CONTEXT REQUIRED] ack, will restate with directive ref"
+        )
+        assert valid is False
+        assert reason == self._NO_DIR
+        daemon._grader.grade.assert_not_called()
+
+    def test_directive_ref_valid_passes_through(self, daemon):
+        """Message with directive ref: grader called; valid=True → (True, '')."""
+        daemon._grader = MagicMock()
+        daemon._grader.grade.return_value = {"valid": True}
+        valid, reason = daemon._validate_brain_message(
+            "#1134 fixed the deploy pipeline — build now stable"
+        )
+        assert valid is True
+        assert reason == ""
+        daemon._grader.grade.assert_called_once()
+
+    def test_directive_ref_grader_blocks(self, daemon):
+        """Message with directive ref: grader called; valid=False → (False, reason)."""
+        daemon._grader = MagicMock()
+        daemon._grader.grade.return_value = {"valid": False, "reason": "No reason clause"}
+        valid, reason = daemon._validate_brain_message("#1134 update")
+        assert valid is False
+        assert reason == "No reason clause"
+        daemon._grader.grade.assert_called_once()
+
+    def test_directive_ref_infrastructure_error_fail_open(self, daemon):
+        """Message with directive ref: Ollama down → fail-open (True, '')."""
+        daemon._grader = MagicMock()
+        daemon._grader.grade.return_value = {"infrastructure_error": True, "error_detail": "Ollama down"}
+        valid, reason = daemon._validate_brain_message("#1134 update")
+        assert valid is True
+        assert reason == ""
+
+    def test_no_directive_ref_blocked_before_grader_infrastructure_error(self, daemon):
+        """Pre-filter fires before grader; no directive ref blocked even when Ollama would fail-open."""
+        daemon._grader = MagicMock()
+        daemon._grader.grade.return_value = {"infrastructure_error": True}
+        valid, reason = daemon._validate_brain_message("Conversational ack to a system notification")
+        assert valid is False
+        assert reason == self._NO_DIR
+        daemon._grader.grade.assert_not_called()
+
+    def test_empty_message_blocked_by_empty_check(self, daemon):
+        """Empty message caught by existing empty check before pre-filter."""
+        daemon._grader = MagicMock()
+        valid, reason = daemon._validate_brain_message("")
+        assert valid is False
+        assert reason == "Empty message"
+        daemon._grader.grade.assert_not_called()
+
+
+class TestPollBrainResponsesFilter:
+    """Tests for poll_brain_responses blocked-message split on _BLOCKED_NO_DIRECTIVE."""
+
+    def test_conversational_response_silently_dropped(self, daemon):
+        """Conversational response without directive ref: no CONTEXT_REQUIRED, no Slack post."""
+        daemon.brain.get_pending_responses.return_value = [
+            "That was conversational output, not a Slack post"
+        ]
+        daemon._grader = MagicMock()
+        daemon.poll_brain_responses()
+        daemon.brain.send_message.assert_not_called()
+        daemon.slack.post_message.assert_not_called()
+
+    def test_context_required_ack_silently_dropped(self, daemon):
+        """Brain ack to CONTEXT_REQUIRED: silently dropped, no feedback loop triggered."""
+        daemon.brain.get_pending_responses.return_value = [
+            "[CONTEXT REQUIRED] understood, I will include directive refs"
+        ]
+        daemon._grader = MagicMock()
+        daemon.poll_brain_responses()
+        daemon.brain.send_message.assert_not_called()
+        daemon.slack.post_message.assert_not_called()
+
+    def test_directive_ref_grader_blocked_sends_context_required(self, daemon):
+        """Message with directive ref blocked by grader → CONTEXT_REQUIRED sent (unchanged)."""
+        daemon.brain.get_pending_responses.return_value = ["#1134 update"]
+        daemon._grader = MagicMock()
+        daemon._grader.grade.return_value = {"valid": False, "reason": "No reason clause"}
+        daemon.poll_brain_responses()
+        daemon.brain.send_message.assert_called_once()
+        msg = daemon.brain.send_message.call_args[0][0]
+        assert "[CONTEXT REQUIRED]" in msg
+        daemon.slack.post_message.assert_not_called()
+
+    def test_directive_ref_valid_posts_to_slack(self, daemon):
+        """Message with directive ref passing grader → posted to Slack."""
+        daemon.brain.get_pending_responses.return_value = [
+            "#1134 fixed the deploy pipeline, now resolving within 2 min"
+        ]
+        daemon._grader = MagicMock()
+        daemon._grader.grade.return_value = {"valid": True}
+        daemon.poll_brain_responses()
+        daemon.brain.send_message.assert_not_called()
+        daemon.slack.post_message.assert_called_once()
+        msg = daemon.slack.post_message.call_args[0][0]
+        assert "#1134" in msg

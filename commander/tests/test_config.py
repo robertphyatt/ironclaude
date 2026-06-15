@@ -86,7 +86,6 @@ class TestLoadConfig:
         config_file = tmp_path / "ironclaude.json"
         config_file.write_text("{}")
         monkeypatch.setenv("SLACK_OPERATOR_USER_ID", "U789")
-        monkeypatch.setenv("SLACK_OPERATOR_USER_ID", "U456")
         cfg = load_config(str(config_file))
         assert cfg["slack_operator_user_id"] == "U789"
 

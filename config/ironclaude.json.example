@@ -1,0 +1,27 @@
+{
+  "_note": "Copy to config/ironclaude.json and fill in your values. This file is committed to git as a setup reference — ironclaude.json is gitignored.",
+  "poll_interval_seconds": 15,
+  "heartbeat_interval_seconds": 900,
+  "worker_stale_threshold_seconds": 300,
+  "brain_heartbeat_timeout_seconds": 60,
+  "brain_timeout_seconds": 600,
+  "max_worker_retries": 3,
+  "min_available_memory_pct": 0.10,
+  "ollama_vram_block_threshold_gb": 8.0,
+  "push_enabled": false,
+  "push_max_per_hour": 5,
+  "tmp_dir": "/tmp/ic",
+  "log_dir": "/tmp/ic-logs",
+  "db_path": "data/db/ironclaude.db",
+  "brain_cwd": "~/.ironclaude/brain",
+  "operator_name": "Operator",
+  "autonomy_level": "3",
+  "brain_model": "opus",
+  "grader_model": "opus",
+  "effort_level": "high",
+  "advisor": {
+    "enabled": true,
+    "executor_model": "sonnet",
+    "advisor_model": "opus"
+  }
+}

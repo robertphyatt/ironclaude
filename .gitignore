@@ -30,3 +30,6 @@ scan
 
 # Local Claude Code settings (not committed)
 .claude/settings.local.json
+
+# Personal runtime config (gitignored — copy from config/ironclaude.json.example)
+config/ironclaude.json

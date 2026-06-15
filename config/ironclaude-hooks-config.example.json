@@ -1,0 +1,10 @@
+{
+  "_note": "Copy to ~/.claude/ironclaude-hooks-config.json and configure. Used by both the daemon (OrchestratorTools._get_ollama_client) and hook scripts (plan-validator.sh). Set url to your Ollama endpoint. Set fallback_url to a secondary endpoint or null.",
+  "validation_backend": "ollama",
+  "ollama": {
+    "url": "http://localhost:11434",
+    "fallback_url": null,
+    "model": "gemma4:12b-it-qat"
+  },
+  "timeout_seconds": 120
+}

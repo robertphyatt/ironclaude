@@ -133,3 +133,242 @@ describe('record_review_verdict — review_pending flag clearing', () => {
     expect(getReviewPending(db)).toBe(1);
   });
 });
+
+describe('claim_task — workflow_stage guard', () => {
+  let db: Database.Database;
+  const SESSION = 'test-session-claim-task';
+
+  beforeEach(() => {
+    db = createTestDb();
+  });
+
+  it('rejects claim_task when workflow_stage is idle', () => {
+    db.prepare(`
+      INSERT INTO sessions (terminal_session, workflow_stage, current_wave, professional_mode)
+      VALUES (?, 'idle', 1, 'on')
+    `).run(SESSION);
+    db.prepare(`
+      INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status)
+      VALUES (?, 1, 1, 'Test Task', 'pending')
+    `).run(SESSION);
+
+    const result = handleWriteTool('claim_task', { task_id: 1 }, db, SESSION);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeDefined();
+    expect(parsed.error).toContain('workflow_stage must be');
+    expect(parsed.error).toContain('idle');
+  });
+
+  it('rejects claim_task when workflow_stage is brainstorming', () => {
+    db.prepare(`
+      INSERT INTO sessions (terminal_session, workflow_stage, current_wave, professional_mode)
+      VALUES (?, 'brainstorming', 1, 'on')
+    `).run(SESSION);
+    db.prepare(`
+      INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status)
+      VALUES (?, 1, 1, 'Test Task', 'pending')
+    `).run(SESSION);
+
+    const result = handleWriteTool('claim_task', { task_id: 1 }, db, SESSION);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeDefined();
+    expect(parsed.error).toContain('workflow_stage must be');
+  });
+
+  it('allows claim_task when workflow_stage is executing', () => {
+    db.prepare(`
+      INSERT INTO sessions (terminal_session, workflow_stage, current_wave, professional_mode)
+      VALUES (?, 'executing', 1, 'on')
+    `).run(SESSION);
+    db.prepare(`
+      INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status)
+      VALUES (?, 1, 1, 'Test Task', 'pending')
+    `).run(SESSION);
+
+    const result = handleWriteTool('claim_task', { task_id: 1 }, db, SESSION);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeUndefined();
+    expect(parsed.status).toBe('in_progress');
+  });
+
+  it('allows claim_task when workflow_stage is reviewing', () => {
+    db.prepare(`
+      INSERT INTO sessions (terminal_session, workflow_stage, current_wave, professional_mode)
+      VALUES (?, 'reviewing', 1, 'on')
+    `).run(SESSION);
+    db.prepare(`
+      INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status)
+      VALUES (?, 1, 1, 'Test Task', 'pending')
+    `).run(SESSION);
+
+    const result = handleWriteTool('claim_task', { task_id: 1 }, db, SESSION);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeUndefined();
+    expect(parsed.status).toBe('in_progress');
+  });
+});
+
+describe('mark_executing — state recovery', () => {
+  let db: Database.Database;
+  const SESSION = 'test-session-mark-executing';
+
+  beforeEach(() => {
+    db = createTestDb();
+  });
+
+  it('recovers when workflow_stage is idle but active wave_tasks exist', () => {
+    db.prepare(`
+      INSERT INTO sessions (terminal_session, workflow_stage, current_wave, professional_mode, review_pending)
+      VALUES (?, 'idle', 1, 'on', 0)
+    `).run(SESSION);
+    db.prepare(`
+      INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status)
+      VALUES (?, 1, 1, 'Test Task', 'pending')
+    `).run(SESSION);
+    db.prepare(`
+      INSERT INTO review_grades (terminal_session, wave_number, task_ids, grade, task_boundary)
+      VALUES (?, 1, '1', 'A', 1)
+    `).run(SESSION);
+
+    const result = handleWriteTool('mark_executing', {}, db, SESSION);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeUndefined();
+    expect(parsed.workflow_stage).toBe('executing');
+    expect(parsed.recovered).toBe(true);
+
+    const auditEntry = db.prepare(
+      `SELECT * FROM audit_log WHERE terminal_session = ? AND action = 'workflow_stage_recovery'`,
+    ).get(SESSION) as { actor: string; old_value: string; new_value: string } | undefined;
+    expect(auditEntry).toBeDefined();
+    expect(auditEntry!.actor).toBe('system:state-correction');
+    expect(auditEntry!.old_value).toBe('idle');
+    expect(auditEntry!.new_value).toBe('executing');
+  });
+
+  it('rejects when workflow_stage is idle and no active wave_tasks exist', () => {
+    db.prepare(`
+      INSERT INTO sessions (terminal_session, workflow_stage, current_wave, professional_mode, review_pending)
+      VALUES (?, 'idle', 1, 'on', 0)
+    `).run(SESSION);
+
+    const result = handleWriteTool('mark_executing', {}, db, SESSION);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeDefined();
+    expect(parsed.error).toContain("workflow_stage must be 'reviewing'");
+    expect(parsed.error).toContain('idle');
+  });
+
+  it('normal path still works: reviewing with passing review', () => {
+    db.prepare(`
+      INSERT INTO sessions (terminal_session, workflow_stage, current_wave, professional_mode, review_pending)
+      VALUES (?, 'reviewing', 1, 'on', 0)
+    `).run(SESSION);
+    db.prepare(`
+      INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status)
+      VALUES (?, 1, 1, 'Test Task', 'review_passed')
+    `).run(SESSION);
+    db.prepare(`
+      INSERT INTO review_grades (terminal_session, wave_number, task_ids, grade, task_boundary)
+      VALUES (?, 1, '1', 'A', 1)
+    `).run(SESSION);
+
+    const result = handleWriteTool('mark_executing', {}, db, SESSION);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeUndefined();
+    expect(parsed.workflow_stage).toBe('executing');
+    expect(parsed.recovered).toBeUndefined();
+  });
+
+  it('recovery still requires passing review grade', () => {
+    db.prepare(`
+      INSERT INTO sessions (terminal_session, workflow_stage, current_wave, professional_mode, review_pending)
+      VALUES (?, 'idle', 1, 'on', 0)
+    `).run(SESSION);
+    db.prepare(`
+      INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status)
+      VALUES (?, 1, 1, 'Test Task', 'pending')
+    `).run(SESSION);
+
+    const result = handleWriteTool('mark_executing', {}, db, SESSION);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeDefined();
+    expect(parsed.error).toContain('no passing review verdict');
+  });
+});
+
+describe('clear_stale_review_pending — stale flag detection', () => {
+  let db: Database.Database;
+  const SESSION = 'test-session-clear-stale';
+
+  beforeEach(() => {
+    db = createTestDb();
+    db.prepare(`
+      INSERT INTO sessions (terminal_session, workflow_stage, review_pending, review_block_count, current_wave, professional_mode)
+      VALUES (?, 'executing', 1, 3, 1, 'on')
+    `).run(SESSION);
+  });
+
+  it('clears stale review_pending when no submitted tasks in current wave', () => {
+    db.prepare(`
+      INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status)
+      VALUES (?, 1, 1, 'Test Task', 'review_passed')
+    `).run(SESSION);
+
+    const result = handleWriteTool('clear_stale_review_pending', {}, db, SESSION);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeUndefined();
+    expect(parsed.cleared).toBe(true);
+    expect(parsed.wave).toBe(1);
+
+    const row = db.prepare(
+      `SELECT review_pending, review_block_count FROM sessions WHERE terminal_session = ?`,
+    ).get(SESSION) as { review_pending: number; review_block_count: number };
+    expect(row.review_pending).toBe(0);
+    expect(row.review_block_count).toBe(0);
+  });
+
+  it('does not clear when submitted task exists in current wave', () => {
+    db.prepare(`
+      INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status)
+      VALUES (?, 1, 1, 'Test Task', 'submitted')
+    `).run(SESSION);
+
+    const result = handleWriteTool('clear_stale_review_pending', {}, db, SESSION);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeUndefined();
+    expect(parsed.cleared).toBe(false);
+    expect(parsed.reason).toContain('still submitted');
+
+    const row = db.prepare(
+      `SELECT review_pending FROM sessions WHERE terminal_session = ?`,
+    ).get(SESSION) as { review_pending: number };
+    expect(row.review_pending).toBe(1);
+  });
+
+  it('does not clear when review_pending is already 0', () => {
+    db.prepare(`UPDATE sessions SET review_pending = 0 WHERE terminal_session = ?`).run(SESSION);
+
+    const result = handleWriteTool('clear_stale_review_pending', {}, db, SESSION);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeUndefined();
+    expect(parsed.cleared).toBe(false);
+    expect(parsed.reason).toContain('already 0');
+  });
+
+  it('writes audit log entry when clearing stale flag', () => {
+    db.prepare(`
+      INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status)
+      VALUES (?, 1, 1, 'Test Task', 'review_passed')
+    `).run(SESSION);
+
+    handleWriteTool('clear_stale_review_pending', {}, db, SESSION);
+
+    const entry = db.prepare(
+      `SELECT * FROM audit_log WHERE terminal_session = ? AND action = 'clear_stale_review_pending'`,
+    ).get(SESSION) as { actor: string; old_value: string; new_value: string } | undefined;
+    expect(entry).toBeDefined();
+    expect(entry!.actor).toBe('system:stale-flag-heal');
+    expect(entry!.old_value).toBe('1');
+    expect(entry!.new_value).toBe('0');
+  });
+});

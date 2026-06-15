@@ -186,6 +186,12 @@ async function main() {
 
     child.on('exit', (code, signal) => {
       log(`MCP server exited: code=${code} signal=${signal}`);
+      if (code && code !== 0) {
+        log(`[diagnostic] Node ${process.version}, platform=${process.platform}, arch=${process.arch}`);
+        log(`[diagnostic] dist/ exists: ${existsSync(join(STATE_MANAGER_ROOT, 'dist'))}`);
+        log(`[diagnostic] node_modules/ exists: ${existsSync(join(STATE_MANAGER_ROOT, 'node_modules'))}`);
+        log(`[diagnostic] Check full log at: ${LOG_FILE}`);
+      }
       if (signal) process.kill(process.pid, signal);
       else process.exit(code || 0);
     });

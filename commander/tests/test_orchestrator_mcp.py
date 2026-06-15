@@ -25,8 +25,11 @@ from ironclaude.slack_interface import SlackBot
 
 
 def _mock_grader_approve(tools):
-    """Mock _call_grader to always approve for unit testing."""
+    """Mock _call_grader and _call_local_grader to always approve for unit testing."""
     tools._call_grader = MagicMock(return_value={
+        "grade": "A", "approved": True, "feedback": "Test approval"
+    })
+    tools._call_local_grader = MagicMock(return_value={
         "grade": "A", "approved": True, "feedback": "Test approval"
     })
 
@@ -125,9 +128,12 @@ def test_ensure_ssh_manager_idempotent(tmp_path, db_conn, registry, mock_tmux):
 
 
 @pytest.fixture
-def tools(registry, mock_tmux, tmp_path, db_conn):
+def tools(registry, mock_tmux, tmp_path, db_conn, monkeypatch):
     """Create OrchestratorTools with test dependencies."""
     ledger_path = str(tmp_path / "task-ledger.json")
+    empty_cfg = tmp_path / "empty_ollama.json"
+    empty_cfg.write_text("{}")
+    monkeypatch.setenv("IC_OLLAMA_CONFIG_PATH", str(empty_cfg))
     t = OrchestratorTools(registry, mock_tmux, ledger_path, db_conn=db_conn)
     t._get_ollama_vram = MagicMock(return_value=(0.0, []))
     return t
@@ -244,6 +250,110 @@ class TestSpawnWorker:
         )
         keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
         assert not any(k.startswith("/advisor") for k in keys_sent)
+
+    def _make_remote_tools(self, registry, mock_tmux, tmp_path, db_conn):
+        """Helper: OrchestratorTools with mocked SSH manager targeting kandice."""
+        from ironclaude.ssh_manager import MachineConfig
+        machine_cfg = MachineConfig(
+            name="kandice",
+            host="kandice",
+            claude_path="/usr/local/bin/claude",
+            repos=["/mnt/c/Users/rober/claudetraderbot"],
+            log_dir="/tmp/ic-logs",
+            env={"ANTHROPIC_API_KEY": "sk-test"},
+            role="worker",
+        )
+        mock_ssh = MagicMock()
+        mock_ssh.get_machine.return_value = machine_cfg
+        mock_health = MagicMock()
+        mock_health.ok = True
+        mock_health.details = "All checks passed"
+        mock_ssh.health_check.return_value = mock_health
+        mock_ssh.list_machine_names.return_value = ["kandice"]
+        ledger_path = str(tmp_path / "task-ledger.json")
+        tools = OrchestratorTools(registry, mock_tmux, ledger_path, db_conn=db_conn)
+        tools._ssh_manager = mock_ssh
+        tools._get_ollama_vram = MagicMock(return_value=(0.0, []))
+        return tools, machine_cfg
+
+    def test_remote_spawn_creates_log_dir_before_session(
+        self, registry, mock_tmux, tmp_path, db_conn
+    ):
+        """spawn_worker calls mkdir_p with remote log dir before spawn_session."""
+        tools, _ = self._make_remote_tools(registry, mock_tmux, tmp_path, db_conn)
+        tools._activate_pm_remote = MagicMock(return_value=None)
+        tools._ensure_claude_md_remote = MagicMock()
+        tools._ensure_worker_trusted_remote = MagicMock()
+        _mock_grader_approve(tools)
+
+        call_order = []
+        mock_tmux.mkdir_p.side_effect = lambda *a, **kw: call_order.append("mkdir_p")
+        mock_tmux.spawn_session.side_effect = (
+            lambda *a, **kw: (call_order.append("spawn_session"), True)[1]
+        )
+
+        tools.spawn_worker(
+            worker_id="w-remote",
+            worker_type="claude-sonnet",
+            repo="/mnt/c/Users/rober/claudetraderbot",
+            objective="Test remote spawn",
+            machine="kandice",
+        )
+
+        assert "mkdir_p" in call_order
+        assert "spawn_session" in call_order
+        assert call_order.index("mkdir_p") < call_order.index("spawn_session")
+        mock_tmux.mkdir_p.assert_called_once_with("/tmp/ic-logs", ssh_host="kandice")
+
+    def test_wait_for_ready_false_dead_session_returns_error(
+        self, registry, mock_tmux, tmp_path, db_conn
+    ):
+        """spawn_worker returns error dict if _wait_for_ready times out and session is dead."""
+        tools, _ = self._make_remote_tools(registry, mock_tmux, tmp_path, db_conn)
+        tools._ensure_claude_md_remote = MagicMock()
+        tools._ensure_worker_trusted_remote = MagicMock()
+        _mock_grader_approve(tools)
+
+        mock_tmux.has_session.return_value = False
+        mock_tmux.read_log_tail.return_value = "error: claude binary not found\n"
+
+        with patch.object(tools, "_wait_for_ready", return_value=False):
+            result = tools.spawn_worker(
+                worker_id="w-dead",
+                worker_type="claude-sonnet",
+                repo="/mnt/c/Users/rober/claudetraderbot",
+                objective="Test remote spawn",
+                machine="kandice",
+            )
+
+        assert "error" in result
+        assert "died before ready" in result["error"]
+        assert "claude binary not found" in result["error"]
+
+    def test_wait_for_ready_false_alive_session_proceeds(
+        self, registry, mock_tmux, tmp_path, db_conn
+    ):
+        """spawn_worker proceeds with warning when _wait_for_ready times out but session alive."""
+        tools, _ = self._make_remote_tools(registry, mock_tmux, tmp_path, db_conn)
+        tools._activate_pm_remote = MagicMock(return_value=None)
+        tools._ensure_claude_md_remote = MagicMock()
+        tools._ensure_worker_trusted_remote = MagicMock()
+        _mock_grader_approve(tools)
+
+        mock_tmux.has_session.return_value = True
+        mock_tmux.read_log_tail.return_value = "starting up...\n"
+
+        with patch.object(tools, "_wait_for_ready", return_value=False):
+            result = tools.spawn_worker(
+                worker_id="w-alive",
+                worker_type="claude-sonnet",
+                repo="/mnt/c/Users/rober/claudetraderbot",
+                objective="Test remote spawn",
+                machine="kandice",
+            )
+
+        assert "w-alive" in result
+        assert "error" not in result
 
 
 class TestWorkerCommunication:
@@ -490,6 +600,12 @@ class TestSpawnWorkerModelName:
         cmd = spawn_call[0][1]  # second positional arg is the command
         assert "--model qwen3:8b" in cmd
         assert "ollama" in cmd
+        assert "CLAUDE_CODE_ATTRIBUTION_HEADER=0" in cmd
+
+    def test_get_worker_command_ollama_disables_attribution_header(self, tools):
+        """_get_worker_command for ollama type disables attribution header to preserve KV cache."""
+        cmd = tools._get_worker_command("ollama", "qwen3:8b")
+        assert "CLAUDE_CODE_ATTRIBUTION_HEADER=0" in cmd
 
 
 class TestWaitForReady:
@@ -821,6 +937,7 @@ class TestSpawnWorkerEnvVar:
         )
         cmd = mock_tmux.spawn_session.call_args[0][1]
         assert cmd.startswith("export IC_ROLE=worker; export IC_WORKER_ID=ollama-1; export ENABLE_STOP_REVIEW=0; ")
+        assert "CLAUDE_CODE_ATTRIBUTION_HEADER=0" in cmd
 
 
 class TestKillWorker:
@@ -1300,6 +1417,9 @@ class TestInlineGraderEnforcement:
 
     def test_spawn_rejected_by_grader(self, tools, mock_tmux, tmp_path):
         """spawn_worker returns error when grader rejects the objective."""
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok"
+        })
         tools._call_grader = MagicMock(return_value={
             "grade": "D", "approved": False, "feedback": "Objective too vague"
         })
@@ -1318,6 +1438,9 @@ class TestInlineGraderEnforcement:
 
     def test_spawn_approved_by_grader(self, tools, mock_tmux):
         """spawn_worker proceeds when grader approves."""
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok"
+        })
         tools._call_grader = MagicMock(return_value={
             "grade": "A", "approved": True, "feedback": "Well-specified"
         })
@@ -1334,6 +1457,9 @@ class TestInlineGraderEnforcement:
 
     def test_spawn_calls_grader_with_objective(self, tools, mock_tmux):
         """spawn_worker passes objective details to the grader."""
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok"
+        })
         tools._call_grader = MagicMock(return_value={
             "grade": "A", "approved": True, "feedback": "OK"
         })
@@ -1403,9 +1529,9 @@ class TestSendToWorkerGrader:
     """Tests for grader enforcement on send_to_worker messages."""
 
     def test_send_approved_by_grader(self, tools, registry, mock_tmux):
-        """send_to_worker delivers message when grader approves."""
+        """send_to_worker delivers message when local grader approves."""
         registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
-        tools._call_grader = MagicMock(return_value={
+        tools._call_local_grader = MagicMock(return_value={
             "grade": "A", "approved": True, "feedback": "Appropriate guidance"
         })
         result = tools.send_to_worker("w1", "The design looks good, proceed to planning.")
@@ -1414,9 +1540,9 @@ class TestSendToWorkerGrader:
         mock_tmux.send_keys.assert_called_once()
 
     def test_send_rejected_by_grader(self, tools, registry, mock_tmux):
-        """send_to_worker blocks message when grader rejects."""
+        """send_to_worker blocks message when local grader rejects."""
         registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
-        tools._call_grader = MagicMock(return_value={
+        tools._call_local_grader = MagicMock(return_value={
             "grade": "F", "approved": False, "feedback": "Tells worker to skip design docs"
         })
         result = tools.send_to_worker("w1", "No need for a design doc, just make the change.")
@@ -1426,21 +1552,24 @@ class TestSendToWorkerGrader:
         mock_tmux.send_keys.assert_not_called()
 
     def test_send_grader_failure_blocks_message(self, tools, registry, mock_tmux):
-        """send_to_worker blocks message when grader is unavailable."""
+        """send_to_worker blocks message when local grader fails (returns grade F)."""
         registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
-        tools._call_grader = MagicMock(side_effect=RuntimeError("Grader session dead"))
-        with pytest.raises(RuntimeError, match="Grader session dead"):
-            tools.send_to_worker("w1", "Some message")
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "F", "approved": False, "feedback": "Ollama unreachable"
+        })
+        result = tools.send_to_worker("w1", "Some message")
+        assert isinstance(result, dict)
+        assert "error" in result
         mock_tmux.send_keys.assert_not_called()
 
     def test_send_grader_prompt_includes_workflow_rules(self, tools, registry, mock_tmux):
-        """send_to_worker passes workflow-specific rubric to grader."""
+        """send_to_worker passes workflow-specific rubric to local grader."""
         registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
-        tools._call_grader = MagicMock(return_value={
+        tools._call_local_grader = MagicMock(return_value={
             "grade": "A", "approved": True, "feedback": "OK"
         })
         tools.send_to_worker("w1", "Approach B looks right.")
-        call_args = tools._call_grader.call_args
+        call_args = tools._call_local_grader.call_args
         system_prompt = call_args[0][0]
         user_prompt = call_args[0][1]
         assert "send_to_worker" in system_prompt.lower()
@@ -1452,15 +1581,77 @@ class TestSendToWorkerGrader:
     def test_send_grader_prompt_includes_pm_deactivation_trigger(self, tools, registry, mock_tmux):
         """send_to_worker grader criteria includes PM deactivation as automatic F-grade trigger."""
         registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
-        tools._call_grader = MagicMock(return_value={
+        tools._call_local_grader = MagicMock(return_value={
             "grade": "A", "approved": True, "feedback": "OK"
         })
         tools.send_to_worker("w1", "Some message.")
-        call_args = tools._call_grader.call_args
+        call_args = tools._call_local_grader.call_args
         system_prompt = call_args[0][0]
         assert "deactivate professional mode" in system_prompt.lower()
         assert "disable professional mode" in system_prompt.lower()
         assert "/deactivate-professional-mode" in system_prompt.lower()
+
+
+class TestPostMessageGrader:
+    """Tests for post_message proactiveness grading."""
+
+    def test_post_message_approved_non_problem(self, tools):
+        """Non-problem messages are approved and posted to Slack."""
+        tools._slack = MagicMock()
+        tools._slack.post_message.return_value = "1234567890.123456"
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "Not a problem report"
+        })
+        result = tools.post_message("Worker w1 completed task 3 successfully.")
+        assert result == "1234567890.123456"
+        tools._slack.post_message.assert_called_once_with("Worker w1 completed task 3 successfully.")
+
+    def test_post_message_rejected_passive_report(self, tools):
+        """Passive problem reports are rejected — Slack NOT called."""
+        tools._slack = MagicMock()
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "D", "approved": False,
+            "feedback": "Reports Docker stopped without attempting fix or pinning escalation"
+        })
+        result = tools.post_message("Docker Desktop stopped on windows-worker, needs RDP restart.")
+        assert isinstance(result, dict)
+        assert "error" in result
+        tools._slack.post_message.assert_not_called()
+
+    def test_post_message_grader_prompt_includes_proactiveness_criteria(self, tools):
+        """System prompt includes semantic proactiveness evaluation criteria."""
+        tools._slack = MagicMock()
+        tools._slack.post_message.return_value = "ts"
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "OK"
+        })
+        tools.post_message("Status update.")
+        call_args = tools._call_local_grader.call_args
+        system_prompt = call_args[0][0]
+        assert "proactiveness" in system_prompt.lower()
+        assert "action already taken" in system_prompt.lower()
+        assert "pinned escalation" in system_prompt.lower()
+        assert "passive reporting" in system_prompt.lower()
+
+    def test_post_message_ollama_failure_escalates_to_opus(self, tools):
+        """Infrastructure error from Ollama triggers Opus fallback."""
+        tools._slack = MagicMock()
+        tools._slack.post_message.return_value = "ts"
+        tools._call_local_grader = MagicMock(return_value={
+            "infrastructure_error": True, "error_detail": "Ollama unreachable"
+        })
+        tools._call_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "Opus approved"
+        })
+        result = tools.post_message("All workers healthy.")
+        tools._call_grader.assert_called_once()
+        tools._slack.post_message.assert_called_once()
+
+    def test_post_message_slack_not_configured(self, tools):
+        """Returns error string when Slack is not configured."""
+        tools._slack = None
+        result = tools.post_message("Any message")
+        assert result == "Error: Slack not configured"
 
 
 class TestSendToWorkerMenuDetection:
@@ -1598,6 +1789,9 @@ class TestSpawnGraderPmDeactivation:
 
     def test_spawn_grader_prompt_includes_pm_deactivation_trigger(self, tools, mock_tmux):
         """spawn_worker grader criteria includes PM deactivation as automatic F-grade trigger."""
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok"
+        })
         tools._call_grader = MagicMock(return_value={
             "grade": "A", "approved": True, "feedback": "OK"
         })
@@ -2806,9 +3000,10 @@ class TestHeartbeatDirectiveCheck:
         from ironclaude.main import IroncladeDaemon
 
         mock_brain = MagicMock()
+        mock_brain.get_token_usage.return_value = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         mock_slack = MagicMock(spec=SlackBot)
         mock_registry = MagicMock()
-        mock_registry.get_running_workers.return_value = [
+        mock_registry.get_recent_workers.return_value = [
             {"id": "w1", "tmux_session": "ic-w1", "description": "test"},
         ]
 
@@ -3093,6 +3288,9 @@ class TestBrainNotes:
         tron_dir = repo_dir / ".ironclaude"
         tron_dir.mkdir()
         (tron_dir / "brain-notes.md").write_text("Always use Makefile targets for builds")
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok"
+        })
         tools._call_grader = MagicMock(return_value={
             "grade": "A", "approved": True, "feedback": "OK"
         })
@@ -3133,6 +3331,9 @@ class TestGraderModelRecommendation:
     def test_spawn_returns_recommended_model(self, tools, mock_tmux):
         """spawn_worker return value includes grader's model recommendation."""
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok"
+        })
         tools._call_grader = MagicMock(return_value={
             "grade": "A", "approved": True, "feedback": "Good",
             "recommended_model": "claude-opus",
@@ -3146,6 +3347,9 @@ class TestGraderModelRecommendation:
     def test_spawn_defaults_model_when_grader_omits(self, tools, mock_tmux):
         """If grader doesn't include recommended_model, spawn still succeeds."""
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok"
+        })
         tools._call_grader = MagicMock(return_value={
             "grade": "A", "approved": True, "feedback": "Good",
         })
@@ -3158,6 +3362,9 @@ class TestGraderModelRecommendation:
     def test_grader_prompt_includes_model_criteria(self, tools, mock_tmux):
         """The grader system prompt includes model recommendation criteria."""
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok"
+        })
         tools._call_grader = MagicMock(return_value={
             "grade": "A", "approved": True, "feedback": "Good",
             "recommended_model": "claude-sonnet",
@@ -3227,6 +3434,7 @@ class TestBatchSpawn:
     def test_batch_grades_all_in_one_call(self, tools, mock_tmux):
         """spawn_workers makes a single grader call for multiple requests."""
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._call_local_grader = MagicMock(return_value={"grade": "A", "approved": True, "feedback": "ok"})
         tools._call_grader = MagicMock(return_value=[
             {"worker_id": "w1", "grade": "A", "approved": True, "feedback": "Good", "recommended_model": "claude-sonnet"},
             {"worker_id": "w2", "grade": "A", "approved": True, "feedback": "Good", "recommended_model": "claude-sonnet"},
@@ -3241,6 +3449,7 @@ class TestBatchSpawn:
     def test_batch_partial_approval(self, tools, mock_tmux):
         """Only approved workers are spawned; rejected return errors."""
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._call_local_grader = MagicMock(return_value={"grade": "A", "approved": True, "feedback": "ok"})
         tools._call_grader = MagicMock(return_value=[
             {"worker_id": "w1", "grade": "A", "approved": True, "feedback": "Good", "recommended_model": "claude-sonnet"},
             {"worker_id": "w2", "grade": "F", "approved": False, "feedback": "Bad objective", "recommended_model": "claude-sonnet"},
@@ -3256,6 +3465,7 @@ class TestBatchSpawn:
     def test_batch_single_request_works(self, tools, mock_tmux):
         """spawn_workers works with a single request."""
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._call_local_grader = MagicMock(return_value={"grade": "A", "approved": True, "feedback": "ok"})
         tools._call_grader = MagicMock(return_value=[
             {"worker_id": "w1", "grade": "A", "approved": True, "feedback": "Good", "recommended_model": "claude-sonnet"},
         ])
@@ -3266,6 +3476,7 @@ class TestBatchSpawn:
 
     def test_batch_grader_fallback(self, tools, mock_tmux):
         """Malformed batch response falls back to individual grading."""
+        tools._call_local_grader = MagicMock(return_value={"grade": "A", "approved": True, "feedback": "ok"})
         call_count = [0]
         def mock_grader(system_prompt, user_prompt, batch=False):
             call_count[0] += 1
@@ -3285,6 +3496,7 @@ class TestSpawnWorkersBatchPmTimeout:
 
     def test_pm_timeout_in_request_accepted(self, tools, mock_tmux):
         """spawn_workers accepts pm_timeout in request dict without TypeError."""
+        tools._call_local_grader = MagicMock(return_value={"grade": "A", "approved": True, "feedback": "ok"})
         tools._call_grader = MagicMock(return_value=[
             {"worker_id": "w1", "grade": "F", "approved": False,
              "feedback": "Bad", "recommended_model": "claude-sonnet"},
@@ -3300,6 +3512,7 @@ class TestSpawnWorkersBatchPmTimeout:
         """spawn_workers deadline equals max per-request pm_timeout, not hardcoded 300."""
         import ironclaude.orchestrator_mcp as orc_mcp
 
+        tools._call_local_grader = MagicMock(return_value={"grade": "A", "approved": True, "feedback": "ok"})
         tools._call_grader = MagicMock(return_value=[
             {"worker_id": "w1", "grade": "A", "approved": True,
              "feedback": "Good", "recommended_model": "claude-sonnet"},
@@ -3950,7 +4163,7 @@ def wiki_tools_with_slack(registry, mock_tmux, tmp_path, db_conn):
 class TestWikiTools:
     """Wiki tool business logic: write, delete, query, log."""
 
-    VALID_CONTENT = "A" * 60
+    VALID_CONTENT = "This wiki page documents worker lifecycle and deployment patterns in the system."
 
     def test_wiki_write_creates_page(self, wiki_tools, tmp_path):
         brain_dir = tmp_path / "brain"
@@ -4214,7 +4427,7 @@ class TestWikiTools:
     def test_wiki_write_accepts_concept_names(self, wiki_tools):
         """wiki_write accepts concept-focused kebab-case names."""
         for page in ["pf2e-pipeline-status", "worker-lifecycle", "operator-preferences"]:
-            result = wiki_tools.wiki_write(page, "Title", self.VALID_CONTENT)
+            result = wiki_tools.wiki_write(page, "Pipeline Status Overview", self.VALID_CONTENT)
             assert not result.startswith("Invalid page name"), f"Page {page} was incorrectly rejected: {result}"
             assert page in result, f"Expected page path in result for {page}, got: {result}"
 
@@ -4237,8 +4450,8 @@ class TestWikiTools:
         assert not (tmp_path / "brain" / "wiki" / "valid-page.md").exists()
 
     def test_wiki_write_accepts_minimum_content(self, wiki_tools, tmp_path):
-        """wiki_write accepts content of exactly 50 characters after stripping whitespace."""
-        result = wiki_tools.wiki_write("valid-page", "Title", "x" * 50)
+        """wiki_write accepts content that meets length and quality thresholds."""
+        result = wiki_tools.wiki_write("valid-page", "Valid Page", "abcde" * 10)
         assert "valid-page" in result
         assert (tmp_path / "brain" / "wiki" / "valid-page.md").exists()
 
@@ -4246,6 +4459,88 @@ class TestWikiTools:
         """wiki_delete rejects page names that escape the wiki directory."""
         result = wiki_tools.wiki_delete("../etc/passwd")
         assert result == "Path traversal rejected: ../etc/passwd"
+
+
+class TestWikiWriteValidation:
+    """Validation hardening: garbage detection, directive-log warnings, duplicate warnings."""
+
+    VALID_CONTENT = "This wiki page documents worker lifecycle and deployment patterns in the system."
+
+    def test_rejects_title_placeholder(self, wiki_tools, tmp_path):
+        result = wiki_tools.wiki_write("worker-lifecycle", "Title", self.VALID_CONTENT)
+        assert "placeholder" in result
+        assert not (tmp_path / "brain" / "wiki" / "worker-lifecycle.md").exists()
+
+    def test_rejects_title_placeholder_case_insensitive(self, wiki_tools, tmp_path):
+        result = wiki_tools.wiki_write("worker-lifecycle", "TITLE", self.VALID_CONTENT)
+        assert "placeholder" in result
+        assert not (tmp_path / "brain" / "wiki" / "worker-lifecycle.md").exists()
+
+    def test_rejects_garbage_content_aaaa(self, wiki_tools, tmp_path):
+        result = wiki_tools.wiki_write("worker-lifecycle", "Worker Lifecycle", "a" * 60)
+        assert "garbage" in result
+        assert not (tmp_path / "brain" / "wiki" / "worker-lifecycle.md").exists()
+
+    def test_rejects_garbage_content_xxxx(self, wiki_tools, tmp_path):
+        result = wiki_tools.wiki_write("worker-lifecycle", "Worker Lifecycle", "x" * 60)
+        assert "garbage" in result
+        assert not (tmp_path / "brain" / "wiki" / "worker-lifecycle.md").exists()
+
+    def test_allows_real_content_after_length_gate(self, wiki_tools, tmp_path):
+        result = wiki_tools.wiki_write("worker-lifecycle", "Worker Lifecycle", self.VALID_CONTENT)
+        assert "worker-lifecycle.md" in result
+        assert (tmp_path / "brain" / "wiki" / "worker-lifecycle.md").exists()
+
+    @patch("ironclaude.orchestrator_mcp.logger")
+    def test_warns_commit_hash_in_title(self, mock_logger, wiki_tools, tmp_path):
+        result = wiki_tools.wiki_write("fix-summary", "Fix abc1234def5678", self.VALID_CONTENT)
+        assert "fix-summary.md" in result
+        warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+        assert any("directive log" in c for c in warning_calls)
+
+    @patch("ironclaude.orchestrator_mcp.logger")
+    def test_warns_status_complete_in_content(self, mock_logger, wiki_tools, tmp_path):
+        content = self.VALID_CONTENT + "\nStatus: Complete (2026-06-01, commit abc1234)"
+        result = wiki_tools.wiki_write("fix-summary", "Fix Summary", content)
+        assert "fix-summary.md" in result
+        warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+        assert any("directive log" in c for c in warning_calls)
+
+    @patch("ironclaude.orchestrator_mcp.logger")
+    def test_warns_duplicate_keyword_overlap(self, mock_logger, wiki_tools, tmp_path):
+        wiki_tools.wiki_write("worker-lifecycle", "Worker Lifecycle", self.VALID_CONTENT)
+        mock_logger.reset_mock()
+        # incoming = {"worker","lifecycle","guide"}, existing = {"worker","lifecycle"}
+        # Jaccard = 2/3 = 0.667 > 0.60
+        result = wiki_tools.wiki_write(
+            "worker-lifecycle-guide", "Worker Lifecycle Guide", self.VALID_CONTENT
+        )
+        assert "worker-lifecycle-guide.md" in result
+        warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+        assert any("overlap" in c for c in warning_calls)
+
+    @patch("ironclaude.orchestrator_mcp.logger")
+    def test_no_warn_below_overlap_threshold(self, mock_logger, wiki_tools, tmp_path):
+        wiki_tools.wiki_write("worker-lifecycle", "Worker Lifecycle", self.VALID_CONTENT)
+        mock_logger.reset_mock()
+        # "state-machine-design" shares no keywords with "worker-lifecycle"
+        result = wiki_tools.wiki_write(
+            "state-machine-design", "State Machine Design", self.VALID_CONTENT
+        )
+        assert "state-machine-design.md" in result
+        warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+        assert not any("overlap" in c for c in warning_calls)
+
+    @patch("ironclaude.orchestrator_mcp.logger")
+    def test_duplicate_check_skips_self_on_update(self, mock_logger, wiki_tools, tmp_path):
+        wiki_tools.wiki_write("worker-lifecycle", "Worker Lifecycle", self.VALID_CONTENT)
+        mock_logger.reset_mock()
+        result = wiki_tools.wiki_write(
+            "worker-lifecycle", "Worker Lifecycle", self.VALID_CONTENT + " Updated."
+        )
+        assert "worker-lifecycle.md" in result
+        warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+        assert not any("overlap" in c for c in warning_calls)
 
 
 def test_constructor_ledger_path_optional(registry, mock_tmux, db_conn):
@@ -4478,26 +4773,14 @@ class TestGetOllamaVram:
 class TestCheckSpawnPreconditions:
     """Tests for _check_spawn_preconditions() resource gating."""
 
-    def test_rejects_when_worker_count_exceeded(self, tools, registry):
-        """Existing behavior: reject when active workers >= max."""
-        tools._config = {"max_concurrent_workers": 2}
-        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp/r")
-        registry.register_worker("w2", "claude-sonnet", "ic-w2", repo="/tmp/r")
-        result = tools._check_spawn_preconditions()
-        assert result is not None
-        assert "Spawn rejected" in result["error"]
-        assert result["active_workers"] == 2
-
     def test_rejects_when_ollama_vram_exceeds_threshold(self, tools):
-        """NEW: hard-block when Ollama VRAM > threshold."""
+        """Hard-block when Ollama VRAM > threshold (ollama worker type only)."""
         tools._config = {
-            "max_concurrent_workers": 6,
             "ollama_vram_block_threshold_gb": 8.0,
-            "min_available_memory_gb": 8.0,
-            "ollama_memory_safety_margin_gb": 4.0,
+            "min_available_memory_pct": 0.10,
         }
         tools._get_ollama_vram = MagicMock(return_value=(17.2, ["gemma4:31b (17.2GB)"]))
-        result = tools._check_spawn_preconditions()
+        result = tools._check_spawn_preconditions(worker_type="ollama")
         assert result is not None
         assert "Ollama VRAM too high" in result["error"]
         assert result["ollama_vram_gb"] == 17.2
@@ -4507,10 +4790,8 @@ class TestCheckSpawnPreconditions:
     def test_passes_when_ollama_vram_below_threshold(self, tools):
         """Ollama loaded but under threshold — allow spawn."""
         tools._config = {
-            "max_concurrent_workers": 6,
             "ollama_vram_block_threshold_gb": 8.0,
-            "min_available_memory_gb": 8.0,
-            "ollama_memory_safety_margin_gb": 4.0,
+            "min_available_memory_pct": 0.10,
         }
         tools._get_ollama_vram = MagicMock(return_value=(4.0, ["qwen3.5:4b (4.0GB)"]))
         mock_mem = MagicMock()
@@ -4520,49 +4801,45 @@ class TestCheckSpawnPreconditions:
             result = tools._check_spawn_preconditions()
         assert result is None
 
-    def test_dynamic_memory_threshold_with_ollama(self, tools):
-        """When Ollama loaded, memory threshold = base + margin."""
+    def test_rejects_when_available_below_pct_threshold(self, tools):
+        """Layer 3: rejects when available < total * min_available_memory_pct."""
         tools._config = {
-            "max_concurrent_workers": 6,
             "ollama_vram_block_threshold_gb": 20.0,
-            "min_available_memory_gb": 8.0,
-            "ollama_memory_safety_margin_gb": 4.0,
+            "min_available_memory_pct": 0.10,
         }
         tools._get_ollama_vram = MagicMock(return_value=(6.0, ["qwen3.5:9b (6.0GB)"]))
         mock_mem = MagicMock()
         mock_mem.total = int(48 * 1024**3)
-        mock_mem.available = int(10 * 1024**3)  # 10GB < 12GB (8+4)
+        mock_mem.available = int(3 * 1024**3)  # 3.0GB < 4.8GB (10% of 48GB)
         with patch("ironclaude.orchestrator_mcp.psutil.virtual_memory", return_value=mock_mem):
             result = tools._check_spawn_preconditions()
         assert result is not None
         assert "system memory too low" in result["error"]
-        assert result["threshold_gb"] == 12.0
-        assert result["base_threshold_gb"] == 8.0
-        assert result["ollama_margin_gb"] == 4.0
+        assert result["threshold_gb"] == 4.8
+        assert result["total_gb"] == 48.0
+        assert result["min_available_memory_pct"] == 0.10
+        assert "available_gb" in result
 
-    def test_no_ollama_margin_when_no_models_loaded(self, tools):
-        """Without Ollama, memory threshold = base only."""
+    def test_pct_threshold_applies_regardless_of_ollama_state(self, tools):
+        """Layer 3 threshold is identical whether Ollama is loaded or not."""
         tools._config = {
-            "max_concurrent_workers": 6,
-            "ollama_vram_block_threshold_gb": 8.0,
-            "min_available_memory_gb": 8.0,
-            "ollama_memory_safety_margin_gb": 4.0,
+            "ollama_vram_block_threshold_gb": 20.0,
+            "min_available_memory_pct": 0.10,
         }
         tools._get_ollama_vram = MagicMock(return_value=(0.0, []))
         mock_mem = MagicMock()
         mock_mem.total = int(48 * 1024**3)
-        mock_mem.available = int(10 * 1024**3)  # 10GB > 8GB base
+        mock_mem.available = int(3 * 1024**3)  # 3.0GB < 4.8GB — same threshold as with Ollama
         with patch("ironclaude.orchestrator_mcp.psutil.virtual_memory", return_value=mock_mem):
             result = tools._check_spawn_preconditions()
-        assert result is None
+        assert result is not None
+        assert result["threshold_gb"] == 4.8
 
     def test_ollama_unreachable_allows_spawn(self, tools):
         """When Ollama API fails, _get_ollama_vram returns (0, []) — spawn allowed."""
         tools._config = {
-            "max_concurrent_workers": 6,
             "ollama_vram_block_threshold_gb": 8.0,
-            "min_available_memory_gb": 8.0,
-            "ollama_memory_safety_margin_gb": 4.0,
+            "min_available_memory_pct": 0.10,
         }
         tools._get_ollama_vram = MagicMock(return_value=(0.0, []))
         mock_mem = MagicMock()
@@ -4575,24 +4852,20 @@ class TestCheckSpawnPreconditions:
     def test_logs_rejection_at_info_level(self, tools, caplog):
         """Rejections are logged at INFO with decision details."""
         tools._config = {
-            "max_concurrent_workers": 6,
             "ollama_vram_block_threshold_gb": 8.0,
-            "min_available_memory_gb": 8.0,
-            "ollama_memory_safety_margin_gb": 4.0,
+            "min_available_memory_pct": 0.10,
         }
         tools._get_ollama_vram = MagicMock(return_value=(17.2, ["gemma4:31b (17.2GB)"]))
         with caplog.at_level(logging.INFO, logger="ironclaude.orchestrator_mcp"):
-            tools._check_spawn_preconditions()
+            tools._check_spawn_preconditions(worker_type="ollama")
         assert "Spawn rejected" in caplog.text
         assert "17.2" in caplog.text
 
     def test_logs_pass_at_info_level(self, tools, caplog):
         """Successful precondition checks are also logged at INFO."""
         tools._config = {
-            "max_concurrent_workers": 6,
             "ollama_vram_block_threshold_gb": 20.0,
-            "min_available_memory_gb": 8.0,
-            "ollama_memory_safety_margin_gb": 4.0,
+            "min_available_memory_pct": 0.10,
         }
         tools._get_ollama_vram = MagicMock(return_value=(0.0, []))
         mock_mem = MagicMock()
@@ -4604,14 +4877,21 @@ class TestCheckSpawnPreconditions:
         assert result is None
         assert "preconditions passed" in caplog.text
 
-    def test_batch_size_respected(self, tools, registry):
-        """Batch spawn checks active + batch_size against max."""
-        tools._config = {"max_concurrent_workers": 6}
-        for i in range(4):
-            registry.register_worker(f"w{i}", "claude-sonnet", f"ic-w{i}", repo="/tmp/r")
-        result = tools._check_spawn_preconditions(batch_size=3)
+    def test_percentage_threshold_scales_with_total_memory(self, tools):
+        """Threshold is proportional to total RAM — 16GB machine uses 1.6GB floor."""
+        tools._config = {
+            "ollama_vram_block_threshold_gb": 20.0,
+            "min_available_memory_pct": 0.10,
+        }
+        tools._get_ollama_vram = MagicMock(return_value=(0.0, []))
+        mock_mem = MagicMock()
+        mock_mem.total = int(16 * 1024**3)
+        mock_mem.available = int(1 * 1024**3)  # 1.0GB < 1.6GB (10% of 16GB)
+        with patch("ironclaude.orchestrator_mcp.psutil.virtual_memory", return_value=mock_mem):
+            result = tools._check_spawn_preconditions()
         assert result is not None
-        assert result["active_workers"] == 4
+        assert result["threshold_gb"] == 1.6
+        assert result["total_gb"] == 16.0
 
 
 class TestActivatePmRemote:
@@ -4635,6 +4915,18 @@ class TestActivatePmRemote:
         result = tools._activate_pm_remote("ic-w1", "remote-host")
         assert result is None
         mock_tmux.run_sqlite_query.assert_called_once()
+
+    def test_pane_pid_none_includes_alive_status_and_log(self, tools, mock_tmux):
+        """When list_pane_pid returns None, error includes session status and log tail."""
+        mock_tmux.list_pane_pid.return_value = None
+        mock_tmux.has_session.return_value = False
+        mock_tmux.read_log_tail.return_value = "/usr/local/bin/claude: not found\n"
+
+        result = tools._activate_pm_remote("ic-w1", "kandice")
+
+        assert isinstance(result, str)
+        assert "DEAD" in result
+        assert "not found" in result
 
 
 class TestCallGraderBatch:
@@ -4755,29 +5047,9 @@ class TestGetOllamaInventory:
 
 
 class TestSpawnPreconditions:
-    def test_spawn_worker_rejected_at_max_workers(self, tools, registry, mock_tmux):
-        """spawn_worker returns error when max_concurrent_workers reached."""
-        tools._config = {"max_concurrent_workers": 2, "min_available_memory_gb": 1.0}
-        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
-        _mock_grader_approve(tools)
-        registry.register_worker("existing1", "claude-sonnet", "ic-existing1", repo="/tmp")
-        registry.register_worker("existing2", "claude-sonnet", "ic-existing2", repo="/tmp")
-        result = tools.spawn_worker(
-            worker_id="w3",
-            worker_type="claude-sonnet",
-            repo="/tmp/repo",
-            objective="Should be rejected",
-        )
-        assert isinstance(result, dict)
-        assert "error" in result
-        assert "max_concurrent_workers" in result["error"]
-        assert result["active_workers"] == 2
-        assert result["max"] == 2
-        tools._call_grader.assert_not_called()
-
     def test_spawn_worker_rejected_low_memory(self, tools, registry, mock_tmux):
         """spawn_worker returns error when available memory below threshold."""
-        tools._config = {"max_concurrent_workers": 6, "min_available_memory_gb": 8.0}
+        tools._config = {"min_available_memory_pct": 0.10}
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
         _mock_grader_approve(tools)
         mock_mem = MagicMock()
@@ -4794,12 +5066,12 @@ class TestSpawnPreconditions:
         assert "error" in result
         assert "memory" in result["error"].lower()
         assert result["available_gb"] == 3.0
-        assert result["threshold_gb"] == 8.0
+        assert result["threshold_gb"] == 4.8
         tools._call_grader.assert_not_called()
 
     def test_spawn_worker_passes_preconditions(self, tools, registry, mock_tmux):
         """spawn_worker proceeds to grader when preconditions pass."""
-        tools._config = {"max_concurrent_workers": 6, "min_available_memory_gb": 8.0}
+        tools._config = {}
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
         _mock_grader_approve(tools)
         mock_mem = MagicMock()
@@ -4816,25 +5088,9 @@ class TestSpawnPreconditions:
         assert "w1" in result
         tools._call_grader.assert_called_once()
 
-    def test_spawn_workers_batch_rejected_exceeds_limit(self, tools, registry, mock_tmux):
-        """spawn_workers rejects entire batch when current + batch > max."""
-        tools._config = {"max_concurrent_workers": 6, "min_available_memory_gb": 1.0}
-        _mock_grader_approve(tools)
-        for i in range(4):
-            registry.register_worker(f"existing{i}", "claude-sonnet", f"ic-existing{i}", repo="/tmp")
-        requests = [
-            {"worker_id": "b1", "worker_type": "claude-sonnet", "repo": "/tmp/repo", "objective": "Task 1"},
-            {"worker_id": "b2", "worker_type": "claude-sonnet", "repo": "/tmp/repo", "objective": "Task 2"},
-            {"worker_id": "b3", "worker_type": "claude-sonnet", "repo": "/tmp/repo", "objective": "Task 3"},
-        ]
-        result = tools.spawn_workers(requests)
-        assert isinstance(result, dict)
-        assert "error" in result
-        assert "max_concurrent_workers" in result["error"]
-
     def test_spawn_workers_batch_passes(self, tools, registry, mock_tmux):
         """spawn_workers proceeds when current + batch <= max."""
-        tools._config = {"max_concurrent_workers": 6, "min_available_memory_gb": 1.0}
+        tools._config = {}
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
         _mock_grader_approve(tools)
         registry.register_worker("existing1", "claude-sonnet", "ic-existing1", repo="/tmp")
@@ -4853,17 +5109,15 @@ class TestSpawnPreconditions:
 
 class TestOllamaConflictWarning:
     def test_spawn_worker_blocked_by_ollama_vram(self, tools, registry, mock_tmux):
-        """spawn_worker rejects pre-spawn when Ollama VRAM exceeds threshold."""
+        """spawn_worker rejects ollama worker when Ollama VRAM exceeds threshold."""
         tools._config = {
-            "max_concurrent_workers": 6,
-            "min_available_memory_gb": 1.0,
             "ollama_vram_block_threshold_gb": 8.0,
-            "ollama_memory_safety_margin_gb": 4.0,
         }
         tools._get_ollama_vram = MagicMock(return_value=(17.4, ["gemma4:31b (17.4GB)"]))
         result = tools.spawn_worker(
             worker_id="w1",
-            worker_type="claude-sonnet",
+            worker_type="ollama",
+            model_name="qwen3:8b",
             repo="/tmp/repo",
             objective="Do something",
         )
@@ -4874,9 +5128,124 @@ class TestOllamaConflictWarning:
 
 class TestConfigDefaults:
     def test_config_defaults_include_spawn_safeguard_keys(self):
-        """DEFAULTS includes max_concurrent_workers and min_available_memory_gb."""
+        """DEFAULTS includes spawn gate config keys."""
         from ironclaude.config import DEFAULTS
-        assert "max_concurrent_workers" in DEFAULTS
-        assert DEFAULTS["max_concurrent_workers"] == 6
-        assert "min_available_memory_gb" in DEFAULTS
-        assert DEFAULTS["min_available_memory_gb"] == 8.0
+        assert "min_available_memory_pct" in DEFAULTS
+        assert DEFAULTS["min_available_memory_pct"] == 0.10
+        assert "ollama_vram_block_threshold_gb" in DEFAULTS
+        assert DEFAULTS["ollama_vram_block_threshold_gb"] == 8.0
+
+
+class TestSpawnPreconditionsWorkerType:
+    """VRAM gate in _check_spawn_preconditions() must only fire for ollama workers."""
+
+    @pytest.fixture
+    def vram_loaded_tools(self, tools):
+        """tools with 12 GB Ollama VRAM loaded and plenty of free RAM."""
+        tools._get_ollama_vram = MagicMock(return_value=(12.0, ["gemma4:31b (12.0GB)"]))
+        tools.get_system_memory = MagicMock(return_value={"available_gb": 30.0, "total_gb": 48.0})
+        return tools
+
+    def test_claude_sonnet_bypasses_vram_gate(self, vram_loaded_tools):
+        result = vram_loaded_tools._check_spawn_preconditions(worker_type="claude-sonnet")
+        assert result is None
+
+    def test_claude_opus_bypasses_vram_gate(self, vram_loaded_tools):
+        result = vram_loaded_tools._check_spawn_preconditions(worker_type="claude-opus")
+        assert result is None
+
+    def test_ollama_blocked_by_vram_gate(self, vram_loaded_tools):
+        result = vram_loaded_tools._check_spawn_preconditions(worker_type="ollama")
+        assert result is not None
+        assert "ollama_vram_gb" in result
+        assert result["ollama_vram_gb"] == 12.0
+
+    def test_empty_worker_type_bypasses_vram_gate(self, vram_loaded_tools):
+        """Backward compat: default empty worker_type skips VRAM gate."""
+        result = vram_loaded_tools._check_spawn_preconditions()
+        assert result is None
+
+    def test_memory_floor_still_applies_to_non_ollama(self, tools):
+        """VRAM gate skipped but memory floor check fires when RAM is critically low."""
+        tools._get_ollama_vram = MagicMock(return_value=(12.0, ["gemma4:31b"]))
+        # threshold = 48.0 * 0.10 = 4.8GB; 3.0 < 4.8 → blocked
+        tools.get_system_memory = MagicMock(return_value={"available_gb": 3.0, "total_gb": 48.0})
+        result = tools._check_spawn_preconditions(worker_type="claude-sonnet")
+        assert result is not None
+        assert "available_gb" in result
+        assert result["available_gb"] == 3.0
+
+    def test_batch_ollama_worker_type_triggers_gate(self, vram_loaded_tools):
+        """batch_type='ollama' (any_ollama=True path) still triggers VRAM gate."""
+        result = vram_loaded_tools._check_spawn_preconditions(worker_type="ollama")
+        assert result is not None
+        assert "ollama_vram_gb" in result
+
+    def test_batch_non_ollama_worker_type_bypasses_gate(self, vram_loaded_tools):
+        """batch_type='' (no ollama in batch) skips VRAM gate for the whole batch."""
+        result = vram_loaded_tools._check_spawn_preconditions(worker_type="")
+        assert result is None
+
+
+class TestUnloadOllamaModel:
+    """Tests for OrchestratorTools.unload_ollama_model()."""
+
+    def test_unload_success(self, tools):
+        """Successful POST returns confirmation string and drains stream."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.iter_content = MagicMock(return_value=iter([b'{"done":true}']))
+        with patch("ironclaude.orchestrator_mcp.requests.post", return_value=mock_resp) as mock_post:
+            result = tools.unload_ollama_model("gemma4:31b")
+        mock_post.assert_called_once_with(
+            "http://localhost:11434/api/generate",
+            json={"model": "gemma4:31b", "keep_alive": 0},
+            timeout=10,
+            stream=True,
+        )
+        assert "gemma4:31b" in result
+        assert "unloaded" in result.lower()
+
+    def test_unload_connection_error(self, tools):
+        """Connection failure returns error string, never raises."""
+        with patch("ironclaude.orchestrator_mcp.requests.post", side_effect=Exception("Connection refused")):
+            result = tools.unload_ollama_model("gemma4:31b")
+        assert "Failed" in result
+        assert "gemma4:31b" in result
+
+    def test_unload_http_error(self, tools):
+        """raise_for_status exception returns error string, never raises."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.side_effect = Exception("404 Not Found")
+        with patch("ironclaude.orchestrator_mcp.requests.post", return_value=mock_resp):
+            result = tools.unload_ollama_model("nonexistent-model")
+        assert "Failed" in result
+        assert "nonexistent-model" in result
+
+
+class TestOllamaConfigPath:
+    def test_default_path_is_hooks_config(self, registry, mock_tmux):
+        """Default _ollama_config_path is ~/.claude/ironclaude-hooks-config.json."""
+        t = OrchestratorTools(registry, mock_tmux)
+        expected = os.path.expanduser("~/.claude/ironclaude-hooks-config.json")
+        assert t._ollama_config_path == expected
+
+    def test_env_override_sets_config_path(self, tmp_path, monkeypatch, registry, mock_tmux):
+        """IC_OLLAMA_CONFIG_PATH env var overrides the default hooks config path."""
+        cfg_file = tmp_path / "test_ollama.json"
+        cfg_file.write_text('{"ollama": {"url": "http://test-host:11434"}, "timeout_seconds": 30}')
+        monkeypatch.setenv("IC_OLLAMA_CONFIG_PATH", str(cfg_file))
+        t = OrchestratorTools(registry, mock_tmux)
+        client = t._get_ollama_client()
+        assert client._url == "http://test-host:11434"
+
+
+class TestCallLocalGraderDelegation:
+    def test_delegates_to_local_grader(self, tools):
+        mock_grade = MagicMock(return_value={"grade": "A", "approved": True})
+        tools._local_grader = MagicMock()
+        tools._local_grader.grade = mock_grade
+        schema = {"type": "object", "required": ["grade", "approved"]}
+        result = tools._call_local_grader("sys_prompt", "user_prompt", schema)
+        mock_grade.assert_called_once_with("sys_prompt", "user_prompt", schema)
+        assert result == {"grade": "A", "approved": True}

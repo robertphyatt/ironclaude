@@ -112,6 +112,16 @@ if [ "${CLAUDE_HOOK_JUDGE_MODE:-false}" = "true" ]; then
 fi
 
 # =============================================================================
+# WORKER STOP REVIEW BYPASS
+# =============================================================================
+
+if [ "${ENABLE_STOP_REVIEW:-1}" = "0" ]; then
+    log_hook "GET-BACK-TO-WORK" "Disabled" "ENABLE_STOP_REVIEW=0"
+    echo '{"decision": "approve", "reason": "Stop review disabled via ENABLE_STOP_REVIEW=0"}'
+    exit 0
+fi
+
+# =============================================================================
 # READ HOOK EVENT
 # =============================================================================
 
@@ -843,7 +853,7 @@ if [[ "$ACTIVE_SKILL" =~ ^(brainstorming|writing-plans)$ ]]; then
 
 You MUST search episodic memory before continuing with $ACTIVE_SKILL. This is blocking — no other action will unblock you. Do NOT write code, do NOT respond to the user, do NOT call any other tool.
 
-Call the Task tool RIGHT NOW with EXACTLY these parameters:
+Call the Agent tool RIGHT NOW with EXACTLY these parameters:
   description: \"Search episodic memory\"
   subagent_type: \"ironclaude:search-conversations\"
   prompt: \"Search for prior decisions and context about [your current task topic]\"

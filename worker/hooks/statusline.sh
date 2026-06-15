@@ -15,11 +15,16 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_JSON="$SCRIPT_DIR/../.claude-plugin/plugin.json"
 DB_PATH="$HOME/.claude/ironclaude.db"
+STATUSLINE_ERROR_LOG="$HOME/.claude/ironclaude-statusline-errors.log"
+DEGRADED=""
 
 # Read version from plugin.json
 VERSION="?.?.?"
 if command -v jq &>/dev/null && [ -f "$PLUGIN_JSON" ]; then
   VERSION=$(jq -r '.version // "?.?.?"' "$PLUGIN_JSON" 2>/dev/null || echo "?.?.?")
+else
+  DEGRADED="true"
+  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] jq missing or plugin.json not found at $PLUGIN_JSON" >> "$STATUSLINE_ERROR_LOG" 2>/dev/null
 fi
 
 # Read stdin JSON from Claude Code and parse session_id
@@ -27,6 +32,8 @@ INPUT=$(cat)
 SESSION_ID=""
 if command -v jq &>/dev/null; then
   SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
+else
+  DEGRADED="true"
 fi
 
 # Query DB for session state
@@ -39,7 +46,13 @@ if [ -n "$SESSION_ID" ] && [ -f "$DB_PATH" ]; then
   if [ -n "$ROW" ]; then
     PROF_MODE=$(echo "$ROW" | cut -d'|' -f1)
     WORKFLOW=$(echo "$ROW" | cut -d'|' -f2)
+  else
+    DEGRADED="true"
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] DB query returned empty for session $SESSION_ID" >> "$STATUSLINE_ERROR_LOG" 2>/dev/null
   fi
+elif [ -n "$SESSION_ID" ] && [ ! -f "$DB_PATH" ]; then
+  DEGRADED="true"
+  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] DB file not found at $DB_PATH" >> "$STATUSLINE_ERROR_LOG" 2>/dev/null
 fi
 
 # Defaults for missing data
@@ -92,7 +105,11 @@ case "$WORKFLOW" in
   *)               WORK_COLOR="$GREEN" ;;
 esac
 
-OUTPUT="ironclaude v${VERSION} | ${PROF_COLOR}Professional Mode: ${PROF_LABEL}${RESET} | ${WORK_COLOR}Status: ${WORKFLOW}${RESET}"
+DEGRADED_MARKER=""
+if [ "$DEGRADED" = "true" ]; then
+  DEGRADED_MARKER=" ${RED}[!]${RESET}"
+fi
+OUTPUT="ironclaude v${VERSION}${DEGRADED_MARKER} | ${PROF_COLOR}Professional Mode: ${PROF_LABEL}${RESET} | ${WORK_COLOR}Status: ${WORKFLOW}${RESET}"
 if [ "$LOG_SESSION_IDS" = "true" ] && [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "null" ]; then
   OUTPUT="${OUTPUT} | ${SESSION_ID}"
 fi

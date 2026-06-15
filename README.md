@@ -104,7 +104,7 @@ The Worker is a Claude Code plugin that enforces the brainstorm-plan-execute wor
 /ironclaude:activate-professional-mode
 ```
 
-When active, Claude operates in architect mode -- planning and designing without making code changes unless executing an approved plan. Every action is validated by hooks that check whether it's permitted in the current workflow phase.
+When active, Claude operates in architect mode -- planning and designing without making code changes unless executing an approved plan. Every write action is validated by hooks that check whether it's permitted in the current workflow phase.
 
 ### Set Up Statusline (Recommended)
 
@@ -130,6 +130,25 @@ Claude: [executing-plans] -- Task-by-task with code review between each
 Changes staged with git add (you commit manually)
 ```
 
+### State Machine Stages
+
+The workflow enforces transitions through named stages visible in the statusline:
+
+| Stage | Meaning |
+|-------|---------|
+| `idle` | No active plan |
+| `brainstorming` | Design session in progress |
+| `debugging` | Systematic debugging investigation (0.75× staleness) |
+| `design_ready` | Design written, awaiting plan creation |
+| `design_marked_for_use` | Design registered for plan consumption |
+| `plan_marked_for_use` | Plan pipeline — design consumed |
+| `final_plan_prep` | Final validation before plan approval |
+| `plan_ready` | Plan approved, awaiting execution start |
+| `executing` | Task implementation in progress |
+| `reviewing` | Code review in progress — `review_pending` blocks the next task |
+| `plan_interrupted` | Mid-execution topic change detected |
+| `execution_complete` | All tasks done |
+
 Each phase transition is enforced by the state machine. Claude cannot skip brainstorming, cannot execute without an approved plan, and cannot move to the next task without passing code review.
 
 ### Validation Backend (Recommended)
@@ -145,7 +164,34 @@ ollama serve
 /ironclaude:setup-ollama-validation
 ```
 
+### Hook System
+
+Enforcement is implemented in 16 hooks across 6 lifecycle events (SessionStart, PreToolUse, PostToolUse, UserPromptSubmit, SubagentStop, Stop). Key hooks:
+
+| Hook | Trigger | Purpose |
+|------|---------|---------|
+| `professional-mode-guard.sh` | PreToolUse | Blocks write tools outside `executing` stage; validates file access against wave whitelist |
+| `skill-state-bridge.sh` | PreToolUse | Detects Skill invocations; requests state machine transitions |
+| `state-activator.sh` | UserPromptSubmit | Handles professional mode on/off; PPID-based session binding |
+| `session-init.sh` | SessionStart | Initializes session, creates DB schema, configures statusline |
+| `topic-change-detector.sh` | UserPromptSubmit | Detects topic changes during plan execution |
+| `get-back-to-work-claude.sh` | Stop | Multi-check grading gate before session stop |
+| `task-completion-validator.sh` | PostToolUse | Validates task completion claims against plan |
+| `subagent-circuit-breaker.sh` | PreToolUse/PostToolUse | Detects context-limit failures in subagents |
+
+8 additional hooks handle episodic memory sync, poll deduplication, MCP state logging, and other internal concerns. Shared libraries (`hook-logger.sh`, `plan-validator.sh`) provide logging, DB access, and LLM validation utilities.
+
+Hooks deploy to `~/.claude/ironclaude-hooks/` via `make deploy-hooks` and run from there at runtime (not from the repo directory).
+
 ### Model Configuration
+
+The Brain selects worker type per task:
+
+| Worker Type | Description |
+|-------------|-------------|
+| `claude-sonnet` | Default. Sonnet with an Opus advisor session; used for most tasks |
+| `claude-opus` | Full Opus worker for high-complexity tasks |
+| `ollama` | Local LLM routed via `ANTHROPIC_BASE_URL` — see [Ollama Workers](#ollama-workers) |
 
 IronClaude defaults to Claude Opus (`opus`) for the brain and grader. You can override this via environment variables to pin a specific model version:
 
@@ -158,7 +204,7 @@ export BRAIN_MODEL="claude-opus-4-6-20250115"
 export GRADER_MODEL="claude-sonnet-4-5-20241022"
 ```
 
-When workers use Sonnet, they automatically get an Opus 4 advisor for oversight. You do you — set these to whatever works best for your workflow.
+When workers use Sonnet, they automatically get an Opus 4 advisor for oversight. If a Sonnet worker fails a task, the Brain may re-assign it to an Opus worker. Configure these to match your workflow requirements.
 
 ### Worker Skills
 
@@ -263,7 +309,7 @@ make install   # Install Python dependencies (includes Anthropic's proprietary c
 make run       # Start the daemon
 ```
 
-The daemon connects to Slack, spawns the Brain session, and begins listening for objectives. Runtime configuration is in `config/ironclaude.json`.
+The daemon connects to Slack, spawns the Brain session, and begins listening for objectives. Runtime configuration is in `config/ironclaude.json` (relative to the `commander/` directory). Daemon logs are written to `/tmp/ic-logs/` by default (configurable via `log_dir`).
 
 ### Daily Usage
 
@@ -274,6 +320,40 @@ The daemon connects to Slack, spawns the Brain session, and begins listening for
 5. **The Brain manages the rest** -- It reviews completed work, reassigns failed tasks, and escalates decisions it can't make autonomously
 
 You can do all of this from your phone.
+
+### Worker Reliability
+
+The daemon monitors all active workers for stalled output. When a worker's log hash stops changing, a stale timer starts. Before killing, the daemon checks for CPU activity — if the process is still running hot, the kill is deferred 15 minutes. The daemon also checks available system memory before spawning workers, blocking new spawns when memory drops below the `min_available_memory_pct` threshold.
+
+Thresholds are stage-aware:
+
+| Situation | Alert | Kill |
+|-----------|-------|------|
+| Normal worker | 30 min | 60 min |
+| Brainstorming/debugging | ~22 min | ~45 min (0.75× multiplier) |
+| Executing/reviewing | ~45 min | ~90 min (1.5× multiplier) |
+| Prompt-waiting (blocked on AskUserQuestion) | 15 min | 30 min |
+
+Stuck escalation is two-step: at the alert threshold, the Brain receives a `[STUCK]` alert with the worker ID and idle duration. At the kill threshold, the operator receives a Slack notification (`*Worker Stuck-Killed:*`) with duration and stage, then the Brain receives a `[MANDATORY SWEEP]` prompt listing remaining directives to re-evaluate.
+
+### Ollama Workers
+
+Workers can run against local Ollama models. The daemon sets `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN=ollama` before spawning, routing Claude Code's API calls to the Ollama endpoint. This is separate from the hook validation backend — hook validation uses a small model for fast gate checks; Ollama workers use a full coding model as the worker's primary LLM.
+
+Workers can also run on remote machines via SSH — configure machine definitions in `config/machines.yaml`. For local Ollama machines, `machines` is a top-level key in `ironclaude.json`:
+
+```json
+"machines": [
+  {
+    "name": "laptop",
+    "url": "http://localhost:11434",
+    "model": "qwen3-coder-next:q2_k",
+    "max_workers": 1
+  }
+]
+```
+
+The daemon checks available Ollama VRAM before spawning. Set `ollama_vram_block_threshold_gb` in the config to adjust the minimum required (default: 8.0 GB). Models can be unloaded on demand via the Brain's MCP tools.
 
 ### Autonomy Levels
 
@@ -363,6 +443,42 @@ Three convergence mechanisms keep the wiki current:
 
 ---
 
+## Configuration Reference
+
+`config/ironclaude.json` controls Commander runtime behavior. All keys are optional; unset keys use defaults.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `poll_interval_seconds` | `15` | Worker status poll interval (seconds) |
+| `heartbeat_interval_seconds` | `900` | Brain heartbeat check interval (15 min) |
+| `worker_stale_threshold_seconds` | `300` | Seconds before a worker is considered stale |
+| `brain_timeout_seconds` | `600` | Max seconds to wait for a Brain response |
+| `max_worker_retries` | `3` | Retry attempts before marking a task failed |
+| `autonomy_level` | `"3"` | Brain autonomy: `1` = confirm all, `3` = default, `5` = full |
+| `brain_model` | `"opus"` | Model for the Brain session |
+| `grader_model` | `"opus"` | Model for the Grader session |
+| `effort_level` | `"high"` | Worker effort level (`CLAUDE_CODE_EFFORT_LEVEL`) |
+| `machines` | `[]` | Named Ollama machine configs — see [Ollama Workers](#ollama-workers) |
+| `advisor.enabled` | `true` | Whether Sonnet workers get an Opus advisor session |
+| `advisor.executor_model` | `"sonnet"` | Default executor worker model |
+| `advisor.advisor_model` | `"opus"` | Advisor model for Sonnet workers |
+| `ollama_vram_block_threshold_gb` | `8.0` | Min VRAM (GB) required to spawn an Ollama worker |
+| `push_enabled` | `false` | Enable automated git push after task completion |
+| `push_max_per_hour` | `5` | Max auto-pushes per hour when `push_enabled` is true |
+| `brain_heartbeat_timeout_seconds` | `60` | Max seconds before Brain is considered dead |
+| `min_available_memory_pct` | `0.10` | Memory pressure threshold (fraction) for worker spawn |
+| `tmp_dir` | `"/tmp/ic"` | Temp directory for daemon artifacts |
+| `log_dir` | `"/tmp/ic-logs"` | Log directory |
+| `db_path` | `"data/db/ironclaude.db"` | Commander database path |
+| `brain_cwd` | `"~/.ironclaude/brain"` | Brain session working directory |
+| `brain_prompt_path` | `""` | Path to brain prompt file |
+| `operator_name` | `"Operator"` | Operator display name |
+
+**Environment variable overrides** (take precedence over `ironclaude.json`):
+`POLL_INTERVAL_SECONDS`, `HEARTBEAT_INTERVAL_SECONDS`, `DB_PATH`, `BRAIN_TIMEOUT_SECONDS`, `BRAIN_MODEL`, `GRADER_MODEL`, `EFFORT_LEVEL`
+
+---
+
 ## Security Model
 
 Commander workers run with `--dangerously-skip-permissions`. This is intentional.
@@ -423,6 +539,8 @@ After installing the plugin, fix CRLF line endings on hook scripts:
 ```bash
 sed -i 's/\r$//' ~/.claude/plugins/cache/ironclaude/ironclaude/*/hooks/*.sh
 ```
+
+For the full Windows setup guide including path handling, bash environment configuration, and troubleshooting, see [WINDOWS_SETUP.md](WINDOWS_SETUP.md).
 
 ---
 

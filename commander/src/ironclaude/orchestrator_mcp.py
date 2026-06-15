@@ -32,6 +32,8 @@ import requests
 import shlex
 
 from ironclaude.config import make_opus_command
+from ironclaude.grader import LocalGrader
+from ironclaude.ollama_client import OllamaClient, OllamaError
 from ironclaude.signal_forensics import _logged_kill
 from ironclaude.tmux_manager import _strip_ansi, detect_ask_user_menu
 
@@ -39,6 +41,10 @@ logger = logging.getLogger("ironclaude.orchestrator_mcp")
 
 _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
 _SAFE_PUSH_NAME_RE = re.compile(r'^[a-zA-Z0-9/_.-]+$')
+_WIKI_COMMIT_HASH_RE = re.compile(r'\b[0-9a-f]{7,40}\b', re.IGNORECASE)
+_WIKI_STATUS_COMPLETE_RE = re.compile(
+    r'Status:\s*Complete\s*\(\s*20\d\d-\d\d-\d\d,\s*commit', re.IGNORECASE
+)
 
 PID_FILE = Path("/tmp/ic-daemon.pid")
 
@@ -385,12 +391,20 @@ class OrchestratorTools:
             or "~/.ironclaude/brain"
         )
         self._wiki_dir = os.path.join(os.path.expanduser(brain_cwd), "wiki")
+        self._ollama_config_path = os.path.expanduser(
+            os.environ.get("IC_OLLAMA_CONFIG_PATH", "~/.claude/ironclaude-hooks-config.json")
+        )
+        self._ollama_client: OllamaClient | None = None
+        self._ollama_cfg_cache: dict = {}
+        self._local_grader = LocalGrader(config_path=self._ollama_config_path)
 
     def _get_worker_command(self, worker_type: str, model_name: str = "") -> str:
         """Build worker command, using advisor config for model selection."""
         advisor = self._advisor_cfg
         if worker_type == "ollama":
-            return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
+            self._get_ollama_client()  # populate _ollama_cfg_cache
+            _ollama_url = self._ollama_cfg_cache.get("url", "http://localhost:11434")
+            return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; export CLAUDE_CODE_ATTRIBUTION_HEADER=0; export ANTHROPIC_BASE_URL={shlex.quote(_ollama_url)}; export ANTHROPIC_AUTH_TOKEN=ollama; export ANTHROPIC_API_KEY=; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
         elif worker_type == "claude-opus":
             return make_opus_command(self._opus_model, self._effort_level)
         elif worker_type in WORKER_COMMANDS:
@@ -399,6 +413,29 @@ class OrchestratorTools:
                 return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model {shlex.quote(model)} --dangerously-skip-permissions"
             return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model 'sonnet' --dangerously-skip-permissions"
         raise ValueError(f"Invalid worker type '{worker_type}'")
+
+    def _get_ollama_client(self) -> OllamaClient:
+        """Lazy-initialize and return the shared OllamaClient.
+
+        Reads ~/.claude/ironclaude-hooks-config.json on first call and caches
+        both the client and the ollama config dict. Falls back to localhost
+        defaults if config is absent or malformed.
+        """
+        if self._ollama_client is None:
+            try:
+                with open(self._ollama_config_path) as f:
+                    cfg = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError) as e:
+                logger.warning("Ollama config unavailable (%s): using localhost defaults", e)
+                cfg = {}
+            ollama_cfg = cfg.get("ollama", {})
+            self._ollama_cfg_cache = ollama_cfg
+            self._ollama_client = OllamaClient(
+                url=ollama_cfg.get("url", "http://localhost:11434"),
+                fallback_url=ollama_cfg.get("fallback_url"),
+                timeout=cfg.get("timeout_seconds", 120),
+            )
+        return self._ollama_client
 
     def get_ollama_inventory(self, force_refresh: bool = False) -> dict:
         """Return classified Ollama model inventory."""
@@ -692,6 +729,10 @@ class OrchestratorTools:
             self._grader_ready = False
             logger.warning("Grader timed out on retry after %ds", self.GRADER_TIMEOUT_SECONDS)
             return {"grade": "F", "approved": False, "feedback": f"Grader timed out after {self.GRADER_TIMEOUT_SECONDS}s"}
+
+    def _call_local_grader(self, system_prompt: str, user_prompt: str, format_schema: dict) -> dict:
+        """Call Ollama for local grading. Delegates to self._local_grader."""
+        return self._local_grader.grade(system_prompt, user_prompt, format_schema)
 
     def get_operator_messages(
         self,
@@ -1312,7 +1353,12 @@ class OrchestratorTools:
         """
         pane_pid = self.tmux.list_pane_pid(session_name, ssh_host=ssh_host)
         if not pane_pid:
-            reason = f"could not get pane PID for {session_name} on {ssh_host}"
+            alive = self.tmux.has_session(session_name, ssh_host=ssh_host)
+            log_snippet = self.tmux.read_log_tail(session_name, lines=20, ssh_host=ssh_host)
+            reason = (
+                f"could not get pane PID for {session_name} on {ssh_host} "
+                f"(session {'alive' if alive else 'DEAD'}).\nLast output:\n{log_snippet}"
+            )
             logger.warning(reason)
             return reason
 
@@ -1359,77 +1405,65 @@ class OrchestratorTools:
         logger.info(f"PM activated via remote sqlite3 for {session_name} on {ssh_host}")
         return None
 
-    def _check_spawn_preconditions(self, batch_size: int = 1) -> dict | None:
+    def _check_spawn_preconditions(self, worker_type: str = "") -> dict | None:
         """Pre-spawn resource checks. Returns None if OK, error dict if rejected.
 
-        Checks worker count (cheap DB query), Ollama VRAM (HTTP), then
-        memory with dynamic threshold (psutil). Fails on first violation.
+        Checks Ollama VRAM (HTTP, ollama workers only), then memory with
+        percentage-based threshold (psutil). Fails on first violation.
         """
-        # 1. Worker count check
-        max_workers = self._config.get("max_concurrent_workers", 6)
         running = self.registry.get_running_workers()
         active_count = len(running)
-        if active_count + batch_size > max_workers:
-            return {
-                "error": (
-                    f"Spawn rejected: {active_count}/{max_workers} workers running "
-                    f"(max_concurrent_workers={max_workers}). "
-                    f"Wait for a worker to finish or increase the limit."
-                ),
-                "active_workers": active_count,
-                "max": max_workers,
-            }
 
-        # 2. Ollama VRAM check
+        # 1. Ollama VRAM check (only blocks ollama-type workers)
         ollama_vram_gb, loaded_models = self._get_ollama_vram()
-        vram_threshold = self._config.get("ollama_vram_block_threshold_gb", 8.0)
-        if ollama_vram_gb > vram_threshold:
-            logger.info(
-                "Spawn rejected: Ollama VRAM %.1fGB exceeds threshold %.1fGB. "
-                "Loaded models: %s", ollama_vram_gb, vram_threshold, loaded_models
-            )
-            return {
-                "error": (
-                    f"Spawn rejected: Ollama VRAM too high "
-                    f"(loaded: {ollama_vram_gb}GB, threshold: {vram_threshold}GB). "
-                    f"Wait for Ollama workload to finish or kill loaded models."
-                ),
-                "ollama_vram_gb": ollama_vram_gb,
-                "threshold_gb": vram_threshold,
-                "loaded_models": loaded_models,
-            }
+        if worker_type == "ollama":
+            vram_threshold = self._config.get("ollama_vram_block_threshold_gb", 8.0)
+            if ollama_vram_gb > vram_threshold:
+                logger.info(
+                    "Spawn rejected: Ollama VRAM %.1fGB exceeds threshold %.1fGB. "
+                    "Loaded models: %s", ollama_vram_gb, vram_threshold, loaded_models
+                )
+                return {
+                    "error": (
+                        f"Spawn rejected: Ollama VRAM too high "
+                        f"(loaded: {ollama_vram_gb}GB, threshold: {vram_threshold}GB). "
+                        f"Wait for Ollama workload to finish or kill loaded models."
+                    ),
+                    "ollama_vram_gb": ollama_vram_gb,
+                    "threshold_gb": vram_threshold,
+                    "loaded_models": loaded_models,
+                }
 
-        # 3. Memory floor check (dynamic threshold when Ollama active)
-        base_threshold = self._config.get("min_available_memory_gb", 8.0)
-        ollama_margin = self._config.get("ollama_memory_safety_margin_gb", 4.0)
-        effective_margin = ollama_margin if ollama_vram_gb > 0 else 0
-        effective_threshold = base_threshold + effective_margin
+        # 2. Memory floor check (percentage-based)
+        pct = self._config.get("min_available_memory_pct", 0.10)
         mem = self.get_system_memory()
-        if mem["available_gb"] < effective_threshold:
+        threshold_gb = round(mem["total_gb"] * pct, 1)
+        if mem["available_gb"] < threshold_gb:
             logger.info(
                 "Spawn rejected: available memory %.1fGB < threshold %.1fGB "
-                "(base %.1f + Ollama margin %.1f).",
-                mem["available_gb"], effective_threshold, base_threshold, effective_margin
+                "(%.0f%% of total %.1fGB).",
+                mem["available_gb"], threshold_gb, pct * 100, mem["total_gb"]
             )
             return {
                 "error": (
                     f"Spawn rejected: system memory too low "
                     f"(available: {mem['available_gb']}GB, "
-                    f"threshold: {effective_threshold}GB "
-                    f"[base {base_threshold} + Ollama safety margin {effective_margin}]). "
+                    f"threshold: {threshold_gb}GB "
+                    f"[{pct*100:.0f}% of {mem['total_gb']}GB total]). "
                     f"Check get_process_info() for memory consumers."
                 ),
                 "available_gb": mem["available_gb"],
-                "threshold_gb": effective_threshold,
-                "base_threshold_gb": base_threshold,
-                "ollama_margin_gb": effective_margin,
+                "threshold_gb": threshold_gb,
+                "total_gb": mem["total_gb"],
+                "min_available_memory_pct": pct,
             }
 
         logger.info(
-            "Spawn preconditions passed: workers %d/%d, Ollama VRAM %.1fGB (threshold %.1f), "
-            "memory %.1fGB available (threshold %.1f)",
-            active_count, max_workers, ollama_vram_gb, vram_threshold,
-            mem["available_gb"], effective_threshold
+            "Spawn preconditions passed: worker_type=%s, active_workers=%d, "
+            "Ollama VRAM %.1fGB (vram_gated=%s), memory %.1fGB available (threshold %.1fGB / %.0f%% of %.1fGB)",
+            worker_type or "unspecified", active_count,
+            ollama_vram_gb, worker_type == "ollama",
+            mem["available_gb"], threshold_gb, pct * 100, mem["total_gb"]
         )
         return None
 
@@ -1438,9 +1472,8 @@ class OrchestratorTools:
         Returns (0.0, []) if Ollama is unreachable or has no loaded models.
         """
         try:
-            resp = requests.get("http://localhost:11434/api/ps", timeout=2)
-            resp.raise_for_status()
-            models = resp.json().get("models", [])
+            data = self._get_ollama_client().get_ps()
+            models = data.get("models", [])
             if not models:
                 return 0.0, []
             total = 0.0
@@ -1450,8 +1483,19 @@ class OrchestratorTools:
                 total += size_gb
                 names.append(f"{m.get('name', 'unknown')} ({size_gb}GB)")
             return round(total, 1), names
-        except Exception:
+        except OllamaError:
             return 0.0, []
+
+    def unload_ollama_model(self, model_name: str) -> str:
+        """Unload an Ollama model from VRAM via keep_alive=0."""
+        try:
+            self._get_ollama_client().post_generate(
+                {"model": model_name, "keep_alive": 0, "stream": True}
+            )
+            logger.info("Ollama model %r unloaded from VRAM.", model_name)
+            return f"Model '{model_name}' unloaded from Ollama VRAM."
+        except OllamaError as exc:
+            return f"Failed to unload model '{model_name}': {exc}"
 
     def spawn_worker(
         self,
@@ -1475,7 +1519,7 @@ class OrchestratorTools:
             worker_type = "claude-opus"
 
         # Pre-spawn resource checks (fail-fast before expensive grader call)
-        precondition_error = self._check_spawn_preconditions()
+        precondition_error = self._check_spawn_preconditions(worker_type=worker_type)
         if precondition_error is not None:
             return precondition_error
 
@@ -1524,7 +1568,37 @@ objective: {objective}
 
 Does this objective meet {self._operator_name}'s standards? Is the worker type appropriate?"""
 
-        grade_result = self._call_grader(system_prompt, user_prompt)
+        # Hybrid grading: Ollama pre-filter with Opus escalation
+        confidence_schema = {
+            "type": "object",
+            "properties": {
+                "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
+                "approved": {"type": "boolean"},
+                "feedback": {"type": "string"},
+                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+            },
+            "required": ["grade", "approved", "feedback", "confidence"],
+        }
+        local_result = self._call_local_grader(system_prompt, user_prompt, confidence_schema)
+
+        confidence_threshold = self._ollama_cfg_cache.get("spawn_confidence_threshold", "high")
+        confidence_levels = ["high", "medium", "low"]
+        threshold_idx = confidence_levels.index(confidence_threshold) if confidence_threshold in confidence_levels else 0
+
+        if local_result.get("infrastructure_error"):
+            logger.info(f"Ollama pre-filter for '{worker_id}': infrastructure error, escalating to Opus")
+            grade_result = self._call_grader(system_prompt, user_prompt)
+        else:
+            confidence = local_result.get("confidence", "")
+            confidence_idx = confidence_levels.index(confidence) if confidence in confidence_levels else len(confidence_levels)
+
+            if confidence_idx > threshold_idx:
+                logger.info(f"Ollama pre-filter for '{worker_id}': confidence={confidence}, escalating to Opus")
+                grade_result = self._call_grader(system_prompt, user_prompt)
+            else:
+                logger.info(f"Ollama pre-filter for '{worker_id}': confidence={confidence}, skipping Opus")
+                grade_result = local_result
+
         if not grade_result["approved"]:
             return {
                 "error": f"Spawn rejected by grader (grade {grade_result['grade']}). {grade_result['feedback']}",
@@ -1564,7 +1638,9 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                     f"Wait for completion or use claude-opus/claude-sonnet."
                 )
 
-            cmd = f"ollama launch claude --model {shlex.quote(model_name)} -- --dangerously-skip-permissions"
+            self._get_ollama_client()  # populate _ollama_cfg_cache
+            _ollama_url = self._ollama_cfg_cache.get("url", "http://localhost:11434")
+            cmd = f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; export CLAUDE_CODE_ATTRIBUTION_HEADER=0; export ANTHROPIC_BASE_URL={shlex.quote(_ollama_url)}; export ANTHROPIC_AUTH_TOKEN=ollama; export ANTHROPIC_API_KEY=; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
         elif machine_cfg:
             cmd_parts = ["export IC_ROLE=worker", f"export IC_WORKER_ID={shlex.quote(worker_id)}"]
             for k, v in machine_cfg.env.items():
@@ -1593,8 +1669,12 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
         else:
             self.ensure_worker_trusted(repo)
 
-        # Stage 2: spawn tmux session
+        # Stage 1.5: ensure remote log dir exists before spawning
         remote_log_dir = machine_cfg.log_dir if machine_cfg else None
+        if ssh_host and remote_log_dir:
+            self.tmux.mkdir_p(remote_log_dir, ssh_host=ssh_host)
+
+        # Stage 2: spawn tmux session
         success = self.tmux.spawn_session(session_name, cmd, cwd=repo,
                                           ssh_host=ssh_host, remote_log_dir=remote_log_dir)
         if not success:
@@ -1603,7 +1683,24 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             )
 
         # Stage 3: wait for ready
-        self._wait_for_ready(session_name, timeout=30, ssh_host=ssh_host)
+        ready = self._wait_for_ready(session_name, timeout=30, ssh_host=ssh_host)
+        if not ready:
+            log_tail = self.tmux.read_log_tail(
+                session_name, lines=30, ssh_host=ssh_host, remote_log_dir=remote_log_dir,
+            )
+            if not self.tmux.has_session(session_name, ssh_host=ssh_host):
+                self.tmux.kill_session(session_name, ssh_host=ssh_host)
+                return {
+                    "error": (
+                        f"Worker '{worker_id}' session died before ready on "
+                        f"{machine or 'local'}.\nLast output:\n{log_tail}"
+                    )
+                }
+            logger.warning(
+                "Worker '%s' not ready after timeout on %s but session alive — "
+                "proceeding.\nLast output:\n%s",
+                worker_id, machine or "local", log_tail,
+            )
 
         # Stages 4-5: activate professional mode
         if ssh_host:
@@ -1662,7 +1759,12 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 req["worker_type"] = "claude-opus"
 
         # Pre-spawn resource checks (fail-fast before batch grading)
-        precondition_error = self._check_spawn_preconditions(batch_size=len(requests))
+        # VRAM gate applies only if any worker in the batch is ollama type
+        any_ollama = any(r.get("worker_type") == "ollama" for r in requests)
+        batch_type = "ollama" if any_ollama else ""
+        precondition_error = self._check_spawn_preconditions(
+            worker_type=batch_type
+        )
         if precondition_error is not None:
             return precondition_error
 
@@ -1676,11 +1778,77 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 except OSError:
                     pass
 
-        # Batch grading: single grader call for all objectives
+        # Hybrid batch grading: Ollama pre-filter with Opus escalation
         avatar_skill = _load_avatar_skill().replace("{OPERATOR_NAME}", self._operator_name)
-        system_prompt = f"""{avatar_skill}
 
-You are grading {len(requests)} spawn_worker decisions. Respond with a valid JSON ARRAY — one object per decision:
+        # Single-decision system prompt for Ollama pre-filter
+        ollama_system_prompt = f"""{avatar_skill}
+
+You are grading a spawn_worker decision. Respond with valid JSON only — no markdown, no explanation:
+{{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "specific feedback", "confidence": "high|medium|low"}}
+
+Grading criteria:
+- A: Specific objective (file paths, success criteria, constraints), correct worker type. approved=true
+- B: Minor issues but fundamentally sound. approved=true
+- C: Missing constraints, weak objective, vague success criteria. approved=false
+- D: Significant problems — wrong approach, scaffolding thinking. approved=false
+- F: Fundamentally wrong — violates {self._operator_name}'s principles. approved=false
+
+Model recommendation (include "recommended_model" in your JSON response):
+- claude-sonnet: single-file changes, config updates, bug fixes with clear root cause
+- claude-opus: multi-file refactors (5+ files), architectural changes, complex debugging"""
+
+        confidence_schema = {
+            "type": "object",
+            "properties": {
+                "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
+                "approved": {"type": "boolean"},
+                "feedback": {"type": "string"},
+                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+            },
+            "required": ["grade", "approved", "feedback", "confidence"],
+        }
+
+        # Determine confidence threshold once
+        confidence_threshold = self._ollama_cfg_cache.get("spawn_confidence_threshold", "high")
+        confidence_levels = ["high", "medium", "low"]
+        threshold_idx = confidence_levels.index(confidence_threshold) if confidence_threshold in confidence_levels else 0
+
+        # Phase 1: Individual Ollama pre-filter for each request
+        grade_results = [None] * len(requests)
+        uncertain_indices = []
+
+        for i, req in enumerate(requests):
+            per_req_prompt = (
+                f"Evaluate this spawn decision:\n\n"
+                f"worker_id: {req['worker_id']}\nworker_type: {req['worker_type']}\n"
+                f"repo: {req['repo']}\nobjective: {req['objective']}\n\n"
+                f"Does this objective meet {self._operator_name}'s standards? Is the worker type appropriate?"
+            )
+            local_result = self._call_local_grader(ollama_system_prompt, per_req_prompt, confidence_schema)
+
+            if local_result.get("infrastructure_error"):
+                logger.info(f"Ollama pre-filter for batch '{req['worker_id']}': infrastructure error, escalating to Opus")
+                uncertain_indices.append(i)
+                continue
+
+            confidence = local_result.get("confidence", "")
+            confidence_idx = confidence_levels.index(confidence) if confidence in confidence_levels else len(confidence_levels)
+
+            if confidence_idx > threshold_idx:
+                logger.info(f"Ollama pre-filter for batch '{req['worker_id']}': confidence={confidence}, escalating to Opus")
+                uncertain_indices.append(i)
+            else:
+                logger.info(f"Ollama pre-filter for batch '{req['worker_id']}': confidence={confidence}, skipping Opus")
+                local_result.setdefault("recommended_model", req["worker_type"])
+                grade_results[i] = local_result
+
+        # Phase 2: Batch uncertain requests to Opus
+        if uncertain_indices:
+            # Build batch system prompt for Opus (only uncertain subset)
+            opus_system_prompt = f"""{avatar_skill}
+
+You are grading {len(uncertain_indices)} spawn_worker decisions. Respond with a valid JSON ARRAY — one object per decision:
 [{{"worker_id": "...", "grade": "A|B|C|D|F", "approved": true|false, "feedback": "...", "recommended_model": "claude-sonnet|claude-opus"}}, ...]
 
 Grading criteria (apply to EACH decision independently):
@@ -1694,32 +1862,46 @@ Model recommendation (include "recommended_model" for each):
 - claude-sonnet: single-file changes, config updates, bug fixes with clear root cause
 - claude-opus: multi-file refactors (5+ files), architectural changes, complex debugging"""
 
-        decisions_text = ""
-        for i, req in enumerate(requests, 1):
-            decisions_text += f"\n\n--- Decision {i} ---\n"
-            decisions_text += f"worker_id: {req['worker_id']}\n"
-            decisions_text += f"worker_type: {req['worker_type']}\n"
-            decisions_text += f"repo: {req['repo']}\n"
-            decisions_text += f"objective: {req['objective']}"
+            decisions_text = ""
+            for j, idx in enumerate(uncertain_indices, 1):
+                req = requests[idx]
+                decisions_text += f"\n\n--- Decision {j} ---\n"
+                decisions_text += f"worker_id: {req['worker_id']}\n"
+                decisions_text += f"worker_type: {req['worker_type']}\n"
+                decisions_text += f"repo: {req['repo']}\n"
+                decisions_text += f"objective: {req['objective']}"
 
-        user_prompt = f"Evaluate these {len(requests)} spawn decisions:{decisions_text}"
+            user_prompt = f"Evaluate these {len(uncertain_indices)} spawn decisions:{decisions_text}"
 
-        # Try batch grading
-        grade_results = self._call_grader(system_prompt, user_prompt, batch=True)
+            # Try batch grading for uncertain subset
+            opus_results = self._call_grader(opus_system_prompt, user_prompt, batch=True)
 
-        # Validate batch response — must be a list with correct length
-        if not isinstance(grade_results, list) or len(grade_results) != len(requests):
-            # Fallback: grade each individually
-            logger.warning("Batch grading returned invalid response — falling back to individual grading")
-            grade_results = []
-            for req in requests:
-                individual_result = self._call_grader(system_prompt, f"Evaluate this spawn decision:\n\n"
-                    f"worker_id: {req['worker_id']}\nworker_type: {req['worker_type']}\n"
-                    f"repo: {req['repo']}\nobjective: {req['objective']}")
-                if isinstance(individual_result, dict):
-                    grade_results.append(individual_result)
+            # Validate batch response — must be a list with correct length
+            if not isinstance(opus_results, list) or len(opus_results) != len(uncertain_indices):
+                # Fallback: grade each uncertain request individually
+                logger.warning("Batch grading returned invalid response — falling back to individual grading")
+                opus_results = []
+                for idx in uncertain_indices:
+                    req = requests[idx]
+                    individual_result = self._call_grader(opus_system_prompt, f"Evaluate this spawn decision:\n\n"
+                        f"worker_id: {req['worker_id']}\nworker_type: {req['worker_type']}\n"
+                        f"repo: {req['repo']}\nobjective: {req['objective']}")
+                    if isinstance(individual_result, dict):
+                        opus_results.append(individual_result)
+                    else:
+                        opus_results.append({"grade": "F", "approved": False, "feedback": "Grader returned invalid response"})
+
+            # Phase 3: Merge Opus results back into grade_results at original indices
+            for j, idx in enumerate(uncertain_indices):
+                if j < len(opus_results):
+                    grade_results[idx] = opus_results[j]
                 else:
-                    grade_results.append({"grade": "F", "approved": False, "feedback": "Grader returned invalid response"})
+                    grade_results[idx] = {"grade": "F", "approved": False, "feedback": "Grader returned invalid response"}
+
+        # Safety: fill any remaining None slots (should not happen)
+        for i in range(len(grade_results)):
+            if grade_results[i] is None:
+                grade_results[i] = {"grade": "F", "approved": False, "feedback": "Grading failed — no result"}
 
         # Separate approved and rejected
         results = []
@@ -1978,7 +2160,18 @@ Automatic F-grade triggers (in addition to avatar_skill banned terms):
 
 Does this message respect the ironclaude workflow? Would it block or misdirect the worker?"""
 
-        grade_result = self._call_grader(system_prompt, user_prompt)
+        grade_result = self._call_local_grader(system_prompt, user_prompt, {
+            "type": "object",
+            "properties": {
+                "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
+                "approved": {"type": "boolean"},
+                "feedback": {"type": "string"},
+            },
+            "required": ["grade", "approved", "feedback"],
+        })
+        if grade_result.get("infrastructure_error"):
+            logger.info(f"Ollama grader unavailable for send_to_worker '{worker_id}', escalating to Opus")
+            grade_result = self._call_grader(system_prompt, user_prompt)
         if not grade_result["approved"]:
             return {
                 "error": f"Message rejected by grader (grade {grade_result['grade']}). {grade_result['feedback']}",
@@ -2020,12 +2213,76 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
 
         return f"Message sent to '{worker_id}'"
 
-    def send_keys_to_worker(self, worker_id: str, keys: list[str]) -> str:
+    def evaluate_worker_health(self, worker_id: str) -> dict:
+        """Evaluate worker productivity via Ollama semantic analysis.
+
+        Returns {healthy: bool|None, diagnosis: str, severity: str}.
+        healthy=None means evaluation was inconclusive (Ollama unavailable or worker not found).
+        """
+        worker = self.registry.get_worker(worker_id)
+        if not worker:
+            return {
+                "healthy": None,
+                "diagnosis": f"Worker '{worker_id}' not found in registry",
+                "severity": "unknown",
+            }
+
+        ssh_host = self._resolve_ssh_host(worker_id)
+        session_name = f"ic-{worker_id}"
+
+        if not self.tmux.has_session(session_name, ssh_host=ssh_host):
+            return {
+                "healthy": None,
+                "diagnosis": f"Worker '{worker_id}' tmux session not found",
+                "severity": "unknown",
+            }
+
+        pane_text = self.tmux.capture_pane(session_name, ssh_host=ssh_host)
+
+        system_prompt = (
+            "You are evaluating worker productivity based on terminal output. "
+            "Assess whether the worker is making meaningful progress. "
+            "Consider: Is the worker actively coding or planning? Is it stuck in an error loop? "
+            "Is it producing meaningful output or idle? Is it repeating the same action without progress? "
+            "Respond with valid JSON only — no markdown, no explanation."
+        )
+
+        user_prompt = f"Terminal output from worker '{worker_id}':\n\n{pane_text}"
+
+        health_schema = {
+            "type": "object",
+            "properties": {
+                "healthy": {"type": "boolean"},
+                "diagnosis": {"type": "string"},
+                "severity": {
+                    "type": "string",
+                    "enum": ["none", "low", "medium", "high", "critical"],
+                },
+            },
+            "required": ["healthy", "diagnosis", "severity"],
+        }
+
+        result = self._call_local_grader(system_prompt, user_prompt, health_schema)
+
+        if result.get("infrastructure_error"):
+            return {
+                "healthy": None,
+                "diagnosis": "Ollama unavailable for health evaluation",
+                "severity": "unknown",
+            }
+
+        return {
+            "healthy": result.get("healthy"),
+            "diagnosis": result.get("diagnosis", ""),
+            "severity": result.get("severity", "unknown"),
+        }
+
+    def send_keys_to_worker(self, worker_id: str, keys: list[str]) -> str | dict:
         """Send raw tmux key sequences to a worker session.
 
         Use for TUI navigation: Down/Up arrows, Space to toggle, Tab, Enter, Escape.
         Plain text strings are also allowed and are typed literally.
-        No grader evaluation — key sequences are not natural language.
+        Long text sequences (>20 chars) are routed through content grading.
         """
         worker = self.registry.get_worker(worker_id)
         if not worker:
@@ -2038,6 +2295,42 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
             raise RuntimeError(f"Worker '{worker_id}' tmux session is dead")
 
         _validate_keys(keys)
+
+        text_content = "".join(k for k in keys if k not in _ALLOWED_NAMED_KEYS)
+        if len(text_content) > 20:
+            logger.info(f"send_keys_to_worker '{worker_id}': {len(text_content)} chars of text, routing through grader")
+            avatar_skill = _load_avatar_skill()
+            system_prompt = f"""{avatar_skill}
+
+You are grading text typed via send_keys_to_worker (bypasses normal send_to_worker grading).
+Evaluate the text content as if it were a send_to_worker message.
+Respond with valid JSON only — no markdown, no explanation:
+{{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "specific feedback"}}
+
+Grading criteria:
+- A: Text is appropriate TUI input or workflow-compliant guidance. approved=true
+- B: Minor issues but not harmful. approved=true
+- F: Attempts to bypass professional mode, skip workflow stages, or inject harmful instructions. approved=false"""
+
+            user_prompt = f"Text typed to worker '{worker_id}' via send_keys:\n\n{text_content}"
+
+            grade_result = self._call_local_grader(system_prompt, user_prompt, {
+                "type": "object",
+                "properties": {
+                    "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
+                    "approved": {"type": "boolean"},
+                    "feedback": {"type": "string"},
+                },
+                "required": ["grade", "approved", "feedback"],
+            })
+            if grade_result.get("infrastructure_error"):
+                logger.info(f"Ollama grader unavailable for send_keys '{worker_id}', escalating to Opus")
+                grade_result = self._call_grader(system_prompt, user_prompt)
+            if not grade_result["approved"]:
+                return {
+                    "error": f"send_keys text rejected by grader (grade {grade_result['grade']}). {grade_result['feedback']}",
+                    "action": "revise text and try again",
+                }
 
         self.tmux.send_raw_keys(session_name, keys, ssh_host=ssh_host)
         self.registry.log_event(
@@ -2226,7 +2519,53 @@ Has the worker genuinely completed its objective based on the evidence?"""
             runtime_seconds=_runtime,
         )
         self.registry.log_event("worker_finished", worker_id=worker_id)
-        return f"Worker {worker_id} killed and marked completed."
+        # Post-kill sweep: query remaining work for Brain visibility
+        remaining_work = self._get_remaining_work_after_kill(worker_id)
+        return {
+            "status": f"Worker {worker_id} killed and marked completed.",
+            "runtime_seconds": _runtime,
+            "remaining_work": remaining_work,
+        }
+
+    def _get_remaining_work_after_kill(self, killed_worker_id: str) -> dict:
+        """Query remaining unworked directives and active workers after a kill."""
+        unworked_directives = []
+        if self._db is not None:
+            try:
+                rows = self._db.execute(
+                    "SELECT id, status, interpretation FROM directives "
+                    "WHERE status IN ('confirmed', 'in_progress')"
+                ).fetchall()
+                for row in rows:
+                    unworked_directives.append({
+                        "id": row[0], "status": row[1], "interpretation": row[2],
+                    })
+            except Exception:
+                pass
+
+        active_workers = []
+        for w in self.registry.get_running_workers():
+            if w.get("id") != killed_worker_id:
+                active_workers.append({
+                    "id": w["id"],
+                    "status": w.get("status", "running"),
+                    "description": w.get("description", ""),
+                })
+
+        action_required = len(unworked_directives) > 0
+        message = ""
+        if action_required:
+            message = (
+                f"{len(unworked_directives)} directive(s) need workers. "
+                f"Spawn workers for unblocked directives immediately."
+            )
+
+        return {
+            "unworked_directives": unworked_directives,
+            "active_workers": active_workers,
+            "action_required": action_required,
+            "message": message,
+        }
 
     def restart_daemon(self) -> str:
         """Send SIGHUP to restart the daemon via a detached watchdog process.
@@ -2678,6 +3017,33 @@ Has the worker genuinely completed its objective based on the evidence?"""
         with open(log_path, "a") as f:
             f.write(f"- {timestamp} — {entry}\n")
 
+    @staticmethod
+    def _wiki_keywords(text: str) -> set:
+        """Extract meaningful keywords (>=4 chars) from a page name or title."""
+        return {w.lower() for w in re.split(r'[\s\-_]+', text) if len(w) >= 4}
+
+    def _wiki_duplicate_warning(self, page: str, title: str) -> str | None:
+        """Return conflicting page name if any existing page has >60% keyword overlap, else None."""
+        wiki_dir = self._wiki_dir
+        if not os.path.isdir(wiki_dir):
+            return None
+        incoming = self._wiki_keywords(page) | self._wiki_keywords(title)
+        if not incoming:
+            return None
+        for fname in os.listdir(wiki_dir):
+            if not fname.endswith('.md') or fname in ('index.md', 'log.md'):
+                continue
+            existing_page = fname[:-3]
+            if existing_page == page:
+                continue
+            existing_kw = self._wiki_keywords(existing_page)
+            if not existing_kw:
+                continue
+            overlap = len(incoming & existing_kw) / len(incoming | existing_kw)
+            if overlap > 0.60:
+                return existing_page
+        return None
+
     # ── Wiki tools ───────────────────────────────────────────────────
 
     def wiki_write(self, page: str, title: str, content: str) -> str:
@@ -2718,6 +3084,18 @@ Has the worker genuinely completed its objective based on the evidence?"""
                 f"Invalid content for '{page}': content must be at least 50 characters after stripping whitespace. "
                 "Placeholder pages are not allowed."
             )
+        if title.strip().lower() == 'title':
+            return (
+                f"Invalid title '{title}': placeholder titles are not allowed. "
+                "Use a descriptive title like 'Worker Lifecycle' or 'State Update Patterns'."
+            )
+        stripped_content = re.sub(r'\s', '', content.lower())
+        if stripped_content and len(set(stripped_content)) < 4:
+            return (
+                f"Invalid content for '{page}': content appears to be garbage "
+                "(fewer than 4 unique non-whitespace characters). "
+                "Placeholder pages are not allowed."
+            )
         is_update = os.path.exists(page_path)
 
         today = date.today().isoformat()
@@ -2740,6 +3118,19 @@ Has the worker genuinely completed its objective based on the evidence?"""
         )
         if r_commit.returncode != 0:
             return f"{page_path} (git commit failed: {r_commit.stderr.strip()})"
+        if _WIKI_COMMIT_HASH_RE.search(title) or _WIKI_STATUS_COMPLETE_RE.search(content):
+            logger.warning(
+                "wiki_write: '%s' looks like a directive log (commit hash in title or "
+                "Status: Complete pattern in content) — consider absorbing into a concept page",
+                page,
+            )
+        conflict = self._wiki_duplicate_warning(page, title)
+        if conflict:
+            logger.warning(
+                "wiki_write: '%s' has >60%% keyword overlap with existing page '%s' — "
+                "consider consolidating",
+                page, conflict,
+            )
         return page_path
 
     def wiki_delete(self, page: str) -> str:
@@ -2847,6 +3238,50 @@ Has the worker genuinely completed its objective based on the evidence?"""
         success = self._slack.unpin_message(timestamp)
         return json.dumps({"success": success})
 
+    def post_message(self, content: str) -> str | dict:
+        """Post a message to the operator's Slack channel with proactiveness grading."""
+        if self._slack is None:
+            return "Error: Slack not configured"
+
+        avatar_skill = _load_avatar_skill()
+        system_prompt = f"""{avatar_skill}
+
+You are grading a Brain-to-operator Slack message for proactiveness. Respond with valid JSON only — no markdown, no explanation:
+{{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "specific feedback"}}
+
+Grading criteria:
+- A: Message is either (1) not reporting a problem, or (2) reporting a problem AND includes a concrete action already taken or a pinned escalation. approved=true
+- B: Message reports a problem with a partial action plan — intent to fix is clear but specifics are vague. approved=true
+- C: Message reports a problem and mentions wanting to fix it but has taken no action and pinned no escalation. approved=false
+- D: Message reports a problem with no action taken and no escalation pinned — pure passive reporting. approved=false
+- F: Message reports a problem and explicitly defers to the operator to fix it when the Brain could act. approved=false"""
+
+        user_prompt = f"""Evaluate this Brain-to-operator Slack message for proactiveness:
+
+{content}
+
+Does this message report a problem? If so, does it include an action already taken or a pinned escalation?"""
+
+        grade_result = self._call_local_grader(system_prompt, user_prompt, {
+            "type": "object",
+            "properties": {
+                "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
+                "approved": {"type": "boolean"},
+                "feedback": {"type": "string"},
+            },
+            "required": ["grade", "approved", "feedback"],
+        })
+        if grade_result.get("infrastructure_error"):
+            logger.info("Ollama grader unavailable for post_message, escalating to Opus")
+            grade_result = self._call_grader(system_prompt, user_prompt)
+        if not grade_result["approved"]:
+            return {
+                "error": f"Message rejected by grader (grade {grade_result['grade']}). {grade_result['feedback']}",
+                "action": "revise message to include action taken or pin an escalation, then try again",
+            }
+        logger.info("Grader approved post_message (grade %s)", grade_result["grade"])
+        return self._slack.post_message(content)
+
 
 def _create_mcp_server(tools: OrchestratorTools):
     """Create and configure the FastMCP server wrapping OrchestratorTools."""
@@ -2935,6 +3370,12 @@ def _create_mcp_server(tools: OrchestratorTools):
         if isinstance(result, dict):
             return json.dumps(result)
         return result
+
+    @mcp.tool()
+    def evaluate_worker_health(worker_id: str) -> str:
+        """Evaluate worker productivity using semantic analysis. Returns JSON with healthy (bool|null), diagnosis, and severity."""
+        result = tools.evaluate_worker_health(worker_id)
+        return json.dumps(result)
 
     @mcp.tool()
     def send_keys_to_worker(worker_id: str, keys: list[str]) -> str:
@@ -3278,6 +3719,24 @@ def _create_mcp_server(tools: OrchestratorTools):
         """
         return tools.unpin_message(timestamp)
 
+    @mcp.tool()
+    def post_message(content: str) -> str:
+        """Post a message to the operator's Slack channel.
+
+        Messages are graded for proactiveness — problem reports must include
+        either an action already taken or a pinned escalation. Pure problem
+        reports without action are rejected.
+
+        Args:
+            content: Message text to post.
+
+        Returns: Slack message timestamp (ts) on success, or JSON error on rejection.
+        """
+        result = tools.post_message(content)
+        if isinstance(result, dict):
+            return json.dumps(result)
+        return result
+
     # --- Process Detective Tools ---
 
     @mcp.tool()
@@ -3404,6 +3863,20 @@ def _create_mcp_server(tools: OrchestratorTools):
             force_refresh: Re-probe Ollama instead of returning cached results.
         """
         return json.dumps(tools.get_ollama_inventory(force_refresh), indent=2)
+
+    @mcp.tool()
+    def unload_ollama_model(model_name: str) -> str:
+        """Unload an Ollama model from VRAM by setting keep_alive to 0.
+
+        Sends POST /api/generate with keep_alive=0, which signals Ollama to immediately
+        evict the named model from memory. Use to free VRAM before spawning workers
+        or before loading a different model.
+
+        Args:
+            model_name: Exact model name as shown in get_ollama_inventory() or
+                        the loaded_models field of spawn rejection errors.
+        """
+        return tools.unload_ollama_model(model_name)
 
     return mcp
 

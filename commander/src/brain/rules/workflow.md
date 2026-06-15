@@ -184,6 +184,7 @@ When checking a worker's log during a scheduled check-in, evaluate:
 | Worker appears idle but no idle notification received | **FLAG:** Report to {OPERATOR_NAME} via Slack. Investigate daemon `.done` marker detection. Do NOT silently work around it. |
 | Worker is running a long task (tests, builds, LLM inference) | Do nothing. Patience. In fail-fast mode, running = passing. |
 | Worker is doing the wrong thing (wrong file, wrong approach, off-plan) | **Intervene immediately** with `send_to_worker` course correction. Don't wait for next polling interval. |
+| Brain is reporting a problem without having attempted a fix or pinned an escalation | **Rewrite:** Attempt the fix first (spawn worker, restart service, run diagnostic). If blocked, pin a decision-format escalation. Then report with what you did or what you need. |
 
 ### 2. Brainstorming (`/brainstorming`)
 
@@ -310,6 +311,10 @@ Worker has finished all tasks, staged changes, and suggests a commit message.
 1. **Review the diff** — `git diff --staged`. Read the actual changes. Do not trust
    the worker's summary alone.
 
+   **Research-only check:** If the diff shows only `.md` or documentation files with no
+   code file changes → this is a research directive. Skip the rest of this checklist
+   and follow **section 6b** (Research Directive Completion) instead.
+
 2. **Verify completion** — Compare the diff against the original directive/objective.
    Does the diff address what {OPERATOR_NAME} asked for? If not, send the worker
    back with specific feedback via `send_to_worker`.
@@ -362,6 +367,53 @@ Brain cannot run `git push` directly (Bash allowlist blocks it). Use the `push_r
 - Call `push_repo` before confirming `push_enabled: true` is set
 - Submit a second push request for the same repo before the first resolves
 - Use Bash `git push` (blocked — will return an error)
+
+### 6b. Research Directive Completion
+
+When the staged diff contains only `.md` or documentation files with no code changes, the directive is research-only. Follow this flow instead of the section 6 commit checklist.
+
+**Research completion steps:**
+
+1. **Read the research output document** — Use the Read tool to read the document the worker staged. Understand the findings before composing the summary.
+
+2. **Compose a structured summary** — Format exactly as follows:
+
+   ```
+   d<N> result: <one-line description of what was researched>
+
+   **Key findings:**
+   - <finding 1>
+   - <finding 2>
+   - <finding 3>
+
+   **Recommendations:**
+   - <recommendation 1>
+   - <recommendation 2>
+
+   **Full document:** <relative path to doc>
+   ```
+
+   The `d<N>` directive reference is mandatory — all operator-facing Slack messages require a directive reference.
+
+3. **Post to Slack** — `post_message(content)` → capture the returned `ts`.
+
+4. **Pin the message** — `pin_message(ts)` → message is now pinned in the brain channel.
+
+5. **Commit the doc** — `git commit -m "docs: d<N> research output — <topic>"`.
+
+6. **Kill the worker** — `kill_worker` with evidence (the committed doc path and a summary of findings verified).
+
+7. **Update directive status** — `update_directive_status(id, 'completed')`. **MANDATORY — never skip.**
+
+**Error handling:**
+- `post_message` fails → do NOT proceed to `pin_message`. Report failure to {OPERATOR_NAME} directly. Do not skip pinning silently.
+- `pin_message` fails after successful post → report the `ts` to {OPERATOR_NAME} so they can pin manually.
+- Research doc missing or unreadable → post a minimal summary noting the directive number, worker ID, and that the doc could not be read. Then pin that minimal summary.
+
+**Do NOT:**
+- Skip pinning — research results must be discoverable via Slack pinned messages
+- Summarize without reading the document first (the summary must reflect actual findings)
+- Use the section 6 commit checklist for research-only directives (no diff review, no contamination check — the doc is the deliverable)
 
 ## Context Recovery Priority
 

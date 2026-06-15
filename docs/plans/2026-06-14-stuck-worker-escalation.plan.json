@@ -1,0 +1,156 @@
+{
+  "name": "Stuck Worker Escalation Fix",
+  "goal": "Fix three compounding bugs that allowed worker d1127 to sit at plan_ready for 499 minutes with no escalation — hash dedup suppressing check-ins, infinite liveness deferral, and missing Slack notifications.",
+  "design_file": "docs/plans/2026-06-14-stuck-worker-escalation-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Add constants, state variables, and cleanup scaffolding",
+      "description": "Add PM_GATE_STAGES, PM_GATE_SLACK_SECONDS, MAX_LIVENESS_DEFERRALS constants; add _stuck_liveness_count and _pm_gate_slack_sent state vars in __init__; add cleanup entries in both cleanup sites and clear _pm_gate_slack_sent on stage change. No tests required: pure scaffolding.",
+      "allowed_files": ["commander/src/ironclaude/main.py"],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add PM_GATE_STAGES, PM_GATE_SLACK_SECONDS, MAX_LIVENESS_DEFERRALS constants after line 106 (STALENESS_LIVENESS_EXTENSION)"
+        },
+        {
+          "description": "Add _stuck_liveness_count and _pm_gate_slack_sent state variables in __init__ after _prompt_waiting_cache"
+        },
+        {
+          "description": "Add _stuck_liveness_count cleanup in check_stuck_workers cleanup loop (after _stuck_kill_deferred.pop)"
+        },
+        {
+          "description": "Add _stuck_liveness_count cleanup in _confirm_and_kill_stuck_worker final cleanup (after _stuck_kill_deferred.pop)"
+        },
+        {
+          "description": "Clear _pm_gate_slack_sent on stage change in check_workers (inside 'if stage != last_seen' block)"
+        },
+        {
+          "description": "Stage changes: git add commander/src/ironclaude/main.py"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Add format_worker_gate_stuck_slack formatter",
+      "description": "Add new Slack notification formatter for workers stuck at PM gate stages. TDD: write test first, verify fail, implement, verify pass.",
+      "allowed_files": ["commander/src/ironclaude/notifications.py", "commander/tests/test_notifications.py"],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add format_worker_gate_stuck_slack to import list and write TestWorkerGateStuckSlack test class in test_notifications.py"
+        },
+        {
+          "description": "Run test to verify it fails (ImportError)",
+          "command": "cd commander && python -m pytest tests/test_notifications.py::TestWorkerGateStuckSlack -v",
+          "expected": "FAIL — ImportError or NameError"
+        },
+        {
+          "description": "Implement format_worker_gate_stuck_slack in notifications.py after format_worker_checkin_slack"
+        },
+        {
+          "description": "Run test to verify it passes",
+          "command": "cd commander && python -m pytest tests/test_notifications.py::TestWorkerGateStuckSlack -v",
+          "expected": "2 passed"
+        },
+        {
+          "description": "Stage changes: git add commander/src/ironclaude/notifications.py commander/tests/test_notifications.py"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Fix Bug 1 — Hash dedup bypass for prompt-waiting workers",
+      "description": "Move prompt_waiting detection above hash check, bypass hash dedup when prompt_waiting=True, add PM gate Slack escalation at >30 min. TDD: write tests first.",
+      "allowed_files": ["commander/src/ironclaude/main.py", "commander/tests/test_daemon.py"],
+      "depends_on": [1, 2],
+      "steps": [
+        {
+          "description": "Write TestHashDedupBypassPromptWaiting test class with 4 tests in test_daemon.py"
+        },
+        {
+          "description": "Run tests to verify they fail",
+          "command": "cd commander && python -m pytest tests/test_daemon.py::TestHashDedupBypassPromptWaiting -v",
+          "expected": "FAIL — hash dedup still blocks"
+        },
+        {
+          "description": "Move prompt_waiting detection above hash check in check_workers, add bypass when prompt_waiting=True, add PM gate Slack escalation after check-in"
+        },
+        {
+          "description": "Run tests to verify they pass",
+          "command": "cd commander && python -m pytest tests/test_daemon.py::TestHashDedupBypassPromptWaiting -v",
+          "expected": "4 passed"
+        },
+        {
+          "description": "Run existing hash dedup tests for regressions",
+          "command": "cd commander && python -m pytest tests/test_daemon.py::TestCheckinHashDedup -v",
+          "expected": "All existing tests pass"
+        },
+        {
+          "description": "Stage changes: git add commander/src/ironclaude/main.py commander/tests/test_daemon.py"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Fix Bug 3 — Slack notification at stuck alert tier",
+      "description": "Add Slack notification in check_stuck_workers alert path for prompt-waiting workers. TDD: write tests first.",
+      "allowed_files": ["commander/src/ironclaude/main.py", "commander/tests/test_daemon.py"],
+      "depends_on": [1, 2, 3],
+      "steps": [
+        {
+          "description": "Write TestStuckWorkerSlackAlert test class with 2 tests in test_daemon.py"
+        },
+        {
+          "description": "Run tests to verify they fail",
+          "command": "cd commander && python -m pytest tests/test_daemon.py::TestStuckWorkerSlackAlert -v",
+          "expected": "FAIL — Slack not called"
+        },
+        {
+          "description": "Add Slack notification after Brain message in check_stuck_workers alert block when prompt_waiting=True"
+        },
+        {
+          "description": "Run tests to verify they pass",
+          "command": "cd commander && python -m pytest tests/test_daemon.py::TestStuckWorkerSlackAlert -v",
+          "expected": "2 passed"
+        },
+        {
+          "description": "Stage changes: git add commander/src/ironclaude/main.py commander/tests/test_daemon.py"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Fix Bug 2 — Liveness deferral cap for prompt-waiting workers",
+      "description": "Track and cap liveness deferrals at MAX_LIVENESS_DEFERRALS for prompt-waiting workers in _confirm_and_kill_stuck_worker. TDD: write tests first.",
+      "allowed_files": ["commander/src/ironclaude/main.py", "commander/tests/test_daemon.py"],
+      "depends_on": [1, 4],
+      "steps": [
+        {
+          "description": "Write TestLivenessDeferralCap test class with 4 tests in test_daemon.py"
+        },
+        {
+          "description": "Run tests to verify they fail",
+          "command": "cd commander && python -m pytest tests/test_daemon.py::TestLivenessDeferralCap -v",
+          "expected": "FAIL — no deferral cap"
+        },
+        {
+          "description": "Add deferral counter tracking and cap logic in _confirm_and_kill_stuck_worker liveness check"
+        },
+        {
+          "description": "Run tests to verify they pass",
+          "command": "cd commander && python -m pytest tests/test_daemon.py::TestLivenessDeferralCap -v",
+          "expected": "4 passed"
+        },
+        {
+          "description": "Run full test suite for regressions",
+          "command": "cd commander && python -m pytest tests/test_daemon.py -v",
+          "expected": "All tests pass"
+        },
+        {
+          "description": "Stage changes: git add commander/src/ironclaude/main.py commander/tests/test_daemon.py"
+        }
+      ]
+    }
+  ]
+}

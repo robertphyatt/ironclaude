@@ -59,12 +59,12 @@ call_validation_llm() {
           --arg model "$model" \
           --arg prompt "$prompt" \
           --argjson schema "$schema" \
-          '{model: $model, prompt: $prompt, stream: false, format: $schema}')
+          '{model: $model, prompt: $prompt, stream: false, format: $schema, options: {temperature: 0.1, num_predict: -1}}')
       else
         payload=$(jq -n \
           --arg model "$model" \
           --arg prompt "$prompt" \
-          '{model: $model, prompt: $prompt, stream: false, format: "json"}')
+          '{model: $model, prompt: $prompt, stream: false, format: "json", options: {temperature: 0.1, num_predict: -1}}')
       fi
 
       # Try primary URL (2s connect timeout if fallback configured, full timeout otherwise)
@@ -79,6 +79,11 @@ call_validation_llm() {
       if [ -z "$result" ] && [ -n "$fallback_url" ]; then
         export VALIDATION_LLM_BACKEND="ollama:${model}(fallback)"
         result=$(curl -s --max-time "$timeout_sec" "$fallback_url/api/generate" -d "$payload" 2>/dev/null | jq -r '.response // empty' 2>/dev/null) || true
+      fi
+
+      # Strip think tags — gemma4/other thinking models may prefix JSON with <think>...</think>
+      if [ -n "$result" ]; then
+        result=$(printf '%s' "$result" | python3 -c "import sys, re; print(re.sub(r'<think>.*?</think>', '', sys.stdin.read(), flags=re.DOTALL).strip())" 2>/dev/null) || true
       fi
 
       export VALIDATION_LLM_RESPONSE="$result"

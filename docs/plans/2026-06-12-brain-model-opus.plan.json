@@ -1,0 +1,31 @@
+{
+  "name": "Brain Model: Fable to Opus",
+  "goal": "Change brain_model from fable to opus in config/ironclaude.json so the daemon uses an available model",
+  "design_file": "docs/plans/2026-06-12-brain-model-opus-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Update brain_model config value",
+      "description": "Change brain_model from fable to opus in config/ironclaude.json and stage the file",
+      "allowed_files": ["config/ironclaude.json", "docs/plans/2026-06-12-brain-model-opus-design.md", "docs/plans/2026-06-12-brain-model-opus.md", "docs/plans/2026-06-12-brain-model-opus.plan.json"],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Edit config/ironclaude.json: change brain_model from fable to opus",
+          "command": "echo 'Use Edit tool: old_string=brain_model fable, new_string=brain_model opus'",
+          "expected": "File updated with brain_model set to opus"
+        },
+        {
+          "description": "Force-stage the gitignored config file",
+          "command": "git add -f config/ironclaude.json",
+          "expected": "File staged successfully"
+        },
+        {
+          "description": "Stage plan and design documents",
+          "command": "git add docs/plans/2026-06-12-brain-model-opus-design.md docs/plans/2026-06-12-brain-model-opus.md docs/plans/2026-06-12-brain-model-opus.plan.json",
+          "expected": "All plan files staged"
+        }
+      ]
+    }
+  ]
+}

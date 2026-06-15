@@ -1,0 +1,113 @@
+{
+  "name": "Slack Filter: Directive-Reference Pre-filter",
+  "goal": "Add deterministic regex pre-filter to _validate_brain_message that blocks Brain conversational responses before the LLM call, and suppress CONTEXT_REQUIRED for directive-missing messages to break the feedback loop",
+  "design_file": "docs/plans/2026-06-14-slack-filter-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Write failing tests for pre-filter behavior",
+      "description": "Append TestBrainMessageFilter and TestPollBrainResponsesFilter classes to test_daemon.py; run to verify RED (failures expected before implementation)",
+      "allowed_files": [
+        "commander/tests/test_daemon.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Read end of test_daemon.py to find the insertion point",
+          "command": null,
+          "expected": "Confirm last line number for appending new test classes"
+        },
+        {
+          "description": "Append TestBrainMessageFilter and TestPollBrainResponsesFilter classes to test_daemon.py",
+          "command": null,
+          "expected": "Two new test classes at end of file"
+        },
+        {
+          "description": "Run new tests to verify they fail (RED phase)",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && python -m pytest tests/test_daemon.py::TestBrainMessageFilter tests/test_daemon.py::TestPollBrainResponsesFilter -v 2>&1 | tail -40",
+          "expected": "Multiple failures including test_no_directive_ref_blocked_without_grader_call, test_conversational_response_silently_dropped, test_non_directive_patterns_blocked[...]"
+        },
+        {
+          "description": "Stage test_daemon.py",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/tests/test_daemon.py",
+          "expected": "File staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Implement directive-reference pre-filter in main.py",
+      "description": "Add _DIRECTIVE_REF_RE and _BLOCKED_NO_DIRECTIVE constants, add pre-filter to _validate_brain_message, split CONTEXT_REQUIRED handler in poll_brain_responses",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Read main.py constants block (lines 53-58) to confirm _BRAIN_MSG_SCHEMA insertion point",
+          "command": null,
+          "expected": "_BRAIN_MSG_SCHEMA closing brace confirmed at line 57"
+        },
+        {
+          "description": "Add _DIRECTIVE_REF_RE and _BLOCKED_NO_DIRECTIVE constants after _BRAIN_MSG_SCHEMA",
+          "command": null,
+          "expected": "Two new module-level constants inserted after line 57"
+        },
+        {
+          "description": "Read _validate_brain_message (lines 608-626) to confirm current state",
+          "command": null,
+          "expected": "Current implementation without pre-filter confirmed"
+        },
+        {
+          "description": "Add pre-filter check to _validate_brain_message after empty-check",
+          "command": null,
+          "expected": "Directive ref regex check added before LLM call"
+        },
+        {
+          "description": "Read poll_brain_responses (lines 1074-1095) to confirm current state",
+          "command": null,
+          "expected": "Current implementation with single CONTEXT_REQUIRED path confirmed"
+        },
+        {
+          "description": "Modify poll_brain_responses to split blocked-message handling on _BLOCKED_NO_DIRECTIVE sentinel",
+          "command": null,
+          "expected": "_BLOCKED_NO_DIRECTIVE branch silently drops; other blocked messages get CONTEXT_REQUIRED"
+        },
+        {
+          "description": "Run new tests to verify all pass (GREEN phase)",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && python -m pytest tests/test_daemon.py::TestBrainMessageFilter tests/test_daemon.py::TestPollBrainResponsesFilter -v 2>&1 | tail -40",
+          "expected": "All tests in both classes PASS"
+        },
+        {
+          "description": "Run full daemon test suite to verify no regressions",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && python -m pytest tests/test_daemon.py -v 2>&1 | tail -20",
+          "expected": "All existing tests pass"
+        },
+        {
+          "description": "Stage main.py",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py",
+          "expected": "File staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Stage plan files",
+      "description": "Stage design doc and plan files written during brainstorming/plan-writing",
+      "allowed_files": [],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "Stage design doc and plan files",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add docs/plans/2026-06-14-slack-filter-design.md docs/plans/2026-06-14-slack-filter.md docs/plans/2026-06-14-slack-filter.plan.json",
+          "expected": "All plan files staged"
+        },
+        {
+          "description": "Verify staged file set",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached --name-only",
+          "expected": "commander/src/ironclaude/main.py, commander/tests/test_daemon.py, docs/plans/2026-06-14-slack-filter-design.md, docs/plans/2026-06-14-slack-filter.md, docs/plans/2026-06-14-slack-filter.plan.json"
+        }
+      ]
+    }
+  ]
+}

@@ -81,6 +81,14 @@ CREATE TABLE IF NOT EXISTS push_requests (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     expires_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS worker_staleness (
+    worker_id TEXT PRIMARY KEY,
+    hash_value INTEGER NOT NULL,
+    stale_since REAL NOT NULL,
+    alert_sent INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT DEFAULT (datetime('now'))
+);
 """
 
 

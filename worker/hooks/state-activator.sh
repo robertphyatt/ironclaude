@@ -48,15 +48,31 @@ SAFE_SESSION=$(echo "$SESSION_TAG" | sed "s/'/''/g")
 # Claude-only restrictions.
 # Debug: surface what user_prompt contains (gated by verbose logging)
 log_hook "state-activator" "Debug" "user_prompt prefix: $(echo "$USER_PROMPT" | head -c 200)"
-if echo "$USER_PROMPT" | grep -qiE '(^|[/: ])deactivate-professional-mode'; then
-  # Soft write: deactivation should never block the user's message
-  DEACTIVATE_CHANGES=$(sqlite3 "$DB_PATH" ".timeout 10000" \
-    "UPDATE sessions SET professional_mode='off', workflow_stage='idle', updated_at=datetime('now') WHERE terminal_session='${SAFE_SESSION}'; SELECT changes();" 2>/dev/null) || true
-  if [ -n "$DEACTIVATE_CHANGES" ] && [ "$DEACTIVATE_CHANGES" != "0" ]; then
-    db_audit_log "hook:state-activator" "professional_mode_off" "on" "off" ""
-    log_hook "state-activator" "Set" "professional-mode-off"
+if echo "$USER_PROMPT" | grep -qiE '^[[:space:]]*/(ironclaude:)?deactivate-professional-mode([[:space:]]|$)'; then
+  # Check for active wave_tasks before resetting workflow_stage
+  ACTIVE_TASKS=$(sqlite3 "$DB_PATH" ".timeout 10000" \
+    "SELECT COUNT(*) FROM wave_tasks WHERE terminal_session='${SAFE_SESSION}' AND status IN ('pending', 'in_progress', 'review_pending');" 2>/dev/null) || ACTIVE_TASKS="0"
+
+  if [ "$ACTIVE_TASKS" -gt 0 ] 2>/dev/null; then
+    # Active execution detected: deactivate PM only, preserve workflow_stage
+    DEACTIVATE_CHANGES=$(sqlite3 "$DB_PATH" ".timeout 10000" \
+      "UPDATE sessions SET professional_mode='off', updated_at=datetime('now') WHERE terminal_session='${SAFE_SESSION}'; SELECT changes();" 2>/dev/null) || true
+    if [ -n "$DEACTIVATE_CHANGES" ] && [ "$DEACTIVATE_CHANGES" != "0" ]; then
+      db_audit_log "hook:state-activator" "professional_mode_off" "on" "off" "Active wave_tasks detected (${ACTIVE_TASKS}) — workflow_stage preserved"
+      log_hook "state-activator" "Set" "professional-mode-off (workflow_stage preserved: ${ACTIVE_TASKS} active tasks)"
+    else
+      log_warning "state-activator" "Deactivation UPDATE affected 0 rows (session=${SESSION_TAG}). Skill will provide sqlite fallback."
+    fi
   else
-    log_warning "state-activator" "Deactivation UPDATE affected 0 rows (session=${SESSION_TAG}). Skill will provide sqlite fallback."
+    # No active execution: safe to reset both PM and workflow_stage
+    DEACTIVATE_CHANGES=$(sqlite3 "$DB_PATH" ".timeout 10000" \
+      "UPDATE sessions SET professional_mode='off', workflow_stage='idle', updated_at=datetime('now') WHERE terminal_session='${SAFE_SESSION}'; SELECT changes();" 2>/dev/null) || true
+    if [ -n "$DEACTIVATE_CHANGES" ] && [ "$DEACTIVATE_CHANGES" != "0" ]; then
+      db_audit_log "hook:state-activator" "professional_mode_off" "on" "off" ""
+      log_hook "state-activator" "Set" "professional-mode-off"
+    else
+      log_warning "state-activator" "Deactivation UPDATE affected 0 rows (session=${SESSION_TAG}). Skill will provide sqlite fallback."
+    fi
   fi
 fi
 
