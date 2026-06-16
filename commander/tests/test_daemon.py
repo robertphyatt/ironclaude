@@ -2637,3 +2637,193 @@ class TestPollBrainResponsesFilter:
         daemon.slack.post_message.assert_called_once()
         msg = daemon.slack.post_message.call_args[0][0]
         assert "#1134" in msg
+
+
+class TestHeartbeatStateHistory:
+    """State tracking mechanics for heartbeat-level stuck detection."""
+
+    def _make_worker(self):
+        return {"id": "w1", "tmux_session": "ic-w1", "description": "task", "machine": None}
+
+    def test_first_heartbeat_no_escalation(self, daemon):
+        """First heartbeat records snapshot but does not escalate."""
+        daemon.registry.get_recent_workers.return_value = [self._make_worker()]
+        daemon.tmux.has_session.return_value = True
+        log_path = os.path.join(daemon.tmux.log_dir, "ic-w1.log")
+        with open(log_path, "w") as f:
+            f.write("x" * 100)
+        with patch.object(daemon, '_get_worker_workflow_stage', return_value='brainstorming'):
+            daemon._last_heartbeat = 0
+            daemon.post_heartbeat()
+        daemon.brain.send_message.assert_not_called()
+        assert len(daemon._heartbeat_state_history.get("w1", [])) == 1
+
+    def test_second_heartbeat_unchanged_escalates(self, daemon):
+        """Second heartbeat with same (stage, log_bytes) fires [ACTION REQUIRED]."""
+        daemon.registry.get_recent_workers.return_value = [self._make_worker()]
+        daemon.tmux.has_session.return_value = True
+        log_path = os.path.join(daemon.tmux.log_dir, "ic-w1.log")
+        with open(log_path, "w") as f:
+            f.write("x" * 100)
+        with patch.object(daemon, '_get_worker_workflow_stage', return_value='brainstorming'):
+            daemon._last_heartbeat = 0
+            daemon.post_heartbeat()
+            daemon._last_heartbeat = 0
+            daemon.post_heartbeat()
+        daemon.brain.send_message.assert_called()
+        msg = daemon.brain.send_message.call_args[0][0]
+        assert "[ACTION REQUIRED]" in msg
+        assert "w1" in msg
+
+    def test_second_heartbeat_stage_changed_no_escalation(self, daemon):
+        """Second heartbeat with different stage does not escalate."""
+        daemon.registry.get_recent_workers.return_value = [self._make_worker()]
+        daemon.tmux.has_session.return_value = True
+        log_path = os.path.join(daemon.tmux.log_dir, "ic-w1.log")
+        with open(log_path, "w") as f:
+            f.write("x" * 100)
+        stages = ['brainstorming', 'writing_plans']
+        call_count = [0]
+        def stage_side_effect(*args, **kwargs):
+            s = stages[min(call_count[0], len(stages) - 1)]
+            call_count[0] += 1
+            return s
+        with patch.object(daemon, '_get_worker_workflow_stage', side_effect=stage_side_effect):
+            daemon._last_heartbeat = 0
+            daemon.post_heartbeat()
+            daemon._last_heartbeat = 0
+            daemon.post_heartbeat()
+        daemon.brain.send_message.assert_not_called()
+
+    def test_second_heartbeat_log_bytes_changed_no_escalation(self, daemon):
+        """Second heartbeat with same stage but different log_bytes does not escalate."""
+        daemon.registry.get_recent_workers.return_value = [self._make_worker()]
+        daemon.tmux.has_session.return_value = True
+        log_path = os.path.join(daemon.tmux.log_dir, "ic-w1.log")
+        with open(log_path, "w") as f:
+            f.write("x" * 100)
+        with patch.object(daemon, '_get_worker_workflow_stage', return_value='brainstorming'):
+            daemon._last_heartbeat = 0
+            daemon.post_heartbeat()
+            with open(log_path, "a") as f:
+                f.write("y" * 100)
+            daemon._last_heartbeat = 0
+            daemon.post_heartbeat()
+        daemon.brain.send_message.assert_not_called()
+
+    def test_escalation_not_repeated_within_same_stuck_episode(self, daemon):
+        """Third heartbeat while still stuck does not fire escalation again (dedup)."""
+        daemon.registry.get_recent_workers.return_value = [self._make_worker()]
+        daemon.tmux.has_session.return_value = True
+        log_path = os.path.join(daemon.tmux.log_dir, "ic-w1.log")
+        with open(log_path, "w") as f:
+            f.write("x" * 100)
+        with patch.object(daemon, '_get_worker_workflow_stage', return_value='brainstorming'):
+            for _ in range(3):
+                daemon._last_heartbeat = 0
+                daemon.post_heartbeat()
+        assert daemon.brain.send_message.call_count == 1
+
+    def test_escalation_resets_on_state_change(self, daemon):
+        """After escalation, state change removes worker from _heartbeat_stuck_notified."""
+        daemon.registry.get_recent_workers.return_value = [self._make_worker()]
+        daemon.tmux.has_session.return_value = True
+        log_path = os.path.join(daemon.tmux.log_dir, "ic-w1.log")
+        with open(log_path, "w") as f:
+            f.write("x" * 100)
+        with patch.object(daemon, '_get_worker_workflow_stage', return_value='brainstorming'):
+            daemon._last_heartbeat = 0
+            daemon.post_heartbeat()
+            daemon._last_heartbeat = 0
+            daemon.post_heartbeat()
+        assert "w1" in daemon._heartbeat_stuck_notified
+        with open(log_path, "a") as f:
+            f.write("y" * 100)
+        with patch.object(daemon, '_get_worker_workflow_stage', return_value='brainstorming'):
+            daemon._last_heartbeat = 0
+            daemon.post_heartbeat()
+        assert "w1" not in daemon._heartbeat_stuck_notified
+
+
+class TestHeartbeatStuckEscalation:
+    """Notification content tests for heartbeat stuck detection."""
+
+    def _setup_stuck_worker(self, daemon):
+        worker = {"id": "w1", "tmux_session": "ic-w1", "description": "task", "machine": None}
+        daemon.registry.get_recent_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        log_path = os.path.join(daemon.tmux.log_dir, "ic-w1.log")
+        with open(log_path, "w") as f:
+            f.write("x" * 100)
+
+    def _fire_two_heartbeats(self, daemon, stage='brainstorming'):
+        with patch.object(daemon, '_get_worker_workflow_stage', return_value=stage):
+            daemon._last_heartbeat = 0
+            daemon.post_heartbeat()
+            daemon._last_heartbeat = 0
+            daemon.post_heartbeat()
+
+    def test_brain_message_has_action_required_prefix(self, daemon):
+        self._setup_stuck_worker(daemon)
+        self._fire_two_heartbeats(daemon)
+        msg = daemon.brain.send_message.call_args[0][0]
+        assert msg.startswith("[ACTION REQUIRED]")
+
+    def test_brain_message_includes_worker_id_and_stage(self, daemon):
+        self._setup_stuck_worker(daemon)
+        self._fire_two_heartbeats(daemon, stage='brainstorming')
+        msg = daemon.brain.send_message.call_args[0][0]
+        assert "w1" in msg
+        assert "brainstorming" in msg
+
+    def test_slack_stuck_message_posted(self, daemon):
+        self._setup_stuck_worker(daemon)
+        self._fire_two_heartbeats(daemon, stage='executing')
+        calls = [c[0][0] for c in daemon.slack.post_message.call_args_list]
+        stuck_calls = [c for c in calls if "[STUCK]" in c]
+        assert len(stuck_calls) == 1
+        assert "w1" in stuck_calls[0]
+        assert "executing" in stuck_calls[0]
+
+
+class TestHeartbeatStateCleanup:
+    """Lifecycle tests for heartbeat state dict cleanup."""
+
+    def test_history_cleared_when_worker_no_longer_in_candidates(self, daemon):
+        """Worker removed from get_recent_workers clears its history entry."""
+        worker = {"id": "w1", "tmux_session": "ic-w1", "description": "task", "machine": None}
+        daemon.registry.get_recent_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        log_path = os.path.join(daemon.tmux.log_dir, "ic-w1.log")
+        with open(log_path, "w") as f:
+            f.write("x" * 100)
+        with patch.object(daemon, '_get_worker_workflow_stage', return_value='brainstorming'):
+            daemon._last_heartbeat = 0
+            daemon.post_heartbeat()
+        assert "w1" in daemon._heartbeat_state_history
+
+        daemon.registry.get_recent_workers.return_value = []
+        daemon._last_heartbeat = 0
+        daemon.post_heartbeat()
+        assert "w1" not in daemon._heartbeat_state_history
+
+    def test_notified_cleared_when_worker_no_longer_in_candidates(self, daemon):
+        """Worker removed from candidates also removed from _heartbeat_stuck_notified."""
+        daemon._heartbeat_stuck_notified.add("w1")
+        daemon.registry.get_recent_workers.return_value = []
+        daemon._last_heartbeat = 0
+        daemon.post_heartbeat()
+        assert "w1" not in daemon._heartbeat_stuck_notified
+
+    def test_active_workers_not_cleaned_up(self, daemon):
+        """Workers still in candidates retain their history."""
+        worker = {"id": "w1", "tmux_session": "ic-w1", "description": "task", "machine": None}
+        daemon.registry.get_recent_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        log_path = os.path.join(daemon.tmux.log_dir, "ic-w1.log")
+        with open(log_path, "w") as f:
+            f.write("x" * 100)
+        with patch.object(daemon, '_get_worker_workflow_stage', return_value='brainstorming'):
+            daemon._last_heartbeat = 0
+            daemon.post_heartbeat()
+        assert "w1" in daemon._heartbeat_state_history

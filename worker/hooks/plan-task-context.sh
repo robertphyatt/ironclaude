@@ -34,6 +34,17 @@ if [ "$REVIEW_PENDING" = "1" ]; then
   case "$TOOL_NAME" in
     Read|Grep|Glob|Skill) ;; # Allow — needed for code review
     *)
+      # Dual-check: verify a submitted task actually exists in the current wave (mirrors professional-mode-guard)
+      CURRENT_WAVE=$(sqlite3 "$DB_PATH" ".timeout 5000" \
+        "SELECT current_wave FROM sessions WHERE terminal_session='${SAFE_SESSION}';" 2>/dev/null || echo "0")
+      SUBMITTED_COUNT=$(sqlite3 "$DB_PATH" ".timeout 5000" \
+        "SELECT COUNT(*) FROM wave_tasks WHERE terminal_session='${SAFE_SESSION}' AND wave_number='${CURRENT_WAVE}' AND status='submitted';" 2>/dev/null || echo "0")
+      if [ "${SUBMITTED_COUNT:-0}" = "0" ]; then
+        sqlite3 "$DB_PATH" ".timeout 5000" \
+          "UPDATE sessions SET review_pending=0, review_block_count=0 WHERE terminal_session='${SAFE_SESSION}';" 2>/dev/null || true
+        log_hook "PLAN-TASK-CONTEXT" "Auto-cleared" "stale review_pending — 0 submitted tasks in wave ${CURRENT_WAVE}"
+        exit 0
+      fi
       block_pretooluse "PLAN-TASK-CONTEXT" "BLOCKED — CODE REVIEW REQUIRED
 
 You must run code review before continuing with the next task.

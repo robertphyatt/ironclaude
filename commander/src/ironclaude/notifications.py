@@ -166,6 +166,13 @@ def format_worker_gate_stuck_slack(
     )
 
 
+def format_worker_heartbeat_stuck_slack(worker_id: str, stage: str) -> str:
+    return (
+        f"[STUCK] Worker {worker_id} unchanged for 2 consecutive heartbeats at stage {stage}. "
+        f"Brain intervention required."
+    )
+
+
 def format_worker_stuck_killed(
     worker_id: str, minutes: int, stage: str, prompt_waiting: bool,
 ) -> str:

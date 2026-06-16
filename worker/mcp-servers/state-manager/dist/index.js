@@ -12860,6 +12860,16 @@ function initDb(dbPath) {
       task_boundary    INTEGER NOT NULL DEFAULT 0,
       created_at       TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS tool_poll_state (
+      terminal_session TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      input_hash TEXT NOT NULL,
+      last_output_hash TEXT NOT NULL DEFAULT '',
+      consecutive_count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (terminal_session, tool_name, input_hash)
+    );
   `);
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_wave_tasks_session
@@ -12878,6 +12888,8 @@ function initDb(dbPath) {
       ON pending_subagent_parents(parent_session);
     CREATE INDEX IF NOT EXISTS idx_review_grades_session_wave
       ON review_grades(terminal_session, wave_number, task_boundary);
+    CREATE INDEX IF NOT EXISTS idx_poll_state_session
+      ON tool_poll_state(terminal_session);
   `);
   _db = db;
   return db;
@@ -14298,6 +14310,36 @@ var writeToolDefinitions = [
       destructiveHint: false,
       idempotentHint: true
     }
+  },
+  {
+    name: "set_testing_theatre_checked",
+    description: "Sets testing_theatre_checked=1 for the current session. Called by the testing-theatre-detection skill after completing its analysis. Signals to code-review that testing-theatre detection ran so the grade cap is lifted.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true
+    }
+  },
+  {
+    name: "clear_stale_review_pending",
+    description: "Detects and clears a stale review_pending flag \u2014 set to 1 but no submitted tasks exist in the current wave. Safe to call speculatively: returns {cleared: false} if flag is already 0 or tasks are genuinely submitted. Idempotent.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true
+    }
   }
 ];
 var writeToolNames = new Set(writeToolDefinitions.map((t) => t.name));
@@ -14540,7 +14582,7 @@ function handleWriteTool(name, args, db, sessionId) {
           status: "pending"
         });
       }
-      updateSession(db, resolvedId, { current_wave: nextWaveNumber });
+      updateSession(db, resolvedId, { current_wave: nextWaveNumber, review_pending: 0 });
       return ok({
         status: "next_wave",
         wave_number: nextWaveNumber,
@@ -14581,7 +14623,7 @@ function handleWriteTool(name, args, db, sessionId) {
         );
       }
       updateWaveTaskStatus(db, waveTask.id, "submitted");
-      updateSession(db, resolvedId, { review_pending: 1 });
+      updateSession(db, resolvedId, { review_pending: 1, review_block_count: 0 });
       insertAuditLog(db, {
         terminal_session: resolvedId,
         actor: "claude",
@@ -14608,6 +14650,12 @@ function handleWriteTool(name, args, db, sessionId) {
       const session = getSession(db, resolvedId);
       if (!session) {
         return err("Session not found", { session_id: resolvedId });
+      }
+      const validClaimStages = ["executing", "reviewing"];
+      if (!validClaimStages.includes(session.workflow_stage)) {
+        return err(
+          `Cannot claim task: workflow_stage must be 'executing' or 'reviewing', got '${session.workflow_stage}'`
+        );
       }
       const currentWave = session.current_wave;
       const waveTask = db.prepare(
@@ -14670,7 +14718,7 @@ function handleWriteTool(name, args, db, sessionId) {
            WHERE terminal_session = ? AND wave_number = ? AND status = 'submitted'`
         ).run(resolvedId, session.current_wave);
         advancedCount = result.changes;
-        updateSession(db, resolvedId, { review_pending: 0 });
+        updateSession(db, resolvedId, { review_pending: 0, review_block_count: 0 });
       }
       insertAuditLog(db, {
         terminal_session: resolvedId,
@@ -14789,10 +14837,27 @@ function handleWriteTool(name, args, db, sessionId) {
       if (!session) {
         return err("Session not found", { session_id: resolvedId });
       }
+      let recovered = false;
       if (session.workflow_stage !== "reviewing") {
-        return err(
-          `Cannot mark executing: workflow_stage must be 'reviewing', got '${session.workflow_stage}'`
-        );
+        const activeTaskCount = db.prepare(
+          `SELECT COUNT(*) as count FROM wave_tasks
+           WHERE terminal_session = ? AND status IN ('pending', 'in_progress', 'review_pending')`
+        ).get(resolvedId).count;
+        if (activeTaskCount > 0) {
+          insertAuditLog(db, {
+            terminal_session: resolvedId,
+            actor: "system:state-correction",
+            action: "workflow_stage_recovery",
+            old_value: session.workflow_stage,
+            new_value: "executing",
+            context: `Force-corrected workflow_stage from '${session.workflow_stage}' to 'executing' \u2014 ${activeTaskCount} active wave_tasks prove execution is in progress`
+          });
+          recovered = true;
+        } else {
+          return err(
+            `Cannot mark executing: workflow_stage must be 'reviewing', got '${session.workflow_stage}'`
+          );
+        }
       }
       const passingReview = db.prepare(
         `SELECT 1 FROM review_grades
@@ -14804,16 +14869,16 @@ function handleWriteTool(name, args, db, sessionId) {
           "Cannot mark executing: no passing review verdict (A or B) recorded for current wave. Call record_review_verdict first."
         );
       }
-      updateSession(db, resolvedId, { workflow_stage: "executing", review_pending: 0 });
+      updateSession(db, resolvedId, { workflow_stage: "executing", review_pending: 0, review_block_count: 0 });
       insertAuditLog(db, {
         terminal_session: resolvedId,
         actor: "claude",
         action: "mark_executing",
-        old_value: "reviewing",
+        old_value: recovered ? session.workflow_stage : "reviewing",
         new_value: "executing",
-        context: "Code review complete, returning to executing"
+        context: recovered ? `Code review complete, returning to executing (recovered from '${session.workflow_stage}')` : "Code review complete, returning to executing"
       });
-      return ok({ success: true, workflow_stage: "executing", session_id: resolvedId });
+      return ok({ success: true, workflow_stage: "executing", session_id: resolvedId, ...recovered && { recovered: true } });
     }
     // ----- retreat -----
     case "retreat": {
@@ -14945,6 +15010,58 @@ function handleWriteTool(name, args, db, sessionId) {
         log_session_ids: value,
         previous
       });
+    }
+    // ----- set_testing_theatre_checked -----
+    case "set_testing_theatre_checked": {
+      const session = getSession(db, resolvedId);
+      if (!session) {
+        return err("Session not found", { session_id: resolvedId });
+      }
+      updateSession(db, resolvedId, { testing_theatre_checked: 1 });
+      insertAuditLog(db, {
+        terminal_session: resolvedId,
+        actor: "claude",
+        action: "set_testing_theatre_checked",
+        old_value: String(session.testing_theatre_checked),
+        new_value: "1",
+        context: "Testing theatre detection completed"
+      });
+      return ok({
+        success: true,
+        testing_theatre_checked: 1,
+        session_id: resolvedId
+      });
+    }
+    // ----- clear_stale_review_pending -----
+    case "clear_stale_review_pending": {
+      const session = getSession(db, resolvedId);
+      if (!session) {
+        return err("Session not found", { session_id: resolvedId });
+      }
+      if (session.review_pending !== 1) {
+        return ok({ cleared: false, reason: "review_pending already 0", session_id: resolvedId });
+      }
+      const submittedCount = db.prepare(
+        `SELECT COUNT(*) as count FROM wave_tasks
+         WHERE terminal_session = ? AND wave_number = ? AND status = 'submitted'`
+      ).get(resolvedId, session.current_wave).count;
+      if (submittedCount > 0) {
+        return ok({
+          cleared: false,
+          reason: `${submittedCount} task(s) still submitted in wave ${session.current_wave} \u2014 review genuinely pending`,
+          session_id: resolvedId
+        });
+      }
+      updateSession(db, resolvedId, { review_pending: 0, review_block_count: 0 });
+      insertAuditLog(db, {
+        terminal_session: resolvedId,
+        actor: "system:stale-flag-heal",
+        action: "clear_stale_review_pending",
+        old_value: "1",
+        new_value: "0",
+        context: `Cleared stale review_pending \u2014 0 submitted tasks in wave ${session.current_wave}`
+      });
+      return ok({ cleared: true, wave: session.current_wave, session_id: resolvedId });
     }
     default:
       throw new Error(`Unknown write tool: ${name}`);

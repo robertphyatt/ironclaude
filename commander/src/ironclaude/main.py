@@ -35,6 +35,7 @@ from ironclaude.notifications import (
     format_heartbeat, format_brain_restarted, format_brain_compacted, format_brain_circuit_breaker,
     format_objective_received,
     format_task_progress, format_plan_ready, format_blocked,
+    format_worker_heartbeat_stuck_slack,
 )
 from ironclaude.grader import LocalGrader
 from ironclaude.orchestrator_mcp import ensure_worker_trusted, WORKER_COMMANDS
@@ -574,6 +575,8 @@ class IroncladeDaemon:
         self._stuck_liveness_count: dict[str, int] = {}
         self._pm_gate_slack_sent: dict[str, bool] = {}
         self._stage_entered_at: dict[str, float] = {}
+        self._heartbeat_state_history: dict[str, list[tuple[str, int]]] = {}
+        self._heartbeat_stuck_notified: set[str] = set()
         self._load_staleness_state()
 
     def shutdown(self):
@@ -1997,11 +2000,13 @@ class IroncladeDaemon:
 
         candidates = self.registry.get_recent_workers()
         worker_details = []
+        stage_map: dict[str, str] = {}
         for w in candidates:
             ssh_host, _ = self._resolve_worker_ssh(w)
             if not self.tmux.has_session(w["tmux_session"], ssh_host=ssh_host):
                 continue
             stage = self._get_worker_workflow_stage(w["tmux_session"], ssh_host=ssh_host)
+            stage_map[w["id"]] = stage or "unknown"
             worker_details.append({
                 "id": w["id"],
                 "description": w.get("description"),
@@ -2028,6 +2033,47 @@ class IroncladeDaemon:
                     )
             except Exception as e:
                 logger.warning(f"Heartbeat directive check failed: {e}")
+
+        # Heartbeat-level stuck detection: compare (stage, log_bytes) across consecutive heartbeats
+        running_heartbeat_ids: set[str] = set()
+        for w in candidates:
+            worker_id = w["id"]
+            if worker_id not in stage_map:
+                continue  # session was gone in first loop
+            running_heartbeat_ids.add(worker_id)
+            ssh_host, _ = self._resolve_worker_ssh(w)
+            if ssh_host:
+                log_bytes = 0
+            else:
+                log_path = os.path.join(self.tmux.log_dir, f"{w['tmux_session']}.log")
+                log_bytes = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+            snapshot = (stage_map[worker_id], log_bytes)
+            history = self._heartbeat_state_history.setdefault(worker_id, [])
+            history.append(snapshot)
+            if len(history) > 2:
+                history.pop(0)
+            if len(history) >= 2 and history[-1] == history[-2]:
+                if worker_id not in self._heartbeat_stuck_notified:
+                    minutes = int(heartbeat_interval / 60) * 2
+                    self.brain.send_message(
+                        f"[ACTION REQUIRED] Worker {worker_id} unchanged for 2 consecutive heartbeats "
+                        f"(~{minutes} min) at stage {stage_map[worker_id]}. Not a PM gate — "
+                        f"verify the worker is alive and making progress."
+                    )
+                    self.slack.post_message(
+                        format_worker_heartbeat_stuck_slack(worker_id, stage_map[worker_id])
+                    )
+                    self._heartbeat_stuck_notified.add(worker_id)
+            elif len(history) >= 2 and history[-1] != history[-2]:
+                self._heartbeat_stuck_notified.discard(worker_id)
+
+        for wid in list(self._heartbeat_state_history.keys()):
+            if wid not in running_heartbeat_ids:
+                del self._heartbeat_state_history[wid]
+                self._heartbeat_stuck_notified.discard(wid)
+        for wid in list(self._heartbeat_stuck_notified):
+            if wid not in running_heartbeat_ids:
+                self._heartbeat_stuck_notified.discard(wid)
 
     def run(self):
         """Main daemon loop."""

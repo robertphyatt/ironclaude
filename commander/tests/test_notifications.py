@@ -14,6 +14,7 @@ from ironclaude.notifications import (
     format_worker_checkin,
     format_worker_checkin_slack,
     format_worker_gate_stuck_slack,
+    format_worker_heartbeat_stuck_slack,
 )
 
 
@@ -346,3 +347,21 @@ class TestWorkerGateStuckSlack:
     def test_format_includes_alert_prefix(self):
         msg = format_worker_gate_stuck_slack("w-1", 15, "design_ready")
         assert "[ALERT]" in msg
+
+
+class TestFormatWorkerHeartbeatStuckSlack:
+    def test_contains_worker_id(self):
+        msg = format_worker_heartbeat_stuck_slack("d1161-robert-brainstorm", "brainstorming")
+        assert "d1161-robert-brainstorm" in msg
+
+    def test_contains_stage(self):
+        msg = format_worker_heartbeat_stuck_slack("w1", "executing")
+        assert "executing" in msg
+
+    def test_starts_with_stuck_prefix(self):
+        msg = format_worker_heartbeat_stuck_slack("w1", "brainstorming")
+        assert msg.startswith("[STUCK]")
+
+    def test_mentions_brain_intervention(self):
+        msg = format_worker_heartbeat_stuck_slack("w1", "brainstorming")
+        assert "Brain intervention" in msg

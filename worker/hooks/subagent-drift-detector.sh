@@ -1,6 +1,6 @@
 #!/bin/bash
 # subagent-drift-detector.sh - SubagentStop hook
-# When a subagent finishes, sets review_pending=1 and cleans up subagent link.
+# When a subagent finishes, logs git status and cleans up subagent link.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -25,8 +25,7 @@ if [ -n "$CHILD_SESSION" ]; then
   if [ "$WORKFLOW" = "executing" ]; then
     CHANGES=$(git status --porcelain 2>/dev/null || true)
     if [ -n "$CHANGES" ]; then
-      db_write_or_fail "SUBAGENT-DRIFT-DETECTOR" \
-        "UPDATE sessions SET review_pending=1, updated_at=datetime('now') WHERE terminal_session='${SAFE_SESSION}';"
+      log_hook "SUBAGENT-DRIFT-DETECTOR" "Detected" "git changes present after subagent — review_pending NOT set (submit_task is sole authority)"
     else
       log_hook "SUBAGENT-DRIFT-DETECTOR" "Skipped" "review_pending not set — no code changes (read-only subagent)"
     fi
