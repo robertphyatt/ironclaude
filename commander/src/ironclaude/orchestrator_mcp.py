@@ -34,6 +34,7 @@ import shlex
 from ironclaude.config import make_opus_command
 from ironclaude.grader import LocalGrader
 from ironclaude.ollama_client import OllamaClient, OllamaError
+from ironclaude.ollama_playbook import OLLAMA_WORKER_PLAYBOOK
 from ironclaude.signal_forensics import _logged_kill
 from ironclaude.tmux_manager import _strip_ansi, detect_ask_user_menu
 
@@ -436,6 +437,19 @@ class OrchestratorTools:
                 timeout=cfg.get("timeout_seconds", 120),
             )
         return self._ollama_client
+
+    def _ensure_ollama_ctx_variant(self, base_model: str) -> str:
+        """Ensure a num_ctx-fixed Ollama variant of base_model exists; return its name.
+
+        Ollama defaults num_ctx to 4096, which truncates Claude Code's first turn.
+        We derive a deterministic variant with a large context window. /api/create
+        is idempotent (reuses existing layers).
+        """
+        num_ctx = int(self._config.get("ollama_worker_num_ctx", 131072))
+        safe = base_model.replace(":", "-").replace("/", "-")
+        variant = f"ic-{safe}-{num_ctx}"
+        self._get_ollama_client().create_model(variant, base_model, {"num_ctx": num_ctx})
+        return variant
 
     def get_ollama_inventory(self, force_refresh: bool = False) -> dict:
         """Return classified Ollama model inventory."""
@@ -1417,7 +1431,12 @@ class OrchestratorTools:
         # 1. Ollama VRAM check (only blocks ollama-type workers)
         ollama_vram_gb, loaded_models = self._get_ollama_vram()
         if worker_type == "ollama":
-            vram_threshold = self._config.get("ollama_vram_block_threshold_gb", 8.0)
+            vram_threshold = self._config.get("ollama_vram_block_threshold_gb")
+            if vram_threshold is None:
+                # Host-aware default: the static 8.0 GB was tuned for a small remote
+                # GPU and wrongly blocks ollama workers on large-memory hosts (e.g.
+                # a 48 GB M4 Max). Scale to half of total system memory.
+                vram_threshold = round(self.get_system_memory()["total_gb"] * 0.5, 1)
             if ollama_vram_gb > vram_threshold:
                 logger.info(
                     "Spawn rejected: Ollama VRAM %.1fGB exceeds threshold %.1fGB. "
@@ -1640,7 +1659,23 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
 
             self._get_ollama_client()  # populate _ollama_cfg_cache
             _ollama_url = self._ollama_cfg_cache.get("url", "http://localhost:11434")
-            cmd = f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; export CLAUDE_CODE_ATTRIBUTION_HEADER=0; export ANTHROPIC_BASE_URL={shlex.quote(_ollama_url)}; export ANTHROPIC_AUTH_TOKEN=ollama; export ANTHROPIC_API_KEY=; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
+            # Use a num_ctx-fixed variant (the 4096 default truncates Claude Code's
+            # first turn) and inject the worker playbook so the small model follows
+            # the workflow rail instead of re-deriving it each tool call.
+            variant = self._ensure_ollama_ctx_variant(model_name)
+            _max_out = int(self._config.get("ollama_worker_max_output_tokens", 0))
+            _max_out_export = (
+                f"export CLAUDE_CODE_MAX_OUTPUT_TOKENS={_max_out}; " if _max_out else ""
+            )
+            cmd = (
+                f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; "
+                f"export CLAUDE_CODE_ATTRIBUTION_HEADER=0; "
+                f"{_max_out_export}"
+                f"export ANTHROPIC_BASE_URL={shlex.quote(_ollama_url)}; "
+                f"export ANTHROPIC_AUTH_TOKEN=ollama; export ANTHROPIC_API_KEY=; "
+                f"exec claude --model {shlex.quote(variant)} --dangerously-skip-permissions "
+                f"--append-system-prompt {shlex.quote(OLLAMA_WORKER_PLAYBOOK)}"
+            )
         elif machine_cfg:
             cmd_parts = ["export IC_ROLE=worker", f"export IC_WORKER_ID={shlex.quote(worker_id)}"]
             for k, v in machine_cfg.env.items():

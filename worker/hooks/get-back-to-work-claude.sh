@@ -298,7 +298,7 @@ Do NOT skip fixing the issues. Do NOT proceed to the next task."
         fi
 
     elif [ "${IN_PROGRESS_OR_PENDING_COUNT:-0}" != "0" ]; then
-        # Suppress block if worker has an active background shell (monitoring pipeline)
+        # Suppress block if worker used a waiting tool (Monitor/TaskOutput/ScheduleWakeup) or run_in_background in recent turns
         if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
             _ic_bg_active="false"
             _ic_recent_req_ids=$(
@@ -310,7 +310,7 @@ Do NOT skip fixing the issues. Do NOT proceed to the next task."
                 while IFS= read -r _ic_req_id; do
                     [ -z "$_ic_req_id" ] && continue
                     if tail -n 500 "$TRANSCRIPT_PATH" 2>/dev/null | grep -F "\"$_ic_req_id\"" | \
-                       jq -r '.message.content[]? | select(.type == "tool_use") | .input.run_in_background // false' \
+                       jq -r '.message.content[]? | select(.type == "tool_use") | if .name == "Monitor" or .name == "TaskOutput" or .name == "ScheduleWakeup" then "true" elif (.input.run_in_background // false) == true then "true" else "false" end' \
                        2>/dev/null | grep -q "^true$" 2>/dev/null; then
                         _ic_bg_active="true"
                         break
@@ -672,7 +672,7 @@ ACTIVE_SKILL=$(db_read "active_skill" "")
 #   executing-plans:  bypass, continuation, suppress-rigor, suppress-prediction
 #   code-review:      bypass, continuation, rigor, prediction
 #   no skill:         bypass, continuation, rigor, prediction
-# Post-matrix override: run_in_background=true in last 3 turns → suppress-continuation
+# Post-matrix override: waiting tool (Monitor/TaskOutput/ScheduleWakeup/run_in_background) in last 3 turns → suppress-continuation
 
 FIRE_BYPASS="true"
 FIRE_CONTINUATION="true"
@@ -714,9 +714,9 @@ if [ "$STOP_HOOK_ACTIVE" = "true" ]; then
     IS_FORCED_CONTINUATION="true"
 fi
 
-# Suppress continuation check if a background job was launched in the last 3 turns.
-# Scans JSONL for run_in_background=true in tool_use blocks within the 3 most recent
-# assistant requestIds. Fail-open: any jq failure leaves FIRE_CONTINUATION unchanged.
+# Suppress continuation check if a waiting or background tool was used in the last 3 turns.
+# Detects Monitor, TaskOutput, ScheduleWakeup by name, plus Bash run_in_background=true.
+# Fail-open: any jq failure leaves FIRE_CONTINUATION unchanged.
 if [ "$FIRE_CONTINUATION" = "true" ]; then
     _BG_RECENT_REQ_IDS=$(
         tail -n 500 "$TRANSCRIPT_PATH" 2>/dev/null | \
@@ -728,7 +728,7 @@ if [ "$FIRE_CONTINUATION" = "true" ]; then
         while IFS= read -r _req_id; do
             [ -z "$_req_id" ] && continue
             if tail -n 500 "$TRANSCRIPT_PATH" 2>/dev/null | grep -F "\"$_req_id\"" | \
-               jq -r '.message.content[]? | select(.type == "tool_use") | .input.run_in_background // false' \
+               jq -r '.message.content[]? | select(.type == "tool_use") | if .name == "Monitor" or .name == "TaskOutput" or .name == "ScheduleWakeup" then "true" elif (.input.run_in_background // false) == true then "true" else "false" end' \
                2>/dev/null | grep -q "^true$" 2>/dev/null; then
                 _BG_JOB_ACTIVE="true"
                 break
@@ -737,7 +737,7 @@ if [ "$FIRE_CONTINUATION" = "true" ]; then
     fi
     if [ "$_BG_JOB_ACTIVE" = "true" ]; then
         FIRE_CONTINUATION="false"
-        log_hook "GET-BACK-TO-WORK" "Suppressed" "continuation check — run_in_background=true detected in last 3 turns"
+        log_hook "GET-BACK-TO-WORK" "Suppressed" "continuation check — waiting tool detected in last 3 turns (Monitor/TaskOutput/ScheduleWakeup/run_in_background)"
     fi
 fi
 

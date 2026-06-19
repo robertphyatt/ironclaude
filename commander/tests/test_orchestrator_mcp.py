@@ -181,6 +181,8 @@ class TestSpawnWorker:
         """Second ollama worker is rejected when slot occupied."""
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
         _mock_grader_approve(tools)
+        tools._check_spawn_preconditions = MagicMock(return_value=None)
+        tools._ensure_ollama_ctx_variant = MagicMock(return_value="ic-qwen3-8b-131072")
         tools.spawn_worker(
             worker_id="ollama1",
             worker_type="ollama",
@@ -585,9 +587,11 @@ class TestSpawnWorkerModelName:
         assert "model_name is required" in result["error"]
 
     def test_ollama_uses_dynamic_command(self, tools, mock_tmux):
-        """Ollama spawn with model_name constructs dynamic command."""
+        """Ollama spawn with model_name constructs dynamic command using the ctx-variant."""
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
         _mock_grader_approve(tools)
+        tools._check_spawn_preconditions = MagicMock(return_value=None)
+        tools._ensure_ollama_ctx_variant = MagicMock(return_value="ic-qwen3-8b-131072")
         tools.spawn_worker(
             worker_id="ollama1",
             worker_type="ollama",
@@ -595,10 +599,10 @@ class TestSpawnWorkerModelName:
             objective="Do something",
             model_name="qwen3:8b",
         )
-        # Verify the command includes --model qwen3:8b
+        # Verify the command targets the num_ctx-fixed variant, not the raw model
         spawn_call = mock_tmux.spawn_session.call_args
         cmd = spawn_call[0][1]  # second positional arg is the command
-        assert "--model qwen3:8b" in cmd
+        assert "--model ic-qwen3-8b-131072" in cmd
         assert "ollama" in cmd
         assert "CLAUDE_CODE_ATTRIBUTION_HEADER=0" in cmd
 
@@ -928,6 +932,8 @@ class TestSpawnWorkerEnvVar:
         """Ollama worker command includes IC_WORKER_ID env var."""
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
         _mock_grader_approve(tools)
+        tools._check_spawn_preconditions = MagicMock(return_value=None)
+        tools._ensure_ollama_ctx_variant = MagicMock(return_value="ic-qwen3-8b-131072")
         tools.spawn_worker(
             worker_id="ollama-1",
             worker_type="ollama",
@@ -5141,7 +5147,13 @@ class TestSpawnPreconditionsWorkerType:
 
     @pytest.fixture
     def vram_loaded_tools(self, tools):
-        """tools with 12 GB Ollama VRAM loaded and plenty of free RAM."""
+        """tools with 12 GB Ollama VRAM loaded and plenty of free RAM.
+
+        Pins an explicit 8.0 GB threshold so these tests exercise the
+        configured-threshold path deterministically (the default is now
+        host-aware — covered by the host-aware tests below).
+        """
+        tools._config = {"ollama_vram_block_threshold_gb": 8.0}
         tools._get_ollama_vram = MagicMock(return_value=(12.0, ["gemma4:31b (12.0GB)"]))
         tools.get_system_memory = MagicMock(return_value={"available_gb": 30.0, "total_gb": 48.0})
         return tools
@@ -5249,3 +5261,114 @@ class TestCallLocalGraderDelegation:
         result = tools._call_local_grader("sys_prompt", "user_prompt", schema)
         mock_grade.assert_called_once_with("sys_prompt", "user_prompt", schema)
         assert result == {"grade": "A", "approved": True}
+
+
+def test_spawn_preconditions_vram_threshold_is_host_aware(tools):
+    """With no configured threshold, the VRAM gate scales to total system memory."""
+    tools._config = {}  # no ollama_vram_block_threshold_gb
+    # 48 GB host -> threshold 24.0 GB; 10 GB loaded must NOT be rejected
+    tools._get_ollama_vram = MagicMock(return_value=(10.0, ["gemma4:12b-it-qat"]))
+    tools.get_system_memory = MagicMock(
+        return_value={"total_gb": 48.0, "available_gb": 30.0}
+    )
+    result = tools._check_spawn_preconditions(worker_type="ollama")
+    assert result is None
+
+
+def test_spawn_preconditions_vram_threshold_explicit_config_wins(tools):
+    """An explicit configured threshold overrides the host-aware default."""
+    tools._config = {"ollama_vram_block_threshold_gb": 8.0}
+    tools._get_ollama_vram = MagicMock(return_value=(10.0, ["gemma4:12b-it-qat"]))
+    tools.get_system_memory = MagicMock(
+        return_value={"total_gb": 48.0, "available_gb": 30.0}
+    )
+    result = tools._check_spawn_preconditions(worker_type="ollama")
+    assert result is not None
+    assert result["threshold_gb"] == 8.0
+
+
+def test_spawn_preconditions_host_aware_default_blocks_over_half(tools):
+    """The host-aware default still blocks when loaded VRAM exceeds half of total."""
+    tools._config = {}  # no explicit threshold
+    # 48 GB host -> threshold 24.0 GB; 30 GB loaded must be rejected
+    tools._get_ollama_vram = MagicMock(return_value=(30.0, ["gemma4:31b"]))
+    tools.get_system_memory = MagicMock(
+        return_value={"total_gb": 48.0, "available_gb": 12.0}
+    )
+    result = tools._check_spawn_preconditions(worker_type="ollama")
+    assert result is not None
+    assert result["threshold_gb"] == 24.0
+
+
+def test_ensure_ollama_ctx_variant_creates_and_returns_name(tools):
+    """_ensure_ollama_ctx_variant derives a deterministic name and calls create_model."""
+    fake_client = MagicMock()
+    tools._get_ollama_client = MagicMock(return_value=fake_client)
+    tools._config = {"ollama_worker_num_ctx": 131072}
+
+    variant = tools._ensure_ollama_ctx_variant("gemma4:12b-it-qat")
+
+    assert variant == "ic-gemma4-12b-it-qat-131072"
+    fake_client.create_model.assert_called_once()
+    args, kwargs = fake_client.create_model.call_args
+    assert args[0] == "ic-gemma4-12b-it-qat-131072"
+    assert args[1] == "gemma4:12b-it-qat"
+    assert args[2] == {"num_ctx": 131072}
+
+
+def test_ensure_ollama_ctx_variant_default_num_ctx(tools):
+    """With no configured num_ctx, defaults to 131072."""
+    fake_client = MagicMock()
+    tools._get_ollama_client = MagicMock(return_value=fake_client)
+    tools._config = {}
+
+    variant = tools._ensure_ollama_ctx_variant("gemma4:12b-it-qat")
+
+    assert variant == "ic-gemma4-12b-it-qat-131072"
+    args, _ = fake_client.create_model.call_args
+    assert args[2] == {"num_ctx": 131072}
+
+
+def test_spawn_worker_ollama_cmd_has_variant_and_playbook(tools, mock_tmux):
+    """Ollama spawn cmd uses the ctx-variant, injects the playbook, and caps output."""
+    tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+    _mock_grader_approve(tools)
+    tools._check_spawn_preconditions = MagicMock(return_value=None)
+    tools._ensure_ollama_ctx_variant = MagicMock(return_value="ic-gemma4-12b-it-qat-131072")
+    tools._config = {"ollama_worker_max_output_tokens": 64000}
+
+    tools.spawn_worker(
+        worker_id="o1",
+        worker_type="ollama",
+        repo="/tmp/repo",
+        objective="Routine task",
+        model_name="gemma4:12b-it-qat",
+    )
+
+    cmd = mock_tmux.spawn_session.call_args[0][1]
+    assert "--model ic-gemma4-12b-it-qat-131072" in cmd
+    assert "--append-system-prompt" in cmd
+    assert "IronClaude Worker — Operating Guide" in cmd
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000" in cmd
+    tools._ensure_ollama_ctx_variant.assert_called_once_with("gemma4:12b-it-qat")
+
+
+def test_spawn_worker_ollama_cmd_no_max_output_when_unset(tools, mock_tmux):
+    """Without configured max-output, no CLAUDE_CODE_MAX_OUTPUT_TOKENS export is added."""
+    tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+    _mock_grader_approve(tools)
+    tools._check_spawn_preconditions = MagicMock(return_value=None)
+    tools._ensure_ollama_ctx_variant = MagicMock(return_value="ic-gemma4-12b-it-qat-131072")
+    tools._config = {}
+
+    tools.spawn_worker(
+        worker_id="o2",
+        worker_type="ollama",
+        repo="/tmp/repo",
+        objective="Routine task",
+        model_name="gemma4:12b-it-qat",
+    )
+
+    cmd = mock_tmux.spawn_session.call_args[0][1]
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in cmd
+    assert "--append-system-prompt" in cmd

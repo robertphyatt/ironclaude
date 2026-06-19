@@ -1,6 +1,6 @@
 .PHONY: tailscale-serve-setup deploy-hooks
 
-PLUGIN_CACHE_HOOK_DIR := $(HOME)/.claude/plugins/cache/ironclaude/ironclaude/1.0.11/hooks
+PLUGIN_CACHE_HOOK_DIR := $(HOME)/.claude/plugins/cache/ironclaude/ironclaude/1.0.12/hooks
 STABLE_HOOK_DIR := $(HOME)/.claude/ironclaude-hooks
 
 # Deploys ALL worker hooks to the runtime locations (stable dir + plugin cache).

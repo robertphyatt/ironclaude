@@ -50,6 +50,35 @@ class OllamaClient:
         """
         return self._post("/api/generate", payload)
 
+    def create_model(self, model: str, from_model: str, parameters: dict) -> None:
+        """POST /api/create to derive a model variant (e.g. a num_ctx override).
+
+        Idempotent on the Ollama side — re-creating an identical variant reuses
+        existing layers. Raises OllamaConnectionError / OllamaTimeoutError on failure.
+        """
+        payload = {
+            "model": model,
+            "from": from_model,
+            "parameters": parameters,
+            "stream": False,
+        }
+        try:
+            resp = requests.post(
+                f"{self._url}/api/create",
+                json=payload,
+                timeout=(self._connect_timeout, self._timeout),
+                stream=False,
+            )
+            resp.raise_for_status()
+        except (requests.ConnectionError, requests.HTTPError) as e:
+            raise OllamaConnectionError(
+                f"Ollama create_model failed at {self._url}: {e}"
+            ) from e
+        except requests.Timeout:
+            raise OllamaTimeoutError(f"Ollama create_model timed out after {self._timeout}s")
+        except requests.RequestException as e:
+            raise OllamaConnectionError(f"Ollama create_model request failed: {e}") from e
+
     def get_ps(self) -> dict:
         """GET /api/ps. Returns parsed JSON dict.
 

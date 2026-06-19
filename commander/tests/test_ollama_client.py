@@ -101,3 +101,31 @@ class TestConnectTimeoutShortcut:
     def test_full_connect_timeout_without_fallback(self):
         c = OllamaClient(url="http://a:11434", timeout=120)
         assert c._connect_timeout == 120
+
+
+class TestCreateModel:
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_create_model_posts_to_api_create(self, mock_post, client_no_fallback):
+        """create_model POSTs /api/create with from + parameters, stream=False."""
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {"status": "success"}
+        mock_post.return_value = resp
+
+        client_no_fallback.create_model(
+            "ic-gemma4-12b-131072", "gemma4:12b-it-qat", {"num_ctx": 131072}
+        )
+
+        args, kwargs = mock_post.call_args
+        assert args[0] == "http://primary:11434/api/create"
+        payload = kwargs["json"]
+        assert payload["model"] == "ic-gemma4-12b-131072"
+        assert payload["from"] == "gemma4:12b-it-qat"
+        assert payload["parameters"] == {"num_ctx": 131072}
+        assert payload["stream"] is False
+
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_create_model_connection_error_raises(self, mock_post, client_no_fallback):
+        mock_post.side_effect = requests.ConnectionError("refused")
+        with pytest.raises(OllamaConnectionError):
+            client_no_fallback.create_model("v", "base", {"num_ctx": 1})
