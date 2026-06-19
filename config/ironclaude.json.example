@@ -8,6 +8,7 @@
   "max_worker_retries": 3,
   "min_available_memory_pct": 0.10,
   "ollama_vram_block_threshold_gb": 8.0,
+  "ollama_worker_num_ctx": 32768,
   "push_enabled": false,
   "push_max_per_hour": 5,
   "tmp_dir": "/tmp/ic",

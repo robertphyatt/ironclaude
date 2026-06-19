@@ -20,6 +20,7 @@ DEFAULTS = {
     "max_worker_retries": 3,
     "min_available_memory_pct": 0.10,
     "ollama_vram_block_threshold_gb": 8.0,
+    "ollama_worker_num_ctx": 32768,
     "machines": [],
     "push_enabled": False,
     "push_max_per_hour": 5,

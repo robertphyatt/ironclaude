@@ -445,7 +445,7 @@ class OrchestratorTools:
         We derive a deterministic variant with a large context window. /api/create
         is idempotent (reuses existing layers).
         """
-        num_ctx = int(self._config.get("ollama_worker_num_ctx", 131072))
+        num_ctx = int(self._config.get("ollama_worker_num_ctx", 32768))
         safe = base_model.replace(":", "-").replace("/", "-")
         variant = f"ic-{safe}-{num_ctx}"
         self._get_ollama_client().create_model(variant, base_model, {"num_ctx": num_ctx})
@@ -1431,12 +1431,7 @@ class OrchestratorTools:
         # 1. Ollama VRAM check (only blocks ollama-type workers)
         ollama_vram_gb, loaded_models = self._get_ollama_vram()
         if worker_type == "ollama":
-            vram_threshold = self._config.get("ollama_vram_block_threshold_gb")
-            if vram_threshold is None:
-                # Host-aware default: the static 8.0 GB was tuned for a small remote
-                # GPU and wrongly blocks ollama workers on large-memory hosts (e.g.
-                # a 48 GB M4 Max). Scale to half of total system memory.
-                vram_threshold = round(self.get_system_memory()["total_gb"] * 0.5, 1)
+            vram_threshold = self._config.get("ollama_vram_block_threshold_gb", 8.0)
             if ollama_vram_gb > vram_threshold:
                 logger.info(
                     "Spawn rejected: Ollama VRAM %.1fGB exceeds threshold %.1fGB. "

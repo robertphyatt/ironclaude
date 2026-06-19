@@ -5263,41 +5263,26 @@ class TestCallLocalGraderDelegation:
         assert result == {"grade": "A", "approved": True}
 
 
-def test_spawn_preconditions_vram_threshold_is_host_aware(tools):
-    """With no configured threshold, the VRAM gate scales to total system memory."""
-    tools._config = {}  # no ollama_vram_block_threshold_gb
-    # 48 GB host -> threshold 24.0 GB; 10 GB loaded must NOT be rejected
+def test_spawn_preconditions_vram_threshold_default_8gb(tools):
+    """With no configured threshold, the default 8.0 GB ceiling applies (not a host-aware default)."""
+    tools._config = {}  # key absent -> .get(..., 8.0) yields 8.0
     tools._get_ollama_vram = MagicMock(return_value=(10.0, ["gemma4:12b-it-qat"]))
-    tools.get_system_memory = MagicMock(
-        return_value={"total_gb": 48.0, "available_gb": 30.0}
-    )
-    result = tools._check_spawn_preconditions(worker_type="ollama")
-    assert result is None
+    blocked = tools._check_spawn_preconditions(worker_type="ollama")
+    assert blocked is not None
+    assert blocked["threshold_gb"] == 8.0
+
+    tools._get_ollama_vram = MagicMock(return_value=(7.0, ["small"]))
+    ok = tools._check_spawn_preconditions(worker_type="ollama")
+    assert ok is None
 
 
 def test_spawn_preconditions_vram_threshold_explicit_config_wins(tools):
-    """An explicit configured threshold overrides the host-aware default."""
+    """An explicit configured threshold is honored."""
     tools._config = {"ollama_vram_block_threshold_gb": 8.0}
     tools._get_ollama_vram = MagicMock(return_value=(10.0, ["gemma4:12b-it-qat"]))
-    tools.get_system_memory = MagicMock(
-        return_value={"total_gb": 48.0, "available_gb": 30.0}
-    )
     result = tools._check_spawn_preconditions(worker_type="ollama")
     assert result is not None
     assert result["threshold_gb"] == 8.0
-
-
-def test_spawn_preconditions_host_aware_default_blocks_over_half(tools):
-    """The host-aware default still blocks when loaded VRAM exceeds half of total."""
-    tools._config = {}  # no explicit threshold
-    # 48 GB host -> threshold 24.0 GB; 30 GB loaded must be rejected
-    tools._get_ollama_vram = MagicMock(return_value=(30.0, ["gemma4:31b"]))
-    tools.get_system_memory = MagicMock(
-        return_value={"total_gb": 48.0, "available_gb": 12.0}
-    )
-    result = tools._check_spawn_preconditions(worker_type="ollama")
-    assert result is not None
-    assert result["threshold_gb"] == 24.0
 
 
 def test_ensure_ollama_ctx_variant_creates_and_returns_name(tools):
@@ -5317,16 +5302,16 @@ def test_ensure_ollama_ctx_variant_creates_and_returns_name(tools):
 
 
 def test_ensure_ollama_ctx_variant_default_num_ctx(tools):
-    """With no configured num_ctx, defaults to 131072."""
+    """With no configured num_ctx, defaults to 32768 (fits the 8 GB ceiling OOTB)."""
     fake_client = MagicMock()
     tools._get_ollama_client = MagicMock(return_value=fake_client)
     tools._config = {}
 
     variant = tools._ensure_ollama_ctx_variant("gemma4:12b-it-qat")
 
-    assert variant == "ic-gemma4-12b-it-qat-131072"
+    assert variant == "ic-gemma4-12b-it-qat-32768"
     args, _ = fake_client.create_model.call_args
-    assert args[2] == {"num_ctx": 131072}
+    assert args[2] == {"num_ctx": 32768}
 
 
 def test_spawn_worker_ollama_cmd_has_variant_and_playbook(tools, mock_tmux):

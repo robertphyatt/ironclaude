@@ -353,7 +353,22 @@ Workers can also run on remote machines via SSH — configure machine definition
 ]
 ```
 
-The daemon checks available Ollama VRAM before spawning. Set `ollama_vram_block_threshold_gb` in the config to adjust the minimum required (default: 8.0 GB). Models can be unloaded on demand via the Brain's MCP tools.
+Before spawning an Ollama worker, the daemon checks how much VRAM Ollama already has loaded and **blocks the spawn if that exceeds `ollama_vram_block_threshold_gb`** (default: 8.0 GB) — it is a ceiling on already-loaded VRAM, not a minimum. The 8 GB default suits Apple Silicon unified memory, where Ollama competes with everything else for the shared pool. Raise it on machines with more memory headroom (see [Running Ollama workers on Apple Silicon](#running-ollama-workers-on-apple-silicon)). Models can be unloaded on demand via the Brain's MCP tools.
+
+#### Running Ollama workers on Apple Silicon
+
+Ollama workers run against a local Ollama, with the model launched *under the hood of a full Claude Code session*. Claude Code's first turn needs ~26k tokens, far above Ollama's 4096 default, so the daemon builds a `num_ctx`-fixed model variant (`ic-<model>-<num_ctx>`) and points the worker at it.
+
+The two knobs interact: a larger `ollama_worker_num_ctx` means a larger resident model, which must still pass the `ollama_vram_block_threshold_gb` ceiling. The defaults (32k context, 8 GB ceiling) are tuned to work together out of the box.
+
+To run a larger context window, raise both. On a 48 GB M4 Max the following works well — a 128k variant sits ~9.12 GB fully on-GPU, so the ceiling must be raised above it:
+
+```json
+{
+  "ollama_vram_block_threshold_gb": 24.0,
+  "ollama_worker_num_ctx": 131072
+}
+```
 
 ### Autonomy Levels
 
@@ -462,7 +477,9 @@ Three convergence mechanisms keep the wiki current:
 | `advisor.enabled` | `true` | Whether Sonnet workers get an Opus advisor session |
 | `advisor.executor_model` | `"sonnet"` | Default executor worker model |
 | `advisor.advisor_model` | `"opus"` | Advisor model for Sonnet workers |
-| `ollama_vram_block_threshold_gb` | `8.0` | Min VRAM (GB) required to spawn an Ollama worker |
+| `ollama_vram_block_threshold_gb` | `8.0` | Max already-loaded Ollama VRAM (GB) tolerated before a spawn is **blocked** (a ceiling, not a minimum) |
+| `ollama_worker_num_ctx` | `32768` | Context window (`num_ctx`) baked into the Ollama worker model variant. 32k (~7.5 GB) fits under the 8 GB default ceiling; raise for longer context if your hardware allows |
+| `ollama_worker_max_output_tokens` | _(unset)_ | When set, exports `CLAUDE_CODE_MAX_OUTPUT_TOKENS` for Ollama workers to cap runaway output |
 | `push_enabled` | `false` | Enable automated git push after task completion |
 | `push_max_per_hour` | `5` | Max auto-pushes per hour when `push_enabled` is true |
 | `brain_heartbeat_timeout_seconds` | `60` | Max seconds before Brain is considered dead |
