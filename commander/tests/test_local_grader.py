@@ -665,3 +665,17 @@ class TestSendKeysContentGate:
         result = tools.send_keys_to_worker("w1", ["Down"] * 30)
         tools._call_local_grader.assert_not_called()
         assert "sent" in result.lower()
+
+
+def test_grade_strips_leaked_special_tokens(tmp_path):
+    """A leaked <|tool_response> control token after valid JSON must not break parsing."""
+    from ironclaude.grader import LocalGrader
+    grader = LocalGrader(config_path=str(tmp_path / "missing.json"))
+    fake_client = MagicMock()
+    fake_client.post_generate.return_value = '{"waiting": true}\n    <|tool_response>'
+    grader._get_client = MagicMock(return_value=fake_client)
+
+    result = grader.grade("sys", "user", {"type": "object", "required": ["waiting"]})
+
+    assert result == {"waiting": True}
+    assert "infrastructure_error" not in result

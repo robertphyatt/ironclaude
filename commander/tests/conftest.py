@@ -73,3 +73,23 @@ def _guard_os_kill(monkeypatch):
     monkeypatch.setattr(os, "kill", _blocked_kill)
     if hasattr(os, "killpg"):
         monkeypatch.setattr(os, "killpg", _blocked_killpg)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ic_env(monkeypatch):
+    """Prevent the developer's real IC_* environment from leaking into tests.
+
+    OrchestratorTools.__init__ resolves brain_cwd / ollama config / machines
+    from IC_* env vars BEFORE falling back to the injected `config` dict. On a
+    machine running a live brain (IC_BRAIN_CWD set), that override made wiki/
+    ledger tests write to and git-commit into the REAL brain repo, and the
+    tmp_path assertions failed. Unset them so injected config is honored.
+    """
+    for var in (
+        "IC_BRAIN_CWD",
+        "IC_OLLAMA_CONFIG_PATH",
+        "IC_MACHINES_CONFIG",
+        "IC_LEDGER_PATH",
+        "IC_LOG_DIR",
+    ):
+        monkeypatch.delenv(var, raising=False)

@@ -18,6 +18,9 @@ logger = logging.getLogger(__name__)
 _DEFAULT_CONFIG_PATH = os.path.expanduser("~/.claude/ironclaude-hooks-config.json")
 _DEFAULT_MODEL = "gemma4:12b-it-qat"
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+# Strip leaked chat-template control tokens (e.g. <|tool_response>, <|im_end|>)
+# that small local models sometimes emit around their JSON output.
+_SPECIAL_TOKEN_RE = re.compile(r"<\|[^>]*>")
 
 
 class LocalGrader:
@@ -85,7 +88,8 @@ class LocalGrader:
 
         logger.debug("Ollama raw response (%d chars): %.500s", len(result_text), result_text)
 
-        result_text = _THINK_TAG_RE.sub("", result_text).strip()
+        result_text = _THINK_TAG_RE.sub("", result_text)
+        result_text = _SPECIAL_TOKEN_RE.sub("", result_text).strip()
 
         try:
             parsed = json.loads(result_text)

@@ -251,8 +251,8 @@ Do NOT run git commit, git push, git merge, or git rebase outside of plan execut
         exit 0
       fi
     fi
-    # Exception: allow read-only git commands at any workflow stage
-    if [ "$TOOL_NAME" = "Bash" ] && echo "$FILE_PATH" | grep -qE '\bgit\s+(diff|status|log|show|blame|branch|rev-list|ls-files|ls-tree|tag|remote|reflog|stash)\b'; then
+    # Exception: allow read-only git commands at any workflow stage (no chaining — mirrors git-add guard above)
+    if [ "$TOOL_NAME" = "Bash" ] && ! echo "$FILE_PATH" | grep -qE '[;&|`]|\$\(' && echo "$FILE_PATH" | grep -qE '\bgit\s+(diff|status|log|show|blame|branch|rev-list|ls-files|ls-tree|tag|remote|reflog|stash)\b'; then
       log_hook "professional-mode-guard" "Allowed" "read-only git command"
       exit 0
     fi
