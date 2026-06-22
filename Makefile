@@ -1,6 +1,12 @@
 .PHONY: tailscale-serve-setup deploy-hooks
 
-PLUGIN_CACHE_HOOK_DIR := $(HOME)/.claude/plugins/cache/ironclaude/ironclaude/1.0.12/hooks
+PLUGIN_CACHE_BASE := $(HOME)/.claude/plugins/cache/ironclaude/ironclaude
+# Derive the latest installed plugin-cache version dir at runtime instead of
+# hard-coding it. A pinned version desyncs from what's actually installed on
+# every release (the new version isn't in the cache until the marketplace
+# publishes it), which silently skips the plugin-cache hook copy.
+PLUGIN_CACHE_VERSION := $(shell ls -1 "$(PLUGIN_CACHE_BASE)" 2>/dev/null | sort -V | tail -1)
+PLUGIN_CACHE_HOOK_DIR := $(PLUGIN_CACHE_BASE)/$(PLUGIN_CACHE_VERSION)/hooks
 STABLE_HOOK_DIR := $(HOME)/.claude/ironclaude-hooks
 
 # Deploys ALL worker hooks to the runtime locations (stable dir + plugin cache).

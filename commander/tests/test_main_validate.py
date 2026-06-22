@@ -37,10 +37,12 @@ class TestValidateBrainMessage:
 
     def test_grader_valid_false_with_reason_returns_false_and_reason(self):
         daemon = _make_daemon()
-        daemon._grader.grade.return_value = {"valid": False, "reason": "Missing directive reference"}
-        valid, reason = daemon._validate_brain_message("everything is good")
+        daemon._grader.grade.return_value = {"valid": False, "reason": "Missing reason clause"}
+        # Include a directive ref so the message passes the pre-filter and the
+        # grader verdict (and its reason) is what flows back.
+        valid, reason = daemon._validate_brain_message("#42 everything is good")
         assert valid is False
-        assert reason == "Missing directive reference"
+        assert reason == "Missing reason clause"
 
     def test_grader_valid_false_no_reason_uses_fallback(self):
         daemon = _make_daemon()

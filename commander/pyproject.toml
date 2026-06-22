@@ -1,7 +1,7 @@
 # pyproject.toml
 [project]
 name = "ironclaude-commander"
-version = "1.0.12"
+version = "1.0.13"
 description = "AI orchestrator that manages Claude Code workers via Slack"
 requires-python = ">=3.11"
 dependencies = [
@@ -21,6 +21,9 @@ dev = [
     "pytest>=8.0.0",
     "pytest-mock>=3.14.0",
 ]
+
+[project.scripts]
+ic-wiki = "ironclaude.wiki_cli:main"
 
 [build-system]
 requires = ["setuptools>=75.0"]

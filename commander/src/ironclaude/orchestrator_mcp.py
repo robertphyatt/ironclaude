@@ -33,19 +33,17 @@ import shlex
 
 from ironclaude.config import make_opus_command
 from ironclaude.grader import LocalGrader
+from ironclaude.shadow_grader import ShadowGrader
 from ironclaude.ollama_client import OllamaClient, OllamaError
 from ironclaude.ollama_playbook import OLLAMA_WORKER_PLAYBOOK
 from ironclaude.signal_forensics import _logged_kill
 from ironclaude.tmux_manager import _strip_ansi, detect_ask_user_menu
+from ironclaude.wiki_tools import WikiTools
 
 logger = logging.getLogger("ironclaude.orchestrator_mcp")
 
 _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
 _SAFE_PUSH_NAME_RE = re.compile(r'^[a-zA-Z0-9/_.-]+$')
-_WIKI_COMMIT_HASH_RE = re.compile(r'\b[0-9a-f]{7,40}\b', re.IGNORECASE)
-_WIKI_STATUS_COMPLETE_RE = re.compile(
-    r'Status:\s*Complete\s*\(\s*20\d\d-\d\d-\d\d,\s*commit', re.IGNORECASE
-)
 
 PID_FILE = Path("/tmp/ic-daemon.pid")
 
@@ -392,12 +390,15 @@ class OrchestratorTools:
             or "~/.ironclaude/brain"
         )
         self._wiki_dir = os.path.join(os.path.expanduser(brain_cwd), "wiki")
+        self._wiki = WikiTools(self._wiki_dir)
         self._ollama_config_path = os.path.expanduser(
             os.environ.get("IC_OLLAMA_CONFIG_PATH", "~/.claude/ironclaude-hooks-config.json")
         )
         self._ollama_client: OllamaClient | None = None
         self._ollama_cfg_cache: dict = {}
         self._local_grader = LocalGrader(config_path=self._ollama_config_path)
+        self._shadow_grader = ShadowGrader(config_path=self._ollama_config_path)
+        self._last_grader_delta: str = ""
 
     def _get_worker_command(self, worker_type: str, model_name: str = "") -> str:
         """Build worker command, using advisor config for model selection."""
@@ -664,6 +665,7 @@ class OrchestratorTools:
                     try:
                         results = json.loads(array_match.group())
                         if isinstance(results, list) and results:
+                            self._last_grader_delta = delta
                             self.tmux.send_keys(self._grader_session, "/clear")
                             self._wait_for_grader_clear()
                             logger.debug("Grader responded in %.1fs", time.time() - start_time)
@@ -679,6 +681,7 @@ class OrchestratorTools:
             if json_match:
                 try:
                     result = json.loads(json_match.group())
+                    self._last_grader_delta = delta
                     self.tmux.send_keys(self._grader_session, "/clear")
                     self._wait_for_grader_clear()
                     logger.debug("Grader responded in %.1fs", time.time() - start_time)
@@ -695,6 +698,7 @@ class OrchestratorTools:
                     approved_m = re.search(r'"approved"\s*:\s*(true|false)', raw)
                     feedback_m = re.search(r'"feedback"\s*:\s*"(.*)"', raw, re.DOTALL)
                     if grade_m and approved_m:
+                        self._last_grader_delta = delta
                         self.tmux.send_keys(self._grader_session, "/clear")
                         self._wait_for_grader_clear()
                         logger.debug("Grader responded in %.1fs", time.time() - start_time)
@@ -706,6 +710,7 @@ class OrchestratorTools:
 
             time.sleep(2)
 
+        self._last_grader_delta = ""
         self.tmux.send_keys(self._grader_session, "/clear")
         self._wait_for_grader_clear()
         return None
@@ -747,6 +752,138 @@ class OrchestratorTools:
     def _call_local_grader(self, system_prompt: str, user_prompt: str, format_schema: dict) -> dict:
         """Call Ollama for local grading. Delegates to self._local_grader."""
         return self._local_grader.grade(system_prompt, user_prompt, format_schema)
+
+    def _parse_tool_calls_from_delta(self, delta: str) -> list:
+        """Extract Claude Code tool invocations from tmux log delta (best-effort).
+
+        Returns list of {"tool": str, "args": str} dicts.
+        """
+        if not delta:
+            return []
+        tool_calls = []
+        for match in re.finditer(r'[●•]\s*(\w+)\(([^)]*)\)', delta):
+            tool_calls.append({"tool": match.group(1), "args": match.group(2)})
+        if not tool_calls:
+            for match in re.finditer(
+                r'\{"type"\s*:\s*"tool_use"\s*,\s*"name"\s*:\s*"(\w+)"[^}]*\}', delta
+            ):
+                tool_calls.append({"tool": match.group(1), "args": ""})
+        return tool_calls
+
+    def _compute_concordance(self, opus: dict, shadow: dict) -> str:
+        """Compute A/B/C/F concordance between Opus and shadow grade results."""
+        if shadow.get("infrastructure_error"):
+            return "F"
+        if opus.get("grade") == shadow.get("grade") and opus.get("approved") == shadow.get("approved"):
+            return "A"
+        if opus.get("approved") == shadow.get("approved"):
+            return "B"
+        return "C"
+
+    def _format_shadow_slack_message(
+        self,
+        context: str,
+        worker_id: str,
+        opus_result: dict,
+        opus_tool_calls: list,
+        shadow_result: dict,
+        concordance: str,
+    ) -> str:
+        """Build Slack concordance report with tool calls as the primary signal."""
+        lines = [f"\U0001f52c Shadow Grader — {context} | {worker_id}", ""]
+
+        lines.append("Tool Calls (primary signal):")
+        if opus_tool_calls:
+            for tc in opus_tool_calls[:8]:
+                lines.append(f"  Opus:    ● {tc['tool']}({tc['args'][:80]})")
+            lines.append(f"  [{len(opus_tool_calls)} call{'s' if len(opus_tool_calls) != 1 else ''}]")
+        else:
+            lines.append("  Opus:    (no tool calls detected)")
+
+        if shadow_result.get("infrastructure_error"):
+            lines.append("  gemma4:  (infrastructure error — see below)")
+        else:
+            shadow_tcs = shadow_result.get("tool_calls", [])
+            if shadow_tcs:
+                for tc in shadow_tcs[:8]:
+                    args_str = json.dumps(tc.get("args", {}), separators=(",", ":"))[:80]
+                    lines.append(f"  gemma4:  {tc['name']}({args_str})")
+                lines.append(f"  [{len(shadow_tcs)} call{'s' if len(shadow_tcs) != 1 else ''}]")
+            else:
+                lines.append("  gemma4:  (no tool calls)")
+
+        lines.append("")
+        lines.append("Verdicts:")
+        opus_mark = "✓" if opus_result.get("approved") else "✗"
+        opus_status = "approved" if opus_result.get("approved") else "rejected"
+        lines.append(f"  Opus:    {opus_result.get('grade', '?')} {opus_mark} {opus_status}")
+        lines.append(f"  \"{opus_result.get('feedback', '')}\"")
+
+        if shadow_result.get("infrastructure_error"):
+            lines.append("  gemma4:  (infrastructure error)")
+            lines.append(f"  \"{shadow_result.get('error_detail', '')}\"")
+        else:
+            shadow_mark = "✓" if shadow_result.get("approved") else "✗"
+            shadow_status = "approved" if shadow_result.get("approved") else "rejected"
+            lines.append(f"  gemma4:  {shadow_result.get('grade', '?')} {shadow_mark} {shadow_status}")
+            lines.append(f"  \"{shadow_result.get('feedback', '')}\"")
+
+        lines.append("")
+        concordance_labels = {
+            "A": "A — exact match",
+            "B": "B — same pass/fail, different grade",
+            "C": "C — DIVERGE on pass/fail",
+            "F": "F — gemma4 failed",
+        }
+        lines.append(f"Concordance: {concordance_labels.get(concordance, concordance)}")
+        if concordance == "F" and shadow_result.get("error_detail"):
+            lines.append(f"  Detail: {shadow_result['error_detail']}")
+
+        return "\n".join(lines)
+
+    def _run_shadow_and_report(
+        self,
+        context: str,
+        worker_id: str,
+        repo: str | None,
+        opus_result: dict,
+        opus_tool_calls: list,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> None:
+        """Background thread: run shadow grade, compute concordance, post to Slack."""
+        try:
+            shadow_result = self._shadow_grader.grade_with_tools(
+                system_prompt, user_prompt, repo_path=repo
+            )
+            concordance = self._compute_concordance(opus_result, shadow_result)
+            msg = self._format_shadow_slack_message(
+                context, worker_id, opus_result, opus_tool_calls, shadow_result, concordance
+            )
+            if self._slack is not None:
+                self._slack.post_message(msg)
+            else:
+                logger.info("Shadow concordance (no Slack): %s", msg)
+        except Exception as e:
+            logger.warning("Shadow grader thread failed for %s/%s: %s", context, worker_id, e)
+
+    def _fire_shadow_thread(
+        self,
+        context: str,
+        worker_id: str,
+        repo: str | None,
+        opus_result: dict,
+        opus_tool_calls: list,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> None:
+        """Fire shadow grading in a background daemon thread."""
+        t = threading.Thread(
+            target=self._run_shadow_and_report,
+            args=(context, worker_id, repo, opus_result, opus_tool_calls, system_prompt, user_prompt),
+            daemon=True,
+        )
+        t.start()
 
     def get_operator_messages(
         self,
@@ -1541,7 +1678,8 @@ class OrchestratorTools:
         avatar_skill = _load_avatar_skill().replace("{OPERATOR_NAME}", self._operator_name)
         system_prompt = f"""{avatar_skill}
 
-You are grading a spawn_worker decision. Respond with valid JSON only — no markdown, no explanation:
+You are grading a spawn_worker decision. You may use Read and Bash to investigate before responding. When ready,
+output ONLY a valid JSON object on a single line:
 {{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "specific feedback"}}
 
 Grading criteria:
@@ -1602,6 +1740,8 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
         if local_result.get("infrastructure_error"):
             logger.info(f"Ollama pre-filter for '{worker_id}': infrastructure error, escalating to Opus")
             grade_result = self._call_grader(system_prompt, user_prompt)
+            _opus_tool_calls = self._parse_tool_calls_from_delta(self._last_grader_delta)
+            self._fire_shadow_thread("spawn_worker", worker_id, repo, grade_result, _opus_tool_calls, system_prompt, user_prompt)
         else:
             confidence = local_result.get("confidence", "")
             confidence_idx = confidence_levels.index(confidence) if confidence in confidence_levels else len(confidence_levels)
@@ -1609,6 +1749,8 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             if confidence_idx > threshold_idx:
                 logger.info(f"Ollama pre-filter for '{worker_id}': confidence={confidence}, escalating to Opus")
                 grade_result = self._call_grader(system_prompt, user_prompt)
+                _opus_tool_calls = self._parse_tool_calls_from_delta(self._last_grader_delta)
+                self._fire_shadow_thread("spawn_worker", worker_id, repo, grade_result, _opus_tool_calls, system_prompt, user_prompt)
             else:
                 logger.info(f"Ollama pre-filter for '{worker_id}': confidence={confidence}, skipping Opus")
                 grade_result = local_result
@@ -2079,7 +2221,8 @@ Model recommendation (include "recommended_model" for each):
         avatar_skill = _load_avatar_skill().replace("{OPERATOR_NAME}", self._operator_name)
         system_prompt = f"""{avatar_skill}
 
-You are grading a plan approval request. Respond with valid JSON only — no markdown, no explanation:
+You are grading a plan approval request. You may use Read and Bash to investigate before responding. When ready,
+output ONLY a valid JSON object on a single line:
 {{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "specific feedback"}}
 
 Grading criteria — evaluate philosophical depth of engagement, not message count:
@@ -2112,6 +2255,8 @@ Interaction transcript (messages Brain sent to this worker during brainstorming)
 Did the Brain act as {self._operator_name}'s avatar during brainstorming? Did it challenge, question, and steer — or did it rubber-stamp?"""
 
         grade_result = self._call_grader(system_prompt, user_prompt)
+        _opus_tool_calls = self._parse_tool_calls_from_delta(self._last_grader_delta)
+        self._fire_shadow_thread("approve_plan", worker_id, worker.get("repo"), grade_result, _opus_tool_calls, system_prompt, user_prompt)
         if not grade_result["approved"]:
             return {
                 "error": f"Plan approval rejected by grader (grade {grade_result['grade']}). {grade_result['feedback']}",
@@ -2419,7 +2564,7 @@ Grading criteria:
         if os.path.exists(wiki_page_path):
             with open(wiki_page_path) as f:
                 raw = f.read()
-            _, _, body = self._parse_wiki_frontmatter(raw)
+            _, _, body = self._wiki._parse_wiki_frontmatter(raw)
             return self._extract_ledger_json(body)
         if self.ledger_path and os.path.exists(self.ledger_path):
             try:
@@ -2432,7 +2577,7 @@ Grading criteria:
                     return data
             except json.JSONDecodeError:
                 os.makedirs(self._wiki_dir, exist_ok=True)
-                self._wiki_log_append(f"Migration failed: malformed ledger JSON at {self.ledger_path}")
+                self._wiki._wiki_log_append(f"Migration failed: malformed ledger JSON at {self.ledger_path}")
         return {"objective": None, "tasks": []}
 
     def get_worker_status(self, worker_id: str | None = None) -> dict | list[dict]:
@@ -2489,7 +2634,8 @@ Grading criteria:
             avatar_skill = _load_avatar_skill()
             system_prompt = f"""{avatar_skill}
 
-You are grading a kill_worker decision. Respond with valid JSON only — no markdown, no explanation:
+You are grading a kill_worker decision. You may use Read and Bash to investigate before responding. When ready,
+output ONLY a valid JSON object on a single line:
 {{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "specific feedback"}}
 
 Grading criteria:
@@ -2508,6 +2654,9 @@ evidence provided: {evidence}
 Has the worker genuinely completed its objective based on the evidence?"""
 
             grade_result = self._call_grader(system_prompt, user_prompt)
+            _kw_repo = (self.registry.get_worker(worker_id) or {}).get("repo")
+            _opus_tool_calls = self._parse_tool_calls_from_delta(self._last_grader_delta)
+            self._fire_shadow_thread("kill_worker", worker_id, _kw_repo, grade_result, _opus_tool_calls, system_prompt, user_prompt)
             if not grade_result["approved"]:
                 # Track failure for retry escalation
                 fail_base = re.sub(r'[-_]?\d*[a-z]?$', '', worker_id)
@@ -2955,37 +3104,6 @@ Has the worker genuinely completed its objective based on the evidence?"""
     # ── Wiki helpers ─────────────────────────────────────────────────
 
     @staticmethod
-    def _parse_wiki_frontmatter(raw: str) -> tuple[str, str, str]:
-        """Parse YAML frontmatter from a wiki page, returning (title, updated, body)."""
-        if not raw.startswith("---"):
-            return ("", "", raw)
-        parts = raw.split("---", 2)
-        if len(parts) < 3:
-            return ("", "", raw)
-        title, updated = "", ""
-        for line in parts[1].strip().splitlines():
-            if line.startswith("title:"):
-                title = line[len("title:"):].strip()
-            elif line.startswith("updated:"):
-                updated = line[len("updated:"):].strip()
-        return (title, updated, parts[2].strip())
-
-    @staticmethod
-    def _extract_summary(body: str) -> str:
-        """Extract first sentence (up to 120 chars) from wiki body text."""
-        if not body:
-            return ""
-        first_line = body.split("\n")[0].strip()
-        summary = first_line
-        for i, ch in enumerate(first_line):
-            if ch in ".!?" and i > 0:
-                summary = first_line[:i + 1]
-                break
-        if len(summary) > 120:
-            summary = summary[:117] + "..."
-        return summary
-
-    @staticmethod
     def _extract_ledger_json(body: str) -> dict:
         """Extract ledger JSON from the ## Data code fence in a wiki page body."""
         parts = body.split("## Data")
@@ -3008,251 +3126,19 @@ Has the worker genuinely completed its objective based on the evidence?"""
         except (json.JSONDecodeError, ValueError):
             return {"objective": None, "tasks": []}
 
-    def _rebuild_wiki_index(self) -> None:
-        """Rebuild wiki/index.md from all page files (derived state)."""
-        wiki_dir = self._wiki_dir
-        entries = []
-        for fname in sorted(os.listdir(wiki_dir)):
-            if not fname.endswith(".md") or fname in ("index.md", "log.md"):
-                continue
-            fpath = os.path.join(wiki_dir, fname)
-            with open(fpath) as f:
-                raw = f.read()
-            title, updated, body = self._parse_wiki_frontmatter(raw)
-            if not title:
-                title = fname[:-3]
-            summary = self._extract_summary(body)
-            entries.append((fname[:-3], title, summary, updated))
-
-        lines = ["# Wiki Index\n"]
-        if entries:
-            lines.append("| Page | Summary | Updated |")
-            lines.append("|------|---------|---------|")
-            for page_name, title, summary, updated in entries:
-                lines.append(f"| [{title}]({page_name}.md) | {summary} | {updated} |")
-        else:
-            lines.append("*No wiki pages yet.*")
-        lines.append("")
-
-        with open(os.path.join(wiki_dir, "index.md"), "w") as f:
-            f.write("\n".join(lines))
-
-    def _wiki_log_append(self, entry: str) -> None:
-        """Append a timestamped entry to wiki/log.md."""
-        log_path = os.path.join(self._wiki_dir, "log.md")
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        if not os.path.exists(log_path):
-            with open(log_path, "w") as f:
-                f.write("# Wiki Log\n\n")
-        with open(log_path, "a") as f:
-            f.write(f"- {timestamp} — {entry}\n")
-
-    @staticmethod
-    def _wiki_keywords(text: str) -> set:
-        """Extract meaningful keywords (>=4 chars) from a page name or title."""
-        return {w.lower() for w in re.split(r'[\s\-_]+', text) if len(w) >= 4}
-
-    def _wiki_duplicate_warning(self, page: str, title: str) -> str | None:
-        """Return conflicting page name if any existing page has >60% keyword overlap, else None."""
-        wiki_dir = self._wiki_dir
-        if not os.path.isdir(wiki_dir):
-            return None
-        incoming = self._wiki_keywords(page) | self._wiki_keywords(title)
-        if not incoming:
-            return None
-        for fname in os.listdir(wiki_dir):
-            if not fname.endswith('.md') or fname in ('index.md', 'log.md'):
-                continue
-            existing_page = fname[:-3]
-            if existing_page == page:
-                continue
-            existing_kw = self._wiki_keywords(existing_page)
-            if not existing_kw:
-                continue
-            overlap = len(incoming & existing_kw) / len(incoming | existing_kw)
-            if overlap > 0.60:
-                return existing_page
-        return None
-
-    # ── Wiki tools ───────────────────────────────────────────────────
+    # ── Wiki tools (delegated to WikiTools — see ironclaude.wiki_tools) ──
 
     def wiki_write(self, page: str, title: str, content: str) -> str:
-        """Create or update a wiki page with frontmatter, rebuild index, append log."""
-        wiki_dir = self._wiki_dir
-        os.makedirs(wiki_dir, exist_ok=True)
-
-        if re.match(r'^d\d+', page):
-            return (
-                f"Invalid page name '{page}': directive-number prefixes (d<N>) are not allowed. "
-                "Wiki pages must be concept-focused, not directive logs. "
-                "Use a descriptive name like 'worker-lifecycle' or 'state-update-patterns'."
-            )
-        if re.search(r'-d\d{1,4}(?:-|$)', page):
-            return (
-                f"Invalid page name '{page}': directive-number suffixes (-d<N>) are not allowed. "
-                "Wiki pages must be concept-focused, not directive logs. "
-                "Use a descriptive name like 'worker-lifecycle' or 'state-update-patterns'."
-            )
-        if re.search(r'\d{4}-\d{2}', page):
-            return (
-                f"Invalid page name '{page}': date-stamped names are not allowed. "
-                "Wiki pages are persistent concepts, not log entries. "
-                "Use a descriptive name like 'deployment-patterns' or 'rollout-strategy'."
-            )
-        if re.search(r'(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\d{4}', page, re.IGNORECASE):
-            return (
-                f"Invalid page name '{page}': date-stamped names are not allowed. "
-                "Wiki pages are persistent concepts, not log entries. "
-                "Use a descriptive name like 'deployment-patterns' or 'rollout-strategy'."
-            )
-
-        page_path = os.path.join(wiki_dir, f"{page}.md")
-        if not Path(page_path).resolve().is_relative_to(Path(wiki_dir).resolve()):
-            return f"Path traversal rejected: {page}"
-        if len(content.strip()) < 50:
-            return (
-                f"Invalid content for '{page}': content must be at least 50 characters after stripping whitespace. "
-                "Placeholder pages are not allowed."
-            )
-        if title.strip().lower() == 'title':
-            return (
-                f"Invalid title '{title}': placeholder titles are not allowed. "
-                "Use a descriptive title like 'Worker Lifecycle' or 'State Update Patterns'."
-            )
-        stripped_content = re.sub(r'\s', '', content.lower())
-        if stripped_content and len(set(stripped_content)) < 4:
-            return (
-                f"Invalid content for '{page}': content appears to be garbage "
-                "(fewer than 4 unique non-whitespace characters). "
-                "Placeholder pages are not allowed."
-            )
-        is_update = os.path.exists(page_path)
-
-        today = date.today().isoformat()
-        page_content = f"---\ntitle: {title}\nupdated: {today}\n---\n\n{content}\n"
-        with open(page_path, "w") as f:
-            f.write(page_content)
-
-        self._rebuild_wiki_index()
-        action = "Updated" if is_update else "Created"
-        self._wiki_log_append(f"{action} {page}.md")
-
-        repo_root = os.path.dirname(self._wiki_dir)
-        verb = "updated" if is_update else "created"
-        r_add = subprocess.run(["git", "add", "wiki/"], cwd=repo_root, capture_output=True, text=True)
-        if r_add.returncode != 0:
-            return f"{page_path} (git commit failed: {r_add.stderr.strip()})"
-        r_commit = subprocess.run(
-            ["git", "commit", "-m", f"wiki: {verb} {page}"],
-            cwd=repo_root, capture_output=True, text=True,
-        )
-        if r_commit.returncode != 0:
-            return f"{page_path} (git commit failed: {r_commit.stderr.strip()})"
-        if _WIKI_COMMIT_HASH_RE.search(title) or _WIKI_STATUS_COMPLETE_RE.search(content):
-            logger.warning(
-                "wiki_write: '%s' looks like a directive log (commit hash in title or "
-                "Status: Complete pattern in content) — consider absorbing into a concept page",
-                page,
-            )
-        conflict = self._wiki_duplicate_warning(page, title)
-        if conflict:
-            logger.warning(
-                "wiki_write: '%s' has >60%% keyword overlap with existing page '%s' — "
-                "consider consolidating",
-                page, conflict,
-            )
-        return page_path
+        return self._wiki.wiki_write(page, title, content)
 
     def wiki_delete(self, page: str) -> str:
-        """Delete a wiki page, rebuild index, append log. Idempotent for missing pages."""
-        wiki_dir = self._wiki_dir
-        page_path = os.path.join(wiki_dir, f"{page}.md")
-        if not Path(page_path).resolve().is_relative_to(Path(wiki_dir).resolve()):
-            return f"Path traversal rejected: {page}"
-        if not os.path.exists(page_path):
-            return f"Page {page}.md not found, no action taken."
-        os.remove(page_path)
-        self._rebuild_wiki_index()
-        self._wiki_log_append(f"Deleted {page}.md")
-
-        repo_root = os.path.dirname(self._wiki_dir)
-        r_add = subprocess.run(["git", "add", "wiki/"], cwd=repo_root, capture_output=True, text=True)
-        if r_add.returncode != 0:
-            return f"Deleted {page}.md (git commit failed: {r_add.stderr.strip()})"
-        r_commit = subprocess.run(
-            ["git", "commit", "-m", f"wiki: delete {page}"],
-            cwd=repo_root, capture_output=True, text=True,
-        )
-        if r_commit.returncode != 0:
-            return f"Deleted {page}.md (git commit failed: {r_commit.stderr.strip()})"
-        return f"Deleted {page}.md"
+        return self._wiki.wiki_delete(page)
 
     def wiki_query(self, keywords: str, limit: int = 20) -> str:
-        """Search wiki pages by keywords. Returns JSON array of matches."""
-        wiki_dir = self._wiki_dir
-        if not os.path.isdir(wiki_dir):
-            return json.dumps([])
-
-        kw_list = keywords.lower().split()
-        if not kw_list:
-            return json.dumps([])
-
-        results: dict[str, dict] = {}
-
-        # Phase 1: scan index for matches (match_source=index)
-        index_path = os.path.join(wiki_dir, "index.md")
-        if os.path.exists(index_path):
-            with open(index_path) as f:
-                for line in f:
-                    if not line.startswith("| ["):
-                        continue
-                    lower_line = line.lower()
-                    if any(kw in lower_line for kw in kw_list):
-                        parts = [p.strip() for p in line.split("|")[1:-1]]
-                        if len(parts) >= 3:
-                            m = re.match(r"\[(.+?)\]\((.+?)\.md\)", parts[0])
-                            if m:
-                                results[m.group(2)] = {
-                                    "path": f"{m.group(2)}.md",
-                                    "title": m.group(1),
-                                    "summary": parts[1],
-                                    "updated": parts[2],
-                                    "match_source": "index",
-                                }
-
-        # Phase 2: scan page content for matches not already found in index
-        for fname in sorted(os.listdir(wiki_dir)):
-            if not fname.endswith(".md") or fname in ("index.md", "log.md"):
-                continue
-            page_name = fname[:-3]
-            if page_name in results:
-                continue
-            fpath = os.path.join(wiki_dir, fname)
-            with open(fpath) as f:
-                raw = f.read()
-            if any(kw in raw.lower() for kw in kw_list):
-                title, updated, body = self._parse_wiki_frontmatter(raw)
-                if not title:
-                    title = page_name
-                results[page_name] = {
-                    "path": fname,
-                    "title": title,
-                    "summary": self._extract_summary(body),
-                    "updated": updated,
-                    "match_source": "content",
-                }
-
-        sorted_results = sorted(
-            results.values(),
-            key=lambda r: (0 if r["match_source"] == "index" else 1, r["path"]),
-        )
-        return json.dumps(sorted_results[:limit], indent=2)
+        return self._wiki.wiki_query(keywords, limit)
 
     def wiki_log(self, entry: str) -> str:
-        """Append a free-form entry to the wiki log."""
-        os.makedirs(self._wiki_dir, exist_ok=True)
-        self._wiki_log_append(entry)
-        return "Log entry appended."
+        return self._wiki.wiki_log(entry)
 
     def pin_message(self, timestamp: str) -> str:
         """Pin a Slack message in the brain channel."""

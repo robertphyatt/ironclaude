@@ -5,6 +5,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/hook-logger.sh"
+source "$SCRIPT_DIR/bash-readonly-guard.sh"
 run_hook "professional-mode-guard"
 
 INPUT=$(cat)
@@ -244,24 +245,24 @@ Git commit, push, merge, and rebase are blocked when not in the executing stage.
 
 Do NOT run git commit, git push, git merge, or git rebase outside of plan execution."
     fi
-    # Exception: allow git add (staging) in Bash — anchored, no chaining
+    # Exception: allow git add (staging) in Bash — anchored, no chaining/redirection
     if [ "$TOOL_NAME" = "Bash" ]; then
-      if ! echo "$FILE_PATH" | grep -qE '[;&|`]|\$\(' && echo "$FILE_PATH" | grep -qE '^\s*git\s+add\b'; then
+      if ! _has_blocked_metachars "$FILE_PATH" && echo "$FILE_PATH" | grep -qE '^\s*git\s+add\b'; then
         log_hook "professional-mode-guard" "Allowed" "git staging"
         exit 0
       fi
     fi
     # Exception: allow read-only git commands at any workflow stage (no chaining — mirrors git-add guard above)
-    if [ "$TOOL_NAME" = "Bash" ] && ! echo "$FILE_PATH" | grep -qE '[;&|`]|\$\(' && echo "$FILE_PATH" | grep -qE '\bgit\s+(diff|status|log|show|blame|branch|rev-list|ls-files|ls-tree|tag|remote|reflog|stash)\b'; then
+    if [ "$TOOL_NAME" = "Bash" ] && ! _has_blocked_metachars "$FILE_PATH" && echo "$FILE_PATH" | grep -qE '\bgit\s+(diff|status|log|show|blame|branch|rev-list|ls-files|ls-tree|tag|remote|reflog|stash)\b'; then
       log_hook "professional-mode-guard" "Allowed" "read-only git command"
       exit 0
     fi
     # Exception: allow specific read-only commands during code review
     if [ "$TOOL_NAME" = "Bash" ] && [ "$WORKFLOW" = "reviewing" ]; then
-      if echo "$FILE_PATH" | grep -qE '[;&|`]|\$\('; then
-        block_pretooluse "professional-mode-guard" "BLOCKED — COMMAND CHAINING NOT ALLOWED DURING REVIEW
+      if _has_blocked_metachars "$FILE_PATH"; then
+        block_pretooluse "professional-mode-guard" "BLOCKED — COMMAND CHAINING/REDIRECTION NOT ALLOWED DURING REVIEW
 
-Shell chaining operators (; && || | backtick \$()) are not permitted during code review.
+Shell chaining/redirection operators (; && || | backtick \$() > <) are not permitted during code review.
 
 Allowed commands: sqlite3, git diff/status/log/show/blame/ls-files, pytest, make test, cat, head, tail, wc, grep, rg, find, ls
 
@@ -273,6 +274,13 @@ Do NOT run commands with shell operators during the reviewing stage."
 You cannot modify database state during code review. Only SELECT and read-only operations are permitted.
 
 Do NOT attempt to modify the database directly. The MCP state manager is the only authorized path to update session state."
+        fi
+        if _find_has_write_action "$FILE_PATH"; then
+          block_pretooluse "professional-mode-guard" "BLOCKED — find write/exec action not allowed
+
+find -exec/-execdir/-delete/-fls/-fprint*/-ok* can modify the filesystem and are not permitted during code review.
+
+Use find for searching only."
         fi
         log_hook "professional-mode-guard" "Allowed" "safe bash during code review"
         exit 0
@@ -286,24 +294,19 @@ Only the following commands are allowed during code review:
 Do NOT run destructive or write commands during the reviewing stage."
       fi
     fi
-    # Exception: allow read-only commands during brainstorming/idle
-    if [ "$TOOL_NAME" = "Bash" ] && [[ "$WORKFLOW" == "brainstorming" || "$WORKFLOW" == "idle" ]]; then
-      if echo "$FILE_PATH" | grep -qE '[;&|`]|\$\('; then
-        block_pretooluse "professional-mode-guard" "BLOCKED — COMMAND CHAINING NOT ALLOWED
-
-Shell chaining operators (; && || | backtick \$()) are not permitted during brainstorming/idle.
-
-Allowed commands: cat, head, tail, wc, grep, rg, find, ls
-
-Do NOT run commands with shell operators during brainstorming or idle stages."
-      elif echo "$FILE_PATH" | grep -qE '^\s*(cat|head|tail|wc|grep|rg|find|ls)\b'; then
-        log_hook "professional-mode-guard" "Allowed" "safe bash during brainstorming/idle"
-        exit 0
-      fi
+    # Exception: allow read-only research bash in ALL non-executing stages.
+    # This build exposes no Grep/Glob tool, so Bash is the only filesystem-
+    # enumeration mechanism; read-only research must work in every stage. The
+    # predicate blocks chaining, redirection, newlines, and find write/exec
+    # actions, so this cannot become a write path. We are already inside the
+    # `WORKFLOW != executing` branch, so executing is unaffected.
+    if [ "$TOOL_NAME" = "Bash" ] && is_readonly_research_bash "$FILE_PATH"; then
+      log_hook "professional-mode-guard" "Allowed" "read-only research bash"
+      exit 0
     fi
     # Exception: allow make test* commands at any workflow stage — anchored, no chaining
     if [ "$TOOL_NAME" = "Bash" ]; then
-      if ! echo "$FILE_PATH" | grep -qE '[;&|`]|\$\(' && echo "$FILE_PATH" | grep -qE '^\s*make\s+test'; then
+      if ! _has_blocked_metachars "$FILE_PATH" && echo "$FILE_PATH" | grep -qE '^\s*make\s+test'; then
         log_hook "professional-mode-guard" "Allowed" "make test* command"
         exit 0
       fi

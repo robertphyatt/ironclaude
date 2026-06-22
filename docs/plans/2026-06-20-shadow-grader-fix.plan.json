@@ -1,0 +1,149 @@
+{
+  "name": "Shadow Grader Fix",
+  "goal": "Fix gemma4 shadow grader to produce correct tool-calling behavior and valid JSON output via system prompt guidance, JSON schema grammar enforcement, and arguments type safety",
+  "design_file": "docs/plans/2026-06-20-shadow-grader-fix-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Add constants and prepend system prompt",
+      "description": "Add GEMMA4_SYSTEM_PROMPT and GRADER_VERDICT_SCHEMA module-level constants. Prepend GEMMA4_SYSTEM_PROMPT to system message in grade_with_tools(). Add test verifying prepend behavior.",
+      "allowed_files": [
+        "commander/src/ironclaude/shadow_grader.py",
+        "commander/tests/test_shadow_grader.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Write test_system_prompt_prepends_gemma4_guidance in TestGradeWithTools",
+          "command": null,
+          "expected": null
+        },
+        {
+          "description": "Run new test to verify it fails (ImportError — GEMMA4_SYSTEM_PROMPT does not exist)",
+          "command": "cd commander && python -m pytest tests/test_shadow_grader.py::TestGradeWithTools::test_system_prompt_prepends_gemma4_guidance -v",
+          "expected": "FAIL"
+        },
+        {
+          "description": "Add GEMMA4_SYSTEM_PROMPT and GRADER_VERDICT_SCHEMA constants after MAX_TOOL_STEPS line",
+          "command": null,
+          "expected": null
+        },
+        {
+          "description": "Prepend GEMMA4_SYSTEM_PROMPT to system message in grade_with_tools() messages construction",
+          "command": null,
+          "expected": null
+        },
+        {
+          "description": "Run new test to verify it passes",
+          "command": "cd commander && python -m pytest tests/test_shadow_grader.py::TestGradeWithTools::test_system_prompt_prepends_gemma4_guidance -v",
+          "expected": "PASS"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/shadow_grader.py commander/tests/test_shadow_grader.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Add format enforcement on verdict calls",
+      "description": "Add GRADER_VERDICT_SCHEMA to max-steps forced payload. Add verdict-enforcement block after regex fallback failure — one format-constrained retry before returning infrastructure_error. Add test verifying retry produces valid result.",
+      "allowed_files": [
+        "commander/src/ironclaude/shadow_grader.py",
+        "commander/tests/test_shadow_grader.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Write test_non_json_triggers_format_constrained_retry in TestGradeWithTools",
+          "command": null,
+          "expected": null
+        },
+        {
+          "description": "Run new test to verify it fails (currently returns infrastructure_error instead of retrying)",
+          "command": "cd commander && python -m pytest tests/test_shadow_grader.py::TestGradeWithTools::test_non_json_triggers_format_constrained_retry -v",
+          "expected": "FAIL"
+        },
+        {
+          "description": "Add format: GRADER_VERDICT_SCHEMA to max-steps forced payload",
+          "command": null,
+          "expected": null
+        },
+        {
+          "description": "Add verdict-enforcement block after regex fallback failure in post-loop JSON parsing",
+          "command": null,
+          "expected": null
+        },
+        {
+          "description": "Run new test to verify it passes",
+          "command": "cd commander && python -m pytest tests/test_shadow_grader.py::TestGradeWithTools::test_non_json_triggers_format_constrained_retry -v",
+          "expected": "PASS"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/shadow_grader.py commander/tests/test_shadow_grader.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Add arguments type safety in tool-call loop",
+      "description": "Add isinstance check for string arguments in tool-call processing. Parse JSON string to dict before passing to _execute_tool. Add test verifying string arguments are handled correctly.",
+      "allowed_files": [
+        "commander/src/ironclaude/shadow_grader.py",
+        "commander/tests/test_shadow_grader.py"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "Write test_string_arguments_parsed_to_dict in TestGradeWithTools",
+          "command": null,
+          "expected": null
+        },
+        {
+          "description": "Run new test to verify it fails (_execute_tool receives string instead of dict)",
+          "command": "cd commander && python -m pytest tests/test_shadow_grader.py::TestGradeWithTools::test_string_arguments_parsed_to_dict -v",
+          "expected": "FAIL"
+        },
+        {
+          "description": "Replace tool-call for-loop with isinstance(args, str) check and json.loads parsing",
+          "command": null,
+          "expected": null
+        },
+        {
+          "description": "Run new test to verify it passes",
+          "command": "cd commander && python -m pytest tests/test_shadow_grader.py::TestGradeWithTools::test_string_arguments_parsed_to_dict -v",
+          "expected": "PASS"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/shadow_grader.py commander/tests/test_shadow_grader.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Run full test suite",
+      "description": "Verify all 16 tests pass (13 original + 3 new). Pay special attention to test_non_json_verdict_returns_error which is most sensitive to the format enforcement changes.",
+      "allowed_files": [
+        "commander/tests/test_shadow_grader.py"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {
+          "description": "Run full test suite",
+          "command": "cd commander && python -m pytest tests/test_shadow_grader.py -v",
+          "expected": "16 passed"
+        },
+        {
+          "description": "Verify test_non_json_verdict_returns_error explicitly (most sensitive to format enforcement changes)",
+          "command": "cd commander && python -m pytest tests/test_shadow_grader.py::TestGradeWithTools::test_non_json_verdict_returns_error -v",
+          "expected": "PASS"
+        }
+      ]
+    }
+  ]
+}

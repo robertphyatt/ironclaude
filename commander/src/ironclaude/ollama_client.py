@@ -50,6 +50,63 @@ class OllamaClient:
         """
         return self._post("/api/generate", payload)
 
+    def post_chat(self, payload: dict) -> tuple:
+        """POST /api/chat. Returns (response_content_str, tool_calls_list).
+
+        tool_calls_list is a list of {"name": str, "arguments": dict} dicts.
+        Returns raw content without think-tag stripping (caller's responsibility).
+        Raises OllamaConnectionError or OllamaTimeoutError on failure.
+        """
+        timeout = (self._connect_timeout, self._timeout)
+        try:
+            resp = requests.post(
+                f"{self._url}/api/chat",
+                json=payload,
+                timeout=timeout,
+                stream=False,
+            )
+            resp.raise_for_status()
+            return self._read_chat_response(resp)
+        except (requests.ConnectionError, requests.HTTPError) as e:
+            if self._fallback_url:
+                return self._chat_via_fallback(payload, str(e))
+            raise OllamaConnectionError(f"Ollama unreachable at {self._url}: {e}") from e
+        except requests.Timeout:
+            raise OllamaTimeoutError(f"Ollama timed out after {self._timeout}s")
+        except requests.RequestException as e:
+            raise OllamaConnectionError(f"Ollama request failed: {e}") from e
+
+    def _chat_via_fallback(self, payload: dict, primary_error: str) -> tuple:
+        try:
+            resp = requests.post(
+                f"{self._fallback_url}/api/chat",
+                json=payload,
+                timeout=self._timeout,
+                stream=False,
+            )
+            resp.raise_for_status()
+            return self._read_chat_response(resp)
+        except requests.RequestException as e2:
+            raise OllamaConnectionError(
+                f"Ollama failed at {self._url} (and fallback {self._fallback_url}): {e2}"
+            ) from e2
+
+    @staticmethod
+    def _read_chat_response(resp) -> tuple:
+        """Parse /api/chat response into (content_str, tool_calls_list)."""
+        data = resp.json()
+        msg = data.get("message", {})
+        content = msg.get("content", "")
+        tool_calls_raw = msg.get("tool_calls") or []
+        tool_calls = []
+        for tc in tool_calls_raw:
+            fn = tc.get("function", {})
+            tool_calls.append({
+                "name": fn.get("name", ""),
+                "arguments": fn.get("arguments", {}),
+            })
+        return content, tool_calls
+
     def create_model(self, model: str, from_model: str, parameters: dict) -> None:
         """POST /api/create to derive a model variant (e.g. a num_ctx override).
 

@@ -211,3 +211,45 @@ class TestFormatHelpText:
         assert "/ironclaude stop" in text
         assert "/ironclaude approve" in text
         assert "/ironclaude help" in text
+
+
+class TestDNSStartupRetry:
+    """Verify App() initialization retries on transient DNS failures."""
+
+    @patch("ironclaude.slack_commands.time.sleep")
+    @patch("slack_bolt.adapter.socket_mode.SocketModeHandler")
+    @patch("slack_bolt.App")
+    def test_start_retries_on_dns_failure_then_succeeds(self, MockApp, MockSMH, mock_sleep):
+        """App() raises socket.gaierror twice then succeeds — start() completes."""
+        import socket as _socket
+        mock_app = MagicMock()
+        MockApp.side_effect = [
+            _socket.gaierror(8, "nodename nor servname provided"),
+            _socket.gaierror(8, "nodename nor servname provided"),
+            mock_app,
+        ]
+
+        def stop_loop():
+            handler._running = False
+        MockSMH.return_value.start.side_effect = stop_loop
+
+        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test")
+        handler.start()
+        handler.stop()
+
+        assert MockApp.call_count == 3
+        assert mock_sleep.call_count == 2
+
+    @patch("ironclaude.slack_commands.time.sleep")
+    @patch("slack_bolt.App")
+    def test_start_crashes_after_max_retries(self, MockApp, mock_sleep):
+        """App() always raises socket.gaierror — start() re-raises after 5 attempts."""
+        import socket as _socket
+        MockApp.side_effect = _socket.gaierror(8, "nodename nor servname provided")
+
+        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test")
+        with pytest.raises(_socket.gaierror):
+            handler.start()
+
+        assert MockApp.call_count == 5
+        assert mock_sleep.call_count == 4  # 4 sleeps between 5 attempts

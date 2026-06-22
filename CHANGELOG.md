@@ -1,5 +1,38 @@
 # Changelog
 
+> **Versioning.** IronClaude uses a single monotonically-increasing `1.0.N`
+> patch series — by deliberate convention both features and fixes increment the
+> patch number (this is not strict semver). The version is declared in
+> `commander/pyproject.toml`, `worker/.claude-plugin/plugin.json`, and
+> `.claude-plugin/marketplace.json`, kept in lockstep by
+> `commander/tests/test_version_consistency.py`. Each release commit is tagged
+> `vX.Y.Z`. Land changes under `## [Unreleased]` as you go, then rename that
+> heading to the new version at release time so the entry matches what shipped.
+
+## [Unreleased]
+
+_Nothing yet._
+
+## 1.0.13
+
+### Added
+- gemma4 **shadow grader** — a local Ollama grader that runs alongside the primary grader and reports tool-calling concordance between the two, surfaced through a Slack command. Verdicts enforce a JSON grammar/schema (replacing the previous regex fallback chain) with argument type-safety and non-JSON robustness (code-fence stripping, stray `tools`-key removal, symmetric verdict instructions). New `shadow_grader.py` + Ollama tool-calling support in `ollama_client.py`; covered by `test_shadow_grader.py`, `test_ollama_client.py`, `test_slack_commands.py`, and orchestrator tests
+- `worker/hooks/bash-readonly-guard.sh` — a sourceable predicate lib (`is_readonly_research_bash`, `_has_blocked_metachars`, `_find_has_write_action`) shared by `professional-mode-guard.sh`, with a DB-free 36-assertion unit test (`worker/hooks/tests/test-bash-readonly-guard.sh`)
+- Manual-session wiki tooling — the brain-wiki operations were extracted from `OrchestratorTools` into a standalone `WikiTools` class (single source of truth for `write`/`delete`/`query`/`log`: page-name validation, derived `index.md` rebuild, changelog append, brain-repo commit), and surfaced through a new `ic-wiki` console script so they are usable from any shell, not just the daemon. No new MCP server — the daemon now delegates to `WikiTools` (−~270 lines, behaviour unchanged). `ic-wiki` resolves the brain directory the same way the daemon does (`IC_BRAIN_CWD`, then `~/.ironclaude/brain`). Covered by `test_wiki_tools.py` (7) and `test_wiki_cli.py` (1) against a git-initialised temporary brain
+- `commander/tests/test_version_consistency.py` — asserts the version string is identical across `pyproject.toml`, `plugin.json`, and `marketplace.json`, so a missed source can't silently drift on a release
+- macOS Prerequisites section in the README — Apple ships Bash 3.2 but the hooks need 4+ (symlink a Homebrew Bash into the default PATH), and `better-sqlite3` builds against `node@24`; documents the symptoms when either is wrong
+
+### Fixed
+- Read-only research Bash (`cat head tail wc grep rg find ls`) is now allowed in **all** non-executing workflow stages, not just brainstorming/idle. Previously `debugging` (and other stages) fell through to the catch-all write-block, and because this Claude Code build exposes no `Grep`/`Glob` tool, Bash is the only filesystem-enumeration mechanism — so an agent told to inspect logs while debugging had no way to do so. The allowlist is enforced by one hardened predicate that blocks command chaining, output redirection (`> <`), embedded newlines, and the complete GNU/BSD `find` write/exec action set (`-exec -execdir -delete -fls -fprint* -ok*`). All edits live inside the `WORKFLOW != executing` branch, so execution mode (plan-aligned Bash, per-task `allowed_files`, the `review_pending` gate) is unchanged. The same hardened check also closes pre-existing redirection bypasses on the `git add`, read-only-`git` (`git diff > out`), `make test`, and reviewing-stage allowlists
+- Read-only-git exception in `professional-mode-guard.sh` now rejects shell chaining operators (`; & | \` $()`), closing a bypass where a write command could ride past the guard by appending a permitted `git diff`/`status`/`log`/etc. — mirrors the anti-chaining guard already on the `git add` exception
+- `make deploy-hooks` no longer pins a plugin-cache version in the `Makefile`; it derives the latest installed version dir at runtime. A pinned version desynced from the installed cache on every release and silently skipped the plugin-cache hook copy
+- Local grader strips leaked chat-template tokens (e.g. `<|tool_response>`) before `json.loads`, eliminating recurring `Non-JSON response` warnings from the Ollama-backed grader
+- Slack App initialization retries on transient DNS failures during daemon startup, so a flaky resolver no longer aborts the boot sequence
+- Restored a green commander test suite via two rounds of test-only fixes — no production-code changes: (1) 35 failures in the orchestrator cluster (`IC_BRAIN_CWD` environment leakage → autouse isolation fixture, stale Ollama exception mocks, the `kill_worker` dict-return / inline-grader cluster); (2) 8 further stale tests in the grader/enforcement/db modules that asserted superseded contracts (config moved into `LocalGrader`, the directive-ref pre-filter's `no_directive_ref` sentinel + silent-drop, and schema growth to 8 tables)
+
+### Changed
+- Version set to 1.0.13 across `pyproject.toml`, `marketplace.json`, and `plugin.json`. The `Makefile` is no longer a version source — it derives the installed plugin-cache version at runtime
+
 ## 1.0.12
 
 ### Added

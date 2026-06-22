@@ -108,11 +108,13 @@ class TestValidateBrainMessage:
         assert valid is True
 
     def test_missing_directive_ref(self, daemon):
+        # No directive ref: the pre-filter rejects before the grader is consulted.
         msg = "Everything is going well, tests pass."
-        daemon._grader.grade = MagicMock(return_value={"valid": False, "reason": "Missing directive reference"})
+        daemon._grader.grade = MagicMock()
         valid, reason = daemon._validate_brain_message(msg)
         assert valid is False
-        assert "directive reference" in reason.lower()
+        assert reason == "no_directive_ref"
+        daemon._grader.grade.assert_not_called()
 
     def test_missing_reason_keyword(self, daemon):
         msg = "About #42 — nothing else to say."
@@ -363,10 +365,12 @@ class TestPollBrainResponsesEnforcement:
         daemon.slack.post_message.assert_called_once_with(f"*Brain:* {msg}")
 
     def test_invalid_message_blocked(self, daemon):
-        """Brain returns invalid message (no directive ref) -> blocked, correction sent."""
-        msg = "Everything is going well, tests pass."
+        """Brain returns a ref-bearing but grader-rejected message -> blocked, correction sent."""
+        # Has a directive ref (passes the pre-filter) but the grader rejects it,
+        # so it hits the [CONTEXT REQUIRED] bounce path rather than the silent drop.
+        msg = "#42 Everything is going well, tests pass."
         daemon.brain.get_pending_responses.return_value = [msg]
-        daemon._grader.grade = MagicMock(return_value={"valid": False, "reason": "No directive reference"})
+        daemon._grader.grade = MagicMock(return_value={"valid": False, "reason": "Missing reason clause"})
         daemon.poll_brain_responses()
         daemon.slack.post_message.assert_not_called()
         daemon.brain.send_message.assert_called_once()
@@ -375,9 +379,12 @@ class TestPollBrainResponsesEnforcement:
 
     def test_validation_before_chunking(self, daemon):
         """Invalid message >39000 chars blocked BEFORE chunking (no slack posts)."""
-        msg = "No context here. " * 3000  # ~48000 chars, no directive ref or reason
+        # Ref-bearing (passes pre-filter) but grader-rejected, so it reaches the
+        # bounce path; validation must happen before the >39000-char chunking.
+        msg = "#42 " + ("No context here. " * 3000)  # ~48000 chars
         assert len(msg) > 39000
         daemon.brain.get_pending_responses.return_value = [msg]
+        daemon._grader.grade = MagicMock(return_value={"valid": False, "reason": "Missing reason clause"})
         daemon.poll_brain_responses()
         daemon.slack.post_message.assert_not_called()
         daemon.brain.send_message.assert_called_once()

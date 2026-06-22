@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import queue
 import re
+import socket
 import threading
 import time
 
@@ -76,7 +77,22 @@ class SlackSocketHandler:
         from slack_bolt import App
         from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-        app = App(token=self._bot_token)
+        _max_attempts = 5
+        _backoff = 1
+        for _attempt in range(1, _max_attempts + 1):
+            try:
+                app = App(token=self._bot_token)
+                break
+            except (socket.gaierror, OSError, ConnectionError) as e:
+                if _attempt >= _max_attempts:
+                    logger.error("Slack App init failed after %d attempts: %s", _max_attempts, e)
+                    raise
+                logger.warning(
+                    "Slack App init failed (attempt %d/%d), retrying in %ds: %s",
+                    _attempt, _max_attempts, _backoff, e,
+                )
+                time.sleep(_backoff)
+                _backoff = min(_backoff * 2, 30)
 
         @app.command(re.compile(r".*"))
         def handle_command(ack, command, respond):

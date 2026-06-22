@@ -36,12 +36,23 @@ class TestInitDb:
     def test_idempotent(self, tmp_path):
         db_path = str(tmp_path / "test.db")
         conn1 = init_db(db_path)
+        tables1 = {
+            r[0] for r in conn1.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
         conn1.close()
         conn2 = init_db(db_path)
-        cursor = conn2.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-        )
-        assert len(cursor.fetchall()) == 7
+        tables2 = {
+            r[0] for r in conn2.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        # Re-initializing must be idempotent: the same table set, no duplicates,
+        # no losses. Asserting the set equality (rather than a hardcoded count)
+        # keeps this robust as the schema grows.
+        assert tables2 == tables1
+        assert tables1, "init_db must create at least one table"
         conn2.close()
 
     def test_brain_state_singleton(self, tmp_path):

@@ -170,7 +170,7 @@ Enforcement is implemented in 16 hooks across 6 lifecycle events (SessionStart, 
 
 | Hook | Trigger | Purpose |
 |------|---------|---------|
-| `professional-mode-guard.sh` | PreToolUse | Blocks write tools outside `executing` stage; validates file access against wave whitelist |
+| `professional-mode-guard.sh` | PreToolUse | Blocks write tools outside `executing` stage; allows a hardened read-only Bash allowlist (`cat`/`grep`/`find`/`ls`/… — no chaining, redirection, or `find` write actions) in every stage so research never requires write access; validates file access against the wave whitelist |
 | `skill-state-bridge.sh` | PreToolUse | Detects Skill invocations; requests state machine transitions |
 | `state-activator.sh` | UserPromptSubmit | Handles professional mode on/off; PPID-based session binding |
 | `session-init.sh` | SessionStart | Initializes session, creates DB schema, configures statusline |
@@ -534,6 +534,34 @@ IronClaude's MIT license applies only to IronClaude's own code, not to Anthropic
 ### Episodic Memory Attribution
 
 The episodic-memory MCP server is derived from [obra/episodic-memory](https://github.com/obra/episodic-memory) by Jesse Vincent (MIT License). See `worker/mcp-servers/episodic-memory/LICENSE` for attribution.
+
+---
+
+## macOS Prerequisites
+
+macOS has two install quirks worth knowing about when setting up IronClaude via Homebrew: Apple ships an old Bash, and `brew install node` resolves to a node version newer than the one IronClaude's bundled `better-sqlite3` currently builds against.
+
+**Recommended install (Apple Silicon):**
+
+```bash
+# 1. Modern Bash, discoverable through default macOS PATH.
+HOMEBREW_NO_INSTALL_CLEANUP=1 brew install bash
+sudo ln -s /opt/homebrew/bin/bash /usr/local/bin/bash
+
+# 2. Node 24 LTS (pin explicitly; generic `node` resolves to a newer major
+#    that the bundled native modules don't yet support).
+HOMEBREW_NO_INSTALL_CLEANUP=1 brew install node@24
+brew link --overwrite node@24
+```
+
+**Why the Bash symlink:** Apple ships Bash 3.2 at `/bin/bash` (the last GPLv2 release), and IronClaude hooks like `professional-mode-guard.sh` use Bash 4+ features. `hooks.json` invokes hooks as `bash <script>` — so the system needs to resolve the bare command `bash` to a modern build (editing hook shebangs does NOT help). The default macOS PATH (`/etc/paths` = `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`) puts `/usr/local/bin` ahead of `/bin`, so the symlink makes Bash 4+ discoverable regardless of how Claude Code is launched (Spotlight, dock, terminal). On Intel Macs, Homebrew links Bash into `/usr/local/bin/bash` directly — the explicit symlink step is unnecessary.
+
+**Why `HOMEBREW_NO_INSTALL_CLEANUP=1`:** without it, `brew install` can autoremove formulae that Homebrew considers orphaned dependencies of untrusted taps. `node` is a common casualty if a previously-trusted tap got revoked. The flag suppresses cleanup for that single command.
+
+**Symptoms if you skip these steps on macOS:**
+- Bash 3.2 still active: every SessionStart prints `bash 3.2.57(1)-release detected — hooks require bash 4+` and some hook functionality is unreliable.
+- `brew install node` chosen instead of `node@24`: `claude mcp list` shows `plugin:ironclaude:state-manager: ✘ Failed to connect`, and `~/.claude/ironclaude-mcp-state-manager.log` contains a `NODE_MODULE_VERSION` mismatch from `better-sqlite3`.
+- node uninstalled entirely (no `node` on PATH): IronClaude's MCP servers cannot launch on macOS.
 
 ---
 

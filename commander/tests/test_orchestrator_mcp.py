@@ -4498,14 +4498,14 @@ class TestWikiWriteValidation:
         assert "worker-lifecycle.md" in result
         assert (tmp_path / "brain" / "wiki" / "worker-lifecycle.md").exists()
 
-    @patch("ironclaude.orchestrator_mcp.logger")
+    @patch("ironclaude.wiki_tools.logger")
     def test_warns_commit_hash_in_title(self, mock_logger, wiki_tools, tmp_path):
         result = wiki_tools.wiki_write("fix-summary", "Fix abc1234def5678", self.VALID_CONTENT)
         assert "fix-summary.md" in result
         warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
         assert any("directive log" in c for c in warning_calls)
 
-    @patch("ironclaude.orchestrator_mcp.logger")
+    @patch("ironclaude.wiki_tools.logger")
     def test_warns_status_complete_in_content(self, mock_logger, wiki_tools, tmp_path):
         content = self.VALID_CONTENT + "\nStatus: Complete (2026-06-01, commit abc1234)"
         result = wiki_tools.wiki_write("fix-summary", "Fix Summary", content)
@@ -4513,7 +4513,7 @@ class TestWikiWriteValidation:
         warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
         assert any("directive log" in c for c in warning_calls)
 
-    @patch("ironclaude.orchestrator_mcp.logger")
+    @patch("ironclaude.wiki_tools.logger")
     def test_warns_duplicate_keyword_overlap(self, mock_logger, wiki_tools, tmp_path):
         wiki_tools.wiki_write("worker-lifecycle", "Worker Lifecycle", self.VALID_CONTENT)
         mock_logger.reset_mock()
@@ -4526,7 +4526,7 @@ class TestWikiWriteValidation:
         warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
         assert any("overlap" in c for c in warning_calls)
 
-    @patch("ironclaude.orchestrator_mcp.logger")
+    @patch("ironclaude.wiki_tools.logger")
     def test_no_warn_below_overlap_threshold(self, mock_logger, wiki_tools, tmp_path):
         wiki_tools.wiki_write("worker-lifecycle", "Worker Lifecycle", self.VALID_CONTENT)
         mock_logger.reset_mock()
@@ -4538,7 +4538,7 @@ class TestWikiWriteValidation:
         warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
         assert not any("overlap" in c for c in warning_calls)
 
-    @patch("ironclaude.orchestrator_mcp.logger")
+    @patch("ironclaude.wiki_tools.logger")
     def test_duplicate_check_skips_self_on_update(self, mock_logger, wiki_tools, tmp_path):
         wiki_tools.wiki_write("worker-lifecycle", "Worker Lifecycle", self.VALID_CONTENT)
         mock_logger.reset_mock()
@@ -5359,3 +5359,142 @@ def test_spawn_worker_ollama_cmd_no_max_output_when_unset(tools, mock_tmux):
     cmd = mock_tmux.spawn_session.call_args[0][1]
     assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in cmd
     assert "--append-system-prompt" in cmd
+
+
+class TestParseToolCallsFromDelta:
+    def test_empty_string_returns_empty(self, db_conn, registry, mock_tmux):
+        tools = OrchestratorTools(registry, mock_tmux)
+        assert tools._parse_tool_calls_from_delta("") == []
+
+    def test_single_bullet_tool_call(self, db_conn, registry, mock_tmux):
+        tools = OrchestratorTools(registry, mock_tmux)
+        delta = '● Read(file_path="/repo/CLAUDE.md")\n  Reading file...\n'
+        result = tools._parse_tool_calls_from_delta(delta)
+        assert len(result) == 1
+        assert result[0]["tool"] == "Read"
+        assert "/repo/CLAUDE.md" in result[0]["args"]
+
+    def test_multiple_tool_calls(self, db_conn, registry, mock_tmux):
+        tools = OrchestratorTools(registry, mock_tmux)
+        delta = '● Read(file_path="/a.py")\n● Bash(command="git log")\n'
+        result = tools._parse_tool_calls_from_delta(delta)
+        assert len(result) == 2
+        assert result[0]["tool"] == "Read"
+        assert result[1]["tool"] == "Bash"
+
+    def test_no_tool_calls_returns_empty(self, db_conn, registry, mock_tmux):
+        tools = OrchestratorTools(registry, mock_tmux)
+        delta = 'Just some regular output\n{"grade": "A", "approved": true}'
+        result = tools._parse_tool_calls_from_delta(delta)
+        assert result == []
+
+
+class TestComputeConcordance:
+    def test_exact_match_grade_and_pass_fail(self, db_conn, registry, mock_tmux):
+        tools = OrchestratorTools(registry, mock_tmux)
+        opus = {"grade": "B", "approved": True}
+        shadow = {"grade": "B", "approved": True, "tool_calls": []}
+        assert tools._compute_concordance(opus, shadow) == "A"
+
+    def test_same_pass_fail_different_grade(self, db_conn, registry, mock_tmux):
+        tools = OrchestratorTools(registry, mock_tmux)
+        opus = {"grade": "B", "approved": True}
+        shadow = {"grade": "A", "approved": True, "tool_calls": []}
+        assert tools._compute_concordance(opus, shadow) == "B"
+
+    def test_different_pass_fail(self, db_conn, registry, mock_tmux):
+        tools = OrchestratorTools(registry, mock_tmux)
+        opus = {"grade": "B", "approved": True}
+        shadow = {"grade": "C", "approved": False, "tool_calls": []}
+        assert tools._compute_concordance(opus, shadow) == "C"
+
+    def test_infrastructure_error_returns_f(self, db_conn, registry, mock_tmux):
+        tools = OrchestratorTools(registry, mock_tmux)
+        opus = {"grade": "A", "approved": True}
+        shadow = {"infrastructure_error": True, "error_detail": "timeout", "tool_calls": []}
+        assert tools._compute_concordance(opus, shadow) == "F"
+
+
+class TestFormatShadowSlackMessage:
+    def test_contains_tool_calls_before_verdicts(self, db_conn, registry, mock_tmux):
+        tools = OrchestratorTools(registry, mock_tmux)
+        opus_result = {"grade": "B", "approved": True, "feedback": "looks good"}
+        opus_tool_calls = [{"tool": "Read", "args": 'file_path="/a.py"'}]
+        shadow_result = {"grade": "A", "approved": True, "feedback": "excellent", "tool_calls": []}
+        msg = tools._format_shadow_slack_message(
+            "spawn_worker", "worker-1", opus_result, opus_tool_calls, shadow_result, "B"
+        )
+        tool_idx = msg.index("Tool Calls")
+        verdict_idx = msg.index("Verdicts")
+        assert tool_idx < verdict_idx
+
+    def test_concordance_a_label(self, db_conn, registry, mock_tmux):
+        tools = OrchestratorTools(registry, mock_tmux)
+        opus_result = {"grade": "A", "approved": True, "feedback": "great"}
+        shadow_result = {"grade": "A", "approved": True, "feedback": "great", "tool_calls": []}
+        msg = tools._format_shadow_slack_message(
+            "kill_worker", "w", opus_result, [], shadow_result, "A"
+        )
+        assert "exact match" in msg.lower()
+
+    def test_concordance_c_shows_diverge(self, db_conn, registry, mock_tmux):
+        tools = OrchestratorTools(registry, mock_tmux)
+        opus_result = {"grade": "B", "approved": True, "feedback": "ok"}
+        shadow_result = {"grade": "C", "approved": False, "feedback": "nope", "tool_calls": []}
+        msg = tools._format_shadow_slack_message(
+            "approve_plan", "w2", opus_result, [], shadow_result, "C"
+        )
+        assert "DIVERGE" in msg
+
+    def test_infrastructure_error_shown(self, db_conn, registry, mock_tmux):
+        tools = OrchestratorTools(registry, mock_tmux)
+        opus_result = {"grade": "A", "approved": True, "feedback": "fine"}
+        shadow_result = {"infrastructure_error": True, "error_detail": "Ollama timed out", "tool_calls": []}
+        msg = tools._format_shadow_slack_message(
+            "spawn_worker", "w3", opus_result, [], shadow_result, "F"
+        )
+        assert "Ollama timed out" in msg
+
+
+class TestShadowThreadFiring:
+    def test_spawn_worker_fires_shadow_thread_on_opus_path(self, tools, registry, mock_tmux):
+        """spawn_worker fires _fire_shadow_thread after Opus grader approves."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._call_grader = MagicMock(return_value={"grade": "A", "approved": True, "feedback": "ok"})
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok", "confidence": "low"
+        })
+        tools._fire_shadow_thread = MagicMock()
+        tools.spawn_worker(
+            worker_id="shadow-w1",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="Do the thing",
+        )
+        tools._fire_shadow_thread.assert_called()
+        call_args = tools._fire_shadow_thread.call_args[0]
+        assert call_args[0] == "spawn_worker"
+        assert call_args[1] == "shadow-w1"
+
+    def test_kill_worker_fires_shadow_thread_when_grader_approves(self, tools, registry, mock_tmux):
+        """kill_worker fires _fire_shadow_thread after Opus grader approves."""
+        registry.register_worker("kw1", "claude-sonnet", "ic-kw1", repo="/tmp/repo", description="test")
+        tools._call_grader = MagicMock(return_value={"grade": "A", "approved": True, "feedback": "done"})
+        tools._fire_shadow_thread = MagicMock()
+        tools.kill_worker("kw1", original_objective="Do X", evidence="Did X")
+        tools._fire_shadow_thread.assert_called_once()
+        call_args = tools._fire_shadow_thread.call_args[0]
+        assert call_args[0] == "kill_worker"
+        assert call_args[1] == "kw1"
+
+    def test_approve_plan_fires_shadow_thread_when_grader_approves(self, tools, registry, mock_tmux):
+        """approve_plan fires _fire_shadow_thread after Opus grader approves."""
+        registry.register_worker("ap1", "claude-sonnet", "ic-ap1", repo="/tmp/repo", description="test")
+        mock_tmux.has_session.return_value = True
+        tools._call_grader = MagicMock(return_value={"grade": "A", "approved": True, "feedback": "deep"})
+        tools._fire_shadow_thread = MagicMock()
+        tools.approve_plan("ap1", rationale="Thorough engagement")
+        tools._fire_shadow_thread.assert_called_once()
+        call_args = tools._fire_shadow_thread.call_args[0]
+        assert call_args[0] == "approve_plan"
+        assert call_args[1] == "ap1"

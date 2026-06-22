@@ -129,3 +129,56 @@ class TestCreateModel:
         mock_post.side_effect = requests.ConnectionError("refused")
         with pytest.raises(OllamaConnectionError):
             client_no_fallback.create_model("v", "base", {"num_ctx": 1})
+
+
+def _make_chat_response(content="", tool_calls=None):
+    """Build a mock Ollama /api/chat response."""
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    msg = {"role": "assistant", "content": content}
+    if tool_calls is not None:
+        msg["tool_calls"] = tool_calls
+    resp.json.return_value = {"message": msg, "done": True}
+    return resp
+
+
+class TestPostChat:
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_success_no_tool_calls(self, mock_post, client):
+        mock_post.return_value = _make_chat_response(content='{"grade": "A"}')
+        content, tcs = client.post_chat({"model": "gemma4", "messages": [], "stream": False})
+        assert content == '{"grade": "A"}'
+        assert tcs == []
+
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_success_with_tool_calls(self, mock_post, client):
+        raw_tcs = [{"function": {"name": "read_file", "arguments": {"path": "/foo"}}}]
+        mock_post.return_value = _make_chat_response(tool_calls=raw_tcs)
+        content, tcs = client.post_chat({"model": "gemma4", "messages": [], "stream": False})
+        assert tcs == [{"name": "read_file", "arguments": {"path": "/foo"}}]
+
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_posts_to_api_chat(self, mock_post, client_no_fallback):
+        mock_post.return_value = _make_chat_response()
+        client_no_fallback.post_chat({"model": "gemma4", "messages": [{"role": "user", "content": "hi"}], "stream": False})
+        args, kwargs = mock_post.call_args
+        assert args[0] == "http://primary:11434/api/chat"
+
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_primary_fails_uses_fallback(self, mock_post, client):
+        mock_post.side_effect = [requests.ConnectionError("refused"), _make_chat_response(content="ok")]
+        content, _ = client.post_chat({"model": "gemma4", "messages": [], "stream": False})
+        assert content == "ok"
+        assert mock_post.call_count == 2
+
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_both_fail_raises(self, mock_post, client):
+        mock_post.side_effect = requests.ConnectionError("refused")
+        with pytest.raises(OllamaConnectionError):
+            client.post_chat({"model": "gemma4", "messages": [], "stream": False})
+
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_timeout_raises(self, mock_post, client_no_fallback):
+        mock_post.side_effect = requests.Timeout()
+        with pytest.raises(OllamaTimeoutError):
+            client_no_fallback.post_chat({"model": "gemma4", "messages": [], "stream": False})

@@ -1,0 +1,205 @@
+{
+  "name": "Shadow Grader",
+  "goal": "Add gemma4 shadow grading with tool-calling to all Opus grading events and post concordance reports to Slack",
+  "design_file": "docs/plans/2026-06-20-shadow-grader-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "OllamaClient.post_chat",
+      "description": "Add post_chat method to OllamaClient for Ollama /api/chat endpoint with tool-calls support and primary/fallback URL behavior",
+      "allowed_files": [
+        "commander/src/ironclaude/ollama_client.py",
+        "commander/tests/test_ollama_client.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Write TestPostChat test class in test_ollama_client.py with _make_chat_response helper and 6 test cases",
+          "command": null,
+          "expected": "Tests added after existing TestCreateModel class"
+        },
+        {
+          "description": "Run new tests to confirm they fail with AttributeError",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_ollama_client.py::TestPostChat -v 2>&1 | tail -20",
+          "expected": "ERRORS — AttributeError: OllamaClient has no attribute post_chat"
+        },
+        {
+          "description": "Add post_chat, _chat_via_fallback, and _read_chat_response methods to OllamaClient in ollama_client.py",
+          "command": null,
+          "expected": "Methods added after post_generate method"
+        },
+        {
+          "description": "Run all ollama_client tests to confirm new and existing tests pass",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_ollama_client.py -v 2>&1 | tail -20",
+          "expected": "All TestPostChat tests PASS, all existing tests PASS"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/ollama_client.py commander/tests/test_ollama_client.py",
+          "expected": "Files staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "ShadowGrader class",
+      "description": "Create shadow_grader.py with ShadowGrader class: Ollama chat tool-calling loop, 3 read-only tools (read_file/grep_files/git_diff), path validation, think-tag stripping",
+      "allowed_files": [
+        "commander/src/ironclaude/shadow_grader.py",
+        "commander/tests/test_shadow_grader.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Create test_shadow_grader.py with TestGradeWithTools (7 cases) and TestExecuteTool (6 cases)",
+          "command": null,
+          "expected": "New test file created"
+        },
+        {
+          "description": "Run tests to confirm they fail with ModuleNotFoundError",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_shadow_grader.py -v 2>&1 | tail -10",
+          "expected": "ModuleNotFoundError: No module named 'ironclaude.shadow_grader'"
+        },
+        {
+          "description": "Create shadow_grader.py with SHADOW_TOOLS, MAX_TOOL_STEPS=5, and ShadowGrader class",
+          "command": null,
+          "expected": "New file created with full implementation"
+        },
+        {
+          "description": "Run shadow grader tests to confirm they all pass",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_shadow_grader.py -v 2>&1 | tail -30",
+          "expected": "All 13 tests PASS"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/shadow_grader.py commander/tests/test_shadow_grader.py",
+          "expected": "Files staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "OrchestratorTools shadow helpers and delta capture",
+      "description": "Add ShadowGrader import, _last_grader_delta instance var, delta storage in _do_grader_send_and_poll, and helper methods: _parse_tool_calls_from_delta, _compute_concordance, _format_shadow_slack_message, _run_shadow_and_report, _fire_shadow_thread",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "Add TestParseToolCallsFromDelta, TestComputeConcordance, TestFormatShadowSlackMessage test classes to test_orchestrator_mcp.py",
+          "command": null,
+          "expected": "3 new test classes added"
+        },
+        {
+          "description": "Run new tests to confirm they fail with AttributeError",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestParseToolCallsFromDelta tests/test_orchestrator_mcp.py::TestComputeConcordance tests/test_orchestrator_mcp.py::TestFormatShadowSlackMessage -v 2>&1 | tail -20",
+          "expected": "AttributeError — helper methods don't exist yet"
+        },
+        {
+          "description": "Add 'from ironclaude.shadow_grader import ShadowGrader' import to orchestrator_mcp.py",
+          "command": null,
+          "expected": "Import added after existing grader import"
+        },
+        {
+          "description": "Add self._shadow_grader and self._last_grader_delta instance variables in OrchestratorTools.__init__",
+          "command": null,
+          "expected": "Two lines added after self._local_grader instantiation"
+        },
+        {
+          "description": "Add self._last_grader_delta = delta at each successful return point in _do_grader_send_and_poll; add self._last_grader_delta = '' on timeout path",
+          "command": null,
+          "expected": "4 lines added in _do_grader_send_and_poll"
+        },
+        {
+          "description": "Add helper methods after _call_local_grader: _parse_tool_calls_from_delta, _compute_concordance, _format_shadow_slack_message, _run_shadow_and_report, _fire_shadow_thread",
+          "command": null,
+          "expected": "5 new methods added to OrchestratorTools"
+        },
+        {
+          "description": "Run new helper tests to confirm they pass",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestParseToolCallsFromDelta tests/test_orchestrator_mcp.py::TestComputeConcordance tests/test_orchestrator_mcp.py::TestFormatShadowSlackMessage -v 2>&1 | tail -20",
+          "expected": "All new tests PASS"
+        },
+        {
+          "description": "Run full orchestrator test suite to confirm no regressions",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py -v 2>&1 | tail -20",
+          "expected": "All pre-existing tests PASS"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "Files staged"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Wire shadow into spawn_worker / kill_worker / approve_plan",
+      "description": "Update Opus grader prompts to allow tool use, add TestShadowThreadFiring tests, fire _fire_shadow_thread after each _call_grader call in spawn_worker, kill_worker, approve_plan",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {
+          "description": "Add TestShadowThreadFiring test class (3 tests) to test_orchestrator_mcp.py",
+          "command": null,
+          "expected": "Test class added"
+        },
+        {
+          "description": "Run wiring tests to confirm they fail",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestShadowThreadFiring -v 2>&1 | tail -20",
+          "expected": "Tests FAIL — _fire_shadow_thread not called"
+        },
+        {
+          "description": "Update spawn_worker Opus grader prompt: replace 'Respond with valid JSON only — no markdown, no explanation:' with 'You may use Read and Bash to investigate before responding.\\nWhen ready, output ONLY a valid JSON object on a single line:'",
+          "command": null,
+          "expected": "Prompt updated in spawn_worker system_prompt f-string"
+        },
+        {
+          "description": "Update kill_worker Opus grader prompt with same change",
+          "command": null,
+          "expected": "Prompt updated in kill_worker system_prompt f-string"
+        },
+        {
+          "description": "Update approve_plan Opus grader prompt with same change",
+          "command": null,
+          "expected": "Prompt updated in approve_plan system_prompt f-string"
+        },
+        {
+          "description": "In spawn_worker, after each _call_grader() call, add opus_tool_calls capture and _fire_shadow_thread call (both Opus call sites: infrastructure error path and low-confidence path)",
+          "command": null,
+          "expected": "Shadow thread fired after both _call_grader calls in spawn_worker"
+        },
+        {
+          "description": "In kill_worker, add _shadow_worker repo lookup before _call_grader(), then capture tool calls and fire shadow thread after",
+          "command": null,
+          "expected": "Shadow thread fired after _call_grader in kill_worker"
+        },
+        {
+          "description": "In approve_plan, add _shadow_worker repo lookup before _call_grader(), then capture tool calls and fire shadow thread after",
+          "command": null,
+          "expected": "Shadow thread fired after _call_grader in approve_plan"
+        },
+        {
+          "description": "Run wiring tests to confirm they pass",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestShadowThreadFiring -v 2>&1 | tail -20",
+          "expected": "All 3 wiring tests PASS"
+        },
+        {
+          "description": "Run full test suite to confirm no regressions",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/ -v --ignore=tests/test_signal_handler_destructive.py 2>&1 | tail -30",
+          "expected": "All tests PASS"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "Files staged"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,126 @@
+{
+  "name": "Shadow Grader Always-Enforce Verdict",
+  "goal": "After the tool-calling loop, ALWAYS make a dedicated verdict call with tools:[] and format:GRADER_VERDICT_SCHEMA, eliminating the regex fallback chain",
+  "design_file": "docs/plans/2026-06-20-shadow-grader-always-enforce-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Write new test (RED)",
+      "description": "Add test_verdict_call_always_uses_format_schema inside TestGradeWithTools. Verifies that even on a no-tool-call first response, a second format-constrained verdict call is always made (call_count==2, second call has format+tools:[]).",
+      "allowed_files": [
+        "commander/tests/test_shadow_grader.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add test_verdict_call_always_uses_format_schema after test_system_prompt_prepends_gemma4_guidance",
+          "command": null,
+          "expected": null
+        },
+        {
+          "description": "Run new test to verify it fails (currently only 1 API call in no-tool-calls path)",
+          "command": "cd commander && python -m pytest tests/test_shadow_grader.py::TestGradeWithTools::test_verdict_call_always_uses_format_schema -v",
+          "expected": "FAILED — AssertionError: assert 1 == 2"
+        },
+        {
+          "description": "Stage test file",
+          "command": "git add commander/tests/test_shadow_grader.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Restructure grade_with_tools() — always-enforce post-loop verdict",
+      "description": "Two edits: (1) remove the 5-line inline post_chat() from the max-steps block, keeping only the user hint + break; (2) replace the post-loop parse/regex/retry block with a single always-enforce verdict_payload call.",
+      "allowed_files": [
+        "commander/src/ironclaude/shadow_grader.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Remove inline client.post_chat() from max-steps block (lines 227-234), keeping only user hint message and break",
+          "command": null,
+          "expected": null
+        },
+        {
+          "description": "Replace post-loop parse/regex/retry block (lines 239-272) with always-enforce verdict_payload call followed by single json.loads()",
+          "command": null,
+          "expected": null
+        },
+        {
+          "description": "Run Task 1 test to verify it now passes",
+          "command": "cd commander && python -m pytest tests/test_shadow_grader.py::TestGradeWithTools::test_verdict_call_always_uses_format_schema -v",
+          "expected": "PASSED"
+        },
+        {
+          "description": "Stage implementation file",
+          "command": "git add commander/src/ironclaude/shadow_grader.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Fix existing tests for new call count",
+      "description": "Three tests used side_effect sequences sized for the old call count. Add one extra (verdict, []) entry to each. Rename test_non_json_triggers_format_constrained_retry to test_format_constrained_verdict_recovers_non_json.",
+      "allowed_files": [
+        "commander/tests/test_shadow_grader.py"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "Add 3rd side_effect entry (verdict, []) to test_single_tool_call_then_verdict",
+          "command": null,
+          "expected": null
+        },
+        {
+          "description": "Add 7th side_effect entry (verdict, []) to test_max_tool_steps_forces_final_verdict (6 calls in loop + 1 post-loop)",
+          "command": null,
+          "expected": null
+        },
+        {
+          "description": "Add 3rd side_effect entry (verdict, []) to test_string_arguments_parsed_to_dict",
+          "command": null,
+          "expected": null
+        },
+        {
+          "description": "Rename test_non_json_triggers_format_constrained_retry to test_format_constrained_verdict_recovers_non_json (assertions unchanged)",
+          "command": null,
+          "expected": null
+        },
+        {
+          "description": "Run all four modified tests to verify PASS",
+          "command": "cd commander && python -m pytest tests/test_shadow_grader.py::TestGradeWithTools::test_single_tool_call_then_verdict tests/test_shadow_grader.py::TestGradeWithTools::test_max_tool_steps_forces_final_verdict tests/test_shadow_grader.py::TestGradeWithTools::test_string_arguments_parsed_to_dict tests/test_shadow_grader.py::TestGradeWithTools::test_format_constrained_verdict_recovers_non_json -v",
+          "expected": "4 passed"
+        },
+        {
+          "description": "Stage test file",
+          "command": "git add commander/tests/test_shadow_grader.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Full test suite verification",
+      "description": "Run all 14 tests (13 original + 1 new). Explicitly verify test_non_json_verdict_returns_error which uses return_value mode — both calls return non-JSON, post-loop verdict call fails json.loads(), returns infrastructure_error.",
+      "allowed_files": [
+        "commander/tests/test_shadow_grader.py"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {
+          "description": "Run full test suite",
+          "command": "cd commander && python -m pytest tests/test_shadow_grader.py -v",
+          "expected": "14 passed"
+        },
+        {
+          "description": "Explicitly verify test_non_json_verdict_returns_error still passes",
+          "command": "cd commander && python -m pytest tests/test_shadow_grader.py::TestGradeWithTools::test_non_json_verdict_returns_error -v",
+          "expected": "PASSED"
+        }
+      ]
+    }
+  ]
+}

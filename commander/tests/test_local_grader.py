@@ -175,15 +175,22 @@ class TestCallLocalGrader:
         assert "non-json" in result["error_detail"].lower()
 
     def test_config_file_missing(self, tools, tmp_path):
-        tools._ollama_config = None
-        tools._ollama_config_path = str(tmp_path / "nonexistent.json")
-        result = tools._call_local_grader("sys", "usr", GRADE_SCHEMA)
-        assert result["infrastructure_error"] is True
-        assert "config not found" in result["error_detail"].lower()
+        """Missing config file falls back to localhost defaults (no crash); grading still works."""
+        tools._local_grader._config_path = str(tmp_path / "nonexistent.json")
+        tools._local_grader._client = None
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "response": '{"grade": "A", "approved": true, "feedback": "ok"}'
+        }
+        mock_response.raise_for_status = MagicMock()
+        with patch("requests.post", return_value=mock_response) as mock_post:
+            result = tools._call_local_grader("sys", "usr", GRADE_SCHEMA)
+        assert result["grade"] == "A"
+        assert "localhost:11434" in mock_post.call_args[0][0]
 
     def test_config_cached_after_first_call(self, tools, ollama_config):
-        tools._ollama_config = None
-        tools._ollama_config_path = ollama_config
+        tools._local_grader._config_path = ollama_config
+        tools._local_grader._client = None
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "response": '{"grade": "A", "approved": true, "feedback": "ok"}'
@@ -191,8 +198,10 @@ class TestCallLocalGrader:
         mock_response.raise_for_status = MagicMock()
         with patch("requests.post", return_value=mock_response):
             tools._call_local_grader("sys", "usr", GRADE_SCHEMA)
+            first_client = tools._local_grader._client
             tools._call_local_grader("sys", "usr", GRADE_SCHEMA)
-        assert tools._ollama_config is not None
+        assert tools._local_grader._client is not None
+        assert tools._local_grader._client is first_client  # client cached, not rebuilt
 
     def test_json_missing_required_fields(self, tools, ollama_config):
         tools._ollama_config = None
@@ -434,10 +443,7 @@ class TestP1SpawnWorkerHybrid:
     def test_configurable_threshold_medium(self, tools, registry, mock_tmux):
         """When threshold is 'medium', medium confidence skips Opus."""
         self._setup_spawn(tools, mock_tmux)
-        tools._ollama_config = {
-            "ollama": {"spawn_confidence_threshold": "medium", "url": "http://localhost:11434", "model": "gemma4:12b-it-qat"},
-            "timeout_seconds": 60,
-        }
+        tools._ollama_cfg_cache = {"spawn_confidence_threshold": "medium"}
         tools._call_local_grader = MagicMock(return_value={
             "grade": "A", "approved": True, "feedback": "ok",
             "confidence": "medium",
