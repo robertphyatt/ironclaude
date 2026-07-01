@@ -190,6 +190,32 @@ class TestDiscoverPlugins:
         # Calling the handler must not raise ImportError
         reg.handle_command(None, "test", {"type": "test"})
 
+    def test_parent_dir_not_left_at_front_of_syspath(self, tmp_path):
+        """Parent dir must not be inserted at sys.path[0] (import-precedence hijack).
+
+        A plugin's parent dir left at the FRONT of sys.path for the whole daemon
+        lets a sibling module shadow stdlib/site-packages. The loader must keep the
+        parent dir available for deferred handler imports (see test above) but must
+        NOT prepend it — append so stdlib/site-packages keep precedence.
+        """
+        import sys
+
+        saved_path = sys.path[:]
+        try:
+            plugin_dir = tmp_path / "myplugin"
+            plugin_dir.mkdir()
+            (plugin_dir / "plugin.py").write_text(
+                "def register(registry):\n"
+                "    registry.register_command('test-cmd', 'A test', lambda t: None, lambda d, p: None)\n"
+            )
+            reg = PluginRegistry()
+            discover_plugins(reg, plugin_dirs=[str(plugin_dir)])
+            # Parent dir still present (deferred imports work) but not shadowing stdlib.
+            assert str(tmp_path) in sys.path
+            assert sys.path[0] != str(tmp_path)
+        finally:
+            sys.path[:] = saved_path
+
 
 class TestParseInboundCommandRegistryFallthrough:
     def test_unknown_command_tries_registry(self):
@@ -225,7 +251,7 @@ class TestSlackSocketHandlerPreprocessor:
         from ironclaude.slack_commands import SlackSocketHandler
         reg = PluginRegistry()
         reg.register_preprocessor(lambda event, say, daemon: {"type": "intercepted"} if event.get("special") else None)
-        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test", registry=reg)
+        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test", operator_user_id="U1", registry=reg)
         handler._handle_message_event({"special": True, "user": "U1", "ts": "1.0"}, say=None)
         items = handler.drain()
         assert len(items) == 1
@@ -235,7 +261,7 @@ class TestSlackSocketHandlerPreprocessor:
         from ironclaude.slack_commands import SlackSocketHandler
         reg = PluginRegistry()
         reg.register_preprocessor(lambda event, say, daemon: None)
-        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test", registry=reg)
+        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test", operator_user_id="U1", registry=reg)
         handler._handle_message_event({"text": "STATUS", "user": "U1", "ts": "1.0"}, say=None)
         items = handler.drain()
         assert len(items) == 1
@@ -243,7 +269,7 @@ class TestSlackSocketHandlerPreprocessor:
 
     def test_no_registry_still_works(self):
         from ironclaude.slack_commands import SlackSocketHandler
-        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test")
+        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test", operator_user_id="U1")
         handler._handle_message_event({"text": "HELP", "user": "U1", "ts": "1.0"}, say=None)
         items = handler.drain()
         assert len(items) == 1
@@ -255,7 +281,7 @@ class TestSlackSocketHandlerPreprocessor:
             raise RuntimeError("boom")
         reg = PluginRegistry()
         reg.register_preprocessor(bad_preprocessor)
-        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test", registry=reg)
+        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test", operator_user_id="U1", registry=reg)
         handler._handle_message_event({"text": "HELP", "user": "U1", "ts": "1.0"}, say=None)
         items = handler.drain()
         assert len(items) == 1

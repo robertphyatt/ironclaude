@@ -344,3 +344,43 @@ class TestFormatWorkerStuckKilled:
     def test_format_prompt_waiting(self):
         result = format_worker_stuck_killed("w2", 30, "brainstorming", True)
         assert "yes" in result.lower()
+
+
+class TestRemoteWorkflowStageSqlInjection:
+    def test_rejects_non_uuid_session_id(self, daemon):
+        # 36-char content containing a SQL-injection payload (quote)
+        bad = "x' OR 1=1" + "-" * (36 - len("x' OR 1=1"))
+        assert len(bad) == 36
+        daemon.tmux.list_pane_pid.return_value = "9999"
+        daemon.tmux.read_file.return_value = bad
+
+        result = daemon._get_worker_workflow_stage_remote("ic-w1", "host1")
+
+        assert result is None
+        daemon.tmux.run_sqlite_query.assert_not_called()
+
+    def test_valid_uuid_proceeds(self, daemon):
+        daemon.tmux.list_pane_pid.return_value = "9999"
+        daemon.tmux.read_file.return_value = "12345678-1234-1234-1234-123456789abc"
+        daemon.tmux.run_sqlite_query.return_value = "executing"
+
+        result = daemon._get_worker_workflow_stage_remote("ic-w1", "host1")
+
+        assert result == "executing"
+        daemon.tmux.run_sqlite_query.assert_called_once()
+
+
+class TestPromptWaitingCacheBounded:
+    def test_cache_does_not_grow_unbounded(self, daemon):
+        daemon._grader = MagicMock()
+        daemon._grader.grade.return_value = {"waiting": False}
+
+        with patch("ironclaude.main.time") as mock_time:
+            clock = [1000.0]
+            mock_time.time.side_effect = lambda: clock[0]
+            for i in range(2000):
+                clock[0] += 1.0
+                daemon._detect_prompt_waiting(f"log tail number {i}")
+
+        # Cap (<=512) plus TTL pruning keeps the cache bounded.
+        assert len(daemon._prompt_waiting_cache) <= 512

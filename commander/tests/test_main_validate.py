@@ -1,7 +1,7 @@
 """Tests for IroncladeDaemon._validate_brain_message and _detect_prompt_waiting."""
 import time
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from ironclaude.main import IroncladeDaemon, PROMPT_WAITING_CACHE_TTL
 
@@ -112,3 +112,44 @@ class TestDetectPromptWaiting:
         user_prompt = call_args[0][1]
         assert "x" * 2001 not in user_prompt
         assert len(user_prompt) <= 2020
+
+
+class TestSpawnWorkerClaudeFable:
+    """_handle_spawn_worker must resolve worker_type 'claude-fable' to a Fable
+    command instead of falling through to 'Unknown worker type'."""
+
+    def _spawn_daemon(self):
+        daemon = IroncladeDaemon.__new__(IroncladeDaemon)
+        daemon.config = {"effort_level": "high", "advisor": {}}
+        daemon.slack = MagicMock()
+        daemon.registry = MagicMock()
+        daemon.registry.get_running_workers_by_type.return_value = []
+        daemon.tmux = MagicMock()
+        daemon.tmux.spawn_session.return_value = True
+        daemon._wait_for_ready = MagicMock(return_value=True)  # avoid real sleeps
+        return daemon
+
+    @patch("ironclaude.main.log_worker_event")
+    @patch("ironclaude.main.format_worker_spawned", return_value="spawned")
+    @patch("ironclaude.main.ensure_worker_trusted")
+    @patch("ironclaude.main.make_opus_command", return_value="FABLE_CMD")
+    def test_claude_fable_builds_fable_command(self, mock_make, mock_trust, mock_fmt, mock_logev):
+        daemon = self._spawn_daemon()
+        decision = {"worker_id": "w-fable", "type": "claude-fable", "repo": "/tmp", "objective": "hard task"}
+        daemon._handle_spawn_worker(decision)
+        # Fable worker command is built via make_opus_command("fable", effort) —
+        # pre-fix this branch didn't exist and the type fell through to the
+        # "Unknown worker type" path, so make_opus_command was never called.
+        mock_make.assert_called_once_with("fable", "high")
+        daemon.tmux.spawn_session.assert_called_once()
+
+    @patch("ironclaude.main.log_worker_event")
+    @patch("ironclaude.main.format_worker_spawned", return_value="spawned")
+    @patch("ironclaude.main.ensure_worker_trusted")
+    @patch("ironclaude.main.make_opus_command", return_value="FABLE_CMD")
+    def test_claude_fable_not_unknown_worker_type(self, mock_make, mock_trust, mock_fmt, mock_logev):
+        daemon = self._spawn_daemon()
+        decision = {"worker_id": "w-fable", "type": "claude-fable", "repo": "/tmp", "objective": "hard task"}
+        daemon._handle_spawn_worker(decision)
+        for call in daemon.slack.post_message.call_args_list:
+            assert "Unknown worker type" not in call[0][0]

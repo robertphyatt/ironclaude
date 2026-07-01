@@ -115,7 +115,7 @@ class ShadowGrader:
             self._client = OllamaClient(
                 url=ollama_cfg.get("url", "http://localhost:11434"),
                 fallback_url=ollama_cfg.get("fallback_url"),
-                timeout=cfg.get("timeout_seconds", 120),
+                timeout=cfg.get("timeout_seconds", 300),
             )
         return self._client
 
@@ -123,15 +123,17 @@ class ShadowGrader:
         """Reject path traversal; require path under allowed roots."""
         if ".." in path:
             raise ValueError("path traversal not allowed")
-        abs_path = os.path.abspath(path)
-        allowed = [os.path.expanduser("~"), "/tmp/"]
-        if repo_path:
-            allowed.append(os.path.abspath(repo_path))
-        if not any(abs_path.startswith(root) for root in allowed):
+        if not repo_path:
+            raise ValueError("path not under allowed roots")
+        real_path = os.path.realpath(path)
+        allowed = [os.path.realpath(repo_path)]
+        if not any(real_path == root or real_path.startswith(root + os.sep) for root in allowed):
             raise ValueError("path not under allowed roots")
 
     def _execute_tool(self, name: str, arguments: dict, repo_path: str | None) -> str:
         """Execute a tool call. Returns result string or JSON error string."""
+        if not isinstance(arguments, dict):
+            arguments = {}
         try:
             if name == "read_file":
                 path = arguments.get("path", "")
@@ -143,7 +145,7 @@ class ShadowGrader:
                 directory = arguments.get("directory", "")
                 self._validate_path(directory, repo_path)
                 result = subprocess.run(
-                    ["rg", "--max-count=20", pattern, directory],
+                    ["rg", "--max-count=20", "-e", pattern, "--", directory],
                     capture_output=True, text=True, timeout=10,
                 )
                 return result.stdout[:4000] or "(no matches)"
@@ -151,7 +153,7 @@ class ShadowGrader:
                 rp = arguments.get("repo_path", "")
                 self._validate_path(rp, repo_path)
                 result = subprocess.run(
-                    ["git", "diff"],
+                    ["git", "--no-ext-diff", "-c", "core.fsmonitor=", "-c", "diff.textconv=", "diff"],
                     capture_output=True, text=True, timeout=10, cwd=rp,
                 )
                 return result.stdout[:8000] or "(no changes)"
@@ -270,6 +272,9 @@ class ShadowGrader:
             parsed = json.loads(content)
         except json.JSONDecodeError:
             return self._build_error(f"Non-JSON response: {content[:200]}", recorded_tool_calls)
+
+        if not isinstance(parsed, dict):
+            return self._build_error(f"Non-dict verdict: {content[:200]}", recorded_tool_calls)
 
         required = ["grade", "approved", "feedback"]
         missing = [k for k in required if k not in parsed]

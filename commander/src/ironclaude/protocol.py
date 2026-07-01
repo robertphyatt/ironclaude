@@ -13,7 +13,7 @@ from pathlib import Path
 
 logger = logging.getLogger("ironclaude.protocol")
 
-_SAFE_ID_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
+_SAFE_ID_RE = re.compile(r'^[a-zA-Z0-9_-]+\Z')
 
 
 def validate_safe_id(value: str) -> None:

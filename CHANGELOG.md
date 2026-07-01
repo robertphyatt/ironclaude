@@ -13,6 +13,31 @@
 
 _Nothing yet._
 
+## 1.0.14
+
+### Added
+- `ironclaude restart` CLI subcommand — sends SIGHUP to the daemon via PID file. Standalone `cli.py` with `pyproject.toml` console script entry point. Covered by unit tests and a real-signal integration test that spawns a subprocess with a SIGHUP handler
+- `resume_session` MCP tool — resume any Claude Code conversation by session ID into a fresh managed tmux session
+- `claude-fable` worker type — routing, grader prompts, and dispatch test
+- `wiki_write` description frontmatter field for improved episodic memory search routing
+- Ollama worker complexity gate, grader tier matrix, and batch spawn playbook injection fix
+- Ollama-powered session summarization for `list_claude_sessions`
+- Session adoption — `list_claude_sessions` + `adopt_session` MCP tools for taking over manually-started Claude Code sessions
+- `.claude/rules/behavioral.md` — project-level behavioral directives for Claude Code rules system
+- Research docs: Ollama MLX engine evaluation, Ollama worker 72h performance analysis, Obsidian Skills evaluation
+- Design docs: rate-limit recovery + stuck-worker escalation, Ollama MLX engine, session sample truncation
+
+### Fixed
+- Grader feedback text corruption — replaced log-tail delta with `capture_pane`, fixed greedy feedback regex
+- Brain timeout false positives during long MCP tool chains — added `_executing_tool` flag with 1800s hard safety net
+- Reduced `list_claude_sessions` sample from 2000 to 200 chars to prevent 64KB+ output bloating Brain context
+- Shadow grader Ollama read timeout increased 120→300s default to prevent gemma4 tool-call timeouts
+- Shadow grader plan JSON fix (null → empty string for command field)
+
+### Changed
+- `brain_model` config set to `opus` (Fable currently unavailable)
+- Version bumped to 1.0.14 across `pyproject.toml`, `plugin.json`, and `marketplace.json`
+
 ## 1.0.13
 
 ### Added

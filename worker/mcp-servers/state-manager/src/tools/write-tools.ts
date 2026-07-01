@@ -616,33 +616,39 @@ export function handleWriteTool(
       // Compute Wave 1
       const wave1Tasks = computeNextWave(planJson, []);
 
-      // Store plan in session (clear stale review_pending from prior plans)
-      updateSession(db, resolvedId, {
-        plan_json: JSON.stringify(planJson),
-        plan_name: planJson.name,
-        current_wave: 1,
-        workflow_stage: 'final_plan_prep',
-        review_pending: 0,
-      });
-
-      // Clear stale review grades from any prior plan run
-      clearReviewGrades(db, resolvedId);
-
-      // Clear stale wave tasks from any prior plan run (prevents ghost completed tasks)
-      db.prepare('DELETE FROM wave_tasks WHERE terminal_session = ?').run(resolvedId);
-
-      // Create wave_task rows for Wave 1
-      for (const task of wave1Tasks) {
-        upsertWaveTask(db, {
-          terminal_session: resolvedId,
-          task_id: task.id,
-          wave_number: 1,
-          task_name: task.name,
-          description: task.description,
-          allowed_files: JSON.stringify(task.allowed_files),
-          status: 'pending',
+      // Atomically install the plan: store it in the session, clear stale review
+      // grades/wave_tasks from any prior run, and create Wave 1 rows. Wrapping the
+      // multi-statement mutation in a transaction prevents a mid-sequence throw from
+      // leaving plan_json set with wave_tasks deleted-and-not-repopulated.
+      const installPlan = db.transaction(() => {
+        updateSession(db, resolvedId, {
+          plan_json: JSON.stringify(planJson),
+          plan_name: planJson.name,
+          current_wave: 1,
+          workflow_stage: 'final_plan_prep',
+          review_pending: 0,
         });
-      }
+
+        // Clear stale review grades from any prior plan run
+        clearReviewGrades(db, resolvedId);
+
+        // Clear stale wave tasks from any prior plan run (prevents ghost completed tasks)
+        db.prepare('DELETE FROM wave_tasks WHERE terminal_session = ?').run(resolvedId);
+
+        // Create wave_task rows for Wave 1
+        for (const task of wave1Tasks) {
+          upsertWaveTask(db, {
+            terminal_session: resolvedId,
+            task_id: task.id,
+            wave_number: 1,
+            task_name: task.name,
+            description: task.description,
+            allowed_files: JSON.stringify(task.allowed_files),
+            status: 'pending',
+          });
+        }
+      });
+      installPlan();
 
       insertAuditLog(db, {
         terminal_session: resolvedId,
@@ -1109,7 +1115,7 @@ export function handleWriteTool(
       if (session.workflow_stage !== 'reviewing') {
         const activeTaskCount = (db.prepare(
           `SELECT COUNT(*) as count FROM wave_tasks
-           WHERE terminal_session = ? AND status IN ('pending', 'in_progress', 'review_pending')`,
+           WHERE terminal_session = ? AND status IN ('pending', 'in_progress', 'submitted')`,
         ).get(resolvedId) as { count: number }).count;
 
         if (activeTaskCount > 0) {
@@ -1131,7 +1137,7 @@ export function handleWriteTool(
 
       const passingReview = db.prepare(
         `SELECT 1 FROM review_grades
-         WHERE terminal_session = ? AND wave_number = ? AND grade IN ('A', 'B')
+         WHERE terminal_session = ? AND wave_number = ? AND grade IN ('A', 'B') AND task_boundary = 1
          ORDER BY created_at DESC LIMIT 1`,
       ).get(resolvedId, session.current_wave);
 

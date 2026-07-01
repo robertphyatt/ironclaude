@@ -5,6 +5,7 @@ import os
 import unittest.mock as mock
 import pytest
 from ironclaude.protocol import (
+    validate_safe_id,
     write_decision,
     read_pending_decisions,
     read_task_ledger,
@@ -20,6 +21,15 @@ def tmp_dirs(tmp_path):
     decisions_dir.mkdir()
     specs_dir.mkdir()
     return {"decisions": str(decisions_dir), "specs": str(specs_dir), "base": str(tmp_path)}
+
+
+class TestValidateSafeId:
+    def test_accepts_valid_id(self):
+        validate_safe_id("abc-123_DEF")
+
+    def test_rejects_newline(self):
+        with pytest.raises(ValueError, match="Unsafe ID rejected"):
+            validate_safe_id("valid\n")
 
 
 class TestDecisions:

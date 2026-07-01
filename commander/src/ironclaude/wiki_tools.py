@@ -27,20 +27,22 @@ class WikiTools:
         self._wiki_dir = wiki_dir
 
     @staticmethod
-    def _parse_wiki_frontmatter(raw: str) -> tuple[str, str, str]:
-        """Parse YAML frontmatter from a wiki page, returning (title, updated, body)."""
+    def _parse_wiki_frontmatter(raw: str) -> tuple[str, str, str, str]:
+        """Parse YAML frontmatter from a wiki page, returning (title, updated, body, description)."""
         if not raw.startswith("---"):
-            return ("", "", raw)
+            return ("", "", raw, "")
         parts = raw.split("---", 2)
         if len(parts) < 3:
-            return ("", "", raw)
-        title, updated = "", ""
+            return ("", "", raw, "")
+        title, updated, description = "", "", ""
         for line in parts[1].strip().splitlines():
             if line.startswith("title:"):
                 title = line[len("title:"):].strip()
             elif line.startswith("updated:"):
                 updated = line[len("updated:"):].strip()
-        return (title, updated, parts[2].strip())
+            elif line.startswith("description:"):
+                description = line[len("description:"):].strip()
+        return (title, updated, parts[2].strip(), description)
 
     @staticmethod
     def _extract_summary(body: str) -> str:
@@ -67,10 +69,10 @@ class WikiTools:
             fpath = os.path.join(wiki_dir, fname)
             with open(fpath) as f:
                 raw = f.read()
-            title, updated, body = self._parse_wiki_frontmatter(raw)
+            title, updated, body, description = self._parse_wiki_frontmatter(raw)
             if not title:
                 title = fname[:-3]
-            summary = self._extract_summary(body)
+            summary = description if description else self._extract_summary(body)
             entries.append((fname[:-3], title, summary, updated))
 
         lines = ["# Wiki Index\n"]
@@ -125,7 +127,7 @@ class WikiTools:
 
     # ── Wiki tools ───────────────────────────────────────────────────
 
-    def wiki_write(self, page: str, title: str, content: str) -> str:
+    def wiki_write(self, page: str, title: str, content: str, description: str | None = None) -> str:
         """Create or update a wiki page with frontmatter, rebuild index, append log."""
         wiki_dir = self._wiki_dir
         os.makedirs(wiki_dir, exist_ok=True)
@@ -178,7 +180,12 @@ class WikiTools:
         is_update = os.path.exists(page_path)
 
         today = date.today().isoformat()
-        page_content = f"---\ntitle: {title}\nupdated: {today}\n---\n\n{content}\n"
+        title = title.replace("\n", " ")
+        desc = description.strip().replace("\n", " ") if description else ""
+        if desc:
+            page_content = f"---\ntitle: {title}\nupdated: {today}\ndescription: {desc}\n---\n\n{content}\n"
+        else:
+            page_content = f"---\ntitle: {title}\nupdated: {today}\n---\n\n{content}\n"
         with open(page_path, "w") as f:
             f.write(page_content)
 
@@ -192,7 +199,7 @@ class WikiTools:
         if r_add.returncode != 0:
             return f"{page_path} (git commit failed: {r_add.stderr.strip()})"
         r_commit = subprocess.run(
-            ["git", "commit", "-m", f"wiki: {verb} {page}"],
+            ["git", "commit", "-m", f"wiki: {verb} {page}", "--", "wiki/"],
             cwd=repo_root, capture_output=True, text=True,
         )
         if r_commit.returncode != 0:
@@ -229,7 +236,7 @@ class WikiTools:
         if r_add.returncode != 0:
             return f"Deleted {page}.md (git commit failed: {r_add.stderr.strip()})"
         r_commit = subprocess.run(
-            ["git", "commit", "-m", f"wiki: delete {page}"],
+            ["git", "commit", "-m", f"wiki: delete {page}", "--", "wiki/"],
             cwd=repo_root, capture_output=True, text=True,
         )
         if r_commit.returncode != 0:
@@ -280,7 +287,7 @@ class WikiTools:
             with open(fpath) as f:
                 raw = f.read()
             if any(kw in raw.lower() for kw in kw_list):
-                title, updated, body = self._parse_wiki_frontmatter(raw)
+                title, updated, body, _ = self._parse_wiki_frontmatter(raw)
                 if not title:
                     title = page_name
                 results[page_name] = {

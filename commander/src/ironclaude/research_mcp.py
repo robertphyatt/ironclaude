@@ -14,7 +14,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import socket
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from markdownify import markdownify as md
 import requests
@@ -79,18 +79,57 @@ def _validate_url(url: str) -> str | None:
     return None
 
 
-def _resolve_and_validate(url: str) -> tuple[str, str]:
-    """Resolve the hostname in *url* once, validate all returned IPs, and return
-    a (resolved_url, hostname) tuple where resolved_url has the IP literal in
-    place of the hostname so the HTTP request never re-resolves DNS.
+def _replace_host(url: str, new_host: str) -> str:
+    """Return *url* with its host component replaced by *new_host*, preserving port."""
+    parsed = urlparse(url)
+    netloc = new_host
+    if parsed.port:
+        netloc = f"{new_host}:{parsed.port}"
+    return parsed._replace(netloc=netloc).geturl()
 
-    Raises ValueError if any resolved address is private/internal, or if the
-    URL contains a literal private/internal IP address.
+
+class _PinnedIPAdapter(requests.adapters.HTTPAdapter):
+    """Connect to a pre-validated IP while using the original hostname for TLS.
+
+    Closes the DNS-rebinding TOCTOU (the socket targets the exact validated IP)
+    WITHOUT breaking HTTPS: SNI and certificate hostname verification still use
+    the real hostname (via urllib3 server_hostname/assert_hostname), and the
+    Host header is preserved. Session-local, so it is thread-safe (unlike a
+    global socket.getaddrinfo monkeypatch).
+    """
+
+    def __init__(self, hostname: str, pinned_ip: str, *args, **kwargs) -> None:
+        self._hostname = hostname
+        self._pinned_ip = pinned_ip
+        super().__init__(*args, **kwargs)
+
+    def send(self, request, **kwargs):
+        real_host = urlparse(request.url).hostname
+        if real_host == self._hostname:
+            # Verify TLS against the real host even though we dial the IP.
+            self.poolmanager.connection_pool_kw["server_hostname"] = self._hostname
+            self.poolmanager.connection_pool_kw["assert_hostname"] = self._hostname
+            request.headers["Host"] = self._hostname
+            request.url = _replace_host(request.url, self._pinned_ip)
+        return super().send(request, **kwargs)
+
+
+def _resolve_and_validate(url: str) -> tuple[str, str, int]:
+    """Resolve the hostname in *url* once and validate every returned IP.
+
+    Returns (hostname, pinned_ip, port). The caller dials pinned_ip while keeping
+    the hostname for TLS SNI/cert verification (see _PinnedIPAdapter), so DNS is
+    resolved exactly once and cannot rebind between validation and connection.
+
+    Raises ValueError for a non-http(s) scheme, a literal private/internal IP,
+    or a hostname that resolves to a private/internal address.
     """
     parsed = urlparse(url)
     if parsed.scheme not in ('http', 'https'):
         raise ValueError(f'Blocked URL scheme: {parsed.scheme!r}')
     hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("URL has no hostname")
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
 
     # Fast-path: reject literal private/reserved IPs without a DNS lookup.
@@ -115,34 +154,40 @@ def _resolve_and_validate(url: str) -> tuple[str, str]:
                 f"Blocked: {hostname!r} resolves to private/internal address {addr}"
             )
     resolved_ip = results[0][4][0]
-    resolved_url = url.replace(hostname, resolved_ip, 1)
-    return resolved_url, hostname
+    return hostname, resolved_ip, port
 
 
-def _safe_get(
-    url: str, max_redirects: int = 5, headers: dict | None = None
-) -> requests.Response:
-    """GET *url* without following redirects automatically.
+def _build_pinned_session(hostname: str, pinned_ip: str) -> requests.Session:
+    """Build a Session that dials *pinned_ip* but verifies TLS against *hostname*."""
+    session = requests.Session()
+    adapter = _PinnedIPAdapter(hostname, pinned_ip)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
-    The first request uses *url* and *headers* as provided (caller is
-    responsible for pre-resolving via _resolve_and_validate).  Each redirect
-    hop calls _resolve_and_validate() on the Location header to pin DNS before
-    following.  Raises ValueError for blocked redirect targets or too many redirects.
+
+def _safe_get(url: str, max_redirects: int = 5) -> requests.Response:
+    """GET *url* without auto-following redirects, pinning DNS on every hop.
+
+    Each hop: re-validate the URL (scheme + SSRF), resolve+pin the IP, and issue
+    the request against the ORIGINAL hostname URL through a pinned-IP session so
+    TLS verification uses the real host. Relative Location headers are resolved
+    against the current URL via urljoin before re-validation.
+    Raises ValueError for a blocked target or too many redirects.
     """
-    is_redirect = False
     for _ in range(max_redirects):
-        if is_redirect:
-            resolved_url, hostname = _resolve_and_validate(url)
-            url = resolved_url
-            headers = {"Host": hostname}
-        else:
-            error = _validate_url(url)
-            if error:
-                raise ValueError(error)
-        response = requests.get(url, timeout=30, allow_redirects=False, headers=headers)
+        error = _validate_url(url)
+        if error:
+            raise ValueError(error)
+        hostname, pinned_ip, _port = _resolve_and_validate(url)
+        session = _build_pinned_session(hostname, pinned_ip)
+        try:
+            response = session.get(url, timeout=30, allow_redirects=False)
+        finally:
+            session.close()
         if response.status_code in (301, 302, 303, 307, 308):
-            url = response.headers.get("Location", "")
-            is_redirect = True
+            location = response.headers.get("Location", "")
+            url = urljoin(url, location)
             continue
         return response
     raise ValueError("Too many redirects")
@@ -197,8 +242,7 @@ class ResearchTools:
             return {"error": error}
 
         try:
-            resolved_url, hostname = _resolve_and_validate(url)
-            response = _safe_get(resolved_url, headers={"Host": hostname})
+            response = _safe_get(url)
             response.raise_for_status()
 
             text = md(response.text, strip=["img"])

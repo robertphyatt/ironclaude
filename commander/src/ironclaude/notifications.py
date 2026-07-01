@@ -121,13 +121,13 @@ def format_objective_received(text: str) -> str:
 
 
 def format_task_progress(current: int, total: int, description: str) -> str:
-    return f"*Task {current}/{total}:* {description}"
+    return f"*Task {current}/{total}:* {_escape_mrkdwn(description)}"
 
 
 def format_plan_ready(worker_id: str, plan_summary: str) -> str:
     return (
         f"*Plan Ready:* `{worker_id}` produced a plan\n"
-        f"Summary: {plan_summary}\n"
+        f"Summary: {_escape_mrkdwn(plan_summary)}\n"
         f"`/approve {worker_id}` or `/reject {worker_id}`"
     )
 
@@ -141,7 +141,7 @@ def format_worker_checkin(
     log_tail: str, prompt_waiting: bool,
 ) -> str:
     prefix = "[ACTION REQUIRED]" if prompt_waiting else "[CHECK-IN]"
-    msg = f"{prefix} {worker_id} {elapsed_minutes}min {stage}\n{log_tail}"
+    msg = f"{prefix} {worker_id} {elapsed_minutes}min {stage}\n{_escape_mrkdwn(log_tail)}"
     if prompt_waiting:
         msg += "\n⚠️ Waiting for input."
     return msg

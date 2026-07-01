@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -10,6 +11,11 @@ import re as _re
 import shlex
 
 logger = logging.getLogger("ironclaude.config")
+
+# Allowed effort levels. Interpolated unquoted into make_opus_command's shell
+# string, so an out-of-allowlist value is rejected (defense-in-depth).
+EFFORT_LEVELS = {"low", "medium", "high"}
+DEFAULT_EFFORT_LEVEL = "high"
 
 DEFAULTS = {
     "poll_interval_seconds": 15,
@@ -31,7 +37,8 @@ DEFAULTS = {
     "brain_prompt_path": "",  # test11
     "operator_name": "Operator",
     "autonomy_level": "3",
-    "brain_model": "opus",
+    "brain_model": "fable",
+    "default_opus_model": "opus",
     "grader_model": "opus",
     "effort_level": "high",
     "advisor": {
@@ -68,15 +75,34 @@ _ENV_VAR_RE = _re.compile(r'\$\{(\w+)\}')
 REQUIRED_MACHINE_FIELDS = ("name", "host", "claude_path", "repos")
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge ``override`` into ``base`` in place.
+
+    For keys present in both where both values are dicts, merge recursively so
+    a partial nested override retains sibling defaults instead of replacing the
+    whole nested dict. Otherwise the override value wins.
+    """
+    for key, value in override.items():
+        if (
+            key in base
+            and isinstance(base[key], dict)
+            and isinstance(value, dict)
+        ):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
 def load_config(config_path: str = "config/ironclaude.json") -> dict:
     """Load config from JSON file, apply env overrides, add env-only vars."""
-    cfg = dict(DEFAULTS)
+    cfg = copy.deepcopy(DEFAULTS)
 
     # Load JSON if it exists
     try:
         with open(config_path) as f:
             file_cfg = json.load(f)
-        cfg.update(file_cfg)
+        _deep_merge(cfg, file_cfg)
     except (FileNotFoundError, json.JSONDecodeError) as e:
         logger.warning(f"Config file not loaded: {e}. Using defaults.")
 
@@ -94,6 +120,10 @@ def load_config(config_path: str = "config/ironclaude.json") -> dict:
 
     # Apply ANTHROPIC_DEFAULT_OPUS_MODEL as a lower-priority override.
     # Specific BRAIN_MODEL / GRADER_MODEL env vars take precedence.
+    # default_opus_model is DECOUPLED from brain_model: it comes from the
+    # ANTHROPIC_DEFAULT_OPUS_MODEL env var if set, else the "opus" default from
+    # DEFAULTS. It must NEVER inherit brain_model — otherwise claude-opus
+    # workers would silently run whatever the Brain model is (e.g. Fable).
     opus_env = os.environ.get("ANTHROPIC_DEFAULT_OPUS_MODEL")
     if opus_env:
         cfg["default_opus_model"] = opus_env
@@ -101,8 +131,17 @@ def load_config(config_path: str = "config/ironclaude.json") -> dict:
             cfg["brain_model"] = opus_env
         if "GRADER_MODEL" not in os.environ:
             cfg["grader_model"] = opus_env
-    else:
-        cfg["default_opus_model"] = cfg["brain_model"]
+
+    # Validate effort_level against the allowlist (defense-in-depth: it is
+    # interpolated unquoted into make_opus_command's shell string).
+    if cfg.get("effort_level") not in EFFORT_LEVELS:
+        logger.warning(
+            "effort_level %r not in %s; falling back to %r",
+            cfg.get("effort_level"),
+            sorted(EFFORT_LEVELS),
+            DEFAULT_EFFORT_LEVEL,
+        )
+        cfg["effort_level"] = DEFAULT_EFFORT_LEVEL
 
     return cfg
 

@@ -25,8 +25,8 @@ if [ "$TOOL_NAME" = "Bash" ]; then
 
   # Block shell chaining first (before any allowlist checks)
   # Also block newlines which can be used to chain commands
-  if echo "$CMD" | grep -qE '[;&|`!]|\$\(' || [[ "$CMD" == *$'\n'* ]]; then
-    echo "BLOCKED — Shell chaining is not allowed for Brain." >&2
+  if echo "$CMD" | grep -qE '[;&|`!<>]|\$\(' || [[ "$CMD" == *$'\n'* ]]; then
+    echo "BLOCKED — Shell chaining/redirection is not allowed for Brain." >&2
     exit 2
   fi
 

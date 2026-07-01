@@ -128,13 +128,12 @@ class TestOperatorRestriction:
         handler._handle_message_event(event, say=None)
         assert handler.drain() == []
 
-    def test_message_when_no_operator_set_is_forwarded(self):
-        """Backward compat: empty operator_user_id allows all users."""
+    def test_message_when_no_operator_set_is_rejected(self):
+        """Fail closed: empty operator_user_id rejects all users."""
         handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test", operator_user_id="")
         event = {"text": "hello", "user": "U_ANYONE", "ts": "100.3"}
         handler._handle_message_event(event, say=None)
-        items = handler.drain()
-        assert len(items) == 1
+        assert handler.drain() == []
 
     def test_bot_message_always_ignored(self):
         handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test", operator_user_id="U_OP123")
@@ -167,6 +166,7 @@ class TestSlashCommandRegistryParsing:
         handler = SlackSocketHandler(
             app_token="xapp-test",
             bot_token="xoxb-test",
+            operator_user_id="U_OP123",
             registry=mock_registry,
         )
 
@@ -197,11 +197,89 @@ class TestSlashCommandRegistryParsing:
         respond = MagicMock()
         captured["handle_command"](
             ack=ack,
-            command={"command": "/ironclaude", "text": "scan start"},
+            command={"command": "/ironclaude", "text": "scan start", "user_id": "U_OP123"},
             respond=respond,
         )
 
         mock_parse.assert_called_once_with(" scan start", registry=mock_registry)
+
+
+def _capture_handle_command(handler):
+    """Drive handler.start() with mocked slack_bolt and return handle_command closure."""
+    captured = {}
+
+    with patch("slack_bolt.App") as MockApp, \
+         patch("slack_bolt.adapter.socket_mode.SocketModeHandler") as MockSMH:
+        mock_app = MockApp.return_value
+
+        def capture_command(pattern):
+            def decorator(fn):
+                captured["handle_command"] = fn
+                return fn
+            return decorator
+
+        mock_app.command.side_effect = capture_command
+        mock_app.event.side_effect = lambda name: lambda fn: fn
+
+        def stop_loop():
+            handler._running = False
+        MockSMH.return_value.start.side_effect = stop_loop
+
+        handler.start()
+
+    handler.stop()
+    return captured["handle_command"]
+
+
+class TestSlashCommandOperatorRestriction:
+    """Operator authorization for slash commands (handle_command)."""
+
+    def test_is_authorized_command_operator(self):
+        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test", operator_user_id="U_OP123")
+        assert handler._is_authorized_command({"user_id": "U_OP123"}) is True
+
+    def test_is_authorized_command_non_operator(self):
+        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test", operator_user_id="U_OP123")
+        assert handler._is_authorized_command({"user_id": "U_STRANGER"}) is False
+
+    def test_is_authorized_command_empty_operator_fails_closed(self):
+        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test", operator_user_id="")
+        assert handler._is_authorized_command({"user_id": "U_ANYONE"}) is False
+
+    def test_slash_command_from_operator_is_queued(self):
+        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test", operator_user_id="U_OP123")
+        handle_command = _capture_handle_command(handler)
+        handle_command(
+            ack=MagicMock(),
+            command={"command": "/ironclaude", "text": "status", "user_id": "U_OP123"},
+            respond=MagicMock(),
+        )
+        items = handler.drain()
+        assert len(items) == 1
+        assert items[0]["parsed"]["type"] == "status"
+
+    def test_slash_command_from_non_operator_is_not_queued(self):
+        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test", operator_user_id="U_OP123")
+        handle_command = _capture_handle_command(handler)
+        ack = MagicMock()
+        handle_command(
+            ack=ack,
+            command={"command": "/ironclaude", "text": "status", "user_id": "U_STRANGER"},
+            respond=MagicMock(),
+        )
+        assert handler.drain() == []
+        ack.assert_called_once()  # must still ack Slack even when dropping
+
+    def test_slash_command_empty_operator_is_not_queued(self):
+        """Fail closed: empty operator_user_id rejects all slash commands."""
+        handler = SlackSocketHandler(app_token="xapp-test", bot_token="xoxb-test", operator_user_id="")
+        handle_command = _capture_handle_command(handler)
+        handle_command(
+            ack=MagicMock(),
+            command={"command": "/ironclaude", "text": "status", "user_id": "U_ANYONE"},
+            respond=MagicMock(),
+        )
+        assert handler.drain() == []
 
 
 class TestFormatHelpText:

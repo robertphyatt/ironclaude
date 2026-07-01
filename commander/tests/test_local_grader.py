@@ -104,7 +104,10 @@ class TestCallLocalGrader:
         assert mock_post.call_count == 2
         assert "fallback:11434" in mock_post.call_args_list[1][0][0]
 
-    def test_http_error_primary_fallback_success(self, tools, ollama_config):
+    def test_http_error_primary_returns_infrastructure_error(self, tools, ollama_config):
+        # HTTP errors raise OllamaHTTPError with NO fallback (fallback only fires on
+        # ConnectionError). grader.py converts OllamaError -> infrastructure_error.
+        # So a primary HTTP 500 yields exactly one POST and an infrastructure_error dict.
         tools._ollama_config = None
         tools._ollama_config_path = ollama_config
         tools._local_grader._config_path = ollama_config
@@ -112,16 +115,10 @@ class TestCallLocalGrader:
         import requests as req_mod
         error_resp = MagicMock()
         error_resp.raise_for_status.side_effect = req_mod.HTTPError("500 Server Error")
-        mock_success = MagicMock()
-        mock_success.json.return_value = {
-            "response": '{"grade": "B", "approved": true, "feedback": "ok"}'
-        }
-        mock_success.raise_for_status = MagicMock()
-        with patch("requests.post", side_effect=[error_resp, mock_success]) as mock_post:
+        with patch("requests.post", return_value=error_resp) as mock_post:
             result = tools._call_local_grader("sys", "usr", GRADE_SCHEMA)
-        assert result["grade"] == "B"
-        assert mock_post.call_count == 2
-        assert "fallback:11434" in mock_post.call_args_list[1][0][0]
+        assert result["infrastructure_error"] is True
+        assert mock_post.call_count == 1
 
     def test_http_error_both_urls_returns_infrastructure_error(self, tools, ollama_config):
         tools._ollama_config = None

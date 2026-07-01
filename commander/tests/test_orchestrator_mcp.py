@@ -22,6 +22,7 @@ from ironclaude.config import make_opus_command
 from ironclaude.ollama_inventory import OllamaInventory
 from ironclaude.orchestrator_mcp import OrchestratorTools, WORKER_COMMANDS, _load_avatar_skill, _init_brain_session_background, _restart_watchdog
 from ironclaude.slack_interface import SlackBot
+from ironclaude.ollama_client import OllamaError
 
 
 def _mock_grader_approve(tools):
@@ -254,13 +255,13 @@ class TestSpawnWorker:
         assert not any(k.startswith("/advisor") for k in keys_sent)
 
     def _make_remote_tools(self, registry, mock_tmux, tmp_path, db_conn):
-        """Helper: OrchestratorTools with mocked SSH manager targeting kandice."""
+        """Helper: OrchestratorTools with mocked SSH manager targeting remote-worker."""
         from ironclaude.ssh_manager import MachineConfig
         machine_cfg = MachineConfig(
-            name="kandice",
-            host="kandice",
+            name="remote-worker",
+            host="remote-worker",
             claude_path="/usr/local/bin/claude",
-            repos=["/mnt/c/Users/rober/claudetraderbot"],
+            repos=["/home/user/projects/traderbot"],
             log_dir="/tmp/ic-logs",
             env={"ANTHROPIC_API_KEY": "sk-test"},
             role="worker",
@@ -271,7 +272,7 @@ class TestSpawnWorker:
         mock_health.ok = True
         mock_health.details = "All checks passed"
         mock_ssh.health_check.return_value = mock_health
-        mock_ssh.list_machine_names.return_value = ["kandice"]
+        mock_ssh.list_machine_names.return_value = ["remote-worker"]
         ledger_path = str(tmp_path / "task-ledger.json")
         tools = OrchestratorTools(registry, mock_tmux, ledger_path, db_conn=db_conn)
         tools._ssh_manager = mock_ssh
@@ -297,15 +298,15 @@ class TestSpawnWorker:
         tools.spawn_worker(
             worker_id="w-remote",
             worker_type="claude-sonnet",
-            repo="/mnt/c/Users/rober/claudetraderbot",
+            repo="/home/user/projects/traderbot",
             objective="Test remote spawn",
-            machine="kandice",
+            machine="remote-worker",
         )
 
         assert "mkdir_p" in call_order
         assert "spawn_session" in call_order
         assert call_order.index("mkdir_p") < call_order.index("spawn_session")
-        mock_tmux.mkdir_p.assert_called_once_with("/tmp/ic-logs", ssh_host="kandice")
+        mock_tmux.mkdir_p.assert_called_once_with("/tmp/ic-logs", ssh_host="remote-worker")
 
     def test_wait_for_ready_false_dead_session_returns_error(
         self, registry, mock_tmux, tmp_path, db_conn
@@ -323,9 +324,9 @@ class TestSpawnWorker:
             result = tools.spawn_worker(
                 worker_id="w-dead",
                 worker_type="claude-sonnet",
-                repo="/mnt/c/Users/rober/claudetraderbot",
+                repo="/home/user/projects/traderbot",
                 objective="Test remote spawn",
-                machine="kandice",
+                machine="remote-worker",
             )
 
         assert "error" in result
@@ -349,9 +350,9 @@ class TestSpawnWorker:
             result = tools.spawn_worker(
                 worker_id="w-alive",
                 worker_type="claude-sonnet",
-                repo="/mnt/c/Users/rober/claudetraderbot",
+                repo="/home/user/projects/traderbot",
                 objective="Test remote spawn",
-                machine="kandice",
+                machine="remote-worker",
             )
 
         assert "w-alive" in result
@@ -542,6 +543,17 @@ class TestEffortLevel:
         cmd = t._get_worker_command("claude-sonnet")
         assert "CLAUDE_CODE_EFFORT_LEVEL=medium" in cmd
 
+    def test_get_worker_command_fable_effort_override(self, registry, mock_tmux, tmp_path, db_conn):
+        """Fable worker command uses configured effort_level."""
+        ledger_path = str(tmp_path / "ledger.json")
+        t = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            effort_level="medium",
+        )
+        cmd = t._get_worker_command("claude-fable")
+        assert "CLAUDE_CODE_EFFORT_LEVEL=medium" in cmd
+        assert "--model fable" in cmd
+
     def test_grader_spawn_includes_effort_level(self, tools, mock_tmux):
         """Grader spawn command includes CLAUDE_CODE_EFFORT_LEVEL."""
         from unittest.mock import patch
@@ -610,6 +622,22 @@ class TestSpawnWorkerModelName:
         """_get_worker_command for ollama type disables attribution header to preserve KV cache."""
         cmd = tools._get_worker_command("ollama", "qwen3:8b")
         assert "CLAUDE_CODE_ATTRIBUTION_HEADER=0" in cmd
+
+    def test_fable_uses_model_flag(self, tools, mock_tmux):
+        """Fable spawn dispatches --model fable flag to tmux session command."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        tools._check_spawn_preconditions = MagicMock(return_value=None)
+        tools.spawn_worker(
+            worker_id="fable1",
+            worker_type="claude-fable",
+            repo="/tmp/repo",
+            objective="Refactor critical auth system",
+        )
+        spawn_call = mock_tmux.spawn_session.call_args
+        cmd = spawn_call[0][1]
+        assert "--model fable" in cmd
+        assert "dangerously-skip-permissions" in cmd
 
 
 class TestWaitForReady:
@@ -4948,7 +4976,10 @@ class TestCallGraderBatch:
         array_json = '[{"grade":"A","approved":true,"feedback":"G1"},{"grade":"B","approved":true,"feedback":"G2"}]'
         with patch("ironclaude.orchestrator_mcp.secrets.token_hex", return_value="abc12345"):
             delimiter = "GRADER_RESPONSE_abc12345"
-            tools.tmux.read_log_tail.side_effect = ["", f"{delimiter}\n{array_json}"]
+            tools.tmux.capture_pane.side_effect = [
+                "some pane content",
+                f"some pane content\n{delimiter}\n{array_json}",
+            ]
             with patch("ironclaude.orchestrator_mcp.time.sleep"):
                 result = tools._call_grader("sys prompt", "user prompt", batch=True)
         assert isinstance(result, list)
@@ -4961,7 +4992,10 @@ class TestCallGraderBatch:
         single_json = '{"grade":"A","approved":true,"feedback":"Good","recommended_model":"claude-sonnet"}'
         with patch("ironclaude.orchestrator_mcp.secrets.token_hex", return_value="abc12345"):
             delimiter = "GRADER_RESPONSE_abc12345"
-            tools.tmux.read_log_tail.side_effect = ["", f"{delimiter}\n{single_json}"]
+            tools.tmux.capture_pane.side_effect = [
+                "some pane content",
+                f"some pane content\n{delimiter}\n{single_json}",
+            ]
             with patch("ironclaude.orchestrator_mcp.time.sleep"):
                 result = tools._call_grader("sys prompt", "user prompt")
         assert isinstance(result, dict)
@@ -5498,3 +5532,653 @@ class TestShadowThreadFiring:
         call_args = tools._fire_shadow_thread.call_args[0]
         assert call_args[0] == "approve_plan"
         assert call_args[1] == "ap1"
+
+
+class TestReadPmState:
+    def _seed_sessions_db(self, claude_dir, uuid, pm="on", stage="executing"):
+        db = sqlite3.connect(str(claude_dir / "ironclaude.db"))
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS sessions ("
+            "terminal_session TEXT PRIMARY KEY, professional_mode TEXT,"
+            " workflow_stage TEXT, updated_at TEXT)"
+        )
+        db.execute(
+            "INSERT INTO sessions (terminal_session, professional_mode, workflow_stage)"
+            " VALUES (?, ?, ?)", (uuid, pm, stage))
+        db.commit()
+        db.close()
+
+    def test_no_id_file_returns_unknown(self, tools, mock_tmux, tmp_path):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        mock_tmux.list_pane_pid.return_value = "12345"
+        out = tools._read_pm_state_via_sqlite("ic-x", _claude_dir=claude)
+        assert out["professional_mode"] == "unknown"
+        assert out["workflow_stage"] is None
+
+    def test_seeded_row_reported_and_unchanged(self, tools, mock_tmux, tmp_path):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        uuid = "a" * 36
+        (claude / "ironclaude-session-12345.id").write_text(uuid)
+        self._seed_sessions_db(claude, uuid, pm="on", stage="executing")
+        mock_tmux.list_pane_pid.return_value = "12345"
+        out = tools._read_pm_state_via_sqlite("ic-x", _claude_dir=claude)
+        assert out["professional_mode"] == "on"
+        assert out["workflow_stage"] == "executing"
+        db = sqlite3.connect(str(claude / "ironclaude.db"))
+        row = db.execute("SELECT professional_mode, workflow_stage FROM sessions"
+                         " WHERE terminal_session=?", (uuid,)).fetchone()
+        db.close()
+        assert row == ("on", "executing")
+
+    def test_id_file_but_no_row_returns_off(self, tools, mock_tmux, tmp_path):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        uuid = "b" * 36
+        (claude / "ironclaude-session-12345.id").write_text(uuid)
+        self._seed_sessions_db(claude, "c" * 36)
+        mock_tmux.list_pane_pid.return_value = "12345"
+        out = tools._read_pm_state_via_sqlite("ic-x", _claude_dir=claude)
+        assert out["professional_mode"] == "off"
+        assert out["workflow_stage"] is None
+
+
+def _make_ollama_client_mock(get_ps_result=None, post_generate_result=None,
+                             get_ps_error=None, post_generate_error=None):
+    """Build a mock OllamaClient for list_claude_sessions summarization tests."""
+    mock_client = MagicMock()
+    if get_ps_error:
+        mock_client.get_ps.side_effect = get_ps_error
+    else:
+        mock_client.get_ps.return_value = get_ps_result or {"models": []}
+    if post_generate_error:
+        mock_client.post_generate.side_effect = post_generate_error
+    else:
+        mock_client.post_generate.return_value = post_generate_result or "summary text"
+    return mock_client
+
+
+class TestListClaudeSessions:
+    def test_excludes_ic_and_flags_confidence(self, tools, mock_tmux):
+        mock_tmux.list_sessions.return_value = ["test-session", "ic-w1", "ic-grader", "plain"]
+        mock_tmux.list_pane_pid.side_effect = lambda n, **k: "111"
+        mock_tmux.pane_current_command.side_effect = (
+            lambda n, **k: "node" if n == "test-session" else "bash")
+        mock_tmux.capture_pane.side_effect = (
+            lambda n, **k: "ironclaude v1.0.13" if n == "test-session" else "$ ")
+        out = json.loads(tools.list_claude_sessions())
+        names = [c["name"] for c in out]
+        assert names == ["test-session", "plain"]
+        rw = next(c for c in out if c["name"] == "test-session")
+        assert rw["confidence"] == "high"
+        plain = next(c for c in out if c["name"] == "plain")
+        assert plain["confidence"] == "low"
+
+    def test_happy_path_returns_sample_and_summary(self, tools, mock_tmux):
+        """Happy path: Ollama available, returns both sample and summary per session."""
+        mock_tmux.list_sessions.return_value = ["my-session"]
+        mock_tmux.list_pane_pid.return_value = "12345"
+        mock_tmux.pane_current_command.return_value = "node"
+        mock_tmux.capture_pane.return_value = "Claude Code is active in /home/user/projects/myproject\n" * 10
+
+        mock_client = _make_ollama_client_mock(
+            post_generate_result="This session runs Claude Code in myproject repo, currently active."
+        )
+        tools._get_ollama_client = MagicMock(return_value=mock_client)
+
+        result = json.loads(tools.list_claude_sessions())
+        assert len(result) == 1
+        session = result[0]
+        assert session["name"] == "my-session"
+        assert session["summary"] == "This session runs Claude Code in myproject repo, currently active."
+        assert "sample" in session
+        assert len(session["sample"]) <= 200
+        assert session["pane_pid"] == "12345"
+        assert session["confidence"] == "high"
+
+    def test_ollama_unavailable_all_sessions_get_error(self, tools, mock_tmux):
+        """When Ollama is unreachable at pre-check, all sessions get explicit error string."""
+        mock_tmux.list_sessions.return_value = ["session-a", "session-b"]
+        mock_tmux.list_pane_pid.return_value = "999"
+        mock_tmux.pane_current_command.return_value = ""
+        mock_tmux.capture_pane.return_value = "some content"
+
+        mock_client = _make_ollama_client_mock(get_ps_error=OllamaError("connection refused"))
+        tools._get_ollama_client = MagicMock(return_value=mock_client)
+
+        result = json.loads(tools.list_claude_sessions())
+        assert len(result) == 2
+        for session in result:
+            assert session["summary"] == "ERROR: Ollama unavailable — summary not generated"
+        mock_client.post_generate.assert_not_called()
+
+    def test_per_session_ollama_error_continues_other_sessions(self, tools, mock_tmux):
+        """Per-session OllamaError: that session gets error string, others still processed."""
+        mock_tmux.list_sessions.return_value = ["session-fail", "session-ok"]
+        mock_tmux.list_pane_pid.return_value = "111"
+        mock_tmux.pane_current_command.return_value = ""
+        mock_tmux.capture_pane.return_value = "some terminal output"
+
+        call_count = {"n": 0}
+
+        def post_generate_side_effect(payload):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise OllamaError("model timeout")
+            return "Session is idle in /home/user."
+
+        mock_client = MagicMock()
+        mock_client.get_ps.return_value = {"models": []}
+        mock_client.post_generate.side_effect = post_generate_side_effect
+        tools._get_ollama_client = MagicMock(return_value=mock_client)
+
+        result = json.loads(tools.list_claude_sessions())
+        assert len(result) == 2
+        fail_session = next(s for s in result if s["name"] == "session-fail")
+        ok_session = next(s for s in result if s["name"] == "session-ok")
+        assert fail_session["summary"].startswith("ERROR:")
+        assert "model timeout" in fail_session["summary"]
+        assert ok_session["summary"] == "Session is idle in /home/user."
+
+    def test_empty_pane_content_gets_no_content_error(self, tools, mock_tmux):
+        """Empty pane content: summary field reports no content error, no Ollama call."""
+        mock_tmux.list_sessions.return_value = ["empty-session"]
+        mock_tmux.list_pane_pid.return_value = "222"
+        mock_tmux.pane_current_command.return_value = ""
+        mock_tmux.capture_pane.return_value = ""
+
+        mock_client = _make_ollama_client_mock()
+        tools._get_ollama_client = MagicMock(return_value=mock_client)
+
+        result = json.loads(tools.list_claude_sessions())
+        assert len(result) == 1
+        assert result[0]["summary"] == "ERROR: no pane content to summarize"
+        mock_client.post_generate.assert_not_called()
+
+    def test_excludes_ic_sessions_from_summarization(self, tools, mock_tmux):
+        """ic-* sessions are excluded; only non-ic sessions appear with summaries."""
+        mock_tmux.list_sessions.return_value = ["ic-w1", "ic-grader", "my-session"]
+        mock_tmux.list_pane_pid.return_value = "333"
+        mock_tmux.pane_current_command.return_value = ""
+        mock_tmux.capture_pane.return_value = "some content"
+
+        mock_client = _make_ollama_client_mock(post_generate_result="A summary.")
+        tools._get_ollama_client = MagicMock(return_value=mock_client)
+
+        result = json.loads(tools.list_claude_sessions())
+        names = [s["name"] for s in result]
+        assert "ic-w1" not in names
+        assert "ic-grader" not in names
+        assert names == ["my-session"]
+
+    def test_both_sample_and_summary_fields_present(self, tools, mock_tmux):
+        """Every session dict has both sample and summary keys alongside existing fields."""
+        mock_tmux.list_sessions.return_value = ["sess-1", "sess-2"]
+        mock_tmux.list_pane_pid.return_value = "444"
+        mock_tmux.pane_current_command.return_value = ""
+        mock_tmux.capture_pane.return_value = "terminal content here"
+
+        mock_client = _make_ollama_client_mock(post_generate_result="A summary.")
+        tools._get_ollama_client = MagicMock(return_value=mock_client)
+
+        result = json.loads(tools.list_claude_sessions())
+        assert len(result) == 2
+        for session in result:
+            assert "sample" in session
+            assert "summary" in session
+            assert "name" in session
+            assert "pane_pid" in session
+            assert "confidence" in session
+
+
+class TestAdoptSession:
+    def test_rejects_existing_worker_id(self, tools, registry, mock_tmux):
+        registry.register_worker("d1", "claude-opus", "ic-d1", repo="/r", description="x")
+        out = tools.adopt_session("test-session", "d1", repo="/r")
+        assert "error" in out
+
+    def test_rejects_existing_target_session(self, tools, mock_tmux):
+        mock_tmux.has_session.side_effect = lambda n, **k: n == "ic-d2"
+        out = tools.adopt_session("test-session", "d2", repo="/r")
+        assert "error" in out
+
+    def test_rejects_missing_source(self, tools, mock_tmux):
+        mock_tmux.has_session.side_effect = lambda n, **k: False
+        out = tools.adopt_session("ghost", "d3", repo="/r")
+        assert "error" in out
+
+    def test_success_renames_registers_reports(self, tools, registry, mock_tmux):
+        mock_tmux.has_session.side_effect = lambda n, **k: n == "test-session"
+        mock_tmux.rename_session.return_value = True
+        mock_tmux.capture_pane.return_value = "recent work output"
+        tools._read_pm_state_via_sqlite = MagicMock(return_value={
+            "professional_mode": "on", "workflow_stage": "executing", "session_uuid": "z" * 36})
+        out = tools.adopt_session("test-session", "d4", repo="/r", description="impl")
+        assert out["worker_id"] == "d4"
+        assert out["tmux_session"] == "ic-d4"
+        assert out["professional_mode"] == "on"
+        assert out["workflow_stage"] == "executing"
+        assert "recent work output" in out["recent_output"]
+        mock_tmux.rename_session.assert_called_once_with("test-session", "ic-d4")
+        mock_tmux.setup_log_capture.assert_called_once_with("ic-d4")
+        w = registry.get_worker("d4")
+        assert w is not None
+        assert w["tmux_session"] == "ic-d4"
+        assert w["status"] == "running"
+
+
+class TestResumeSession:
+    def test_rejects_existing_worker_id(self, tools, registry, mock_tmux):
+        registry.register_worker("d1", "claude-opus", "ic-d1", repo="/r", description="x")
+        out = tools.resume_session("aaaa-1111", "d1", repo="/r")
+        assert "error" in out
+
+    def test_rejects_existing_target_session(self, tools, mock_tmux):
+        mock_tmux.has_session.side_effect = lambda n, **k: n == "ic-d2"
+        out = tools.resume_session("aaaa-2222", "d2", repo="/r")
+        assert "error" in out
+
+    def test_spawn_fails(self, tools, mock_tmux):
+        mock_tmux.has_session.return_value = False
+        mock_tmux.spawn_session.return_value = False
+        tools._ensure_claude_md = MagicMock()
+        tools.ensure_worker_trusted = MagicMock()
+        out = tools.resume_session("aaaa-3333", "d3", repo="/r")
+        assert "error" in out
+
+    def test_pm_failure_kills_session(self, tools, mock_tmux):
+        mock_tmux.has_session.return_value = False
+        mock_tmux.spawn_session.return_value = True
+        tools._ensure_claude_md = MagicMock()
+        tools.ensure_worker_trusted = MagicMock()
+        tools._wait_for_ready = MagicMock(return_value=True)
+        tools._activate_pm_via_sqlite = MagicMock(return_value="timeout waiting for session ID")
+        out = tools.resume_session("aaaa-4444", "d4", repo="/r")
+        assert "error" in out
+        mock_tmux.kill_session.assert_called_once_with("ic-d4")
+
+    def test_success_spawns_activates_registers(self, tools, registry, mock_tmux):
+        session_id = "e6d6a6fb-35ae-4ddf-ba2d-3f098c24b9ec"
+        mock_tmux.has_session.return_value = False
+        mock_tmux.spawn_session.return_value = True
+        mock_tmux.capture_pane.return_value = "resumed context output"
+        tools._ensure_claude_md = MagicMock()
+        tools.ensure_worker_trusted = MagicMock()
+        tools._wait_for_ready = MagicMock(return_value=True)
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._read_pm_state_via_sqlite = MagicMock(return_value={
+            "professional_mode": "on", "workflow_stage": "executing", "session_uuid": "z" * 36,
+        })
+        out = tools.resume_session(session_id, "d5", repo="/r", description="resuming auth work")
+        assert out["worker_id"] == "d5"
+        assert out["tmux_session"] == "ic-d5"
+        assert out["professional_mode"] == "on"
+        assert out["workflow_stage"] == "executing"
+        assert "resumed context output" in out["recent_output"]
+        spawn_call = mock_tmux.spawn_session.call_args
+        assert "--resume" in spawn_call.args[1]
+        assert session_id in spawn_call.args[1]
+        w = registry.get_worker("d5")
+        assert w is not None
+        assert w["tmux_session"] == "ic-d5"
+        assert w["status"] == "running"
+
+
+class TestDoGraderSendAndPoll:
+    """Tests for _do_grader_send_and_poll — the tmux grader polling loop."""
+
+    NONCE = "deadbeef12345678"
+
+    def _make_tools(self, mock_tmux, registry):
+        tools = OrchestratorTools(registry, mock_tmux)
+        tools.GRADER_TIMEOUT_SECONDS = 1  # fast timeout for tests
+        tools._wait_for_grader_clear = MagicMock()
+        return tools
+
+    def _pane_with_response(self, grade="B", approved=True, feedback="Code fixes are real and correct."):
+        json_body = json.dumps({
+            "grade": grade,
+            "approved": approved,
+            "feedback": feedback,
+            "recommended_model": "claude-sonnet",
+        })
+        return f"some prior content\nGRADER_RESPONSE_{self.NONCE}\n{json_body}"
+
+    def test_uses_capture_pane_not_read_log_tail(self, registry, mock_tmux):
+        """capture_pane (not read_log_tail) must be called in the polling loop."""
+        tools = self._make_tools(mock_tmux, registry)
+        mock_tmux.capture_pane.return_value = self._pane_with_response()
+
+        with patch("ironclaude.orchestrator_mcp.secrets.token_hex", return_value=self.NONCE):
+            tools._do_grader_send_and_poll("sys", "user")
+
+        mock_tmux.capture_pane.assert_called()
+        mock_tmux.read_log_tail.assert_not_called()
+
+    def test_returns_clean_feedback_text(self, registry, mock_tmux):
+        """Feedback text from capture_pane must be returned without corruption."""
+        tools = self._make_tools(mock_tmux, registry)
+        feedback = "Code fixes are real and correct: no spaces dropped."
+        mock_tmux.capture_pane.return_value = self._pane_with_response(feedback=feedback)
+
+        with patch("ironclaude.orchestrator_mcp.secrets.token_hex", return_value=self.NONCE):
+            result = tools._do_grader_send_and_poll("sys", "user")
+
+        assert result is not None
+        assert result["feedback"] == feedback
+        assert result["grade"] == "B"
+        assert result["approved"] is True
+
+    def test_uses_rfind_for_delimiter(self, registry, mock_tmux):
+        """rfind must be used so the response (last occurrence) is found, not prompt echo."""
+        tools = self._make_tools(mock_tmux, registry)
+        # Pane shows prompt echo first, then actual response — rfind lands on second occurrence
+        prompt_echo = (
+            f"Begin your JSON response after the delimiter: GRADER_RESPONSE_{self.NONCE}"
+        )
+        actual_response = json.dumps({
+            "grade": "A",
+            "approved": True,
+            "feedback": "All good.",
+            "recommended_model": "claude-sonnet",
+        })
+        pane = f"{prompt_echo}\nGRADER_RESPONSE_{self.NONCE}\n{actual_response}"
+        mock_tmux.capture_pane.return_value = pane
+
+        with patch("ironclaude.orchestrator_mcp.secrets.token_hex", return_value=self.NONCE):
+            result = tools._do_grader_send_and_poll("sys", "user")
+
+        assert result is not None
+        assert result["feedback"] == "All good."
+
+    def test_timeout_returns_none(self, registry, mock_tmux):
+        """Returns None when delimiter never appears within timeout."""
+        tools = self._make_tools(mock_tmux, registry)
+        mock_tmux.capture_pane.return_value = "no delimiter here"
+
+        with patch("ironclaude.orchestrator_mcp.secrets.token_hex", return_value=self.NONCE):
+            result = tools._do_grader_send_and_poll("sys", "user")
+
+        assert result is None
+
+
+class TestOllamaComplexityGate:
+    """Tests for _check_ollama_objective_complexity pre-spawn gate."""
+
+    def test_rejects_objective_with_too_many_files(self, tools):
+        ok, reason = tools._check_ollama_objective_complexity(
+            "Modify `a.py`, `b.py`, `c.py` to add validation. Success: all tests pass."
+        )
+        assert not ok
+        assert "3 files" in reason
+
+    def test_rejects_open_ended_verb_without_success(self, tools):
+        ok, reason = tools._check_ollama_objective_complexity(
+            "Refactor `auth.py` to use dataclasses."
+        )
+        assert not ok
+        assert "refactor" in reason.lower()
+
+    def test_passes_open_ended_verb_with_success(self, tools):
+        ok, reason = tools._check_ollama_objective_complexity(
+            "Refactor `auth.py` to use dataclasses. "
+            "Success: `git diff auth.py` shows only dataclass changes."
+        )
+        assert ok
+        assert reason == ""
+
+    def test_rejects_open_ended_verb_with_unsuccessful(self, tools):
+        """'unsuccessful' substring should not bypass the open-ended verb gate (FW-3)."""
+        ok, reason = tools._check_ollama_objective_complexity(
+            "Analyze why login was unsuccessful"
+        )
+        assert not ok
+        assert "analyze" in reason.lower()
+
+    def test_rejects_objective_over_1500_chars(self, tools):
+        ok, reason = tools._check_ollama_objective_complexity("x" * 1501)
+        assert not ok
+        assert "1500" in reason
+
+    def test_passes_valid_single_file_objective(self, tools):
+        ok, reason = tools._check_ollama_objective_complexity(
+            "Target: `src/auth.py`\n"
+            "Grounding: read `src/auth.py` first\n"
+            "Action: add `validate_email(email: str) -> bool` at line 45\n"
+            "Constraint: do not change existing functions\n"
+            "Success: `git diff src/auth.py` shows new function added at line 45"
+        )
+        assert ok
+        assert reason == ""
+
+    def test_spawn_worker_ollama_gate_returns_error_on_bad_objective(self, tools, mock_tmux):
+        """spawn_worker returns error dict when gate fires before grader."""
+        tools._check_spawn_preconditions = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        result = tools.spawn_worker(
+            worker_id="o1",
+            worker_type="ollama",
+            repo="/tmp/repo",
+            objective="Refactor `a.py`, `b.py`, `c.py` to improve performance",
+            model_name="gemma4:12b",
+        )
+        assert isinstance(result, dict)
+        assert "complexity gate" in result.get("error", "").lower()
+
+    def test_spawn_workers_ollama_gate_returns_error_on_bad_objective(self, tools, mock_tmux):
+        """spawn_workers returns error dict when ollama request fails gate."""
+        tools._check_spawn_preconditions = MagicMock(return_value=None)
+        result = tools.spawn_workers([{
+            "worker_id": "o1",
+            "worker_type": "ollama",
+            "repo": "/tmp/repo",
+            "objective": "Refactor `a.py`, `b.py`, `c.py` to improve performance",
+            "model_name": "gemma4:12b",
+        }])
+        assert isinstance(result, dict)
+        assert "o1" in result.get("error", "")
+        assert "complexity gate" in result.get("error", "").lower()
+
+    def test_spawn_worker_non_ollama_skips_gate(self, tools, mock_tmux):
+        """Gate is not applied to claude-sonnet workers."""
+        tools._check_spawn_preconditions = MagicMock(return_value=None)
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        result = tools.spawn_worker(
+            worker_id="w1",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="Refactor `a.py`, `b.py`, `c.py` to improve performance",
+        )
+        assert isinstance(result, str)
+        assert "spawned" in result.lower()
+
+
+def test_batch_spawn_ollama_cmd_has_playbook_and_variant(tools, mock_tmux):
+    """Batch-spawned ollama worker gets full env matching single-spawn path."""
+    tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+    tools._check_spawn_preconditions = MagicMock(return_value=None)
+    tools._call_local_grader = MagicMock(return_value={
+        "grade": "A", "approved": True, "feedback": "ok", "confidence": "high",
+    })
+    tools._ensure_ollama_ctx_variant = MagicMock(return_value="ic-gemma4-12b-131072")
+    tools._config = {"ollama_worker_max_output_tokens": 64000}
+
+    tools.spawn_workers([{
+        "worker_id": "o1",
+        "worker_type": "ollama",
+        "repo": "/tmp/repo",
+        "objective": (
+            "Target: `config.py`\n"
+            "Grounding: read config.py\n"
+            "Action: add MAX_TIMEOUT=30 constant at line 5\n"
+            "Constraint: do not change other constants\n"
+            "Success: git diff config.py shows MAX_TIMEOUT=30"
+        ),
+        "model_name": "gemma4:12b",
+    }])
+
+    assert mock_tmux.spawn_session.called
+    cmd = mock_tmux.spawn_session.call_args[0][1]
+    assert "ANTHROPIC_BASE_URL" in cmd
+    assert "--model ic-gemma4-12b-131072" in cmd
+    assert "--append-system-prompt" in cmd
+    assert "IronClaude Worker" in cmd
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000" in cmd
+    tools._ensure_ollama_ctx_variant.assert_called_once_with("gemma4:12b")
+
+
+class TestValidateKeysControlDenylist:
+    """_validate_keys must reject tmux control-sequence tokens (C-c, C-d, ...)."""
+
+    def test_rejects_ctrl_c(self):
+        from ironclaude.orchestrator_mcp import _validate_keys
+        with pytest.raises(ValueError, match="Invalid key"):
+            _validate_keys(["C-c"])
+
+    def test_rejects_ctrl_d_z_backslash_bracket(self):
+        from ironclaude.orchestrator_mcp import _validate_keys
+        for tok in ["C-d", "C-z", "C-\\", "C-["]:
+            with pytest.raises(ValueError, match="Invalid key"):
+                _validate_keys([tok])
+
+    def test_rejects_case_insensitive_and_meta(self):
+        from ironclaude.orchestrator_mcp import _validate_keys
+        for tok in ["c-c", "c-d", "M-x", "m-x"]:
+            with pytest.raises(ValueError, match="Invalid key"):
+                _validate_keys([tok])
+
+    def test_rejects_control_token_mixed_with_navigation(self):
+        from ironclaude.orchestrator_mcp import _validate_keys
+        with pytest.raises(ValueError, match="Invalid key"):
+            _validate_keys(["Down", "C-c", "Enter"])
+
+    def test_allows_navigation_keys(self):
+        from ironclaude.orchestrator_mcp import _validate_keys
+        # Should not raise
+        _validate_keys(["Down", "Up", "Space", "Tab", "Enter", "Escape"])
+
+    def test_allows_short_printable_text(self):
+        from ironclaude.orchestrator_mcp import _validate_keys
+        # Plain text (not a control sequence) still passes
+        _validate_keys(["hello", "y", "1", "$(x)"])
+
+    def test_send_keys_to_worker_rejects_ctrl_c(self, tools, registry, mock_tmux):
+        """Integration: navigation-only tool refuses C-c before reaching tmux."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        with pytest.raises(ValueError, match="Invalid key"):
+            tools.send_keys_to_worker("w1", ["C-c"])
+        mock_tmux.send_raw_keys.assert_not_called()
+
+
+class TestSpawnWorkersResultSlotMapping:
+    """Batch spawn must attribute each result to the correct request slot."""
+
+    def test_mixed_success_and_unknown_type_positional(self, tools, mock_tmux):
+        """A (valid) at slot 0, B (unknown type) at slot 1 — no cross-attribution."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok",
+        })
+        tools._call_grader = MagicMock(return_value=[
+            {"worker_id": "w1", "grade": "A", "approved": True,
+             "feedback": "ok", "recommended_model": "claude-sonnet"},
+            {"worker_id": "w2", "grade": "A", "approved": True,
+             "feedback": "ok", "recommended_model": "claude-sonnet"},
+        ])
+        results = tools.spawn_workers([
+            {"worker_id": "w1", "worker_type": "claude-sonnet",
+             "repo": "/tmp/repo", "objective": "Task A"},
+            {"worker_id": "w2", "worker_type": "banana",
+             "repo": "/tmp/repo", "objective": "Task B"},
+        ])
+        assert len(results) == 2
+        # A's slot holds A's result (times out in test env — no real tmux pane)
+        assert results[0]["worker_id"] == "w1"
+        # B's slot holds B's unknown-type error, not A's
+        assert results[1]["worker_id"] == "w2"
+        assert "Unknown worker type" in results[1]["error"]
+
+
+class TestFailedWorkerBasesBounded:
+    """_failed_worker_bases must stay bounded, not grow forever."""
+
+    def test_tracking_many_bases_stays_bounded(self, tools):
+        from ironclaude.orchestrator_mcp import _MAX_FAILED_WORKER_BASES
+        for i in range(_MAX_FAILED_WORKER_BASES * 3):
+            tools._track_failed_base(f"base{i}")
+        assert len(tools._failed_worker_bases) <= _MAX_FAILED_WORKER_BASES
+
+
+class TestGameSubprocessCapture:
+    """game_* actions must capture subprocess output + set a timeout.
+
+    Uncaptured cliclick stdout can corrupt the stdio MCP JSON-RPC frame.
+    """
+
+    def test_game_click_captures_and_times_out(self, tools):
+        with patch("ironclaude.orchestrator_mcp.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            tools.game_click(10, 20)
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("capture_output") is True
+        assert "timeout" in kwargs and kwargs["timeout"]
+
+    def test_game_type_captures_and_times_out(self, tools):
+        with patch("ironclaude.orchestrator_mcp.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            tools.game_type("hello")
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("capture_output") is True
+        assert "timeout" in kwargs and kwargs["timeout"]
+
+    def test_game_key_captures_and_times_out(self, tools):
+        with patch("ironclaude.orchestrator_mcp.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            tools.game_key("Return")
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("capture_output") is True
+        assert "timeout" in kwargs and kwargs["timeout"]
+
+
+class TestRestartWatchdogForkSafety:
+    """Watchdog must signal FIRST and log AFTER (fork-safe): a frozen logging
+    lock in the forked child must not block SIGHUP delivery."""
+
+    def test_signal_sent_before_any_logging(self, tmp_path):
+        import signal as _signal
+        status_file = str(tmp_path / "status.json")
+        order = []
+
+        def record_kill(pid, sig):
+            order.append("kill")
+
+        def record_log(*a, **k):
+            order.append("log")
+
+        with patch("os.kill", side_effect=record_kill), \
+             patch("ironclaude.orchestrator_mcp.logger.warning", side_effect=record_log), \
+             patch("ironclaude.orchestrator_mcp.logger.info", side_effect=record_log), \
+             patch("ironclaude.orchestrator_mcp._lock_is_free", side_effect=[True, False]), \
+             patch("ironclaude.orchestrator_mcp.time.time", side_effect=itertools.count(0, 1)), \
+             patch("ironclaude.orchestrator_mcp.time.sleep"):
+            _restart_watchdog(12345, _signal.SIGHUP, status_file)
+
+        assert "kill" in order, "signal was never sent"
+        # No logging may precede the kill in the forked child
+        if "log" in order:
+            assert order.index("kill") < order.index("log")
+
+    def test_does_not_use_logged_kill_wrapper(self, tmp_path):
+        """The log-before-kill forensic wrapper must not run in the forked child."""
+        import signal as _signal
+        status_file = str(tmp_path / "status.json")
+        with patch("os.kill") as mock_kill, \
+             patch("ironclaude.orchestrator_mcp._logged_kill") as mock_logged_kill, \
+             patch("ironclaude.orchestrator_mcp._lock_is_free", side_effect=[True, False]), \
+             patch("ironclaude.orchestrator_mcp.time.time", side_effect=itertools.count(0, 1)), \
+             patch("ironclaude.orchestrator_mcp.time.sleep"):
+            _restart_watchdog(12345, _signal.SIGHUP, status_file)
+        mock_kill.assert_called_once_with(12345, _signal.SIGHUP)
+        mock_logged_kill.assert_not_called()

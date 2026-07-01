@@ -32,11 +32,21 @@ class SlackSocketHandler:
         self._last_disconnect_time: float | None = None
         self._registry = registry
 
+    def _is_authorized_command(self, command: dict) -> bool:
+        """Return True only if a slash command is from the configured operator.
+
+        Fails closed: when no operator id is configured, all commands are rejected.
+        """
+        if not self._operator_user_id:
+            return False
+        return command.get("user_id") == self._operator_user_id
+
     def _handle_message_event(self, event: dict, say) -> None:
         """Handle an incoming channel message event."""
         if event.get("bot_id"):
             return
-        if self._operator_user_id and event.get("user") != self._operator_user_id:
+        # Fail closed: reject when no operator is configured, or the user does not match.
+        if not self._operator_user_id or event.get("user") != self._operator_user_id:
             logger.warning("Ignoring message from non-operator user: %s", event.get("user"))
             return
         text = event.get("text", "")
@@ -97,6 +107,11 @@ class SlackSocketHandler:
         @app.command(re.compile(r".*"))
         def handle_command(ack, command, respond):
             ack()
+            if not self._is_authorized_command(command):
+                logger.warning(
+                    "Ignoring slash command from non-operator user: %s", command.get("user_id")
+                )
+                return
             cmd_name = command.get("command", "").lstrip("/").removeprefix("ironclaude")
             cmd_text = command.get("text", "")
             full_text = f"{cmd_name} {cmd_text}" if cmd_text else cmd_name

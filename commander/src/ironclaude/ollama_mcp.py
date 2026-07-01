@@ -49,6 +49,7 @@ class OllamaTools:
             ["ollama", "list"],
             capture_output=True,
             text=True,
+            timeout=60,
         )
         if result.returncode != 0:
             return {"error": result.stderr.strip()}
@@ -111,6 +112,7 @@ class OllamaTools:
             ["ollama", "show", name],
             capture_output=True,
             text=True,
+            timeout=60,
         )
         if result.returncode != 0:
             return {"error": result.stderr.strip()}
@@ -130,6 +132,7 @@ class OllamaTools:
             ["ollama", "ps"],
             capture_output=True,
             text=True,
+            timeout=60,
         )
         if result.returncode != 0:
             return {"error": result.stderr.strip()}
@@ -228,6 +231,7 @@ class OllamaTools:
             ["ollama", "rm", name],
             capture_output=True,
             text=True,
+            timeout=60,
         )
         if result.returncode != 0:
             return {"error": result.stderr.strip()}
@@ -280,6 +284,7 @@ class OllamaTools:
                 ["ollama", "create", name, "-f", tmp_path],
                 capture_output=True,
                 text=True,
+                timeout=600,
             )
         finally:
             os.unlink(tmp_path)

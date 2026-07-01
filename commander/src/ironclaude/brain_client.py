@@ -90,6 +90,7 @@ class BrainClient:
 
     MAX_PERMISSION_CORRECTIONS = 3
     PERMISSION_CORRECTION_WINDOW = 600  # seconds (10 minutes)
+    COMPACTION_DEADLINE = 1800  # seconds — max time compaction-resume may run before force-restart
     BRAIN_PID_FILE = "/tmp/ic/brain.pid"
     CORRECTION_MESSAGE = (
         "Continue without asking for permission. Do not ask "
@@ -141,7 +142,9 @@ class BrainClient:
         self._session_id: str | None = None
         self._resume_session_id: str | None = None
         self._compacting = False
+        self._compaction_started = 0.0
         self._compaction_complete = False
+        self._executing_tool: bool = False
         self._restart_reason: str = ""
         self._last_response_time = 0.0
         self._last_message_time: float = 0.0
@@ -447,12 +450,14 @@ class BrainClient:
                     )
                     if self._compacting:
                         self._compacting = False
+                        self._compaction_started = 0.0
                         self._compaction_complete = True
                     if self._stop_event.is_set():
                         break  # Intentional shutdown
                     # Session ended cleanly (likely context limit) — try to resume with compaction
                     if self._session_id:
                         self._compacting = True
+                        self._compaction_started = time.time()
                         self._resume_session_id = self._session_id
                         self._session_id = None  # Clear for next capture
                         attempt = 0  # Reset backoff for resume
@@ -463,6 +468,7 @@ class BrainClient:
                 except Exception as e:
                     self._session_log_write(f"ERROR: {e}")
                     self._compacting = False  # Clear on error to allow restart
+                    self._compaction_started = 0.0
                     if self._stop_event.is_set():
                         break
                     # Forensic snapshot: brain died from SIGTERM — log all .venv/bin/python processes
@@ -497,6 +503,16 @@ class BrainClient:
             self._close_session_log(reason)
             loop.close()
 
+    async def _maybe_correct_permission_seeking(self, text: str) -> str | None:
+        """Run the (blocking) permission-seeking grade off the event loop thread.
+
+        `_check_permission_seeking` calls the grader over blocking HTTP; running it
+        inline would stall the SDK message loop. Dispatch it to the default executor
+        so the event loop stays responsive.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._check_permission_seeking, text)
+
     def _check_permission_seeking(self, text: str) -> str | None:
         """Detect permission-seeking language in the final sentence via LLM grading."""
         parts = re.split(r'[.!?]\s+', text.rstrip())
@@ -530,6 +546,27 @@ class BrainClient:
         self._permission_correction_timestamps.append(now)
         logger.info("Permission-seeking detected in brain response, sending correction")
         return self.CORRECTION_MESSAGE
+
+    @staticmethod
+    def _pid_cmdline_matches(pid: int) -> bool:
+        """Return True if the live process `pid` still looks like a brain subprocess.
+
+        Uses the same 'claude.*stream-json.*Orchestrator' cmdline pattern as the
+        pgrep singleton scan. `ps -ww` avoids terminal-width truncation so a long
+        command line does not cause a false negative.
+        """
+        try:
+            result = subprocess.run(
+                ["ps", "-ww", "-o", "command=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=3,
+            )
+        except Exception as e:
+            logger.warning(f"cmdline recheck for PID {pid} failed: {e}")
+            return False
+        if result.returncode != 0:
+            return False
+        cmdline = result.stdout.strip()
+        return bool(re.search(r"claude.*stream-json.*Orchestrator", cmdline))
 
     @staticmethod
     def _log_brain_pid_diagnostics(pid: int) -> None:
@@ -654,8 +691,10 @@ class BrainClient:
             pid_task = asyncio.create_task(_discover_and_write_pid())
             try:
                 async for message in query(prompt=message_generator(), options=opts):
+                    self._last_response_time = time.time()
                     if isinstance(message, ResultMessage):
                         self._session_id = message.session_id
+                        self._executing_tool = False
                         if message.usage:
                             self._total_input_tokens += message.usage.get("input_tokens", 0) or 0
                             self._total_output_tokens += message.usage.get("output_tokens", 0) or 0
@@ -669,10 +708,10 @@ class BrainClient:
                         if text_parts:
                             full_text = "\n\n".join(text_parts)
                             self._response_queue.put(full_text)
-                            self._last_response_time = time.time()
+                            self._executing_tool = False
                             self._session_log_write(f"MSG_SEND chars={len(full_text)} preview={full_text[:100]!r}")
                             logger.info(f"Brain response received ({len(full_text)} chars)")
-                            correction = self._check_permission_seeking(full_text)
+                            correction = await self._maybe_correct_permission_seeking(full_text)
                             if correction is not None:
                                 await self._message_queue.put(correction)
             finally:
@@ -700,6 +739,7 @@ class BrainClient:
         if not self._running or self._loop is None or self._message_queue is None:
             return False
         self._last_message_time = time.time()
+        self._executing_tool = True
         asyncio.run_coroutine_threadsafe(
             self._message_queue.put(text), self._loop
         )
@@ -722,11 +762,53 @@ class BrainClient:
     def needs_restart(self) -> bool:
         """Check if brain needs restart (dead or unresponsive)."""
         if self._compacting:
-            return False  # Don't interfere with in-progress compaction
+            # Don't interfere with in-progress compaction — unless it has been
+            # stuck well past the deadline, in which case a hang during
+            # compaction-resume would otherwise be unrecoverable.
+            if (
+                self._compaction_started
+                and time.time() - self._compaction_started > self.COMPACTION_DEADLINE
+            ):
+                elapsed = time.time() - self._compaction_started
+                self._restart_reason = (
+                    f"compaction deadline exceeded (stuck {elapsed:.0f}s)"
+                )
+                logger.warning(
+                    f"Brain compaction deadline exceeded: stuck {elapsed:.0f}s "
+                    f"(deadline {self.COMPACTION_DEADLINE}s)"
+                )
+                return True
+            return False
         if not self.is_alive():
             self._restart_reason = "dead (thread not alive)"
             return True
-        # Timeout: message sent but no response within timeout_seconds
+        # Hard safety net: fires even during tool execution (1800s)
+        if (
+            self._executing_tool
+            and time.time() - self._last_message_time > 1800
+        ):
+            elapsed = time.time() - self._last_message_time
+            self._restart_reason = f"timeout (hung {elapsed:.0f}s during tool execution)"
+            logger.warning(
+                f"Brain hard timeout: hung {elapsed:.0f}s during tool execution "
+                f"after message sent at {self._last_message_time:.0f}"
+            )
+            return True
+        # Skip 600s check while a request is in-flight
+        if self._executing_tool:
+            return False
+        # Absolute inactivity: no SDK messages for 1800s regardless of flag state
+        if (
+            self._last_response_time > 0
+            and time.time() - self._last_response_time > 1800
+        ):
+            elapsed = time.time() - self._last_response_time
+            self._restart_reason = f"timeout (no SDK activity for {elapsed:.0f}s)"
+            logger.warning(
+                f"Brain absolute inactivity timeout: no SDK messages for {elapsed:.0f}s"
+            )
+            return True
+        # Normal timeout: message sent but no SDK activity since
         if (
             self._last_message_time > self._last_response_time
             and time.time() - self._last_message_time > self.timeout_seconds
@@ -774,9 +856,12 @@ class BrainClient:
         self._total_cost_usd = 0.0
         self._resume_session_id = None
         self._session_id = None
+        self._compacting = False
+        self._compaction_started = 0.0
         self.shutdown()
         self._last_message_time = 0.0
         self._last_response_time = 0.0
+        self._executing_tool = False
         self.start(system_prompt, cwd)
         if self.is_alive():
             self.restart_count += 1
@@ -835,7 +920,17 @@ class BrainClient:
                 logger.warning(f"pgrep scan for brain subprocess failed: {e}")
                 kill_pids = []
         else:
-            kill_pids = [pid]
+            # PID came from a stored source (instance var or PID file), not from a
+            # pattern-matched pgrep scan. Re-verify identity before killing so a
+            # recycled PID (now some unrelated process) is not killed.
+            if self._pid_cmdline_matches(pid):
+                kill_pids = [pid]
+            else:
+                logger.warning(
+                    f"Stored brain PID {pid} cmdline no longer matches brain "
+                    f"pattern — skipping kill (likely recycled/stale PID)"
+                )
+                kill_pids = []
 
         for kpid in kill_pids:
             try:
@@ -869,11 +964,27 @@ class BrainClient:
         """Shut down the brain client."""
         self._running = False
         self._stop_event.set()
+        thread_alive = False
         if self._thread is not None:
             self._thread.join(timeout=10)
-        self._thread = None
+            thread_alive = self._thread.is_alive()
         self._expected_kill = True
         self._kill_brain_subprocess()   # force-kill subprocess after thread join
         self._expected_kill = False
-        self._loop = None
+        if thread_alive:
+            # Thread did not exit within the join timeout. Nulling _loop/_thread now
+            # would leak a still-running loop (and make is_alive() report False while
+            # the thread lives). Keep the references and ask the loop to stop so its
+            # own finally-block can close it once the subprocess kill unblocks it.
+            logger.warning(
+                "Brain thread still alive after 10s join; requested loop stop, "
+                "keeping _loop/_thread references to avoid leaking a running loop"
+            )
+            if self._loop is not None and self._loop.is_running():
+                self._loop.call_soon_threadsafe(self._loop.stop)
+        else:
+            self._thread = None
+            if self._loop is not None and not self._loop.is_closed():
+                self._loop.close()
+            self._loop = None
         self._message_queue = None

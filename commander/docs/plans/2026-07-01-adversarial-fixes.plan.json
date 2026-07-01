@@ -1,0 +1,195 @@
+{
+  "name": "Adversarial Review Fixes",
+  "goal": "Fix 8 findings (FW-1 through FW-9, excluding FW-8) from the full-week blind adversarial review. DO NOT PUSH.",
+  "design_file": "docs/plans/2026-07-01-adversarial-fixes-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "FW-1+FW-2: Shadow Grader Path Validation Fix",
+      "description": "Fix _validate_path to use realpath (resolves symlinks) and os.sep-aware containment (prevents prefix collision). TDD: 2 new tests first, then fix.",
+      "allowed_files": [
+        "commander/src/ironclaude/shadow_grader.py",
+        "commander/tests/test_shadow_grader.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add test_path_prefix_collision_rejected and test_symlink_outside_allowed_roots_rejected to TestExecuteTool in test_shadow_grader.py"
+        },
+        {
+          "description": "Run new tests to verify they fail (RED)",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_shadow_grader.py::TestExecuteTool::test_path_prefix_collision_rejected tests/test_shadow_grader.py::TestExecuteTool::test_symlink_outside_allowed_roots_rejected -v",
+          "expected": "FAIL — current code uses startswith without os.sep and abspath without symlink resolution"
+        },
+        {
+          "description": "Fix _validate_path: abspath→realpath, startswith→== root or startswith(root+os.sep), /tmp/→/tmp"
+        },
+        {
+          "description": "Run all shadow grader tests to verify (GREEN)",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_shadow_grader.py -v",
+          "expected": "ALL tests pass"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/shadow_grader.py commander/tests/test_shadow_grader.py"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "FW-3+FW-4: Complexity Gate Success Check Fix",
+      "description": "Fix complexity gate substring bug: replace 'success' not in obj_lower with regex \\bsuccess\\s*: check. TDD: 1 new test first, then fix. Existing test_passes_open_ended_verb_with_success already uses Success: pattern and needs no update.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add test_rejects_open_ended_verb_with_unsuccessful to TestOllamaComplexityGate after line 5923"
+        },
+        {
+          "description": "Run new test to verify it fails (RED)",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_orchestrator_mcp.py::TestOllamaComplexityGate::test_rejects_open_ended_verb_with_unsuccessful -v",
+          "expected": "FAIL — 'unsuccessful' contains 'success' substring, bypasses gate"
+        },
+        {
+          "description": "Fix regex at line 1751: replace '\"success\" not in obj_lower' with 'not re.search(r'\\bsuccess\\s*:', obj_lower)'"
+        },
+        {
+          "description": "Run all complexity gate tests (GREEN)",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_orchestrator_mcp.py::TestOllamaComplexityGate -v",
+          "expected": "ALL 9 tests pass (8 existing + 1 new)"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "FW-5: validate_safe_id Regression Test",
+      "description": "Create tests/test_protocol.py with 2 regression tests for validate_safe_id: accepts valid IDs and rejects newline-containing IDs (guards \\Z anchor).",
+      "allowed_files": [
+        "commander/tests/test_protocol.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Create commander/tests/test_protocol.py with TestValidateSafeId class containing test_accepts_valid_id and test_rejects_newline"
+        },
+        {
+          "description": "Run tests to verify they pass (testing existing behavior, no RED phase)",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_protocol.py -v",
+          "expected": "ALL tests pass"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/tests/test_protocol.py"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "FW-7: Fallback Timeout Tuple Fix",
+      "description": "Fix both _chat_via_fallback (line 84) and _post_via_fallback (line 177) to use timeout tuple (self._connect_timeout, self._timeout) matching primary paths. TDD: add timeout assertions to both fallback tests first.",
+      "allowed_files": [
+        "commander/src/ironclaude/ollama_client.py",
+        "commander/tests/test_ollama_client.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add timeout=(2, 30) assertion to TestPostGenerate.test_primary_fails_uses_fallback and TestPostChat.test_primary_fails_uses_fallback"
+        },
+        {
+          "description": "Run updated tests to verify they fail (RED)",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_ollama_client.py::TestPostGenerate::test_primary_fails_uses_fallback tests/test_ollama_client.py::TestPostChat::test_primary_fails_uses_fallback -v",
+          "expected": "FAIL — fallback passes timeout=30 (int), not timeout=(2, 30) (tuple)"
+        },
+        {
+          "description": "Fix _chat_via_fallback line 84: timeout=self._timeout → timeout=(self._connect_timeout, self._timeout)"
+        },
+        {
+          "description": "Fix _post_via_fallback line 177: timeout=self._timeout → timeout=(self._connect_timeout, self._timeout)"
+        },
+        {
+          "description": "Run all ollama client tests (GREEN)",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_ollama_client.py -v",
+          "expected": "ALL tests pass"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/ollama_client.py commander/tests/test_ollama_client.py"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "FW-9: Summarization Model Constant Extraction",
+      "description": "Extract _DEFAULT_SUMMARIZATION_MODEL = 'gemma4:9b' at module level, replace both occurrences at lines 2794 and 2799. No tests required: pure refactor with no behavior change.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add _DEFAULT_SUMMARIZATION_MODEL = 'gemma4:9b' near top of orchestrator_mcp.py with other module-level constants"
+        },
+        {
+          "description": "Replace 'gemma4:9b' at line 2794 with _DEFAULT_SUMMARIZATION_MODEL"
+        },
+        {
+          "description": "Replace 'gemma4:9b' fallback at line 2799 with _DEFAULT_SUMMARIZATION_MODEL"
+        },
+        {
+          "description": "Run ListClaudeSessions tests to verify no regression",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_orchestrator_mcp.py::TestListClaudeSessions -v",
+          "expected": "ALL tests pass"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "name": "FW-6: Plan JSON Absolute Path Cleanup",
+      "description": "Replace 20 instances of /Users/roberthyatt/Code/ironclaude/commander with relative cd commander && form in shadow-grader.plan.json. No tests required: data file cleanup.",
+      "allowed_files": [
+        "docs/plans/2026-06-20-shadow-grader.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Replace all instances of /Users/roberthyatt/Code/ironclaude/commander with relative path form"
+        },
+        {
+          "description": "Stage changes (docs/ is gitignored, requires -f)",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f commander/docs/plans/2026-06-20-shadow-grader.plan.json"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "name": "Full Test Suite Verification",
+      "description": "Run complete test suite to verify zero regressions across all fixes. No tests required: verification-only task.",
+      "allowed_files": [],
+      "depends_on": [1, 2, 3, 4, 5, 6],
+      "steps": [
+        {
+          "description": "Run full test suite",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest -v",
+          "expected": "ALL tests pass. Zero failures, zero errors."
+        },
+        {
+          "description": "Verify staged changes",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --staged --stat",
+          "expected": "7 files changed (5 source/test files + 1 new test file + 1 data file)"
+        }
+      ]
+    }
+  ]
+}

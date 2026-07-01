@@ -746,3 +746,47 @@ class TestSlackBotDownloadFile:
         bot = SlackBot(token="xoxb-test", channel_id="C123")
         with pytest.raises(HTTPError):
             bot.download_file("https://files.slack.com/F999/screenshot.png", str(tmp_path / "out.png"))
+
+    @patch("ironclaude.slack_interface.requests")
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_download_file_rejects_non_slack_host(self, mock_client_cls, mock_requests, tmp_path):
+        """Token must not be sent to a non-Slack host; no request is made and None returned."""
+        mock_client = MagicMock()
+        mock_client.token = "xoxb-secret-token"
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-secret-token", channel_id="C123")
+        save_path = str(tmp_path / "evil.png")
+        result = bot.download_file("https://evil.example.com/F999/screenshot.png", save_path)
+        assert result is None
+        mock_requests.get.assert_not_called()
+        assert not Path(save_path).exists()
+
+    @patch("ironclaude.slack_interface.requests")
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_download_file_rejects_slack_lookalike_host(self, mock_client_cls, mock_requests, tmp_path):
+        """A host that merely contains 'slack.com' as a substring must be rejected."""
+        mock_client = MagicMock()
+        mock_client.token = "xoxb-secret-token"
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-secret-token", channel_id="C123")
+        result = bot.download_file("https://files.slack.com.evil.com/F999/x.png", str(tmp_path / "x.png"))
+        assert result is None
+        mock_requests.get.assert_not_called()
+
+    @patch("ironclaude.slack_interface.requests")
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_download_file_allows_files_slack_subdomain(self, mock_client_cls, mock_requests, tmp_path):
+        """A legitimate files.slack.com URL proceeds with a token-bearing request."""
+        mock_client = MagicMock()
+        mock_client.token = "xoxb-test"
+        mock_client_cls.return_value = mock_client
+        mock_resp = MagicMock()
+        mock_resp.content = b"ok"
+        mock_requests.get.return_value = mock_resp
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        save_path = str(tmp_path / "F1_ok.png")
+        bot.download_file("https://files.slack.com/files-pri/T0/F1/ok.png", save_path)
+        mock_requests.get.assert_called_once()
+        call = mock_requests.get.call_args
+        assert call[1]["headers"] == {"Authorization": "Bearer xoxb-test"}
+        assert Path(save_path).read_bytes() == b"ok"

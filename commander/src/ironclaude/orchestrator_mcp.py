@@ -42,6 +42,12 @@ from ironclaude.wiki_tools import WikiTools
 
 logger = logging.getLogger("ironclaude.orchestrator_mcp")
 
+_DEFAULT_SUMMARIZATION_MODEL = "gemma4:9b"
+
+# Cap the retry-escalation base set so a long-running daemon can't leak memory
+# nor permanently escalate every ever-failed base to opus.
+_MAX_FAILED_WORKER_BASES = 256
+
 _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
 _SAFE_PUSH_NAME_RE = re.compile(r'^[a-zA-Z0-9/_.-]+$')
 
@@ -51,6 +57,14 @@ _ALLOWED_NAMED_KEYS = frozenset({
     "Up", "Down", "Left", "Right", "Tab", "BTab",
     "Space", "Enter", "Escape",
 })
+
+# tmux control-sequence tokens (C-c / C-d / C-z / C-\ / C-[ / M-x …) are
+# interpreted by tmux as Ctrl-/Meta- chords, letting the navigation-only
+# send_keys tool kill/suspend/EOF a worker. Deny them regardless of case.
+_CONTROL_KEY_RE = re.compile(r'^[CM]-.', re.IGNORECASE)
+
+_GRADER_DEBUG = bool(os.environ.get('GRADER_DEBUG'))
+_GRADER_DEBUG_LOG = '/tmp/grader-debug.log'
 
 
 def _validate_keys(keys: list[str]) -> None:
@@ -64,6 +78,11 @@ def _validate_keys(keys: list[str]) -> None:
     for key in keys:
         if key in _ALLOWED_NAMED_KEYS:
             continue
+        if _CONTROL_KEY_RE.match(key):
+            raise ValueError(
+                f"Invalid key: {key!r}. Control-sequence keys (C-*/M-*) are "
+                f"rejected — they let a navigation tool signal/kill a worker."
+            )
         if key and all(0x20 <= ord(c) <= 0x7E for c in key):
             continue
         raise ValueError(
@@ -174,12 +193,23 @@ def _restart_watchdog(daemon_pid: int, sig: int, status_path: str) -> None:
         except OSError:
             pass
 
-    # Send signal
+    # Send signal FIRST, log AFTER. This runs in a double-forked child of a
+    # multithreaded process: a logging lock held by another thread at fork time
+    # would be frozen in the child. The forensic _logged_kill logs (and shells
+    # out to `ps`) BEFORE os.kill, so a frozen lock there would mean the SIGHUP
+    # is never delivered and the daemon never restarts. Signal directly, then
+    # best-effort log once the critical kill has already gone out.
     try:
-        _logged_kill(daemon_pid, sig, f"restart_watchdog sig={sig} daemon_pid={daemon_pid}")
+        os.kill(daemon_pid, sig)
     except (ProcessLookupError, PermissionError) as e:
         _write_status("error", error=f"Failed to send signal: {e}")
         return
+    try:
+        logger.warning(
+            f"restart_watchdog delivered sig={sig} to daemon_pid={daemon_pid}"
+        )
+    except Exception:
+        pass
 
     # Phase 3: wait up to 15s for old daemon to release the lock
     deadline = time.time() + 15
@@ -400,6 +430,20 @@ class OrchestratorTools:
         self._shadow_grader = ShadowGrader(config_path=self._ollama_config_path)
         self._last_grader_delta: str = ""
 
+    def _track_failed_base(self, base: str) -> None:
+        """Record a worker base for retry escalation, keeping the set bounded.
+
+        Without a cap this set grows forever (memory leak) and permanently
+        escalates every ever-failed base to opus. Evict an arbitrary older
+        entry (never the one just added) once over the size limit.
+        """
+        self._failed_worker_bases.add(base)
+        while len(self._failed_worker_bases) > _MAX_FAILED_WORKER_BASES:
+            victim = next(iter(self._failed_worker_bases - {base}), None)
+            if victim is None:
+                break
+            self._failed_worker_bases.discard(victim)
+
     def _get_worker_command(self, worker_type: str, model_name: str = "") -> str:
         """Build worker command, using advisor config for model selection."""
         advisor = self._advisor_cfg
@@ -409,6 +453,8 @@ class OrchestratorTools:
             return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; export CLAUDE_CODE_ATTRIBUTION_HEADER=0; export ANTHROPIC_BASE_URL={shlex.quote(_ollama_url)}; export ANTHROPIC_AUTH_TOKEN=ollama; export ANTHROPIC_API_KEY=; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
         elif worker_type == "claude-opus":
             return make_opus_command(self._opus_model, self._effort_level)
+        elif worker_type == "claude-fable":
+            return make_opus_command("fable", self._effort_level)
         elif worker_type in WORKER_COMMANDS:
             if advisor.get("enabled") and worker_type == "claude-sonnet":
                 model = advisor.get("executor_model", "sonnet")  # CLI routing only — not a model selection decision
@@ -627,8 +673,6 @@ class OrchestratorTools:
         Called from _call_grader with _grader_lock already held. Returns parsed
         result dict/list on success, or None on timeout. Sends /clear in both cases.
         """
-        baseline = self.tmux.read_log_tail(self._grader_session, lines=200)
-
         nonce = secrets.token_hex(8)
         combined = (
             f"{system_prompt}\n\n---\n\n{user_prompt}\n\n"
@@ -642,21 +686,30 @@ class OrchestratorTools:
         deadline = start_time + self.GRADER_TIMEOUT_SECONDS
         delimiter = f"GRADER_RESPONSE_{nonce}"
         while time.time() < deadline:
-            current = self.tmux.read_log_tail(self._grader_session, lines=200)
-
-            # Compute delta: new output since baseline
-            if current.startswith(baseline):
-                delta = current[len(baseline):]
-            else:
-                # Log was truncated or rotated — search full current output
-                delta = current
+            try:
+                current = self.tmux.capture_pane(self._grader_session, lines=500)
+            except Exception:
+                time.sleep(2)
+                continue
+            delta = current
 
             # Only search for JSON after the nonce delimiter to prevent echo injection
-            delimiter_pos = delta.find(delimiter)
+            delimiter_pos = delta.rfind(delimiter)
             if delimiter_pos == -1:
                 time.sleep(2)
                 continue
             post_delimiter = delta[delimiter_pos + len(delimiter):]
+
+            if _GRADER_DEBUG:
+                try:
+                    with open(_GRADER_DEBUG_LOG, 'a') as _dbg:
+                        _dbg.write(
+                            f"--- grader-debug {time.time():.0f} ---\n"
+                            f"  capture_len={len(current)}\n"
+                            f"  post_delim_head={repr(post_delimiter[:200])}\n"
+                        )
+                except OSError:
+                    pass
 
             # Batch mode: extract JSON array of grade objects
             if batch:
@@ -679,12 +732,24 @@ class OrchestratorTools:
                 post_delimiter,
             )
             if json_match:
+                if _GRADER_DEBUG:
+                    try:
+                        with open(_GRADER_DEBUG_LOG, 'a') as _dbg:
+                            _dbg.write(f"  json_raw={repr(json_match.group())}\n")
+                    except OSError:
+                        pass
                 try:
                     result = json.loads(json_match.group())
                     self._last_grader_delta = delta
                     self.tmux.send_keys(self._grader_session, "/clear")
                     self._wait_for_grader_clear()
                     logger.debug("Grader responded in %.1fs", time.time() - start_time)
+                    if _GRADER_DEBUG:
+                        try:
+                            with open(_GRADER_DEBUG_LOG, 'a') as _dbg:
+                                _dbg.write(f"  feedback={repr(result.get('feedback', ''))}\n")
+                        except OSError:
+                            pass
                     return {
                         "grade": result.get("grade", "F"),
                         "approved": result.get("approved", False),
@@ -696,12 +761,24 @@ class OrchestratorTools:
                     raw = json_match.group()
                     grade_m = re.search(r'"grade"\s*:\s*"([ABCDF])"', raw)
                     approved_m = re.search(r'"approved"\s*:\s*(true|false)', raw)
-                    feedback_m = re.search(r'"feedback"\s*:\s*"(.*)"', raw, re.DOTALL)
+                    feedback_m = re.search(
+                        r'"feedback"\s*:\s*"(.*?)"(?=\s*,\s*"recommended_model"|\s*\})',
+                        raw,
+                        re.DOTALL,
+                    )
                     if grade_m and approved_m:
                         self._last_grader_delta = delta
                         self.tmux.send_keys(self._grader_session, "/clear")
                         self._wait_for_grader_clear()
                         logger.debug("Grader responded in %.1fs", time.time() - start_time)
+                        if _GRADER_DEBUG:
+                            try:
+                                with open(_GRADER_DEBUG_LOG, 'a') as _dbg:
+                                    _dbg.write(
+                                        f"  feedback_fallback={repr(feedback_m.group(1) if feedback_m else '')}\n"
+                                    )
+                            except OSError:
+                                pass
                         return {
                             "grade": grade_m.group(1),
                             "approved": approved_m.group(1) == "true",
@@ -1423,6 +1500,51 @@ class OrchestratorTools:
         )
         return None
 
+    def _read_pm_state_via_sqlite(
+        self, session_name: str, _claude_dir: Path | None = None,
+    ) -> dict:
+        """Read (without mutating) professional_mode + workflow_stage for a session.
+
+        Returns {"professional_mode", "workflow_stage", "session_uuid"}.
+        professional_mode is "unknown" when the session-id binding file is absent
+        (a manual session that never ran IronClaude's SessionStart hook).
+        """
+        claude_dir = _claude_dir if _claude_dir is not None else Path("~/.claude").expanduser()
+        unknown = {"professional_mode": "unknown", "workflow_stage": None, "session_uuid": None}
+
+        pane_pid = self.tmux.list_pane_pid(session_name)
+        if not pane_pid:
+            return unknown
+        session_id_file = claude_dir / f"ironclaude-session-{pane_pid}.id"
+        if not session_id_file.exists():
+            return unknown
+        session_uuid = session_id_file.read_text().strip()
+        if len(session_uuid) != 36:
+            return unknown
+
+        db_path = claude_dir / "ironclaude.db"
+        conn = None
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=5)
+            conn.execute("PRAGMA journal_mode=WAL")
+            row = conn.execute(
+                "SELECT professional_mode, workflow_stage FROM sessions"
+                " WHERE terminal_session=?",
+                (session_uuid,),
+            ).fetchone()
+        except sqlite3.Error as e:
+            logger.warning(f"PM read sqlite error for {session_name}: {e}")
+            return {"professional_mode": "unknown", "workflow_stage": None,
+                    "session_uuid": session_uuid}
+        finally:
+            if conn:
+                conn.close()
+        if row is None:
+            return {"professional_mode": "off", "workflow_stage": None,
+                    "session_uuid": session_uuid}
+        return {"professional_mode": row[0], "workflow_stage": row[1],
+                "session_uuid": session_uuid}
+
     def _activate_pm_via_sqlite(
         self, session_name: str, timeout: int = 30,
         max_retries: int = 3, _claude_dir: Path | None = None
@@ -1648,6 +1770,33 @@ class OrchestratorTools:
         except OllamaError as exc:
             return f"Failed to unload model '{model_name}': {exc}"
 
+    def _check_ollama_objective_complexity(self, objective: str) -> tuple[bool, str]:
+        """Return (is_valid, rejection_reason) for ollama pre-spawn complexity gate.
+
+        Rejects objectives that exceed 12B model capability:
+        - >2 unique file references (allows primary write + 1 read-only)
+        - Open-ended verb without explicit success condition
+        - Objective >1500 characters
+        """
+        file_refs = set(re.findall(
+            r'\b[\w/.-]*\w\.(?:py|md|json|yaml|yml|sh|txt|toml|cfg|ini|ts|js|tsx|go|rs|sql)\b',
+            objective,
+            re.IGNORECASE,
+        ))
+        if len(file_refs) > 2:
+            names = ", ".join(sorted(file_refs)[:3])
+            return False, f"References {len(file_refs)} files ({names}…) — ollama limit is 2"
+        open_ended = {"refactor", "improve", "analyze", "review", "optimize", "design"}
+        obj_lower = objective.lower()
+        for verb in open_ended:
+            if re.search(rf'\b{verb}\b', obj_lower) and not re.search(r'\bsuccess\s*:', obj_lower):
+                return False, f"Open-ended verb '{verb}' without explicit success condition"
+        if len(objective) > 1500:
+            return False, (
+                f"Objective exceeds 1500 characters ({len(objective)}) — decompose before spawning"
+            )
+        return True, ""
+
     def spawn_worker(
         self,
         worker_id: str,
@@ -1674,6 +1823,15 @@ class OrchestratorTools:
         if precondition_error is not None:
             return precondition_error
 
+        # Ollama complexity gate — reject objectives too broad for 12B model
+        if worker_type == "ollama":
+            ok, reason = self._check_ollama_objective_complexity(objective)
+            if not ok:
+                return {"error": (
+                    f"Ollama complexity gate rejected objective: {reason}. "
+                    "Rewrite as single-file, concrete-verb, explicit-success objective."
+                )}
+
         # Inline grader enforcement — MCP grades automatically
         avatar_skill = _load_avatar_skill().replace("{OPERATOR_NAME}", self._operator_name)
         system_prompt = f"""{avatar_skill}
@@ -1698,7 +1856,12 @@ Model recommendation (include "recommended_model" in your JSON response):
 - claude-sonnet: single-file changes, config updates, bug fixes with clear root cause,
   adding tests, documentation, straightforward features
 - claude-opus: multi-file refactors (5+ files), architectural changes requiring broad
-  codebase understanding, complex debugging with unclear root cause, greenfield design"""
+  codebase understanding, complex debugging with unclear root cause, greenfield design
+- claude-fable: highest capability — architectural decisions requiring maximum reasoning,
+  cross-codebase changes where correctness is critical
+- ollama (local 12B model): single-file edits only, concrete action verb (not "refactor"/"improve"),
+  explicit success condition present, no architectural decisions required
+  Contraindicated: multi-file scope, ambiguous outcome, architectural judgment"""
 
         # Hard-enforce brain-notes: append repo constraints before grader sees objective
         notes_path = os.path.join(repo, ".ironclaude", "brain-notes.md")
@@ -1940,6 +2103,17 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
         if precondition_error is not None:
             return precondition_error
 
+        # Ollama complexity gate — check Brain-authored content before brain-notes injection
+        for req in requests:
+            if req.get("worker_type") == "ollama":
+                ok, reason = self._check_ollama_objective_complexity(req.get("objective", ""))
+                if not ok:
+                    wid = req.get("worker_id", "unknown")
+                    return {"error": (
+                        f"Worker '{wid}' rejected by ollama complexity gate: {reason}. "
+                        "Rewrite as single-file, concrete-verb, explicit-success objective."
+                    )}
+
         # Hard-enforce brain-notes for each request
         for req in requests:
             notes_path = os.path.join(req["repo"], ".ironclaude", "brain-notes.md")
@@ -1968,7 +2142,9 @@ Grading criteria:
 
 Model recommendation (include "recommended_model" in your JSON response):
 - claude-sonnet: single-file changes, config updates, bug fixes with clear root cause
-- claude-opus: multi-file refactors (5+ files), architectural changes, complex debugging"""
+- claude-opus: multi-file refactors (5+ files), architectural changes, complex debugging
+- claude-fable: highest capability — architectural decisions requiring maximum reasoning
+- ollama (local 12B model): single-file edits only, concrete action verb, explicit success condition — no architectural decisions"""
 
         confidence_schema = {
             "type": "object",
@@ -2021,7 +2197,7 @@ Model recommendation (include "recommended_model" in your JSON response):
             opus_system_prompt = f"""{avatar_skill}
 
 You are grading {len(uncertain_indices)} spawn_worker decisions. Respond with a valid JSON ARRAY — one object per decision:
-[{{"worker_id": "...", "grade": "A|B|C|D|F", "approved": true|false, "feedback": "...", "recommended_model": "claude-sonnet|claude-opus"}}, ...]
+[{{"worker_id": "...", "grade": "A|B|C|D|F", "approved": true|false, "feedback": "...", "recommended_model": "claude-sonnet|claude-opus|ollama"}}, ...]
 
 Grading criteria (apply to EACH decision independently):
 - A: Specific objective (file paths, success criteria, constraints), correct worker type. approved=true
@@ -2032,7 +2208,9 @@ Grading criteria (apply to EACH decision independently):
 
 Model recommendation (include "recommended_model" for each):
 - claude-sonnet: single-file changes, config updates, bug fixes with clear root cause
-- claude-opus: multi-file refactors (5+ files), architectural changes, complex debugging"""
+- claude-opus: multi-file refactors (5+ files), architectural changes, complex debugging
+- claude-fable: highest capability — architectural decisions requiring maximum reasoning
+- ollama: single-file edits only, concrete action verb, explicit success condition"""
 
             decisions_text = ""
             for j, idx in enumerate(uncertain_indices, 1):
@@ -2084,12 +2262,13 @@ Model recommendation (include "recommended_model" for each):
                 g = grade.get("grade", "F") if isinstance(grade, dict) else "F"
                 results.append({"worker_id": req["worker_id"], "error": f"Rejected (grade {g}): {feedback}"})
             else:
-                approved.append((req, grade))
+                # Remember this request's slot so results stay positionally correct
+                approved.append((req, grade, len(results)))
                 results.append(None)  # placeholder — will be filled after spawn
 
         # Spawn all approved tmux sessions
         spawned = []
-        for req, grade in approved:
+        for req, grade, res_idx in approved:
             worker_type = req["worker_type"]
             worker_id = req["worker_id"]
             repo = req["repo"]
@@ -2100,13 +2279,27 @@ Model recommendation (include "recommended_model" for each):
 
             if worker_type == "claude-opus":
                 cmd = make_opus_command(self._opus_model, self._effort_level)
+            elif worker_type == "claude-fable":
+                cmd = make_opus_command("fable", self._effort_level)
             elif worker_type in WORKER_COMMANDS:
                 cmd = WORKER_COMMANDS[worker_type]
             elif worker_type == "ollama" and model_name:
-                cmd = f"export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
+                self._get_ollama_client()
+                _ollama_url = self._ollama_cfg_cache.get("url", "http://localhost:11434")
+                variant = self._ensure_ollama_ctx_variant(model_name)
+                _max_out = int(self._config.get("ollama_worker_max_output_tokens", 0))
+                _max_out_export = f"export CLAUDE_CODE_MAX_OUTPUT_TOKENS={_max_out}; " if _max_out else ""
+                cmd = (
+                    f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; "
+                    f"export CLAUDE_CODE_ATTRIBUTION_HEADER=0; "
+                    f"{_max_out_export}"
+                    f"export ANTHROPIC_BASE_URL={shlex.quote(_ollama_url)}; "
+                    f"export ANTHROPIC_AUTH_TOKEN=ollama; export ANTHROPIC_API_KEY=; "
+                    f"exec claude --model {shlex.quote(variant)} --dangerously-skip-permissions "
+                    f"--append-system-prompt {shlex.quote(OLLAMA_WORKER_PLAYBOOK)}"
+                )
             else:
-                idx = next(i for i, r in enumerate(results) if r is None)
-                results[idx] = {"worker_id": worker_id, "error": f"Unknown worker type: {worker_type}"}
+                results[res_idx] = {"worker_id": worker_id, "error": f"Unknown worker type: {worker_type}"}
                 continue
 
             cmd = f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; export ENABLE_STOP_REVIEW=0; {cmd}"
@@ -2114,23 +2307,22 @@ Model recommendation (include "recommended_model" for each):
 
             success = self.tmux.spawn_session(session_name, cmd, cwd=repo)
             if not success:
-                idx = next(i for i, r in enumerate(results) if r is None)
-                results[idx] = {"worker_id": worker_id, "error": "Failed to spawn tmux session"}
+                results[res_idx] = {"worker_id": worker_id, "error": "Failed to spawn tmux session"}
                 continue
 
-            spawned.append((req, grade, session_name))
+            spawned.append((req, grade, session_name, res_idx))
 
         # Parallel PM activation: poll all PPID files in a single loop
         # timeout raised from 120→300; now configurable via pm_timeout per request
         # when ~/.claude/session-env/ has many files (find without -maxdepth)
         claude_dir = Path("~/.claude").expanduser()
         max_pm_timeout = max(
-            (req.get("pm_timeout", 300) for req, grade in approved),
+            (req.get("pm_timeout", 300) for req, grade, res_idx in approved),
             default=300,
         )
         deadline = time.time() + max_pm_timeout
         pending = {}
-        for req, grade, session_name in spawned:
+        for req, grade, session_name, res_idx in spawned:
             try:
                 result = subprocess.run(
                     ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_pid}"],
@@ -2170,9 +2362,8 @@ Model recommendation (include "recommended_model" for each):
             time.sleep(2)
 
         # Send objectives to activated workers, clean up timed-out ones
-        for req, grade, session_name in spawned:
+        for req, grade, session_name, res_idx in spawned:
             worker_id = req["worker_id"]
-            idx = next(i for i, r in enumerate(results) if r is None)
             if session_name in activated:
                 if self._advisor_cfg.get("enabled"):
                     advisor_model = self._advisor_cfg.get("advisor_model", "opus")
@@ -2183,7 +2374,7 @@ Model recommendation (include "recommended_model" for each):
                     repo=req["repo"], description=req["objective"])
                 self.tmux.send_keys(session_name, req["objective"])
                 recommended = grade.get("recommended_model", req["worker_type"])
-                results[idx] = {
+                results[res_idx] = {
                     "worker_id": worker_id,
                     "status": "spawned",
                     "grade": grade.get("grade", "?"),
@@ -2191,7 +2382,7 @@ Model recommendation (include "recommended_model" for each):
                 }
             else:
                 self.tmux.kill_session(session_name)
-                results[idx] = {"worker_id": worker_id, "error": "PM activation timed out (batch)"}
+                results[res_idx] = {"worker_id": worker_id, "error": "PM activation timed out (batch)"}
 
         return results
 
@@ -2564,7 +2755,7 @@ Grading criteria:
         if os.path.exists(wiki_page_path):
             with open(wiki_page_path) as f:
                 raw = f.read()
-            _, _, body = self._wiki._parse_wiki_frontmatter(raw)
+            _, _, body, _ = self._wiki._parse_wiki_frontmatter(raw)
             return self._extract_ledger_json(body)
         if self.ledger_path and os.path.exists(self.ledger_path):
             try:
@@ -2627,6 +2818,185 @@ Grading criteria:
         except FileNotFoundError:
             raise ValueError(f"No log file found for worker '{worker_id}'")
 
+    def list_claude_sessions(self) -> str:
+        """List candidate Claude Code tmux sessions available for adoption.
+
+        Excludes IronClaude-managed ic-* sessions (workers + grader). For each
+        remaining session reports a heuristic confidence it is a Claude instance.
+        Returns a JSON array of {name, pane_pid, confidence, sample, summary}.
+        sample: last 200 chars of raw terminal output (backwards-compatible).
+        summary: Ollama-generated 2-4 sentence description, or explicit ERROR string.
+        """
+        # Check Ollama availability once before the session loop to avoid per-session
+        # timeout cascades when Ollama is down.
+        ollama_available = False
+        summarization_model = _DEFAULT_SUMMARIZATION_MODEL
+        try:
+            client = self._get_ollama_client()
+            client.get_ps()
+            ollama_available = True
+            summarization_model = self._ollama_cfg_cache.get("summarization_model", _DEFAULT_SUMMARIZATION_MODEL)
+        except OllamaError as e:
+            logger.debug("Ollama unavailable for session summarization: %s", e)
+
+        candidates = []
+        for name in self.tmux.list_sessions(prefix=""):
+            if name.startswith("ic-"):
+                continue
+            pane_pid = self.tmux.list_pane_pid(name)
+            cmd = (self.tmux.pane_current_command(name) or "").lower()
+            try:
+                raw = self.tmux.capture_pane(name, lines=500)
+            except subprocess.CalledProcessError:
+                raw = ""
+            confidence = "low"
+            if "claude" in cmd or "node" in cmd:
+                confidence = "medium"
+            if "ironclaude" in raw.lower() or "claude code" in raw.lower():
+                confidence = "high"
+
+            sample = _strip_ansi(raw)[-200:]
+            sample_large = _strip_ansi(raw)[-30000:]
+
+            if not ollama_available:
+                summary = "ERROR: Ollama unavailable — summary not generated"
+            elif not sample_large:
+                summary = "ERROR: no pane content to summarize"
+            else:
+                prompt = (
+                    "Summarize this terminal session in 2-4 sentences. "
+                    "Describe: what task the session is running, its current state "
+                    "(idle/active/blocked), which git repo or directory it's working in, "
+                    "and any notable context (error messages, waiting on input, etc.). "
+                    "Be concise and factual.\n\n"
+                    f"Session name: {name}\n"
+                    f"Terminal output (last ~30k chars):\n{sample_large}"
+                )
+                try:
+                    summary = self._get_ollama_client().post_generate({
+                        "model": summarization_model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"num_predict": 200},
+                    })
+                except OllamaError as e:
+                    summary = f"ERROR: Ollama summarization failed — {e}"
+
+            candidates.append({
+                "name": name,
+                "pane_pid": pane_pid,
+                "confidence": confidence,
+                "sample": sample,
+                "summary": summary,
+            })
+        return json.dumps(candidates)
+
+    def adopt_session(
+        self, session_name: str, worker_id: str,
+        repo: str, description: str = "", worker_type: str = "claude-opus",
+    ) -> str | dict:
+        """Adopt a manually-started Claude Code tmux session as an IronClaude worker.
+
+        Renames the session to ic-{worker_id}, registers it so the daemon monitors
+        it, enables log capture, and reports (read-only) its professional-mode state.
+        """
+        target = f"ic-{worker_id}"
+        if self.registry.get_worker(worker_id):
+            return {"error": f"worker_id '{worker_id}' already exists"}
+        if self.tmux.has_session(target):
+            return {"error": f"target session '{target}' already exists"}
+        if not self.tmux.has_session(session_name):
+            return {"error": f"session '{session_name}' not found"}
+        if not self.tmux.rename_session(session_name, target):
+            return {"error": f"failed to rename '{session_name}' -> '{target}'"}
+        try:
+            self.tmux.setup_log_capture(target)
+        except Exception as e:
+            logger.warning(f"adopt_session: log capture setup failed for {target}: {e}")
+        self.registry.register_worker(worker_id, worker_type, target,
+                                      repo=repo, description=description)
+        pm = self._read_pm_state_via_sqlite(target)
+        try:
+            recent_output = _strip_ansi(self.tmux.capture_pane(target, lines=200))
+        except subprocess.CalledProcessError:
+            recent_output = ""
+        self.registry.log_event("session_adopted", worker_id=worker_id,
+                                details={"from_session": session_name})
+        return {
+            "worker_id": worker_id,
+            "tmux_session": target,
+            "professional_mode": pm["professional_mode"],
+            "workflow_stage": pm["workflow_stage"],
+            "recent_output": recent_output,
+        }
+
+    def resume_session(
+        self, session_id: str, worker_id: str,
+        repo: str, description: str = "", worker_type: str = "claude-opus",
+    ) -> str | dict:
+        """Resume a previous Claude Code conversation in a new tmux session.
+
+        Creates a fresh tmux session running 'claude --resume {session_id}',
+        activates professional mode, and registers the session as an IronClaude
+        worker. Works with any past conversation, even if the original tmux
+        session is gone.
+        """
+        target = f"ic-{worker_id}"
+        if self.registry.get_worker(worker_id):
+            return {"error": f"worker_id '{worker_id}' already exists"}
+        if self.tmux.has_session(target):
+            return {"error": f"target session '{target}' already exists"}
+
+        self._ensure_claude_md(repo)
+        self.ensure_worker_trusted(repo)
+
+        cmd = (
+            f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; "
+            f"export ENABLE_STOP_REVIEW=0; "
+            f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; "
+            f"exec claude --resume {shlex.quote(session_id)} --dangerously-skip-permissions"
+        )
+
+        success = self.tmux.spawn_session(target, cmd, cwd=repo)
+        if not success:
+            return {"error": f"Failed to spawn tmux session for worker '{worker_id}'"}
+
+        try:
+            self.tmux.setup_log_capture(target)
+        except Exception as e:
+            logger.warning(f"resume_session: log capture setup failed for {target}: {e}")
+
+        ready = self._wait_for_ready(target, timeout=30)
+        if not ready:
+            log_tail = self.tmux.read_log_tail(target, lines=30)
+            if not self.tmux.has_session(target):
+                return {"error": f"Worker '{worker_id}' died before ready.\nLast output:\n{log_tail}"}
+            logger.warning(
+                "Worker '%s' not ready after timeout but session alive — proceeding.", worker_id
+            )
+
+        pm_failure = self._activate_pm_via_sqlite(target, timeout=300, max_retries=3)
+        if pm_failure is not None:
+            self.tmux.kill_session(target)
+            return {"error": f"PM activation failed for worker '{worker_id}': {pm_failure}"}
+
+        self.registry.register_worker(worker_id, worker_type, target,
+                                      repo=repo, description=description)
+        pm = self._read_pm_state_via_sqlite(target)
+        try:
+            recent_output = _strip_ansi(self.tmux.capture_pane(target, lines=200))
+        except subprocess.CalledProcessError:
+            recent_output = ""
+        self.registry.log_event("session_resumed", worker_id=worker_id,
+                                details={"session_id": session_id})
+        return {
+            "worker_id": worker_id,
+            "tmux_session": target,
+            "professional_mode": pm["professional_mode"],
+            "workflow_stage": pm["workflow_stage"],
+            "recent_output": recent_output,
+        }
+
     def kill_worker(self, worker_id: str, original_objective: str = "", evidence: str = "") -> str | dict:
         """Kill a worker's tmux session and mark it completed."""
         # Inline grader enforcement — MCP grades automatically
@@ -2661,7 +3031,7 @@ Has the worker genuinely completed its objective based on the evidence?"""
                 # Track failure for retry escalation
                 fail_base = re.sub(r'[-_]?\d*[a-z]?$', '', worker_id)
                 if fail_base:
-                    self._failed_worker_bases.add(fail_base)
+                    self._track_failed_base(fail_base)
                     logger.info(f"Tracked failure base '{fail_base}' for retry escalation")
                 return {
                     "error": f"Kill rejected by grader (grade {grade_result['grade']}). {grade_result['feedback']}",
@@ -2881,18 +3251,19 @@ Has the worker genuinely completed its objective based on the evidence?"""
 
     def game_click(self, x: int, y: int) -> str:
         """Click at screen coordinates (x, y) via cliclick."""
-        result = subprocess.run(["cliclick", f"c:{x},{y}"])
+        # capture_output keeps cliclick stdout off the stdio MCP JSON-RPC frame
+        result = subprocess.run(["cliclick", f"c:{x},{y}"], capture_output=True, timeout=10)
         return json.dumps({"action": "click", "x": x, "y": y, "success": result.returncode == 0})
 
     def game_type(self, text: str) -> str:
         """Type text at current cursor position via cliclick."""
-        result = subprocess.run(["cliclick", f"t:{text}"])
+        result = subprocess.run(["cliclick", f"t:{text}"], capture_output=True, timeout=10)
         return json.dumps({"action": "type", "text": text, "success": result.returncode == 0})
 
     def game_key(self, key: str) -> str:
         """Press a key or key combination via cliclick. Examples: 'Return', 'Escape', 'space'."""
         mapped = KEY_MAP.get(key, key.lower())
-        result = subprocess.run(["cliclick", f"kp:{mapped}"])
+        result = subprocess.run(["cliclick", f"kp:{mapped}"], capture_output=True, timeout=10)
         return json.dumps({"action": "key", "key": key, "success": result.returncode == 0})
 
     def game_kill(self) -> str:
@@ -3128,8 +3499,8 @@ Has the worker genuinely completed its objective based on the evidence?"""
 
     # ── Wiki tools (delegated to WikiTools — see ironclaude.wiki_tools) ──
 
-    def wiki_write(self, page: str, title: str, content: str) -> str:
-        return self._wiki.wiki_write(page, title, content)
+    def wiki_write(self, page: str, title: str, content: str, description: str | None = None) -> str:
+        return self._wiki.wiki_write(page, title, content, description=description)
 
     def wiki_delete(self, page: str) -> str:
         return self._wiki.wiki_delete(page)
@@ -3221,11 +3592,19 @@ def _create_mcp_server(tools: OrchestratorTools):
 
         Args:
             worker_id: Unique identifier for the worker.
-            worker_type: Model type (e.g. claude-opus, claude-sonnet).
+            worker_type: Model type (e.g. claude-opus, claude-sonnet, claude-fable).
             repo: Repository path for the worker to operate in.
-            objective: The task objective for the worker.
+            objective: The task objective for the worker. For ollama workers
+                (worker_type="ollama"), structure as:
+                  Target: [exactly one named file path]
+                  Grounding: [read target / check config before editing]
+                  Action: [concrete verb — "add X", "change Y to Z", NOT "refactor"/"improve"]
+                  Constraint: [what must NOT change]
+                  Success: [observable artifact — git diff shows line / file contains pattern]
+                Ollama models (12B) cannot handle multi-file scope, open-ended verbs, or
+                objectives >1500 characters — spawn is rejected by the complexity gate.
             allowed_paths: Optional list of file paths the worker may edit.
-            model_name: Optional explicit model name override.
+            model_name: Optional explicit model name override. Required when worker_type="ollama".
             machine: Optional remote machine name from machines.yaml. If set, worker spawns on that machine via SSH.
             pm_timeout: Seconds to wait per PM activation attempt (default: 300). Increase for slow-booting models like ollama/gemma4:31b (~600).
             pm_max_retries: Total PM activation attempts before returning error (default: 3). Each attempt waits up to pm_timeout seconds for the session ID file.
@@ -3253,6 +3632,8 @@ def _create_mcp_server(tools: OrchestratorTools):
         """Spawn multiple workers with batch grading and parallel startup.
 
         Each request: {worker_id, worker_type, repo, objective, allowed_paths?, model_name?}
+        For ollama requests, objective must name one file, use a concrete verb, and include a
+        "Success:" condition (≤1500 chars) — rejected by complexity gate otherwise.
         """
         results = tools.spawn_workers(requests)
         return json.dumps(results)
@@ -3560,7 +3941,7 @@ def _create_mcp_server(tools: OrchestratorTools):
         return json.dumps(tools.get_system_memory())
 
     @mcp.tool()
-    def wiki_write(page: str, title: str, content: str) -> str:
+    def wiki_write(page: str, title: str, content: str, description: str | None = None) -> str:
         """Write or update a wiki page.
 
         Creates the page with YAML frontmatter (title + updated date),
@@ -3574,8 +3955,10 @@ def _create_mcp_server(tools: OrchestratorTools):
             page: Page name (kebab-case, no .md extension).
             title: Human-readable page title.
             content: Markdown content for the page body.
+            description: Optional one-line summary for the wiki index. When provided,
+                used as the index summary instead of auto-extracting the first sentence.
         """
-        return tools.wiki_write(page, title, content)
+        return tools.wiki_write(page, title, content, description=description)
 
     @mcp.tool()
     def wiki_delete(page: str) -> str:
@@ -3793,6 +4176,69 @@ def _create_mcp_server(tools: OrchestratorTools):
                         the loaded_models field of spawn rejection errors.
         """
         return tools.unload_ollama_model(model_name)
+
+    @mcp.tool()
+    def list_claude_sessions() -> str:
+        """List manually-started Claude Code tmux sessions available for adoption.
+
+        Returns a JSON array of {name, pane_pid, confidence, sample}. Excludes
+        IronClaude-managed ic-* sessions.
+        """
+        return tools.list_claude_sessions()
+
+    @mcp.tool()
+    def adopt_session(
+        session_name: str,
+        worker_id: str,
+        repo: str,
+        description: str = "",
+        worker_type: str = "claude-opus",
+    ) -> str:
+        """Adopt an existing Claude Code session as an IronClaude worker.
+
+        Renames the tmux session to ic-{worker_id}, registers it for daemon
+        monitoring, enables log capture, and reports its professional-mode state
+        (read-only). After adoption, standard worker tools (send_to_worker,
+        get_worker_log, kill_worker) operate on it.
+
+        Args:
+            session_name: Existing tmux session name (from list_claude_sessions).
+            worker_id: Identifier to assign; the session is renamed to ic-{worker_id}.
+            repo: Repository path the session is working in.
+            description: Short description of what the session is doing.
+            worker_type: Metadata label (default claude-opus).
+        """
+        result = tools.adopt_session(session_name, worker_id, repo, description, worker_type)
+        if isinstance(result, dict):
+            return json.dumps(result)
+        return result
+
+    @mcp.tool()
+    def resume_session(
+        session_id: str,
+        worker_id: str,
+        repo: str,
+        description: str = "",
+        worker_type: str = "claude-opus",
+    ) -> str:
+        """Resume a previous Claude Code conversation as an IronClaude worker.
+
+        Creates a fresh tmux session running 'claude --resume {session_id}',
+        activates professional mode, and registers it for daemon monitoring.
+        Works with any past conversation — the original tmux session does not
+        need to be running.
+
+        Args:
+            session_id: Claude Code conversation UUID to resume (e.g., "e6d6a6fb-35ae-4ddf-ba2d-3f098c24b9ec").
+            worker_id: Identifier for the new worker; tmux session is named ic-{worker_id}.
+            repo: Repository path; used as the working directory for the resumed session.
+            description: Short description stored in worker registry metadata.
+            worker_type: Registry metadata label only (default claude-opus); does not control model.
+        """
+        result = tools.resume_session(session_id, worker_id, repo, description, worker_type)
+        if isinstance(result, dict):
+            return json.dumps(result)
+        return result
 
     return mcp
 

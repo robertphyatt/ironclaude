@@ -35,6 +35,7 @@ class TestListModels:
             ["ollama", "list"],
             capture_output=True,
             text=True,
+            timeout=60,
         )
         assert len(result) == 2
         assert result[0]["name"] == "llama3.2:latest"
@@ -84,6 +85,7 @@ class TestShowModel:
             ["ollama", "show", "llama3.2:latest"],
             capture_output=True,
             text=True,
+            timeout=60,
         )
         assert result["name"] == "llama3.2:latest"
         assert "raw" in result
@@ -109,6 +111,7 @@ class TestListRunning:
             ["ollama", "ps"],
             capture_output=True,
             text=True,
+            timeout=60,
         )
         assert len(result) == 1
         assert result[0]["name"] == "llama3.2:latest"
@@ -166,6 +169,7 @@ class TestRemoveModel:
             ["ollama", "rm", "llama3.2:latest"],
             capture_output=True,
             text=True,
+            timeout=60,
         )
         assert result["success"] is True
         assert result["name"] == "llama3.2:latest"
@@ -199,6 +203,7 @@ class TestCreateModel:
             ["ollama", "create", "my-model", "-f", "/tmp/Modelfile_abc123"],
             capture_output=True,
             text=True,
+            timeout=600,
         )
         assert result["success"] is True
         assert result["name"] == "my-model"
@@ -453,3 +458,56 @@ class TestNameValidation:
                 with patch("ironclaude.ollama_mcp.os.unlink"):
                     result = tools.create_model(name="my-model/v1", from_model="llama3.2:latest")
         assert result["success"] is True
+
+
+class TestSubprocessTimeouts:
+    """RED tests for subprocess timeouts: a wedged ollama CLI/daemon must not
+    hang the MCP thread forever. Every subprocess.run invocation must pass a
+    timeout kwarg.
+
+    RED signal: before the fix, list_models/show_model/list_running/
+    remove_model/create_model call subprocess.run without timeout, so
+    'timeout' is absent from call kwargs and these assertions fail.
+    """
+
+    def _ok_result(self):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+        mock_result.stderr = ""
+        return mock_result
+
+    def test_list_models_has_timeout(self, tools):
+        with patch("subprocess.run", return_value=self._ok_result()) as mock_run:
+            tools.list_models()
+        assert "timeout" in mock_run.call_args.kwargs
+        assert mock_run.call_args.kwargs["timeout"] == 60
+
+    def test_show_model_has_timeout(self, tools):
+        with patch("subprocess.run", return_value=self._ok_result()) as mock_run:
+            tools.show_model("llama3.2:latest")
+        assert "timeout" in mock_run.call_args.kwargs
+        assert mock_run.call_args.kwargs["timeout"] == 60
+
+    def test_list_running_has_timeout(self, tools):
+        with patch("subprocess.run", return_value=self._ok_result()) as mock_run:
+            tools.list_running()
+        assert "timeout" in mock_run.call_args.kwargs
+        assert mock_run.call_args.kwargs["timeout"] == 60
+
+    def test_remove_model_has_timeout(self, tools):
+        with patch("subprocess.run", return_value=self._ok_result()) as mock_run:
+            tools.remove_model("llama3.2:latest")
+        assert "timeout" in mock_run.call_args.kwargs
+        assert mock_run.call_args.kwargs["timeout"] == 60
+
+    def test_create_model_has_timeout(self, tools):
+        with patch("subprocess.run", return_value=self._ok_result()) as mock_run:
+            with patch("ironclaude.ollama_mcp.tempfile.NamedTemporaryFile") as mock_tmpfile:
+                mock_file = MagicMock()
+                mock_file.name = "/tmp/Modelfile_test"
+                mock_tmpfile.return_value = mock_file
+                with patch("ironclaude.ollama_mcp.os.unlink"):
+                    tools.create_model(name="my-model", from_model="llama3.2:latest")
+        assert "timeout" in mock_run.call_args.kwargs
+        assert mock_run.call_args.kwargs["timeout"] == 600

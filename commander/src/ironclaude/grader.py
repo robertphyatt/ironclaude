@@ -21,6 +21,8 @@ _THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 # Strip leaked chat-template control tokens (e.g. <|tool_response>, <|im_end|>)
 # that small local models sometimes emit around their JSON output.
 _SPECIAL_TOKEN_RE = re.compile(r"<\|[^>]*>")
+# Strip markdown code fences (```json ... ```) that some models wrap JSON in.
+_MARKDOWN_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 
 class LocalGrader:
@@ -91,12 +93,19 @@ class LocalGrader:
         result_text = _THINK_TAG_RE.sub("", result_text)
         result_text = _SPECIAL_TOKEN_RE.sub("", result_text).strip()
 
+        fence_match = _MARKDOWN_FENCE_RE.search(result_text)
+        if fence_match:
+            result_text = fence_match.group(1)
+
         try:
             parsed = json.loads(result_text)
         except json.JSONDecodeError:
             detail = f"Non-JSON response ({len(result_text)} chars): {result_text[:200]}"
             logger.warning(detail)
             return self._build_infrastructure_error(detail)
+
+        if not isinstance(parsed, dict):
+            return self._build_infrastructure_error("Non-dict verdict: " + result_text[:200])
 
         if schema:
             required = schema.get("required", [])

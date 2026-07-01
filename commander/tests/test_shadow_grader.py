@@ -1,5 +1,6 @@
 """Unit tests for ShadowGrader (Ollama chat-based grading with tool calling)."""
 import json
+import os
 import subprocess
 import pytest
 from unittest.mock import MagicMock, patch, mock_open
@@ -53,6 +54,14 @@ class TestGradeWithTools:
     def test_non_json_verdict_returns_error(self):
         grader, mock_client = _make_shadow_grader()
         mock_client.post_chat.return_value = ("not json at all", [])
+        result = grader.grade_with_tools("sys", "user")
+        assert result["infrastructure_error"] is True
+        assert result["tool_calls"] == []
+
+    def test_non_dict_verdict_returns_infrastructure_error(self):
+        """A verdict that is valid JSON but not a dict (e.g. bare true/number) must not raise."""
+        grader, mock_client = _make_shadow_grader()
+        mock_client.post_chat.return_value = ("true", [])
         result = grader.grade_with_tools("sys", "user")
         assert result["infrastructure_error"] is True
         assert result["tool_calls"] == []
@@ -211,9 +220,124 @@ class TestExecuteTool:
             result = grader._execute_tool("git_diff", {"repo_path": "/tmp"}, "/tmp")
         assert "diff" in result
 
+    def test_git_diff_uses_no_ext_diff(self):
+        """git_diff must pass --no-ext-diff to prevent RCE via diff.external config."""
+        grader = ShadowGrader(config_path="/nonexistent/config.json")
+        mock_result = MagicMock()
+        mock_result.stdout = "diff output\n"
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            grader._execute_tool("git_diff", {"repo_path": "/tmp"}, "/tmp")
+        cmd = mock_run.call_args[0][0]
+        assert "--no-ext-diff" in cmd
+
+    def test_validate_path_resolves_tmp_symlink(self):
+        """On macOS, /tmp -> /private/tmp; _validate_path must resolve the root too (FW-6)."""
+        grader = ShadowGrader(config_path="/nonexistent/config.json")
+
+        def _macos_realpath(p):
+            if p == "/tmp":
+                return "/private/tmp"
+            if p.startswith("/tmp/"):
+                return "/private" + p
+            return p
+
+        with patch("os.path.realpath", side_effect=_macos_realpath):
+            grader._validate_path("/private/tmp/test.txt", repo_path="/tmp")
+
     def test_unknown_tool_returns_error_json(self):
         grader = ShadowGrader(config_path="/nonexistent/config.json")
         result = grader._execute_tool("nonexistent_tool", {}, None)
         parsed = json.loads(result)
         assert "error" in parsed
         assert "unknown" in parsed["error"].lower()
+
+    def test_path_prefix_collision_rejected(self):
+        """Path matching home dir prefix but different directory is rejected (FW-1)."""
+        import os
+        grader = ShadowGrader(config_path="/nonexistent/config.json")
+        home = os.path.expanduser("~")
+        evil_path = home + "evil/secret.txt"
+        with pytest.raises(ValueError, match="path not under allowed roots"):
+            grader._validate_path(evil_path, repo_path="/tmp/myrepo")
+
+    def test_symlink_outside_allowed_roots_rejected(self, tmp_path):
+        """Symlink pointing outside allowed roots is rejected (FW-2)."""
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        secret = outside / "secret.txt"
+        secret.write_text("sensitive")
+        inside = tmp_path / "allowed_repo"
+        inside.mkdir()
+        link = inside / "escape.txt"
+        link.symlink_to(secret)
+        grader = ShadowGrader(config_path="/nonexistent/config.json")
+        with pytest.raises(ValueError, match="path not under allowed roots"):
+            grader._validate_path(str(link), repo_path=str(inside))
+
+    def test_grep_files_uses_e_flag_and_double_dash(self):
+        """CR-4: rg pattern must be passed after -e and directory after -- to block flag injection."""
+        grader = ShadowGrader(config_path="/nonexistent/config.json")
+        mock_result = MagicMock()
+        mock_result.stdout = "match\n"
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            grader._execute_tool("grep_files", {"pattern": "--pre=evil", "directory": "/tmp"}, "/tmp")
+        cmd = mock_run.call_args[0][0]
+        assert "-e" in cmd
+        assert cmd[cmd.index("-e") + 1] == "--pre=evil"
+        assert "--" in cmd
+        assert cmd[cmd.index("--") + 1] == "/tmp"
+
+    def test_home_path_outside_repo_rejected(self):
+        """Read scope: a path under $HOME but outside repo_path must be rejected."""
+        grader = ShadowGrader(config_path="/nonexistent/config.json")
+        home = os.path.expanduser("~")
+        with patch("builtins.open", mock_open(read_data="secret")):
+            result = grader._execute_tool(
+                "read_file", {"path": home + "/.ssh/id_rsa"}, "/tmp/myrepo"
+            )
+        parsed = json.loads(result)
+        assert "error" in parsed
+
+    def test_path_inside_repo_accepted(self, tmp_path):
+        """Read scope: a path inside repo_path is accepted."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        target = repo / "file.txt"
+        target.write_text("inside repo contents")
+        grader = ShadowGrader(config_path="/nonexistent/config.json")
+        result = grader._execute_tool("read_file", {"path": str(target)}, str(repo))
+        assert "inside repo contents" in result
+
+    def test_validate_path_none_repo_rejected(self):
+        """Read scope: repo_path=None must be rejected (no blanket ~ or /tmp roots)."""
+        grader = ShadowGrader(config_path="/nonexistent/config.json")
+        with pytest.raises(ValueError):
+            grader._validate_path("/tmp/anything.txt", repo_path=None)
+
+    def test_git_diff_disables_fsmonitor_and_textconv(self):
+        """git_diff must neutralize repo-local core.fsmonitor and diff.textconv config."""
+        grader = ShadowGrader(config_path="/nonexistent/config.json")
+        mock_result = MagicMock()
+        mock_result.stdout = "diff output\n"
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            grader._execute_tool("git_diff", {"repo_path": "/tmp"}, "/tmp")
+        cmd = mock_run.call_args[0][0]
+        assert "-c" in cmd
+        assert "core.fsmonitor=" in cmd
+        assert "diff.textconv=" in cmd
+
+    def test_arguments_none_does_not_raise(self):
+        """arguments=None (malformed local-LLM tool call) must not raise AttributeError."""
+        grader = ShadowGrader(config_path="/nonexistent/config.json")
+        result = grader._execute_tool("read_file", None, "/tmp")
+        parsed = json.loads(result)
+        assert "error" in parsed
+
+
+class TestGetClient:
+    def test_default_timeout_is_300_when_config_missing(self):
+        grader = ShadowGrader(config_path="/nonexistent/config.json")
+        with patch("ironclaude.shadow_grader.OllamaClient") as mock_cls:
+            mock_cls.return_value = MagicMock()
+            grader._get_client()
+        assert mock_cls.call_args.kwargs["timeout"] == 300

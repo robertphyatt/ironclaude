@@ -191,6 +191,7 @@ The Brain selects worker type per task:
 |-------------|-------------|
 | `claude-sonnet` | Default. Sonnet with an Opus advisor session; used for most tasks |
 | `claude-opus` | Full Opus worker for high-complexity tasks |
+| `claude-fable` | Fable model for highest-capability architectural work |
 | `ollama` | Local LLM routed via `ANTHROPIC_BASE_URL` — see [Ollama Workers](#ollama-workers) |
 
 IronClaude defaults to Claude Opus (`opus`) for the brain and grader. You can override this via environment variables to pin a specific model version:

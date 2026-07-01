@@ -72,6 +72,12 @@ _PROMPT_WAITING_SCHEMA = {
 }
 
 PROMPT_WAITING_CACHE_TTL = 120
+PROMPT_WAITING_CACHE_MAX = 512
+# Canonical UUID: 8-4-4-4-12 hex groups.
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 def log_worker_event(event_type: str, **fields) -> None:
@@ -1319,13 +1325,15 @@ class IroncladeDaemon:
                 _ollama_url = "http://localhost:11434"
             cmd = f"export CLAUDE_CODE_ATTRIBUTION_HEADER=0; export ANTHROPIC_BASE_URL={shlex.quote(_ollama_url)}; export ANTHROPIC_AUTH_TOKEN=ollama; export ANTHROPIC_API_KEY=; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
         elif worker_type == "claude-opus":
-            cmd = make_opus_command(self.config.get("default_opus_model", DEFAULTS["brain_model"]), self.config.get("effort_level", "high"))
+            cmd = make_opus_command(self.config.get("default_opus_model", "opus"), self.config.get("effort_level", "high"))
+        elif worker_type == "claude-fable":
+            cmd = make_opus_command("fable", self.config.get("effort_level", "high"))
         elif worker_type in WORKER_COMMANDS:
             cmd = WORKER_COMMANDS[worker_type]
         else:
             self.slack.post_message(
                 f"Unknown worker type `{worker_type}`. "
-                f"Supported: ollama, claude-opus, {', '.join(WORKER_COMMANDS.keys())}"
+                f"Supported: ollama, claude-opus, claude-fable, {', '.join(WORKER_COMMANDS.keys())}"
             )
             return
 
@@ -1438,6 +1446,10 @@ class IroncladeDaemon:
         if not content or len(content.strip()) != 36:
             return None
         session_id = content.strip()
+        # Guard against SQL injection: session_id is interpolated into the
+        # remote query string, so require a strict UUID before proceeding.
+        if not _UUID_RE.fullmatch(session_id):
+            return None
         db_path = "~/.claude/ironclaude.db"
         result = self.tmux.run_sqlite_query(
             db_path,
@@ -1466,8 +1478,24 @@ class IroncladeDaemon:
             )
             return False
         waiting = bool(result_dict.get("waiting", False))
-        self._prompt_waiting_cache[cache_key] = (time.time(), waiting)
+        now = time.time()
+        self._prompt_waiting_cache[cache_key] = (now, waiting)
+        self._prune_prompt_waiting_cache(now)
         return waiting
+
+    def _prune_prompt_waiting_cache(self, now: float) -> None:
+        """Drop expired entries and cap the cache to a bounded size."""
+        cache = self._prompt_waiting_cache
+        expired = [
+            k for k, (ts, _) in cache.items()
+            if now - ts >= PROMPT_WAITING_CACHE_TTL
+        ]
+        for k in expired:
+            del cache[k]
+        # Evict oldest entries if still over the cap.
+        while len(cache) > PROMPT_WAITING_CACHE_MAX:
+            oldest = min(cache, key=lambda k: cache[k][0])
+            del cache[oldest]
 
     def _load_staleness_state(self):
         """Load stuck worker state from DB for restart persistence."""

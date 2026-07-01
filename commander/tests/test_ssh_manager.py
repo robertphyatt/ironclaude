@@ -119,6 +119,50 @@ class TestHealthCheck:
         assert result.ok is True
         assert mock_run.call_count == 3  # SSH + claude + tmux
 
+    @patch("ironclaude.ssh_manager.subprocess.run")
+    def test_claude_path_metacharacters_are_neutralized(self, mock_run, ssh_mgr):
+        # A malicious/mistyped claude_path with shell metacharacters must not
+        # break out of the remote `which ...` command.
+        malicious = "/opt/claude; rm -rf ~"
+        machines = [{"name": "k", "host": "k", "claude_path": malicious, "repos": ["/r"]}]
+        ssh_mgr.register_machines(machines)
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok\n")
+        ssh_mgr.health_check("k")
+
+        # Find the remote command string that runs `which` for the claude binary.
+        which_cmds = [
+            c.args[0][-1]
+            for c in mock_run.call_args_list
+            if isinstance(c.args[0][-1], str) and c.args[0][-1].startswith("which ")
+        ]
+        assert len(which_cmds) == 1
+        remote_cmd = which_cmds[0]
+        # The metacharacters must appear only inside the shlex-quoted form,
+        # never as a bare, executable `; rm` sequence.
+        import shlex
+        assert shlex.quote(malicious) in remote_cmd
+        assert "; rm" not in remote_cmd.replace(shlex.quote(malicious), "")
+
+    @patch("ironclaude.ssh_manager.subprocess.run")
+    def test_home_tilde_path_still_expands(self, mock_run, ssh_mgr):
+        # A legitimate ~/path must still resolve $HOME on the remote host.
+        machines = [{"name": "k", "host": "k",
+                     "claude_path": "~/.claude/local/claude", "repos": ["/r"]}]
+        ssh_mgr.register_machines(machines)
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok\n")
+        ssh_mgr.health_check("k")
+
+        which_cmds = [
+            c.args[0][-1]
+            for c in mock_run.call_args_list
+            if isinstance(c.args[0][-1], str) and c.args[0][-1].startswith("which ")
+        ]
+        assert len(which_cmds) == 1
+        remote_cmd = which_cmds[0]
+        # $HOME stays unquoted so the remote shell expands it; the rest is quoted.
+        assert "$HOME" in remote_cmd
+        assert "~" not in remote_cmd
+
 
 class TestTeardown:
     @patch("ironclaude.ssh_manager.subprocess.run")

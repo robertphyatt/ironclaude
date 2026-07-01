@@ -9,9 +9,16 @@ import time
 import logging
 import requests
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 from slack_sdk import WebClient
 
 logger = logging.getLogger("ironclaude.slack")
+
+
+def _is_slack_host(url: str) -> bool:
+    """True only if the URL's host is slack.com or a *.slack.com subdomain."""
+    host = (urlparse(url).hostname or "").lower()
+    return host == "slack.com" or host.endswith(".slack.com")
 
 
 def _format_message(m: dict) -> dict:
@@ -77,8 +84,16 @@ class SlackBot:
         return response.get("file", {}).get("id", "")
 
     def download_file(self, url: str, save_path: str) -> None:
-        """Download a private Slack file to save_path using bot token auth. Raises on failure."""
+        """Download a private Slack file to save_path using bot token auth. Raises on failure.
+
+        The bot token is only sent to Slack-owned hosts (slack.com / *.slack.com).
+        For any other host, no request is made and None is returned so the token
+        cannot leak to a crafted or redirected URL.
+        """
         import os
+        if not _is_slack_host(url):
+            logger.warning(f"Refusing to send bot token to non-Slack host: {urlparse(url).hostname!r}")
+            return None
         dir_part = os.path.dirname(save_path)
         if dir_part:
             os.makedirs(dir_part, exist_ok=True)

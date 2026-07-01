@@ -1,0 +1,57 @@
+{
+  "name": "Ollama MLX Engine Evaluation",
+  "goal": "Research Ollama's MLX engine and write a version-verified evaluation doc at docs/research/2026-06-29-ollama-mlx-engine-evaluation.md",
+  "design_file": "docs/plans/2026-06-29-ollama-mlx-engine-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Verify Ollama Environment",
+      "description": "Run ollama --version and ollama list to get current version and installed model tags. Resolve the gemma4 naming discrepancy (task references gemma4:9b but no such Ollama tag exists — likely gemma4:e4b). No file changes — read-only information gathering.",
+      "allowed_files": [],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Check Ollama version",
+          "command": "ollama --version",
+          "expected": "Version string like 'ollama version 0.X.Y'. Note: >=0.19 = MLX for -mlx tags; >=0.30 = GGUF also gets partial MLX"
+        },
+        {
+          "description": "List installed models",
+          "command": "ollama list",
+          "expected": "Table of installed models. Look for gemma4 variant (resolve 9b vs e4b discrepancy), qwen3.5 variant, any existing -mlx tags"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Write Research Document",
+      "description": "Write docs/research/2026-06-29-ollama-mlx-engine-evaluation.md incorporating pre-gathered research facts and Task 1 environment check results. See plan markdown for full content structure and pre-gathered facts. Stage the file after writing.",
+      "allowed_files": [
+        "docs/research/2026-06-29-ollama-mlx-engine-evaluation.md"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Create docs/research directory if needed",
+          "command": "mkdir -p docs/research",
+          "expected": "Directory exists"
+        },
+        {
+          "description": "Write research document — incorporate Task 1 version/model facts into template in plan markdown. Fill all [bracketed] sections before writing.",
+          "command": null,
+          "expected": "File docs/research/2026-06-29-ollama-mlx-engine-evaluation.md created with version-verified facts and clear ADOPT/WAIT/REJECT recommendation"
+        },
+        {
+          "description": "Stage research document",
+          "command": "git add -f docs/research/2026-06-29-ollama-mlx-engine-evaluation.md",
+          "expected": "File staged, not committed. (docs/ is in .gitignore — -f required for new files)"
+        },
+        {
+          "description": "Verify staging",
+          "command": "git status",
+          "expected": "docs/research/2026-06-29-ollama-mlx-engine-evaluation.md listed under Changes to be committed"
+        }
+      ]
+    }
+  ]
+}

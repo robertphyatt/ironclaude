@@ -160,7 +160,7 @@ class TmuxManager:
     def send_keys(self, name: str, text: str, ssh_host: str | None = None) -> bool:
         """Send text + Enter to a tmux session."""
         result = self._run(
-            ["tmux", "send-keys", "-t", name, text], ssh_host=ssh_host, capture_output=True
+            ["tmux", "send-keys", "-t", name, "--", text], ssh_host=ssh_host, capture_output=True
         )
         if result.returncode != 0:
             logger.error(f"Failed to send keys to {name}: {result.stderr.decode()}")
@@ -174,7 +174,7 @@ class TmuxManager:
     def send_raw_keys(self, name: str, keys: list[str], ssh_host: str | None = None) -> bool:
         """Send raw key sequences to a tmux session. No auto-Enter appended."""
         result = self._run(
-            ["tmux", "send-keys", "-t", name] + keys,
+            ["tmux", "send-keys", "-t", name, "--"] + keys,
             ssh_host=ssh_host, capture_output=True,
         )
         if result.returncode != 0:
@@ -229,6 +229,44 @@ class TmuxManager:
             return pid if pid.isdigit() else None
         except Exception:
             return None
+
+    def rename_session(self, old_name: str, new_name: str, ssh_host: str | None = None) -> bool:
+        """Rename a tmux session. Preserves the pane and its PID."""
+        validate_safe_id(new_name)
+        result = self._run(
+            ["tmux", "rename-session", "-t", old_name, new_name],
+            ssh_host=ssh_host, capture_output=True,
+        )
+        if result.returncode != 0:
+            logger.error(f"Failed to rename tmux session {old_name} -> {new_name}: {result.stderr.decode()}")
+            return False
+        logger.info(f"Renamed tmux session: {old_name} -> {new_name}")
+        return True
+
+    def pane_current_command(self, name: str, ssh_host: str | None = None) -> str | None:
+        """Return the pane's current foreground command, or None on failure."""
+        result = self._run(
+            ["tmux", "list-panes", "-t", name, "-F", "#{pane_current_command}"],
+            ssh_host=ssh_host, capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return None
+        lines = result.stdout.strip().splitlines()
+        return lines[0] if lines else None
+
+    def setup_log_capture(self, name: str, ssh_host: str | None = None,
+                          remote_log_dir: str | None = None) -> str:
+        """Enable tmux pipe-pane logging for an already-running session. Returns log path."""
+        if remote_log_dir:
+            log_path = os.path.join(remote_log_dir, f"{name}.log")
+        else:
+            log_path = os.path.join(self.log_dir, f"{name}.log")
+        self._run(
+            ["tmux", "pipe-pane", "-t", name, f"cat >> {shlex.quote(log_path)}"],
+            ssh_host=ssh_host, capture_output=True,
+        )
+        logger.info(f"Enabled log capture for {name} -> {log_path}")
+        return log_path
 
     def get_log_mtime(self, name: str, ssh_host: str | None = None,
                       remote_log_dir: str | None = None) -> float | None:

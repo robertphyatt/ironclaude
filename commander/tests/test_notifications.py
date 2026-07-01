@@ -11,6 +11,7 @@ from ironclaude.notifications import (
     format_brain_circuit_breaker,
     format_objective_received,
     format_task_progress,
+    format_plan_ready,
     format_worker_checkin,
     format_worker_checkin_slack,
     format_worker_gate_stuck_slack,
@@ -265,6 +266,23 @@ class TestMrkdwnInjectionPrevention:
         assert "&lt;alert&gt;" in msg
         assert "&amp;" in msg
         assert "&gt;" in msg
+
+    def test_task_progress_escapes_description(self):
+        msg = format_task_progress(current=2, total=5, description="<!channel> deploy now")
+        assert "<!channel>" not in msg
+        assert "&lt;!channel&gt;" in msg
+
+    def test_plan_ready_escapes_plan_summary(self):
+        msg = format_plan_ready("w1", "<!here> approve <http://evil|click>")
+        assert "<!here>" not in msg
+        assert "&lt;!here&gt;" in msg
+        assert "<http://evil|click>" not in msg
+        assert "&lt;http://evil|click&gt;" in msg
+
+    def test_worker_checkin_escapes_log_tail(self):
+        msg = format_worker_checkin("w1", 15, "executing", "<!channel> injected log", False)
+        assert "<!channel>" not in msg
+        assert "&lt;!channel&gt;" in msg
 
 
 class TestFmtTokens:

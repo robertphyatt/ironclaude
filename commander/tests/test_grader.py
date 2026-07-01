@@ -136,6 +136,42 @@ class TestSchemaValidation:
         assert result == {"whatever": 42}
 
 
+class TestNonDictVerdict:
+    def test_bare_true_returns_infrastructure_error(self):
+        grader, mock_client = _make_grader()
+        mock_client.post_generate.return_value = "true"
+        result = grader.grade("sys", "user", SIMPLE_SCHEMA)
+        assert result["infrastructure_error"] is True
+        assert "non-dict" in result["error_detail"].lower()
+
+    def test_bare_number_returns_infrastructure_error(self):
+        grader, mock_client = _make_grader()
+        mock_client.post_generate.return_value = "42"
+        result = grader.grade("sys", "user", SIMPLE_SCHEMA)
+        assert result["infrastructure_error"] is True
+        assert "non-dict" in result["error_detail"].lower()
+
+    def test_bare_list_does_not_raise(self):
+        grader, mock_client = _make_grader()
+        mock_client.post_generate.return_value = "[1, 2, 3]"
+        result = grader.grade("sys", "user", SIMPLE_SCHEMA)
+        assert result["infrastructure_error"] is True
+
+
+class TestMarkdownFenceStripping:
+    def test_json_fence_stripped_before_parse(self):
+        grader, mock_client = _make_grader()
+        mock_client.post_generate.return_value = '```json\n{"valid": true}\n```'
+        result = grader.grade("sys", "user", SIMPLE_SCHEMA)
+        assert result == {"valid": True}
+
+    def test_bare_fence_stripped_before_parse(self):
+        grader, mock_client = _make_grader()
+        mock_client.post_generate.return_value = '```\n{"valid": false}\n```'
+        result = grader.grade("sys", "user", SIMPLE_SCHEMA)
+        assert result == {"valid": False}
+
+
 class TestConfigLoading:
     def test_config_absent_uses_localhost_defaults(self, tmp_path):
         with patch("ironclaude.grader.OllamaClient") as MockClient:

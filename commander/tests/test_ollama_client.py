@@ -8,6 +8,7 @@ from ironclaude.ollama_client import (
     OllamaClient,
     OllamaError,
     OllamaConnectionError,
+    OllamaHTTPError,
     OllamaTimeoutError,
 )
 
@@ -42,6 +43,8 @@ class TestPostGenerate:
         result = client.post_generate({"model": "gemma4", "prompt": "test", "stream": False})
         assert result == "from_fallback"
         assert mock_post.call_count == 2
+        fallback_call = mock_post.call_args_list[1]
+        assert fallback_call.kwargs["timeout"] == (2, 30)
 
     @patch("ironclaude.ollama_client.requests.post")
     def test_both_fail_raises_connection_error(self, mock_post, client):
@@ -91,6 +94,20 @@ class TestGetPs:
         mock_get.side_effect = requests.ConnectionError("refused")
         with pytest.raises(OllamaConnectionError):
             client_no_fallback.get_ps()
+
+
+class TestGetFallbackTimeout:
+    @patch("ironclaude.ollama_client.requests.get")
+    def test_get_fallback_uses_timeout_tuple(self, mock_get, client):
+        """_get fallback must use (connect_timeout, timeout) tuple, not scalar."""
+        resp = MagicMock()
+        resp.json.return_value = {"models": []}
+        resp.raise_for_status = MagicMock()
+        mock_get.side_effect = [requests.ConnectionError("refused"), resp]
+        client._get("/api/ps")
+        assert mock_get.call_count == 2
+        fallback_call = mock_get.call_args_list[1]
+        assert fallback_call.kwargs["timeout"] == (2, 30)
 
 
 class TestConnectTimeoutShortcut:
@@ -170,6 +187,8 @@ class TestPostChat:
         content, _ = client.post_chat({"model": "gemma4", "messages": [], "stream": False})
         assert content == "ok"
         assert mock_post.call_count == 2
+        fallback_call = mock_post.call_args_list[1]
+        assert fallback_call.kwargs["timeout"] == (2, 30)
 
     @patch("ironclaude.ollama_client.requests.post")
     def test_both_fail_raises(self, mock_post, client):
@@ -182,3 +201,74 @@ class TestPostChat:
         mock_post.side_effect = requests.Timeout()
         with pytest.raises(OllamaTimeoutError):
             client_no_fallback.post_chat({"model": "gemma4", "messages": [], "stream": False})
+
+
+def _make_http_error_response(status=404, streaming=False):
+    """Mock response whose raise_for_status raises an HTTPError with a status code."""
+    resp = MagicMock()
+    err = requests.HTTPError(f"{status} Client Error")
+    err.response = MagicMock(status_code=status)
+    resp.raise_for_status.side_effect = err
+    if streaming:
+        resp.iter_content.return_value = [b"partial"]
+    return resp
+
+
+class TestHTTPErrorNotConflatedWithConnectivity:
+    """4xx/5xx must NOT trigger the connectivity fallback, and must surface as a
+    distinct HTTP/status error rather than OllamaConnectionError."""
+
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_post_generate_404_no_fallback(self, mock_post, client):
+        # client HAS a fallback configured; a 404 must not invoke it.
+        mock_post.return_value = _make_http_error_response(404)
+        with pytest.raises(OllamaHTTPError) as exc:
+            client.post_generate({"model": "missing", "prompt": "x", "stream": False})
+        assert mock_post.call_count == 1  # no fallback POST
+        assert not isinstance(exc.value, OllamaConnectionError)
+        assert exc.value.status_code == 404
+
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_post_chat_400_no_fallback(self, mock_post, client):
+        mock_post.return_value = _make_http_error_response(400)
+        with pytest.raises(OllamaHTTPError) as exc:
+            client.post_chat({"model": "gemma4", "messages": [], "stream": False})
+        assert mock_post.call_count == 1
+        assert not isinstance(exc.value, OllamaConnectionError)
+        assert exc.value.status_code == 400
+
+    @patch("ironclaude.ollama_client.requests.get")
+    def test_get_ps_404_no_fallback(self, mock_get, client):
+        mock_get.return_value = _make_http_error_response(404)
+        with pytest.raises(OllamaHTTPError) as exc:
+            client.get_ps()
+        assert mock_get.call_count == 1
+        assert not isinstance(exc.value, OllamaConnectionError)
+        assert exc.value.status_code == 404
+
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_create_model_500_raises_http_error(self, mock_post, client_no_fallback):
+        mock_post.return_value = _make_http_error_response(500)
+        with pytest.raises(OllamaHTTPError) as exc:
+            client_no_fallback.create_model("v", "base", {"num_ctx": 1})
+        assert exc.value.status_code == 500
+        assert not isinstance(exc.value, OllamaConnectionError)
+
+    def test_http_error_is_ollama_error_subclass(self):
+        # Existing `except OllamaError` callers must still catch HTTP errors.
+        assert issubclass(OllamaHTTPError, OllamaError)
+
+
+class TestStreamedErrorBodyClosed:
+    """A streamed request whose raise_for_status raises must close the response
+    to avoid leaking the connection."""
+
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_streaming_http_error_closes_response(self, mock_post, client_no_fallback):
+        resp = _make_http_error_response(404, streaming=True)
+        mock_post.return_value = resp
+        with pytest.raises(OllamaHTTPError):
+            client_no_fallback.post_generate(
+                {"model": "gemma4", "keep_alive": 0, "stream": True}
+            )
+        resp.close.assert_called_once()

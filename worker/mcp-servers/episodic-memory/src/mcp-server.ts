@@ -21,6 +21,7 @@ import {
   SearchOptions,
 } from './search.js';
 import { formatConversationAsMarkdown } from './show.js';
+import { getArchiveDir } from './paths.js';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import path from 'path';
@@ -267,13 +268,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === 'read') {
       const params = ShowConversationInputSchema.parse(args);
 
-      // Verify file exists
+      // Verify file exists (preserve existing not-found handling)
       if (!fs.existsSync(params.path)) {
         throw new Error(`File not found: ${params.path}`);
       }
 
+      // Confine reads to the conversation-archive directory. Episodic memory
+      // indexes untrusted prior-conversation content, so a prompt-injection
+      // payload in an indexed exchange could otherwise steer the agent to read
+      // an arbitrary local file (SSH keys, .env, etc.) and surface it. Resolve
+      // both the archive base and the requested path through realpathSync to
+      // defeat symlink escapes, then assert containment before reading.
+      const archiveDir = fs.realpathSync(getArchiveDir());
+      const resolvedPath = fs.realpathSync(path.resolve(params.path));
+      const relative = path.relative(archiveDir, resolvedPath);
+      const isInsideArchive =
+        resolvedPath === archiveDir ||
+        (relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative));
+      if (!isInsideArchive) {
+        throw new Error(
+          `Access denied: path is outside the conversation archive directory: ${params.path}`
+        );
+      }
+
       // Read and format conversation with optional line range
-      const jsonlContent = fs.readFileSync(params.path, 'utf-8');
+      const jsonlContent = fs.readFileSync(resolvedPath, 'utf-8');
       const markdownContent = formatConversationAsMarkdown(
         jsonlContent,
         params.startLine,

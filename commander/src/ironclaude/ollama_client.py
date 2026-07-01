@@ -17,8 +17,40 @@ class OllamaConnectionError(OllamaError):
     """Connection refused, HTTP error, or both URLs exhausted."""
 
 
+class OllamaHTTPError(OllamaError):
+    """Server returned a 4xx/5xx status (client/config error, not an outage).
+
+    Distinct from OllamaConnectionError so a bad request or missing model is not
+    masked as connectivity loss and does not trigger the fallback retry.
+    """
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class OllamaTimeoutError(OllamaError):
     """Read or connect timeout."""
+
+
+def _http_error(url: str, err: "requests.HTTPError", verb: str = "request") -> OllamaHTTPError:
+    """Build an OllamaHTTPError carrying the response status code (if available)."""
+    status = getattr(getattr(err, "response", None), "status_code", None)
+    status_txt = status if status is not None else "?"
+    return OllamaHTTPError(
+        f"Ollama {verb} returned HTTP {status_txt} at {url}: {err}",
+        status_code=status,
+    )
+
+
+def _raise_for_status_closing(resp) -> None:
+    """Call resp.raise_for_status(); on HTTPError, close the (possibly streamed)
+    response before propagating so the connection is not leaked."""
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError:
+        resp.close()
+        raise
 
 
 class OllamaClient:
@@ -67,7 +99,9 @@ class OllamaClient:
             )
             resp.raise_for_status()
             return self._read_chat_response(resp)
-        except (requests.ConnectionError, requests.HTTPError) as e:
+        except requests.HTTPError as e:
+            raise _http_error(self._url, e) from e
+        except requests.ConnectionError as e:
             if self._fallback_url:
                 return self._chat_via_fallback(payload, str(e))
             raise OllamaConnectionError(f"Ollama unreachable at {self._url}: {e}") from e
@@ -81,11 +115,13 @@ class OllamaClient:
             resp = requests.post(
                 f"{self._fallback_url}/api/chat",
                 json=payload,
-                timeout=self._timeout,
+                timeout=(self._connect_timeout, self._timeout),
                 stream=False,
             )
             resp.raise_for_status()
             return self._read_chat_response(resp)
+        except requests.HTTPError as e2:
+            raise _http_error(self._fallback_url, e2) from e2
         except requests.RequestException as e2:
             raise OllamaConnectionError(
                 f"Ollama failed at {self._url} (and fallback {self._fallback_url}): {e2}"
@@ -127,7 +163,9 @@ class OllamaClient:
                 stream=False,
             )
             resp.raise_for_status()
-        except (requests.ConnectionError, requests.HTTPError) as e:
+        except requests.HTTPError as e:
+            raise _http_error(self._url, e, verb="create_model") from e
+        except requests.ConnectionError as e:
             raise OllamaConnectionError(
                 f"Ollama create_model failed at {self._url}: {e}"
             ) from e
@@ -156,9 +194,11 @@ class OllamaClient:
                 timeout=timeout,
                 stream=is_streaming,
             )
-            resp.raise_for_status()
+            _raise_for_status_closing(resp)
             return self._read_post_response(resp, is_streaming)
-        except (requests.ConnectionError, requests.HTTPError) as e:
+        except requests.HTTPError as e:
+            raise _http_error(self._url, e) from e
+        except requests.ConnectionError as e:
             if self._fallback_url:
                 return self._post_via_fallback(path, payload, is_streaming, str(e))
             raise OllamaConnectionError(f"Ollama unreachable at {self._url}: {e}") from e
@@ -174,11 +214,13 @@ class OllamaClient:
             resp = requests.post(
                 f"{self._fallback_url}{path}",
                 json=payload,
-                timeout=self._timeout,
+                timeout=(self._connect_timeout, self._timeout),
                 stream=is_streaming,
             )
-            resp.raise_for_status()
+            _raise_for_status_closing(resp)
             return self._read_post_response(resp, is_streaming)
+        except requests.HTTPError as e2:
+            raise _http_error(self._fallback_url, e2) from e2
         except requests.RequestException as e2:
             raise OllamaConnectionError(
                 f"Ollama failed at {self._url} (and fallback {self._fallback_url}): {e2}"
@@ -190,12 +232,16 @@ class OllamaClient:
             resp = requests.get(f"{self._url}{path}", timeout=timeout)
             resp.raise_for_status()
             return resp.json()
-        except (requests.ConnectionError, requests.HTTPError) as e:
+        except requests.HTTPError as e:
+            raise _http_error(self._url, e) from e
+        except requests.ConnectionError as e:
             if self._fallback_url:
                 try:
-                    resp = requests.get(f"{self._fallback_url}{path}", timeout=self._timeout)
+                    resp = requests.get(f"{self._fallback_url}{path}", timeout=timeout)
                     resp.raise_for_status()
                     return resp.json()
+                except requests.HTTPError as e2:
+                    raise _http_error(self._fallback_url, e2) from e2
                 except requests.RequestException as e2:
                     raise OllamaConnectionError(
                         f"Ollama failed at {self._url} (and fallback {self._fallback_url}): {e2}"

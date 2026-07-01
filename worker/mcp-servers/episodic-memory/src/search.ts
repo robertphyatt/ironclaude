@@ -46,8 +46,12 @@ export async function searchConversations(
     timeFilterParams.push(after);
   }
   if (before) {
+    // `before` is a date-only string (YYYY-MM-DD) but e.timestamp is a full ISO
+    // datetime. A plain lexicographic `<= 'YYYY-MM-DD'` excludes the entire
+    // boundary day. Bind the end-of-day instant so the whole `before` day is
+    // included (mirrors `after`, which is inclusive via `>=`).
     timeFilterClauses.push('e.timestamp <= ?');
-    timeFilterParams.push(before);
+    timeFilterParams.push(`${before}T23:59:59.999Z`);
   }
   const timeClause = timeFilterClauses.length > 0
     ? `AND ${timeFilterClauses.join(' AND ')}`
@@ -96,7 +100,7 @@ export async function searchConversations(
         e.archive_path,
         e.line_start,
         e.line_end,
-        0 as distance
+        NULL as distance
       FROM exchanges AS e
       WHERE (e.user_message LIKE ? OR e.assistant_message LIKE ?)
         ${timeClause}
@@ -114,6 +118,9 @@ export async function searchConversations(
           results.push(textResult);
         }
       }
+      // Vector fill (<= limit) plus appended text matches (<= limit) can exceed
+      // the caller's limit; cap the merged set so at most `limit` rows return.
+      results = results.slice(0, limit);
     } else {
       results = textResults;
     }
@@ -142,9 +149,17 @@ export async function searchConversations(
     const snippetText = exchange.userMessage.substring(0, 200).replace(/\s+/g, ' ').trim();
     const snippet = snippetText + (exchange.userMessage.length > 200 ? '...' : '');
 
+    // Text-match rows carry a NULL distance (see text query) and are not on the
+    // same scale as vector distances, so leave their similarity undefined rather
+    // than reporting a misleading 100%. Vector rows use a raw KNN distance that
+    // is not bounded to [0,1], so clamp the derived similarity.
+    const similarity = row.distance == null
+      ? undefined
+      : Math.max(0, Math.min(1, 1 - row.distance));
+
     return {
       exchange,
-      similarity: mode === 'text' ? undefined : 1 - row.distance,
+      similarity,
       snippet,
       summary
     } as SearchResult & { summary?: string };

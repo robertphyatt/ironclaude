@@ -296,6 +296,72 @@ describe('mark_executing — state recovery', () => {
   });
 });
 
+describe('mark_executing — task_boundary review gate', () => {
+  let db: Database.Database;
+  const SESSION = 'test-session-mark-executing-tb';
+
+  beforeEach(() => {
+    db = createTestDb();
+    db.prepare(`
+      INSERT INTO sessions (terminal_session, workflow_stage, current_wave, professional_mode, review_pending)
+      VALUES (?, 'reviewing', 1, 'on', 0)
+    `).run(SESSION);
+    db.prepare(`
+      INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status)
+      VALUES (?, 1, 1, 'Test Task', 'review_passed')
+    `).run(SESSION);
+  });
+
+  it('REJECTS when the only passing grade is informational (task_boundary=0)', () => {
+    // A standalone/informational A recorded earlier must NOT satisfy the
+    // return-to-executing gate — only a task-boundary review counts.
+    db.prepare(`
+      INSERT INTO review_grades (terminal_session, wave_number, task_ids, grade, task_boundary)
+      VALUES (?, 1, '1', 'A', 0)
+    `).run(SESSION);
+
+    const result = handleWriteTool('mark_executing', {}, db, SESSION);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeDefined();
+    expect(parsed.error).toContain('no passing review verdict');
+    // Gate rejected: workflow_stage must remain 'reviewing'
+    const stage = (db.prepare(
+      `SELECT workflow_stage FROM sessions WHERE terminal_session = ?`,
+    ).get(SESSION) as { workflow_stage: string }).workflow_stage;
+    expect(stage).toBe('reviewing');
+  });
+
+  it('ACCEPTS when a passing grade has task_boundary=1', () => {
+    db.prepare(`
+      INSERT INTO review_grades (terminal_session, wave_number, task_ids, grade, task_boundary)
+      VALUES (?, 1, '1', 'A', 1)
+    `).run(SESSION);
+
+    const result = handleWriteTool('mark_executing', {}, db, SESSION);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeUndefined();
+    expect(parsed.workflow_stage).toBe('executing');
+  });
+
+  it('REJECTS informational A even when a failing task-boundary grade also exists', () => {
+    // Informational A (task_boundary=0) plus a task-boundary C (not A/B):
+    // no passing task-boundary grade exists, so the gate must reject.
+    db.prepare(`
+      INSERT INTO review_grades (terminal_session, wave_number, task_ids, grade, task_boundary)
+      VALUES (?, 1, '1', 'A', 0)
+    `).run(SESSION);
+    db.prepare(`
+      INSERT INTO review_grades (terminal_session, wave_number, task_ids, grade, task_boundary)
+      VALUES (?, 1, '1', 'C', 1)
+    `).run(SESSION);
+
+    const result = handleWriteTool('mark_executing', {}, db, SESSION);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toBeDefined();
+    expect(parsed.error).toContain('no passing review verdict');
+  });
+});
+
 describe('clear_stale_review_pending — stale flag detection', () => {
   let db: Database.Database;
   const SESSION = 'test-session-clear-stale';

@@ -1,0 +1,70 @@
+{
+  "name": "v1.0.14 Adversarial Round 3 Bug Fixes",
+  "goal": "Fix 2 bugs: inverted has_session semantics in resume_session, and broken test referencing nonexistent _GRADER_DEBUG_LOG attribute",
+  "design_file": "docs/plans/2026-06-30-v1014-adversarial-round3-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Fix resume_session inverted has_session semantics",
+      "description": "Revert condition at line 2932 from 'if self.tmux.has_session(target):' to 'if not self.tmux.has_session(target):' and remove kill_session call (dead session needs no killing). Matches spawn_worker pattern at line 1984. No tests required: production bug fix matching established tested pattern.",
+      "allowed_files": ["commander/src/ironclaude/orchestrator_mcp.py"],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Fix the condition and remove dead kill_session call at lines 2932-2934",
+          "command": "",
+          "expected": "Condition inverted, kill_session removed"
+        },
+        {
+          "description": "Run orchestrator tests to verify no regressions",
+          "command": "cd commander && python -m pytest tests/test_orchestrator_mcp.py -v -x",
+          "expected": "All tests pass"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/orchestrator_mcp.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Extract _GRADER_DEBUG_LOG constant and fix debug log test",
+      "description": "Add _GRADER_DEBUG_LOG constant to orchestrator_mcp.py, replace 4 hardcoded paths, and fix test to monkeypatch both _GRADER_DEBUG and _GRADER_DEBUG_LOG. No separate RED/GREEN cycle: the test IS the thing being fixed.",
+      "allowed_files": ["commander/src/ironclaude/orchestrator_mcp.py", "commander/tests/test_orchestrator_debug_log.py"],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Add _GRADER_DEBUG_LOG constant after _GRADER_DEBUG on line 55",
+          "command": "",
+          "expected": "_GRADER_DEBUG_LOG = '/tmp/grader-debug.log' added at line 56"
+        },
+        {
+          "description": "Replace 4 hardcoded '/tmp/grader-debug.log' with _GRADER_DEBUG_LOG at lines 663, 695, 707, 734",
+          "command": "",
+          "expected": "All 4 open() calls use the constant"
+        },
+        {
+          "description": "Fix test: add monkeypatch.setattr for _GRADER_DEBUG=True alongside existing _GRADER_DEBUG_LOG patch",
+          "command": "",
+          "expected": "Test patches both _GRADER_DEBUG and _GRADER_DEBUG_LOG"
+        },
+        {
+          "description": "Run the debug log test",
+          "command": "cd commander && python -m pytest tests/test_orchestrator_debug_log.py -v",
+          "expected": "1 test passes"
+        },
+        {
+          "description": "Run full test suite",
+          "command": "cd commander && python -m pytest tests/ -v -x",
+          "expected": "All tests pass"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_debug_log.py",
+          "expected": "Changes staged"
+        }
+      ]
+    }
+  ]
+}

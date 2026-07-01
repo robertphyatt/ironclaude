@@ -15,12 +15,12 @@
       "steps": [
         {
           "description": "Write TestPostChat test class in test_ollama_client.py with _make_chat_response helper and 6 test cases",
-          "command": null,
+          "command": "",
           "expected": "Tests added after existing TestCreateModel class"
         },
         {
           "description": "Run new tests to confirm they fail with AttributeError",
-          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_ollama_client.py::TestPostChat -v 2>&1 | tail -20",
+          "command": "cd commander && .venv/bin/pytest tests/test_ollama_client.py::TestPostChat -v 2>&1 | tail -20",
           "expected": "ERRORS — AttributeError: OllamaClient has no attribute post_chat"
         },
         {
@@ -30,7 +30,7 @@
         },
         {
           "description": "Run all ollama_client tests to confirm new and existing tests pass",
-          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_ollama_client.py -v 2>&1 | tail -20",
+          "command": "cd commander && .venv/bin/pytest tests/test_ollama_client.py -v 2>&1 | tail -20",
           "expected": "All TestPostChat tests PASS, all existing tests PASS"
         },
         {
@@ -57,7 +57,7 @@
         },
         {
           "description": "Run tests to confirm they fail with ModuleNotFoundError",
-          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_shadow_grader.py -v 2>&1 | tail -10",
+          "command": "cd commander && .venv/bin/pytest tests/test_shadow_grader.py -v 2>&1 | tail -10",
           "expected": "ModuleNotFoundError: No module named 'ironclaude.shadow_grader'"
         },
         {
@@ -67,7 +67,7 @@
         },
         {
           "description": "Run shadow grader tests to confirm they all pass",
-          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_shadow_grader.py -v 2>&1 | tail -30",
+          "command": "cd commander && .venv/bin/pytest tests/test_shadow_grader.py -v 2>&1 | tail -30",
           "expected": "All 13 tests PASS"
         },
         {
@@ -94,7 +94,7 @@
         },
         {
           "description": "Run new tests to confirm they fail with AttributeError",
-          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestParseToolCallsFromDelta tests/test_orchestrator_mcp.py::TestComputeConcordance tests/test_orchestrator_mcp.py::TestFormatShadowSlackMessage -v 2>&1 | tail -20",
+          "command": "cd commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestParseToolCallsFromDelta tests/test_orchestrator_mcp.py::TestComputeConcordance tests/test_orchestrator_mcp.py::TestFormatShadowSlackMessage -v 2>&1 | tail -20",
           "expected": "AttributeError — helper methods don't exist yet"
         },
         {
@@ -119,12 +119,12 @@
         },
         {
           "description": "Run new helper tests to confirm they pass",
-          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestParseToolCallsFromDelta tests/test_orchestrator_mcp.py::TestComputeConcordance tests/test_orchestrator_mcp.py::TestFormatShadowSlackMessage -v 2>&1 | tail -20",
+          "command": "cd commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestParseToolCallsFromDelta tests/test_orchestrator_mcp.py::TestComputeConcordance tests/test_orchestrator_mcp.py::TestFormatShadowSlackMessage -v 2>&1 | tail -20",
           "expected": "All new tests PASS"
         },
         {
           "description": "Run full orchestrator test suite to confirm no regressions",
-          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py -v 2>&1 | tail -20",
+          "command": "cd commander && .venv/bin/pytest tests/test_orchestrator_mcp.py -v 2>&1 | tail -20",
           "expected": "All pre-existing tests PASS"
         },
         {
@@ -151,7 +151,7 @@
         },
         {
           "description": "Run wiring tests to confirm they fail",
-          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestShadowThreadFiring -v 2>&1 | tail -20",
+          "command": "cd commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestShadowThreadFiring -v 2>&1 | tail -20",
           "expected": "Tests FAIL — _fire_shadow_thread not called"
         },
         {
@@ -186,12 +186,12 @@
         },
         {
           "description": "Run wiring tests to confirm they pass",
-          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestShadowThreadFiring -v 2>&1 | tail -20",
+          "command": "cd commander && .venv/bin/pytest tests/test_orchestrator_mcp.py::TestShadowThreadFiring -v 2>&1 | tail -20",
           "expected": "All 3 wiring tests PASS"
         },
         {
           "description": "Run full test suite to confirm no regressions",
-          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/pytest tests/ -v --ignore=tests/test_signal_handler_destructive.py 2>&1 | tail -30",
+          "command": "cd commander && .venv/bin/pytest tests/ -v --ignore=tests/test_signal_handler_destructive.py 2>&1 | tail -30",
           "expected": "All tests PASS"
         },
         {

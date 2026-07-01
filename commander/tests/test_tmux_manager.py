@@ -105,7 +105,7 @@ class TestTmuxManager:
         mgr.send_raw_keys("worker-1", ["Down", "Space", "Enter"])
         assert mock_run.call_count == 1
         call_args = mock_run.call_args[0][0]
-        assert call_args == ["tmux", "send-keys", "-t", "worker-1", "Down", "Space", "Enter"]
+        assert call_args == ["tmux", "send-keys", "-t", "worker-1", "--", "Down", "Space", "Enter"]
 
     @patch("ironclaude.tmux_manager.subprocess.run")
     def test_send_raw_keys_list_form_not_shell(self, mock_run):
@@ -115,6 +115,47 @@ class TestTmuxManager:
         mgr.send_raw_keys("worker-1", ["Down"])
         assert isinstance(mock_run.call_args[0][0], list), "Must use list form, not shell string"
         assert mock_run.call_args.kwargs.get("shell", False) is False
+
+    @patch("ironclaude.tmux_manager.subprocess.run")
+    def test_send_keys_uses_double_dash_terminator(self, mock_run):
+        """send_keys inserts '--' immediately before the text so tmux never
+        parses the text as a flag."""
+        mock_run.return_value = MagicMock(returncode=0)
+        mgr = TmuxManager(log_dir="/tmp/ic-logs")
+        mgr.send_keys("worker-1", "hello world")
+        text_argv = mock_run.call_args_list[0].args[0]
+        assert text_argv == ["tmux", "send-keys", "-t", "worker-1", "--", "hello world"]
+        assert text_argv[-2] == "--"
+        assert text_argv[-1] == "hello world"
+
+    @patch("ironclaude.tmux_manager.subprocess.run")
+    def test_send_keys_dash_leading_text_placed_after_terminator(self, mock_run):
+        """Dash-leading text is placed after '--' so tmux treats it as literal text."""
+        mock_run.return_value = MagicMock(returncode=0)
+        mgr = TmuxManager(log_dir="/tmp/ic-logs")
+        mgr.send_keys("worker-1", "-v hello")
+        text_argv = mock_run.call_args_list[0].args[0]
+        dash_idx = text_argv.index("--")
+        assert text_argv[dash_idx + 1] == "-v hello"
+
+    @patch("ironclaude.tmux_manager.subprocess.run")
+    def test_send_raw_keys_uses_double_dash_terminator(self, mock_run):
+        """send_raw_keys inserts '--' immediately before the keys list."""
+        mock_run.return_value = MagicMock(returncode=0)
+        mgr = TmuxManager(log_dir="/tmp/ic-logs")
+        mgr.send_raw_keys("worker-1", ["Down", "Space", "Enter"])
+        argv = mock_run.call_args[0][0]
+        assert argv == ["tmux", "send-keys", "-t", "worker-1", "--", "Down", "Space", "Enter"]
+
+    @patch("ironclaude.tmux_manager.subprocess.run")
+    def test_send_raw_keys_dash_leading_key_placed_after_terminator(self, mock_run):
+        """A dash-leading key is placed after '--' so tmux treats it as literal."""
+        mock_run.return_value = MagicMock(returncode=0)
+        mgr = TmuxManager(log_dir="/tmp/ic-logs")
+        mgr.send_raw_keys("worker-1", ["-v hello"])
+        argv = mock_run.call_args[0][0]
+        dash_idx = argv.index("--")
+        assert argv[dash_idx + 1] == "-v hello"
 
 
 class TestSpawnSessionPathTraversal:
@@ -619,3 +660,38 @@ class TestDetectAskUserMenu:
         assert "Event-driven" in labels
         assert "Direct calls" in labels
         assert "Other" in labels
+
+
+class TestAdoptionHelpers:
+    @patch("ironclaude.tmux_manager.subprocess.run")
+    def test_rename_session_success(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stderr=b"")
+        tm = TmuxManager(log_dir="/tmp/ic-logs")
+        assert tm.rename_session("test-session", "ic-d1209a") is True
+        assert "rename-session" in mock_run.call_args.args[0]
+
+    @patch("ironclaude.tmux_manager.subprocess.run")
+    def test_rename_session_failure_returns_false(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stderr=b"no session")
+        tm = TmuxManager(log_dir="/tmp/ic-logs")
+        assert tm.rename_session("nope", "ic-x") is False
+
+    @patch("ironclaude.tmux_manager.subprocess.run")
+    def test_pane_current_command_returns_first_line(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="node\n")
+        tm = TmuxManager(log_dir="/tmp/ic-logs")
+        assert tm.pane_current_command("test-session") == "node"
+
+    @patch("ironclaude.tmux_manager.subprocess.run")
+    def test_pane_current_command_failure_returns_none(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stdout="")
+        tm = TmuxManager(log_dir="/tmp/ic-logs")
+        assert tm.pane_current_command("nope") is None
+
+    @patch("ironclaude.tmux_manager.subprocess.run")
+    def test_setup_log_capture_returns_log_path(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stderr=b"")
+        tm = TmuxManager(log_dir="/tmp/ic-logs")
+        path = tm.setup_log_capture("ic-d1209a")
+        assert path == "/tmp/ic-logs/ic-d1209a.log"
+        assert "pipe-pane" in mock_run.call_args.args[0]

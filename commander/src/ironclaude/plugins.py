@@ -114,11 +114,14 @@ def discover_plugins(registry: PluginRegistry, plugin_dirs: list[str] | None = N
             continue
         plugin_name = os.path.basename(plugin_dir)
         try:
-            # Add parent dir to sys.path permanently so handler functions can import
-            # plugin submodules at runtime (e.g. scan.session, scan.preprocess)
+            # Append parent dir to sys.path so handler functions can import plugin
+            # submodules at runtime (e.g. scan.session, scan.preprocess). Handlers
+            # resolve siblings at call time, so parent_dir must stay on sys.path for
+            # the daemon's lifetime — but we append (not insert(0)) so a plugin's
+            # sibling module cannot shadow stdlib/site-packages (import-precedence hijack).
             parent_dir = os.path.dirname(plugin_dir)
             if parent_dir not in sys.path:
-                sys.path.insert(0, parent_dir)
+                sys.path.append(parent_dir)
             spec = importlib.util.spec_from_file_location(f"plugin_{plugin_name}", plugin_file)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)

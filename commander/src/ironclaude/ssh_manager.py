@@ -4,10 +4,30 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import subprocess
 from dataclasses import dataclass, field
 
 logger = logging.getLogger("ironclaude.ssh_manager")
+
+
+def _quote_remote_path(path: str) -> str:
+    """Render a config-supplied path safe for interpolation into a remote shell string.
+
+    The joined `which <path>` command is passed to ssh as a single remote-shell
+    command, so any shell metacharacters in `path` would otherwise be interpreted
+    (or injected) by the remote shell. We shlex.quote the path to neutralize them.
+
+    A leading `~/` is the one intentional shell reference (expand to the remote
+    $HOME): keep `$HOME/` unquoted so the remote shell expands it, and quote only
+    the remainder. All other paths (including a bare metacharacter-laden string)
+    are fully quoted, so e.g. `/opt/claude; rm -rf ~` becomes a single inert arg.
+    """
+    if path == "~":
+        return "$HOME"
+    if path.startswith("~/"):
+        return "$HOME/" + shlex.quote(path[2:])
+    return shlex.quote(path)
 
 
 @dataclass
@@ -78,7 +98,7 @@ class SSHConnectionManager:
 
         checks = [
             (["true"], "SSH connectivity"),
-            (["which", machine.claude_path.replace("~", "$HOME")], "Claude binary"),
+            (["which", _quote_remote_path(machine.claude_path)], "Claude binary"),
         ]
         if machine.role == "worker":
             checks.append((["tmux", "-V"], "tmux available"))

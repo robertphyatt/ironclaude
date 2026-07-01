@@ -62,8 +62,11 @@ if [ "$prof_mode" = "undecided" ]; then
     fi
   fi
   # Bash mkdir .claude/rules/: allow during undecided setup (activation skill creates directory)
+  # Anchored to the command start + metachar-blocked so chained payloads cannot ride the exception.
   if [[ "$TOOL_NAME" == "Bash" ]]; then
-    if [[ "$FILE_PATH" =~ mkdir.*\.claude/rules ]]; then
+    if ! _has_blocked_metachars "$FILE_PATH" \
+        && [[ "$FILE_PATH" =~ ^[[:space:]]*mkdir[[:space:]] ]] \
+        && [[ "$FILE_PATH" == *".claude/rules"* ]]; then
       log_hook "professional-mode-guard" "Allowed" "mkdir .claude/rules during undecided setup"
       exit 0
     fi
@@ -253,7 +256,7 @@ Do NOT run git commit, git push, git merge, or git rebase outside of plan execut
       fi
     fi
     # Exception: allow read-only git commands at any workflow stage (no chaining — mirrors git-add guard above)
-    if [ "$TOOL_NAME" = "Bash" ] && ! _has_blocked_metachars "$FILE_PATH" && echo "$FILE_PATH" | grep -qE '\bgit\s+(diff|status|log|show|blame|branch|rev-list|ls-files|ls-tree|tag|remote|reflog|stash)\b'; then
+    if [ "$TOOL_NAME" = "Bash" ] && ! _has_blocked_metachars "$FILE_PATH" && echo "$FILE_PATH" | grep -qE '^\s*git\s+(diff|status|log|show|blame|branch|rev-list|ls-files|ls-tree|tag|remote|reflog|stash)\b'; then
       log_hook "professional-mode-guard" "Allowed" "read-only git command"
       exit 0
     fi
@@ -409,7 +412,7 @@ Use 'git add <file>' to stage your changes. The user will commit manually after 
 
 Do NOT run git commit, git push, git merge, or git rebase."
     fi
-    if ! echo "$FILE_PATH" | grep -qE '[;&|`]|\$\(' && echo "$FILE_PATH" | grep -qE '^\s*git\s+add\b'; then
+    if ! _has_blocked_metachars "$FILE_PATH" && echo "$FILE_PATH" | grep -qE '^\s*git\s+add\b'; then
       log_hook "professional-mode-guard" "Allowed" "git staging"
       exit 0
     fi

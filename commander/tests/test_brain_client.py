@@ -380,6 +380,99 @@ class TestBrainLivenessTimeout:
         assert client.needs_restart() is False
         client._stop_event.set()  # Clean up new thread
 
+    def test_needs_restart_false_during_tool_execution(self):
+        """600s timeout is bypassed when _executing_tool is True."""
+        client = self._make_alive_client(timeout_seconds=300)
+        client._executing_tool = True
+        client._last_message_time = time.time() - 700  # past 600s threshold
+        client._last_response_time = client._last_message_time - 10
+        assert client.needs_restart() is False
+        client._stop_event.set()
+
+    def test_hard_timeout_fires_at_1800s(self):
+        """1800s hard safety net fires even when _executing_tool is True."""
+        client = self._make_alive_client(timeout_seconds=300)
+        client._executing_tool = True
+        client._last_message_time = time.time() - 1801
+        client._last_response_time = client._last_message_time - 10
+        assert client.needs_restart() is True
+        assert "hung" in client.restart_reason
+        client._stop_event.set()
+
+    def test_absolute_inactivity_timeout_fires(self):
+        """If no SDK messages for 1800s (flag cleared), needs_restart fires."""
+        client = self._make_alive_client(timeout_seconds=300)
+        client._executing_tool = False
+        client._last_response_time = time.time() - 1801
+        client._last_message_time = time.time() - 2000
+        assert client.needs_restart() is True
+        assert "no SDK activity" in client.restart_reason
+        client._stop_event.set()
+
+    def test_normal_timeout_fires_without_executing_tool(self):
+        """600s timeout still fires when _executing_tool is False."""
+        client = self._make_alive_client(timeout_seconds=300)
+        client._executing_tool = False
+        client._last_message_time = time.time() - 700
+        client._last_response_time = client._last_message_time - 10
+        assert client.needs_restart() is True
+        client._stop_event.set()
+
+    def test_send_message_sets_executing_tool(self):
+        """send_message() sets _executing_tool=True when message is dispatched."""
+        client = BrainClient()
+        client._running = True
+        client._loop = asyncio.new_event_loop()
+        client._message_queue = asyncio.Queue()
+        client.send_message("test")
+        assert client._executing_tool is True
+        client._loop.run_until_complete(client._message_queue.get())
+        client._loop.close()
+
+    def test_restart_resets_executing_tool(self):
+        """restart() clears _executing_tool to False."""
+        client = self._make_alive_client(timeout_seconds=300)
+        client._executing_tool = True
+        client.start = lambda *a, **kw: setattr(client, '_running', True)
+        client._kill_brain_subprocess = lambda: None
+        client.restart("test prompt")
+        assert client._executing_tool is False
+        client._stop_event.set()
+
+    def test_executing_tool_cleared_on_result_message(self):
+        """ResultMessage (end-of-turn) must clear _executing_tool even without text."""
+        from unittest.mock import patch, MagicMock
+        from claude_agent_sdk.types import ResultMessage
+
+        client = BrainClient()
+        client._executing_tool = True
+        client._running = True
+        client._session_log_path = None
+
+        mock_result = MagicMock(spec=ResultMessage)
+        mock_result.session_id = "test-session"
+        mock_result.usage = None
+        mock_result.total_cost_usd = None
+
+        async def fake_query(**kwargs):
+            yield mock_result
+            client._running = False
+
+        async def run():
+            with patch("claude_agent_sdk.query", fake_query):
+                with patch("claude_agent_sdk.ClaudeAgentOptions"):
+                    await client._brain_session("test prompt", "/tmp")
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(run())
+        except Exception:
+            pass
+        finally:
+            loop.close()
+
+        assert client._executing_tool is False
+
 
 class TestCircuitBreaker:
     """Circuit breaker prevents infinite restart loops."""
@@ -460,6 +553,69 @@ class TestCompactionFlags:
     def test_check_compaction_complete_false_by_default(self):
         client = BrainClient()
         assert client.check_compaction_complete() is False
+
+
+class TestCompactionDeadline:
+    """needs_restart must recover from a hang during compaction-resume."""
+
+    def test_compaction_started_initially_zero(self):
+        client = BrainClient()
+        assert client._compaction_started == 0.0
+
+    def test_deadline_constant_is_1800(self):
+        assert BrainClient.COMPACTION_DEADLINE == 1800
+
+    def test_needs_restart_true_when_compaction_exceeds_deadline(self):
+        """A compaction stuck past COMPACTION_DEADLINE must force a restart."""
+        client = BrainClient()
+        client._compacting = True
+        client._compaction_started = time.time() - (BrainClient.COMPACTION_DEADLINE + 200)
+        assert client.needs_restart() is True
+        assert "compaction deadline exceeded" in client.restart_reason
+
+    def test_needs_restart_false_within_compaction_deadline(self):
+        """A compaction within the deadline must still be left alone."""
+        client = BrainClient()
+        client._compacting = True
+        client._compaction_started = time.time() - 10  # well within deadline
+        assert client.needs_restart() is False
+
+    def test_needs_restart_false_when_compacting_and_no_start_timestamp(self):
+        """Defensive: _compacting True with unset timestamp must not force restart."""
+        client = BrainClient()
+        client._compacting = True
+        client._compaction_started = 0.0
+        assert client.needs_restart() is False
+
+    def test_restart_clears_compaction_state(self):
+        """restart() must clear _compacting/_compaction_started to avoid a restart loop.
+
+        Without this, a deadline-exceeded restart leaves _compacting=True with a
+        stale timestamp; the very next poll re-fires 'compaction deadline exceeded'
+        and burns the entire restart budget.
+        """
+        client = TestBrainLivenessTimeout._make_alive_client(timeout_seconds=300)
+        client._compacting = True
+        client._compaction_started = time.time() - (BrainClient.COMPACTION_DEADLINE + 200)
+        assert client.needs_restart() is True  # confirm it would trigger
+
+        def fake_start(*a, **kw):
+            new_stop = threading.Event()
+            client._running = True
+            client._thread = threading.Thread(target=new_stop.wait, daemon=True)
+            client._thread.start()
+            client._stop_event = new_stop
+        client.start = fake_start
+        client._kill_brain_subprocess = lambda: None
+
+        client.restart("test prompt")
+        assert client._compacting is False
+        assert client._compaction_started == 0.0
+        # Must not immediately re-fire a compaction-deadline restart
+        client._restart_reason = ""  # clear stale reason from the confirm call above
+        assert client.needs_restart() is False
+        assert client.restart_reason == ""  # no new restart reason set
+        client._stop_event.set()
 
 
 class TestTimeoutAndReason:
@@ -1128,6 +1284,62 @@ class TestBrainPIDTracking:
         with patch('ironclaude.brain_client.os.kill', side_effect=ProcessLookupError):
             client._kill_brain_subprocess()
         assert client._brain_pid is None
+
+    def test_kill_skips_stored_pid_when_cmdline_mismatch(self, tmp_path, monkeypatch):
+        """A stored PID whose cmdline no longer matches the brain pattern is NOT killed."""
+        from unittest.mock import patch
+        client = BrainClient()
+        client._brain_pid = 12345
+        monkeypatch.setattr(BrainClient, 'BRAIN_PID_FILE', str(tmp_path / 'brain.pid'))
+        # cmdline lookup reports the PID is no longer a brain process
+        monkeypatch.setattr(client, '_pid_cmdline_matches', lambda pid: False)
+        with patch('ironclaude.brain_client._logged_kill') as mock_kill:
+            client._kill_brain_subprocess()
+        mock_kill.assert_not_called()
+        assert client._brain_pid is None  # cleanup still happens
+
+    def test_kill_proceeds_when_stored_pid_cmdline_matches(self, tmp_path, monkeypatch):
+        """A stored PID whose cmdline still matches the brain pattern IS killed."""
+        from unittest.mock import patch
+        client = BrainClient()
+        client._brain_pid = 12345
+        monkeypatch.setattr(BrainClient, 'BRAIN_PID_FILE', str(tmp_path / 'brain.pid'))
+        monkeypatch.setattr(client, '_pid_cmdline_matches', lambda pid: True)
+        with patch('ironclaude.brain_client._logged_kill') as mock_kill, \
+                patch('ironclaude.brain_client.os.kill', side_effect=ProcessLookupError):
+            client._kill_brain_subprocess()
+        mock_kill.assert_called_once()
+        assert mock_kill.call_args[0][0] == 12345
+
+    def test_pid_cmdline_matches_true_for_brain_pattern(self, monkeypatch):
+        """_pid_cmdline_matches returns True when ps reports a brain command line."""
+        from unittest.mock import MagicMock
+        monkeypatch.setattr(
+            'ironclaude.brain_client.subprocess.run',
+            lambda *a, **kw: MagicMock(
+                returncode=0,
+                stdout="node claude --output-format stream-json --system-prompt Orchestrator",
+            ),
+        )
+        assert BrainClient._pid_cmdline_matches(999) is True
+
+    def test_pid_cmdline_matches_false_for_other_process(self, monkeypatch):
+        """_pid_cmdline_matches returns False for an unrelated command line."""
+        from unittest.mock import MagicMock
+        monkeypatch.setattr(
+            'ironclaude.brain_client.subprocess.run',
+            lambda *a, **kw: MagicMock(returncode=0, stdout="/usr/bin/python some_other_script.py"),
+        )
+        assert BrainClient._pid_cmdline_matches(999) is False
+
+    def test_pid_cmdline_matches_false_when_pid_absent(self, monkeypatch):
+        """_pid_cmdline_matches returns False when ps exits non-zero (no such PID)."""
+        from unittest.mock import MagicMock
+        monkeypatch.setattr(
+            'ironclaude.brain_client.subprocess.run',
+            lambda *a, **kw: MagicMock(returncode=1, stdout=""),
+        )
+        assert BrainClient._pid_cmdline_matches(999) is False
 
     def test_shutdown_calls_kill_subprocess(self, monkeypatch):
         """shutdown() calls _kill_brain_subprocess() after thread join."""
@@ -2353,3 +2565,76 @@ class TestCheckPermissionSeeking:
         for _ in range(BrainClient.MAX_PERMISSION_CORRECTIONS):
             client._check_permission_seeking("Shall I proceed?")
         assert client._permission_correction_timestamps == []
+
+
+class TestPermissionSeekingOffLoop:
+    """The blocking permission-seeking grade must run off the event loop thread."""
+
+    def test_grade_dispatched_off_event_loop_thread(self):
+        """_maybe_correct_permission_seeking runs _check_permission_seeking in an executor."""
+        client = BrainClient()
+        seen = {}
+
+        def fake_check(text):
+            seen["thread"] = threading.get_ident()
+            seen["text"] = text
+            return "CORRECTION"
+
+        client._check_permission_seeking = fake_check
+        loop = asyncio.new_event_loop()
+        try:
+            loop_thread = threading.get_ident()  # run_until_complete drives loop on this thread
+            result = loop.run_until_complete(
+                client._maybe_correct_permission_seeking("Shall I proceed?")
+            )
+        finally:
+            loop.close()
+
+        assert result == "CORRECTION"
+        assert seen["text"] == "Shall I proceed?"
+        # Must have executed on a different (executor pool) thread, not the loop thread
+        assert seen["thread"] != loop_thread
+
+    def test_maybe_correct_returns_none_when_no_correction(self):
+        client = BrainClient()
+        client._check_permission_seeking = lambda text: None
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                client._maybe_correct_permission_seeking("I fixed it.")
+            )
+        finally:
+            loop.close()
+        assert result is None
+
+
+class TestShutdownLoopGuard:
+    """shutdown() must not leak a still-running loop, and must close a stopped one."""
+
+    def test_shutdown_closes_loop_when_thread_exits(self):
+        """Clean path: thread already gone → loop closed and _loop nulled."""
+        client = BrainClient()
+        loop = asyncio.new_event_loop()
+        client._loop = loop
+        client._thread = None
+        client._kill_brain_subprocess = lambda: None
+        client.shutdown()
+        assert client._loop is None
+        assert loop.is_closed()
+
+    def test_shutdown_keeps_loop_when_thread_still_alive(self):
+        """If the thread survives the join, _loop/_thread refs are kept (no leak of a live loop)."""
+        from unittest.mock import MagicMock
+        client = BrainClient()
+        fake_thread = MagicMock()
+        fake_thread.is_alive.return_value = True  # still running after join
+        client._thread = fake_thread
+        loop = asyncio.new_event_loop()  # not running → is_running() False
+        client._loop = loop
+        client._kill_brain_subprocess = lambda: None
+        client.shutdown()
+        # References preserved so is_alive() keeps reflecting the live thread
+        assert client._loop is loop
+        assert client._thread is fake_thread
+        assert not loop.is_closed()  # not force-closed while thread may still use it
+        loop.close()  # test cleanup
