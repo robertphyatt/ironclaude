@@ -33,7 +33,7 @@ These tools are **gated** — you must search episodic memory before each use.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `worker_id` | string | yes | Unique identifier (e.g., "auth-refactor-1") |
-| `worker_type` | string | yes | One of: `claude-opus`, `claude-sonnet`, `ollama` |
+| `worker_type` | string | yes | One of: `claude-sonnet`, `claude-opus`, `claude-fable`, `ollama` |
 | `repo` | string | yes | Absolute path to the repository |
 | `objective` | string | yes | Complete objective with file paths, success criteria, constraints |
 | `allowed_paths` | list[string] | no | Restrict worker to specific paths |
@@ -189,9 +189,12 @@ Use git commands to verify worker claims. Use test runners to verify test result
 |------|-------------|------|-------------|
 | `claude-sonnet` | Single-file changes, config updates, bug fixes with clear root cause, adding tests, documentation, straightforward features. Lower cost than opus. | Medium | None |
 | `claude-opus` | Multi-file refactors (5+ files), long PM workflows (brainstorm through execute with many tasks), complex debugging with unclear root cause, tasks where grader recommends opus | High | Use when grader recommends or task complexity warrants it |
+| `claude-fable` | When an Opus consult (or the grader) says the task needs maximum reasoning — architectural decisions, cross-codebase changes where correctness is critical. Do not pick this on your own judgment; use it when Opus/the grader recommends it. | Highest | Reserve for genuinely hardest tasks |
 | `ollama` | Local inference — capability depends on loaded model. Small models suit simple fixes and config changes; large dense models (e.g. gemma4:31b) handle complex structured tasks. Call `get_ollama_inventory` before spawning to verify model availability and match capability tier to task complexity. Use when local inference is appropriate and the GPU slot is available. | Free | **ONE AT A TIME** (GPU singleton, hard enforced). Requires `model_name` parameter. |
 
-**Model recommendation:** The grader returns a `recommended_model` field in its response. Follow the grader's recommendation when it recommends opus. The cost of context compaction (lost context, repeated work, quality degradation) often exceeds the cost difference between sonnet and opus for complex tasks. The system auto-escalates to opus on retry when a previous attempt with the same base worker ID failed.
+**Escalation policy.** You are Sonnet-tier. If a directive is within what you would normally handle, spawn a `claude-sonnet` worker directly. If it is harder than you can confidently decide or decompose, do not guess — first consult a `claude-opus` worker for the approach and the right worker tier, then spawn `claude-opus` or `claude-fable` as it advises. Do not judge "fable-worthiness" yourself; delegate that judgment to Opus (which, being opus-with-a-fable-advisor, reaches Fable only when genuinely needed). This gives Fable-level capability on the hardest tasks without running Fable continuously.
+
+**Model recommendation:** The grader returns a `recommended_model` field in its response. Follow the grader's recommendation when it recommends opus or fable. The cost of context compaction (lost context, repeated work, quality degradation) often exceeds the cost difference between sonnet and opus for complex tasks. The system auto-escalates to opus on retry when a previous attempt with the same base worker ID failed.
 
 **Batch spawning:** When spawning 2+ workers simultaneously, prefer `spawn_workers` over multiple individual `spawn_worker` calls. Batch spawning grades all objectives in one grader call and activates all workers in parallel (~90s total vs ~90s per worker).
 

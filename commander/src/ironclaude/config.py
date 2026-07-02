@@ -37,15 +37,17 @@ DEFAULTS = {
     "brain_prompt_path": "",  # test11
     "operator_name": "Operator",
     "autonomy_level": "3",
-    "brain_model": "fable",
+    "brain_model": "sonnet",
     "default_opus_model": "opus",
     "grader_model": "opus",
     "effort_level": "high",
     "advisor": {
         "enabled": True,
         "executor_model": "sonnet",  # CLI routing only — sets --model flag for sonnet workers; not a Brain model selection input
-        "advisor_model": "opus",
+        "advisor_model": "opus",  # scalar fallback for unknown worker types
+        "advisor_models": {"claude-sonnet": "opus", "claude-opus": "fable"},  # one-tier-up map per worker type
     },
+    "dispatch": {"use_goal": False},
 }
 
 # Env vars that override JSON config (env name -> config key, type)

@@ -61,3 +61,9 @@
    - If problem detected (errors, stalls, process died): call it out immediately, do NOT wait for next heartbeat
    - Use `/loop` or ScheduleWakeup — do NOT repeatedly stop and restart the process
    - Report to Brain only on: errors detected, process died, or pipeline completed
+
+11. **Right-Size Every Subagent (delegate liberally, match model to difficulty)**
+   - Delegate liberally: if a subagent can do a task, dispatch one — reserve your own context for orchestration and the judgment only you can provide. (This does not override Subagent Discipline: keep prompts focused, set max_turns, and run inline when a task is complex enough to risk a context spiral.)
+   - Match the model to the task's difficulty — never higher than needed. Capability (and cost) ranking, highest to lowest: Fable → Opus → Sonnet → Haiku.
+   - Pick the LEAST capable model that will reliably succeed: Haiku for mechanical or lookup work, Sonnet for routine implementation, Opus for hard multi-step reasoning, Fable only for the hardest problems lower tiers cannot handle.
+   - Never burn a higher tier on lower-tier work: no Fable doing Opus's job, no Opus doing Sonnet's, no Sonnet doing Haiku's. When unsure, start one tier lower and escalate only if it genuinely fails.

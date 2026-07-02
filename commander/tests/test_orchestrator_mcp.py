@@ -254,6 +254,136 @@ class TestSpawnWorker:
         keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
         assert not any(k.startswith("/advisor") for k in keys_sent)
 
+    _TIERED_ADVISOR_CFG = {
+        "enabled": True,
+        "executor_model": "sonnet",
+        "advisor_model": "opus",
+        "advisor_models": {"claude-sonnet": "opus", "claude-opus": "fable"},
+    }
+
+    def test_spawn_worker_sonnet_sends_tiered_advisor_opus(self, registry, mock_tmux, tmp_path, db_conn):
+        """A claude-sonnet worker gets /advisor opus per the advisor_models tier map."""
+        ledger_path = str(tmp_path / "task-ledger.json")
+        tools = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            advisor_cfg=self._TIERED_ADVISOR_CFG,
+        )
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        with patch("ironclaude.orchestrator_mcp.time.sleep"):
+            tools.spawn_worker(
+                worker_id="w-tier-sonnet",
+                worker_type="claude-sonnet",
+                repo="/tmp/repo",
+                objective="Do the thing",
+            )
+        keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
+        assert "/advisor opus" in keys_sent
+
+    def test_spawn_worker_opus_sends_tiered_advisor_fable(self, registry, mock_tmux, tmp_path, db_conn):
+        """A claude-opus worker gets /advisor fable per the advisor_models tier map."""
+        ledger_path = str(tmp_path / "task-ledger.json")
+        tools = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            advisor_cfg=self._TIERED_ADVISOR_CFG,
+        )
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        with patch("ironclaude.orchestrator_mcp.time.sleep"):
+            tools.spawn_worker(
+                worker_id="w-tier-opus",
+                worker_type="claude-opus",
+                repo="/tmp/repo",
+                objective="Do the thing",
+            )
+        keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
+        assert "/advisor fable" in keys_sent
+
+    def test_spawn_worker_fable_skips_advisor_entirely(self, registry, mock_tmux, tmp_path, db_conn):
+        """A claude-fable worker sends no /advisor at all — it is the top tier."""
+        ledger_path = str(tmp_path / "task-ledger.json")
+        tools = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            advisor_cfg=self._TIERED_ADVISOR_CFG,
+        )
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        with patch("ironclaude.orchestrator_mcp.time.sleep"):
+            tools.spawn_worker(
+                worker_id="w-tier-fable",
+                worker_type="claude-fable",
+                repo="/tmp/repo",
+                objective="Do the thing",
+            )
+        keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
+        assert not any(k.startswith("/advisor") for k in keys_sent)
+
+    def test_spawn_worker_sends_goal_when_use_goal_enabled(self, registry, mock_tmux, tmp_path, db_conn):
+        """With dispatch.use_goal True, a /goal command is sent after the advisor stage."""
+        ledger_path = str(tmp_path / "task-ledger.json")
+        tools = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            dispatch_cfg={"use_goal": True},
+        )
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        with patch("ironclaude.orchestrator_mcp.time.sleep"):
+            tools.spawn_worker(
+                worker_id="w-goal-on",
+                worker_type="claude-sonnet",
+                repo="/tmp/repo",
+                objective="Do the thing",
+            )
+        keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
+        assert "/goal the assigned objective is complete and code review has passed" in keys_sent
+
+    def test_spawn_worker_no_goal_when_use_goal_disabled(self, tools, mock_tmux):
+        """With dispatch.use_goal False (default), no /goal command is sent."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        tools.spawn_worker(
+            worker_id="w-goal-off",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="Do the thing",
+        )
+        keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
+        assert not any(k.startswith("/goal") for k in keys_sent)
+
+    def test_opus_worker_escalates_to_fable_when_grader_recommends(self, tools, registry, mock_tmux):
+        """A claude-opus spawn escalates to claude-fable when the grader explicitly recommends it."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok", "confidence": "high",
+            "recommended_model": "claude-fable",
+        })
+        tools.spawn_worker(
+            worker_id="w-opus-fable",
+            worker_type="claude-opus",
+            repo="/tmp/repo",
+            objective="Complex architectural task",
+        )
+        worker = registry.get_worker("w-opus-fable")
+        assert worker is not None
+        assert worker["type"] == "claude-fable"
+
+    def test_opus_worker_not_escalated_without_explicit_fable_recommendation(self, tools, registry, mock_tmux):
+        """A claude-opus spawn stays claude-opus when the grader does not recommend fable —
+        the bump is never unconditional."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok", "confidence": "high",
+        })
+        tools.spawn_worker(
+            worker_id="w-opus-stay",
+            worker_type="claude-opus",
+            repo="/tmp/repo",
+            objective="Complex architectural task",
+        )
+        worker = registry.get_worker("w-opus-stay")
+        assert worker is not None
+        assert worker["type"] == "claude-opus"
+
     def _make_remote_tools(self, registry, mock_tmux, tmp_path, db_conn):
         """Helper: OrchestratorTools with mocked SSH manager targeting remote-worker."""
         from ironclaude.ssh_manager import MachineConfig
@@ -1289,7 +1419,8 @@ class TestPersistentGrader:
                 if m:
                     return baseline + m.group() + "\n" + json_response + "\n"
             return baseline
-        mock_tmux.read_log_tail.side_effect = fake_read_log_tail
+        # _do_grader_send_and_poll polls capture_pane (not read_log_tail) — inject there.
+        mock_tmux.capture_pane.side_effect = fake_read_log_tail
 
         result = tools._call_grader("system prompt", "user prompt")
         assert result["grade"] == "A"
@@ -1392,7 +1523,8 @@ class TestPersistentGrader:
                 if m:
                     return baseline + m.group() + "\n" + bad_json + "\n"
             return baseline
-        mock_tmux.read_log_tail.side_effect = fake_read_log_tail
+        # _do_grader_send_and_poll polls capture_pane (not read_log_tail) — inject there.
+        mock_tmux.capture_pane.side_effect = fake_read_log_tail
 
         result = tools._call_grader("system prompt", "user prompt")
         assert result["grade"] == "F"
@@ -1433,7 +1565,8 @@ class TestPersistentGrader:
             # No nonce in prompt (unfixed code): return echo with injected JSON only
             return echo
 
-        mock_tmux.read_log_tail.side_effect = fake_read_log_tail
+        # _do_grader_send_and_poll polls capture_pane (not read_log_tail) — inject there.
+        mock_tmux.capture_pane.side_effect = fake_read_log_tail
         tools._wait_for_grader_clear = MagicMock(return_value=True)
 
         result = tools._call_grader("system prompt", user_prompt)
@@ -4127,6 +4260,31 @@ class TestGetMessagesByTsRange:
         mock_slack.get_messages_by_ts_range.assert_called_once_with("1.0", "2.0", True, channel="C999")
 
 
+class TestAdvisorModelFor:
+    """Tests for _advisor_model_for — tiered advisor selection by worker type."""
+
+    def test_returns_tiered_model_for_known_worker_type(self, tools):
+        tools._advisor_cfg = {
+            "enabled": True,
+            "advisor_model": "opus",
+            "advisor_models": {"claude-sonnet": "opus", "claude-opus": "fable"},
+        }
+        assert tools._advisor_model_for("claude-sonnet") == "opus"
+        assert tools._advisor_model_for("claude-opus") == "fable"
+
+    def test_falls_back_to_scalar_advisor_model_for_unmapped_worker_type(self, tools):
+        tools._advisor_cfg = {
+            "enabled": True,
+            "advisor_model": "opus",
+            "advisor_models": {"claude-sonnet": "opus", "claude-opus": "fable"},
+        }
+        assert tools._advisor_model_for("ollama") == "opus"
+
+    def test_falls_back_to_default_opus_when_no_config(self, tools):
+        tools._advisor_cfg = {}
+        assert tools._advisor_model_for("claude-sonnet") == "opus"
+
+
 class TestGetWorkerCommand:
     def test_returns_worker_commands_fallback_when_no_advisor(self, tools):
         """Without advisor config, returns WORKER_COMMANDS entry unchanged."""
@@ -5855,6 +6013,18 @@ class TestDoGraderSendAndPoll:
 
         mock_tmux.capture_pane.assert_called()
         mock_tmux.read_log_tail.assert_not_called()
+
+    def test_prompt_schema_offers_claude_fable_as_a_recommendation(self, registry, mock_tmux):
+        """The recommended_model schema sent to the grader must include claude-fable
+        so the grader can reach it, not just claude-sonnet|claude-opus."""
+        tools = self._make_tools(mock_tmux, registry)
+        mock_tmux.capture_pane.return_value = "no delimiter here"  # times out fast
+
+        with patch("ironclaude.orchestrator_mcp.secrets.token_hex", return_value=self.NONCE):
+            tools._do_grader_send_and_poll("sys", "user")
+
+        combined = mock_tmux.send_keys.call_args_list[0][0][1]
+        assert "claude-fable" in combined
 
     def test_returns_clean_feedback_text(self, registry, mock_tmux):
         """Feedback text from capture_pane must be returned without corruption."""

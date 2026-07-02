@@ -13,6 +13,27 @@
 
 _Nothing yet._
 
+## 1.0.15
+
+Model-tiering release: right-size the whole system around capability-on-demand. The always-on brain runs on Sonnet and reaches Opus/Fable only when a task warrants it, backed by one-tier-up advisors — Fable-level capability on the hardest work without burning the top tier continuously.
+
+### Added
+- **Right-Size Every Subagent** behavioral directive — a new Core Principle telling every worker to delegate to subagents liberally and match the subagent model to task difficulty (Fable → Opus → Sonnet → Haiku; use the least capable model that will reliably succeed). Added to all synchronized directive copies: the worker template (`commander/src/ironclaude/templates/worker_claude_md.md`), `worker/CLAUDE.md`, the repo-root and `commander/` `CLAUDE.md`, and `.claude/rules/behavioral.md`. Harmonizes with the existing Subagent Discipline principle.
+- **Sonnet default brain (user-overridable).** `brain_model` default changed `fable` → `sonnet`; still overridable via `BRAIN_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`, or config. `default_opus_model` stays decoupled (`opus`) so `claude-opus` workers are unaffected. The brain handles routine orchestration itself and escalates to stronger workers on demand rather than running the top tier every cycle.
+- **`claude-fable` as a first-class worker + brain escalation policy.** The brain's system prompt now lists `claude-fable` and an escalation policy: routine work → `claude-sonnet`; harder-than-it-can-decide → consult a `claude-opus` worker, then spawn `claude-opus`/`claude-fable` as advised (the brain delegates "fable-worthiness" to Opus rather than judging it itself). The spawn-time grader can recommend `claude-fable`, and an approved `claude-opus` spawn escalates to `claude-fable` only when the grader explicitly recommends it (no unconditional bump).
+- **One-tier-up worker advisors.** Advisor model is now selected by worker type via `advisor.advisor_models` (`claude-sonnet` → `opus`, `claude-opus` → `fable`), with the scalar `advisor.advisor_model` as a fallback for unmapped types; `claude-fable` workers get no advisor (top tier). Applied in both the MCP and file-decision spawn paths.
+- **Config-flagged `/goal` autonomous dispatch** (`dispatch.use_goal`, default off): when enabled, a spawned worker is given a `/goal` completion condition after professional-mode activation and advisor setup, for more autonomous, less-babysat execution.
+
+### Fixed
+- **Brain `fable[1m]` startup crash.** The brain unconditionally appended the `[1m]` suffix + `context-1m-2025-08-07` beta to its model string. Fable 5 and Sonnet 5 have a 1M context window natively and reject that beta, so `fable[1m]` errored on every cycle and wedged the brain. The suffix/beta is now applied only to models that need it to unlock 1M (opus); 1M-native models launch with the bare alias.
+- **Message-shaped model-unavailable fallback.** The brain's fallback-to-opus fired only on raised exceptions, but the SDK returned model-unavailability as a normal assistant message (`"There's an issue with the selected model … may not have access"`), so the brain never recovered. It now also detects that message signature and falls back to opus.
+- **GBTW Stop hook accepts a waiting state.** The get-back-to-work hook now treats a "holding for … / waiting for … / standing by / awaiting" final sentence as a legitimate stop — suppressing only the continuation nudge while keeping the code-review, memory-search, tasks-in-progress, and bypass gates intact — so it no longer fights `/goal`-driven or legitimately-waiting workers.
+- **`scripts/bump-version.sh` now updates the correct files.** It previously targeted a nonexistent `plugins/ironclaude/.claude-plugin/plugin.json` and never touched `commander/pyproject.toml`, so it errored and left the version out of sync. It now updates `commander/pyproject.toml`, `worker/.claude-plugin/plugin.json`, and `.claude-plugin/marketplace.json` (the three files `test_version_consistency.py` enforces), with version-format and file-existence validation.
+- **Grader test drift.** Three `TestPersistentGrader` tests injected the grader response via `read_log_tail`, but the poll loop reads `capture_pane`; the mocks were repointed so the tests exercise the real poll path instead of timing out.
+
+### Changed
+- Version bumped to 1.0.15 across `pyproject.toml`, `plugin.json`, and `marketplace.json`.
+
 ## 1.0.14
 
 ### Added

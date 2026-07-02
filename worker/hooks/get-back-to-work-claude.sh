@@ -746,6 +746,20 @@ if [ "$FIRE_CONTINUATION" = "true" ]; then
     fi
 fi
 
+# Suppress continuation check when the worker ends on a legitimate "holding/waiting" state.
+# /goal-driven workers (and workers waiting on an external event) commonly end a turn with
+# "holding for <something>" / "waiting for ..." — an acceptable place to stop, because /goal
+# (or the operator) drives continuation. Without this, GBTW's continuation check fights the
+# /goal loop. Only the continuation nudge is suppressed here — the hard gates above
+# (code-review, memory-search, tasks-in-progress, bypass detection) still apply.
+if [ "$FIRE_CONTINUATION" = "true" ]; then
+    _IC_LAST_LINE=$(printf '%s\n' "$RECENT_CONTEXT" | grep -v '^[[:space:]]*$' | tail -1)
+    if echo "$_IC_LAST_LINE" | grep -qiE 'holding (for|until)|waiting for|standing by|awaiting'; then
+        FIRE_CONTINUATION="false"
+        log_hook "GET-BACK-TO-WORK" "Suppressed" "continuation check — worker in holding/waiting state: ${_IC_LAST_LINE}"
+    fi
+fi
+
 # Inject skill context into bypass prompt if available
 if [ -n "$BYPASS_CONTEXT" ]; then
     BYPASS_PROMPT="${BYPASS_PROMPT}

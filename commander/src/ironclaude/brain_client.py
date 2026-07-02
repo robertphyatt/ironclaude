@@ -64,6 +64,57 @@ def _is_model_unavailable(exc: Exception) -> bool:
     )
 
 
+# Models that REQUIRE the [1m] suffix + context-1m-2025-08-07 beta to unlock a
+# 1M-token context window. Opus opts into 1M via this beta (this session runs on
+# "claude-opus-4-8[1m]"). Fable 5 and Sonnet 5 have 1M context NATIVELY and REJECT
+# this beta — passing "fable[1m]"/"sonnet[1m]" is an error (observed brain crash:
+# "There's an issue with the selected model (fable[1m])"). So the suffix/beta is
+# applied ONLY to models in this set; everything else launches with the bare model.
+_MODEL_UNAVAILABLE_TEXT_PHRASES = (
+    "may not exist",
+    "may not have access",
+    "not available",
+    "issue with the selected model",
+)
+
+
+def _is_model_unavailable_text(text: str) -> bool:
+    """Return True if brain assistant TEXT (not an exception) signals the selected
+    model is unavailable/inaccessible. The SDK sometimes returns this as a normal
+    assistant message instead of raising, e.g. "There's an issue with the selected
+    model (fable[1m]). It may not exist or you may not have access to ...". Requires
+    the "selected model" anchor plus an availability phrase to avoid false positives
+    on ordinary prose that merely mentions a model.
+    """
+    if not text:
+        return False
+    t = text.lower()
+    if "selected model" not in t:
+        return False
+    return any(phrase in t for phrase in _MODEL_UNAVAILABLE_TEXT_PHRASES)
+
+
+class _ModelUnavailableFromMessage(Exception):
+    """Raised when the brain's assistant TEXT (not an exception) signals the model
+    is unavailable, so the outer handler can fall back to opus — mirroring the
+    exception-driven fallback path."""
+
+
+_MODELS_NEEDING_1M_BETA = ("opus",)
+
+
+def _model_needs_1m_beta(model: str) -> bool:
+    """Return True only for models that need the [1m] suffix + context-1m-2025-08-07
+    beta to unlock 1M context (opus). Models with 1M natively (fable, sonnet) return
+    False and must launch with the bare model string — no suffix, no beta.
+
+    Matches on the base model token even if the value carries a suffix or provider
+    prefix (e.g. "claude-opus-4-8", "opus[1m]").
+    """
+    model_lower = model.lower()
+    return any(token in model_lower for token in _MODELS_NEEDING_1M_BETA)
+
+
 class BrainClient:
     """Manages the brain as a Claude Agent SDK subprocess with structured I/O."""
 
@@ -640,10 +691,13 @@ class BrainClient:
                 max_buffer_size=self.MAX_BUFFER_SIZE,
                 mcp_servers=mcp_servers,
                 effort=self._effort_level,
-                model=f"{model_str}[1m]",
-                betas=["context-1m-2025-08-07"],
                 setting_sources=["project", "local"],
             )
+            if _model_needs_1m_beta(model_str):
+                common["model"] = f"{model_str}[1m]"
+                common["betas"] = ["context-1m-2025-08-07"]
+            else:
+                common["model"] = model_str
             if resume_session_id:
                 return ClaudeAgentOptions(
                     **common,
@@ -707,6 +761,15 @@ class BrainClient:
                                 text_parts.append(block.text)
                         if text_parts:
                             full_text = "\n\n".join(text_parts)
+                            # Message-shaped model-unavailability: the SDK returned the
+                            # error as normal assistant text rather than raising, so the
+                            # exception fallback never fires. Detect it and fall back to
+                            # opus (unless we are already on opus — nothing higher to try).
+                            if (
+                                _is_model_unavailable_text(full_text)
+                                and "opus" not in self._model.lower()
+                            ):
+                                raise _ModelUnavailableFromMessage(full_text)
                             self._response_queue.put(full_text)
                             self._executing_tool = False
                             self._session_log_write(f"MSG_SEND chars={len(full_text)} preview={full_text[:100]!r}")
@@ -723,6 +786,13 @@ class BrainClient:
 
         try:
             await _run_session(_build_options(self._model))
+        except _ModelUnavailableFromMessage:
+            resolved = "opus"
+            logger.error(
+                f"BRAIN MODEL '{self._model}' UNAVAILABLE (message-shaped) — resolving to '{resolved}'"
+            )
+            self._model = resolved
+            await _run_session(_build_options(resolved))
         except Exception as exc:
             if _is_model_unavailable(exc):
                 resolved = "opus"

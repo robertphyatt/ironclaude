@@ -1824,6 +1824,119 @@ class TestBrainSessionOptions:
         assert captured.get("setting_sources") == ["project", "local"]
 
 
+class TestBrain1MContextGating:
+    """1M-context beta ([1m] suffix + context-1m-2025-08-07 beta) applies ONLY to
+    models that need it to unlock 1M (opus). Fable 5 and Sonnet 5 have 1M natively
+    and reject the beta — they must launch with the bare model string."""
+
+    def _run_and_capture(self, client, system_prompt, resume_session_id=None):
+        """Run _brain_session with patched SDK, return captured ClaudeAgentOptions kwargs."""
+        import asyncio
+        from unittest.mock import patch
+
+        captured = {}
+
+        class CapturingOptions:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        async def noop_query(prompt=None, options=None):
+            return
+            yield  # noqa: unreachable — makes this an async generator
+
+        with patch("claude_agent_sdk.ClaudeAgentOptions", CapturingOptions), \
+             patch("claude_agent_sdk.query", noop_query):
+            client._episodic_memory_path = "/fake/memory.js"
+            asyncio.run(client._brain_session(system_prompt, None, resume_session_id))
+
+        return captured
+
+    def test_opus_gets_1m_suffix_and_beta(self):
+        client = BrainClient(model="opus")
+        captured = self._run_and_capture(client, "my-prompt")
+        assert captured.get("model") == "opus[1m]"
+        assert captured.get("betas") == ["context-1m-2025-08-07"]
+
+    def test_fable_gets_bare_model_no_beta(self):
+        """Fable 5 has 1M natively and rejects the [1m] suffix/beta (the daemon crash)."""
+        client = BrainClient(model="fable")
+        captured = self._run_and_capture(client, "my-prompt")
+        assert captured.get("model") == "fable"
+        assert "context-1m-2025-08-07" not in (captured.get("betas") or [])
+
+    def test_sonnet_gets_bare_model_no_beta(self):
+        client = BrainClient(model="sonnet")
+        captured = self._run_and_capture(client, "my-prompt")
+        assert captured.get("model") == "sonnet"
+        assert "context-1m-2025-08-07" not in (captured.get("betas") or [])
+
+
+class TestModelUnavailableText:
+    """Message-shaped model-unavailable detection + fallback (the SDK returned the
+    error as a normal assistant message, so the exception-only fallback never fired)."""
+
+    def test_detects_unavailable_signature(self):
+        from ironclaude.brain_client import _is_model_unavailable_text
+        assert _is_model_unavailable_text(
+            "There's an issue with the selected model (fable[1m]). "
+            "It may not exist or you may not have access to it."
+        ) is True
+
+    def test_detects_no_access_signature(self):
+        from ironclaude.brain_client import _is_model_unavailable_text
+        assert _is_model_unavailable_text(
+            "Error: the selected model is not available; you may not have access."
+        ) is True
+
+    def test_ignores_benign_text(self):
+        from ironclaude.brain_client import _is_model_unavailable_text
+        assert _is_model_unavailable_text("The selected model handled the task well.") is False
+        assert _is_model_unavailable_text("All checks passed, changes staged.") is False
+        assert _is_model_unavailable_text("") is False
+
+    def test_message_shaped_unavailability_falls_back_to_opus(self):
+        """A brain assistant MESSAGE signaling model-unavailable triggers fallback
+        to opus and is not surfaced as a brain response."""
+        import asyncio
+        from unittest.mock import patch
+        from claude_agent_sdk import AssistantMessage
+        from claude_agent_sdk.types import TextBlock
+
+        models_built = []
+
+        class CapturingOptions:
+            def __init__(self, **kwargs):
+                models_built.append(kwargs.get("model"))
+
+        call_count = {"n": 0}
+        unavailable_text = (
+            "There's an issue with the selected model (fable[1m]). "
+            "It may not exist or you may not have access to it."
+        )
+
+        async def fake_query(prompt=None, options=None):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                yield AssistantMessage(content=[TextBlock(text=unavailable_text)], model="fable")
+            else:
+                return
+                yield  # noqa: unreachable — async generator marker
+
+        client = BrainClient(model="fable")
+        with patch("claude_agent_sdk.ClaudeAgentOptions", CapturingOptions), \
+             patch("claude_agent_sdk.query", fake_query):
+            client._episodic_memory_path = "/fake/memory.js"
+            asyncio.run(client._brain_session("my-prompt", None, None))
+
+        # First session launched fable (bare), then fell back to opus[1m]
+        assert models_built[0] == "fable"
+        assert any(m == "opus[1m]" for m in models_built), models_built
+        assert client._model == "opus"
+        # The unavailability text was NOT surfaced as a brain response
+        drained = client.get_pending_responses()
+        assert all(unavailable_text not in r for r in drained)
+
+
 class TestMutationToolFirstCheck:
     """Mutation tool check is first in _tool_guard_logic — unconditional, before all other checks."""
 

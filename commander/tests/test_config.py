@@ -95,18 +95,36 @@ class TestLoadConfig:
         assert cfg["advisor"]["executor_model"] == "sonnet"
         assert cfg["advisor"]["advisor_model"] == "opus"
 
-    def test_defaults_include_brain_model(self):
-        """brain_model defaults to fable."""
-        from ironclaude.config import DEFAULTS
-        assert DEFAULTS["brain_model"] == "fable"
+    def test_advisor_models_map_default(self):
+        """advisor_models provides a one-tier-up map per worker type."""
+        cfg = load_config("/nonexistent/path.json")
+        assert cfg["advisor"]["advisor_models"] == {
+            "claude-sonnet": "opus",
+            "claude-opus": "fable",
+        }
 
-    def test_no_env_brain_model_is_fable(self, monkeypatch):
-        """With no relevant env vars, brain_model resolves to fable."""
+    def test_advisor_model_scalar_fallback_retained(self):
+        """The flat advisor_model scalar remains as a fallback for unknown worker types."""
+        cfg = load_config("/nonexistent/path.json")
+        assert cfg["advisor"]["advisor_model"] == "opus"
+
+    def test_dispatch_use_goal_default_false(self):
+        """dispatch.use_goal is a feature flag defaulting to off."""
+        cfg = load_config("/nonexistent/path.json")
+        assert cfg["dispatch"]["use_goal"] is False
+
+    def test_defaults_include_brain_model(self):
+        """brain_model defaults to sonnet."""
+        from ironclaude.config import DEFAULTS
+        assert DEFAULTS["brain_model"] == "sonnet"
+
+    def test_no_env_brain_model_is_sonnet(self, monkeypatch):
+        """With no relevant env vars, brain_model resolves to sonnet."""
         monkeypatch.delenv("ANTHROPIC_DEFAULT_OPUS_MODEL", raising=False)
         monkeypatch.delenv("BRAIN_MODEL", raising=False)
         monkeypatch.delenv("GRADER_MODEL", raising=False)
         cfg = load_config("/nonexistent/path.json")
-        assert cfg["brain_model"] == "fable"
+        assert cfg["brain_model"] == "sonnet"
 
     def test_defaults_include_grader_model(self):
         """grader_model defaults to opus."""

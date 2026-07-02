@@ -185,27 +185,29 @@ Hooks deploy to `~/.claude/ironclaude-hooks/` via `make deploy-hooks` and run fr
 
 ### Model Configuration
 
-The Brain selects worker type per task:
+The Brain selects worker type per task, and each worker gets an advisor **one tier up** for oversight:
 
-| Worker Type | Description |
-|-------------|-------------|
-| `claude-sonnet` | Default. Sonnet with an Opus advisor session; used for most tasks |
-| `claude-opus` | Full Opus worker for high-complexity tasks |
-| `claude-fable` | Fable model for highest-capability architectural work |
-| `ollama` | Local LLM routed via `ANTHROPIC_BASE_URL` — see [Ollama Workers](#ollama-workers) |
+| Worker Type | Description | Advisor |
+|-------------|-------------|---------|
+| `claude-sonnet` | Default. Used for most tasks | Opus |
+| `claude-opus` | Full Opus worker for high-complexity tasks | Fable |
+| `claude-fable` | Fable model for the hardest, correctness-critical architectural work | — (top tier) |
+| `ollama` | Local LLM routed via `ANTHROPIC_BASE_URL` — see [Ollama Workers](#ollama-workers) | — |
 
-IronClaude defaults to Claude Opus (`opus`) for the brain and grader. You can override this via environment variables to pin a specific model version:
+**Model tiering — capability on demand.** The always-on Brain runs on **Sonnet** by default and handles routine orchestration itself. When a directive is harder than it can confidently decide, it doesn't guess: it consults an Opus worker for the approach and the right worker tier, then spawns `claude-opus` or `claude-fable` as advised (the spawn-time grader can recommend `claude-fable`, and an approved Opus spawn escalates to Fable only when the grader explicitly recommends it). Combined with the one-tier-up advisors above — a Sonnet worker gets an Opus advisor, an Opus worker gets a Fable advisor — the system delivers **Fable-level capability on the hardest work without burning Fable tokens continuously**: the persistent component stays cheap, and the top tiers are reached transiently, on demand.
+
+The grader defaults to Opus. You can override any of these via environment variables to pin a specific model version:
 
 ```bash
-# Override all opus-class usage (brain, grader, workers) with a single var
+# Override all opus-class usage (grader, opus workers) with a single var
 export ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-4-6-20250115"
 
 # Or override individually (takes precedence over ANTHROPIC_DEFAULT_OPUS_MODEL)
-export BRAIN_MODEL="claude-opus-4-6-20250115"
+export BRAIN_MODEL="sonnet"                              # the Brain (default: sonnet)
 export GRADER_MODEL="claude-sonnet-4-5-20241022"
 ```
 
-When workers use Sonnet, they automatically get an Opus 4 advisor for oversight. If a Sonnet worker fails a task, the Brain may re-assign it to an Opus worker. Configure these to match your workflow requirements.
+Advisor pairing is configured under `advisor.advisor_models` (per worker type) with a scalar `advisor.advisor_model` fallback; see the [Configuration Reference](#configuration-reference).
 
 ### Worker Skills
 
@@ -471,13 +473,15 @@ Three convergence mechanisms keep the wiki current:
 | `brain_timeout_seconds` | `600` | Max seconds to wait for a Brain response |
 | `max_worker_retries` | `3` | Retry attempts before marking a task failed |
 | `autonomy_level` | `"3"` | Brain autonomy: `1` = confirm all, `3` = default, `5` = full |
-| `brain_model` | `"opus"` | Model for the Brain session |
+| `brain_model` | `"sonnet"` | Model for the Brain session (escalates to opus/fable workers on demand) |
 | `grader_model` | `"opus"` | Model for the Grader session |
 | `effort_level` | `"high"` | Worker effort level (`CLAUDE_CODE_EFFORT_LEVEL`) |
 | `machines` | `[]` | Named Ollama machine configs — see [Ollama Workers](#ollama-workers) |
-| `advisor.enabled` | `true` | Whether Sonnet workers get an Opus advisor session |
+| `advisor.enabled` | `true` | Whether workers get a one-tier-up advisor session |
 | `advisor.executor_model` | `"sonnet"` | Default executor worker model |
-| `advisor.advisor_model` | `"opus"` | Advisor model for Sonnet workers |
+| `advisor.advisor_models` | `{"claude-sonnet": "opus", "claude-opus": "fable"}` | One-tier-up advisor model per worker type |
+| `advisor.advisor_model` | `"opus"` | Fallback advisor model for worker types not in `advisor_models` |
+| `dispatch.use_goal` | `false` | When true, spawned workers are given a `/goal` completion condition for more autonomous execution |
 | `ollama_vram_block_threshold_gb` | `8.0` | Max already-loaded Ollama VRAM (GB) tolerated before a spawn is **blocked** (a ceiling, not a minimum) |
 | `ollama_worker_num_ctx` | `32768` | Context window (`num_ctx`) baked into the Ollama worker model variant. 32k (~7.5 GB) fits under the 8 GB default ceiling; raise for longer context if your hardware allows |
 | `ollama_worker_max_output_tokens` | _(unset)_ | When set, exports `CLAUDE_CODE_MAX_OUTPUT_TOKENS` for Ollama workers to cap runaway output |

@@ -390,7 +390,7 @@ class OrchestratorTools:
 
     GRADER_TIMEOUT_SECONDS = 300
 
-    def __init__(self, registry, tmux, ledger_path: str = "", grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "opus", opus_model: str = "opus", effort_level: str = "high", ssh_manager=None, config: dict | None = None, ollama_inventory=None):
+    def __init__(self, registry, tmux, ledger_path: str = "", grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "opus", opus_model: str = "opus", effort_level: str = "high", ssh_manager=None, config: dict | None = None, ollama_inventory=None, dispatch_cfg: dict | None = None):
         self.registry = registry
         self.tmux = tmux
         self.ledger_path = ledger_path
@@ -409,6 +409,7 @@ class OrchestratorTools:
         self._failed_worker_bases: set[str] = set()
         self._game_pid: int | None = None
         self._advisor_cfg = advisor_cfg or {}
+        self._dispatch_cfg = dispatch_cfg or {}
         self._ssh_manager = ssh_manager
         self._machines_config_path = os.environ.get("IC_MACHINES_CONFIG", "config/machines.yaml")
         self._ssh_lock = threading.Lock()
@@ -429,6 +430,14 @@ class OrchestratorTools:
         self._local_grader = LocalGrader(config_path=self._ollama_config_path)
         self._shadow_grader = ShadowGrader(config_path=self._ollama_config_path)
         self._last_grader_delta: str = ""
+
+    def _advisor_model_for(self, worker_type: str) -> str:
+        """Return the tiered advisor model for a given worker type.
+
+        Looks up worker_type in advisor_models (one-tier-up map); falls back
+        to the scalar advisor_model default when worker_type is unmapped.
+        """
+        return self._advisor_cfg.get("advisor_models", {}).get(worker_type) or self._advisor_cfg.get("advisor_model", "opus")
 
     def _track_failed_base(self, base: str) -> None:
         """Record a worker base for retry escalation, keeping the set bounded.
@@ -677,7 +686,7 @@ class OrchestratorTools:
         combined = (
             f"{system_prompt}\n\n---\n\n{user_prompt}\n\n"
             f"Respond with ONLY valid JSON, no markdown fences: "
-            f'{{\"grade\": \"A|B|C|D|F\", \"approved\": true|false, \"feedback\": \"...\", \"recommended_model\": \"claude-sonnet|claude-opus\"}}\n\n'
+            f'{{\"grade\": \"A|B|C|D|F\", \"approved\": true|false, \"feedback\": \"...\", \"recommended_model\": \"claude-sonnet|claude-opus|claude-fable\"}}\n\n'
             f"Begin your JSON response after the delimiter: GRADER_RESPONSE_{nonce}"
         )
         self.tmux.send_keys(self._grader_session, combined)
@@ -1925,6 +1934,13 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             }
         logger.info(f"Grader approved spawn for '{worker_id}' (grade {grade_result['grade']})")
 
+        # Fable escalation: only when the grader explicitly recommends claude-fable —
+        # never an unconditional opus->fable bump (unlike the sonnet->opus retry
+        # escalation above, which fires on failure history alone).
+        if worker_type == "claude-opus" and grade_result.get("recommended_model") == "claude-fable":
+            logger.info(f"Escalating {worker_id} to claude-fable (grader recommendation)")
+            worker_type = "claude-fable"
+
         self._ensure_ssh_manager()
         # Resolve remote machine if specified
         ssh_host = None
@@ -2048,10 +2064,20 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             self.tmux.kill_session(session_name, ssh_host=ssh_host)
             return {"error": f"PM activation failed for worker '{worker_id}': {pm_failure}"}
 
-        # Stage 5.5: enable advisor if configured
-        if self._advisor_cfg.get("enabled"):
-            advisor_model = self._advisor_cfg.get("advisor_model", "opus")
+        # Stage 5.5: enable advisor if configured (skip for claude-fable — top tier,
+        # no higher advisor available)
+        if self._advisor_cfg.get("enabled") and worker_type != "claude-fable":
+            advisor_model = self._advisor_model_for(worker_type)
             self.tmux.send_keys(session_name, f"/advisor {advisor_model}", ssh_host=ssh_host)
+            time.sleep(3)
+
+        # Stage 5.6: dispatch by goal instead of raw objective, if configured
+        if self._dispatch_cfg.get("use_goal"):
+            self.tmux.send_keys(
+                session_name,
+                "/goal the assigned objective is complete and code review has passed",
+                ssh_host=ssh_host,
+            )
             time.sleep(3)
 
         # Stage 6: send objective
@@ -4289,6 +4315,7 @@ def main():
         slack_bot=slack_bot, db_conn=conn, operator_name=operator_name,
         supabase_url=supabase_url, supabase_anon_key=supabase_anon_key,
         advisor_cfg=cfg.get("advisor", {}),
+        dispatch_cfg=cfg.get("dispatch", {}),
         grader_model=cfg.get("grader_model", "opus"),
         opus_model=cfg.get("default_opus_model", "opus"),
         effort_level=cfg.get("effort_level", "high"),

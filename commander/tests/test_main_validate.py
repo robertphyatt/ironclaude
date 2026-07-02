@@ -153,3 +153,119 @@ class TestSpawnWorkerClaudeFable:
         daemon._handle_spawn_worker(decision)
         for call in daemon.slack.post_message.call_args_list:
             assert "Unknown worker type" not in call[0][0]
+
+
+class TestSpawnWorkerAdvisorTiering:
+    """_handle_spawn_worker must select the advisor model per worker_type via
+    advisor.advisor_models (one-tier-up map), skip the advisor entirely for
+    claude-fable (top tier, no higher advisor), and optionally dispatch via
+    /goal instead of the raw objective when dispatch.use_goal is set."""
+
+    def _spawn_daemon(self, config):
+        daemon = IroncladeDaemon.__new__(IroncladeDaemon)
+        daemon.config = config
+        daemon.slack = MagicMock()
+        daemon.registry = MagicMock()
+        daemon.registry.get_running_workers_by_type.return_value = []
+        daemon.tmux = MagicMock()
+        daemon.tmux.spawn_session.return_value = True
+        daemon._wait_for_ready = MagicMock(return_value=True)  # avoid real sleeps
+        return daemon
+
+    def _advisor_sends(self, daemon):
+        return [
+            call[0][1] for call in daemon.tmux.send_keys.call_args_list
+            if call[0][1].startswith("/advisor")
+        ]
+
+    def _goal_sends(self, daemon):
+        return [
+            call[0][1] for call in daemon.tmux.send_keys.call_args_list
+            if call[0][1].startswith("/goal")
+        ]
+
+    @patch("ironclaude.main.log_worker_event")
+    @patch("ironclaude.main.format_worker_spawned", return_value="spawned")
+    @patch("ironclaude.main.ensure_worker_trusted")
+    def test_claude_sonnet_advisor_is_opus(self, mock_trust, mock_fmt, mock_logev):
+        config = {
+            "effort_level": "high",
+            "advisor": {
+                "enabled": True,
+                "advisor_model": "opus",
+                "advisor_models": {"claude-sonnet": "opus", "claude-opus": "fable"},
+            },
+            "dispatch": {"use_goal": False},
+        }
+        daemon = self._spawn_daemon(config)
+        decision = {"worker_id": "w-sonnet", "type": "claude-sonnet", "repo": "/tmp", "objective": "task"}
+        daemon._handle_spawn_worker(decision)
+        assert self._advisor_sends(daemon) == ["/advisor opus"]
+
+    @patch("ironclaude.main.log_worker_event")
+    @patch("ironclaude.main.format_worker_spawned", return_value="spawned")
+    @patch("ironclaude.main.ensure_worker_trusted")
+    @patch("ironclaude.main.make_opus_command", return_value="OPUS_CMD")
+    def test_claude_opus_advisor_is_fable(self, mock_make, mock_trust, mock_fmt, mock_logev):
+        config = {
+            "effort_level": "high",
+            "advisor": {
+                "enabled": True,
+                "advisor_model": "opus",
+                "advisor_models": {"claude-sonnet": "opus", "claude-opus": "fable"},
+            },
+            "dispatch": {"use_goal": False},
+        }
+        daemon = self._spawn_daemon(config)
+        decision = {"worker_id": "w-opus", "type": "claude-opus", "repo": "/tmp", "objective": "task"}
+        daemon._handle_spawn_worker(decision)
+        assert self._advisor_sends(daemon) == ["/advisor fable"]
+
+    @patch("ironclaude.main.log_worker_event")
+    @patch("ironclaude.main.format_worker_spawned", return_value="spawned")
+    @patch("ironclaude.main.ensure_worker_trusted")
+    @patch("ironclaude.main.make_opus_command", return_value="FABLE_CMD")
+    def test_claude_fable_sends_no_advisor(self, mock_make, mock_trust, mock_fmt, mock_logev):
+        config = {
+            "effort_level": "high",
+            "advisor": {
+                "enabled": True,
+                "advisor_model": "opus",
+                "advisor_models": {"claude-sonnet": "opus", "claude-opus": "fable"},
+            },
+            "dispatch": {"use_goal": False},
+        }
+        daemon = self._spawn_daemon(config)
+        decision = {"worker_id": "w-fable", "type": "claude-fable", "repo": "/tmp", "objective": "task"}
+        daemon._handle_spawn_worker(decision)
+        assert self._advisor_sends(daemon) == []
+
+    @patch("ironclaude.main.log_worker_event")
+    @patch("ironclaude.main.format_worker_spawned", return_value="spawned")
+    @patch("ironclaude.main.ensure_worker_trusted")
+    def test_goal_dispatch_sent_when_configured(self, mock_trust, mock_fmt, mock_logev):
+        config = {
+            "effort_level": "high",
+            "advisor": {"enabled": False},
+            "dispatch": {"use_goal": True},
+        }
+        daemon = self._spawn_daemon(config)
+        decision = {"worker_id": "w-goal", "type": "claude-sonnet", "repo": "/tmp", "objective": "task"}
+        daemon._handle_spawn_worker(decision)
+        assert self._goal_sends(daemon) == [
+            "/goal the assigned objective is complete and code review has passed"
+        ]
+
+    @patch("ironclaude.main.log_worker_event")
+    @patch("ironclaude.main.format_worker_spawned", return_value="spawned")
+    @patch("ironclaude.main.ensure_worker_trusted")
+    def test_goal_dispatch_not_sent_when_disabled(self, mock_trust, mock_fmt, mock_logev):
+        config = {
+            "effort_level": "high",
+            "advisor": {"enabled": False},
+            "dispatch": {"use_goal": False},
+        }
+        daemon = self._spawn_daemon(config)
+        decision = {"worker_id": "w-nogoal", "type": "claude-sonnet", "repo": "/tmp", "objective": "task"}
+        daemon._handle_spawn_worker(decision)
+        assert self._goal_sends(daemon) == []

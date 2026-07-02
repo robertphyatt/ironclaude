@@ -1359,12 +1359,19 @@ class IroncladeDaemon:
         # Stage 5: wait for professional mode
         self._wait_for_ready(session_name, timeout=15, marker="Professional Mode: ON")
 
-        # Stage 5.5: enable advisor if configured
+        # Stage 5.5: enable advisor if configured (skip for claude-fable — top
+        # tier, no higher advisor available)
         advisor_cfg = self.config.get("advisor", {})
-        if advisor_cfg.get("enabled"):
-            advisor_model = advisor_cfg.get("advisor_model", "opus")
+        if advisor_cfg.get("enabled") and worker_type != "claude-fable":
+            advisor_model = advisor_cfg.get("advisor_models", {}).get(worker_type) or advisor_cfg.get("advisor_model", "opus")
             self.tmux.send_keys(session_name, f"/advisor {advisor_model}")
             self._wait_for_ready(session_name, timeout=10, marker="advisor")
+
+        # Stage 5.6: dispatch by goal instead of raw objective, if configured
+        dispatch_cfg = self.config.get("dispatch", {})
+        if dispatch_cfg.get("use_goal"):
+            self.tmux.send_keys(session_name, "/goal the assigned objective is complete and code review has passed")
+            self._wait_for_ready(session_name, timeout=10, marker="goal")
 
         # Stage 6: register and send objective
         self.registry.register_worker(worker_id, worker_type, session_name, repo=repo, description=objective)
