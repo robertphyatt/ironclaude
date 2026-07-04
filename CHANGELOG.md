@@ -13,6 +13,19 @@
 
 _Nothing yet._
 
+## 1.0.16
+
+Slack observability fix: an intentionally-held worker no longer looks stuck — the operator sees exactly what is waiting on them, in every heartbeat.
+
+### Fixed
+- **"Waiting on operator" is now surfaced in every Slack heartbeat.** When the Brain held a worker for the operator's reply, its "Still holding. Awaiting …" status was silently discarded by the no-directive-ref message filter and the heartbeat showed only the raw `executing` stage — so a worker blocked on a human decision looked stuck indefinitely. The daemon now classifies a holding message at the drop boundary (via the grader, for every Brain message — so it works whether or not the message would pass the directive-ref gate) into an in-memory `operator_waits` signal, posts a one-time "⏳ Waiting on you: `<worker>` — <what it needs>" alert, and renders a "⏳ WAITING ON YOU" block in every heartbeat plus a tag on that worker's line. The state clears on the operator's next Slack message (self-healing: if the Brain is still holding it re-affirms next cycle), with a TTL backstop and a bounded map.
+
+### Added
+- Bounded Brain feedback on dropped non-waiting messages: the Brain now gets one `[FYI]` notice when a message is dropped for lacking a directive reference, so it stops blindly re-emitting. Guarded against reopening the `CONTEXT_REQUIRED` feedback loop (that the silent drop exists to break) by two mechanisms: it skips messages echoing our own `[CONTEXT REQUIRED]`/`[FYI]` markers, and throttles to at most 2 nudges per 10-minute window, reset on any successful post.
+
+### Changed
+- Version bumped to 1.0.16 across `pyproject.toml`, `plugin.json`, and `marketplace.json`.
+
 ## 1.0.15
 
 Model-tiering release: right-size the whole system around capability-on-demand. The always-on brain runs on Sonnet and reaches Opus/Fable only when a task warrants it, backed by one-tier-up advisors — Fable-level capability on the hardest work without burning the top tier continuously.

@@ -326,6 +326,37 @@ class TestHeartbeatBrainLine:
         assert "🧠" not in msg
 
 
+class TestHeartbeatWaits:
+    """format_heartbeat surfaces 'waiting on operator' state in every heartbeat."""
+
+    def test_waits_shows_block_and_tags_worker(self):
+        workers = [{"id": "d1267", "description": "Your task: Fix band collapse", "workflow_stage": "executing"}]
+        waits = {"d1267": {"question": "approve the migration?"}}
+        msg = format_heartbeat(workers, waits=waits)
+        assert "WAITING ON YOU" in msg
+        assert "d1267" in msg
+        assert "approve the migration?" in msg
+        # the worker's own line is tagged as waiting
+        worker_line = next(ln for ln in msg.splitlines() if ln.startswith("•") and "d1267" in ln)
+        assert "waiting on you" in worker_line.lower()
+
+    def test_waits_none_is_unchanged(self):
+        workers = [{"id": "w1", "description": "Your task: Do stuff", "workflow_stage": "executing"}]
+        assert format_heartbeat(workers, waits=None) == format_heartbeat(workers)
+        assert "WAITING ON YOU" not in format_heartbeat(workers, waits=None)
+
+    def test_waits_empty_is_unchanged(self):
+        workers = [{"id": "w1", "description": "Your task: Do stuff", "workflow_stage": "executing"}]
+        assert format_heartbeat(workers, waits={}) == format_heartbeat(workers)
+
+    def test_waits_shown_even_with_no_active_workers(self):
+        """A held wait must surface even if the worker session is no longer listed."""
+        msg = format_heartbeat([], waits={"d1267": {"question": "approve?"}})
+        assert "WAITING ON YOU" in msg
+        assert "d1267" in msg
+        assert "approve?" in msg
+
+
 class TestWorkerCheckinSlackNotification:
     def test_action_required_format(self):
         msg = format_worker_checkin_slack("w1", 5, "brainstorming", True)

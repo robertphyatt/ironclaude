@@ -75,17 +75,29 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
-def format_heartbeat(workers: list[dict], brain_usage: dict | None = None) -> str:
-    if not workers:
+def format_heartbeat(
+    workers: list[dict],
+    brain_usage: dict | None = None,
+    waits: dict | None = None,
+) -> str:
+    waits = waits or {}
+    if not workers and not waits:
         return "*Heartbeat* | No active workers"
     lines = ["*Heartbeat*"]
+    if waits:
+        # Contract: if anything is holding on the operator, EVERY heartbeat says so.
+        lines.append("⏳ *WAITING ON YOU*")
+        for wid, info in waits.items():
+            question = _escape_mrkdwn(str((info or {}).get("question") or "").strip()) or "(awaiting your reply)"
+            lines.append(f"  • `{wid}` — {question}")
     for w in workers:
         snippet = _extract_task_snippet(w.get("description"))
         desc = _escape_mrkdwn(snippet)
         if len(desc) > 60:
             desc = desc[:60] + "..."
         stage = w.get("workflow_stage") or "unknown"
-        lines.append(f'• {w["id"]} — "{desc}" ({stage})')
+        tag = " — ⏳ waiting on you" if w["id"] in waits else ""
+        lines.append(f'• {w["id"]} — "{desc}" ({stage}{tag})')
     if brain_usage is not None:
         inp = brain_usage.get("input_tokens", 0)
         out = brain_usage.get("output_tokens", 0)

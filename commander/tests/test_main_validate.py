@@ -269,3 +269,97 @@ class TestSpawnWorkerAdvisorTiering:
         decision = {"worker_id": "w-nogoal", "type": "claude-sonnet", "repo": "/tmp", "objective": "task"}
         daemon._handle_spawn_worker(decision)
         assert self._goal_sends(daemon) == []
+
+
+def _make_poll_daemon():
+    d = IroncladeDaemon.__new__(IroncladeDaemon)
+    d._grader = MagicMock()
+    d.slack = MagicMock()
+    d.brain = MagicMock()
+    d._operator_waits = {}
+    d._operator_wait_alerted = {}
+    d._brain_nudge_count = 0
+    d._brain_nudge_window_start = 0.0
+    d.config = {}
+    d._heartbeat_state_history = {}
+    d._heartbeat_stuck_notified = set()
+    return d
+
+
+def _posts(daemon):
+    return " ".join(str(c.args[0]) for c in daemon.slack.post_message.call_args_list)
+
+
+class TestOperatorWaits:
+    def test_awaiting_operator_message_captures_and_alerts(self):
+        d = _make_poll_daemon()
+        d.brain.get_pending_responses.return_value = ["Still holding. Awaiting Robert's Slack response."]
+        d._grader.grade.return_value = {"awaiting_operator": True, "worker_id": "d1267", "question": "approve the migration?"}
+        d.poll_brain_responses()
+        assert "d1267" in d._operator_waits
+        assert d._operator_waits["d1267"]["question"] == "approve the migration?"
+        posts = _posts(d)
+        assert "Waiting on you" in posts and "d1267" in posts and "approve the migration?" in posts
+        assert "*Brain:*" not in posts  # not posted as a normal brain message
+        for c in d.brain.send_message.call_args_list:
+            assert "CONTEXT REQUIRED" not in str(c.args[0])  # loop-break preserved
+
+    def test_conversational_message_not_captured_and_dropped(self):
+        d = _make_poll_daemon()
+        d.brain.get_pending_responses.return_value = ["Everything looks fine so far."]
+        d.poll_brain_responses()
+        assert d._operator_waits == {}
+        assert "*Brain:*" not in _posts(d)
+        d._grader.grade.assert_not_called()  # no awaiting-phrase, no directive -> no grader call
+
+    def test_awaiting_phrase_but_grader_says_no_falls_through(self):
+        d = _make_poll_daemon()
+        d.brain.get_pending_responses.return_value = ["#1267 done waiting for tests to finish, all green"]
+        d._grader.grade.return_value = {"awaiting_operator": False, "worker_id": None, "question": None}
+        d.poll_brain_responses()
+        assert d._operator_waits == {}
+        # has a directive ref (#1267) so it validates+posts normally
+        assert "*Brain:*" in _posts(d)
+
+    def test_operator_slack_message_clears_waits(self):
+        d = _make_poll_daemon()
+        d._operator_waits = {"d1267": {"question": "q", "updated_at": time.time()}}
+        d._operator_wait_alerted = {"d1267": "q"}
+        d.socket_handler = MagicMock()
+        d.socket_handler.drain.return_value = [{"parsed": {"type": "help"}, "original_text": "/help"}]
+        d._handle_directive_confirmation = MagicMock(return_value=False)
+        d.plugin_registry = MagicMock()
+        with patch("ironclaude.main.format_help_text", return_value="help"):
+            d.poll_slack_commands()
+        assert d._operator_waits == {}
+
+    def test_post_heartbeat_passes_waits(self):
+        d = _make_poll_daemon()
+        d._last_heartbeat = 0.0
+        d.config = {"heartbeat_interval_seconds": 0}
+        d.registry = MagicMock()
+        d.registry.get_recent_workers.return_value = []
+        d.brain.get_token_usage.return_value = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
+        d._db = None
+        d._operator_waits = {"d1267": {"question": "approve?", "updated_at": time.time()}}
+        with patch("ironclaude.main.format_heartbeat", return_value="hb") as fh:
+            d.post_heartbeat()
+        _, kwargs = fh.call_args
+        assert "d1267" in (kwargs.get("waits") or {})
+
+    def test_brain_drop_nudge_throttled(self):
+        d = _make_poll_daemon()
+        d.brain.get_pending_responses.return_value = ["all good one", "all good two", "all good three"]
+        d.poll_brain_responses()
+        nudges = [c for c in d.brain.send_message.call_args_list if "wasn't posted" in str(c.args[0])]
+        assert 0 < len(nudges) <= 2  # at least one, throttled to <=2
+
+    def test_alert_deduped_for_same_question(self):
+        d = _make_poll_daemon()
+        d._grader.grade.return_value = {"awaiting_operator": True, "worker_id": "d1267", "question": "approve?"}
+        d.brain.get_pending_responses.return_value = ["holding, awaiting your decision"]
+        d.poll_brain_responses()
+        d.brain.get_pending_responses.return_value = ["still holding, awaiting your decision"]
+        d.poll_brain_responses()
+        alerts = [c for c in d.slack.post_message.call_args_list if "Waiting on you" in str(c.args[0])]
+        assert len(alerts) == 1

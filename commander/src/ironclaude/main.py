@@ -36,6 +36,7 @@ from ironclaude.notifications import (
     format_objective_received,
     format_task_progress, format_plan_ready, format_blocked,
     format_worker_heartbeat_stuck_slack,
+    _escape_mrkdwn,
 )
 from ironclaude.grader import LocalGrader
 from ironclaude.orchestrator_mcp import ensure_worker_trusted, WORKER_COMMANDS
@@ -58,6 +59,35 @@ _BRAIN_MSG_SCHEMA = {
 }
 _DIRECTIVE_REF_RE = re.compile(r'(?:#\d+|d\d+|directive\s+\d+)', re.IGNORECASE)
 _BLOCKED_NO_DIRECTIVE = "no_directive_ref"
+
+# --- Awaiting-operator surfacing ---------------------------------------------
+# Cheap pre-check: only run the grader classifier on messages that look like the
+# Brain is holding for the operator (avoids a grader call on every dropped message).
+_AWAITING_PHRASE_RE = re.compile(
+    r"holding|awaiting|waiting for|waiting on|slack response|"
+    r"your (?:reply|response|input|decision)|pinned decision",
+    re.IGNORECASE,
+)
+_AWAITING_OP_SYSTEM = (
+    "You classify a Brain status message. Determine whether the Brain is reporting that it is "
+    "WAITING ON THE OPERATOR (the human) to reply or decide before work can continue.\n\n"
+    "If yes, extract the worker id it is waiting about (e.g. d1267; use null if it is the Brain itself) "
+    "and a short paraphrase of what it is waiting for.\n\n"
+    'Respond ONLY with valid JSON: {"awaiting_operator": true|false, "worker_id": "..."|null, "question": "..."|null}'
+)
+_AWAITING_OP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "awaiting_operator": {"type": "boolean"},
+        "worker_id": {"type": ["string", "null"]},
+        "question": {"type": ["string", "null"]},
+    },
+    "required": ["awaiting_operator"],
+}
+_OPERATOR_WAIT_TTL_SECONDS = 1800   # backstop: drop a wait the Brain stopped re-affirming
+_OPERATOR_WAIT_MAX = 32            # bound the in-memory map
+_BRAIN_DROP_NUDGE_MAX = 2         # max nudges per window (loop guard — see d1133)
+_BRAIN_DROP_NUDGE_WINDOW = 600    # seconds
 
 _PROMPT_WAITING_SYSTEM = (
     "You detect whether a worker process is waiting for user input based on its log tail.\n\n"
@@ -583,6 +613,11 @@ class IroncladeDaemon:
         self._stage_entered_at: dict[str, float] = {}
         self._heartbeat_state_history: dict[str, list[tuple[str, int]]] = {}
         self._heartbeat_stuck_notified: set[str] = set()
+        # Awaiting-operator surfacing (in-memory; refreshed by Brain re-emission)
+        self._operator_waits: dict[str, dict] = {}
+        self._operator_wait_alerted: dict[str, str] = {}
+        self._brain_nudge_count: int = 0
+        self._brain_nudge_window_start: float = 0.0
         self._load_staleness_state()
 
     def shutdown(self):
@@ -748,7 +783,14 @@ class IroncladeDaemon:
         """Drain and process Slack commands."""
         if not self.socket_handler:
             return
-        for item in self.socket_handler.drain():
+        items = self.socket_handler.drain()
+        # Operator re-engaged: clear any "waiting on you" state. If the Brain is still
+        # genuinely holding, it re-emits next cycle and re-sets it (self-healing).
+        if items and self._operator_waits:
+            self._operator_waits.clear()
+            self._operator_wait_alerted.clear()
+            logger.info("operator_waits cleared — operator re-engaged via Slack")
+        for item in items:
             # Check for directive confirmation before command parsing
             raw_text = item.get("original_text", "").strip()
             if self._handle_directive_confirmation(raw_text):
@@ -1084,14 +1126,84 @@ class IroncladeDaemon:
             self._db.rollback()
             logger.warning("push_requests sweep skipped (db locked): %s", e)
 
+    def _prune_operator_waits(self, now: float) -> None:
+        """Drop awaiting-operator entries the Brain has stopped re-affirming (TTL backstop)."""
+        stale = [
+            wid for wid, info in self._operator_waits.items()
+            if now - info.get("updated_at", now) > _OPERATOR_WAIT_TTL_SECONDS
+        ]
+        for wid in stale:
+            self._operator_waits.pop(wid, None)
+            self._operator_wait_alerted.pop(wid, None)
+
+    def _maybe_capture_operator_wait(self, text: str) -> bool:
+        """If the Brain message reports it is waiting on the operator, record structured
+        state + post a one-time alert. Returns True when captured — the caller must then
+        NOT post it as a normal Brain message and NOT send CONTEXT_REQUIRED (preserving the
+        loop-break). Fail-safe: any classifier error/uncertainty -> not captured."""
+        if not _AWAITING_PHRASE_RE.search(text):
+            return False
+        try:
+            result = self._grader.grade(
+                _AWAITING_OP_SYSTEM, f"Classify this Brain message:\n{text}", _AWAITING_OP_SCHEMA
+            )
+        except Exception as e:
+            logger.warning("awaiting-operator classify failed: %s — not capturing", e)
+            return False
+        if (not isinstance(result, dict)) or result.get("infrastructure_error") or not result.get("awaiting_operator"):
+            return False
+        worker_id = (str(result.get("worker_id") or "").strip()) or "brain"
+        question = str(result.get("question") or "").strip()
+        now = time.time()
+        self._prune_operator_waits(now)
+        self._operator_waits[worker_id] = {"question": question, "updated_at": now}
+        if len(self._operator_waits) > _OPERATOR_WAIT_MAX:
+            oldest = min(self._operator_waits, key=lambda k: self._operator_waits[k]["updated_at"])
+            self._operator_waits.pop(oldest, None)
+            self._operator_wait_alerted.pop(oldest, None)
+        # One-time alert per (worker, question) — heartbeat handles the repeat surfacing.
+        if self._operator_wait_alerted.get(worker_id) != question:
+            self._operator_wait_alerted[worker_id] = question
+            self.slack.post_message(
+                f"⏳ *Waiting on you:* `{worker_id}` — {_escape_mrkdwn(question) or '(awaiting your reply)'}"
+            )
+        logger.info("operator_wait recorded for %s: %s", worker_id, question[:80])
+        return True
+
+    def _maybe_nudge_brain_on_drop(self, text: str) -> None:
+        """Bounded feedback to the Brain that a (non-waiting) message was dropped, throttled
+        so it cannot reopen the CONTEXT_REQUIRED feedback loop the silent drop was added (d1133) to break."""
+        # Never nudge the Brain's ack/echo of our own markers — that IS the exact
+        # exchange the silent drop (d1133) exists to break. Stay silent on those.
+        if "[CONTEXT REQUIRED]" in text or "[FYI]" in text:
+            return
+        now = time.time()
+        if now - self._brain_nudge_window_start > _BRAIN_DROP_NUDGE_WINDOW:
+            self._brain_nudge_window_start = now
+            self._brain_nudge_count = 0
+        if self._brain_nudge_count >= _BRAIN_DROP_NUDGE_MAX:
+            return
+        self._brain_nudge_count += 1
+        self.brain.send_message(
+            "[FYI] Your last message wasn't posted to Slack (no directive reference). "
+            "If you are waiting on the operator, that is surfaced automatically now — no action needed. "
+            "Otherwise tie status updates to a directive (#N or dN)."
+        )
+
     def poll_brain_responses(self):
         """Drain brain responses, validate context, and post to Slack."""
         for text in self.brain.get_pending_responses():
             logger.info(f"Brain response: {text[:100]}...")
+            # Awaiting-operator capture runs FIRST, for every message (whether or not it
+            # would pass the directive-ref gate), converting a "holding" message into
+            # structured heartbeat state instead of posting or silently dropping it.
+            if self._maybe_capture_operator_wait(text):
+                continue
             valid, reason = self._validate_brain_message(text)
             if not valid:
                 if reason == _BLOCKED_NO_DIRECTIVE:
                     logger.info("Brain response dropped (no directive ref): %s", text[:100])
+                    self._maybe_nudge_brain_on_drop(text)
                     continue
                 logger.warning(f"Brain message blocked: {reason} | text={text[:200]}")
                 self.brain.send_message(
@@ -1102,6 +1214,8 @@ class IroncladeDaemon:
                     f'Original message: "{text[:200]}..."'
                 )
                 continue
+            # Valid post — reset the drop-nudge throttle (successful post).
+            self._brain_nudge_count = 0
             if len(text) > 39000:
                 chunks = [text[i:i+39000] for i in range(0, len(text), 39000)]
                 for chunk in chunks:
@@ -2049,7 +2163,10 @@ class IroncladeDaemon:
             })
 
         brain_usage = self.brain.get_token_usage() if self.brain is not None else None
-        self.slack.post_message(format_heartbeat(worker_details, brain_usage=brain_usage))
+        self._prune_operator_waits(now)
+        self.slack.post_message(
+            format_heartbeat(worker_details, brain_usage=brain_usage, waits=dict(self._operator_waits))
+        )
 
         # Grader enforcement: if no alive workers but directives exist, nudge the Brain
         if not worker_details and self._db is not None:
