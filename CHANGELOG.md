@@ -13,6 +13,21 @@
 
 _Nothing yet._
 
+## 1.0.17
+
+Stop-hook false-positive fix: a worker legitimately waiting on a background subagent (dispatched via the `Agent`/Task tool with `run_in_background`) is no longer blocked by GBTW.
+
+### Fixed
+- **GBTW "tasks still in progress" gate now detects genuinely in-flight background jobs.** The suppression check in `worker/hooks/get-back-to-work-claude.sh` inspected only the last 3 assistant `requestId`s (`tail -3`); after a worker posted a few text-only "holding" turns while a background subagent was still running, the dispatch scrolled out of that window and the hook blocked — repeatedly, until "max blocks reached, likely false positives" fired. Confirmed against the real failing transcript (`7331628f-1c4d-4ee1-9c9d-347758be418d`). The `tail -3` window is replaced with true in-flight detection: over `tail -n 4000` of the transcript, collect launched background ids (Agent `toolUseResult.agentId`, Bash `Command running in background with ID: <id>`) and completed ids (delivered `<task-notification>` turns with `<status>` ∈ {completed,failed,killed,stopped}, plus the resumed plain-text `agentId: … subagent_tokens:` shape from `SendMessage`), and suppress the block iff at least one launched id has no matching completion. Diagnostics: every invocation logs the launched/completed/in-flight counts. Fail-safe: on missing jq or parse errors, falls through to today's block (never bypasses).
+- Covered by 8 fixture-driven bash tests at `worker/hooks/tests/test-gbtw-inflight.sh` (subagent in-flight, subagent completed, in-flight past the old 3-turn window, resumed plain-text completion, background Bash in flight, two-dispatched-one-completed, all four terminal statuses, malformed JSONL line resilience). All 8 GREEN.
+- **Fable availability caching and graceful fallback.** Fable is being removed for subscription users on 2026-07-07. Previously, only the always-on Brain had a Fable → Opus fallback (v1.0.15); on-demand Fable uses (spawn a `claude-fable` worker, or send `/advisor fable` to an Opus worker) would silently degrade or hard-fail. The daemon now caches Fable-unavailability in a small state file (`~/.ironclaude/state/fable_unavailable.json`, 24-hour TTL) and redirects at every source: `claude-fable` spawns become `claude-opus`; `/advisor fable` becomes `/advisor opus`; a `session died before ready` on a `claude-fable` spawn sets the flag, posts a one-time `⚠️ Fable unavailable` Slack alert (with the redirect target and the manual re-probe hint), and retries as `claude-opus`. Recovery is intrinsic: when the flag has expired and the next `claude-fable` spawn succeeds, the daemon posts `✅ Fable is back` to Slack. The Brain-side v1.0.15 fallback now also records the flag when it fires on a Fable model, so the worker/advisor paths pick it up automatically. Idempotent per detection episode — one alert per Fable outage, not one per operation. Fail-safe: any state-file error is treated as "Fable available (probe again)" so a corrupt file can never spuriously suppress Fable.
+- Covered by 37 new tests: `commander/tests/test_fable_availability.py` (15, atomic write + TTL + transition semantics + resolve helpers, all hermetic via `monkeypatch`), `commander/tests/test_notifications.py::TestFableNotifications` (11, formatter content + mrkdwn escaping), and integration tests in `commander/tests/test_orchestrator_mcp.py` (5, worker-type redirect + advisor redirect + spawn retry + idempotency + recovery), `commander/tests/test_main_validate.py` (2, file-decision-path redirect + passthrough), and `commander/tests/test_brain_client.py::TestModelUnavailableFableTransition` (4, mark-on-fable-only + optional callback + transition-only-callback + no-callback default). All pass; no regressions.
+
+### Changed
+- Version bumped to 1.0.17 across `pyproject.toml`, `plugin.json`, and `marketplace.json`.
+
+**Deploy:** `make deploy-hooks` (hooks run from `~/.claude/ironclaude-hooks`, not the repo) plus a daemon restart (the Fable-availability + Slack-alerts wiring lives in the commander daemon, not the hooks).
+
 ## 1.0.16
 
 Slack observability fix: an intentionally-held worker no longer looks stuck — the operator sees exactly what is waiting on them, in every heartbeat.

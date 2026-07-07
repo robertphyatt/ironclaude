@@ -39,6 +39,11 @@ from ironclaude.notifications import (
     _escape_mrkdwn,
 )
 from ironclaude.grader import LocalGrader
+from ironclaude.fable_availability import (
+    resolve_worker_type as _resolve_fable_worker_type,
+    resolve_advisor_model as _resolve_fable_advisor_model,
+    is_fable_unavailable as _is_fable_unavailable,
+)
 from ironclaude.orchestrator_mcp import ensure_worker_trusted, WORKER_COMMANDS
 from ironclaude.signal_forensics import _logged_kill
 from ironclaude.plugins import PluginRegistry, discover_plugins
@@ -866,7 +871,7 @@ class IroncladeDaemon:
         if self._db is None:
             return False
         normalized = text.strip().lower()
-        if normalized not in ("yes", "no"):
+        if normalized not in ("yes", "no", "changes", "change", "revise"):
             return False
         row = self._db.execute(
             "SELECT id, interpretation, interpretation_ts FROM directives "
@@ -876,6 +881,7 @@ class IroncladeDaemon:
             return False
         directive_id = row[0]
         interpretation = row[1]
+        terminal = normalized in ("yes", "no")
         if normalized == "yes":
             self._db.execute(
                 "UPDATE directives SET status='confirmed', updated_at=datetime('now') WHERE id=?",
@@ -885,6 +891,13 @@ class IroncladeDaemon:
             self.slack.post_message(f"Directive #{directive_id} confirmed: {interpretation}")
             operator = self.config.get("operator_name", "Operator")
             self.brain.send_message(f"Directive #{directive_id} confirmed by {operator}: {interpretation}")
+        elif normalized in ("changes", "change", "revise"):
+            self._db.execute(
+                "UPDATE directives SET status='awaiting_changes', updated_at=datetime('now') WHERE id=?",
+                (directive_id,),
+            )
+            self._db.commit()
+            self._notify_awaiting_changes(directive_id)
         else:
             self._db.execute(
                 "UPDATE directives SET status='rejected', updated_at=datetime('now') WHERE id=?",
@@ -892,7 +905,10 @@ class IroncladeDaemon:
             )
             self._db.commit()
             self.slack.post_message(f"Directive #{directive_id} rejected.")
-        if row[2]:
+        if terminal and row[2]:
+            # The changes/revise branch keeps the interpretation pinned — the
+            # operator is about to reference it while composing feedback (mirrors
+            # the reaction-based 🤔 path, which also leaves it pinned).
             self.slack.unpin_message(row[2])
         return True
 
@@ -903,14 +919,19 @@ class IroncladeDaemon:
         1. Regex for 'Directive #N' — look up by ID
         2. Check if text contains a pending directive's interpretation
         3. Check if text matches a pending directive's source_text
+
+        Returns (id, interpretation, status) — the same 3-column shape as the
+        fast-path timestamp match in _handle_directive_reaction, so callers
+        don't need a second query to learn the status.
         """
         # Strategy 1: Directive ID reference
         match = re.search(r"Directive\s*#(\d+)", message_text, re.IGNORECASE)
         if match:
             directive_id = int(match.group(1))
             row = self._db.execute(
-                "SELECT id, interpretation FROM directives "
-                "WHERE id=? AND status IN ('pending_confirmation','in_progress') LIMIT 1",
+                "SELECT id, interpretation, status FROM directives "
+                "WHERE id=? AND status IN "
+                "('pending_confirmation','in_progress','awaiting_changes','superseded') LIMIT 1",
                 (directive_id,),
             ).fetchone()
             if row:
@@ -918,8 +939,9 @@ class IroncladeDaemon:
 
         # Strategy 2: Interpretation text match
         pending = self._db.execute(
-            "SELECT id, interpretation FROM directives "
-            "WHERE status IN ('pending_confirmation','in_progress')"
+            "SELECT id, interpretation, status FROM directives "
+            "WHERE status IN "
+            "('pending_confirmation','in_progress','awaiting_changes','superseded')"
         ).fetchall()
         for row in pending:
             if row[1] in message_text:
@@ -927,14 +949,99 @@ class IroncladeDaemon:
 
         # Strategy 3: Source text match
         pending_sources = self._db.execute(
-            "SELECT id, interpretation, source_text FROM directives "
-            "WHERE status IN ('pending_confirmation','in_progress')"
+            "SELECT id, interpretation, status, source_text FROM directives "
+            "WHERE status IN "
+            "('pending_confirmation','in_progress','awaiting_changes','superseded')"
         ).fetchall()
         for row in pending_sources:
-            if row[2] in message_text:
-                return (row[0], row[1])
+            if row[3] in message_text:
+                return (row[0], row[1], row[2])
 
         return None
+
+    def _notify_awaiting_changes(self, directive_id: int) -> None:
+        """Single source of truth for the awaiting-changes notification pair.
+
+        The brain rules key on the EXACT wire-protocol phrasing below — both
+        entry paths (🤔 reaction and 'changes' text reply) MUST emit identical
+        text, or the brain recognizes the revision prompt from one path but
+        not the other.
+        """
+        self.slack.post_message(f"Directive #{directive_id} → waiting for your feedback...")
+        operator = self.config.get("operator_name", "Operator")
+        self.brain.send_message(
+            f"Directive #{directive_id} needs revision by {operator}. "
+            f"Their next Slack message is the requested change. "
+            f"Once they send it, re-submit this directive by calling submit_directive "
+            f"with supersedes={directive_id} and the updated interpretation + planned fields."
+        )
+
+    def _walk_to_chain_head(self, start_id: int, cap: int = 20) -> int:
+        """Walk the superseded_by chain to the head (row where superseded_by IS NULL).
+        Returns start_id if that row is already the head. Caps at `cap` hops as a
+        safety valve — if the loop doesn't terminate (cyclic chain, corruption),
+        log a warning and return the last valid id we followed.
+
+        Load-bearing for the 🤔 revision workflow: after N rounds, the chain has
+        N+1 rows, and code that assumes at most one hop points the operator (or
+        the brain) at another already-stale row.
+        """
+        if self._db is None:
+            return start_id
+        current = start_id
+        prev = start_id
+        for _ in range(cap):
+            row = self._db.execute(
+                "SELECT superseded_by FROM directives WHERE id=?",
+                (current,),
+            ).fetchone()
+            if row is None:
+                if current == start_id:
+                    # Caller passed an id that doesn't exist at all —
+                    # nothing better to return than what we were given.
+                    return start_id
+                # Dangling superseded_by pointer: #prev points at a
+                # nonexistent #current. Warn like the cyclic-cap case and
+                # return the last EXISTING id so the operator is never
+                # pointed at a row that isn't there.
+                logger.warning(
+                    "_walk_to_chain_head: dangling superseded_by pointer — "
+                    "#%s points at nonexistent #%s; returning #%s",
+                    prev, current, prev,
+                )
+                try:
+                    self.slack.post_message(
+                        f"⚠️ Supersession chain has a dangling pointer: "
+                        f"#{prev} points at nonexistent #{current} — possible "
+                        f"data corruption; check the directives table."
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to post dangling-pointer warning to Slack",
+                        exc_info=True,
+                    )
+                return prev
+            next_id = row[0]
+            if next_id is None:
+                return current  # head of chain
+            prev = current
+            current = int(next_id)
+        logger.warning(
+            "_walk_to_chain_head cap (%s) reached starting at #%s; "
+            "abandoning walk (possible cyclic supersession chain)",
+            cap, start_id,
+        )
+        try:
+            self.slack.post_message(
+                f"⚠️ Supersession chain walk hit the safety cap starting at "
+                f"#{start_id} — possible data corruption; check the directives table."
+            )
+        except Exception:
+            logger.debug("Failed to post chain-walk cap warning to Slack", exc_info=True)
+        # Return start_id, not the mid-cycle node the loop happened to stop
+        # on — the caller's head_id == directive_id corruption fallback then
+        # fires instead of pointing the operator at another broken row.
+        return start_id
 
     def _handle_directive_reaction(self, emoji: str, message_ts: str) -> bool:
         """Handle a reaction on any directive-related message.
@@ -948,15 +1055,22 @@ class IroncladeDaemon:
         if self._db is None:
             return False
         logger.info("_handle_directive_reaction: emoji=%r ts=%r", emoji, message_ts)
-        if emoji not in ("thumbsup", "+1", "thumbs_up", "thumbsdown", "-1", "thumbs_down"):
+        if emoji not in (
+            "thumbsup", "+1", "thumbs_up", "thumbsdown", "-1", "thumbs_down",
+            "thinking_face", "thinking",
+        ):
             logger.debug("reaction emoji %r not in accepted set, ignoring", emoji)
             return False
 
         # Fast path: match on interpretation_ts (bot's message) or source_ts (operator's message)
+        # ORDER BY prefers the chain head (superseded_by IS NULL) over stale
+        # rows sharing the same source_ts after a supersession; ties broken
+        # by newest id.
         row = self._db.execute(
-            "SELECT id, interpretation FROM directives "
+            "SELECT id, interpretation, status FROM directives "
             "WHERE (interpretation_ts=? OR source_ts=?) "
-            "AND status IN ('pending_confirmation','in_progress') LIMIT 1",
+            "AND status IN ('pending_confirmation','in_progress','awaiting_changes','superseded') "
+            "ORDER BY (superseded_by IS NULL) DESC, id DESC LIMIT 1",
             (message_ts, message_ts),
         ).fetchone()
 
@@ -987,21 +1101,65 @@ class IroncladeDaemon:
 
         directive_id = row[0]
         interpretation = row[1]
+        # Both the fast path and the content fallback return
+        # (id, interpretation, status) — no separate status re-query needed.
+        status = row[2]
+        if status == "superseded":
+            head_id = self._walk_to_chain_head(directive_id)
+            if head_id != directive_id:
+                self.slack.post_message(
+                    f"Directive #{directive_id} is superseded by #{head_id}; "
+                    f"please react on the newer message."
+                )
+            else:
+                # Row claims 'superseded' but chain-walk finds no successor —
+                # data corruption. Post a fallback message without a specific id.
+                self.slack.post_message(
+                    f"Directive #{directive_id} is superseded; please react "
+                    f"on the current head directive."
+                )
+            return True  # We handled the reaction (by rejecting), so don't fall through
+
         ts_row = self._db.execute(
             "SELECT interpretation_ts FROM directives WHERE id=?", (directive_id,)
         ).fetchone()
         interpretation_ts = ts_row[0] if ts_row else None
+        if emoji in ("thinking_face", "thinking"):
+            self._db.execute(
+                "UPDATE directives SET status='awaiting_changes', updated_at=datetime('now') WHERE id=?",
+                (directive_id,),
+            )
+            self._db.commit()
+            self._notify_awaiting_changes(directive_id)
+            source_ts = self._db.execute(
+                "SELECT source_ts FROM directives WHERE id=?", (directive_id,)
+            ).fetchone()[0]
+            self.slack.remove_reaction("hourglass_flowing_sand", source_ts)
+            self.slack.add_reaction("thinking_face", source_ts)
+            logger.info("Directive #%d awaiting_changes via reaction %r", directive_id, emoji)
+            return True
         if emoji in ("thumbsup", "+1", "thumbs_up"):
             self._db.execute(
                 "UPDATE directives SET status='confirmed', updated_at=datetime('now') WHERE id=?",
                 (directive_id,),
             )
             self._db.commit()
-            self.slack.post_message(f"Directive #{directive_id} confirmed: {interpretation}")
             operator = self.config.get("operator_name", "Operator")
-            delivered = self.brain.send_message(
-                f"Directive #{directive_id} confirmed by {operator}: {interpretation}"
-            )
+            if status == "awaiting_changes":
+                self.slack.post_message(
+                    f"Directive #{directive_id} confirmed (cancelling the pending "
+                    f"change request): {interpretation}"
+                )
+                delivered = self.brain.send_message(
+                    f"Directive #{directive_id} confirmed by {operator} — the earlier "
+                    f"change request is cancelled; do NOT wait for feedback. "
+                    f"Interpretation: {interpretation}"
+                )
+            else:
+                self.slack.post_message(f"Directive #{directive_id} confirmed: {interpretation}")
+                delivered = self.brain.send_message(
+                    f"Directive #{directive_id} confirmed by {operator}: {interpretation}"
+                )
             if delivered:
                 self._directive_reminder_sent[directive_id] = time.time()
             else:
@@ -1020,7 +1178,25 @@ class IroncladeDaemon:
                 (directive_id,),
             )
             self._db.commit()
-            self.slack.post_message(f"Directive #{directive_id} rejected.")
+            if status == "awaiting_changes":
+                self.slack.post_message(
+                    f"Directive #{directive_id} rejected (cancelling the pending "
+                    f"change request)."
+                )
+                # The brain was told "their next Slack message is the requested
+                # change" when the operator reacted 🤔 — it must be told to
+                # stand down, or it will misinterpret the operator's next
+                # message as feedback for this rejected directive. Normal
+                # rejects stay brain-silent (pre-existing design; brain
+                # discovers them via status polling).
+                operator = self.config.get("operator_name", "Operator")
+                self.brain.send_message(
+                    f"Directive #{directive_id} rejected by {operator} — the "
+                    f"earlier change request is cancelled; do NOT wait for "
+                    f"feedback."
+                )
+            else:
+                self.slack.post_message(f"Directive #{directive_id} rejected.")
             source_ts = self._db.execute(
                 "SELECT source_ts FROM directives WHERE id=?", (directive_id,)
             ).fetchone()[0]
@@ -1248,6 +1424,9 @@ class IroncladeDaemon:
         needs_input = self._db.execute(
             "SELECT id, interpretation FROM directives WHERE status='pending_confirmation' ORDER BY created_at DESC"
         ).fetchall()
+        awaiting_changes = self._db.execute(
+            "SELECT id, interpretation FROM directives WHERE status='awaiting_changes' ORDER BY created_at DESC"
+        ).fetchall()
         recently_completed = self._db.execute(
             "SELECT id, interpretation FROM directives WHERE status='completed' ORDER BY updated_at DESC LIMIT 5"
         ).fetchall()
@@ -1266,6 +1445,17 @@ class IroncladeDaemon:
         lines.append(f"*Blocked / Needs Input ({len(needs_input)}):*")
         if needs_input:
             for row in needs_input:
+                lines.append(f"• #{row[0]} — {row[1]}")
+        else:
+            lines.append("(none)")
+        lines.append("")
+        # awaiting_changes is where the daemon is waiting on the OPERATOR —
+        # the summary is exactly where they need that reminder. superseded is
+        # deliberately excluded: it's a historical chain-link state, not
+        # actionable.
+        lines.append(f"*Awaiting Your Feedback 🤔 ({len(awaiting_changes)}):*")
+        if awaiting_changes:
+            for row in awaiting_changes:
                 lines.append(f"• #{row[0]} — {row[1]}")
         else:
             lines.append("(none)")
@@ -1414,6 +1604,16 @@ class IroncladeDaemon:
         model_name = decision.get("model_name", "")
         session_name = f"ic-{worker_id}"
 
+        # Redirect claude-fable -> claude-opus while Fable is flagged
+        # unavailable (fable_availability.resolve_worker_type). This path
+        # never inspects _wait_for_ready's return value below, so it has no
+        # "died before ready" surface to detect a dead-on-arrival Fable
+        # session — unlike orchestrator_mcp's MCP spawn path, which checks it
+        # and calls mark_fable_unavailable + retries as claude-opus on death.
+        # Only the redirect is mirrored here; there is no death-triggered
+        # retry/Slack hook to wire in this path.
+        worker_type = _resolve_fable_worker_type(worker_type)
+
         # Handle ollama dynamic command construction
         if worker_type == "ollama":
             if not model_name:
@@ -1445,9 +1645,16 @@ class IroncladeDaemon:
         elif worker_type in WORKER_COMMANDS:
             cmd = WORKER_COMMANDS[worker_type]
         else:
+            # MP-04: drop claude-fable from the advertised list while Fable is
+            # flagged unavailable — the daemon would silently redirect it to
+            # claude-opus if requested, so advertising it here contradicts the
+            # "Fable unavailable" Slack alert.
+            builtin_types = ["ollama", "claude-opus"]
+            if not _is_fable_unavailable():
+                builtin_types.append("claude-fable")
+            supported = ", ".join(builtin_types + list(WORKER_COMMANDS.keys()))
             self.slack.post_message(
-                f"Unknown worker type `{worker_type}`. "
-                f"Supported: ollama, claude-opus, claude-fable, {', '.join(WORKER_COMMANDS.keys())}"
+                f"Unknown worker type `{worker_type}`. Supported: {supported}"
             )
             return
 
@@ -1478,6 +1685,7 @@ class IroncladeDaemon:
         advisor_cfg = self.config.get("advisor", {})
         if advisor_cfg.get("enabled") and worker_type != "claude-fable":
             advisor_model = advisor_cfg.get("advisor_models", {}).get(worker_type) or advisor_cfg.get("advisor_model", "opus")
+            advisor_model = _resolve_fable_advisor_model(advisor_model)
             self.tmux.send_keys(session_name, f"/advisor {advisor_model}")
             self._wait_for_ready(session_name, timeout=10, marker="advisor")
 

@@ -58,6 +58,9 @@ CREATE TABLE IF NOT EXISTS brain_state (
     restart_count INTEGER NOT NULL DEFAULT 0
 );
 
+-- status enum: pending_confirmation, awaiting_changes, superseded,
+-- confirmed, rejected, in_progress, completed (see VALID_DIRECTIVE_STATUSES
+-- in orchestrator_mcp.py)
 CREATE TABLE IF NOT EXISTS directives (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_ts TEXT NOT NULL,
@@ -66,7 +69,14 @@ CREATE TABLE IF NOT EXISTS directives (
     status TEXT NOT NULL DEFAULT 'pending_confirmation',
     interpretation_ts TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    planned_worker_type TEXT,
+    planned_use_goal INTEGER DEFAULT 0,
+    planned_prompt TEXT,
+    planned_worker_type_reason TEXT,
+    planned_use_goal_reason TEXT,
+    planned_prompt_reason TEXT,
+    superseded_by INTEGER REFERENCES directives(id)
 );
 
 CREATE TABLE IF NOT EXISTS push_requests (
@@ -89,7 +99,47 @@ CREATE TABLE IF NOT EXISTS worker_staleness (
     alert_sent INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS shadow_concordance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    context TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    opus_grade TEXT,
+    opus_approved INTEGER,
+    shadow_grade TEXT,
+    shadow_approved INTEGER,
+    concordance TEXT NOT NULL CHECK (concordance IN ('A', 'B', 'C', 'F')),
+    confidence_in_disagreement TEXT,
+    test_mode INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_shadow_concordance_worker_id ON shadow_concordance(worker_id);
+CREATE INDEX IF NOT EXISTS idx_shadow_concordance_created_at ON shadow_concordance(created_at);
 """
+
+# Indexes that depend on columns added by _DIRECTIVES_MIGRATION_COLUMNS.
+# These must run AFTER init_db()'s ADD-COLUMN loop, not inside SCHEMA,
+# because SCHEMA runs before the migration and would crash on an old DB
+# that has the `directives` table but not the migrated column.
+_POST_MIGRATION_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_directives_superseded_by ON directives(superseded_by)",
+]
+
+# Columns added to `directives` after its initial release. Each is applied via
+# an independent ALTER TABLE in init_db() so that pre-existing DBs (which
+# already have the CREATE TABLE IF NOT EXISTS'd `directives` without these
+# columns) get migrated in place, and so that one already-present column
+# doesn't block the rest from being added.
+_DIRECTIVES_MIGRATION_COLUMNS = [
+    ("planned_worker_type", "TEXT"),
+    ("planned_use_goal", "INTEGER DEFAULT 0"),
+    ("planned_prompt", "TEXT"),
+    ("planned_worker_type_reason", "TEXT"),
+    ("planned_use_goal_reason", "TEXT"),
+    ("planned_prompt_reason", "TEXT"),
+    ("superseded_by", "INTEGER REFERENCES directives(id)"),
+]
 
 
 def init_db(db_path: str) -> sqlite3.Connection:
@@ -99,9 +149,49 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
+    # Migrate pre-existing `directives` tables that predate these columns.
+    # Each ALTER TABLE runs independently so that one column already being
+    # present (a partially-migrated DB) doesn't prevent the rest from
+    # being added.
+    for column_name, column_def in _DIRECTIVES_MIGRATION_COLUMNS:
+        try:
+            conn.execute(
+                f"ALTER TABLE directives ADD COLUMN {column_name} {column_def}"
+            )
+        except sqlite3.OperationalError as exc:
+            # SQLite raises "duplicate column name: X" (and, on some
+            # versions, "table directives already has column named X")
+            # when the column already exists from a prior migration.
+            msg = str(exc).lower()
+            if "duplicate column name" in msg or "already has column" in msg:
+                logger.debug(
+                    "directives.%s already present, skipping migration: %s",
+                    column_name, exc,
+                )
+            else:
+                raise
+    for stmt in _POST_MIGRATION_INDEXES:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError as exc:
+            # These statements use CREATE INDEX IF NOT EXISTS, so the
+            # already-exists case never raises — ANY error here is
+            # unexpected (e.g. the referenced column missing because the
+            # ADD-COLUMN loop above regressed). Keep startup fail-open,
+            # but log loudly so the regression is visible.
+            logger.warning(
+                "Post-migration index failed unexpectedly: %s (%s)", stmt, exc
+            )
     # Ensure brain_state singleton row exists
     conn.execute(
         "INSERT OR IGNORE INTO brain_state (id, session_active, restart_count) VALUES (1, 0, 0)"
     )
     conn.commit()
+    # Deterministic row shape: sqlite3.Row supports BOTH integer indexing
+    # (row[0]) and name indexing (row["col"]), so every existing tuple-index
+    # call site keeps working while dict(row)-style code becomes safe on ANY
+    # connection from init_db. Previously Row was only set as a side effect
+    # of WorkerRegistry.__init__, making dict(row) code construction-order-
+    # dependent (crash if reached before WorkerRegistry was built).
+    conn.row_factory = sqlite3.Row
     return conn

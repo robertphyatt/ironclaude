@@ -16,6 +16,15 @@ def _escape_mrkdwn(text: str) -> str:
     return text
 
 
+def _escape_backticks(s: str) -> str:
+    """Escape backticks so they don't terminate a Slack code fence
+    (```…```) or single-backtick span (`…`). Slack treats a
+    backslash-backtick as a literal backtick and does NOT close the span.
+    Load-bearing for format_directive_review — planned_prompt is LLM-
+    authored and may contain code fences."""
+    return s.replace("`", "\\`")
+
+
 def format_worker_spawned(worker_id: str, worker_type: str, repo: str, objective: str) -> str:
     label = WORKER_TYPE_LABELS.get(worker_type, worker_type)
     return (
@@ -185,6 +194,54 @@ def format_worker_heartbeat_stuck_slack(worker_id: str, stage: str) -> str:
     )
 
 
+def format_directive_review(
+    directive_id: int,
+    interpretation: str,
+    source_text: str,
+    planned_worker_type: str,
+    planned_use_goal: bool,
+    planned_prompt: str,
+    planned_worker_type_reason: str,
+    planned_use_goal_reason: str,
+    planned_prompt_reason: str,
+    supersedes: int | None = None,
+) -> str:
+    """Slack-mrkdwn presentation of a directive for operator review.
+
+    Every user/LLM-supplied string is escaped via _escape_mrkdwn (so `&`,
+    `<`, `>` — including Slack's <!channel>/<@U…>/<#C…> mention syntax,
+    which is parsed at the payload level even inside a code fence — render
+    as literal text). Strings that are additionally embedded inside a
+    backtick span (`…`) or triple-backtick fence (```…```) also get
+    _escape_backticks, applied AFTER _escape_mrkdwn, so any ``` or `
+    sequences inside them cannot break out of their span/fence. This
+    applies to source_text, planned_worker_type, and planned_prompt. When
+    supersedes is given, the header notes the chain link so the operator
+    can trust that this is a revised presentation.
+    """
+    if supersedes is None:
+        header = f"*Directive #{directive_id}* detected:"
+    else:
+        header = f"*Directive #{directive_id}* (revised from #{supersedes}) detected:"
+    goal_answer = "yes" if planned_use_goal else "no"
+    lines = [
+        header,
+        f"> {_escape_mrkdwn(interpretation)}",
+        f"_From your message:_ `{_escape_backticks(_escape_mrkdwn(source_text))}`",
+        "",
+        f"*Model:* `{_escape_backticks(_escape_mrkdwn(planned_worker_type))}` — {_escape_mrkdwn(planned_worker_type_reason)}",
+        f"*`/goal`:* {goal_answer} — {_escape_mrkdwn(planned_use_goal_reason)}",
+        "*Worker prompt:*",
+        "```",
+        _escape_backticks(_escape_mrkdwn(planned_prompt)),
+        "```",
+        f"_Why:_ {_escape_mrkdwn(planned_prompt_reason)}",
+        "",
+        "React 👍 to confirm, 👎 to reject, 🤔 to request changes.",
+    ]
+    return "\n".join(lines)
+
+
 def format_worker_stuck_killed(
     worker_id: str, minutes: int, stage: str, prompt_waiting: bool,
 ) -> str:
@@ -193,4 +250,30 @@ def format_worker_stuck_killed(
         f"Stage: {stage} | Prompt waiting: {'yes' if prompt_waiting else 'no'}\n"
         f"Liveness: confirmed stuck (0% CPU across process tree)\n"
         f"Brain notified to respawn."
+    )
+
+
+def format_fable_unavailable(reason: str, redirected_to: str = "opus", worker_id: str | None = None) -> str:
+    """Slack alert when Fable becomes unavailable and the daemon starts redirecting.
+
+    Posted exactly once per detection episode (the caller decides based on
+    mark_fable_unavailable's transition return). See fable_availability.py.
+    """
+    lines = [
+        "⚠️ *Fable unavailable*",
+        f"Reason: {_escape_mrkdwn(reason)}",
+    ]
+    if worker_id is not None:
+        lines.append(f"Worker: `{_escape_mrkdwn(worker_id)}`")
+    lines.append(f"Redirecting claude-fable requests to `{_escape_mrkdwn(redirected_to)}` for the next 24h.")
+    lines.append("To re-probe manually: `rm ~/.ironclaude/state/fable_unavailable.json`")
+    return "\n".join(lines)
+
+
+def format_fable_recovered() -> str:
+    """Slack alert when Fable comes back — flag cleared, subsequent claude-fable
+    and /advisor fable requests will be honored again."""
+    return (
+        "✅ *Fable is back*\n"
+        "Flag cleared — subsequent claude-fable and /advisor fable requests will be honored again."
     )

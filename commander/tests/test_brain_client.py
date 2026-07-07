@@ -1937,6 +1937,155 @@ class TestModelUnavailableText:
         assert all(unavailable_text not in r for r in drained)
 
 
+class TestModelUnavailableFableTransition:
+    """Fable-specific fallback side effects: mark_fable_unavailable + optional
+    Slack callback, wired at BrainClient construction."""
+
+    def _drive_message_shaped_fallback(self, client):
+        """Run _brain_session with a fake_query that yields a message-shaped
+        model-unavailable signal on the first call, then completes cleanly."""
+        import asyncio
+        from unittest.mock import patch
+        from claude_agent_sdk import AssistantMessage
+        from claude_agent_sdk.types import TextBlock
+
+        models_built = []
+
+        class CapturingOptions:
+            def __init__(self, **kwargs):
+                models_built.append(kwargs.get("model"))
+
+        call_count = {"n": 0}
+        unavailable_text = (
+            "There's an issue with the selected model (fable[1m]). "
+            "It may not exist or you may not have access to it."
+        )
+
+        async def fake_query(prompt=None, options=None):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                yield AssistantMessage(content=[TextBlock(text=unavailable_text)], model="fable")
+            else:
+                return
+                yield  # noqa: unreachable — async generator marker
+
+        with patch("claude_agent_sdk.ClaudeAgentOptions", CapturingOptions), \
+             patch("claude_agent_sdk.query", fake_query):
+            client._episodic_memory_path = "/fake/memory.js"
+            asyncio.run(client._brain_session("my-prompt", None, None))
+
+        return models_built
+
+    def test_ModelUnavailable_fable_model_calls_mark_and_callback(self, tmp_path, monkeypatch):
+        """Fallback from a failing fable model marks fable unavailable and
+        invokes the transition callback with a 'brain-detected' reason."""
+        from unittest.mock import MagicMock
+        from ironclaude import fable_availability
+
+        monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "s.json")
+
+        callback = MagicMock()
+        client = BrainClient(model="fable", on_fable_unavailable_transition=callback)
+
+        with_mark = MagicMock(wraps=fable_availability.mark_fable_unavailable)
+        monkeypatch.setattr("ironclaude.brain_client._mark_fable_unavailable", with_mark)
+
+        models_built = self._drive_message_shaped_fallback(client)
+
+        with_mark.assert_called_once()
+        reason_arg = with_mark.call_args.args[0]
+        assert reason_arg.startswith("brain-detected")
+
+        callback.assert_called_once()
+        callback_reason = callback.call_args.args[0]
+        assert "brain-detected" in callback_reason
+
+        # Fallback still resolved to opus — existing behavior unchanged.
+        assert client._model == "opus"
+        assert any(m == "opus[1m]" for m in models_built), models_built
+
+    def test_ModelUnavailable_non_fable_model_does_not_call_mark_or_callback(self, tmp_path, monkeypatch):
+        """A non-fable failing model must not touch the fable-availability flag
+        or invoke the transition callback."""
+        from unittest.mock import MagicMock
+        from ironclaude import fable_availability
+
+        monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "s.json")
+
+        callback = MagicMock()
+        # Not "opus": _is_model_unavailable_text's "opus not in self._model" guard
+        # would suppress the raise entirely if the current model were opus already.
+        client = BrainClient(model="sonnet", on_fable_unavailable_transition=callback)
+
+        with_mark = MagicMock(wraps=fable_availability.mark_fable_unavailable)
+        monkeypatch.setattr("ironclaude.brain_client._mark_fable_unavailable", with_mark)
+
+        self._drive_message_shaped_fallback(client)
+
+        with_mark.assert_not_called()
+        callback.assert_not_called()
+
+    def test_ModelUnavailable_fable_transition_only_calls_callback_once(self, tmp_path, monkeypatch):
+        """A second fallback trigger against an already-unavailable fable does not
+        re-invoke the callback — mark_fable_unavailable returns False (no transition)."""
+        from unittest.mock import MagicMock
+        from ironclaude import fable_availability
+
+        monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "s.json")
+
+        callback = MagicMock()
+
+        client1 = BrainClient(model="fable", on_fable_unavailable_transition=callback)
+        self._drive_message_shaped_fallback(client1)
+        assert callback.call_count == 1
+
+        client2 = BrainClient(model="fable", on_fable_unavailable_transition=callback)
+        self._drive_message_shaped_fallback(client2)
+
+        # Second client's fallback also fires (mark_fable_unavailable is called
+        # again), but since fable was already unavailable it's not a transition,
+        # so the callback must not fire a second time.
+        assert callback.call_count == 1
+        assert fable_availability.is_fable_unavailable() is True
+
+    def test_ModelUnavailable_callback_default_none_does_not_crash(self, tmp_path, monkeypatch):
+        """No callback wired at construction (the default) must not raise when
+        the fable fallback fires — mark_fable_unavailable still runs."""
+        from unittest.mock import MagicMock
+        from ironclaude import fable_availability
+
+        monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "s.json")
+
+        with_mark = MagicMock(wraps=fable_availability.mark_fable_unavailable)
+        monkeypatch.setattr("ironclaude.brain_client._mark_fable_unavailable", with_mark)
+
+        client = BrainClient(model="fable")  # no on_fable_unavailable_transition passed
+
+        models_built = self._drive_message_shaped_fallback(client)
+
+        with_mark.assert_called_once()
+        assert client._model == "opus"
+        assert any(m == "opus[1m]" for m in models_built), models_built
+
+    def test_callback_fires_on_write_failed(self, tmp_path, monkeypatch):
+        """When mark_ returns write_failed (disk error), the callback still fires
+        so the operator is told Fable is down."""
+        monkeypatch.setattr("ironclaude.brain_client._mark_fable_unavailable", lambda reason: "write_failed")
+        callback_calls = []
+        client = BrainClient(model="fable", on_fable_unavailable_transition=lambda r: callback_calls.append(r))
+        client._maybe_mark_fable_unavailable("fable", "brain-detected-message")
+        assert len(callback_calls) == 1
+
+    def test_callback_NOT_fired_on_already_flagged(self, tmp_path, monkeypatch):
+        """When mark_ returns already_flagged (dedup, no state change), the
+        callback must not fire again."""
+        monkeypatch.setattr("ironclaude.brain_client._mark_fable_unavailable", lambda reason: "already_flagged")
+        callback_calls = []
+        client = BrainClient(model="fable", on_fable_unavailable_transition=lambda r: callback_calls.append(r))
+        client._maybe_mark_fable_unavailable("fable", "brain-detected-message")
+        assert len(callback_calls) == 0
+
+
 class TestMutationToolFirstCheck:
     """Mutation tool check is first in _tool_guard_logic — unconditional, before all other checks."""
 

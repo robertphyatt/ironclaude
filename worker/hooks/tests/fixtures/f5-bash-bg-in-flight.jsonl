@@ -1,0 +1,3 @@
+{"type":"assistant","requestId":"req_f5_a","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01F5AAAAAAAAAAAAAAAAAAAA","name":"Bash","input":{"command":"sleep 300","description":"Long poll","run_in_background":true}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01F5AAAAAAAAAAAAAAAAAAAA","content":[{"type":"text","text":"Command running in background with ID: babcdef01. Output is being written to: /private/tmp/tasks/babcdef01.output."}]}]}}
+{"type":"assistant","requestId":"req_f5_b","message":{"role":"assistant","content":[{"type":"text","text":"Holding for the background command."}]}}

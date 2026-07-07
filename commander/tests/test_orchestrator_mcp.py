@@ -1,6 +1,7 @@
 # tests/test_orchestrator_mcp.py
 """Tests for the orchestrator MCP server business logic."""
 
+import difflib
 import fcntl
 import itertools
 import json
@@ -33,6 +34,21 @@ def _mock_grader_approve(tools):
     tools._call_local_grader = MagicMock(return_value={
         "grade": "A", "approved": True, "feedback": "Test approval"
     })
+
+
+def _submit_directive_default(tools_obj, source_ts, source_text, interpretation, **overrides):
+    """submit_directive with valid default planned_* fields, for tests that don't
+    care about the extended-signature reality-check fields themselves."""
+    kwargs = dict(
+        planned_worker_type="claude-sonnet",
+        planned_use_goal=False,
+        planned_prompt="default test prompt",
+        planned_worker_type_reason="default test reason",
+        planned_use_goal_reason="default test reason",
+        planned_prompt_reason="default test reason",
+    )
+    kwargs.update(overrides)
+    return tools_obj.submit_directive(source_ts, source_text, interpretation, **kwargs)
 
 
 @pytest.fixture
@@ -141,6 +157,11 @@ def tools(registry, mock_tmux, tmp_path, db_conn, monkeypatch):
 
 
 class TestSpawnWorker:
+    @pytest.fixture(autouse=True)
+    def _isolate_fable_state(self, tmp_path, monkeypatch):
+        from ironclaude import fable_availability as fa
+        monkeypatch.setattr(fa, "_STATE_PATH", tmp_path / "fable_state.json")
+
     def test_spawn_worker_valid(self, tools, registry, mock_tmux):
         """Valid spawn creates worker in registry and sends objective."""
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
@@ -489,6 +510,327 @@ class TestSpawnWorker:
         assert "error" not in result
 
 
+def _plant_directive(db_conn, planned_worker_type, planned_use_goal, planned_prompt):
+    """Insert a directive row with planned_* fields set, for drift-check tests."""
+    cursor = db_conn.execute(
+        "INSERT INTO directives "
+        "(source_ts, source_text, interpretation, planned_worker_type, planned_use_goal, "
+        "planned_prompt, planned_worker_type_reason, planned_use_goal_reason, planned_prompt_reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "1700000001.0", "source text", "interpretation",
+            planned_worker_type, planned_use_goal, planned_prompt,
+            "reason", "reason", "reason",
+        ),
+    )
+    db_conn.commit()
+    return cursor.lastrowid
+
+
+class TestSpawnWorkerRealityCheck:
+    """spawn_worker(directive_id=...) drift check: compares the spawn actually
+    made against the planned_* fields promised in the directive. Never blocks
+    the spawn — logs + posts a Slack warning only."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_fable_state(self, tmp_path, monkeypatch):
+        from ironclaude import fable_availability as fa
+        monkeypatch.setattr(fa, "_STATE_PATH", tmp_path / "fable_state.json")
+
+    def test_drift_worker_type_posts_warning_non_blocking(self, tools, registry, mock_tmux, db_conn):
+        """Different worker_type than planned posts a drift warning but still spawns."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        tools._slack = MagicMock()
+        directive_id = _plant_directive(db_conn, "claude-opus", False, "do X")
+
+        result = tools.spawn_worker(
+            worker_id="w1",
+            worker_type="claude-fable",
+            repo="/tmp/repo",
+            objective="do X",
+            directive_id=directive_id,
+        )
+
+        posted = [c.args[0] for c in tools._slack.post_message.call_args_list]
+        assert any(
+            "drift" in m and "promised claude-opus" in m and "spawning claude-fable" in m
+            for m in posted
+        ), posted
+        mock_tmux.spawn_session.assert_called_once()
+        assert "w1" in result
+
+    def test_drift_use_goal_mismatch_is_honored_not_warned(self, tools, registry, mock_tmux, db_conn):
+        """ORCH-01: a directive's planned_use_goal that differs from the daemon's
+        static dispatch config is HONORED (not warned about) — the daemon sends
+        /goal per the plan, and posts no /goal drift warning, since the check
+        was tautological now that the plan is what actually gets dispatched."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        tools._slack = MagicMock()
+        tools._dispatch_cfg = {"use_goal": False}
+        directive_id = _plant_directive(db_conn, "claude-sonnet", True, "do X")
+
+        tools.spawn_worker(
+            worker_id="w1",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="do X",
+            directive_id=directive_id,
+        )
+
+        posted = [c.args[0] for c in tools._slack.post_message.call_args_list]
+        assert not any("drift" in m and "/goal" in m for m in posted), posted
+        keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
+        assert "/goal the assigned objective is complete and code review has passed" in keys_sent
+
+    def test_drift_prompt_low_similarity_warns(self, tools, registry, mock_tmux, db_conn):
+        """Low prompt-similarity between planned_prompt and objective posts a drift warning."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        tools._slack = MagicMock()
+        planned_prompt = "alpha beta gamma delta"
+        objective = "completely different thing about foo bar baz quux"
+        ratio = difflib.SequenceMatcher(None, planned_prompt, objective).ratio()
+        assert ratio < 0.8, "test fixture strings must have similarity < 0.8"
+        directive_id = _plant_directive(db_conn, "claude-sonnet", False, planned_prompt)
+
+        tools.spawn_worker(
+            worker_id="w1",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective=objective,
+            directive_id=directive_id,
+        )
+
+        posted = [c.args[0] for c in tools._slack.post_message.call_args_list]
+        assert any("prompt similarity" in m and f"{ratio:.2f}" in m for m in posted), posted
+
+    def test_no_drift_when_all_match_no_warning(self, tools, registry, mock_tmux, db_conn):
+        """Matching worker_type, /goal, and prompt posts no drift warning."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        tools._slack = MagicMock()
+        tools._dispatch_cfg = {"use_goal": True}
+        prompt = "Implement feature X exactly as described"
+        directive_id = _plant_directive(db_conn, "claude-sonnet", True, prompt)
+
+        tools.spawn_worker(
+            worker_id="w1",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective=prompt,
+            directive_id=directive_id,
+        )
+
+        posted = [c.args[0] for c in tools._slack.post_message.call_args_list]
+        assert not any("drift" in m for m in posted), posted
+
+    def test_no_directive_id_no_lookup(self, tools, registry, mock_tmux, db_conn):
+        """Without directive_id, no drift lookup query is issued at all."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+
+        # sqlite3.Connection.execute can't be patched in-place (builtin type,
+        # read-only attribute), so wrap the connection in a thin spy that
+        # delegates everything except recording each query string.
+        class _ExecuteSpy:
+            def __init__(self, conn):
+                self._conn = conn
+                self.queries = []
+
+            def execute(self, query, *args, **kwargs):
+                self.queries.append(query)
+                return self._conn.execute(query, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        spy = _ExecuteSpy(tools._db)
+        tools._db = spy
+
+        tools.spawn_worker(
+            worker_id="w1",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="do X",
+            directive_id=None,
+        )
+
+        assert not any("planned_" in q for q in spy.queries), spy.queries
+
+
+class TestOrchDirectivePlanHonor:
+    """Regression tests for ORCH-01 + ORCH-02: daemon honors the directive's
+    planned_use_goal at spawn time (drops the tautological /goal drift check)
+    and warns when spawn_worker is called with a superseded directive_id."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_fable_state(self, tmp_path, monkeypatch):
+        from ironclaude import fable_availability as fa
+        monkeypatch.setattr(fa, "_STATE_PATH", tmp_path / "fable_state.json")
+
+    def test_spawn_honors_directives_planned_use_goal_over_daemon_config(
+        self, tools, registry, mock_tmux, db_conn
+    ):
+        """ORCH-01: daemon config says use_goal=False, but the directive's
+        plan says True. The worker should receive /goal per the plan, not
+        per the static daemon config."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        tools._slack = MagicMock()
+        tools._dispatch_cfg = {"use_goal": False}
+        directive_id = _plant_directive(db_conn, "claude-sonnet", True, "do the thing")
+
+        tools.spawn_worker(
+            worker_id="w-o1",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="do the thing",
+            directive_id=directive_id,
+        )
+
+        keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
+        assert "/goal the assigned objective is complete and code review has passed" in keys_sent, (
+            f"Expected /goal command sent to worker (planned_use_goal=True). Sent: {keys_sent}"
+        )
+
+    def test_spawn_falls_back_to_daemon_config_when_no_directive_id(
+        self, tools, mock_tmux
+    ):
+        """No directive_id → fall back to the daemon's static dispatch config."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        tools._dispatch_cfg = {"use_goal": True}
+
+        tools.spawn_worker(
+            worker_id="w-o2",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="obj",
+        )
+
+        keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
+        assert "/goal the assigned objective is complete and code review has passed" in keys_sent, (
+            f"Expected /goal from daemon config fallback. Got: {keys_sent}"
+        )
+
+    def test_drift_check_warns_on_superseded_directive(
+        self, tools, registry, mock_tmux, db_conn
+    ):
+        """ORCH-02: a superseded directive triggers a distinct 'is superseded'
+        warning (spawn still proceeds — never blocked)."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        tools._slack = MagicMock()
+        directive_id = _plant_directive(db_conn, "claude-sonnet", False, "do it")
+
+        db_conn.execute(
+            "UPDATE directives SET status='superseded', superseded_by=? WHERE id=?",
+            (directive_id + 1, directive_id),
+        )
+        db_conn.commit()
+
+        tools.spawn_worker(
+            worker_id="w-o3",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="do it",
+            directive_id=directive_id,
+        )
+
+        posted = [c.args[0] for c in tools._slack.post_message.call_args_list]
+        assert any(
+            "superseded" in m.lower() and f"#{directive_id}" in m
+            for m in posted
+        ), posted
+
+    def test_drift_check_skips_pre_migration_directive_with_null_plan(
+        self, tools, registry, mock_tmux, db_conn
+    ):
+        """I-1 regression: directive rows created before the planned_* columns
+        existed read back NULL. The drift check must SKIP such rows instead of
+        posting nonsense 'promised None' / 'similarity 0.00' warnings."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        tools._slack = MagicMock()
+
+        # Raw INSERT without any planned_* fields — simulates a pre-migration row.
+        cursor = db_conn.execute(
+            "INSERT INTO directives (source_ts, source_text, interpretation, status) "
+            "VALUES ('pre-mig-ts', 'src', 'old interp', 'confirmed')"
+        )
+        db_conn.commit()
+        directive_id = cursor.lastrowid
+
+        tools.spawn_worker(
+            worker_id="w-premig",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="anything at all",
+            directive_id=directive_id,
+        )
+
+        posted = [c.args[0] for c in tools._slack.post_message.call_args_list]
+        drift_posts = [m for m in posted if "drift" in m.lower()]
+        assert not drift_posts, (
+            f"Expected NO drift warnings for a pre-migration directive with NULL "
+            f"planned fields. Got: {drift_posts}"
+        )
+
+    def test_drift_warns_when_retry_escalation_changes_worker_type(
+        self, tools, registry, mock_tmux, db_conn
+    ):
+        """R4-I1 regression: promised sonnet + retry-escalation to opus must
+        WARN — the early comparison saw sonnet==sonnet and stayed silent while
+        the actual spawn went to opus."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        tools._slack = MagicMock()
+        directive_id = _plant_directive(db_conn, "claude-sonnet", False, "obj")
+        # Seed the retry-escalation trigger: base_id of "w-esc-1" is "w-esc".
+        tools._failed_worker_bases.add("w-esc")
+
+        tools.spawn_worker(
+            worker_id="w-esc-1",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="obj",
+            directive_id=directive_id,
+        )
+
+        posted = [c.args[0] for c in tools._slack.post_message.call_args_list]
+        assert any(
+            "drift" in m and "claude-sonnet" in m and "claude-opus" in m
+            for m in posted
+        ), posted
+
+    def test_drift_check_skips_partially_null_plan(
+        self, tools, registry, mock_tmux, db_conn
+    ):
+        """R4-N1 regression: a plan row with only ONE planned field NULL
+        (direct-SQL corruption) must be skipped, not compared."""
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        tools._slack = MagicMock()
+        directive_id = _plant_directive(db_conn, "claude-sonnet", False, "obj")
+        db_conn.execute(
+            "UPDATE directives SET planned_prompt=NULL WHERE id=?", (directive_id,),
+        )
+        db_conn.commit()
+
+        tools.spawn_worker(
+            worker_id="w-pn-1",
+            worker_type="claude-opus",   # would drift vs sonnet if compared
+            repo="/tmp/repo",
+            objective="totally different objective",
+            directive_id=directive_id,
+        )
+
+        posted = [c.args[0] for c in tools._slack.post_message.call_args_list]
+        assert not any("drift" in m for m in posted), posted
+
+
 class TestWorkerCommunication:
     def test_approve_plan_logs_rationale(self, tools, registry, mock_tmux):
         """Approve sends 'yes' to tmux and logs rationale."""
@@ -714,7 +1056,379 @@ class TestEffortLevel:
         assert "CLAUDE_CODE_EFFORT_LEVEL=medium" in cmd
 
 
+class TestFableAvailabilityIntegration:
+    """Fable-availability caching + Slack alerts wired into spawn_worker.
+
+    Covers: worker_type redirect (claude-fable -> claude-opus), advisor tier
+    redirect (fable -> opus), the spawn-died-on-fable retry-and-alert path,
+    idempotent alerting (no repeat Slack post while already flagged), and
+    the Fable-recovered alert when a stale flag is cleared.
+    """
+
+    _TIERED_ADVISOR_CFG = {
+        "enabled": True,
+        "executor_model": "sonnet",
+        "advisor_model": "opus",
+        "advisor_models": {"claude-sonnet": "opus", "claude-opus": "fable"},
+    }
+
+    def test_worker_type_redirect_when_fable_unavailable(self, tools, tmp_path, monkeypatch):
+        """_get_worker_command('claude-fable') matches _get_worker_command('claude-opus')
+        once Fable has been marked unavailable — same command, --model opus not fable."""
+        from ironclaude import fable_availability
+        monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "fable_state.json")
+        fable_availability.mark_fable_unavailable("test")
+
+        cmd_fable = tools._get_worker_command("claude-fable")
+        cmd_opus = tools._get_worker_command("claude-opus")
+
+        assert cmd_fable == cmd_opus
+        assert "--model opus" in cmd_fable
+        assert "--model fable" not in cmd_fable
+
+    def test_advisor_redirect_when_fable_unavailable(self, registry, mock_tmux, tmp_path, db_conn, monkeypatch):
+        """A claude-opus worker whose tiered advisor is 'fable' gets /advisor opus
+        instead once Fable has been marked unavailable."""
+        from ironclaude import fable_availability
+        monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "fable_state.json")
+        fable_availability.mark_fable_unavailable("test")
+
+        ledger_path = str(tmp_path / "task-ledger.json")
+        tools = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            advisor_cfg=self._TIERED_ADVISOR_CFG,
+        )
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok", "confidence": "high",
+        })
+        with patch("ironclaude.orchestrator_mcp.time.sleep"):
+            tools.spawn_worker(
+                worker_id="w-tier-opus-redirect",
+                worker_type="claude-opus",
+                repo="/tmp/repo",
+                objective="Do the thing",
+            )
+        keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
+        assert "/advisor opus" in keys_sent
+        assert "/advisor fable" not in keys_sent
+
+    def test_spawn_retry_on_fable_death_marks_and_posts_slack(
+        self, tools, registry, mock_tmux, tmp_path, monkeypatch,
+    ):
+        """A claude-fable spawn whose session dies before ready marks Fable
+        unavailable, posts a Slack alert, and retries once as claude-opus."""
+        from ironclaude import fable_availability
+        state_path = tmp_path / "fable_state.json"
+        monkeypatch.setattr(fable_availability, "_STATE_PATH", state_path)
+
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok", "confidence": "high",
+        })
+        tools._slack = MagicMock()
+
+        mock_tmux.has_session.return_value = False
+        mock_tmux.read_log_tail.return_value = "fable binary crashed\n"
+
+        with patch.object(tools, "_wait_for_ready", side_effect=[False, True]):
+            result = tools.spawn_worker(
+                worker_id="w-fable-death",
+                worker_type="claude-fable",
+                repo="/tmp/repo",
+                objective="Do the architecture thing",
+            )
+
+        assert "w-fable-death" in result
+        assert "error" not in result
+
+        assert fable_availability.is_fable_unavailable()
+        state = json.loads(state_path.read_text())
+        assert "spawn-died" in state["reason"]
+
+        tools._slack.post_message.assert_called_once()
+        posted = tools._slack.post_message.call_args[0][0]
+        assert "Fable unavailable" in posted
+
+        spawn_calls = mock_tmux.spawn_session.call_args_list
+        assert len(spawn_calls) == 2
+        retry_cmd = spawn_calls[1][0][1]
+        assert "--model opus" in retry_cmd
+
+        worker = registry.get_worker("w-fable-death")
+        assert worker["type"] == "claude-opus"
+
+    def test_spawn_retry_idempotent_no_second_slack(
+        self, tools, registry, mock_tmux, tmp_path, monkeypatch,
+    ):
+        """Two consecutive fable-spawn deaths post the Fable-unavailable Slack
+        alert exactly once — the second death sees the flag already set."""
+        from ironclaude import fable_availability
+        state_path = tmp_path / "fable_state.json"
+        monkeypatch.setattr(fable_availability, "_STATE_PATH", state_path)
+
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok", "confidence": "high",
+        })
+        tools._slack = MagicMock()
+
+        mock_tmux.has_session.return_value = False
+        mock_tmux.read_log_tail.return_value = "fable binary crashed\n"
+
+        with patch.object(tools, "_wait_for_ready", side_effect=[False, True, False, True]):
+            result1 = tools.spawn_worker(
+                worker_id="w-fable-death-1",
+                worker_type="claude-fable",
+                repo="/tmp/repo",
+                objective="Do the architecture thing",
+            )
+            result2 = tools.spawn_worker(
+                worker_id="w-fable-death-2",
+                worker_type="claude-fable",
+                repo="/tmp/repo",
+                objective="Do another architecture thing",
+            )
+
+        assert "error" not in result1
+        assert "error" not in result2
+
+        fable_unavailable_posts = [
+            call.args[0] for call in tools._slack.post_message.call_args_list
+            if "Fable unavailable" in call.args[0]
+        ]
+        assert len(fable_unavailable_posts) == 1
+
+    def test_fable_recovery_post_when_previously_flagged(
+        self, tools, registry, mock_tmux, tmp_path, monkeypatch,
+    ):
+        """A successful claude-fable spawn after a stale (expired) unavailable
+        flag clears the flag and posts the Fable-recovered Slack alert."""
+        from ironclaude import fable_availability
+        state_path = tmp_path / "fable_state.json"
+        monkeypatch.setattr(fable_availability, "_STATE_PATH", state_path)
+
+        # Write an already-expired flag directly: is_fable_unavailable() reads
+        # this as "available" (so the fable spawn below is NOT redirected to
+        # opus), but the file still exists for clear_fable_unavailable() to find.
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps({
+            "unavailable_until": time.time() - 10,
+            "reason": "prior",
+            "marked_at": time.time() - 100000,
+        }))
+
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok", "confidence": "high",
+        })
+        tools._slack = MagicMock()
+
+        with patch.object(tools, "_wait_for_ready", return_value=True):
+            result = tools.spawn_worker(
+                worker_id="w-fable-recover",
+                worker_type="claude-fable",
+                repo="/tmp/repo",
+                objective="Do the architecture thing",
+            )
+
+        assert "w-fable-recover" in result
+        assert "error" not in result
+        assert not state_path.exists()
+
+        tools._slack.post_message.assert_called_once()
+        posted = tools._slack.post_message.call_args[0][0]
+        assert "Fable is back" in posted
+
+    def test_slack_posted_on_write_failed_at_spawn_death(self, tools, registry, mock_tmux, tmp_path, monkeypatch):
+        """Spawn-died on a fable worker where the state-file write fails: Slack
+        alert still fires, since Fable is still down regardless of whether the
+        on-disk flag was successfully persisted."""
+        from ironclaude import fable_availability
+        state_path = tmp_path / "fable_state.json"
+        monkeypatch.setattr(fable_availability, "_STATE_PATH", state_path)
+        monkeypatch.setattr("ironclaude.orchestrator_mcp._mark_fable_unavailable", lambda reason: "write_failed")
+
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok", "confidence": "high",
+        })
+        tools._slack = MagicMock()
+
+        mock_tmux.has_session.return_value = False
+        mock_tmux.read_log_tail.return_value = "fable binary crashed\n"
+
+        with patch.object(tools, "_wait_for_ready", side_effect=[False, True]):
+            result = tools.spawn_worker(
+                worker_id="w-fable-write-failed",
+                worker_type="claude-fable",
+                repo="/tmp/repo",
+                objective="Do the architecture thing",
+            )
+
+        assert "w-fable-write-failed" in result
+        assert "error" not in result
+
+        tools._slack.post_message.assert_called_once()
+        posted = tools._slack.post_message.call_args[0][0]
+        assert "Fable unavailable" in posted
+
+    def test_batch_spawn_advisor_redirect_when_fable_unavailable(self, tools, mock_tmux, tmp_path, monkeypatch):
+        """spawn_workers (batch path) filters advisor model through
+        resolve_advisor_model — a claude-opus worker whose advisor_model is
+        'fable' gets /advisor opus instead once Fable is flagged unavailable."""
+        from ironclaude import fable_availability
+        monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "fable_state.json")
+        fable_availability.mark_fable_unavailable("test")
+
+        tools._advisor_cfg = {"enabled": True, "advisor_model": "fable"}
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok", "confidence": "high",
+        })
+
+        # Force the batch PM-activation loop to succeed on its first iteration:
+        # redirect HOME so claude_dir resolves under tmp_path, drop a valid
+        # session-id file for the pane_pid we return, and pre-create the
+        # sessions table in the ironclaude.db that the batch loop opens.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        session_uuid = "a" * 36
+        pane_pid = "12345"
+        (claude_dir / f"ironclaude-session-{pane_pid}.id").write_text(session_uuid)
+        db_path = claude_dir / "ironclaude.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE sessions (terminal_session TEXT PRIMARY KEY, "
+            "professional_mode TEXT NOT NULL DEFAULT 'undecided', "
+            "updated_at TEXT NOT NULL DEFAULT (datetime('now')))"
+        )
+        conn.commit()
+        conn.close()
+
+        mock_tmux.spawn_session.return_value = True
+        mock_run_result = MagicMock()
+        mock_run_result.stdout = pane_pid + "\n"
+
+        with patch("subprocess.run", return_value=mock_run_result), \
+             patch("ironclaude.orchestrator_mcp.time.sleep"):
+            tools.spawn_workers([
+                {"worker_id": "w-opus", "worker_type": "claude-opus", "repo": "/tmp/repo", "objective": "Do the thing"},
+            ])
+
+        keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
+        assert "/advisor opus" in keys_sent
+        assert "/advisor fable" not in keys_sent
+
+    def test_recovery_does_not_fire_when_default_opus_model_starts_with_fable(
+        self, tools, registry, mock_tmux, tmp_path, monkeypatch,
+    ):
+        """When default_opus_model is 'fable-nano', a redirected spawn (claude-fable
+        -> claude-opus -> --model fable-nano) must NOT trigger the Fable-recovered
+        Slack post, because the actual spawn didn't target Fable (OR-02)."""
+        from ironclaude import fable_availability as fa
+        state_path = tmp_path / "fable_state.json"
+        monkeypatch.setattr(fa, "_STATE_PATH", state_path)
+        fa.mark_fable_unavailable("test")  # flag active
+
+        tools._opus_model = "fable-nano"
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok", "confidence": "high",
+        })
+        tools._slack = MagicMock()
+
+        with patch.object(tools, "_wait_for_ready", return_value=True):
+            result = tools.spawn_worker(
+                worker_id="w-fable-redir",
+                worker_type="claude-fable",
+                repo="/tmp/repo",
+                objective="Do the architecture thing",
+            )
+
+        assert "w-fable-redir" in result
+        assert "error" not in result
+
+        # Sanity: the redirected command really does carry the lookalike
+        # substring that used to false-positive the recovery check.
+        spawn_cmd = mock_tmux.spawn_session.call_args[0][1]
+        assert "--model fable-nano" in spawn_cmd
+
+        slack_calls = [
+            call for call in tools._slack.post_message.call_args_list
+            if "Fable is back" in str(call)
+        ]
+        assert not slack_calls
+        assert fa.is_fable_unavailable()
+
+    def test_retry_preserves_remote_command_shape_on_fable_death(
+        self, registry, mock_tmux, tmp_path, db_conn, monkeypatch,
+    ):
+        """Remote (SSH) claude-fable spawn dies before ready. Retry-as-opus must use
+        machine_cfg.claude_path and machine_cfg.env, not local exec claude (OR-03)."""
+        from ironclaude import fable_availability as fa
+        from ironclaude.ssh_manager import MachineConfig
+        state_path = tmp_path / "fable_state.json"
+        monkeypatch.setattr(fa, "_STATE_PATH", state_path)
+
+        machine_cfg = MachineConfig(
+            name="remote-worker",
+            host="remote-worker",
+            claude_path="/usr/local/bin/claude",
+            repos=["/home/user/projects/traderbot"],
+            log_dir="/tmp/ic-logs",
+            env={"ANTHROPIC_API_KEY": "sk-test"},
+            role="worker",
+        )
+        mock_ssh = MagicMock()
+        mock_ssh.get_machine.return_value = machine_cfg
+        mock_health = MagicMock()
+        mock_health.ok = True
+        mock_health.details = "All checks passed"
+        mock_ssh.health_check.return_value = mock_health
+        mock_ssh.list_machine_names.return_value = ["remote-worker"]
+        ledger_path = str(tmp_path / "task-ledger.json")
+        tools = OrchestratorTools(registry, mock_tmux, ledger_path, db_conn=db_conn)
+        tools._ssh_manager = mock_ssh
+        tools._get_ollama_vram = MagicMock(return_value=(0.0, []))
+
+        tools._activate_pm_remote = MagicMock(return_value=None)
+        tools._ensure_claude_md_remote = MagicMock()
+        tools._ensure_worker_trusted_remote = MagicMock()
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok", "confidence": "high",
+        })
+        tools._slack = MagicMock()
+
+        mock_tmux.has_session.return_value = False
+        mock_tmux.read_log_tail.return_value = "fable binary crashed\n"
+
+        with patch.object(tools, "_wait_for_ready", side_effect=[False, True]):
+            result = tools.spawn_worker(
+                worker_id="w-fable-remote-death",
+                worker_type="claude-fable",
+                repo="/home/user/projects/traderbot",
+                objective="Do the architecture thing",
+                machine="remote-worker",
+            )
+
+        assert "w-fable-remote-death" in result
+        assert "error" not in result
+
+        spawn_calls = mock_tmux.spawn_session.call_args_list
+        assert len(spawn_calls) == 2
+        retry_cmd = spawn_calls[1][0][1]
+        assert "exec claude" not in retry_cmd
+        assert machine_cfg.claude_path in retry_cmd
+        assert "ANTHROPIC_API_KEY=sk-test" in retry_cmd
+
+
 class TestSpawnWorkerModelName:
+    @pytest.fixture(autouse=True)
+    def _isolate_fable_state(self, tmp_path, monkeypatch):
+        from ironclaude import fable_availability as fa
+        monkeypatch.setattr(fa, "_STATE_PATH", tmp_path / "fable_state.json")
+
     def test_ollama_requires_model_name(self, tools):
         """Ollama spawn without model_name returns error dict."""
         _mock_grader_approve(tools)
@@ -2377,6 +3091,12 @@ class TestDirectiveLifecycle:
             source_ts="1700000001.0",
             source_text="please fix the login bug",
             interpretation="Fix the authentication bug in the login flow",
+            planned_worker_type="claude-sonnet",
+            planned_use_goal=False,
+            planned_prompt="Fix the login bug",
+            planned_worker_type_reason="single-file bug fix",
+            planned_use_goal_reason="not needed",
+            planned_prompt_reason="scoped to the reported bug",
         )
         assert "id" in result
         assert result["status"] == "pending_confirmation"
@@ -2391,6 +3111,12 @@ class TestDirectiveLifecycle:
             source_ts="1700000001.0",
             source_text="fix the bug",
             interpretation="Fix the login bug",
+            planned_worker_type="claude-sonnet",
+            planned_use_goal=False,
+            planned_prompt="Fix the login bug",
+            planned_worker_type_reason="single-file bug fix",
+            planned_use_goal_reason="not needed",
+            planned_prompt_reason="scoped to the reported bug",
         )
         mock_slack.post_message.assert_called_once()
         msg = mock_slack.post_message.call_args[0][0]
@@ -2403,6 +3129,12 @@ class TestDirectiveLifecycle:
             source_ts="1700000001.0",
             source_text="fix the bug",
             interpretation="Fix the login bug",
+            planned_worker_type="claude-sonnet",
+            planned_use_goal=False,
+            planned_prompt="Fix the login bug",
+            planned_worker_type_reason="single-file bug fix",
+            planned_use_goal_reason="not needed",
+            planned_prompt_reason="scoped to the reported bug",
         )
         assert "id" in result
         assert result["status"] == "pending_confirmation"
@@ -2414,6 +3146,12 @@ class TestDirectiveLifecycle:
             source_ts="1700000001.0",
             source_text="fix the bug",
             interpretation="Fix the login bug",
+            planned_worker_type="claude-sonnet",
+            planned_use_goal=False,
+            planned_prompt="Fix the login bug",
+            planned_worker_type_reason="single-file bug fix",
+            planned_use_goal_reason="not needed",
+            planned_prompt_reason="scoped to the reported bug",
         )
         mock_slack.pin_message.assert_called_once_with("1700000099.0")
 
@@ -2424,20 +3162,26 @@ class TestDirectiveLifecycle:
             source_ts="1700000001.0",
             source_text="fix the bug",
             interpretation="Fix the login bug",
+            planned_worker_type="claude-sonnet",
+            planned_use_goal=False,
+            planned_prompt="Fix the login bug",
+            planned_worker_type_reason="single-file bug fix",
+            planned_use_goal_reason="not needed",
+            planned_prompt_reason="scoped to the reported bug",
         )
         mock_slack.pin_message.assert_not_called()
 
     def test_get_directives_no_filter(self, tools_with_slack, db_conn):
         """get_directives returns all directives when no status filter."""
-        tools_with_slack.submit_directive("ts1", "msg1", "interp1")
-        tools_with_slack.submit_directive("ts2", "msg2", "interp2")
+        _submit_directive_default(tools_with_slack, "ts1", "msg1", "interp1")
+        _submit_directive_default(tools_with_slack, "ts2", "msg2", "interp2")
         result = tools_with_slack.get_directives()
         assert len(result) == 2
 
     def test_get_directives_filters_by_status(self, tools_with_slack, db_conn):
         """get_directives filters by status."""
-        tools_with_slack.submit_directive("ts1", "msg1", "interp1")
-        d2 = tools_with_slack.submit_directive("ts2", "msg2", "interp2")
+        _submit_directive_default(tools_with_slack, "ts1", "msg1", "interp1")
+        d2 = _submit_directive_default(tools_with_slack, "ts2", "msg2", "interp2")
         # Manually confirm one directive
         db_conn.execute(
             "UPDATE directives SET status='confirmed' WHERE id=?", (d2["id"],)
@@ -2452,14 +3196,14 @@ class TestDirectiveLifecycle:
     def test_get_directives_limit(self, tools_with_slack, db_conn):
         """get_directives respects limit param."""
         for i in range(5):
-            tools_with_slack.submit_directive(f"ts{i}", f"msg{i}", f"interp{i}")
+            _submit_directive_default(tools_with_slack, f"ts{i}", f"msg{i}", f"interp{i}")
         result = tools_with_slack.get_directives(limit=3)
         assert len(result) == 3
 
     def test_get_directives_offset(self, tools_with_slack, db_conn):
         """get_directives respects offset param."""
         for i in range(5):
-            tools_with_slack.submit_directive(f"ts{i}", f"msg{i}", f"interp{i}")
+            _submit_directive_default(tools_with_slack, f"ts{i}", f"msg{i}", f"interp{i}")
         all_results = tools_with_slack.get_directives()
         offset_results = tools_with_slack.get_directives(offset=2)
         assert len(offset_results) == 3
@@ -2467,7 +3211,7 @@ class TestDirectiveLifecycle:
 
     def test_get_directives_after(self, tools_with_slack, db_conn):
         """get_directives filters by after date."""
-        d = tools_with_slack.submit_directive("ts1", "msg1", "interp1")
+        d = _submit_directive_default(tools_with_slack, "ts1", "msg1", "interp1")
         db_conn.execute(
             "UPDATE directives SET created_at='2026-01-01 00:00:00' WHERE id=?",
             (d["id"],),
@@ -2479,7 +3223,7 @@ class TestDirectiveLifecycle:
 
     def test_get_directives_before(self, tools_with_slack, db_conn):
         """get_directives filters by before date."""
-        d = tools_with_slack.submit_directive("ts1", "msg1", "interp1")
+        d = _submit_directive_default(tools_with_slack, "ts1", "msg1", "interp1")
         db_conn.execute(
             "UPDATE directives SET created_at='2026-01-01 00:00:00' WHERE id=?",
             (d["id"],),
@@ -2492,22 +3236,22 @@ class TestDirectiveLifecycle:
 
     def test_get_directives_search(self, tools_with_slack, db_conn):
         """get_directives filters by text search across source_text and interpretation."""
-        tools_with_slack.submit_directive("ts1", "find me please", "interp1")
-        tools_with_slack.submit_directive("ts2", "other message", "find me here")
-        tools_with_slack.submit_directive("ts3", "no match", "no match either")
+        _submit_directive_default(tools_with_slack, "ts1", "find me please", "interp1")
+        _submit_directive_default(tools_with_slack, "ts2", "other message", "find me here")
+        _submit_directive_default(tools_with_slack, "ts3", "no match", "no match either")
         result = tools_with_slack.get_directives(search="find me")
         assert len(result) == 2
 
     def test_get_directives_combined_filters(self, tools_with_slack, db_conn):
         """get_directives combines multiple filters correctly."""
         for i in range(5):
-            tools_with_slack.submit_directive(f"ts{i}", f"msg{i}", f"interp{i}")
+            _submit_directive_default(tools_with_slack, f"ts{i}", f"msg{i}", f"interp{i}")
         result = tools_with_slack.get_directives(limit=2, search="msg")
         assert len(result) == 2
 
     def test_update_directive_status_valid(self, tools_with_slack, db_conn):
         """update_directive_status updates status and updated_at."""
-        d = tools_with_slack.submit_directive("ts1", "msg1", "interp1")
+        d = _submit_directive_default(tools_with_slack, "ts1", "msg1", "interp1")
         tools_with_slack.update_directive_status(d["id"], "confirmed")
         row = db_conn.execute(
             "SELECT status FROM directives WHERE id=?", (d["id"],)
@@ -2521,9 +3265,376 @@ class TestDirectiveLifecycle:
 
     def test_update_directive_status_invalid_status(self, tools_with_slack):
         """update_directive_status raises ValueError for invalid status."""
-        d = tools_with_slack.submit_directive("ts1", "msg1", "interp1")
+        d = _submit_directive_default(tools_with_slack, "ts1", "msg1", "interp1")
         with pytest.raises(ValueError, match="Invalid status"):
             tools_with_slack.update_directive_status(d["id"], "banana")
+
+
+class TestSubmitDirective:
+    """Tests for the extended submit_directive signature: required planned_*
+    fields, format_directive_review-based Slack posting, and supersedes chaining."""
+
+    @pytest.fixture
+    def mock_slack(self):
+        slack = MagicMock()
+        slack.post_message.return_value = "1700000099.0"
+        return slack
+
+    @pytest.fixture
+    def tools_with_slack(self, registry, mock_tmux, tmp_path, mock_slack, db_conn):
+        ledger_path = str(tmp_path / "task-ledger.json")
+        return OrchestratorTools(registry, mock_tmux, ledger_path, slack_bot=mock_slack, db_conn=db_conn)
+
+    def _valid_kwargs(self, **overrides):
+        kwargs = dict(
+            planned_worker_type="claude-sonnet",
+            planned_use_goal=False,
+            planned_prompt="Fix the login bug",
+            planned_worker_type_reason="single-file bug fix",
+            planned_use_goal_reason="not needed",
+            planned_prompt_reason="scoped to the reported bug",
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_extended_signature_required_planned_worker_type_raises_on_none(self, tools_with_slack):
+        with pytest.raises(ValueError, match="planned_worker_type"):
+            tools_with_slack.submit_directive(
+                "ts1", "msg1", "interp1",
+                **self._valid_kwargs(planned_worker_type=None),
+            )
+
+    def test_extended_signature_required_planned_prompt_raises_on_empty_string(self, tools_with_slack):
+        with pytest.raises(ValueError, match="planned_prompt"):
+            tools_with_slack.submit_directive(
+                "ts1", "msg1", "interp1",
+                **self._valid_kwargs(planned_prompt=""),
+            )
+
+    def test_extended_signature_required_reason_fields_raise_on_none(self, tools_with_slack):
+        with pytest.raises(ValueError, match="planned_worker_type_reason"):
+            tools_with_slack.submit_directive(
+                "ts1", "msg1", "interp1",
+                **self._valid_kwargs(planned_worker_type_reason=None),
+            )
+
+    def test_persists_all_planned_fields(self, tools_with_slack, db_conn):
+        kwargs = self._valid_kwargs()
+        result = tools_with_slack.submit_directive("ts1", "msg1", "interp1", **kwargs)
+        row = dict(
+            db_conn.execute("SELECT * FROM directives WHERE id=?", (result["id"],)).fetchone()
+        )
+        assert row["planned_worker_type"] == kwargs["planned_worker_type"]
+        assert bool(row["planned_use_goal"]) == kwargs["planned_use_goal"]
+        assert row["planned_prompt"] == kwargs["planned_prompt"]
+        assert row["planned_worker_type_reason"] == kwargs["planned_worker_type_reason"]
+        assert row["planned_use_goal_reason"] == kwargs["planned_use_goal_reason"]
+        assert row["planned_prompt_reason"] == kwargs["planned_prompt_reason"]
+
+    def test_slack_post_uses_format_directive_review(self, tools_with_slack, mock_slack):
+        kwargs = self._valid_kwargs()
+        with patch("ironclaude.orchestrator_mcp.format_directive_review") as mock_format:
+            mock_format.return_value = "FORMATTED"
+            result = tools_with_slack.submit_directive("ts1", "msg1", "interp1", **kwargs)
+        mock_format.assert_called_once_with(
+            result["id"],
+            "interp1",
+            "msg1",
+            kwargs["planned_worker_type"],
+            kwargs["planned_use_goal"],
+            kwargs["planned_prompt"],
+            kwargs["planned_worker_type_reason"],
+            kwargs["planned_use_goal_reason"],
+            kwargs["planned_prompt_reason"],
+            supersedes=None,
+        )
+        mock_slack.post_message.assert_called_once_with("FORMATTED")
+
+    def test_supersedes_none_no_supersession_update(self, tools_with_slack, db_conn):
+        _submit_directive_default(tools_with_slack, "ts1", "msg1", "interp1")
+        tools_with_slack.submit_directive("ts2", "msg2", "interp2", **self._valid_kwargs())
+        rows = db_conn.execute("SELECT status FROM directives").fetchall()
+        assert not any(dict(r)["status"] == "superseded" for r in rows)
+
+    def test_supersedes_valid_id_marks_old_row_superseded_in_same_transaction(self, tools_with_slack, db_conn):
+        old = _submit_directive_default(tools_with_slack, "ts1", "msg1", "interp1")
+        old_id = old["id"]
+        db_conn.execute("UPDATE directives SET status='awaiting_changes' WHERE id=?", (old_id,))
+        db_conn.commit()
+
+        new = tools_with_slack.submit_directive(
+            "ts2", "msg2", "interp2", **self._valid_kwargs(), supersedes=old_id,
+        )
+
+        old_row = dict(
+            db_conn.execute("SELECT status, superseded_by FROM directives WHERE id=?", (old_id,)).fetchone()
+        )
+        assert old_row["status"] == "superseded"
+        assert old_row["superseded_by"] == new["id"]
+        assert new["status"] == "pending_confirmation"
+        new_row = dict(
+            db_conn.execute("SELECT status FROM directives WHERE id=?", (new["id"],)).fetchone()
+        )
+        assert new_row["status"] == "pending_confirmation"
+
+    def test_supersedes_nonexistent_id_posts_warning_and_inserts_anyway(self, tools_with_slack, mock_slack):
+        result = tools_with_slack.submit_directive(
+            "ts1", "msg1", "interp1", **self._valid_kwargs(), supersedes=99999,
+        )
+        posted = [c.args[0] for c in mock_slack.post_message.call_args_list]
+        assert any("cannot be superseded" in m and "not found" in m for m in posted), posted
+        assert "id" in result
+        assert result["status"] == "pending_confirmation"
+
+    def test_supersedes_already_superseded_row_posts_warning_and_inserts_anyway(self, tools_with_slack, db_conn, mock_slack):
+        old = _submit_directive_default(tools_with_slack, "ts1", "msg1", "interp1")
+        old_id = old["id"]
+        db_conn.execute(
+            "UPDATE directives SET status='superseded', superseded_by=42 WHERE id=?", (old_id,)
+        )
+        db_conn.commit()
+        mock_slack.reset_mock()
+
+        result = tools_with_slack.submit_directive(
+            "ts2", "msg2", "interp2", **self._valid_kwargs(), supersedes=old_id,
+        )
+
+        posted = [c.args[0] for c in mock_slack.post_message.call_args_list]
+        assert any("already replaced by #42" in m for m in posted), posted
+        assert "id" in result
+        assert result["status"] == "pending_confirmation"
+
+    def test_supersede_warning_handles_corrupt_row_without_successor(
+        self, tools_with_slack, mock_slack, db_conn
+    ):
+        """N-1 regression: a row with status='superseded' but superseded_by NULL
+        (data corruption) must not produce an '#None' message."""
+        r = tools_with_slack.submit_directive(
+            "ts-n1", "msg", "interp",
+            **self._valid_kwargs(),
+        )
+        did = r["id"]
+        db_conn.execute(
+            "UPDATE directives SET status='superseded', superseded_by=NULL WHERE id=?",
+            (did,),
+        )
+        db_conn.commit()
+
+        tools_with_slack.submit_directive(
+            "ts-n1b", "msg2", "interp2",
+            **self._valid_kwargs(),
+            supersedes=did,
+        )
+
+        posted = [c.args[0] for c in mock_slack.post_message.call_args_list]
+        assert not any("#None" in m for m in posted), posted
+        assert any("already marked superseded" in m for m in posted), posted
+
+    def test_supersedes_rejected_for_confirmed_directive(
+        self, tools_with_slack, mock_slack, db_conn
+    ):
+        """R3-I1 regression: a wrong/stale supersedes id pointing at a
+        confirmed (or in_progress) directive must NOT silently flip it to
+        superseded — that would drop it out of check_confirmed_directives'
+        reminder loop. Only awaiting_changes/pending_confirmation rows are
+        valid revision targets."""
+        r = tools_with_slack.submit_directive(
+            "ts-r3", "msg", "interp",
+            **self._valid_kwargs(),
+        )
+        did = r["id"]
+        db_conn.execute(
+            "UPDATE directives SET status='confirmed' WHERE id=?", (did,),
+        )
+        db_conn.commit()
+
+        r2 = tools_with_slack.submit_directive(
+            "ts-r3b", "msg2", "interp2",
+            **self._valid_kwargs(),
+            supersedes=did,
+        )
+        assert r2["status"] == "pending_confirmation"
+
+        # The confirmed directive must be untouched.
+        old = db_conn.execute(
+            "SELECT status, superseded_by FROM directives WHERE id=?", (did,),
+        ).fetchone()
+        assert old[0] == "confirmed", f"confirmed directive was flipped: {old[0]}"
+        assert old[1] is None, f"confirmed directive was linked: {old[1]}"
+
+        # And the operator must see why the supersession was skipped.
+        posted = [c.args[0] for c in mock_slack.post_message.call_args_list]
+        assert any(
+            "cannot be superseded" in m and "confirmed" in m for m in posted
+        ), posted
+
+
+class TestPlainConnDictRowAccessRegression:
+    """Defense-in-depth regression: orchestrator_mcp.py must not use
+    `dict(row)`-style access that only works under row_factory=sqlite3.Row.
+    init_db() sets Row nowadays, but connections from other sources may be
+    plain — the fixture below strips the factory explicitly so each affected
+    code path is exercised against tuple rows (where naive `dict(row)`
+    raises TypeError).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_fable_state(self, tmp_path, monkeypatch):
+        """Prevent the spawn_worker drift-check test's claude-fable spawn from
+        leaking into the real ~/.ironclaude/state/fable_unavailable.json and
+        contaminating other tests in the same run."""
+        from ironclaude import fable_availability as fa
+        monkeypatch.setattr(fa, "_STATE_PATH", tmp_path / "fable_state.json")
+
+    @pytest.fixture
+    def mock_slack(self):
+        slack = MagicMock()
+        # Return a unique message_ts each call so directive rows get distinct
+        # interpretation_ts values.
+        counter = {"n": 0}
+
+        def _post(msg):
+            counter["n"] += 1
+            return f"reg-ts-{counter['n']:04d}"
+
+        slack.post_message.side_effect = _post
+        return slack
+
+    @pytest.fixture
+    def plain_db_conn(self, tmp_path):
+        """DB conn with row_factory explicitly stripped, so rows are plain
+        tuples. init_db() sets sqlite3.Row itself these days, but conns from
+        other sources (or older code paths) may be plain — orchestrator_mcp
+        must be robust against both shapes, so this fixture exercises the
+        tuple shape deliberately."""
+        conn = init_db(str(tmp_path / "plain.db"))
+        conn.row_factory = None
+        return conn
+
+    @pytest.fixture
+    def tools_reg(self, mock_tmux, tmp_path, mock_slack, plain_db_conn):
+        ledger_path = str(tmp_path / "task-ledger.json")
+        # NOTE: registry mock is a bare MagicMock — deliberately NOT a real
+        # WorkerRegistry, since WorkerRegistry.__init__ would set
+        # row_factory=sqlite3.Row on plain_db_conn and mask the bug.
+        return OrchestratorTools(MagicMock(), mock_tmux, ledger_path, slack_bot=mock_slack, db_conn=plain_db_conn)
+
+    def _valid_kwargs(self, **overrides):
+        kwargs = dict(
+            planned_worker_type="claude-sonnet",
+            planned_use_goal=False,
+            planned_prompt="do the thing",
+            planned_worker_type_reason="routine",
+            planned_use_goal_reason="not needed",
+            planned_prompt_reason="scoped",
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_submit_with_supersedes_works_on_plain_conn(self, tools_reg, plain_db_conn):
+        """orchestrator_mcp.py:1168 — supersession unpack must use tuple index."""
+        r1 = tools_reg.submit_directive(
+            "ts-a", "op msg", "initial interp",
+            **self._valid_kwargs(),
+        )
+        first_id = r1["id"]
+
+        # This would raise TypeError at :1168 under the current bug.
+        r2 = tools_reg.submit_directive(
+            "ts-a", "op msg", "revised interp",
+            **self._valid_kwargs(planned_worker_type="claude-opus"),
+            supersedes=first_id,
+        )
+        new_id = r2["id"]
+        assert new_id != first_id
+        assert r2["status"] == "pending_confirmation"
+
+        old = plain_db_conn.execute(
+            "SELECT status, superseded_by FROM directives WHERE id=?", (first_id,),
+        ).fetchone()
+        assert old[0] == "superseded"
+        assert old[1] == new_id
+
+    def test_get_directives_returns_list_of_dicts_on_plain_conn(self, tools_reg):
+        """orchestrator_mcp.py:1379 — SELECT * → list-of-dicts must use cursor.description."""
+        tools_reg.submit_directive(
+            "ts-b", "op msg", "interp b",
+            **self._valid_kwargs(),
+        )
+        # This would raise TypeError at :1379 under the current bug.
+        result = tools_reg.get_directives()
+        assert isinstance(result, list)
+        assert len(result) >= 1
+        assert isinstance(result[0], dict)
+        # Must include the new planned_* columns as dict keys (proves cursor.description path).
+        assert "planned_worker_type" in result[0]
+        assert "interpretation" in result[0]
+
+    def test_update_directive_status_works_on_plain_conn(self, tools_reg, plain_db_conn):
+        """orchestrator_mcp.py:1454+1460 — old_status/source_ts unpacks must use tuple index."""
+        r = tools_reg.submit_directive(
+            "ts-c", "op msg", "interp c",
+            **self._valid_kwargs(),
+        )
+        did = r["id"]
+
+        # This would raise TypeError at :1454 under the current bug.
+        tools_reg.update_directive_status(did, "confirmed")
+
+        row = plain_db_conn.execute("SELECT status FROM directives WHERE id=?", (did,)).fetchone()
+        assert row[0] == "confirmed"
+
+    def test_spawn_worker_drift_check_reads_planned_fields_on_plain_conn(
+        self, tools_reg, plain_db_conn, mock_slack
+    ):
+        """orchestrator_mcp.py:1992 — drift-check unpack must use tuple index.
+
+        Planting a directive with planned_worker_type='claude-opus' and calling
+        spawn_worker with worker_type='claude-fable' should trigger a drift
+        warning. Under the bug at :1992, the drift check TypeErrors before
+        posting anything.
+        """
+        r = tools_reg.submit_directive(
+            "ts-d", "op msg", "interp d",
+            **self._valid_kwargs(
+                planned_worker_type="claude-opus",
+                planned_use_goal=False,
+                planned_prompt="do the opus thing",
+            ),
+        )
+        did = r["id"]
+
+        posts_before = len(mock_slack.post_message.call_args_list)
+
+        # Short-circuit spawn AFTER drift check runs by making tmux.spawn_session
+        # raise. Drift check happens BEFORE tmux is touched, so we still exercise
+        # the :1992 code path but skip the network-heavy grader/spawn logic.
+        # Also mock the grader path so we get to the drift check without calling
+        # real Ollama.
+        from unittest.mock import patch
+        with patch.object(
+            tools_reg, "_call_local_grader",
+            return_value={"grade": "A", "approved": True, "feedback": "ok", "confidence": "high"},
+        ), patch.object(tools_reg, "_activate_pm_via_sqlite", return_value=None):
+            tools_reg.tmux.spawn_session.side_effect = RuntimeError("stop-after-drift-check")
+            try:
+                tools_reg.spawn_worker(
+                    worker_id="d-drift-1",
+                    worker_type="claude-fable",
+                    repo="/tmp",
+                    objective="do the opus thing",
+                    directive_id=did,
+                )
+            except Exception:
+                # Downstream spawn errors are fine — we only care that :1992's
+                # code path executed without TypeError.
+                pass
+
+        new_posts = mock_slack.post_message.call_args_list[posts_before:]
+        assert any(
+            "drift" in c.args[0] and "claude-opus" in c.args[0] and "claude-fable" in c.args[0]
+            for c in new_posts
+        ), [c.args[0] for c in new_posts]
 
 
 class TestGetStatusSummary:
@@ -2958,6 +4069,19 @@ def test_directives_table_has_interpretation_ts(db_conn):
     assert "interpretation_ts" in columns
 
 
+def test_valid_directive_statuses_includes_awaiting_changes_and_superseded():
+    """VALID_DIRECTIVE_STATUSES must gain awaiting_changes/superseded without
+    losing any of the pre-existing enum values."""
+    from ironclaude.orchestrator_mcp import VALID_DIRECTIVE_STATUSES
+
+    assert "awaiting_changes" in VALID_DIRECTIVE_STATUSES
+    assert "superseded" in VALID_DIRECTIVE_STATUSES
+    for existing in (
+        "pending_confirmation", "confirmed", "rejected", "in_progress", "completed",
+    ):
+        assert existing in VALID_DIRECTIVE_STATUSES
+
+
 def test_submit_directive_stores_interpretation_ts(db_conn, registry, tmp_path):
     """Verify interpretation_ts is stored when Slack post succeeds."""
     mock_slack = MagicMock(spec=SlackBot)
@@ -2966,7 +4090,7 @@ def test_submit_directive_stores_interpretation_ts(db_conn, registry, tmp_path):
         registry, MagicMock(), str(tmp_path / "ledger.json"),
         slack_bot=mock_slack, db_conn=db_conn,
     )
-    result = tools.submit_directive("123.456", "do the thing", "Build feature X")
+    result = _submit_directive_default(tools, "123.456", "do the thing", "Build feature X")
     row = db_conn.execute(
         "SELECT interpretation_ts FROM directives WHERE id=?", (result["id"],)
     ).fetchone()
@@ -2981,7 +4105,7 @@ def test_submit_directive_adds_pending_reaction(db_conn, registry, tmp_path):
         registry, MagicMock(), str(tmp_path / "ledger.json"),
         slack_bot=mock_slack, db_conn=db_conn,
     )
-    tools.submit_directive("123.456", "do the thing", "Build feature X")
+    _submit_directive_default(tools, "123.456", "do the thing", "Build feature X")
     mock_slack.add_reaction.assert_called_once_with("hourglass_flowing_sand", "123.456")
 
 
@@ -3083,7 +4207,7 @@ def test_submit_directive_removes_eyes_before_adding_hourglass(db_conn, registry
         registry, MagicMock(), str(tmp_path / "ledger.json"),
         slack_bot=mock_slack, db_conn=db_conn,
     )
-    tools.submit_directive("123.456", "do the thing", "Build feature X")
+    _submit_directive_default(tools, "123.456", "do the thing", "Build feature X")
     calls = mock_slack.method_calls
     remove_eyes = [c for c in calls if c[0] == "remove_reaction" and c[1] == ("eyes", "123.456")]
     add_hourglass = [c for c in calls if c[0] == "add_reaction" and c[1] == ("hourglass_flowing_sand", "123.456")]
@@ -3099,7 +4223,7 @@ def test_submit_directive_message_includes_directive_id(db_conn, registry, tmp_p
         registry, MagicMock(), str(tmp_path / "ledger.json"),
         slack_bot=mock_slack, db_conn=db_conn,
     )
-    result = tools.submit_directive("123.456", "fix the bug", "Fix the login bug")
+    result = _submit_directive_default(tools, "123.456", "fix the bug", "Fix the login bug")
     msg = mock_slack.post_message.call_args[0][0]
     assert f"Directive #{result['id']}" in msg
 
@@ -3114,7 +4238,7 @@ def test_submit_directive_logs_interpretation_ts_on_success(db_conn, registry, t
         slack_bot=mock_slack, db_conn=db_conn,
     )
     with caplog.at_level(logging.INFO, logger="ironclaude.orchestrator_mcp"):
-        tools.submit_directive("123.456", "fix the bug", "Fix the login bug")
+        _submit_directive_default(tools, "123.456", "fix the bug", "Fix the login bug")
     messages = [r.message for r in caplog.records if r.levelno >= logging.INFO]
     assert any("interpretation_ts" in m and "999.888" in m for m in messages)
 
@@ -3129,7 +4253,7 @@ def test_submit_directive_warns_on_null_interpretation_ts(db_conn, registry, tmp
         slack_bot=mock_slack, db_conn=db_conn,
     )
     with caplog.at_level(logging.WARNING, logger="ironclaude.orchestrator_mcp"):
-        tools.submit_directive("123.456", "fix the bug", "Fix the login bug")
+        _submit_directive_default(tools, "123.456", "fix the bug", "Fix the login bug")
     messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("None" in m or "NULL" in m or "null" in m for m in messages)
 
@@ -5690,6 +6814,63 @@ class TestShadowThreadFiring:
         call_args = tools._fire_shadow_thread.call_args[0]
         assert call_args[0] == "approve_plan"
         assert call_args[1] == "ap1"
+
+
+class TestShadowConcordancePersistence:
+    def test_run_shadow_and_report_persists_concordance_row(self, tools, db_conn):
+        tools._shadow_grader = MagicMock()
+        tools._shadow_grader.grade_with_tools.return_value = {
+            "grade": "B",
+            "approved": True,
+            "feedback": "gemma4 feedback",
+            "confidence_in_disagreement": "medium",
+            "tool_calls": [],
+        }
+        opus_result = {"grade": "A", "approved": True, "feedback": "opus feedback"}
+        tools._run_shadow_and_report(
+            "spawn_worker", "w-persist-1", "/tmp/repo",
+            opus_result, [], "sys prompt", "user prompt",
+            test_mode=True,
+        )
+        row = db_conn.execute(
+            "SELECT context, worker_id, opus_grade, opus_approved, shadow_grade,"
+            " shadow_approved, concordance, confidence_in_disagreement, test_mode"
+            " FROM shadow_concordance WHERE worker_id = ?",
+            ("w-persist-1",),
+        ).fetchone()
+        assert tuple(row) == ("spawn_worker", "w-persist-1", "A", 1, "B", 1, "B", "medium", 1)
+
+    def test_run_shadow_and_report_persists_null_on_infrastructure_error(self, tools, db_conn):
+        tools._shadow_grader = MagicMock()
+        tools._shadow_grader.grade_with_tools.return_value = {
+            "infrastructure_error": True,
+            "error_detail": "Ollama timed out after 300s",
+            "tool_calls": [],
+        }
+        opus_result = {"grade": "A", "approved": True, "feedback": "opus feedback"}
+        tools._run_shadow_and_report(
+            "kill_worker", "w-persist-2", "/tmp/repo",
+            opus_result, [], "sys prompt", "user prompt",
+        )
+        row = db_conn.execute(
+            "SELECT shadow_grade, shadow_approved, concordance, confidence_in_disagreement, test_mode"
+            " FROM shadow_concordance WHERE worker_id = ?",
+            ("w-persist-2",),
+        ).fetchone()
+        assert tuple(row) == (None, None, "F", None, 0)
+
+    def test_shadow_thread_failure_logs_error_not_warning(self, tools, caplog):
+        tools._shadow_grader = MagicMock()
+        tools._shadow_grader.grade_with_tools.side_effect = RuntimeError("boom")
+        with caplog.at_level("ERROR"):
+            tools._run_shadow_and_report(
+                "approve_plan", "w-persist-3", "/tmp/repo",
+                {"grade": "A", "approved": True, "feedback": "ok"}, [], "sys", "user",
+            )
+        assert any(
+            r.levelname == "ERROR" and "Shadow grader thread failed" in r.message
+            for r in caplog.records
+        )
 
 
 class TestReadPmState:

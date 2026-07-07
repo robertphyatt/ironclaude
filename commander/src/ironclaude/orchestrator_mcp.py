@@ -12,6 +12,7 @@ the FastMCP server wraps them for the brain's Claude Agent SDK session.
 from __future__ import annotations
 
 import collections
+import difflib
 import fcntl
 import json
 import logging
@@ -32,7 +33,14 @@ import requests
 import shlex
 
 from ironclaude.config import make_opus_command
+from ironclaude.fable_availability import (
+    resolve_worker_type as _resolve_fable_worker_type,
+    resolve_advisor_model as _resolve_fable_advisor_model,
+    mark_fable_unavailable as _mark_fable_unavailable,
+    clear_fable_unavailable as _clear_fable_unavailable,
+)
 from ironclaude.grader import LocalGrader
+from ironclaude.notifications import format_directive_review, format_fable_unavailable, format_fable_recovered
 from ironclaude.shadow_grader import ShadowGrader
 from ironclaude.ollama_client import OllamaClient, OllamaError
 from ironclaude.ollama_playbook import OLLAMA_WORKER_PLAYBOOK
@@ -116,7 +124,8 @@ WORKER_COMMANDS = {
 }
 
 VALID_DIRECTIVE_STATUSES = frozenset({
-    "pending_confirmation", "confirmed", "rejected", "in_progress", "completed",
+    "pending_confirmation", "awaiting_changes", "superseded",
+    "confirmed", "rejected", "in_progress", "completed",
 })
 
 VALID_SUPABASE_TABLES = frozenset({"players", "sessions", "events", "feedback", "errors"})
@@ -388,7 +397,7 @@ class OrchestratorTools:
     All methods are synchronous and raise exceptions on error.
     """
 
-    GRADER_TIMEOUT_SECONDS = 300
+    GRADER_TIMEOUT_SECONDS = 600
 
     def __init__(self, registry, tmux, ledger_path: str = "", grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "opus", opus_model: str = "opus", effort_level: str = "high", ssh_manager=None, config: dict | None = None, ollama_inventory=None, dispatch_cfg: dict | None = None):
         self.registry = registry
@@ -453,8 +462,19 @@ class OrchestratorTools:
                 break
             self._failed_worker_bases.discard(victim)
 
+    def _post_slack_safe(self, message: str) -> None:
+        """Post a message to Slack, silently skipping if Slack isn't configured.
+
+        Fail-safe guard: never raises if self._slack is None or lacks
+        post_message (e.g. a bare mock or a misconfigured environment).
+        """
+        slack = getattr(self, "_slack", None)
+        if slack is not None and hasattr(slack, "post_message"):
+            slack.post_message(message)
+
     def _get_worker_command(self, worker_type: str, model_name: str = "") -> str:
         """Build worker command, using advisor config for model selection."""
+        worker_type = _resolve_fable_worker_type(worker_type)
         advisor = self._advisor_cfg
         if worker_type == "ollama":
             self._get_ollama_client()  # populate _ollama_cfg_cache
@@ -470,6 +490,35 @@ class OrchestratorTools:
                 return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model {shlex.quote(model)} --dangerously-skip-permissions"
             return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model 'sonnet' --dangerously-skip-permissions"
         raise ValueError(f"Invalid worker type '{worker_type}'")
+
+    def _build_worker_launch_cmd(
+        self, worker_type: str, model_name: str, worker_id: str, machine_cfg,
+    ) -> str:
+        """Build the full non-ollama worker launch command for either a local or
+        remote (machine_cfg) target.
+
+        For a remote machine: env prefix (IC_ROLE/IC_WORKER_ID) + machine_cfg.env
+        + machine_cfg.claude_path invocation — no local `_get_worker_command`
+        involved, since the remote binary path and env are machine-specific.
+
+        For local: `_get_worker_command`'s resolved command, with the
+        IC_ROLE/IC_WORKER_ID/ENABLE_STOP_REVIEW prefix needed for stop-hook
+        completion detection.
+
+        Used by both the initial spawn and the spawn-died-on-fable retry-as-opus
+        path (OR-03), so a remote retry gets the same machine-specific shape as
+        the initial remote spawn instead of silently falling back to a local
+        `exec claude` command.
+        """
+        if machine_cfg:
+            cmd_parts = ["export IC_ROLE=worker", f"export IC_WORKER_ID={shlex.quote(worker_id)}"]
+            for k, v in machine_cfg.env.items():
+                cmd_parts.append(f"export {k}={shlex.quote(v)}")
+            model = model_name or self._opus_model
+            cmd_parts.append(f"{machine_cfg.claude_path} --model {shlex.quote(model)} --dangerously-skip-permissions")
+            return "; ".join(cmd_parts)
+        cmd = self._get_worker_command(worker_type, model_name)
+        return f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; export ENABLE_STOP_REVIEW=0; {cmd}"
 
     def _get_ollama_client(self) -> OllamaClient:
         """Lazy-initialize and return the shared OllamaClient.
@@ -936,11 +985,12 @@ class OrchestratorTools:
         opus_tool_calls: list,
         system_prompt: str,
         user_prompt: str,
+        test_mode: bool = False,
     ) -> None:
-        """Background thread: run shadow grade, compute concordance, post to Slack."""
+        """Background thread: run shadow grade, compute concordance, post to Slack, persist."""
         try:
             shadow_result = self._shadow_grader.grade_with_tools(
-                system_prompt, user_prompt, repo_path=repo
+                system_prompt, user_prompt, repo_path=repo, test_mode=test_mode
             )
             concordance = self._compute_concordance(opus_result, shadow_result)
             msg = self._format_shadow_slack_message(
@@ -950,8 +1000,19 @@ class OrchestratorTools:
                 self._slack.post_message(msg)
             else:
                 logger.info("Shadow concordance (no Slack): %s", msg)
+            if self._db is not None:
+                self._db.execute(
+                    "INSERT INTO shadow_concordance"
+                    " (context, worker_id, opus_grade, opus_approved, shadow_grade, shadow_approved,"
+                    " concordance, confidence_in_disagreement, test_mode)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (context, worker_id, opus_result.get("grade"), opus_result.get("approved"),
+                     shadow_result.get("grade"), shadow_result.get("approved"),
+                     concordance, shadow_result.get("confidence_in_disagreement"), int(test_mode)),
+                )
+                self._db.commit()
         except Exception as e:
-            logger.warning("Shadow grader thread failed for %s/%s: %s", context, worker_id, e)
+            logger.error("Shadow grader thread failed for %s/%s: %s", context, worker_id, e)
 
     def _fire_shadow_thread(
         self,
@@ -962,11 +1023,13 @@ class OrchestratorTools:
         opus_tool_calls: list,
         system_prompt: str,
         user_prompt: str,
+        test_mode: bool = False,
     ) -> None:
         """Fire shadow grading in a background daemon thread."""
         t = threading.Thread(
             target=self._run_shadow_and_report,
             args=(context, worker_id, repo, opus_result, opus_tool_calls, system_prompt, user_prompt),
+            kwargs={"test_mode": test_mode},
             daemon=True,
         )
         t.start()
@@ -1039,26 +1102,138 @@ class OrchestratorTools:
                         logger.warning("Failed to download Slack image %s: %s", f["name"], e)
         return messages
 
-    def submit_directive(self, source_ts: str, source_text: str, interpretation: str) -> dict:
+    def submit_directive(
+        self,
+        source_ts: str,
+        source_text: str,
+        interpretation: str,
+        planned_worker_type: str,
+        planned_use_goal: bool,
+        planned_prompt: str,
+        planned_worker_type_reason: str,
+        planned_use_goal_reason: str,
+        planned_prompt_reason: str,
+        supersedes: int | None = None,
+    ) -> dict:
         """Submit a new directive for the operator's confirmation.
 
-        Inserts a row into the directives table and posts to Slack for confirmation.
+        Inserts a row into the directives table — including the planned_*
+        fields describing the worker spawn this directive will trigger —
+        and posts a Slack review message for the operator to confirm,
+        reject, or request changes.
+
+        If `supersedes` is given, the prior directive with that id is
+        marked 'superseded' and linked to this new directive in the same
+        transaction as the INSERT — unless the prior directive can't be
+        found or was already superseded, in which case a warning is
+        posted to Slack and the new directive is still inserted, just
+        without a supersession link.
+
         Returns dict with id and status.
         """
         if self._db is None:
             raise RuntimeError("Database connection required for directive operations")
-        cursor = self._db.execute(
-            "INSERT INTO directives (source_ts, source_text, interpretation) VALUES (?, ?, ?)",
-            (source_ts, source_text, interpretation),
-        )
-        self._db.commit()
-        directive_id = cursor.lastrowid
-        if self._slack is not None:
-            interpretation_ts = self._slack.post_message(
-                f"Directive #{directive_id} detected: '{interpretation}'. "
-                f"From your message: '{source_text}'. "
-                f"React 👍 to confirm or 👎 to reject."
+
+        required_string_fields = {
+            "planned_worker_type": planned_worker_type,
+            "planned_prompt": planned_prompt,
+            "planned_worker_type_reason": planned_worker_type_reason,
+            "planned_use_goal_reason": planned_use_goal_reason,
+            "planned_prompt_reason": planned_prompt_reason,
+        }
+        for field_name, value in required_string_fields.items():
+            if not value:
+                raise ValueError(
+                    f"submit_directive requires non-empty planned_* fields: "
+                    f"{field_name} is None or empty"
+                )
+        if planned_use_goal is None or not isinstance(planned_use_goal, bool):
+            raise ValueError(
+                "submit_directive requires non-empty planned_* fields: "
+                "planned_use_goal must be a bool, not None"
             )
+
+        old_row = None
+        if supersedes is not None:
+            old_row = self._db.execute(
+                "SELECT id, status, superseded_by FROM directives WHERE id=?",
+                (supersedes,),
+            ).fetchone()
+
+        supersede_warning: str | None = None
+        if supersedes is not None:
+            if old_row is None:
+                supersede_warning = f"Directive #{supersedes} cannot be superseded — not found"
+            else:
+                # SELECT above returned (id, status, superseded_by) — use tuple
+                # index, which works whether or not the connection has
+                # row_factory=sqlite3.Row set (init_db sets it, but conns from
+                # other sources may be plain).
+                old_status = old_row[1]
+                old_superseded_by = old_row[2]
+                if old_status == "superseded" or old_superseded_by is not None:
+                    if old_superseded_by is not None:
+                        supersede_warning = (
+                            f"Directive #{supersedes} cannot be superseded — "
+                            f"already replaced by #{old_superseded_by}"
+                        )
+                    else:
+                        supersede_warning = (
+                            f"Directive #{supersedes} cannot be superseded — "
+                            f"already marked superseded"
+                        )
+                elif old_status not in ("awaiting_changes", "pending_confirmation"):
+                    # Only rows still in the review loop may be revised. A
+                    # wrong/stale supersedes id pointing at a confirmed or
+                    # in_progress directive would otherwise silently flip it
+                    # to superseded and drop it out of the
+                    # check_confirmed_directives reminder loop.
+                    supersede_warning = (
+                        f"Directive #{supersedes} cannot be superseded — status "
+                        f"is '{old_status}' (only awaiting_changes/"
+                        f"pending_confirmation directives can be revised)"
+                    )
+
+        # Single transaction: INSERT the new directive, then (if supersedes is
+        # valid) UPDATE the old row to link to it. One commit covers both.
+        cursor = self._db.execute(
+            "INSERT INTO directives "
+            "(source_ts, source_text, interpretation, planned_worker_type, "
+            "planned_use_goal, planned_prompt, planned_worker_type_reason, "
+            "planned_use_goal_reason, planned_prompt_reason, superseded_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            (
+                source_ts, source_text, interpretation,
+                planned_worker_type, planned_use_goal, planned_prompt,
+                planned_worker_type_reason, planned_use_goal_reason, planned_prompt_reason,
+            ),
+        )
+        directive_id = cursor.lastrowid
+
+        if supersedes is not None and old_row is not None and supersede_warning is None:
+            self._db.execute(
+                "UPDATE directives SET status='superseded', superseded_by=? WHERE id=?",
+                (directive_id, supersedes),
+            )
+        self._db.commit()
+
+        if supersede_warning is not None:
+            self._post_slack_safe(supersede_warning)
+
+        if self._slack is not None:
+            review_msg = format_directive_review(
+                directive_id,
+                interpretation,
+                source_text,
+                planned_worker_type,
+                planned_use_goal,
+                planned_prompt,
+                planned_worker_type_reason,
+                planned_use_goal_reason,
+                planned_prompt_reason,
+                supersedes=supersedes,
+            )
+            interpretation_ts = self._slack.post_message(review_msg)
             if interpretation_ts:
                 self._db.execute(
                     "UPDATE directives SET interpretation_ts=? WHERE id=?",
@@ -1222,8 +1397,13 @@ class OrchestratorTools:
             sql += " LIMIT -1 OFFSET ?"
             params.append(offset)
 
-        rows = self._db.execute(sql, params).fetchall()
-        directives = [dict(row) for row in rows]
+        # Build dicts via cursor.description so this works whether or not
+        # the connection has row_factory=sqlite3.Row set (init_db sets it,
+        # but conns from other sources may be plain).
+        cursor = self._db.execute(sql, params)
+        columns = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+        directives = [dict(zip(columns, row)) for row in rows]
         # Reconcile emoji on recent directives
         if self._slack is not None:
             import time
@@ -1295,16 +1475,21 @@ class OrchestratorTools:
             raise RuntimeError("Database connection required for directive operations")
         if status not in VALID_DIRECTIVE_STATUSES:
             raise ValueError(f"Invalid status '{status}'. Must be one of: {', '.join(sorted(VALID_DIRECTIVE_STATUSES))}")
-        row = self._db.execute("SELECT * FROM directives WHERE id=?", (directive_id,)).fetchone()
+        # Narrow SELECT to the two columns we actually consume — avoids the
+        # `dict(row)` construction and works against a plain conn.
+        row = self._db.execute(
+            "SELECT status, source_ts FROM directives WHERE id=?",
+            (directive_id,),
+        ).fetchone()
         if row is None:
             raise ValueError(f"Directive {directive_id} not found")
-        old_status = dict(row)["status"]
+        old_status = row[0]
         self._db.execute(
             "UPDATE directives SET status=?, updated_at=datetime('now') WHERE id=?", (status, directive_id),
         )
         self._db.commit()
         # Swap emoji reaction on operator's original message
-        source_ts = dict(row).get("source_ts")
+        source_ts = row[1]
         if self._slack is not None and source_ts:
             from ironclaude.slack_interface import DIRECTIVE_STATUS_EMOJI
             old_emoji = DIRECTIVE_STATUS_EMOJI.get(old_status)
@@ -1313,8 +1498,10 @@ class OrchestratorTools:
                 self._slack.remove_reaction(old_emoji, source_ts)
             if new_emoji:
                 self._slack.add_reaction(new_emoji, source_ts)
-        updated = self._db.execute("SELECT * FROM directives WHERE id=?", (directive_id,)).fetchone()
-        return dict(updated)
+        cursor = self._db.execute("SELECT * FROM directives WHERE id=?", (directive_id,))
+        columns = [desc[0] for desc in cursor.description]
+        updated = cursor.fetchone()
+        return dict(zip(columns, updated))
 
     def debug_slack_connection(self) -> dict:
         """Diagnose Slack connectivity issues.
@@ -1817,10 +2004,107 @@ class OrchestratorTools:
         machine: str | None = None,
         pm_timeout: int = 300,
         pm_max_retries: int = 3,
+        directive_id: int | None = None,
     ) -> str | dict:
         """Spawn a new worker with the given objective. Set machine to target a remote host."""
         if pm_max_retries < 1:
             raise ValueError("pm_max_retries must be >= 1")
+
+        # ORCH-01: the daemon honors the directive's planned_use_goal at spawn
+        # time (see the /goal dispatch decision below) rather than treating it
+        # as a static config prediction to be checked for drift. This override
+        # is populated by the directive lookup below, if a directive_id was
+        # passed and the directive has a non-NULL planned_use_goal.
+        planned_use_goal_override: bool | None = None
+
+        # R4-I1: the promised worker_type is captured here but NOT compared
+        # yet — worker_type can still be mutated by retry-escalation and
+        # grader-driven fable escalation below, so comparing at lookup time
+        # would miss real drift (promised sonnet, escalated to opus) and
+        # false-positive on escalate-to-promised (promised fable, requested
+        # opus, escalated to fable). The comparison happens once, after the
+        # FINAL worker_type resolution, right before the actual spawn.
+        drift_planned_worker_type: str | None = None
+
+        # Reality check: if this spawn is fulfilling a confirmed directive,
+        # compare what was actually promised to the operator (planned_*
+        # fields on that directive) against what's about to be spawned.
+        # Never blocks the spawn — drift is logged + posted to Slack so a
+        # human notices a worker_type/prompt bait-and-switch, but the
+        # spawn always proceeds.
+        if directive_id is not None and self._db is not None:
+            directive_row = self._db.execute(
+                "SELECT planned_worker_type, planned_use_goal, planned_prompt, status "
+                "FROM directives WHERE id=?",
+                (directive_id,),
+            ).fetchone()
+            if directive_row is not None:
+                # SELECT above returned (planned_worker_type, planned_use_goal,
+                # planned_prompt, status) — use tuple index, which works
+                # whether or not the connection has row_factory=sqlite3.Row
+                # set (init_db sets it; conns from other sources may be plain).
+                planned_worker_type = directive_row[0]
+                planned_use_goal = directive_row[1]
+                planned_prompt = directive_row[2]
+                directive_status = directive_row[3]
+
+                # ORCH-02: a stale brain session may pass a directive_id that's
+                # since been superseded (e.g. after a 🤔 revision). Warn — but
+                # never block — so a human notices the brain is spawning
+                # against a revoked plan instead of walking to the chain head.
+                # This check runs regardless of whether the planned_* fields
+                # are populated: a superseded pre-migration row is still
+                # worth warning about.
+                if directive_status == "superseded":
+                    drift_msg = (
+                        f"⚠️ Directive #{directive_id} is superseded "
+                        f"(spawning against stale plan; brain should be "
+                        f"walking to head)."
+                    )
+                    logger.warning(drift_msg)
+                    self._post_slack_safe(drift_msg)
+
+                if planned_worker_type is None or planned_prompt is None:
+                    # Pre-migration directive row — the planned_* fields were
+                    # never populated (they're NULL from ALTER TABLE ADD
+                    # COLUMN backfill). Also covers a partially-NULL plan
+                    # (only one of the two fields NULL), which is only
+                    # reachable via direct SQL and is equally untrustworthy
+                    # to compare against — a plan half-corrupted is not a
+                    # plan. There is no plan to check drift against;
+                    # comparing None/"" to the actual spawn would post
+                    # nonsense "promised None" warnings.
+                    logger.debug(
+                        "Directive #%s has no planned_* fields (pre-migration row); "
+                        "skipping drift check and /goal override.",
+                        directive_id,
+                    )
+                else:
+                    # R4-I1: capture the promise for the deferred comparison
+                    # below (after worker_type's final resolution) instead of
+                    # comparing now.
+                    drift_planned_worker_type = planned_worker_type
+
+                    # ORCH-01: no /goal drift check here — the daemon honors
+                    # planned_use_goal at spawn time (see the /goal dispatch
+                    # decision below), so whatever the brain predicted per-
+                    # directive IS what reaches the worker. Checking "did the
+                    # config match the plan" was tautologically wrong: the brain
+                    # is instructed to reason per-directive, not mirror a single
+                    # daemon-wide static config value.
+                    if planned_use_goal is not None:
+                        planned_use_goal_override = bool(planned_use_goal)
+
+                    ratio = difflib.SequenceMatcher(
+                        None, planned_prompt or "", objective or ""
+                    ).ratio()
+                    if ratio < 0.8:
+                        drift_msg = (
+                            f"⚠️ Directive #{directive_id} drift: prompt similarity {ratio:.2f} < 0.8"
+                        )
+                        logger.warning(drift_msg)
+                        self._post_slack_safe(drift_msg)
+
         # Retry escalation: auto-upgrade to opus if previous attempt with same base ID failed
         base_id = re.sub(r'[-_]?\d*[a-z]?$', '', worker_id)
         if base_id and base_id in self._failed_worker_bases and worker_type == "claude-sonnet":
@@ -1941,6 +2225,17 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             logger.info(f"Escalating {worker_id} to claude-fable (grader recommendation)")
             worker_type = "claude-fable"
 
+        # R4-I1: deferred drift comparison against the FINAL resolved
+        # worker_type, now that retry-escalation and grader-driven fable
+        # escalation have both had their chance to mutate it.
+        if drift_planned_worker_type is not None and worker_type != drift_planned_worker_type:
+            drift_msg = (
+                f"⚠️ Directive #{directive_id} drift: promised "
+                f"{drift_planned_worker_type}, spawning {worker_type}"
+            )
+            logger.warning(drift_msg)
+            self._post_slack_safe(drift_msg)
+
         self._ensure_ssh_manager()
         # Resolve remote machine if specified
         ssh_host = None
@@ -1959,6 +2254,25 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             if not health.ok:
                 return {"error": f"Machine '{machine}' unhealthy: {health.details}"}
             ssh_host = machine_cfg.host
+
+        # Captured before _get_worker_command can redirect claude-fable -> claude-opus
+        # (fable_availability flag). Used below to detect a fable spawn that died
+        # before ready, and to detect a fable spawn that came up successfully.
+        original_worker_type = worker_type
+
+        # True iff this spawn actually targets Fable — i.e. the request was
+        # claude-fable AND the fable_availability resolve step (the same one
+        # _get_worker_command applies internally) did NOT redirect it to
+        # claude-opus. Computed via direct resolution rather than re-reading
+        # `worker_type` after the fact: _get_worker_command's redirect is local
+        # to that call and never mutates this function's `worker_type`, so a
+        # naive post-hoc check would stay True even when the actual command
+        # targeted opus (e.g. under a lookalike default_opus_model like
+        # "fable-nano") — the OR-02 false-positive this flag exists to avoid.
+        spawn_used_fable = (
+            original_worker_type == "claude-fable"
+            and _resolve_fable_worker_type(original_worker_type) == "claude-fable"
+        )
 
         # Handle ollama dynamic command construction
         if worker_type == "ollama":
@@ -1992,19 +2306,11 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 f"exec claude --model {shlex.quote(variant)} --dangerously-skip-permissions "
                 f"--append-system-prompt {shlex.quote(OLLAMA_WORKER_PLAYBOOK)}"
             )
-        elif machine_cfg:
-            cmd_parts = ["export IC_ROLE=worker", f"export IC_WORKER_ID={shlex.quote(worker_id)}"]
-            for k, v in machine_cfg.env.items():
-                cmd_parts.append(f"export {k}={shlex.quote(v)}")
-            model = model_name or self._opus_model
-            cmd_parts.append(f"{machine_cfg.claude_path} --model {shlex.quote(model)} --dangerously-skip-permissions")
-            cmd = "; ".join(cmd_parts)
+            # Inject worker ID for stop hook completion detection (local only)
+            if not machine_cfg:
+                cmd = f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; export ENABLE_STOP_REVIEW=0; {cmd}"
         else:
-            cmd = self._get_worker_command(worker_type, model_name)
-
-        # Inject worker ID for stop hook completion detection (local only — remote handled above)
-        if not machine_cfg:
-            cmd = f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; export ENABLE_STOP_REVIEW=0; {cmd}"
+            cmd = self._build_worker_launch_cmd(worker_type, model_name, worker_id, machine_cfg)
 
         session_name = f"ic-{worker_id}"
 
@@ -2041,17 +2347,80 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             )
             if not self.tmux.has_session(session_name, ssh_host=ssh_host):
                 self.tmux.kill_session(session_name, ssh_host=ssh_host)
-                return {
-                    "error": (
-                        f"Worker '{worker_id}' session died before ready on "
-                        f"{machine or 'local'}.\nLast output:\n{log_tail}"
+
+                if original_worker_type == "claude-fable":
+                    # Fable spawn died before ready. Mark it unavailable (Slack alert
+                    # exactly once per detection episode) and retry once as claude-opus.
+                    mark_result = _mark_fable_unavailable("spawn-died")
+                    if mark_result == "write_failed":
+                        logger.warning(
+                            "mark_fable_unavailable write failed; alerting Slack anyway "
+                            "(Fable is still down)"
+                        )
+                    if mark_result in ("transition", "write_failed"):
+                        self._post_slack_safe(
+                            format_fable_unavailable(
+                                "spawn-died", redirected_to="opus", worker_id=worker_id,
+                            )
+                        )
+
+                    worker_type = "claude-opus"
+                    # This retry never targets Fable regardless of what the initial
+                    # resolve found — the recovery check below must not fire for it.
+                    spawn_used_fable = False
+                    cmd = self._build_worker_launch_cmd(worker_type, model_name, worker_id, machine_cfg)
+
+                    retry_success = self.tmux.spawn_session(
+                        session_name, cmd, cwd=repo, ssh_host=ssh_host, remote_log_dir=remote_log_dir,
                     )
-                }
-            logger.warning(
-                "Worker '%s' not ready after timeout on %s but session alive — "
-                "proceeding.\nLast output:\n%s",
-                worker_id, machine or "local", log_tail,
-            )
+                    if not retry_success:
+                        raise RuntimeError(
+                            f"Failed to spawn tmux session for worker '{worker_id}' (opus retry)"
+                        )
+
+                    ready = self._wait_for_ready(session_name, timeout=30, ssh_host=ssh_host)
+                    if not ready:
+                        retry_log_tail = self.tmux.read_log_tail(
+                            session_name, lines=30, ssh_host=ssh_host, remote_log_dir=remote_log_dir,
+                        )
+                        if not self.tmux.has_session(session_name, ssh_host=ssh_host):
+                            self.tmux.kill_session(session_name, ssh_host=ssh_host)
+                            return {
+                                "error": (
+                                    f"Worker '{worker_id}' session died before ready on "
+                                    f"{machine or 'local'}.\nLast output:\n{retry_log_tail}"
+                                )
+                            }
+                        logger.warning(
+                            "Worker '%s' (opus retry) not ready after timeout on %s but "
+                            "session alive — proceeding.\nLast output:\n%s",
+                            worker_id, machine or "local", retry_log_tail,
+                        )
+                else:
+                    return {
+                        "error": (
+                            f"Worker '{worker_id}' session died before ready on "
+                            f"{machine or 'local'}.\nLast output:\n{log_tail}"
+                        )
+                    }
+            else:
+                logger.warning(
+                    "Worker '%s' not ready after timeout on %s but session alive — "
+                    "proceeding.\nLast output:\n%s",
+                    worker_id, machine or "local", log_tail,
+                )
+
+        # Fable recovery: the spawn actually targeted Fable (no fable_availability
+        # redirect and no spawn-died-retry kicked in above) — if Fable had
+        # previously been flagged unavailable, clear it and tell the operator
+        # it's back. Gated on `spawn_used_fable` rather than a "--model fable"
+        # substring check on `cmd`, since that substring also matches a
+        # lookalike model name (e.g. a redirected opus command using an
+        # operator-configured default_opus_model of "fable-nano") — OR-02.
+        if spawn_used_fable:
+            clear_result = _clear_fable_unavailable()
+            if clear_result == "removed":
+                self._post_slack_safe(format_fable_recovered())
 
         # Stages 4-5: activate professional mode
         if ssh_host:
@@ -2068,11 +2437,20 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
         # no higher advisor available)
         if self._advisor_cfg.get("enabled") and worker_type != "claude-fable":
             advisor_model = self._advisor_model_for(worker_type)
+            advisor_model = _resolve_fable_advisor_model(advisor_model)
             self.tmux.send_keys(session_name, f"/advisor {advisor_model}", ssh_host=ssh_host)
             time.sleep(3)
 
-        # Stage 5.6: dispatch by goal instead of raw objective, if configured
-        if self._dispatch_cfg.get("use_goal"):
+        # Stage 5.6: dispatch by goal instead of raw objective, if configured.
+        # ORCH-01: honor the directive's planned_use_goal if the brain
+        # provided one for this spawn; otherwise fall back to the daemon's
+        # static dispatch config.
+        effective_use_goal = (
+            planned_use_goal_override
+            if planned_use_goal_override is not None
+            else bool(self._dispatch_cfg.get("use_goal"))
+        )
+        if effective_use_goal:
             self.tmux.send_keys(
                 session_name,
                 "/goal the assigned objective is complete and code review has passed",
@@ -2393,6 +2771,7 @@ Model recommendation (include "recommended_model" for each):
             if session_name in activated:
                 if self._advisor_cfg.get("enabled"):
                     advisor_model = self._advisor_cfg.get("advisor_model", "opus")
+                    advisor_model = _resolve_fable_advisor_model(advisor_model)
                     self.tmux.send_keys(session_name, f"/advisor {advisor_model}")
                     time.sleep(3)
                 self.registry.register_worker(
@@ -3613,6 +3992,7 @@ def _create_mcp_server(tools: OrchestratorTools):
         machine: str | None = None,
         pm_timeout: int = 300,
         pm_max_retries: int = 3,
+        directive_id: int | None = None,
     ) -> str:
         """Spawn a new worker with the given objective.
 
@@ -3634,11 +4014,16 @@ def _create_mcp_server(tools: OrchestratorTools):
             machine: Optional remote machine name from machines.yaml. If set, worker spawns on that machine via SSH.
             pm_timeout: Seconds to wait per PM activation attempt (default: 300). Increase for slow-booting models like ollama/gemma4:31b (~600).
             pm_max_retries: Total PM activation attempts before returning error (default: 3). Each attempt waits up to pm_timeout seconds for the session ID file.
+            directive_id: Optional id of the confirmed directive this spawn fulfills. When set,
+                the spawn is compared against that directive's planned_* fields and any drift
+                (different worker_type, different /goal usage, low prompt similarity) is logged
+                and posted to Slack as a warning. Never blocks the spawn.
         """
         result = tools.spawn_worker(
             worker_id, worker_type, repo, objective,
             allowed_paths, model_name, machine=machine,
             pm_timeout=pm_timeout, pm_max_retries=pm_max_retries,
+            directive_id=directive_id,
         )
         if isinstance(result, dict):
             return json.dumps(result)
@@ -3835,17 +4220,41 @@ def _create_mcp_server(tools: OrchestratorTools):
         )
 
     @mcp.tool()
-    def submit_directive(source_ts: str, source_text: str, interpretation: str) -> str:
+    def submit_directive(
+        source_ts: str,
+        source_text: str,
+        interpretation: str,
+        planned_worker_type: str,
+        planned_use_goal: bool,
+        planned_prompt: str,
+        planned_worker_type_reason: str,
+        planned_use_goal_reason: str,
+        planned_prompt_reason: str,
+        supersedes: int | None = None,
+    ) -> str:
         """Submit a new directive for the operator's confirmation.
 
         Args:
             source_ts: Slack message timestamp of the original message.
             source_text: The operator's original message text.
             interpretation: Your interpretation of what the operator wants done.
+            planned_worker_type: The worker model you intend to spawn for this directive
+                (e.g. claude-sonnet, claude-opus, claude-fable, ollama).
+            planned_use_goal: Whether you intend to use the /goal workflow for the spawned worker.
+            planned_prompt: The exact worker prompt/objective you intend to send.
+            planned_worker_type_reason: Why this worker type is the right choice.
+            planned_use_goal_reason: Why /goal should (or shouldn't) be used.
+            planned_prompt_reason: Why this prompt is correctly scoped.
+            supersedes: Optional id of a prior directive this one revises and replaces.
 
         Returns JSON with directive id and status.
         """
-        return json.dumps(tools.submit_directive(source_ts, source_text, interpretation))
+        return json.dumps(tools.submit_directive(
+            source_ts, source_text, interpretation,
+            planned_worker_type, planned_use_goal, planned_prompt,
+            planned_worker_type_reason, planned_use_goal_reason, planned_prompt_reason,
+            supersedes=supersedes,
+        ))
 
     @mcp.tool()
     def push_repo(repo: str, remote: str = "origin", branch: str = "") -> str:

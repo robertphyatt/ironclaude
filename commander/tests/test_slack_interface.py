@@ -549,6 +549,20 @@ class TestSlackBotUploadFile:
             bot.upload_file("/tmp/x.txt")
 
 
+def test_directive_status_emoji_covers_all_valid_statuses():
+    """R5-N2 regression + invariant: every status accepted by
+    update_directive_status must have an emoji mapping, or a direct tool
+    call with that status silently skips the reaction swap on the
+    operator's message."""
+    from ironclaude.orchestrator_mcp import VALID_DIRECTIVE_STATUSES
+    from ironclaude.slack_interface import DIRECTIVE_STATUS_EMOJI
+    missing = VALID_DIRECTIVE_STATUSES - set(DIRECTIVE_STATUS_EMOJI)
+    assert not missing, (
+        f"Statuses without an emoji mapping: {missing}. Add entries to "
+        f"DIRECTIVE_STATUS_EMOJI in slack_interface.py."
+    )
+
+
 def test_directive_status_emoji_confirmed_is_thumbsup():
     """Verify confirmed maps to thumbsup not eyes."""
     from ironclaude.slack_interface import DIRECTIVE_STATUS_EMOJI

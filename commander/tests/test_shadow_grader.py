@@ -21,17 +21,18 @@ def _make_shadow_grader():
 class TestGradeWithTools:
     def test_no_tool_calls_parses_json_verdict(self):
         grader, mock_client = _make_shadow_grader()
-        verdict_json = '{"grade": "B", "approved": true, "feedback": "looks good"}'
+        verdict_json = '{"grade": "B", "approved": true, "feedback": "looks good", "confidence_in_disagreement": "medium"}'
         mock_client.post_chat.return_value = (verdict_json, [])
-        result = grader.grade_with_tools("sys", "user")
+        result = grader.grade_with_tools("sys", "user", repo_path="/tmp")
         assert result["grade"] == "B"
         assert result["approved"] is True
+        assert result["confidence_in_disagreement"] == "medium"
         assert result["tool_calls"] == []
 
     def test_single_tool_call_then_verdict(self):
         grader, mock_client = _make_shadow_grader()
         tool_call = [{"name": "read_file", "arguments": {"path": "/tmp/test.txt"}}]
-        verdict = '{"grade": "A", "approved": true, "feedback": "verified"}'
+        verdict = '{"grade": "A", "approved": true, "feedback": "verified", "confidence_in_disagreement": "low"}'
         mock_client.post_chat.side_effect = [
             ("", tool_call),
             (verdict, []),
@@ -46,7 +47,7 @@ class TestGradeWithTools:
     def test_infrastructure_error_returns_error_dict(self):
         grader, mock_client = _make_shadow_grader()
         mock_client.post_chat.side_effect = OllamaConnectionError("refused")
-        result = grader.grade_with_tools("sys", "user")
+        result = grader.grade_with_tools("sys", "user", repo_path="/tmp")
         assert result["infrastructure_error"] is True
         assert "refused" in result["error_detail"]
         assert result["tool_calls"] == []
@@ -68,16 +69,16 @@ class TestGradeWithTools:
 
     def test_think_tags_stripped_before_parse(self):
         grader, mock_client = _make_shadow_grader()
-        response = '<think>reasoning</think>{"grade": "C", "approved": false, "feedback": "missing evidence"}'
+        response = '<think>reasoning</think>{"grade": "C", "approved": false, "feedback": "missing evidence", "confidence_in_disagreement": "high"}'
         mock_client.post_chat.return_value = (response, [])
-        result = grader.grade_with_tools("sys", "user")
+        result = grader.grade_with_tools("sys", "user", repo_path="/tmp")
         assert result["grade"] == "C"
         assert result["approved"] is False
 
     def test_max_tool_steps_forces_final_verdict(self):
         grader, mock_client = _make_shadow_grader()
         tool_call = [{"name": "read_file", "arguments": {"path": "/tmp/f"}}]
-        verdict = '{"grade": "B", "approved": true, "feedback": "done"}'
+        verdict = '{"grade": "B", "approved": true, "feedback": "done", "confidence_in_disagreement": "low"}'
         side_effects = [("", tool_call) for _ in range(5)] + [(verdict, []), (verdict, [])]
         mock_client.post_chat.side_effect = side_effects
         grader._execute_tool = MagicMock(return_value="content")
@@ -88,16 +89,25 @@ class TestGradeWithTools:
     def test_missing_grade_field_returns_infrastructure_error(self):
         grader, mock_client = _make_shadow_grader()
         mock_client.post_chat.return_value = ('{"approved": true, "feedback": "ok"}', [])
-        result = grader.grade_with_tools("sys", "user")
+        result = grader.grade_with_tools("sys", "user", repo_path="/tmp")
+        assert result["infrastructure_error"] is True
+        assert "missing" in result["error_detail"].lower()
+
+    def test_missing_confidence_field_returns_infrastructure_error(self):
+        grader, mock_client = _make_shadow_grader()
+        mock_client.post_chat.return_value = (
+            '{"grade": "B", "approved": true, "feedback": "ok"}', []
+        )
+        result = grader.grade_with_tools("sys", "user", repo_path="/tmp")
         assert result["infrastructure_error"] is True
         assert "missing" in result["error_detail"].lower()
 
     def test_system_prompt_prepends_gemma4_guidance(self):
         from ironclaude.shadow_grader import GEMMA4_SYSTEM_PROMPT
         grader, mock_client = _make_shadow_grader()
-        verdict_json = '{"grade": "B", "approved": true, "feedback": "ok"}'
+        verdict_json = '{"grade": "B", "approved": true, "feedback": "ok", "confidence_in_disagreement": "low"}'
         mock_client.post_chat.return_value = (verdict_json, [])
-        grader.grade_with_tools("original system prompt", "user")
+        grader.grade_with_tools("original system prompt", "user", repo_path="/tmp")
         call_payload = mock_client.post_chat.call_args[0][0]
         system_msg = call_payload["messages"][0]["content"]
         assert system_msg.startswith(GEMMA4_SYSTEM_PROMPT)
@@ -106,12 +116,12 @@ class TestGradeWithTools:
     def test_verdict_call_always_uses_format_schema(self):
         from ironclaude.shadow_grader import GRADER_VERDICT_SCHEMA
         grader, mock_client = _make_shadow_grader()
-        verdict_json = '{"grade": "A", "approved": true, "feedback": "well done"}'
+        verdict_json = '{"grade": "A", "approved": true, "feedback": "well done", "confidence_in_disagreement": "high"}'
         mock_client.post_chat.side_effect = [
             (verdict_json, []),   # initial loop call — no tool calls, break
             (verdict_json, []),   # post-loop verdict call with format constraint
         ]
-        result = grader.grade_with_tools("sys", "user")
+        result = grader.grade_with_tools("sys", "user", repo_path="/tmp")
         assert result["grade"] == "A"
         assert mock_client.post_chat.call_count == 2
         verdict_call_payload = mock_client.post_chat.call_args_list[1][0][0]
@@ -120,12 +130,12 @@ class TestGradeWithTools:
 
     def test_format_constrained_verdict_recovers_non_json(self):
         grader, mock_client = _make_shadow_grader()
-        valid_json = '{"grade": "B", "approved": true, "feedback": "ok"}'
+        valid_json = '{"grade": "B", "approved": true, "feedback": "ok", "confidence_in_disagreement": "low"}'
         mock_client.post_chat.side_effect = [
             ("not json at all", []),
             (valid_json, []),
         ]
-        result = grader.grade_with_tools("sys", "user")
+        result = grader.grade_with_tools("sys", "user", repo_path="/tmp")
         assert result["grade"] == "B"
         assert result["approved"] is True
         second_call_payload = mock_client.post_chat.call_args_list[1][0][0]
@@ -135,7 +145,7 @@ class TestGradeWithTools:
     def test_string_arguments_parsed_to_dict(self):
         grader, mock_client = _make_shadow_grader()
         tool_call = [{"name": "read_file", "arguments": '{"path": "/tmp/test.txt"}'}]
-        verdict = '{"grade": "A", "approved": true, "feedback": "ok"}'
+        verdict = '{"grade": "A", "approved": true, "feedback": "ok", "confidence_in_disagreement": "medium"}'
         mock_client.post_chat.side_effect = [
             ("", tool_call),
             (verdict, []),
@@ -148,12 +158,12 @@ class TestGradeWithTools:
 
     def test_normal_exit_appends_verdict_instruction(self):
         grader, mock_client = _make_shadow_grader()
-        verdict_json = '{"grade": "B", "approved": true, "feedback": "ok"}'
+        verdict_json = '{"grade": "B", "approved": true, "feedback": "ok", "confidence_in_disagreement": "low"}'
         mock_client.post_chat.side_effect = [
             (verdict_json, []),   # loop: no tool calls → break
             (verdict_json, []),   # verdict call
         ]
-        grader.grade_with_tools("sys", "user")
+        grader.grade_with_tools("sys", "user", repo_path="/tmp")
         verdict_payload = mock_client.post_chat.call_args_list[1][0][0]
         user_msgs = [m["content"] for m in verdict_payload["messages"] if m["role"] == "user"]
         assert any("Investigation complete" in c for c in user_msgs)
@@ -161,7 +171,7 @@ class TestGradeWithTools:
     def test_max_steps_exit_no_duplicate_verdict_instruction(self):
         grader, mock_client = _make_shadow_grader()
         tool_call = [{"name": "read_file", "arguments": {"path": "/tmp/f"}}]
-        verdict = '{"grade": "B", "approved": true, "feedback": "done"}'
+        verdict = '{"grade": "B", "approved": true, "feedback": "done", "confidence_in_disagreement": "low"}'
         # 6 tool-call responses triggers the step >= MAX_TOOL_STEPS branch
         side_effects = [("", tool_call) for _ in range(6)] + [(verdict, [])]
         mock_client.post_chat.side_effect = side_effects
@@ -174,14 +184,60 @@ class TestGradeWithTools:
 
     def test_markdown_fence_stripped_from_verdict(self):
         grader, mock_client = _make_shadow_grader()
-        fenced = '```json\n{"grade": "A", "approved": true, "feedback": "well done"}\n```'
+        fenced = '```json\n{"grade": "A", "approved": true, "feedback": "well done", "confidence_in_disagreement": "high"}\n```'
         mock_client.post_chat.side_effect = [
             (fenced, []),   # loop: no tool calls → break
             (fenced, []),   # verdict call
         ]
-        result = grader.grade_with_tools("sys", "user")
+        result = grader.grade_with_tools("sys", "user", repo_path="/tmp")
         assert result["grade"] == "A"
         assert result["approved"] is True
+
+    def test_test_mode_param_accepted(self):
+        grader, mock_client = _make_shadow_grader()
+        verdict_json = '{"grade": "B", "approved": true, "feedback": "ok", "confidence_in_disagreement": "low"}'
+        mock_client.post_chat.return_value = (verdict_json, [])
+        result = grader.grade_with_tools("sys", "user", test_mode=True)
+        assert result["grade"] == "B"
+
+    def test_grade_with_tools_raises_infra_error_when_repo_path_is_none(self):
+        grader, mock_client = _make_shadow_grader()
+        result = grader.grade_with_tools("sys", "user", repo_path=None, test_mode=False)
+        assert result == {
+            "infrastructure_error": True,
+            "error_detail": "grade_with_tools requires repo_path (tool calls disabled)",
+            "tool_calls": [],
+        }
+        mock_client.post_chat.assert_not_called()
+
+    def test_grade_with_tools_test_mode_returns_synthetic_verdict(self):
+        grader, mock_client = _make_shadow_grader()
+        result = grader.grade_with_tools("sys", "user", repo_path=None, test_mode=True)
+        assert result == {
+            "grade": "B",
+            "approved": True,
+            "feedback": "test_mode",
+            "confidence_in_disagreement": "low",
+            "tool_calls": [],
+        }
+        mock_client.post_chat.assert_not_called()
+
+    def test_last_fence_wins_when_multiple_fences(self):
+        grader, mock_client = _make_shadow_grader()
+        double_fenced = (
+            '```json\n{"grade": "F", "approved": false, "feedback": "reasoning", '
+            '"confidence_in_disagreement": "low"}\n```\n'
+            '```json\n{"grade": "A", "approved": true, "feedback": "verdict", '
+            '"confidence_in_disagreement": "high"}\n```'
+        )
+        mock_client.post_chat.side_effect = [
+            (double_fenced, []),   # loop: no tool calls → break
+            (double_fenced, []),   # verdict call
+        ]
+        result = grader.grade_with_tools("sys", "user", repo_path="/tmp")
+        assert result["grade"] == "A"
+        assert result["approved"] is True
+        assert result["feedback"] == "verdict"
 
 
 class TestExecuteTool:
@@ -335,9 +391,9 @@ class TestExecuteTool:
 
 
 class TestGetClient:
-    def test_default_timeout_is_300_when_config_missing(self):
+    def test_default_timeout_is_600_when_config_missing(self):
         grader = ShadowGrader(config_path="/nonexistent/config.json")
         with patch("ironclaude.shadow_grader.OllamaClient") as mock_cls:
             mock_cls.return_value = MagicMock()
             grader._get_client()
-        assert mock_cls.call_args.kwargs["timeout"] == 300
+        assert mock_cls.call_args.kwargs["timeout"] == 600

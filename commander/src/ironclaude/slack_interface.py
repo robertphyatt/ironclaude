@@ -43,6 +43,8 @@ DIRECTIVE_STATUS_EMOJI = {
     "in_progress": "hammer",
     "completed": "white_check_mark",
     "rejected": "x",
+    "awaiting_changes": "thinking_face",
+    "superseded": "arrows_counterclockwise",
 }
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")

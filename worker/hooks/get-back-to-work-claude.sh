@@ -26,6 +26,78 @@ if ! source "$SCRIPT_DIR/hook-logger.sh" 2>/dev/null; then
   echo '{"systemMessage": "[GET-BACK-TO-WORK]: CRITICAL - Failed to load hook-logger.sh!"}'
   echo "CRITICAL: hook-logger.sh failed to load" >&2
 fi
+
+# =============================================================================
+# IN-FLIGHT DETECTION (background subagents / background Bash jobs)
+# =============================================================================
+# Print (to stdout) the space-separated set of currently-in-flight ids in the
+# given transcript JSONL (launched ids minus completed ids). Never crashes;
+# jq errors are swallowed and treated as "no id extracted" (fail-safe:
+# absence of the suppression -> falls through to the existing block).
+_gbtw_extract_in_flight() {
+    local transcript="$1"
+    if [ -z "$transcript" ] || [ ! -f "$transcript" ]; then
+        return 0
+    fi
+    if ! command -v jq &>/dev/null; then
+        # Fail-safe: without jq we cannot classify; do not spuriously suppress.
+        return 0
+    fi
+    local tail_data launched_agent launched_bash launched_all completed_ids in_flight
+    # 8 MB byte-bounded tail — ~10x the previous 4000-line horizon while still
+    # capped so jq scans stay fast on multi-hundred-MB transcripts. Fixes GB-01
+    # (long transcripts with an old dispatch scrolled the launch out of view).
+    tail_data=$(tail -c 8M "$transcript" 2>/dev/null || true)
+    # Launched (a) Agent tool_use with input.run_in_background==true whose
+    # subsequent tool_result carries toolUseResult.agentId or an
+    # 'agentId: <id>' text marker; and (b) Bash tool_use with
+    # input.run_in_background==true whose tool_result carries
+    # 'Command running in background with ID: <id>'.
+    launched_agent=$(printf '%s\n' "$tail_data" | \
+        jq -r 'select(.toolUseResult.status == "async_launched") | .toolUseResult.agentId // empty' 2>/dev/null || true)
+    launched_bash=$(printf '%s\n' "$tail_data" | \
+        jq -r 'select(.type == "user") | .message.content[]? | select(.type == "tool_result") | .content[]?.text? // empty' 2>/dev/null | \
+        sed -nE 's/.*Command running in background with ID:[[:space:]]*([A-Za-z0-9_-]+).*/\1/p' || true)
+    launched_all=$(printf '%s\n%s\n' "$launched_agent" "$launched_bash" | sed '/^$/d' | LC_ALL=C sort -u)
+
+    # Completed via (i) delivered task-notification turn: message.content is
+    # a plain string wrapping <task-notification><task-id>ID</task-id>...
+    # <status>completed|failed|killed|stopped</status>...</task-notification>;
+    # (ii) resumed plain-text tool_result whose text contains both
+    # 'agentId: <id>' and 'subagent_tokens:' (SendMessage-resume shape).
+    # Completions: each source JSONL line is one turn, but the content of a
+    # task-notification is a single JSON string spanning multiple newlines
+    # (<task-id> and <status> on separate lines). Do the check in jq itself
+    # so the whole string is examined per input record.
+    local completed_notif completed_plain
+    completed_notif=$(printf '%s\n' "$tail_data" | \
+        jq -r 'select(.origin.kind == "task-notification")
+               | (.message.content // "") | tostring
+               | select(test("<status>(completed|failed|killed|stopped)</status>"))
+               | (capture("<task-id>(?<id>[^<]+)</task-id>") | .id)' 2>/dev/null || true)
+    # Plain-text completion (SendMessage-resume shape): a tool_result whose
+    # text contains BOTH 'agentId: <id>' and 'subagent_tokens:'. Same
+    # in-jq-string approach so the whole text is examined per record.
+    completed_plain=$(printf '%s\n' "$tail_data" | \
+        jq -r 'select(.type == "user")
+               | .message.content[]? | select(.type == "tool_result")
+               | .content[]?.text? // empty
+               | select(test("subagent_tokens:") and test("agentId:"))
+               | (capture("agentId:[[:space:]]*(?<id>[A-Za-z0-9_-]+)") | .id)' 2>/dev/null || true)
+    completed_ids=$(printf '%s\n%s\n' "$completed_notif" "$completed_plain" | sed '/^$/d' | LC_ALL=C sort -u)
+
+    # Set-difference: launched \ completed
+    in_flight=$(comm -23 <(printf '%s\n' "$launched_all") <(printf '%s\n' "$completed_ids") 2>/dev/null || true)
+    printf '%s\n' "$in_flight" | sed '/^$/d' | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+    return 0
+}
+
+# Test-mode shim: sourcing with GBTW_TEST_MODE=1 exposes helpers without
+# running the hook body.
+if [ "${GBTW_TEST_MODE:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 run_hook "GET-BACK-TO-WORK"
 
 EVENT=$(cat)
@@ -298,27 +370,20 @@ Do NOT skip fixing the issues. Do NOT proceed to the next task."
         fi
 
     elif [ "${IN_PROGRESS_OR_PENDING_COUNT:-0}" != "0" ]; then
-        # Suppress block if worker used a waiting tool (Monitor/TaskOutput/ScheduleWakeup/AskUserQuestion) or run_in_background in recent turns
+        # Suppress the block iff at least one background subagent / background
+        # Bash job dispatched earlier in the transcript has no matching
+        # completion — i.e. it is genuinely still in flight. Replaces the old
+        # tail-3 requestId window (which false-positive-blocked workers that
+        # posted several text-only "holding" turns after their dispatch).
         if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
-            _ic_bg_active="false"
-            _ic_recent_req_ids=$(
-                tail -n 500 "$TRANSCRIPT_PATH" 2>/dev/null | \
-                jq -r 'select(.type == "assistant") | .requestId // empty' 2>/dev/null | \
-                tail -3
-            )
-            if [ -n "$_ic_recent_req_ids" ]; then
-                while IFS= read -r _ic_req_id; do
-                    [ -z "$_ic_req_id" ] && continue
-                    if tail -n 500 "$TRANSCRIPT_PATH" 2>/dev/null | grep -F "\"$_ic_req_id\"" | \
-                       jq -r '.message.content[]? | select(.type == "tool_use") | if .name == "Monitor" or .name == "TaskOutput" or .name == "ScheduleWakeup" or .name == "AskUserQuestion" then "true" elif (.input.run_in_background // false) == true then "true" else "false" end' \
-                       2>/dev/null | grep -q "^true$" 2>/dev/null; then
-                        _ic_bg_active="true"
-                        break
-                    fi
-                done <<< "$_ic_recent_req_ids"
-            fi
-            if [ "$_ic_bg_active" = "true" ]; then
-                echo '{"decision": "approve", "reason": "Background job active", "systemMessage": "[GET-BACK-TO-WORK]: Passed - background job active, worker monitoring pipeline"}'
+            _ic_in_flight_ids=$(_gbtw_extract_in_flight "$TRANSCRIPT_PATH")
+            log_hook "GET-BACK-TO-WORK" "InFlight" "in_flight=[${_ic_in_flight_ids:-none}]"
+            if [ -n "$_ic_in_flight_ids" ]; then
+                jq -n --arg ids "$_ic_in_flight_ids" '{
+                    "decision": "approve",
+                    "reason": ("Background job(s) in flight: " + $ids),
+                    "systemMessage": ("[GET-BACK-TO-WORK]: Passed - background job(s) in flight: " + $ids)
+                }'
                 exit 0
             fi
         fi

@@ -64,3 +64,7 @@
    - Only switch to usage credits if the operator explicitly instructs it
    - Usage credits have cost implications that require operator approval
 20. **Fix Before Reporting** — When you discover a problem, attempt a fix first (spawn a worker, run a command, restart a service). If the fix requires operator action, pin a decision-format escalation with options. Never post a message that identifies a problem without either (a) an action you already took or (b) a pinned escalation with actionable next steps. Pure problem reports are rejected by the grader.
+
+21. **Surface Assumptions Before Acting** — When interpreting a new directive or reviewing a worker plan, briefly state any material assumptions you're making and what information gaps could change the answer (1–3 bullets max). Skip for routine operations and status queries. Keep it brief — this is not a hedging exercise, it's a mis-assumption catch.
+
+22. **Verify Worker Reasoning Integrity** — When a worker presents a chain of reasoning ("I checked X, which showed Y, so I concluded Z"), verify each link has evidence in the log. A coherent narrative ≠ evidence the computation happened. Confirm stated intermediate steps produced claimed results before acting on the conclusion. If a step lacks evidence, treat the conclusion as unverified and send the worker back to produce actual output.

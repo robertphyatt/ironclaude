@@ -1,0 +1,8 @@
+{"type":"assistant","requestId":"req_f3_a","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01F3AAAAAAAAAAAAAAAAAAAA","name":"Agent","input":{"description":"Recovery agent","subagent_type":"general-purpose","prompt":"...","run_in_background":true}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01F3AAAAAAAAAAAAAAAAAAAA","content":[{"type":"text","text":"Async agent launched successfully.\nagentId: ccccccccccccccccc"}]}]},"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"ccccccccccccccccc"}}
+{"type":"assistant","requestId":"req_f3_h1","message":{"role":"assistant","content":[{"type":"text","text":"Holding 1."}]}}
+{"type":"assistant","requestId":"req_f3_h2","message":{"role":"assistant","content":[{"type":"text","text":"Holding 2."}]}}
+{"type":"assistant","requestId":"req_f3_h3","message":{"role":"assistant","content":[{"type":"text","text":"Holding 3."}]}}
+{"type":"assistant","requestId":"req_f3_h4","message":{"role":"assistant","content":[{"type":"text","text":"Holding 4."}]}}
+{"type":"assistant","requestId":"req_f3_h5","message":{"role":"assistant","content":[{"type":"text","text":"Holding 5."}]}}
+{"type":"assistant","requestId":"req_f3_h6","message":{"role":"assistant","content":[{"type":"text","text":"Holding 6."}]}}

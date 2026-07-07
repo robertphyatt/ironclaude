@@ -69,10 +69,11 @@ RULES:
 - Do NOT read .git/HEAD or other git internal files
 - Do NOT use find or shell commands — only the three tools above
 - Do NOT grep for generic patterns like 'TODO' — search for patterns directly relevant to the grading criteria
-- After investigating, produce ONLY a JSON verdict with keys: grade, approved, feedback
+- After investigating, produce ONLY a JSON verdict with keys: grade, approved, feedback, confidence_in_disagreement
 - grade must be one of: A, B, C, D, F
 - approved must be true or false
-- feedback must explain your reasoning"""
+- feedback must explain your reasoning
+- confidence_in_disagreement must be one of: low, medium, high — how confident you are in your own grade and approval decision"""
 
 GRADER_VERDICT_SCHEMA = {
     "type": "object",
@@ -80,8 +81,9 @@ GRADER_VERDICT_SCHEMA = {
         "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
         "approved": {"type": "boolean"},
         "feedback": {"type": "string"},
+        "confidence_in_disagreement": {"type": "string", "enum": ["low", "medium", "high"]},
     },
-    "required": ["grade", "approved", "feedback"],
+    "required": ["grade", "approved", "feedback", "confidence_in_disagreement"],
 }
 
 
@@ -115,7 +117,7 @@ class ShadowGrader:
             self._client = OllamaClient(
                 url=ollama_cfg.get("url", "http://localhost:11434"),
                 fallback_url=ollama_cfg.get("fallback_url"),
-                timeout=cfg.get("timeout_seconds", 300),
+                timeout=cfg.get("timeout_seconds", 600),
             )
         return self._client
 
@@ -170,12 +172,25 @@ class ShadowGrader:
         system_prompt: str,
         user_prompt: str,
         repo_path: str | None = None,
+        test_mode: bool = False,
     ) -> dict:
         """Grade using Ollama chat API with tool-calling loop.
 
         Returns {"grade", "approved", "feedback", "tool_calls": [...]} on success,
         or {"infrastructure_error": True, "error_detail": str, "tool_calls": []} on failure.
         """
+        if test_mode:
+            return {
+                "grade": "B",
+                "approved": True,
+                "feedback": "test_mode",
+                "confidence_in_disagreement": "low",
+                "tool_calls": [],
+            }
+
+        if repo_path is None:
+            return self._build_error("grade_with_tools requires repo_path (tool calls disabled)")
+
         try:
             client = self._get_client()
         except Exception as e:
@@ -228,7 +243,8 @@ class ShadowGrader:
                         "role": "user",
                         "content": (
                             "Maximum investigation steps reached. Respond with ONLY valid JSON: "
-                            '{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "..."}'
+                            '{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "...", '
+                            '"confidence_in_disagreement": "low|medium|high"}'
                         ),
                     })
                     max_steps_reached = True
@@ -241,7 +257,8 @@ class ShadowGrader:
                 "role": "user",
                 "content": (
                     'Investigation complete. Provide your verdict as JSON: '
-                    '{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "..."}'
+                    '{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "...", '
+                    '"confidence_in_disagreement": "low|medium|high"}'
                 ),
             })
 
@@ -265,9 +282,9 @@ class ShadowGrader:
 
         content = _THINK_TAG_RE.sub("", content)
         content = _SPECIAL_TOKEN_RE.sub("", content).strip()
-        fence_match = _MARKDOWN_FENCE_RE.search(content)
-        if fence_match:
-            content = fence_match.group(1)
+        fence_matches = _MARKDOWN_FENCE_RE.findall(content)
+        if fence_matches:
+            content = fence_matches[-1]
         try:
             parsed = json.loads(content)
         except json.JSONDecodeError:
@@ -276,7 +293,7 @@ class ShadowGrader:
         if not isinstance(parsed, dict):
             return self._build_error(f"Non-dict verdict: {content[:200]}", recorded_tool_calls)
 
-        required = ["grade", "approved", "feedback"]
+        required = ["grade", "approved", "feedback", "confidence_in_disagreement"]
         missing = [k for k in required if k not in parsed]
         if missing:
             return self._build_error(
@@ -288,5 +305,6 @@ class ShadowGrader:
             "grade": parsed["grade"],
             "approved": parsed["approved"],
             "feedback": parsed["feedback"],
+            "confidence_in_disagreement": parsed["confidence_in_disagreement"],
             "tool_calls": recorded_tool_calls,
         }

@@ -21,8 +21,10 @@ import threading
 import time
 from glob import glob
 from pathlib import Path
+from typing import Callable, Optional
 from ironclaude.grader import LocalGrader
 from ironclaude.signal_forensics import _logged_kill
+from ironclaude.fable_availability import mark_fable_unavailable as _mark_fable_unavailable
 
 logger = logging.getLogger("ironclaude.brain")
 
@@ -178,11 +180,19 @@ class BrainClient:
             )
         return matches[-1]  # sorted() puts latest version last
 
-    def __init__(self, timeout_seconds: int = 600, operator_name: str = "Operator", model: str = "opus", effort_level: str = "high"):
+    def __init__(
+        self,
+        timeout_seconds: int = 600,
+        operator_name: str = "Operator",
+        model: str = "opus",
+        effort_level: str = "high",
+        on_fable_unavailable_transition: Optional[Callable[[str], None]] = None,
+    ):
         self.timeout_seconds = timeout_seconds
         self._operator_name = operator_name
         self._model = model
         self._effort_level = effort_level
+        self._on_fable_unavailable_transition = on_fable_unavailable_transition
         self.restart_count = 0
         self._response_queue: queue.Queue[str] = queue.Queue()
         self._message_queue: asyncio.Queue | None = None
@@ -636,6 +646,22 @@ class BrainClient:
         except Exception as e:
             logger.debug(f"Could not log brain process diagnostics: {e}")
 
+    def _maybe_mark_fable_unavailable(self, failing_model: str, reason: str) -> None:
+        """If the model that just failed was fable, record the transition on disk
+        and notify the optional callback (once per actual availability transition,
+        plus every time the write itself fails — Fable is still down in that case
+        even though the on-disk flag didn't take, so the operator must be told)."""
+        if "fable" not in (failing_model or "").lower():
+            return
+        result = _mark_fable_unavailable(reason)
+        if result == "write_failed":
+            logger.warning("mark_fable_unavailable write failed; alerting anyway (Fable is still down)")
+        if result in ("transition", "write_failed") and self._on_fable_unavailable_transition is not None:
+            try:
+                self._on_fable_unavailable_transition(reason)
+            except Exception as cb_exc:
+                logger.warning("on_fable_unavailable_transition callback failed: %s", cb_exc)
+
     async def _brain_session(self, system_prompt: str, cwd: str | None, resume_session_id: str | None = None) -> None:
         """Run the brain session with streaming I/O."""
         from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage
@@ -787,19 +813,23 @@ class BrainClient:
         try:
             await _run_session(_build_options(self._model))
         except _ModelUnavailableFromMessage:
+            failing_model = self._model
             resolved = "opus"
             logger.error(
-                f"BRAIN MODEL '{self._model}' UNAVAILABLE (message-shaped) — resolving to '{resolved}'"
+                f"BRAIN MODEL '{failing_model}' UNAVAILABLE (message-shaped) — resolving to '{resolved}'"
             )
             self._model = resolved
+            self._maybe_mark_fable_unavailable(failing_model, "brain-detected-message")
             await _run_session(_build_options(resolved))
         except Exception as exc:
             if _is_model_unavailable(exc):
+                failing_model = self._model
                 resolved = "opus"
                 logger.error(
-                    f"BRAIN MODEL '{self._model}' NOT AVAILABLE — resolving to '{resolved}'"
+                    f"BRAIN MODEL '{failing_model}' NOT AVAILABLE — resolving to '{resolved}'"
                 )
                 self._model = resolved
+                self._maybe_mark_fable_unavailable(failing_model, "brain-detected-exception")
                 await _run_session(_build_options(resolved))
             else:
                 raise

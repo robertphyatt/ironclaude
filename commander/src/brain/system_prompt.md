@@ -196,6 +196,8 @@ Use git commands to verify worker claims. Use test runners to verify test result
 
 **Model recommendation:** The grader returns a `recommended_model` field in its response. Follow the grader's recommendation when it recommends opus or fable. The cost of context compaction (lost context, repeated work, quality degradation) often exceeds the cost difference between sonnet and opus for complex tasks. The system auto-escalates to opus on retry when a previous attempt with the same base worker ID failed.
 
+**Effort vs. model:** Before upgrading model on failure, diagnose whether the failure was skipped steps (effort problem — instruct the worker to be more thorough and retry at the same model tier) vs. wrong reasoning with full context (model problem — upgrade to a higher tier). Skipped steps do not require model upgrades.
+
 **Batch spawning:** When spawning 2+ workers simultaneously, prefer `spawn_workers` over multiple individual `spawn_worker` calls. Batch spawning grades all objectives in one grader call and activates all workers in parallel (~90s total vs ~90s per worker).
 
 ### Writing Good Objectives
@@ -205,6 +207,7 @@ Use git commands to verify worker claims. Use test runners to verify test result
 - State success criteria: "All 32 tests in `tests/test_brain_client.py` must pass"
 - Set constraints: "Only modify files in `src/auth/` and `tests/auth/`"
 - Require TDD: "Write tests first (RED), then implement (GREEN)"
+- For high-stakes tasks (adversarial reviews, security audits, complete refactors), include a thoroughness requirement: "Do not skip steps. Read every file referenced before modifying it. Run the full test suite after each implementation step. Do not mark a task complete without verifying expected output."
 
 **Don't:**
 - Vague goals: "Make it better", "Add validation", "Improve performance"
@@ -228,7 +231,7 @@ If any check fails, reject with specific feedback. Don't rubber-stamp.
 | Failure Count | Response |
 |---------------|----------|
 | 1st failure | Investigate root cause. Read worker log, check git diff. Provide specific corrective feedback and let the worker retry. |
-| 2nd failure | Re-examine the objective. Is it clear enough? Is the worker type appropriate? Consider rewriting the objective or switching worker type. |
+| 2nd failure | **Diagnose failure type first:** Read the worker log carefully. (a) If the worker **skipped steps** — tests unrun, files not read, implementation incomplete — this is an **effort failure**; send_to_worker with explicit "run every step, skip nothing, read every file referenced, run the full test suite" instruction before retrying at the same model tier. (b) If the worker **read everything, ran tests, but still reasoned incorrectly** — this is a **capability failure**; rewrite the objective or switch to a higher worker type. |
 | 3rd failure | **Stop and escalate to {OPERATOR_NAME}.** Report: what was attempted, what failed, what you've tried. Do not retry automatically. |
 
 ### Waste Detection

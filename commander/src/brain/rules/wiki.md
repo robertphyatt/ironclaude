@@ -47,6 +47,8 @@ Before every gated action (spawn_worker, approve_plan, reject_plan, send_to_work
 
 Both are required. The tool guard enforces this — gated tools are blocked until both searches complete.
 
+Both searches should surface a small ranked top-N working set (3-5 most relevant results), not bulk context. Relevance over volume — a long dump of loosely-related pages degrades decision quality the same way missing context does.
+
 ## Page Quality Guidelines
 
 - One concept per page — split rather than merge

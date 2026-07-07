@@ -1,0 +1,28 @@
+{
+  "name": "d1277 Assumption Surfacing Direct Sessions Research Doc",
+  "goal": "Produce the d1277 research document answering whether the assumption-surfacing directive should extend to direct user sessions.",
+  "design_file": "docs/plans/2026-07-05-assumption-surfacing-direct-sessions-design.md",
+  "estimated_memory_gb": 0.5,
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Write d1277 research document",
+      "description": "Create docs/research/d1277-assumption-surfacing-direct-sessions.md covering the direct answer, RQ1-5 analysis, and final recommendation with both directive texts, per the design doc.",
+      "allowed_files": ["docs/research/d1277-assumption-surfacing-direct-sessions.md"],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Write the research document with frontmatter, direct answer, RQ1-5 analysis, and recommendation section with both directive texts side by side"
+        },
+        {
+          "description": "Verify content completeness against the design doc's Research Questions and Recommendation sections"
+        },
+        {
+          "description": "Stage the file",
+          "command": "git add -f docs/research/d1277-assumption-surfacing-direct-sessions.md",
+          "expected": "Change staged"
+        }
+      ]
+    }
+  ]
+}

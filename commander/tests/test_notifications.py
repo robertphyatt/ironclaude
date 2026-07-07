@@ -16,6 +16,9 @@ from ironclaude.notifications import (
     format_worker_checkin_slack,
     format_worker_gate_stuck_slack,
     format_worker_heartbeat_stuck_slack,
+    format_fable_unavailable,
+    format_fable_recovered,
+    format_directive_review,
 )
 
 
@@ -414,3 +417,227 @@ class TestFormatWorkerHeartbeatStuckSlack:
     def test_mentions_brain_intervention(self):
         msg = format_worker_heartbeat_stuck_slack("w1", "brainstorming")
         assert "Brain intervention" in msg
+
+
+class TestFableNotifications:
+    def test_unavailable_contains_title(self):
+        msg = format_fable_unavailable("spawn-died", "opus")
+        assert "⚠️" in msg
+        assert "Fable unavailable" in msg
+
+    def test_unavailable_names_reason(self):
+        msg = format_fable_unavailable(reason="spawn-died", redirected_to="opus")
+        assert "spawn-died" in msg
+
+    def test_unavailable_names_redirect_target(self):
+        msg = format_fable_unavailable("r", redirected_to="opus")
+        assert "opus" in msg
+
+    def test_unavailable_names_worker_id_when_given(self):
+        msg = format_fable_unavailable("r", "opus", worker_id="d1267")
+        assert "d1267" in msg
+
+    def test_unavailable_omits_worker_id_when_none(self):
+        msg = format_fable_unavailable("r", "opus", worker_id=None)
+        assert "None" not in msg
+
+    def test_unavailable_mentions_24h_window(self):
+        msg = format_fable_unavailable("r", "opus")
+        assert "24" in msg
+
+    def test_unavailable_gives_reprobe_hint(self):
+        msg = format_fable_unavailable("r", "opus")
+        assert "rm" in msg
+        assert "~/.ironclaude/state/fable_unavailable.json" in msg
+
+    def test_unavailable_escapes_mrkdwn_in_reason(self):
+        msg = format_fable_unavailable("<script>", "opus")
+        assert "&lt;script&gt;" in msg
+        assert "<script>" not in msg
+
+    def test_unavailable_escapes_mrkdwn_in_worker_id(self):
+        msg = format_fable_unavailable("r", "opus", worker_id="<bad>")
+        assert "&lt;bad&gt;" in msg
+        assert "<bad>" not in msg
+
+    def test_recovered_contains_title(self):
+        msg = format_fable_recovered()
+        assert "✅" in msg
+        assert "Fable is back" in msg
+
+    def test_recovered_mentions_recovery_effect(self):
+        msg = format_fable_recovered()
+        assert "claude-fable" in msg or "advisor" in msg
+
+
+class TestFormatDirectiveReview:
+    def test_contains_directive_id_and_interpretation(self):
+        msg = format_directive_review(
+            42, "do the thing", "op message", "claude-opus", True,
+            "prompt", "reason1", "reason2", "reason3",
+        )
+        assert "Directive #42" in msg
+        assert "do the thing" in msg
+
+    def test_contains_source_text(self):
+        msg = format_directive_review(
+            42, "do the thing", "op message", "claude-opus", True,
+            "prompt", "reason1", "reason2", "reason3",
+        )
+        assert "op message" in msg
+
+    def test_lists_all_three_planned_fields_with_reasons(self):
+        msg = format_directive_review(
+            1, "interp", "source", "claude-sonnet", False,
+            "do X", "tier-r", "goal-r", "prompt-r",
+        )
+        assert "claude-sonnet" in msg
+        assert "tier-r" in msg
+        assert "goal-r" in msg
+        assert "prompt-r" in msg
+        assert "do X" in msg
+
+    def test_prompt_is_code_fenced(self):
+        msg = format_directive_review(
+            1, "interp", "source", "claude-sonnet", True,
+            "hello world", "r1", "r2", "r3",
+        )
+        assert "```\nhello world\n```" in msg
+
+    def test_use_goal_true_renders_yes_branch(self):
+        msg = format_directive_review(
+            1, "interp", "source", "claude-sonnet", True,
+            "prompt", "r1", "r2", "r3",
+        )
+        goal_line = next(ln for ln in msg.splitlines() if "/goal" in ln)
+        assert "yes" in goal_line
+        assert "no" not in goal_line
+
+    def test_use_goal_false_renders_no_branch(self):
+        msg = format_directive_review(
+            1, "interp", "source", "claude-sonnet", False,
+            "prompt", "r1", "r2", "r3",
+        )
+        goal_line = next(ln for ln in msg.splitlines() if "/goal" in ln)
+        assert "no" in goal_line
+        assert "yes" not in goal_line
+
+    def test_supersedes_none_omits_revised_from_line(self):
+        msg = format_directive_review(
+            1, "interp", "source", "claude-sonnet", True,
+            "prompt", "r1", "r2", "r3",
+        )
+        assert "revised from" not in msg
+
+    def test_supersedes_id_includes_revised_from_line(self):
+        msg = format_directive_review(
+            1, "interp", "source", "claude-sonnet", True,
+            "prompt", "r1", "r2", "r3", supersedes=41,
+        )
+        assert "(revised from #41)" in msg
+
+    def test_escapes_mrkdwn_in_all_user_strings(self):
+        msg = format_directive_review(
+            1, "<script>", "a&b", "opus<x>", True,
+            "safe prompt", "r1>", "r2", "r3",
+        )
+        assert "&lt;script&gt;" in msg
+        assert "<script>" not in msg
+        assert "a&amp;b" in msg
+        source_line = next(ln for ln in msg.splitlines() if "From your message" in ln)
+        assert "a&b" not in source_line
+
+    def test_trailing_reaction_line_includes_all_three_reactions(self):
+        msg = format_directive_review(
+            1, "interp", "source", "claude-sonnet", True,
+            "prompt", "r1", "r2", "r3",
+        )
+        assert "👍" in msg
+        assert "👎" in msg
+        assert "🤔" in msg
+        assert "React" in msg
+
+    def test_format_directive_review_survives_triple_backtick_in_planned_prompt(self):
+        """Regression NOTIF-01: `planned_prompt` may contain triple-backticks
+        (LLM-authored). Without escaping, they close the fence early and
+        everything after renders as live mrkdwn instead of literal prompt text."""
+        out = format_directive_review(
+            directive_id=1,
+            interpretation="interp",
+            source_text="src",
+            planned_worker_type="claude-sonnet",
+            planned_use_goal=False,
+            planned_prompt="do the thing ```python\nfoo()\n``` then stop",
+            planned_worker_type_reason="r1",
+            planned_use_goal_reason="r2",
+            planned_prompt_reason="r3",
+        )
+        # Fence markers must remain balanced.
+        assert out.count("```") == 2, (
+            f"expected exactly two ``` fence markers, got {out.count('```')}. "
+            f"Backticks inside planned_prompt must be escaped so they don't "
+            f"terminate the code fence early.\nMessage:\n{out}"
+        )
+        # The escaped backticks should be present as `\`` sequences.
+        assert "\\`\\`\\`python" in out or "\\`\\`\\`" in out, (
+            f"Expected escaped triple-backticks (\\`\\`\\`) in output; got:\n{out}"
+        )
+
+    def test_planned_prompt_mrkdwn_special_sequences_escaped(self):
+        """I-4 regression: Slack parses <!channel>/<@U…> sequences at the payload
+        level even inside code fences. planned_prompt is LLM-authored and must be
+        mrkdwn-escaped in addition to backtick-escaped."""
+        out = format_directive_review(
+            directive_id=1,
+            interpretation="interp",
+            source_text="src",
+            planned_worker_type="claude-sonnet",
+            planned_use_goal=False,
+            planned_prompt="ping <!channel> & <@U123> now",
+            planned_worker_type_reason="r1",
+            planned_use_goal_reason="r2",
+            planned_prompt_reason="r3",
+        )
+        assert "&lt;!channel&gt;" in out, out
+        assert "<!channel>" not in out, out
+        assert "&lt;@U123&gt;" in out, out
+        assert "<@U123>" not in out, out
+        # & must be escaped exactly once (no double-escape of the &lt; entities)
+        assert "&amp; " in out, out
+
+    def test_planned_worker_type_backtick_escaped(self):
+        """Q-1 regression: planned_worker_type sits inside a single-backtick span;
+        an unexpected backtick must not break the span (nothing in submit_directive
+        enforces the worker-type vocabulary)."""
+        out = format_directive_review(
+            directive_id=1,
+            interpretation="interp",
+            source_text="src",
+            planned_worker_type="claude`x",
+            planned_use_goal=False,
+            planned_prompt="p",
+            planned_worker_type_reason="r1",
+            planned_use_goal_reason="r2",
+            planned_prompt_reason="r3",
+        )
+        assert "claude\\`x" in out, out
+
+    def test_format_directive_review_survives_backtick_in_source_text(self):
+        """Regression NOTIF-01: `source_text` sits inside a single-backtick
+        span. A backtick in source_text closes the span early."""
+        out = format_directive_review(
+            directive_id=1,
+            interpretation="interp",
+            source_text="run `ls` please",
+            planned_worker_type="claude-sonnet",
+            planned_use_goal=False,
+            planned_prompt="p",
+            planned_worker_type_reason="r1",
+            planned_use_goal_reason="r2",
+            planned_prompt_reason="r3",
+        )
+        # The `_From your message:_ `…` span should have TWO enclosing single
+        # backticks and any internal backticks escaped as `\``.
+        assert "_From your message:_ `run \\`ls\\` please`" in out, (
+            f"Expected escaped source_text inside single-backtick span. Got:\n{out}"
+        )

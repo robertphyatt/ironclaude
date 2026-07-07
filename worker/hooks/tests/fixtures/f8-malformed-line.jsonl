@@ -1,0 +1,4 @@
+{"type":"assistant","requestId":"req_f8_a","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01F8AAAAAAAAAAAAAAAAAAAA","name":"Agent","input":{"description":"X","subagent_type":"general-purpose","prompt":"...","run_in_background":true}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01F8AAAAAAAAAAAAAAAAAAAA","content":[{"type":"text","text":"Async agent launched successfully.\nagentId: h5555555555555555"}]}]},"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"h5555555555555555"}}
+{this line is intentionally not valid JSON to test malformed-line resilience: "unclosed
+{"type":"assistant","requestId":"req_f8_b","message":{"role":"assistant","content":[{"type":"text","text":"Holding after malformed line."}]}}
