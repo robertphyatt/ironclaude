@@ -397,3 +397,61 @@ class TestGetClient:
             mock_cls.return_value = MagicMock()
             grader._get_client()
         assert mock_cls.call_args.kwargs["timeout"] == 600
+
+
+class TestNumCtx:
+    def test_num_ctx_present_in_both_payloads(self, tmp_path):
+        grader = ShadowGrader(config_path=str(tmp_path / "nope.json"))
+        mock_client = MagicMock()
+        grader._client = mock_client
+        grader._model = "gemma4:12b-it-qat"
+        verdict = '{"grade": "B", "approved": true, "feedback": "ok", "confidence_in_disagreement": "low"}'
+        mock_client.post_chat.side_effect = [
+            ("no tool calls here", []),
+            (verdict, []),
+        ]
+        grader.grade_with_tools("sys", "user", repo_path="/tmp")
+        assert mock_client.post_chat.call_count == 2
+        for call in mock_client.post_chat.call_args_list:
+            payload = call[0][0]
+            assert payload["options"]["num_ctx"] == 32768
+
+
+class TestAssistantAnalysisPreserved:
+    def test_assistant_analysis_preserved_in_verdict_transcript(self):
+        grader, mock_client = _make_shadow_grader()
+        verdict = '{"grade": "B", "approved": true, "feedback": "ok", "confidence_in_disagreement": "low"}'
+        mock_client.post_chat.side_effect = [
+            ("My analysis: X", []),
+            (verdict, []),
+        ]
+        grader.grade_with_tools("sys", "user", repo_path="/tmp")
+        verdict_payload = mock_client.post_chat.call_args_list[-1][0][0]
+        assistant_msgs = [
+            m for m in verdict_payload["messages"]
+            if m.get("role") == "assistant" and "My analysis: X" in (m.get("content") or "")
+        ]
+        assert assistant_msgs, verdict_payload["messages"]
+
+
+class TestGrepFallback:
+    def test_grep_cmd_is_rg_or_grep(self):
+        """Environment-agnostic sanity check on the import-time resolution."""
+        from ironclaude import shadow_grader
+        assert shadow_grader._GREP_CMD[0] in ("rg", "grep")
+
+    def test_grep_files_falls_back_to_grep_when_rg_missing(self, monkeypatch, tmp_path):
+        from ironclaude import shadow_grader
+        monkeypatch.setattr(shadow_grader, "_GREP_CMD", ["grep", "-r", "-m", "20", "-e"])
+        grader = shadow_grader.ShadowGrader(config_path="/nonexistent/config.json")
+        mock_result = MagicMock()
+        mock_result.stdout = "match\n"
+        captured = {}
+
+        def _fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return mock_result
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        grader._execute_tool("grep_files", {"pattern": "TODO", "directory": str(tmp_path)}, str(tmp_path))
+        assert captured["argv"][:5] == ["grep", "-r", "-m", "20", "-e"]

@@ -5,11 +5,21 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 
 from ironclaude.ollama_client import OllamaClient, OllamaError
 
 logger = logging.getLogger(__name__)
+
+# rg preferred; BSD-compatible grep fallback so grep_files is never a dead
+# tool on hosts without ripgrep (observed in production: every call failed
+# with [Errno 2] 'rg').
+_GREP_CMD = (
+    ["rg", "--max-count=20", "-e"]
+    if shutil.which("rg")
+    else ["grep", "-r", "-m", "20", "-e"]
+)
 
 _DEFAULT_CONFIG_PATH = os.path.expanduser("~/.claude/ironclaude-hooks-config.json")
 _DEFAULT_SHADOW_MODEL = "gemma4:12b-it-qat"
@@ -99,6 +109,7 @@ class ShadowGrader:
         self._config_path = config_path or _DEFAULT_CONFIG_PATH
         self._client: OllamaClient | None = None
         self._model: str = _DEFAULT_SHADOW_MODEL
+        self._num_ctx: int = 32768
 
     @staticmethod
     def _build_error(detail: str, tool_calls: list | None = None) -> dict:
@@ -114,6 +125,11 @@ class ShadowGrader:
                 cfg = {}
             ollama_cfg = cfg.get("ollama", {})
             self._model = cfg.get("shadow_model") or ollama_cfg.get("model", _DEFAULT_SHADOW_MODEL)
+            # Default 4096 (Ollama's built-in default) truncates the grading
+            # conversation oldest-first, i.e. the grading instructions go
+            # first — same root cause as the 2026-06-18 worker num_ctx
+            # finding; 32768 matches ollama_worker_num_ctx.
+            self._num_ctx = int(cfg.get("shadow_num_ctx", 32768))
             self._client = OllamaClient(
                 url=ollama_cfg.get("url", "http://localhost:11434"),
                 fallback_url=ollama_cfg.get("fallback_url"),
@@ -147,7 +163,7 @@ class ShadowGrader:
                 directory = arguments.get("directory", "")
                 self._validate_path(directory, repo_path)
                 result = subprocess.run(
-                    ["rg", "--max-count=20", "-e", pattern, "--", directory],
+                    _GREP_CMD + [pattern, "--", directory],
                     capture_output=True, text=True, timeout=10,
                 )
                 return result.stdout[:4000] or "(no matches)"
@@ -204,7 +220,7 @@ class ShadowGrader:
             "model": self._model,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": 0.1},
+            "options": {"temperature": 0.1, "num_ctx": self._num_ctx},
             "tools": SHADOW_TOOLS,
         }
 
@@ -250,6 +266,11 @@ class ShadowGrader:
                     max_steps_reached = True
                     break
             else:
+                # Preserve the model's analysis in the transcript — the verdict
+                # call should grade WITH the model's own reasoning in context,
+                # not from a transcript where it was silently dropped.
+                if content:
+                    messages.append({"role": "assistant", "content": content})
                 break
 
         if not max_steps_reached:
@@ -266,7 +287,7 @@ class ShadowGrader:
             "model": self._model,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": 0.1},
+            "options": {"temperature": 0.1, "num_ctx": self._num_ctx},
             "format": GRADER_VERDICT_SCHEMA,
         }
         logger.debug(

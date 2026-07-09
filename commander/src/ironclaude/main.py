@@ -11,6 +11,7 @@ from logging.handlers import RotatingFileHandler
 import os
 import re
 import shlex
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -559,6 +560,75 @@ def ensure_brain_trusted(brain_cwd: str) -> None:
         logger.warning(f"{claude_json_path} not found — cannot pre-trust brain directory")
     except OSError as e:
         logger.warning(f"Could not update {claude_json_path}: {e}")
+
+
+def _deploy_worker_hooks(
+    repo_root: str,
+    stable_dir: str | None = None,
+    plugin_cache_base: str | None = None,
+) -> None:
+    """Deploy worker/hooks/*.sh to the runtime locations, mirroring the root
+    Makefile's deploy-hooks target. Called at every daemon start (including
+    SIGHUP execvp restarts) so a restart always implies current hooks —
+    eliminating the forgotten-`make deploy-hooks` stale-hook failure mode.
+
+    - Stable dir ~/.claude/ironclaude-hooks: mandatory. Missing source dir or
+      copy failure exits the daemon (consistent with the brain-file syncs in
+      main() — a broken layout should be fixed, not papered over).
+    - Latest plugin-cache hooks dir: best-effort. Absent cache logs a WARNING
+      and continues (mirrors the Makefile's WARN branch).
+    """
+    hooks_src = os.path.join(os.path.dirname(repo_root), "worker", "hooks")
+    stable = stable_dir or os.path.expanduser("~/.claude/ironclaude-hooks")
+    cache_base = plugin_cache_base or os.path.expanduser(
+        "~/.claude/plugins/cache/ironclaude/ironclaude"
+    )
+    if not os.path.isdir(hooks_src):
+        logger.error(f"Worker hooks source not found at {hooks_src}")
+        sys.exit(1)
+    scripts = sorted(f for f in os.listdir(hooks_src) if f.endswith(".sh"))
+    try:
+        os.makedirs(stable, exist_ok=True)
+        for name in scripts:
+            shutil.copy2(os.path.join(hooks_src, name), os.path.join(stable, name))
+    except OSError as exc:
+        logger.error(f"Failed deploying worker hooks to {stable}: {exc}")
+        sys.exit(1)
+    logger.info(f"Deployed {len(scripts)} worker hooks to {stable}")
+
+    def _version_key(name: str) -> tuple:
+        # Numeric sort so 1.0.16 beats 1.0.9 (lexicographic would invert;
+        # the Makefile uses `sort -V` for the same reason). Non-version dirs
+        # sort lowest and are never selected over a real version.
+        try:
+            return (1, tuple(int(p) for p in name.split(".")))
+        except ValueError:
+            return (0, ())
+
+    latest = None
+    if os.path.isdir(cache_base):
+        versions = [
+            d for d in os.listdir(cache_base)
+            if os.path.isdir(os.path.join(cache_base, d)) and _version_key(d)[0] == 1
+        ]
+        if versions:
+            latest = max(versions, key=_version_key)
+    cache_hooks = os.path.join(cache_base, latest, "hooks") if latest else None
+    if cache_hooks and os.path.isdir(cache_hooks):
+        try:
+            for name in scripts:
+                shutil.copy2(
+                    os.path.join(hooks_src, name), os.path.join(cache_hooks, name)
+                )
+            logger.info(
+                f"Deployed {len(scripts)} worker hooks to plugin cache {cache_hooks}"
+            )
+        except OSError as exc:
+            logger.warning(f"Plugin-cache hook deploy failed (continuing): {exc}")
+    else:
+        logger.warning(
+            f"Plugin cache hooks dir absent under {cache_base} — stable dir updated only"
+        )
 
 
 def _worker_matches_directive(worker: dict, directive_id: int) -> bool:
@@ -2554,6 +2624,10 @@ def main():
     except FileNotFoundError:
         logger.error(f"Grader CLAUDE.md not found at {grader_claude_md_src}")
         sys.exit(1)
+
+    # Deploy worker hooks so a daemon restart always implies current hooks
+    # (mirrors `make deploy-hooks`; see _deploy_worker_hooks docstring).
+    _deploy_worker_hooks(repo_root)
 
     ensure_brain_trusted(grader_home)
 

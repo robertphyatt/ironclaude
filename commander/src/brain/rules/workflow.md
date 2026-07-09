@@ -636,6 +636,8 @@ The daemon posts your interpretation + the three planned fields to Slack. {OPERA
 
 When unsure, start one tier lower and rely on the retry-escalation path (Sonnet → Opus on failure) rather than pre-emptively spawning a bigger worker.
 
+After a week of shadow-grading data has accumulated, review `get_shadow_concordance_stats` before proposing any grader prompt/model changes — tune against evidence, not impressions.
+
 **`/goal` reasoning.** `dispatch.use_goal` is a daemon config flag that, when set, causes the daemon to send `/goal the assigned objective is complete and code review has passed` to the worker BEFORE the objective — pinning a success condition into the worker's context. Use `True` when:
 - The workflow is multi-turn / multi-phase and the worker needs a stable "done" definition to hold against.
 - The task is likely to spawn subagents or take multiple review cycles.

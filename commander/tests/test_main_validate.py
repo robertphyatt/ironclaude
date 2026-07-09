@@ -485,3 +485,77 @@ class TestOperatorWaits:
         d.poll_brain_responses()
         alerts = [c for c in d.slack.post_message.call_args_list if "Waiting on you" in str(c.args[0])]
         assert len(alerts) == 1
+
+
+class TestDeployWorkerHooks:
+    """Startup hook auto-deploy: mirrors `make deploy-hooks`. Stable dir is
+    mandatory (fail-hard); latest plugin-cache hooks dir is best-effort."""
+
+    @pytest.fixture
+    def layout(self, tmp_path):
+        """Fake repo layout + destinations. Returns (repo_root, hooks_src,
+        stable_dir, cache_base)."""
+        repo_root = tmp_path / "repo" / "commander"
+        hooks_src = tmp_path / "repo" / "worker" / "hooks"
+        hooks_src.mkdir(parents=True)
+        (hooks_src / "guard.sh").write_text("#!/bin/bash\necho guard\n")
+        exec_hook = hooks_src / "gbtw.sh"
+        exec_hook.write_text("#!/bin/bash\necho gbtw\n")
+        exec_hook.chmod(0o755)
+        (hooks_src / "README.md").write_text("not a hook")
+        repo_root.mkdir(parents=True)
+        stable_dir = tmp_path / "stable-hooks"
+        cache_base = tmp_path / "plugin-cache"
+        return repo_root, hooks_src, stable_dir, cache_base
+
+    def test_copies_sh_files_to_stable_dir_preserving_exec_bit(self, layout):
+        import os
+        from ironclaude.main import _deploy_worker_hooks
+        repo_root, _, stable_dir, cache_base = layout
+        _deploy_worker_hooks(str(repo_root), str(stable_dir), str(cache_base))
+        assert (stable_dir / "guard.sh").exists()
+        assert (stable_dir / "gbtw.sh").exists()
+        assert os.access(stable_dir / "gbtw.sh", os.X_OK)
+
+    def test_non_sh_files_not_copied(self, layout):
+        from ironclaude.main import _deploy_worker_hooks
+        repo_root, _, stable_dir, cache_base = layout
+        _deploy_worker_hooks(str(repo_root), str(stable_dir), str(cache_base))
+        assert not (stable_dir / "README.md").exists()
+
+    def test_latest_plugin_cache_version_selected_numerically(self, layout):
+        """1.0.16 must beat 1.0.9 — lexicographic sort would invert this."""
+        from ironclaude.main import _deploy_worker_hooks
+        repo_root, _, stable_dir, cache_base = layout
+        (cache_base / "1.0.9" / "hooks").mkdir(parents=True)
+        (cache_base / "1.0.16" / "hooks").mkdir(parents=True)
+        _deploy_worker_hooks(str(repo_root), str(stable_dir), str(cache_base))
+        assert (cache_base / "1.0.16" / "hooks" / "guard.sh").exists()
+        assert not (cache_base / "1.0.9" / "hooks" / "guard.sh").exists()
+
+    def test_non_version_dirs_in_cache_base_ignored(self, layout):
+        from ironclaude.main import _deploy_worker_hooks
+        repo_root, _, stable_dir, cache_base = layout
+        (cache_base / "1.0.9" / "hooks").mkdir(parents=True)
+        (cache_base / "not-a-version" / "hooks").mkdir(parents=True)
+        _deploy_worker_hooks(str(repo_root), str(stable_dir), str(cache_base))
+        assert (cache_base / "1.0.9" / "hooks" / "guard.sh").exists()
+        assert not (cache_base / "not-a-version" / "hooks" / "guard.sh").exists()
+
+    def test_cache_absent_warns_and_still_deploys_stable(self, layout):
+        from ironclaude.main import _deploy_worker_hooks
+        repo_root, _, stable_dir, cache_base = layout
+        # cache_base never created
+        _deploy_worker_hooks(str(repo_root), str(stable_dir), str(cache_base))
+        assert (stable_dir / "guard.sh").exists()
+
+    def test_missing_source_dir_exits(self, tmp_path):
+        from ironclaude.main import _deploy_worker_hooks
+        bare_repo_root = tmp_path / "empty" / "commander"
+        bare_repo_root.mkdir(parents=True)
+        with pytest.raises(SystemExit):
+            _deploy_worker_hooks(
+                str(bare_repo_root),
+                str(tmp_path / "stable"),
+                str(tmp_path / "cache"),
+            )

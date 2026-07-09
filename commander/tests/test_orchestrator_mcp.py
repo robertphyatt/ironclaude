@@ -9,6 +9,7 @@ import logging
 import os
 import sqlite3
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -6816,6 +6817,13 @@ class TestShadowThreadFiring:
         assert call_args[1] == "ap1"
 
 
+def _db_file_path(conn):
+    """Resolve the on-disk file path of a sqlite3 connection, mirroring the
+    production PRAGMA database_list lookup in _fire_shadow_thread."""
+    row = conn.execute("PRAGMA database_list").fetchone()
+    return row[2] if row else None
+
+
 class TestShadowConcordancePersistence:
     def test_run_shadow_and_report_persists_concordance_row(self, tools, db_conn):
         tools._shadow_grader = MagicMock()
@@ -6830,6 +6838,7 @@ class TestShadowConcordancePersistence:
         tools._run_shadow_and_report(
             "spawn_worker", "w-persist-1", "/tmp/repo",
             opus_result, [], "sys prompt", "user prompt",
+            db_path=_db_file_path(db_conn),
             test_mode=True,
         )
         row = db_conn.execute(
@@ -6851,6 +6860,7 @@ class TestShadowConcordancePersistence:
         tools._run_shadow_and_report(
             "kill_worker", "w-persist-2", "/tmp/repo",
             opus_result, [], "sys prompt", "user prompt",
+            db_path=_db_file_path(db_conn),
         )
         row = db_conn.execute(
             "SELECT shadow_grade, shadow_approved, concordance, confidence_in_disagreement, test_mode"
@@ -6871,6 +6881,45 @@ class TestShadowConcordancePersistence:
             r.levelname == "ERROR" and "Shadow grader thread failed" in r.message
             for r in caplog.records
         )
+
+    def test_concordance_insert_from_real_thread_persists_row(self, tools, db_conn, caplog):
+        """Anti-theatre: the concordance INSERT must work from the shadow
+        thread. Uses a REAL threading.Thread + REAL tmp-file DB — the
+        production failure was 'SQLite objects created in a thread can only
+        be used in that same thread', invisible to same-thread tests."""
+        tools._shadow_grader = MagicMock()
+        tools._shadow_grader.grade_with_tools.return_value = {
+            "grade": "A",
+            "approved": True,
+            "feedback": "gemma4 feedback",
+            "confidence_in_disagreement": None,
+            "tool_calls": [],
+        }
+        tools._slack = None
+        opus_result = {"grade": "A", "approved": True, "feedback": "opus feedback"}
+
+        with caplog.at_level("ERROR"):
+            thread = tools._fire_shadow_thread(
+                "kill_worker", "w-real-thread-1", "/tmp/repo",
+                opus_result, [], "sys prompt", "user prompt",
+            )
+            assert isinstance(thread, threading.Thread)
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+        assert not any(
+            r.levelname == "ERROR" and "Shadow grader thread failed" in r.message
+            for r in caplog.records
+        )
+
+        row = db_conn.execute(
+            "SELECT context, worker_id, opus_grade, opus_approved, shadow_grade,"
+            " shadow_approved, concordance"
+            " FROM shadow_concordance WHERE worker_id = ?",
+            ("w-real-thread-1",),
+        ).fetchone()
+        assert row is not None, "concordance row missing — INSERT from shadow thread failed"
+        assert tuple(row) == ("kill_worker", "w-real-thread-1", "A", 1, "A", 1, "A")
 
 
 class TestReadPmState:
@@ -7533,3 +7582,63 @@ class TestRestartWatchdogForkSafety:
             _restart_watchdog(12345, _signal.SIGHUP, status_file)
         mock_kill.assert_called_once_with(12345, _signal.SIGHUP)
         mock_logged_kill.assert_not_called()
+
+
+class TestShadowConcordanceStats:
+    def _seed(self, db_conn, **overrides):
+        row = dict(
+            context="ctx",
+            worker_id="w1",
+            opus_grade="A",
+            opus_approved=1,
+            shadow_grade="A",
+            shadow_approved=1,
+            concordance="A",
+            confidence_in_disagreement=None,
+            test_mode=0,
+            created_at="datetime('now')",
+        )
+        row.update(overrides)
+        created_at_expr = row.pop("created_at")
+        cols = ", ".join(row.keys())
+        placeholders = ", ".join("?" for _ in row)
+        db_conn.execute(
+            f"INSERT INTO shadow_concordance ({cols}, created_at) "
+            f"VALUES ({placeholders}, {created_at_expr})",
+            tuple(row.values()),
+        )
+
+    def test_aggregates_and_excludes_test_mode_and_old_rows(self, tools, db_conn):
+        self._seed(
+            db_conn,
+            concordance="A",
+            confidence_in_disagreement="high",
+            opus_grade="A",
+            shadow_grade="A",
+        )
+        self._seed(
+            db_conn,
+            concordance="B",
+            confidence_in_disagreement="low",
+            opus_grade="A",
+            shadow_grade="B",
+        )
+        self._seed(db_conn, test_mode=1)
+        self._seed(db_conn, created_at="datetime('now', '-30 days')")
+        db_conn.commit()
+
+        stats = tools.get_shadow_concordance_stats(days=7)
+
+        assert stats["total"] == 2
+        assert stats["by_concordance"] == {"A": 1, "B": 1}
+        assert stats["by_confidence"] == {"high": 1, "low": 1}
+        assert {"opus": "A", "shadow": "A", "count": 1} in stats["grade_pairs"]
+        assert {"opus": "A", "shadow": "B", "count": 1} in stats["grade_pairs"]
+
+    def test_error_dict_when_table_missing(self, tools, db_conn):
+        db_conn.execute("DROP TABLE shadow_concordance")
+        db_conn.commit()
+
+        stats = tools.get_shadow_concordance_stats()
+
+        assert "error" in stats

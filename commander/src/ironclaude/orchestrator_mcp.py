@@ -985,6 +985,7 @@ class OrchestratorTools:
         opus_tool_calls: list,
         system_prompt: str,
         user_prompt: str,
+        db_path: str | None = None,
         test_mode: bool = False,
     ) -> None:
         """Background thread: run shadow grade, compute concordance, post to Slack, persist."""
@@ -1000,17 +1001,27 @@ class OrchestratorTools:
                 self._slack.post_message(msg)
             else:
                 logger.info("Shadow concordance (no Slack): %s", msg)
-            if self._db is not None:
-                self._db.execute(
-                    "INSERT INTO shadow_concordance"
-                    " (context, worker_id, opus_grade, opus_approved, shadow_grade, shadow_approved,"
-                    " concordance, confidence_in_disagreement, test_mode)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (context, worker_id, opus_result.get("grade"), opus_result.get("approved"),
-                     shadow_result.get("grade"), shadow_result.get("approved"),
-                     concordance, shadow_result.get("confidence_in_disagreement"), int(test_mode)),
-                )
-                self._db.commit()
+            # sqlite3 connections are thread-bound; self._db belongs to the main
+            # thread and raises "SQLite objects created in a thread can only be
+            # used in that same thread" here (observed in production). Open a
+            # short-lived connection of our own — WAL mode (set by init_db) makes
+            # the concurrent writer safe.
+            if db_path:
+                conn = sqlite3.connect(db_path, timeout=5)
+                try:
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    conn.execute(
+                        "INSERT INTO shadow_concordance"
+                        " (context, worker_id, opus_grade, opus_approved, shadow_grade, shadow_approved,"
+                        " concordance, confidence_in_disagreement, test_mode)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (context, worker_id, opus_result.get("grade"), opus_result.get("approved"),
+                         shadow_result.get("grade"), shadow_result.get("approved"),
+                         concordance, shadow_result.get("confidence_in_disagreement"), int(test_mode)),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
         except Exception as e:
             logger.error("Shadow grader thread failed for %s/%s: %s", context, worker_id, e)
 
@@ -1024,15 +1035,26 @@ class OrchestratorTools:
         system_prompt: str,
         user_prompt: str,
         test_mode: bool = False,
-    ) -> None:
-        """Fire shadow grading in a background daemon thread."""
+    ) -> threading.Thread:
+        """Fire shadow grading in a background daemon thread. Returns the Thread
+        so callers (e.g. tests) can .join() it deterministically."""
+        # Resolve the DB file path on the main thread — self._db itself is
+        # thread-bound and must not be touched from the background thread.
+        db_path = None
+        if self._db is not None:
+            try:
+                row = self._db.execute("PRAGMA database_list").fetchone()
+                db_path = row[2] if row else None  # (seq, name, file)
+            except sqlite3.Error:
+                db_path = None
         t = threading.Thread(
             target=self._run_shadow_and_report,
             args=(context, worker_id, repo, opus_result, opus_tool_calls, system_prompt, user_prompt),
-            kwargs={"test_mode": test_mode},
+            kwargs={"db_path": db_path, "test_mode": test_mode},
             daemon=True,
         )
         t.start()
+        return t
 
     def get_operator_messages(
         self,
@@ -1339,6 +1361,50 @@ class OrchestratorTools:
                 self._slack.pin_message(message_ts)
 
         return {"status": "pending", "id": push_id, "expires_at": expires_at}
+
+    def get_shadow_concordance_stats(self, days: int = 7) -> dict:
+        """Aggregate shadow-grader concordance over the trailing window.
+
+        Returns {window_days, total, by_concordance, by_confidence,
+        grade_pairs} — production rows only (test_mode=0). Read-only; the
+        intended consumer is the brain's periodic 'should we change the
+        grader?' review after data has accumulated.
+        """
+        if self._db is None:
+            return {"error": "Database connection required"}
+        days = int(days)
+        window = f"-{days} days"
+        try:
+            by_concordance = dict(self._db.execute(
+                "SELECT concordance, COUNT(*) FROM shadow_concordance"
+                " WHERE test_mode=0 AND created_at >= datetime('now', ?)"
+                " GROUP BY concordance", (window,),
+            ).fetchall())
+            by_confidence = dict(self._db.execute(
+                "SELECT COALESCE(confidence_in_disagreement, 'unknown'), COUNT(*)"
+                " FROM shadow_concordance"
+                " WHERE test_mode=0 AND created_at >= datetime('now', ?)"
+                " GROUP BY confidence_in_disagreement", (window,),
+            ).fetchall())
+            grade_pairs = [
+                {"opus": r[0], "shadow": r[1], "count": r[2]}
+                for r in self._db.execute(
+                    "SELECT opus_grade, shadow_grade, COUNT(*)"
+                    " FROM shadow_concordance"
+                    " WHERE test_mode=0 AND created_at >= datetime('now', ?)"
+                    " GROUP BY opus_grade, shadow_grade ORDER BY COUNT(*) DESC",
+                    (window,),
+                ).fetchall()
+            ]
+        except sqlite3.Error as e:
+            return {"error": f"Concordance query failed: {e}"}
+        return {
+            "window_days": days,
+            "total": sum(by_concordance.values()),
+            "by_concordance": by_concordance,
+            "by_confidence": by_confidence,
+            "grade_pairs": grade_pairs,
+        }
 
     def get_directives(
         self,
@@ -4275,6 +4341,11 @@ def _create_mcp_server(tools: OrchestratorTools):
         if isinstance(result, dict):
             return json.dumps(result)
         return result
+
+    @mcp.tool()
+    def get_shadow_concordance_stats(days: int = 7) -> str:
+        """Read-only aggregate of shadow-grader concordance over the trailing window (days)."""
+        return json.dumps(tools.get_shadow_concordance_stats(days), indent=2)
 
     @mcp.tool()
     def get_directives(
