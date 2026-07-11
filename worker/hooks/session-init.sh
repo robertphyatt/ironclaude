@@ -134,6 +134,15 @@ if command -v sqlite3 &>/dev/null; then
       created_at       TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS tier_up_reviews (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      terminal_session TEXT NOT NULL,
+      plan_hash        TEXT NOT NULL,
+      reviewer_model   TEXT NOT NULL,
+      verdict          TEXT NOT NULL,
+      created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS tool_poll_state (
       terminal_session TEXT NOT NULL,
       tool_name TEXT NOT NULL,
@@ -160,6 +169,8 @@ if command -v sqlite3 &>/dev/null; then
       ON pending_subagent_parents(parent_session);
     CREATE INDEX IF NOT EXISTS idx_review_grades_session_wave
       ON review_grades(terminal_session, wave_number, task_boundary);
+    CREATE INDEX IF NOT EXISTS idx_tier_up_reviews_session_hash
+      ON tier_up_reviews(terminal_session, plan_hash);
     CREATE INDEX IF NOT EXISTS idx_poll_state_session
       ON tool_poll_state(terminal_session);
   " 2>/dev/null || true

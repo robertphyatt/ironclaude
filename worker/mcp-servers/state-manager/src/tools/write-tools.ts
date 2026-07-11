@@ -18,6 +18,7 @@ import type Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { createHash } from 'crypto';
 import type { PlanJson, Session, WaveTask, WorkflowStage } from '../types.js';
 import {
   getSession,
@@ -33,6 +34,8 @@ import {
   updateWaveTaskStatus,
   insertReviewGrade,
   clearReviewGrades,
+  insertTierUpReview,
+  getTierUpReviewByHash,
 } from '../db.js';
 import {
   validateWorkflowTransition,
@@ -89,6 +92,37 @@ function err(message: string, extra?: Record<string, unknown>): ToolResult {
       { type: 'text', text: JSON.stringify({ error: message, ...extra }, null, 2) },
     ],
   };
+}
+
+// ---------------------------------------------------------------------------
+// Tier-up review policy + plan hashing
+// ---------------------------------------------------------------------------
+
+export type TierUpPolicy = 'enforced' | 'commander-choice' | 'off';
+
+/**
+ * Resolve the tier-up review policy. Fail-secure: any missing/unreadable/invalid
+ * value resolves to 'enforced' — the safe failure is MORE review, never less.
+ * There is deliberately NO setter tool: the commander has no MCP write-path to
+ * this value; only a human editing the file on disk can change it.
+ */
+export function getTierUpPolicy(): TierUpPolicy {
+  const configPath = process.env.IRONCLAUDE_HOOKS_CONFIG_PATH
+    || path.join(os.homedir(), '.claude', 'ironclaude-hooks-config.json');
+  try {
+    const cfg = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    const v = cfg.tier_up_review_policy;
+    if (v === 'enforced' || v === 'commander-choice' || v === 'off') return v;
+    return 'enforced';
+  } catch {
+    return 'enforced';
+  }
+}
+
+/** SHA-256 of the exact stored plan JSON string. Both submit and the gate hash
+ *  the identical session.plan_json string, so an unchanged plan always matches. */
+export function hashPlan(planJson: string): string {
+  return createHash('sha256').update(planJson).digest('hex');
 }
 
 // ---------------------------------------------------------------------------
@@ -465,6 +499,24 @@ export const writeToolDefinitions = [
       idempotentHint: true,
     },
   },
+  {
+    name: 'submit_tier_up_review',
+    description:
+      'Records that a tier-up (higher-model, blind) review of the current plan was performed. ' +
+      'The server binds the record to sha256(session.plan_json). Called by executing-plans after ' +
+      'create_plan when tier_up_review_policy is enforced or commander-choice. Required (under ' +
+      'enforced policy) before start_execution will advance to executing.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        reviewer_model: { type: 'string' as const, description: 'The reviewer model used, e.g. "opus" or "fable".' },
+        verdict: { type: 'string' as const, description: 'The reviewer\'s summary verdict/label.' },
+      },
+      required: ['reviewer_model', 'verdict'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -605,11 +657,13 @@ export function handleWriteTool(
         return err('Session not found', { session_id: resolvedId });
       }
 
-      // Check workflow stage
-      const validStages: WorkflowStage[] = ['design_ready', 'design_marked_for_use', 'plan_ready', 'plan_marked_for_use'];
+      // Check workflow stage. 'final_plan_prep' is included so the executing-plans
+      // Revise flow can re-call create_plan to RELOAD a revised plan (rebuilding
+      // wave_tasks) before start_execution — otherwise the stale plan would execute.
+      const validStages: WorkflowStage[] = ['design_ready', 'design_marked_for_use', 'plan_ready', 'plan_marked_for_use', 'final_plan_prep'];
       if (!validStages.includes(session.workflow_stage)) {
         return err(
-          `Cannot create plan: workflow must be design_ready, design_marked_for_use, plan_ready, or plan_marked_for_use, currently ${session.workflow_stage}`,
+          `Cannot create plan: workflow must be design_ready, design_marked_for_use, plan_ready, plan_marked_for_use, or final_plan_prep, currently ${session.workflow_stage}`,
         );
       }
 
@@ -689,6 +743,27 @@ export function handleWriteTool(
 
       if (!transitionResult.valid) {
         return err(transitionResult.reason);
+      }
+
+      // ----- Tier-up review gate (policy-controlled, fail-secure) -----
+      if (getTierUpPolicy() === 'enforced') {
+        if (!session.plan_json) {
+          return err(
+            'BLOCKED — tier-up review gate: no plan loaded. Call create_plan first.',
+          );
+        }
+        const planHash = hashPlan(session.plan_json);
+        const review = getTierUpReviewByHash(db, resolvedId, planHash);
+        if (!review) {
+          return err(
+            'BLOCKED — tier-up review required (tier_up_review_policy=enforced). ' +
+            'Dispatch a blind higher-tier reviewer for THIS plan and call ' +
+            'submit_tier_up_review, then retry start_execution. If the plan changed ' +
+            'after a prior review, re-review is required (the hash no longer matches). ' +
+            'To change this requirement, a human must edit tier_up_review_policy in ' +
+            '~/.claude/ironclaude-hooks-config.json (the commander cannot change it).',
+          );
+        }
       }
 
       // Update workflow (clear stale review_pending from prior plans)
@@ -1387,6 +1462,46 @@ export function handleWriteTool(
       });
 
       return ok({ cleared: true, wave: session.current_wave, session_id: resolvedId });
+    }
+
+    // ----- submit_tier_up_review -----
+    case 'submit_tier_up_review': {
+      const reviewerModel = args.reviewer_model as string;
+      const verdict = args.verdict as string;
+      if (!reviewerModel || typeof reviewerModel !== 'string') {
+        return err('Missing or empty required parameter: reviewer_model');
+      }
+      if (!verdict || typeof verdict !== 'string') {
+        return err('Missing or empty required parameter: verdict');
+      }
+
+      const session = getSession(db, resolvedId);
+      if (!session) {
+        return err('Session not found', { session_id: resolvedId });
+      }
+      if (!session.plan_json) {
+        return err('Cannot submit tier-up review: no plan loaded (call create_plan first)');
+      }
+      const validStages: WorkflowStage[] = ['final_plan_prep', 'executing'];
+      if (!validStages.includes(session.workflow_stage)) {
+        return err(
+          `Cannot submit tier-up review: workflow must be final_plan_prep or executing, currently ${session.workflow_stage}`,
+        );
+      }
+
+      const planHash = hashPlan(session.plan_json);
+      insertTierUpReview(db, resolvedId, planHash, reviewerModel, verdict);
+
+      insertAuditLog(db, {
+        terminal_session: resolvedId,
+        actor: 'claude',
+        action: 'submit_tier_up_review',
+        old_value: null,
+        new_value: verdict,
+        context: `Tier-up review recorded (model=${reviewerModel}, plan_hash=${planHash.slice(0, 12)}…)`,
+      });
+
+      return ok({ success: true, plan_hash: planHash, reviewer_model: reviewerModel, session_id: resolvedId });
     }
 
     default:

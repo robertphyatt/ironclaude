@@ -20,6 +20,7 @@ import type {
   RegisteredDesign,
   SubagentSession,
   ReviewGradeEntry,
+  TierUpReviewEntry,
 } from './types.js';
 
 // --- Database path ---
@@ -284,6 +285,15 @@ export function initDb(dbPath?: string): Database.Database {
       created_at       TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS tier_up_reviews (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      terminal_session TEXT NOT NULL,
+      plan_hash        TEXT NOT NULL,
+      reviewer_model   TEXT NOT NULL,
+      verdict          TEXT NOT NULL,
+      created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS tool_poll_state (
       terminal_session TEXT NOT NULL,
       tool_name TEXT NOT NULL,
@@ -313,6 +323,8 @@ export function initDb(dbPath?: string): Database.Database {
       ON pending_subagent_parents(parent_session);
     CREATE INDEX IF NOT EXISTS idx_review_grades_session_wave
       ON review_grades(terminal_session, wave_number, task_boundary);
+    CREATE INDEX IF NOT EXISTS idx_tier_up_reviews_session_hash
+      ON tier_up_reviews(terminal_session, plan_hash);
     CREATE INDEX IF NOT EXISTS idx_poll_state_session
       ON tool_poll_state(terminal_session);
   `);
@@ -337,6 +349,13 @@ export function getDb(): Database.Database {
  * hook-layer sqlite3 reads see fresh data.
  */
 function walCheckpoint(db: Database.Database): void {
+  // A WAL checkpoint is flush *timing* only, never correctness. Running it while
+  // a transaction is open on this same connection throws SQLITE_LOCKED (the
+  // checkpoint can't acquire the lock the transaction holds) — which is exactly
+  // what create_plan's installPlan transaction (write-tools.ts) triggers via
+  // updateSession. Skip the checkpoint inside a transaction; it will happen on
+  // the next non-transactional write (or via autocheckpoint) instead.
+  if (db.inTransaction) return;
   db.pragma('wal_checkpoint(PASSIVE)');
 }
 
@@ -645,4 +664,32 @@ export function getLatestReviewGrade(
 export function clearReviewGrades(db: Database.Database, sessionId: string): void {
   db.prepare(`DELETE FROM review_grades WHERE terminal_session = ?`).run(sessionId);
   walCheckpoint(db);
+}
+
+// --- Tier-Up Reviews CRUD ---
+
+export function insertTierUpReview(
+  db: Database.Database,
+  sessionId: string,
+  planHash: string,
+  reviewerModel: string,
+  verdict: string,
+): void {
+  db.prepare(`
+    INSERT INTO tier_up_reviews (terminal_session, plan_hash, reviewer_model, verdict)
+    VALUES (?, ?, ?, ?)
+  `).run(sessionId, planHash, reviewerModel, verdict);
+  walCheckpoint(db);
+}
+
+export function getTierUpReviewByHash(
+  db: Database.Database,
+  sessionId: string,
+  planHash: string,
+): TierUpReviewEntry | undefined {
+  return db.prepare(`
+    SELECT * FROM tier_up_reviews
+    WHERE terminal_session = ? AND plan_hash = ?
+    ORDER BY created_at DESC LIMIT 1
+  `).get(sessionId, planHash) as TierUpReviewEntry | undefined;
 }

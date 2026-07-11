@@ -33,6 +33,15 @@ export interface ReviewGradeEntry {
   created_at: string;
 }
 
+export interface TierUpReviewEntry {
+  id: number;
+  terminal_session: string;
+  plan_hash: string;        // sha256 of session.plan_json at submit time
+  reviewer_model: string;   // e.g. "opus", "fable"
+  verdict: string;          // reviewer's summary verdict/label (free text)
+  created_at: string;
+}
+
 // --- Table row interfaces ---
 
 export interface Session {

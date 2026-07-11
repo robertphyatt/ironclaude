@@ -17,6 +17,37 @@ FILE_PATH=$(normalize_path "$FILE_PATH")
 
 SAFE_SESSION=$(echo "$SESSION_TAG" | sed "s/'/''/g")
 
+# ─── Human-only: never let the agent write the hooks-config file ───
+# tier_up_review_policy and other guardrail settings live here. The agent must
+# have no normal write-path to its own constraints (mirrors human-only PM
+# deactivation). Runs before the prof_mode branches, so it holds when PM is off.
+_HOOKS_CFG_BLOCK="BLOCKED — HUMAN-ONLY CONFIG
+
+~/.claude/ironclaude-hooks-config.json holds guardrail settings (including
+tier_up_review_policy) and can only be changed by a human editing it on disk.
+
+Do NOT write this file."
+# NotebookEdit is intentionally omitted: line-15 extracts FILE_PATH from
+# .tool_input.file_path // .tool_input.command only, so a NotebookEdit event
+# (which carries notebook_path) would never populate FILE_PATH here — listing it
+# would be dead/misleading. The Bash branch below covers any redirect-based write.
+if [[ "$TOOL_NAME" == "Edit" || "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "MultiEdit" ]]; then
+  _CANON=$(realpath -m "$FILE_PATH" 2>/dev/null || echo "$FILE_PATH")
+  # Match the canonical path OR the basename (BSD realpath -m may no-op on macOS,
+  # so also catch any path ending in the config filename).
+  if [[ "$_CANON" == "$HOME/.claude/ironclaude-hooks-config.json" || "$FILE_PATH" == *"ironclaude-hooks-config.json" ]]; then
+    block_pretooluse "professional-mode-guard" "$_HOOKS_CFG_BLOCK"
+  fi
+fi
+if [[ "$TOOL_NAME" == "Bash" ]]; then
+  # FILE_PATH holds the command string for Bash. Block common write vectors that
+  # reference the config file: redirects, tee, sed -i, cp/mv, ln/rsync, truncate, dd.
+  if echo "$FILE_PATH" | grep -q "ironclaude-hooks-config\.json" \
+     && echo "$FILE_PATH" | grep -qE '(>>?|\btee\b|\bsed\b[^|]*-i|\bdd\b|\bcp\b|\bmv\b|\bln\b|\brsync\b|\btruncate\b|\binstall\b)'; then
+    block_pretooluse "professional-mode-guard" "$_HOOKS_CFG_BLOCK"
+  fi
+fi
+
 # ─── Helper: query design/plan paths for SUGGESTED_NEXT_ACTION ───
 get_design_file() {
   sqlite3 "$DB_PATH" ".timeout 5000" \

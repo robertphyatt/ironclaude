@@ -12861,6 +12861,15 @@ function initDb(dbPath) {
       created_at       TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS tier_up_reviews (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      terminal_session TEXT NOT NULL,
+      plan_hash        TEXT NOT NULL,
+      reviewer_model   TEXT NOT NULL,
+      verdict          TEXT NOT NULL,
+      created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS tool_poll_state (
       terminal_session TEXT NOT NULL,
       tool_name TEXT NOT NULL,
@@ -12888,6 +12897,8 @@ function initDb(dbPath) {
       ON pending_subagent_parents(parent_session);
     CREATE INDEX IF NOT EXISTS idx_review_grades_session_wave
       ON review_grades(terminal_session, wave_number, task_boundary);
+    CREATE INDEX IF NOT EXISTS idx_tier_up_reviews_session_hash
+      ON tier_up_reviews(terminal_session, plan_hash);
     CREATE INDEX IF NOT EXISTS idx_poll_state_session
       ON tool_poll_state(terminal_session);
   `);
@@ -12895,6 +12906,7 @@ function initDb(dbPath) {
   return db;
 }
 function walCheckpoint(db) {
+  if (db.inTransaction) return;
   db.pragma("wal_checkpoint(PASSIVE)");
 }
 function logStateChange(sessionId, field, oldValue, newValue) {
@@ -13079,6 +13091,20 @@ function insertReviewGrade(db, sessionId, waveNumber, taskIds, grade, taskBounda
 function clearReviewGrades(db, sessionId) {
   db.prepare(`DELETE FROM review_grades WHERE terminal_session = ?`).run(sessionId);
   walCheckpoint(db);
+}
+function insertTierUpReview(db, sessionId, planHash, reviewerModel, verdict) {
+  db.prepare(`
+    INSERT INTO tier_up_reviews (terminal_session, plan_hash, reviewer_model, verdict)
+    VALUES (?, ?, ?, ?)
+  `).run(sessionId, planHash, reviewerModel, verdict);
+  walCheckpoint(db);
+}
+function getTierUpReviewByHash(db, sessionId, planHash) {
+  return db.prepare(`
+    SELECT * FROM tier_up_reviews
+    WHERE terminal_session = ? AND plan_hash = ?
+    ORDER BY created_at DESC LIMIT 1
+  `).get(sessionId, planHash);
 }
 
 // src/state-machine.ts
@@ -13969,6 +13995,7 @@ ${JSON.stringify({ results, passed, total }, null, 2)}`
 import path3 from "path";
 import fs3 from "fs";
 import os3 from "os";
+import { createHash } from "crypto";
 var _currentSessionId2 = null;
 function setCurrentSession2(sessionId) {
   _currentSessionId2 = sessionId;
@@ -13993,6 +14020,20 @@ function err(message, extra) {
       { type: "text", text: JSON.stringify({ error: message, ...extra }, null, 2) }
     ]
   };
+}
+function getTierUpPolicy() {
+  const configPath = process.env.IRONCLAUDE_HOOKS_CONFIG_PATH || path3.join(os3.homedir(), ".claude", "ironclaude-hooks-config.json");
+  try {
+    const cfg = JSON.parse(fs3.readFileSync(configPath, "utf-8"));
+    const v = cfg.tier_up_review_policy;
+    if (v === "enforced" || v === "commander-choice" || v === "off") return v;
+    return "enforced";
+  } catch {
+    return "enforced";
+  }
+}
+function hashPlan(planJson) {
+  return createHash("sha256").update(planJson).digest("hex");
 }
 var writeToolDefinitions = [
   {
@@ -14340,6 +14381,20 @@ var writeToolDefinitions = [
       destructiveHint: false,
       idempotentHint: true
     }
+  },
+  {
+    name: "submit_tier_up_review",
+    description: "Records that a tier-up (higher-model, blind) review of the current plan was performed. The server binds the record to sha256(session.plan_json). Called by executing-plans after create_plan when tier_up_review_policy is enforced or commander-choice. Required (under enforced policy) before start_execution will advance to executing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        reviewer_model: { type: "string", description: 'The reviewer model used, e.g. "opus" or "fable".' },
+        verdict: { type: "string", description: "The reviewer's summary verdict/label." }
+      },
+      required: ["reviewer_model", "verdict"],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false }
   }
 ];
 var writeToolNames = new Set(writeToolDefinitions.map((t) => t.name));
@@ -14438,33 +14493,36 @@ function handleWriteTool(name, args, db, sessionId) {
       if (!session) {
         return err("Session not found", { session_id: resolvedId });
       }
-      const validStages = ["design_ready", "design_marked_for_use", "plan_ready", "plan_marked_for_use"];
+      const validStages = ["design_ready", "design_marked_for_use", "plan_ready", "plan_marked_for_use", "final_plan_prep"];
       if (!validStages.includes(session.workflow_stage)) {
         return err(
-          `Cannot create plan: workflow must be design_ready, design_marked_for_use, plan_ready, or plan_marked_for_use, currently ${session.workflow_stage}`
+          `Cannot create plan: workflow must be design_ready, design_marked_for_use, plan_ready, plan_marked_for_use, or final_plan_prep, currently ${session.workflow_stage}`
         );
       }
       const wave1Tasks = computeNextWave(planJson, []);
-      updateSession(db, resolvedId, {
-        plan_json: JSON.stringify(planJson),
-        plan_name: planJson.name,
-        current_wave: 1,
-        workflow_stage: "final_plan_prep",
-        review_pending: 0
-      });
-      clearReviewGrades(db, resolvedId);
-      db.prepare("DELETE FROM wave_tasks WHERE terminal_session = ?").run(resolvedId);
-      for (const task of wave1Tasks) {
-        upsertWaveTask(db, {
-          terminal_session: resolvedId,
-          task_id: task.id,
-          wave_number: 1,
-          task_name: task.name,
-          description: task.description,
-          allowed_files: JSON.stringify(task.allowed_files),
-          status: "pending"
+      const installPlan = db.transaction(() => {
+        updateSession(db, resolvedId, {
+          plan_json: JSON.stringify(planJson),
+          plan_name: planJson.name,
+          current_wave: 1,
+          workflow_stage: "final_plan_prep",
+          review_pending: 0
         });
-      }
+        clearReviewGrades(db, resolvedId);
+        db.prepare("DELETE FROM wave_tasks WHERE terminal_session = ?").run(resolvedId);
+        for (const task of wave1Tasks) {
+          upsertWaveTask(db, {
+            terminal_session: resolvedId,
+            task_id: task.id,
+            wave_number: 1,
+            task_name: task.name,
+            description: task.description,
+            allowed_files: JSON.stringify(task.allowed_files),
+            status: "pending"
+          });
+        }
+      });
+      installPlan();
       insertAuditLog(db, {
         terminal_session: resolvedId,
         actor: "claude",
@@ -14500,6 +14558,20 @@ function handleWriteTool(name, args, db, sessionId) {
       );
       if (!transitionResult.valid) {
         return err(transitionResult.reason);
+      }
+      if (getTierUpPolicy() === "enforced") {
+        if (!session.plan_json) {
+          return err(
+            "BLOCKED \u2014 tier-up review gate: no plan loaded. Call create_plan first."
+          );
+        }
+        const planHash = hashPlan(session.plan_json);
+        const review = getTierUpReviewByHash(db, resolvedId, planHash);
+        if (!review) {
+          return err(
+            "BLOCKED \u2014 tier-up review required (tier_up_review_policy=enforced). Dispatch a blind higher-tier reviewer for THIS plan and call submit_tier_up_review, then retry start_execution. If the plan changed after a prior review, re-review is required (the hash no longer matches). To change this requirement, a human must edit tier_up_review_policy in ~/.claude/ironclaude-hooks-config.json (the commander cannot change it)."
+          );
+        }
       }
       updateSession(db, resolvedId, { workflow_stage: "executing", review_pending: 0 });
       insertAuditLog(db, {
@@ -14841,7 +14913,7 @@ function handleWriteTool(name, args, db, sessionId) {
       if (session.workflow_stage !== "reviewing") {
         const activeTaskCount = db.prepare(
           `SELECT COUNT(*) as count FROM wave_tasks
-           WHERE terminal_session = ? AND status IN ('pending', 'in_progress', 'review_pending')`
+           WHERE terminal_session = ? AND status IN ('pending', 'in_progress', 'submitted')`
         ).get(resolvedId).count;
         if (activeTaskCount > 0) {
           insertAuditLog(db, {
@@ -14861,7 +14933,7 @@ function handleWriteTool(name, args, db, sessionId) {
       }
       const passingReview = db.prepare(
         `SELECT 1 FROM review_grades
-         WHERE terminal_session = ? AND wave_number = ? AND grade IN ('A', 'B')
+         WHERE terminal_session = ? AND wave_number = ? AND grade IN ('A', 'B') AND task_boundary = 1
          ORDER BY created_at DESC LIMIT 1`
       ).get(resolvedId, session.current_wave);
       if (!passingReview) {
@@ -15062,6 +15134,41 @@ function handleWriteTool(name, args, db, sessionId) {
         context: `Cleared stale review_pending \u2014 0 submitted tasks in wave ${session.current_wave}`
       });
       return ok({ cleared: true, wave: session.current_wave, session_id: resolvedId });
+    }
+    // ----- submit_tier_up_review -----
+    case "submit_tier_up_review": {
+      const reviewerModel = args.reviewer_model;
+      const verdict = args.verdict;
+      if (!reviewerModel || typeof reviewerModel !== "string") {
+        return err("Missing or empty required parameter: reviewer_model");
+      }
+      if (!verdict || typeof verdict !== "string") {
+        return err("Missing or empty required parameter: verdict");
+      }
+      const session = getSession(db, resolvedId);
+      if (!session) {
+        return err("Session not found", { session_id: resolvedId });
+      }
+      if (!session.plan_json) {
+        return err("Cannot submit tier-up review: no plan loaded (call create_plan first)");
+      }
+      const validStages = ["final_plan_prep", "executing"];
+      if (!validStages.includes(session.workflow_stage)) {
+        return err(
+          `Cannot submit tier-up review: workflow must be final_plan_prep or executing, currently ${session.workflow_stage}`
+        );
+      }
+      const planHash = hashPlan(session.plan_json);
+      insertTierUpReview(db, resolvedId, planHash, reviewerModel, verdict);
+      insertAuditLog(db, {
+        terminal_session: resolvedId,
+        actor: "claude",
+        action: "submit_tier_up_review",
+        old_value: null,
+        new_value: verdict,
+        context: `Tier-up review recorded (model=${reviewerModel}, plan_hash=${planHash.slice(0, 12)}\u2026)`
+      });
+      return ok({ success: true, plan_hash: planHash, reviewer_model: reviewerModel, session_id: resolvedId });
     }
     default:
       throw new Error(`Unknown write tool: ${name}`);

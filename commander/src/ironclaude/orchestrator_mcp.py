@@ -390,6 +390,23 @@ def _init_brain_session_background(
         logger.warning(f"Brain session init sqlite error: {e}")
 
 
+def _int_env(name: str, default: int) -> int:
+    """Read an int from the environment, falling back to default on a missing
+    or non-integer value. A malformed override must not crash daemon startup."""
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Like _int_env, but floors the result at 1 — for values that must be a
+    positive count. A zero/negative override is clamped to 1 rather than
+    reaching (and crashing) a consumer like deque(maxlen=...), which raises
+    ValueError on a negative maxlen."""
+    return max(1, _int_env(name, default))
+
+
 class OrchestratorTools:
     """Business logic for orchestrator MCP tools.
 
@@ -398,6 +415,10 @@ class OrchestratorTools:
     """
 
     GRADER_TIMEOUT_SECONDS = 600
+    # Floor at 1 — a log-line count must be positive. A zero/negative override
+    # would otherwise reach TmuxManager.read_log_tail's deque(maxlen=...),
+    # which raises ValueError on a negative maxlen.
+    GRADER_LOG_MAX_LINES = _positive_int_env("GRADER_LOG_MAX_LINES", 500)
 
     def __init__(self, registry, tmux, ledger_path: str = "", grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "opus", opus_model: str = "opus", effort_level: str = "high", ssh_manager=None, config: dict | None = None, ollama_inventory=None, dispatch_cfg: dict | None = None):
         self.registry = registry
@@ -3470,13 +3491,25 @@ Grading criteria:
 
     def kill_worker(self, worker_id: str, original_objective: str = "", evidence: str = "") -> str | dict:
         """Kill a worker's tmux session and mark it completed."""
+        _kw = self.registry.get_worker(worker_id)
+        if _kw and _kw.get("machine"):
+            self._ensure_ssh_manager()
+        ssh_host = self._resolve_ssh_host(worker_id)
+        session_name = f"ic-{worker_id}"
+        remote_log_dir = None
+        if ssh_host:
+            machine = self._ssh_manager.get_machine(_kw["machine"]) if self._ssh_manager and _kw else None
+            remote_log_dir = machine.log_dir if machine else None
+
         # Inline grader enforcement — MCP grades automatically
         if original_objective and evidence:
             avatar_skill = _load_avatar_skill()
             system_prompt = f"""{avatar_skill}
 
-You are grading a kill_worker decision. You may use Read and Bash to investigate before responding. When ready,
-output ONLY a valid JSON object on a single line:
+You are grading a kill_worker decision. The worker's recent log is provided in the user
+message as a capped excerpt — evaluate log evidence from that excerpt, not by re-reading
+the log file. You may still use Read and Bash to investigate other evidence (diffs, test
+output). When ready, output ONLY a valid JSON object on a single line:
 {{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "specific feedback"}}
 
 Grading criteria:
@@ -3486,16 +3519,26 @@ Grading criteria:
 - D: Worker claimed done but evidence shows incomplete. approved=false
 - F: Work clearly not done. approved=false"""
 
+            try:
+                log_tail = self.tmux.read_log_tail(
+                    session_name, lines=self.GRADER_LOG_MAX_LINES,
+                    ssh_host=ssh_host, remote_log_dir=remote_log_dir,
+                )
+            except Exception as exc:  # a log-read failure must not abort the kill+grade
+                log_tail = f"(worker log unavailable — {type(exc).__name__}: {exc})"
             user_prompt = f"""Evaluate this kill_worker decision:
 
 worker_id: {worker_id}
 original_objective: {original_objective}
 evidence provided: {evidence}
 
-Has the worker genuinely completed its objective based on the evidence?"""
+Has the worker genuinely completed its objective based on the evidence?
+
+--- WORKER LOG (last {self.GRADER_LOG_MAX_LINES} lines) ---
+{log_tail}"""
 
             grade_result = self._call_grader(system_prompt, user_prompt)
-            _kw_repo = (self.registry.get_worker(worker_id) or {}).get("repo")
+            _kw_repo = (_kw or {}).get("repo")  # already fetched at method entry
             _opus_tool_calls = self._parse_tool_calls_from_delta(self._last_grader_delta)
             self._fire_shadow_thread("kill_worker", worker_id, _kw_repo, grade_result, _opus_tool_calls, system_prompt, user_prompt)
             if not grade_result["approved"]:
@@ -3512,11 +3555,6 @@ Has the worker genuinely completed its objective based on the evidence?"""
         else:
             logger.warning(f"kill_worker called without objective/evidence for '{worker_id}' — skipping grader")
 
-        _kw = self.registry.get_worker(worker_id)
-        if _kw and _kw.get("machine"):
-            self._ensure_ssh_manager()
-        ssh_host = self._resolve_ssh_host(worker_id)
-        session_name = f"ic-{worker_id}"
         pane_pid = self.tmux.list_pane_pid(session_name, ssh_host=ssh_host)
         self.tmux.kill_session(session_name, ssh_host=ssh_host)
         self.registry.update_worker_status(worker_id, "completed")

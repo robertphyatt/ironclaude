@@ -264,6 +264,8 @@ If `mcp__plugin_ironclaude_state-manager__mark_plan_ready` returns an error (wro
 
 Note: Do NOT call `mcp__plugin_ironclaude_state-manager__create_plan` here. That is called by executing-plans.
 
+Note: The higher-model plan review has been RELOCATED to the executing-plans skill (it now runs after `create_plan` loads the plan, gated by `tier_up_review_policy`). It is no longer part of writing-plans.
+
 ### Phase 5: Offer Execution Options
 
 **Step 6: Stage plan document**

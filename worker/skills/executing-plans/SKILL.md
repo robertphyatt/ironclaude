@@ -124,6 +124,86 @@ The MCP will:
 
 If validation fails, the MCP returns an error with specific issues. Fix the plan JSON and retry.
 
+**Step 1.5: Tier-up plan review (policy-gated)**
+
+Read `tier_up_review_policy` from `~/.claude/ironclaude-hooks-config.json` (if the
+`IRONCLAUDE_HOOKS_CONFIG_PATH` env var is set, read that path instead — this mirrors
+the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
+(fail-secure).
+
+- `off` → skip this step entirely; proceed to Step 2.
+- `commander-choice` → use AskUserQuestion ("Run a tier-up plan review before
+  execution? (default: yes)" / "Yes — run (Recommended)" | "No — skip"). If the user
+  declines, proceed to Step 2. If yes, run the review below.
+- `enforced` → always run the review below (no prompt). `start_execution` will
+  refuse to advance without it.
+
+**Run the review (commander-choice=yes or enforced):**
+
+1. Resolve the reviewer model one tier above your current model
+   (Sonnet→`opus`, Haiku→`sonnet`, Opus→`fable` UNLESS Fable is unavailable→`opus`,
+   Fable→top tier: see the note below). To check Fable availability, read the state
+   flag at `IRONCLAUDE_FABLE_STATE_PATH` if set else
+   `~/.ironclaude/state/fable_unavailable.json`; if it exists and `unavailable_until`
+   > the current epoch time, Fable is unavailable. Fail-safe: on any read error treat
+   Fable as available.
+2. Dispatch a fresh, blind reviewer with the Agent tool
+   (`subagent_type="general-purpose"`, `model=<resolved model>`), using this exact
+   prompt template (carried over verbatim from the former writing-plans Phase 4.5 —
+   do not paraphrase). It MUST NOT receive your rationale, this conversation,
+   prior-round findings, or a diff — it reviews the plan cold, report-only:
+   ```
+   You are reviewing an implementation plan with fresh eyes. You have NOT seen
+   this plan before and know nothing about how it was written.
+
+   Read these files:
+   - Plan (human): <PLAN_MD_PATH>
+   - Plan (machine): <PLAN_JSON_PATH>
+   - Design (source of intent): <DESIGN_MD_PATH>
+
+   Evaluate the plan against the design and these criteria:
+   - Design coverage: every component/requirement in the design has a
+     corresponding task; nothing silently dropped.
+   - Task ordering: depends_on is correct and cycle-free; foundations before
+     dependents; tests after the code they cover.
+   - allowed_files completeness: each task lists EVERY file its steps touch
+     (an omission blocks the task mid-execution under the file guard).
+   - Step granularity: steps are mechanical (exact paths, commands, code) —
+     not hand-waving like "add validation".
+   - TDD structure where the task involves executable code (RED→GREEN→stage),
+     or an explicit "No tests required: [reason]".
+   - JSON↔markdown consistency and schema validity.
+   - Hidden risks, ambiguities, or edge cases an implementer would trip on.
+
+   Output a verdict line (SOLID or HAS-ISSUES), then findings grouped
+   Critical / Important / Minor. Each finding cites a specific task/step and
+   states the concrete problem. IDENTIFY PROBLEMS ONLY — do not rewrite the
+   plan or propose fixes. Do not edit any files.
+   ```
+3. Present the findings (verdict + Critical/Important/Minor). The operator chooses
+   Revise / Proceed / Abort. On **Revise**: edit the plan files (`.md` + `.plan.json`)
+   to address the findings, re-stage, then **RE-CALL `create_plan` with the revised
+   plan JSON** — REQUIRED: `create_plan` reloads `session.plan_json` and rebuilds
+   `wave_tasks` from the revised plan (it is allowed from `final_plan_prep`). Without
+   it, the OLD plan executes and the fixes never run. Then dispatch a BRAND-NEW blind
+   reviewer against the revised plan (fresh context; never pass prior findings or a
+   diff) and, when the operator proceeds, call `submit_tier_up_review` again (it binds
+   to the NEW plan hash). After 3 rounds, note the count.
+4. When the operator proceeds, record the review:
+   `mcp__plugin_ironclaude_state-manager__submit_tier_up_review` with
+   `reviewer_model=<resolved model>` and `verdict=<reviewer's summary verdict>`.
+   The server binds it to sha256 of the loaded plan.
+
+**Top-tier note (Fable):** if your current model IS Fable, there is no tier above
+you. Display "Already at top model tier (Fable); no tier-up review available." Under
+`enforced`, still call `submit_tier_up_review` with `reviewer_model=fable`,
+`verdict=top-tier-self` so the gate can pass — a Fable commander needs no higher
+reviewer. Under `commander-choice`/`off`, skip.
+
+**Fail behavior under `enforced`:** if the reviewer model is genuinely unavailable
+and no review can be produced, `start_execution` will block. This is intentional —
+the human's lever is `tier_up_review_policy`. Report the block to the operator.
+
 **Step 2: Start execution**
 
 Call the MCP `mcp__plugin_ironclaude_state-manager__start_execution` tool to transition the workflow from plan_ready to executing.
