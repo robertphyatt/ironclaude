@@ -1,0 +1,65 @@
+{
+  "name": "Advisor Fallback Directive",
+  "goal": "Bake into IronClaude, as defined behavior shipped to all users, that when the harness-injected advisor tool is unavailable Claude spawns a Fable subagent to perform the same adversarial review instead of skipping it; then release as v1.0.20.",
+  "design_file": "docs/plans/2026-07-11-advisor-fallback-directive-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Add the directive to both behavioral.md files (+ presence guard)",
+      "description": "TDD. Create commander/tests/test_advisor_fallback_directive.py asserting the 'Advisor Fallback' directive names BOTH the preferred tier (model=fable) AND its required fallback (model=opus) in .claude/rules/behavioral.md and commander/src/brain/rules/behavioral.md (RED). Then append directive #10 to the canonical file and #23 to the brain copy — the directive text is tier-relative ('Fable if available, else Opus'), NOT a hard-coded fable, because Fable can be unavailable for the same reason the advisor is (GREEN). Run the guard green and stage.",
+      "allowed_files": [
+        ".claude/rules/behavioral.md",
+        "commander/src/brain/rules/behavioral.md",
+        "commander/tests/test_advisor_fallback_directive.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: create test_advisor_fallback_directive.py with test_directive_in_canonical_behavioral + test_directive_in_brain_behavioral (assert 'Advisor Fallback', 'model=fable' AND 'model=opus' present — the fallback tier must be named too)", "command": "cd commander && .venv/bin/python -m pytest tests/test_advisor_fallback_directive.py -q -p no:cacheprovider", "expected": "FAIL — directive not present yet"},
+        {"description": "GREEN: append directive #10 'Advisor Fallback' block to .claude/rules/behavioral.md (after #9 Right-Size Every Subagent)"},
+        {"description": "GREEN: append directive #23 'Advisor Fallback' one-paragraph entry to commander/src/brain/rules/behavioral.md (after #22)"},
+        {"description": "Run the guard — verify GREEN", "command": "cd commander && .venv/bin/python -m pytest tests/test_advisor_fallback_directive.py -q -p no:cacheprovider", "expected": "2 passed"},
+        {"description": "Stage", "command": "git add .claude/rules/behavioral.md commander/src/brain/rules/behavioral.md commander/tests/test_advisor_fallback_directive.py"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Add the directive to the activate-professional-mode skill (+ extend guard)",
+      "description": "TDD. Extend the guard with test_directive_in_activation_skill that asserts EACH of the four distinct edits individually (template line '9. **Advisor Fallback**', concept-table row '| 9 | Advisor Fallback |', 'Concept 9 (Advisor Fallback):' block, count strings '9 concepts' and '(9 principles)') plus the tier-relative fallback (both 'model=fable' AND 'model=opus') — a weak count() would pass with the propagation-vector table row omitted (RED). Then edit worker/skills/activate-professional-mode/SKILL.md: compact CLAUDE.md template one-liner, full behavioral.md template block, concept-detection table row 9, Concept 9 canonical-text block (PLAIN backtick fences — no zero-width space), and bump ALL THREE count-string occurrences 8->9 ('8 concepts', '(8 principles)', and both '8-principle template' at ~line 147 and ~line 232 via replace-all) (GREEN). Directive text is tier-relative (Fable if available, else Opus). Run the guard green and stage. Depends on Task 1 (both edit the test file).",
+      "allowed_files": [
+        "worker/skills/activate-professional-mode/SKILL.md",
+        "commander/tests/test_advisor_fallback_directive.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "RED: append test_directive_in_activation_skill asserting the FIVE distinct edits apart — compact one-liner ('**Advisor Fallback** — If the'), the two full-form blocks (count('just reason it through')>=2 distinguishes them from the compact line), table row ('| 9 | Advisor Fallback |'), Concept-9 header, count strings ('9 concepts','(9 principles)','9-principle template') — plus model=fable AND model=opus", "command": "cd commander && .venv/bin/python -m pytest tests/test_advisor_fallback_directive.py::test_directive_in_activation_skill -q -p no:cacheprovider", "expected": "FAIL — skill not updated yet"},
+        {"description": "GREEN: add '9. Advisor Fallback' one-liner to the compact CLAUDE.md template in SKILL.md"},
+        {"description": "GREEN: add the full '9. Advisor Fallback' block to the full behavioral.md template in SKILL.md"},
+        {"description": "GREEN: add table row '| 9 | Advisor Fallback | ... |' to the concept-detection table"},
+        {"description": "GREEN: add the 'Concept 9 (Advisor Fallback):' canonical-text fenced block after Concept 8"},
+        {"description": "GREEN: update count strings — 'the 8 concepts'->'the 9 concepts', '(8 principles)'->'(9 principles)', '8-principle template'->'9-principle template'"},
+        {"description": "Run the full guard — verify GREEN", "command": "cd commander && .venv/bin/python -m pytest tests/test_advisor_fallback_directive.py -q -p no:cacheprovider", "expected": "3 passed"},
+        {"description": "Stage", "command": "git add worker/skills/activate-professional-mode/SKILL.md commander/tests/test_advisor_fallback_directive.py"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "v1.0.20 release prep",
+      "description": "No tests required: version bump + documentation. Bump 1.0.19 -> 1.0.20 in commander/pyproject.toml, worker/.claude-plugin/plugin.json, .claude-plugin/marketplace.json (plugins[0].version); in CHANGELOG rename '## [Unreleased]' -> '## 1.0.20', add a one-paragraph summary + an '### Added' entry for the Advisor Fallback directive, AND fix the carried-over Deploy line (which said 'daemon code only, no hook/skill/plugin change') to reflect that this release also changes the activate-professional-mode skill/plugin (needs plugin update + /reload-plugins). Verify test_version_consistency.py green. Depends on Task 2.",
+      "allowed_files": [
+        "commander/pyproject.toml",
+        "worker/.claude-plugin/plugin.json",
+        ".claude-plugin/marketplace.json",
+        "CHANGELOG.md"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {"description": "Bump commander/pyproject.toml version = \"1.0.19\" -> \"1.0.20\""},
+        {"description": "Bump worker/.claude-plugin/plugin.json \"version\": \"1.0.19\" -> \"1.0.20\""},
+        {"description": "Bump .claude-plugin/marketplace.json plugins[0].version \"1.0.19\" -> \"1.0.20\""},
+        {"description": "CHANGELOG.md: (a) rename '## [Unreleased]' -> '## 1.0.20'; (b) add a one-paragraph 1.0.20 summary (house style); (c) add an '### Added' entry for the Advisor Fallback directive (tier-relative fable-or-opus); (d) FIX the now-false Deploy line — the carried-over 'daemon code only ... no hook/skill/plugin change' becomes 'restart daemon + claude plugin update + /reload-plugins' because this release edits the activate-professional-mode skill (plugin) and bumps the plugin version"},
+        {"description": "Verify version lockstep", "command": "cd commander && .venv/bin/python -m pytest tests/test_version_consistency.py -q -p no:cacheprovider", "expected": "1 passed (all three sources = 1.0.20)"},
+        {"description": "Stage", "command": "git add commander/pyproject.toml worker/.claude-plugin/plugin.json .claude-plugin/marketplace.json CHANGELOG.md"}
+      ]
+    }
+  ]
+}

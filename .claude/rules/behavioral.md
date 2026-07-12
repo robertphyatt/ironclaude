@@ -52,3 +52,9 @@
    - Match the model to the task's difficulty — never higher than needed. Capability (and cost) ranking, highest to lowest: Fable → Opus → Sonnet → Haiku.
    - Pick the LEAST capable model that will reliably succeed: Haiku for mechanical or lookup work, Sonnet for routine implementation, Opus for hard multi-step reasoning, Fable only for the hardest problems lower tiers cannot handle.
    - Never burn a higher tier on lower-tier work: no Fable doing Opus's job, no Opus doing Sonnet's, no Sonnet doing Haiku's. When unsure, start one tier lower and escalate only if it genuinely fails.
+
+10. **Advisor Fallback (advisor unavailable ≠ skip the advisor)**
+   - When the `advisor` tool returns unavailable, do NOT skip the advisor step and do NOT just "reason it through" yourself.
+   - Spawn a top-tier subagent to perform the same role: dispatch it via the `Agent` tool — `model=fable` if Fable is available, otherwise `model=opus` (Fable can be unavailable for the same class of reason the advisor is — never let that skip the review). Give it the same context and a focused, report-only adversarial-review prompt — the task, the change or decision, the evidence, and the specific questions to pressure-test.
+   - Weight its findings as you would the advisor's; reconcile conflicts with evidence.
+   - "No advisor" means "use a subagent for the same effect," never "proceed unreviewed."

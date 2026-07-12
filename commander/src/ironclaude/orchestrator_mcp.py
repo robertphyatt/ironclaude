@@ -18,10 +18,10 @@ import json
 import logging
 import os
 import re
-import secrets
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -70,9 +70,6 @@ _ALLOWED_NAMED_KEYS = frozenset({
 # interpreted by tmux as Ctrl-/Meta- chords, letting the navigation-only
 # send_keys tool kill/suspend/EOF a worker. Deny them regardless of case.
 _CONTROL_KEY_RE = re.compile(r'^[CM]-.', re.IGNORECASE)
-
-_GRADER_DEBUG = bool(os.environ.get('GRADER_DEBUG'))
-_GRADER_DEBUG_LOG = '/tmp/grader-debug.log'
 
 
 def _validate_keys(keys: list[str]) -> None:
@@ -324,7 +321,7 @@ def _init_brain_session_background(
     Called from main() in a daemon thread. Polls for the PPID-keyed session ID
     file written by session-init.sh, then writes professional_mode='off' to
     ~/.claude/ironclaude.db using the same INSERT OR IGNORE + UPDATE pattern
-    as _deactivate_pm_via_sqlite.
+    as _set_pm_via_sqlite.
 
     Args:
         ppid: Claude CLI PID (os.getppid() from main() — our direct parent).
@@ -353,7 +350,7 @@ def _init_brain_session_background(
         )
         return
 
-    # Mirror of _deactivate_pm_via_sqlite Step 3 — direct UUID, no tmux needed
+    # INSERT OR IGNORE + UPDATE the session row directly by UUID (no tmux needed)
     try:
         with sqlite3.connect(str(db_path), timeout=5) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -414,7 +411,7 @@ class OrchestratorTools:
     All methods are synchronous and raise exceptions on error.
     """
 
-    GRADER_TIMEOUT_SECONDS = 600
+    GRADER_TIMEOUT_SECONDS = 120  # hard subprocess kill; typical grade ~40s (was a 600s false poll-timeout)
     # Floor at 1 — a log-line count must be positive. A zero/negative override
     # would otherwise reach TmuxManager.read_log_tail's deque(maxlen=...),
     # which raises ValueError on a negative maxlen.
@@ -424,8 +421,6 @@ class OrchestratorTools:
         self.registry = registry
         self.tmux = tmux
         self.ledger_path = ledger_path
-        self._grader_session = "ic-grader"
-        self._grader_ready = False
         self._grader_lock = threading.Lock()
         self._grader_home = os.path.expanduser(grader_home)
         self._grader_model = grader_model
@@ -651,259 +646,164 @@ class OrchestratorTools:
             })
         return {"machines": result}
 
-    def _is_grader_alive(self) -> bool:
-        """Check if grader tmux session has a live process."""
-        if not self.tmux.has_session(self._grader_session):
-            return False
-        result = subprocess.run(
-            ["tmux", "list-panes", "-t", self._grader_session, "-F", "#{pane_pid}"],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            return False
-        pane_pid = result.stdout.strip()
-        if not pane_pid:
-            return False
-        result = subprocess.run(
-            ["pgrep", "-P", pane_pid],
-            capture_output=True,
-        )
-        return result.returncode == 0
+    _GRADER_VERDICT_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
+            "approved": {"type": "boolean"},
+            "feedback": {"type": "string"},
+            "recommended_model": {"type": "string"},
+        },
+        "required": ["grade", "approved", "feedback"],
+        "additionalProperties": False,
+    }
 
-    def _ensure_grader(self) -> bool:
-        """Ensure the persistent grader tmux session is running.
+    # Every env var that could route the grader off the Claude Max subscription:
+    # API-key/token (metered API billing), base-URL (the local worker path exports
+    # ANTHROPIC_BASE_URL=<ollama-url>), and the Bedrock/Vertex provider switches.
+    # Stripping all of them guarantees grading always runs on Max.
+    _GRADER_ENV_STRIP = (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+    )
 
-        Lazily spawns a Claude Opus session on first call.
-        Detects zombie sessions (tmux exists but process dead) and re-spawns.
-        Truncates log before spawn to prevent stale readiness matches.
-        Returns True if grader is ready, False on failure.
-        """
-        # Fast path: grader known-ready and process alive
-        if self._grader_ready and self._is_grader_alive():
-            return True
+    def _grader_env(self) -> dict:
+        """Env for the grader subprocess. Strips every provider/billing routing var
+        (see _GRADER_ENV_STRIP) so grading always uses the Claude Max subscription and
+        can never be misrouted to Ollama/Bedrock/Vertex or metered API billing. Pins
+        the reasoning-effort level."""
+        env = dict(os.environ)
+        for var in self._GRADER_ENV_STRIP:
+            env.pop(var, None)
+        env["CLAUDE_CODE_EFFORT_LEVEL"] = self._effort_level
+        return env
 
-        # Kill zombie session if it exists but process is dead
-        if self.tmux.has_session(self._grader_session):
-            logger.warning("Grader session exists but process is dead — killing zombie")
-            self.tmux.kill_session(self._grader_session)
-        self._grader_ready = False
-
-        # Truncate stale log before spawning fresh grader
-        log_path = self.tmux.get_log_path(self._grader_session)
-        open(log_path, "w").close()
-
-        return self._spawn_grader()
-
-    def _spawn_grader(self) -> bool:
-        """Inject trust, spawn the grader session, and wait for readiness.
-
-        Called by _ensure_grader after zombie cleanup and log truncation.
-        Returns True if grader is ready, False on failure.
-        """
-        # Inject trust entry immediately before spawn (lazy import avoids circular dep)
-        from ironclaude.main import ensure_brain_trusted
-        ensure_brain_trusted(self._grader_home)
-
-        # Spawn fresh session with grader's own working directory
-        success = self.tmux.spawn_session(
-            self._grader_session,
-            f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model '{self._grader_model}[1m]' --dangerously-skip-permissions",
-            cwd=self._grader_home,
-        )
-        if not success:
-            logger.warning("Failed to spawn grader tmux session")
-            return False
-
-        # Wait for Claude CLI to be ready (look for prompt indicator)
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            output = self.tmux.read_log_tail(self._grader_session, lines=50)
-            if output and ("\u2771" in output or ">" in output or "\u276f" in output or "waiting for your" in output.lower()):
-                # Deactivate professional mode so hooks don't interfere with grading
-                if self._deactivate_pm_via_sqlite(self._grader_session, timeout=120) is not None:
-                    logger.warning("Failed to deactivate PM on grader — killing session")
-                    self.tmux.kill_session(self._grader_session)
-                    return False
-                self._grader_ready = True
-                return True
-            time.sleep(2)
-
-        logger.warning("Grader session timed out waiting for ready")
-        return False
-
-    def _wait_for_grader_clear(self, timeout: int = 10) -> bool:
-        """Wait for grader to finish processing /clear command.
-
-        Polls log for prompt indicator confirming context was reset.
-        Returns True when detected, False on timeout.
-        """
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            output = self.tmux.read_log_tail(self._grader_session, lines=50)
-            if output and ("\u2771" in output or "\u276f" in output or ">" in output or "waiting for your" in output.lower()):
-                return True
-            time.sleep(0.5)
-        logger.warning("Grader /clear timed out after %ds", timeout)
-        return False
-
-    def _do_grader_send_and_poll(self, system_prompt: str, user_prompt: str, batch: bool = False) -> dict | list | None:
-        """Send prompt to grader tmux session and poll for JSON response.
-
-        Called from _call_grader with _grader_lock already held. Returns parsed
-        result dict/list on success, or None on timeout. Sends /clear in both cases.
-        """
-        nonce = secrets.token_hex(8)
-        combined = (
-            f"{system_prompt}\n\n---\n\n{user_prompt}\n\n"
-            f"Respond with ONLY valid JSON, no markdown fences: "
-            f'{{\"grade\": \"A|B|C|D|F\", \"approved\": true|false, \"feedback\": \"...\", \"recommended_model\": \"claude-sonnet|claude-opus|claude-fable\"}}\n\n'
-            f"Begin your JSON response after the delimiter: GRADER_RESPONSE_{nonce}"
-        )
-        self.tmux.send_keys(self._grader_session, combined)
-
-        start_time = time.time()
-        deadline = start_time + self.GRADER_TIMEOUT_SECONDS
-        delimiter = f"GRADER_RESPONSE_{nonce}"
-        while time.time() < deadline:
-            try:
-                current = self.tmux.capture_pane(self._grader_session, lines=500)
-            except Exception:
-                time.sleep(2)
-                continue
-            delta = current
-
-            # Only search for JSON after the nonce delimiter to prevent echo injection
-            delimiter_pos = delta.rfind(delimiter)
-            if delimiter_pos == -1:
-                time.sleep(2)
-                continue
-            post_delimiter = delta[delimiter_pos + len(delimiter):]
-
-            if _GRADER_DEBUG:
-                try:
-                    with open(_GRADER_DEBUG_LOG, 'a') as _dbg:
-                        _dbg.write(
-                            f"--- grader-debug {time.time():.0f} ---\n"
-                            f"  capture_len={len(current)}\n"
-                            f"  post_delim_head={repr(post_delimiter[:200])}\n"
-                        )
-                except OSError:
-                    pass
-
-            # Batch mode: extract JSON array of grade objects
-            if batch:
-                array_match = re.search(r'\[.*\]', post_delimiter, re.DOTALL)
-                if array_match:
-                    try:
-                        results = json.loads(array_match.group())
-                        if isinstance(results, list) and results:
-                            self._last_grader_delta = delta
-                            self.tmux.send_keys(self._grader_session, "/clear")
-                            self._wait_for_grader_clear()
-                            logger.debug("Grader responded in %.1fs", time.time() - start_time)
-                            return results
-                    except json.JSONDecodeError:
-                        pass
-
-            # Look for JSON with grade/approved/feedback fields
-            json_match = re.search(
-                r'\{[^{}]*"grade"\s*:\s*"[ABCDF]"[^{}]*"approved"\s*:\s*(?:true|false)[^{}]*"feedback"\s*:\s*"[^"]*"[^{}]*\}',
-                post_delimiter,
-            )
-            if json_match:
-                if _GRADER_DEBUG:
-                    try:
-                        with open(_GRADER_DEBUG_LOG, 'a') as _dbg:
-                            _dbg.write(f"  json_raw={repr(json_match.group())}\n")
-                    except OSError:
-                        pass
-                try:
-                    result = json.loads(json_match.group())
-                    self._last_grader_delta = delta
-                    self.tmux.send_keys(self._grader_session, "/clear")
-                    self._wait_for_grader_clear()
-                    logger.debug("Grader responded in %.1fs", time.time() - start_time)
-                    if _GRADER_DEBUG:
-                        try:
-                            with open(_GRADER_DEBUG_LOG, 'a') as _dbg:
-                                _dbg.write(f"  feedback={repr(result.get('feedback', ''))}\n")
-                        except OSError:
-                            pass
-                    return {
-                        "grade": result.get("grade", "F"),
-                        "approved": result.get("approved", False),
-                        "feedback": result.get("feedback", ""),
-                    }
-                except json.JSONDecodeError:
-                    # Grader emitted invalid JSON (e.g. unescaped quotes in feedback)
-                    # Extract fields individually via targeted regex
-                    raw = json_match.group()
-                    grade_m = re.search(r'"grade"\s*:\s*"([ABCDF])"', raw)
-                    approved_m = re.search(r'"approved"\s*:\s*(true|false)', raw)
-                    feedback_m = re.search(
-                        r'"feedback"\s*:\s*"(.*?)"(?=\s*,\s*"recommended_model"|\s*\})',
-                        raw,
-                        re.DOTALL,
-                    )
-                    if grade_m and approved_m:
-                        self._last_grader_delta = delta
-                        self.tmux.send_keys(self._grader_session, "/clear")
-                        self._wait_for_grader_clear()
-                        logger.debug("Grader responded in %.1fs", time.time() - start_time)
-                        if _GRADER_DEBUG:
-                            try:
-                                with open(_GRADER_DEBUG_LOG, 'a') as _dbg:
-                                    _dbg.write(
-                                        f"  feedback_fallback={repr(feedback_m.group(1) if feedback_m else '')}\n"
-                                    )
-                            except OSError:
-                                pass
-                        return {
-                            "grade": grade_m.group(1),
-                            "approved": approved_m.group(1) == "true",
-                            "feedback": feedback_m.group(1) if feedback_m else "",
-                        }
-
-            time.sleep(2)
-
-        self._last_grader_delta = ""
-        self.tmux.send_keys(self._grader_session, "/clear")
-        self._wait_for_grader_clear()
-        return None
+    @staticmethod
+    def _grader_failure(batch: bool, feedback: str):
+        f = {"grade": "F", "approved": False, "feedback": feedback}
+        return [f] if batch else f
 
     def _call_grader(self, system_prompt: str, user_prompt: str, batch: bool = False) -> dict | list:
-        """Send grading prompt to persistent grader worker, read response.
+        """Grade via a per-call ``claude -p`` headless subprocess with no file/exec tools.
 
-        Sends the prompt to the ic-grader tmux session, polls the log
-        for a JSON response, then sends /clear to reset context.
-        Retries once with a fresh grader session on timeout.
+        The grading prompt goes on stdin (it may be large — hundreds of KB); the system
+        prompt via a temp file; the verdict is a schema-validated object the CLI returns
+        via a ``StructuredOutput`` tool call, surfaced in the ``structured_output`` field
+        of the ``type=="result"`` element of the ``--output-format json`` event array
+        (some CLI builds emit a single result object instead of an array — both are
+        handled). A hard ``subprocess.run(timeout=...)`` kills a hung grade
+        deterministically instead of freezing the brain for up to 20 minutes.
 
-        When batch=True, expects a JSON array response and returns a list of
-        grade dicts. Falls back to grade F dict on any error or timeout.
+        All file/exec tools are disallowed, so the grader evaluates ONLY from the inline
+        evidence in the prompt and ordinary Bash/Read/Write-targeted hooks never fire
+        (note: it is not literally tool-free — it makes the one StructuredOutput verdict
+        call, so a catch-all PreToolUse hook could still block it). A prompt that
+        legitimately needs longer than GRADER_TIMEOUT_SECONDS is killed → grade F; the
+        prompt length is logged on timeout so systematic F-on-large-prompt is diagnosable.
+        Falls back to grade F on any timeout/error — never raises to the caller.
+
+        When batch=True the schema is an OBJECT wrapping the verdict array
+        (`{"verdicts": [...]}`, because the API rejects a top-level array schema); the
+        unwrapped list of verdicts is returned.
         """
+        from ironclaude.main import ensure_brain_trusted
+        # The Anthropic tool input_schema (what --json-schema becomes) MUST be a
+        # top-level object — a top-level array is rejected (400 ...type: 'object').
+        # So batch mode wraps the verdict array in an object with a `verdicts` key.
+        schema = ({
+            "type": "object",
+            "properties": {"verdicts": {"type": "array", "items": self._GRADER_VERDICT_SCHEMA}},
+            "required": ["verdicts"],
+            "additionalProperties": False,
+        } if batch else self._GRADER_VERDICT_SCHEMA)
         with self._grader_lock:
-            if not self._ensure_grader():
-                return {"grade": "F", "approved": False, "feedback": "Grader session failed to start"}
+            self._last_grader_delta = ""  # tool-free grader makes no tool calls; nothing to scrape
+            sysfile = None
+            try:
+                ensure_brain_trusted(self._grader_home)
+                with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as sf:
+                    sf.write(system_prompt)
+                    sysfile = sf.name
+                cmd = [
+                    "claude", "-p",
+                    "--system-prompt-file", sysfile,
+                    "--output-format", "json",
+                    "--json-schema", json.dumps(schema),
+                    "--model", f"{self._grader_model}[1m]",
+                    "--dangerously-skip-permissions",
+                    # --dangerously-skip-permissions is required for a non-interactive
+                    # run, so the grader must be starved of every mutating/agentic tool
+                    # by name (the prompt embeds worker-controlled log text — treat it as
+                    # untrusted). --strict-mcp-config drops the plugin MCP servers so no
+                    # `mcp__*` state-manager mutators are reachable; the disallow list
+                    # removes the built-in file/exec tools AND the agentic ones (Skill,
+                    # Workflow, worktree, cron, wakeup, remote-trigger, messaging). The
+                    # StructuredOutput verdict tool is intentionally NOT disallowed.
+                    "--strict-mcp-config",
+                    "--disallowedTools",
+                    "Task,Bash,Read,Edit,Write,NotebookEdit,Grep,Glob,WebFetch,WebSearch,"
+                    "Skill,Workflow,ToolSearch,SendMessage,EnterWorktree,ExitWorktree,"
+                    "CronCreate,CronDelete,CronList,ScheduleWakeup,RemoteTrigger",
+                ]
+                proc = subprocess.run(
+                    cmd, input=user_prompt, cwd=self._grader_home, env=self._grader_env(),
+                    capture_output=True, text=True, timeout=self.GRADER_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "Grader subprocess timed out after %ds (prompt %d chars) — grade F",
+                    self.GRADER_TIMEOUT_SECONDS, len(user_prompt),
+                )
+                return self._grader_failure(batch, f"Grader timed out after {self.GRADER_TIMEOUT_SECONDS}s")
+            except Exception as exc:  # noqa: BLE001 — a grader failure must never crash the caller
+                logger.warning("Grader subprocess error: %s", exc)
+                return self._grader_failure(batch, f"Grader subprocess error: {exc}")
+            finally:
+                if sysfile is not None:
+                    try:
+                        os.unlink(sysfile)
+                    except OSError:
+                        pass
 
-            attempt_start = time.time()
-            result = self._do_grader_send_and_poll(system_prompt, user_prompt, batch)
-            if result is not None:
-                return result
-
-            elapsed = time.time() - attempt_start
-            self._grader_ready = False
-            logger.warning("Grader timed out after %.1fs, retrying with fresh session", elapsed)
-            if not self._ensure_grader():
-                return {"grade": "F", "approved": False, "feedback": "Grader session failed to restart after timeout"}
-
-            attempt_start = time.time()
-            result = self._do_grader_send_and_poll(system_prompt, user_prompt, batch)
-            if result is not None:
-                return result
-
-            self._grader_ready = False
-            logger.warning("Grader timed out on retry after %ds", self.GRADER_TIMEOUT_SECONDS)
-            return {"grade": "F", "approved": False, "feedback": f"Grader timed out after {self.GRADER_TIMEOUT_SECONDS}s"}
+            if proc.returncode != 0:
+                return self._grader_failure(batch, f"Grader exited {proc.returncode}: {proc.stderr[:300]}")
+            # `claude -p --output-format json` normally emits a JSON ARRAY of events; the
+            # type=="result" element carries the schema verdict in structured_output. Some
+            # CLI builds emit a single result OBJECT instead — handle both shapes so a CLI
+            # version change cannot silently degrade every grade to F.
+            try:
+                payload = json.loads(proc.stdout)
+                if isinstance(payload, dict):
+                    result_event = payload if (
+                        payload.get("type") == "result" or "structured_output" in payload
+                    ) else None
+                else:
+                    result_event = next(
+                        (e for e in payload if isinstance(e, dict) and e.get("type") == "result"), None
+                    )
+                out = result_event.get("structured_output") if result_event else None
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                out = None
+            if out is None:
+                return self._grader_failure(batch, f"Grader produced no structured_output: {proc.stdout[:300]}")
+            if batch:
+                # batch schema wraps the array in an object: {"verdicts": [...]}
+                verdicts = out.get("verdicts") if isinstance(out, dict) else None
+                return verdicts if isinstance(verdicts, list) else self._grader_failure(
+                    True, f"Grader batch output missing 'verdicts' list: {str(out)[:200]}")
+            if not isinstance(out, dict):
+                # non-batch schema is an object; a non-dict slipping through would make
+                # out.get(...) raise and crash the caller — return F instead.
+                return self._grader_failure(False, f"Grader verdict not an object: {out!r}"[:300])
+            return {
+                "grade": out.get("grade", "F"),
+                "approved": out.get("approved", False),
+                "feedback": out.get("feedback", ""),
+                **({"recommended_model": out["recommended_model"]} if "recommended_model" in out else {}),
+            }
 
     def _call_local_grader(self, system_prompt: str, user_prompt: str, format_schema: dict) -> dict:
         """Call Ollama for local grading. Delegates to self._local_grader."""
@@ -1853,12 +1753,6 @@ class OrchestratorTools:
                 time.sleep(1)
         return last_error
 
-    def _deactivate_pm_via_sqlite(
-        self, session_name: str, timeout: int = 30, _claude_dir: Path | None = None
-    ) -> str | None:
-        """Deactivate professional mode by writing 'off' to ironclaude.db."""
-        return self._set_pm_via_sqlite(session_name, "off", timeout, _claude_dir)
-
     def _ensure_claude_md_remote(self, repo: str, ssh_host: str) -> None:
         """Ensure remote repo has a CLAUDE.md for clean PM activation."""
         if self.tmux.file_exists(os.path.join(repo, "CLAUDE.md"), ssh_host=ssh_host):
@@ -2216,9 +2110,9 @@ class OrchestratorTools:
         avatar_skill = _load_avatar_skill().replace("{OPERATOR_NAME}", self._operator_name)
         system_prompt = f"""{avatar_skill}
 
-You are grading a spawn_worker decision. You may use Read and Bash to investigate before responding. When ready,
-output ONLY a valid JSON object on a single line:
-{{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "specific feedback"}}
+You are grading a spawn_worker decision. You have NO tools — evaluate ONLY from the
+evidence provided in this prompt. Your verdict is returned as structured JSON with
+fields: {{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "specific feedback"}}
 
 Grading criteria:
 - A: Specific objective (file paths, success criteria, constraints), correct worker type. approved=true
@@ -2685,23 +2579,35 @@ Model recommendation (include "recommended_model" in your JSON response):
         # Phase 2: Batch uncertain requests to Opus
         if uncertain_indices:
             # Build batch system prompt for Opus (only uncertain subset)
-            opus_system_prompt = f"""{avatar_skill}
-
-You are grading {len(uncertain_indices)} spawn_worker decisions. Respond with a valid JSON ARRAY — one object per decision:
-[{{"worker_id": "...", "grade": "A|B|C|D|F", "approved": true|false, "feedback": "...", "recommended_model": "claude-sonnet|claude-opus|ollama"}}, ...]
-
-Grading criteria (apply to EACH decision independently):
+            grading_criteria = f"""Grading criteria (apply to EACH decision independently):
 - A: Specific objective (file paths, success criteria, constraints), correct worker type. approved=true
 - B: Minor issues but fundamentally sound. approved=true
 - C: Missing constraints, weak objective, vague success criteria. approved=false
 - D: Significant problems — wrong approach, scaffolding thinking. approved=false
 - F: Fundamentally wrong — violates {self._operator_name}'s principles. approved=false
 
-Model recommendation (include "recommended_model" for each):
+Model recommendation (include "recommended_model"):
 - claude-sonnet: single-file changes, config updates, bug fixes with clear root cause
 - claude-opus: multi-file refactors (5+ files), architectural changes, complex debugging
 - claude-fable: highest capability — architectural decisions requiring maximum reasoning
 - ollama: single-file edits only, concrete action verb, explicit success condition"""
+
+            # NOTE: the verdict schema is strict (additionalProperties: false), so the
+            # prompt must NOT ask for keys the schema forbids (e.g. worker_id). Batch
+            # results are merged positionally, so per-object order — not an id — is what matters.
+            opus_system_prompt = f"""{avatar_skill}
+
+You are grading {len(uncertain_indices)} spawn_worker decisions. Respond with a JSON object whose `verdicts` array holds one object per decision, in the SAME ORDER as presented below (results are matched positionally; do NOT add extra keys such as worker_id):
+{{"verdicts": [{{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "...", "recommended_model": "claude-sonnet|claude-opus|claude-fable|ollama"}}, ...]}}
+
+{grading_criteria}"""
+
+            opus_single_system_prompt = f"""{avatar_skill}
+
+You are grading a spawn_worker decision. Your verdict is a JSON object:
+{{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "...", "recommended_model": "claude-sonnet|claude-opus|claude-fable|ollama"}}
+
+{grading_criteria}"""
 
             decisions_text = ""
             for j, idx in enumerate(uncertain_indices, 1):
@@ -2714,17 +2620,22 @@ Model recommendation (include "recommended_model" for each):
 
             user_prompt = f"Evaluate these {len(uncertain_indices)} spawn decisions:{decisions_text}"
 
-            # Try batch grading for uncertain subset
-            opus_results = self._call_grader(opus_system_prompt, user_prompt, batch=True)
+            # Batch-grade the uncertain subset in one call — but ONLY when there are 2+.
+            # A batch of one has no efficiency benefit and its length-1 result would be
+            # indistinguishable from a grader-failure F list (which would slip past the
+            # length check below), so grade a lone decision individually instead.
+            if len(uncertain_indices) >= 2:
+                opus_results = self._call_grader(opus_system_prompt, user_prompt, batch=True)
+            else:
+                opus_results = None
 
-            # Validate batch response — must be a list with correct length
+            # Validate batch response — must be a list with correct length; else grade each individually
             if not isinstance(opus_results, list) or len(opus_results) != len(uncertain_indices):
-                # Fallback: grade each uncertain request individually
-                logger.warning("Batch grading returned invalid response — falling back to individual grading")
+                logger.warning("Grading %d uncertain spawn decision(s) individually", len(uncertain_indices))
                 opus_results = []
                 for idx in uncertain_indices:
                     req = requests[idx]
-                    individual_result = self._call_grader(opus_system_prompt, f"Evaluate this spawn decision:\n\n"
+                    individual_result = self._call_grader(opus_single_system_prompt, f"Evaluate this spawn decision:\n\n"
                         f"worker_id: {req['worker_id']}\nworker_type: {req['worker_type']}\n"
                         f"repo: {req['repo']}\nobjective: {req['objective']}")
                     if isinstance(individual_result, dict):
@@ -2904,9 +2815,9 @@ Model recommendation (include "recommended_model" for each):
         avatar_skill = _load_avatar_skill().replace("{OPERATOR_NAME}", self._operator_name)
         system_prompt = f"""{avatar_skill}
 
-You are grading a plan approval request. You may use Read and Bash to investigate before responding. When ready,
-output ONLY a valid JSON object on a single line:
-{{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "specific feedback"}}
+You are grading a plan approval request. You have NO tools — evaluate ONLY from the
+evidence provided in this prompt. Your verdict is returned as structured JSON with
+fields: {{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "specific feedback"}}
 
 Grading criteria — evaluate philosophical depth of engagement, not message count:
 - A: Brain demonstrated genuine avatar engagement — challenged design assumptions, evaluated alternatives, made architectural decisions, drew on project knowledge. approved=true
@@ -3489,7 +3400,7 @@ Grading criteria:
             "recent_output": recent_output,
         }
 
-    def kill_worker(self, worker_id: str, original_objective: str = "", evidence: str = "") -> str | dict:
+    def kill_worker(self, worker_id: str, original_objective: str = "", evidence: str = "", directive_id: int | None = None) -> str | dict:
         """Kill a worker's tmux session and mark it completed."""
         _kw = self.registry.get_worker(worker_id)
         if _kw and _kw.get("machine"):
@@ -3501,16 +3412,30 @@ Grading criteria:
             machine = self._ssh_manager.get_machine(_kw["machine"]) if self._ssh_manager and _kw else None
             remote_log_dir = machine.log_dir if machine else None
 
+        directive_completed = False
+        if directive_id is not None:
+            if self._db is None:
+                logger.warning("directive_id %s given but no DB handle — grading normally", directive_id)
+            else:
+                try:
+                    row = self._db.execute(
+                        "SELECT status FROM directives WHERE id = ?", (directive_id,)
+                    ).fetchone()
+                    directive_completed = bool(row and row["status"] == "completed")
+                except Exception as exc:
+                    logger.warning(f"directive_id lookup failed for {directive_id}: {exc}")
+
         # Inline grader enforcement — MCP grades automatically
-        if original_objective and evidence:
+        if directive_completed:
+            logger.info(f"kill_worker fast-path: directive {directive_id} already completed — skipping grader")
+        elif original_objective and evidence:
             avatar_skill = _load_avatar_skill()
             system_prompt = f"""{avatar_skill}
 
-You are grading a kill_worker decision. The worker's recent log is provided in the user
-message as a capped excerpt — evaluate log evidence from that excerpt, not by re-reading
-the log file. You may still use Read and Bash to investigate other evidence (diffs, test
-output). When ready, output ONLY a valid JSON object on a single line:
-{{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "specific feedback"}}
+You are grading a kill_worker decision. You have NO tools — evaluate ONLY from the
+evidence provided in this prompt (the worker's recent log is included as a capped
+excerpt in the user message). Your verdict is returned as structured JSON with
+fields: {{"grade": "A|B|C|D|F", "approved": true|false, "feedback": "specific feedback"}}
 
 Grading criteria:
 - A: All success criteria verified with concrete evidence (diffs, timestamps, test results). approved=true
@@ -4216,9 +4141,14 @@ def _create_mcp_server(tools: OrchestratorTools):
         return tools.get_worker_log(worker_id, lines)
 
     @mcp.tool()
-    def kill_worker(worker_id: str, original_objective: str = "", evidence: str = "") -> str:
-        """Kill a worker's tmux session and mark it completed. Use after reviewing worker log."""
-        result = tools.kill_worker(worker_id, original_objective, evidence)
+    def kill_worker(worker_id: str, original_objective: str = "", evidence: str = "", directive_id: int | None = None) -> str:
+        """Kill a worker's tmux session and mark it completed. Use after reviewing worker log.
+
+        directive_id: Optional id of the directive this worker was fulfilling. When set and
+            that directive's status is 'completed', the grader is skipped and the kill is
+            approved immediately. Otherwise grading proceeds as before.
+        """
+        result = tools.kill_worker(worker_id, original_objective, evidence, directive_id)
         if isinstance(result, dict):
             return json.dumps(result)
         return result

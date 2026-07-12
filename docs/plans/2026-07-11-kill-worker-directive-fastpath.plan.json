@@ -1,0 +1,48 @@
+{
+  "name": "kill_worker Directive Fast-Path",
+  "goal": "Add an optional directive_id parameter to kill_worker so it skips the Opus grader when the directive is already marked completed.",
+  "design_file": "docs/plans/2026-07-11-kill-worker-directive-fastpath-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Add directive fast-path to kill_worker",
+      "description": "Add directive_id param to kill_worker (class method + MCP wrapper) in orchestrator_mcp.py; skip grader when directives.status == 'completed' for that id; two new tests in test_orchestrator_mcp.py cover both branches.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add test_kill_worker_fast_path_skips_grader_when_directive_completed (must pass non-empty original_objective/evidence so a broken fast-path would fall through to the elif and call the grader, making the test capable of failing) and test_kill_worker_directive_not_completed_still_calls_grader to class TestInlineGraderEnforcement in commander/tests/test_orchestrator_mcp.py, after test_kill_without_evidence_skips_grader (line 2393)"
+        },
+        {
+          "description": "Run the two new tests, verify they fail with TypeError (directive_id not yet a valid kwarg)",
+          "command": "cd commander && python -m pytest tests/test_orchestrator_mcp.py -k \"test_kill_worker_fast_path_skips_grader_when_directive_completed or test_kill_worker_directive_not_completed_still_calls_grader\" -v",
+          "expected": "FAILED — TypeError: kill_worker() got an unexpected keyword argument 'directive_id'"
+        },
+        {
+          "description": "Add directive_id: int | None = None param to kill_worker class method (orchestrator_mcp.py:3492); add directive_completed lookup (try/except SELECT status FROM directives WHERE id = ?) before the existing grader block; change `if original_objective and evidence:` to `elif` with the new `if directive_completed:` branch first"
+        },
+        {
+          "description": "Add matching directive_id param to the kill_worker MCP tool wrapper (orchestrator_mcp.py:4218-4224), pass through to tools.kill_worker(...), update docstring"
+        },
+        {
+          "description": "Run the two new tests again, verify they pass",
+          "command": "cd commander && python -m pytest tests/test_orchestrator_mcp.py -k \"test_kill_worker_fast_path_skips_grader_when_directive_completed or test_kill_worker_directive_not_completed_still_calls_grader\" -v",
+          "expected": "2 passed"
+        },
+        {
+          "description": "Run the full commander test suite to confirm no regressions",
+          "command": "cd commander && python -m pytest tests/ -x",
+          "expected": "all tests pass"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "both files staged"
+        }
+      ]
+    }
+  ]
+}

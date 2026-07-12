@@ -1,0 +1,43 @@
+{
+  "name": "Grader Transport claude -p (tool-free)",
+  "goal": "Replace the inline Opus grader's tmux-pane-scraping transport with a per-grade tool-free `claude -p` subprocess (schema JSON output + hard subprocess timeout), fixing the false-F grades and the ~20-min daemon/brain freeze while preserving Claude Max billing.",
+  "design_file": "docs/plans/2026-07-11-grader-transport-claude-p-design.md",
+  "estimated_memory_gb": 2.0,
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Rewrite _call_grader to a tool-free claude -p subprocess (atomic refactor)",
+      "description": "Atomic refactor of the grader transport in orchestrator_mcp.py: rewrite _call_grader to run `claude -p --output-format json --json-schema <verdict>` as a subprocess (prompt via stdin, system prompt via --system-prompt-file, --model <grader>[1m], TOOL-FREE, cwd=grader_home, env with ANTHROPIC_API_KEY/AUTH_TOKEN stripped for Max billing), wrapped in subprocess.run(timeout=GRADER_TIMEOUT_SECONDS) for a hard kill. Change GRADER_TIMEOUT_SECONDS 600->120. Delete the tmux transport functions (_ensure_grader, _spawn_grader, _is_grader_alive, _do_grader_send_and_poll, _wait_for_grader_clear) + nonce/_grader_ready + set _last_grader_delta='' (tool-free grader makes no tool calls). Signature/return of _call_grader unchanged so callers + shadow grader are untouched. MUST also delete the now-obsolete transport tests and add new subprocess-mocked tests in the SAME task (deleting the functions breaks their tests, so test surgery lands with the impl). TDD: write TestCallGraderSubprocess first (RED), implement, delete obsolete tests, run the full orchestrator suite GREEN. Step 0 FIRST: confirm exact `claude -p` flags via `claude -p --help` (do not guess flag names / the structured_output envelope field).",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_debug_log.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Step 0 HARD GATE: confirm the real claude -p flag/field names (--output-format json, --json-schema, --system-prompt-file, --model, the tool-disable flag, and the envelope field carrying schema output e.g. structured_output). Unit tests mock subprocess so a wrong name is only caught by the Step 6b smoke test — reflect confirmed names in code, do not guess", "command": "claude -p --help", "expected": "flag/field names confirmed"},
+        {"description": "Write TestCallGraderSubprocess (RED): structured_output->verdict, TimeoutExpired->F, nonzero->F, missing structured_output->F, batch->list, ANTHROPIC_API_KEY stripped, prompt via stdin + model pinned, AND test_sets_effort_level_env (I6); also add TestGraderPromptsToolFree.test_no_grader_system_prompt_instructs_read_and_bash (C1)", "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_orchestrator_mcp.py::TestCallGraderSubprocess tests/test_orchestrator_mcp.py::TestGraderPromptsToolFree -q", "expected": "FAIL (subprocess internals not implemented; prompts still say Read and Bash)"},
+        {"description": "Add _GRADER_VERDICT_SCHEMA + _grader_env + _grader_failure helpers and rewrite _call_grader body (lines ~874-906) to the claude -p subprocess per the plan"},
+        {"description": "Change GRADER_TIMEOUT_SECONDS at orchestrator_mcp.py:417 from 600 to 120"},
+        {"description": "C1: make all THREE grader system prompts tool-free — remove 'use Read and Bash' at :2219 (spawn), :2907 (approve_plan), :3523 (kill_worker); replace with 'evaluate ONLY from the evidence in this prompt; you have no tools'", "command": "grep -n \"Read and Bash\" commander/src/ironclaude/orchestrator_mcp.py", "expected": "no output after the edits"},
+        {"description": "Delete _ensure_grader, _spawn_grader, _is_grader_alive, _do_grader_send_and_poll, _wait_for_grader_clear, _grader_ready, the _grader_session='ic-grader' attr (~:427, M-1), the _GRADER_DEBUG/_GRADER_DEBUG_LOG module globals (only used by the deleted poll fn, M-2), nonce/secrets usage (grep secrets first; remove import), AND _deactivate_pm_via_sqlite (~:1856, only caller is deleted _spawn_grader:723; :327/:356 are comments in a different function that stays). Keep _grader_lock/_grader_model/_grader_home/_effort_level/_parse_tool_calls_from_delta/shadow path"},
+        {"description": "Delete/retarget obsolete tests by EXACT NAME (they span classes — I5): TestPersistentGrader (test_ensure_grader_*, test_wait_for_grader_clear_*, test_deactivate_pm_via_sqlite [C3], old _call_grader poll/clear/nonce tests); TestEffortLevel (test_grader_spawn_includes_effort_level, test_grader_spawn_uses_effort_override); TestCallGraderLocking (test_grader_ready_reset_on_timeout — KEEP sibling test_grader_lock_attribute_exists); whole TestDoGraderSendAndPoll. Retarget TestCallGraderBatch (~:6299-6331; it mocks _ensure_grader/_wait_for_grader_clear/capture_pane + patches secrets.token_hex — C2) to mock subprocess.run returning an array structured_output. C-1: ALSO delete the ENTIRE obsolete commander/tests/test_orchestrator_debug_log.py (its sole class TestDoGraderDebugLog tests the deleted _do_grader_send_and_poll + _GRADER_DEBUG globals + patches secrets.token_hex)", "command": "git rm commander/tests/test_orchestrator_debug_log.py", "expected": "file removed"},
+        {"description": "Run the FULL commander suite GREEN at this task's boundary (I1 — not just one file, so obsolete-test breakage cannot hide until Task 2)", "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest -q", "expected": "green (or only the known pre-existing thread-leak flake)"},
+        {"description": "Step 6b REQUIRED smoke test (I4 — only real-CLI check; unit tests mock subprocess): run one real claude -p with the verdict schema and confirm structured_output returns a grade/approved/feedback object promptly (not a 120s hang). Use the CONFIGURED grader model (self._grader_model, e.g. opus — NOT an env var; M-3). If flag/field names differ, fix the code and re-run the suite. Do NOT stage until a real verdict is observed", "command": "printf '%s' 'Objective: say ok. Evidence: done.' | claude -p --output-format json --json-schema '{\"type\":\"object\",\"properties\":{\"grade\":{\"type\":\"string\",\"enum\":[\"A\",\"B\",\"C\",\"D\",\"F\"]},\"approved\":{\"type\":\"boolean\"},\"feedback\":{\"type\":\"string\"}},\"required\":[\"grade\",\"approved\",\"feedback\"]}' --model opus --dangerously-skip-permissions", "expected": "JSON stdout with structured_output verdict; prompt exit"},
+        {"description": "Stage", "command": "git add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "CHANGELOG + full verification",
+      "description": "Add a CHANGELOG entry describing the grader transport replacement (tool-free claude -p + schema JSON + hard 120s timeout; fixes false-F grades and the ~20-min freeze; Max billing preserved; tmux grader machinery removed; deploy = restart daemon). Do NOT change version numbers unless the operator asks. Run the full commander suite for regressions. No tests required for the CHANGELOG edit (documentation).",
+      "allowed_files": ["CHANGELOG.md"],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Add the CHANGELOG entry (under [Unreleased] or a patch heading; no version bump) with the deploy note (restart daemon) AND the behavior-change callouts: grader is now tool-free / reduced rigor (no independent diff read), and the shadow-report 'Opus tool calls' column is now always empty (M7)"},
+        {"description": "Run the full commander test suite", "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest -q", "expected": "green (or only the known pre-existing thread-leak flake test_send_to_worker_mcp_wrapper_returns_str_on_rejection, which passes standalone)"},
+        {"description": "Stage", "command": "git add CHANGELOG.md"}
+      ]
+    }
+  ]
+}

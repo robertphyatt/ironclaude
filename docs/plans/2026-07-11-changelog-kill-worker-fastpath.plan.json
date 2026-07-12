@@ -1,0 +1,20 @@
+{
+  "name": "CHANGELOG kill_worker fast-path entry",
+  "goal": "Document the already-staged kill_worker directive fast-path in the v1.0.20 CHANGELOG so the release note matches what ships.",
+  "design_file": "docs/plans/2026-07-11-changelog-kill-worker-fastpath-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Add the kill_worker fast-path CHANGELOG bullet",
+      "description": "No tests required: documentation-only. Append one bullet to the existing '### Added' block under '## 1.0.20' in CHANGELOG.md, after the Advisor Fallback bullet, describing the kill_worker directive_id fast-path (opt-in, backward-compatible, graceful-degrade) and its deliberate enforcement-relaxation caveat. The kill_worker code + tests are already staged (concurrent worker); this task adds only the release note. Verify version_consistency still green and stage.",
+      "allowed_files": ["CHANGELOG.md"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Append the kill_worker fast-path bullet to the ## 1.0.20 ### Added block (after the Advisor Fallback bullet)"},
+        {"description": "Verify the section reads correctly", "command": "sed -n '/## 1.0.20/,/## 1.0.19/p' CHANGELOG.md", "expected": "### Added has both the Advisor Fallback and kill_worker bullets, ahead of ### Changed"},
+        {"description": "Confirm version lockstep still green", "command": "cd commander && .venv/bin/python -m pytest tests/test_version_consistency.py -q -p no:cacheprovider", "expected": "1 passed"},
+        {"description": "Stage", "command": "git add CHANGELOG.md"}
+      ]
+    }
+  ]
+}

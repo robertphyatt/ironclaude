@@ -59,6 +59,7 @@ Create CLAUDE.md with the compact template (using the Write tool):
 6. **Search Before Guessing** — After compaction, search episodic memory first. Use `ironclaude:search-conversations`.
 7. **Subagent Discipline** — One task, one deliverable, set max_turns. No orchestration in subagents.
 8. **No Sycophantic Responses** — No performative agreement; push back with evidence; verify corrections.
+9. **Advisor Fallback** — If the `advisor` tool is unavailable, spawn a top-tier subagent (`Agent`, `model=fable` if Fable is available else `model=opus`) to do the same adversarial review; never skip the advisor step.
 
 Full behavioral rules: [`.claude/rules/behavioral.md`](.claude/rules/behavioral.md)
 ```
@@ -112,18 +113,23 @@ Then create `.claude/rules/behavioral.md` with the full canonical principles (us
    - If you disagree with review feedback, push back with evidence
    - Before implementing a correction, verify the correction is actually correct
    - Forbidden phrases: "Great point", "You're right", "Good catch", "Absolutely", "That's a great suggestion"
+
+9. **Advisor Fallback**
+   - When the `advisor` tool returns unavailable, do NOT skip the advisor step or just reason it through yourself
+   - Spawn a top-tier subagent via the `Agent` tool (`model=fable` if Fable is available, else `model=opus`) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
+   - Weight its findings as you would the advisor's; "no advisor" means "use a subagent for the same effect," never "proceed unreviewed"
 ```
 
 Display:
 ```
-Created CLAUDE.md (compact index) + .claude/rules/behavioral.md (8 principles)
+Created CLAUDE.md (compact index) + .claude/rules/behavioral.md (9 principles)
 ```
 
 Continue to Step 3.5.
 
 **If CLAUDE.md exists:**
 
-Perform semantic concept analysis. Use the Read tool to check `.claude/rules/behavioral.md` directly (this is the only rules file written by the activation skill). For each of the 8 concepts below, check the entire CLAUDE.md AND `.claude/rules/behavioral.md` (if it exists) and determine whether it's already covered — regardless of heading text, section structure, or wording. A concept is "covered" if CLAUDE.md or `.claude/rules/behavioral.md` contains instructions, rules, or guidance that address the same intent, even if expressed differently. When uncertain, err on the side of "covered" (don't add) rather than "missing" (add redundant content).
+Perform semantic concept analysis. Use the Read tool to check `.claude/rules/behavioral.md` directly (this is the only rules file written by the activation skill). For each of the 9 concepts below, check the entire CLAUDE.md AND `.claude/rules/behavioral.md` (if it exists) and determine whether it's already covered — regardless of heading text, section structure, or wording. A concept is "covered" if CLAUDE.md or `.claude/rules/behavioral.md` contains instructions, rules, or guidance that address the same intent, even if expressed differently. When uncertain, err on the side of "covered" (don't add) rather than "missing" (add redundant content).
 
 | # | Concept | Covered if the file contains... |
 |---|---------|----------------------------------|
@@ -135,6 +141,7 @@ Perform semantic concept analysis. Use the Read tool to check `.claude/rules/beh
 | 6 | Search Before Guessing | Instructions to search episodic memory or conversation history before making assumptions after compaction |
 | 7 | Subagent Discipline | Instructions about keeping subagent prompts focused, setting max_turns, or avoiding orchestration in subagents |
 | 8 | No Sycophantic Responses | Instructions to avoid performative agreement, push back with evidence when disagreeing, or verify corrections before implementing them |
+| 9 | Advisor Fallback | Instructions to substitute a subagent (Fable if available, else Opus) for the advisor's review when the `advisor` tool is unavailable, rather than skipping the review |
 
 Also check whether the workflow requirement concept (all changes must follow brainstorm → write-plans → execute-plans, no exceptions) is expressed anywhere in CLAUDE.md or `.claude/rules/behavioral.md`.
 
@@ -144,7 +151,7 @@ Also check whether the workflow requirement concept (all changes must follow bra
 
 Write missing concepts to `.claude/rules/behavioral.md`:
 
-- If `.claude/rules/behavioral.md` does not exist: create it with the full 8-principle template (same template as in the "CLAUDE.md doesn't exist" path above — use the Write tool).
+- If `.claude/rules/behavioral.md` does not exist: create it with the full 9-principle template (same template as in the "CLAUDE.md doesn't exist" path above — use the Write tool).
 - If `.claude/rules/behavioral.md` exists: append the missing concept(s) to the end of the file using the Edit tool.
 
 Do NOT append numbered directives to CLAUDE.md.
@@ -218,6 +225,14 @@ N. **No Sycophantic Responses**
    - Forbidden phrases: "Great point", "You're right", "Good catch", "Absolutely", "That's a great suggestion"
 ```
 
+Concept 9 (Advisor Fallback):
+```
+N. **Advisor Fallback**
+   - When the `advisor` tool returns unavailable, do NOT skip the advisor step or just reason it through yourself
+   - Spawn a top-tier subagent via the `Agent` tool (`model=fable` if Fable is available, else `model=opus`) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
+   - Weight its findings as you would the advisor's; "no advisor" means "use a subagent for the same effect," never "proceed unreviewed"
+```
+
 Display: `Added missing directive(s) to .claude/rules/behavioral.md: [list of concept names]`
 
 **If workflow requirement is missing:**
@@ -229,7 +244,7 @@ Prepend at the top of the file (before any existing content):
 
 Display: `Added workflow requirement directive`
 
-**Edge case:** If CLAUDE.md exists but has no numbered directives at all, create `.claude/rules/behavioral.md` with the full 8-principle template (do not modify CLAUDE.md).
+**Edge case:** If CLAUDE.md exists but has no numbered directives at all, create `.claude/rules/behavioral.md` with the full 9-principle template (do not modify CLAUDE.md).
 
 **Error handling:** If Write/Edit to CLAUDE.md fails (permissions, etc.), display the error and continue with activation. CLAUDE.md upgrade is best-effort, not a blocker for professional mode.
 
