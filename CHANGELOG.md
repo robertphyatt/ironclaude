@@ -13,6 +13,17 @@
 
 _Nothing yet._
 
+## 1.0.21
+
+A GBTW stop-hook fix so a worker legitimately waiting on a persistent `Monitor` is no longer falsely blocked with "TASKS STILL IN PROGRESS," plus a brain-notification fix for the turn-in-progress context when the token count is zero.
+
+### Fixed
+- **GBTW tasks-in-progress gate is now Monitor-aware.** The hard "TASKS STILL IN PROGRESS" gate in `get-back-to-work-claude.sh` only suppressed on completion-aware background Agent/Bash jobs (`_gbtw_extract_in_flight`), which is blind to a persistent `Monitor` — so a worker watching a long-running suite via a Monitor was blocked on every stop and thrashed against the block-throttle for the run's duration. Added `_gbtw_recent_waiting_tool` (detects `Monitor`/`ScheduleWakeup`/`TaskOutput`/`AskUserQuestion` in the last 3 assistant turns) and wired it into the gate (gate = classifier OR helper). Gate-only: the continuation check already handles Monitor and is left untouched; `run_in_background` is deliberately excluded from the helper (it is covered completion-aware by the classifier, so matching it here would leave the gate suppressed for up to 3 turns after a bg job finished). Unit-tested via the `GBTW_TEST_MODE` seam (`worker/hooks/tests/test-gbtw-waiting.sh` + 8 fixtures); the existing in-flight suite stays green. **Deploy:** `make deploy-hooks` to copy the hook into `~/.claude/ironclaude-hooks/`.
+- **Brain notifications surface turn-in-progress context when the token count is zero.** `notifications.py`/`brain_client.py` previously suppressed the turn-in-progress context on a zero token count; it now surfaces correctly. Covered by `test_notifications.py` / `test_brain_client.py`.
+
+### Changed
+- Version is 1.0.21 across `pyproject.toml`, `plugin.json`, and `marketplace.json`.
+
 ## 1.0.20
 
 A grader-transport overhaul (the inline grader now runs a tool-free `claude -p` subprocess with a hard timeout instead of scraping a persistent tmux pane) plus a new **Advisor Fallback** behavioral directive that makes "advisor unavailable" mean "spawn a top-tier subagent for the same review," never "skip it."

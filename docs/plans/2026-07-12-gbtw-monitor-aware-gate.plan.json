@@ -1,0 +1,61 @@
+{
+  "name": "GBTW Monitor-Aware Tasks-In-Progress Gate",
+  "goal": "Stop the GBTW hook blocking a worker with 'TASKS STILL IN PROGRESS' when it is legitimately waiting on a persistent Monitor, by adding a _gbtw_recent_waiting_tool helper (waiting tools only) and wiring it into the hard tasks-in-progress gate (classifier OR helper). Gate-only: the continuation check is left untouched. Deploy is an operator step.",
+  "design_file": "docs/plans/2026-07-12-gbtw-monitor-aware-gate-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "RED — waiting-tool test harness + fixtures",
+      "description": "TDD RED. Create worker/hooks/tests/test-gbtw-waiting.sh (sources the hook with GBTW_TEST_MODE=1, calls _gbtw_recent_waiting_tool against fixtures, asserts trimmed stdout 'true'/'') and 8 fixtures w1-w8: w1 monitor-last-turn→true, w2 monitor-within-window→true, w3 monitor-outside-window→'', w4 no-waiting-tool→'', w5 schedulewakeup→true, w6 bash-bg (run_in_background)→'' (regression witness: the helper must NOT match run_in_background — that is the completion-aware classifier's job), w7 askuserquestion→true, w8 malformed-line→true. Run → RED (helper undefined; expect-true cases fail). Stage.",
+      "allowed_files": [
+        "worker/hooks/tests/test-gbtw-waiting.sh",
+        "worker/hooks/tests/fixtures/w1-monitor-last-turn.jsonl",
+        "worker/hooks/tests/fixtures/w2-monitor-within-window.jsonl",
+        "worker/hooks/tests/fixtures/w3-monitor-outside-window.jsonl",
+        "worker/hooks/tests/fixtures/w4-no-waiting-tool.jsonl",
+        "worker/hooks/tests/fixtures/w5-schedulewakeup.jsonl",
+        "worker/hooks/tests/fixtures/w6-bash-bg.jsonl",
+        "worker/hooks/tests/fixtures/w7-askuserquestion.jsonl",
+        "worker/hooks/tests/fixtures/w8-malformed-line.jsonl"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Create the 8 w*.jsonl fixtures (exact content in the markdown plan)"},
+        {"description": "Create worker/hooks/tests/test-gbtw-waiting.sh (exact content in the markdown plan)"},
+        {"description": "Run — expect RED (helper undefined → stub returns empty; w6 expects empty — run_in_background is the classifier's job, not the helper's)", "command": "bash worker/hooks/tests/test-gbtw-waiting.sh", "expected": "results: 3 pass, 5 fail (w1,w2,w5,w7,w8 fail; w3,w4,w6 pass); nonzero exit"},
+        {"description": "Stage", "command": "git add worker/hooks/tests/test-gbtw-waiting.sh worker/hooks/tests/fixtures/w1-monitor-last-turn.jsonl worker/hooks/tests/fixtures/w2-monitor-within-window.jsonl worker/hooks/tests/fixtures/w3-monitor-outside-window.jsonl worker/hooks/tests/fixtures/w4-no-waiting-tool.jsonl worker/hooks/tests/fixtures/w5-schedulewakeup.jsonl worker/hooks/tests/fixtures/w6-bash-bg.jsonl worker/hooks/tests/fixtures/w7-askuserquestion.jsonl worker/hooks/tests/fixtures/w8-malformed-line.jsonl"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "GREEN — add the _gbtw_recent_waiting_tool helper",
+      "description": "Add _gbtw_recent_waiting_tool to worker/hooks/get-back-to-work-claude.sh immediately after _gbtw_extract_in_flight and BEFORE the GBTW_TEST_MODE early-return (so it is exposed when sourced in test mode). Detects ONLY the waiting tools Monitor/TaskOutput/ScheduleWakeup/AskUserQuestion in the last 3 assistant turns — NOT run_in_background (that is covered completion-aware by _gbtw_extract_in_flight; matching it here would be completion-blind). Prints 'true' when found, empty otherwise; fail-safe empty on any error. Run test-gbtw-waiting (8 pass) and test-gbtw-inflight (10 pass, unchanged) and bash -n. Stage.",
+      "allowed_files": ["worker/hooks/get-back-to-work-claude.sh"],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Add the helper (exact snippet in the markdown plan) after _gbtw_extract_in_flight, before the GBTW_TEST_MODE shim"},
+        {"description": "Run new test — expect GREEN", "command": "bash worker/hooks/tests/test-gbtw-waiting.sh", "expected": "results: 8 pass, 0 fail"},
+        {"description": "Classifier test must stay GREEN", "command": "bash worker/hooks/tests/test-gbtw-inflight.sh", "expected": "results: 10 pass, 0 fail"},
+        {"description": "Syntax check", "command": "bash -n worker/hooks/get-back-to-work-claude.sh", "expected": "no output, exit 0"},
+        {"description": "Stage", "command": "git add worker/hooks/get-back-to-work-claude.sh"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "WIRE — waiting-tool suppression into the hard gate (gate-only)",
+      "description": "No unit test for the wiring: the gate approve-path runs in the hook main body (not a function), unreachable via GBTW_TEST_MODE without refactoring the gate into a function (out of scope, hold); no full-hook integration harness exists. The behavior-bearing unit (_gbtw_recent_waiting_tool) is fully unit-tested in Task 2; wiring verified by bash -n + call-site grep + both suites green. GATE-ONLY: in the IN_PROGRESS_OR_PENDING_COUNT!=0 branch, after the _gbtw_extract_in_flight suppression and before increment_block_counter/block_stop, add a waiting-tool approve+exit (gate = classifier OR helper). The continuation-suppression block (_BG_RECENT_REQ_IDS) and the holding/waiting text matcher are LEFT UNTOUCHED — the continuation check already handles Monitor and is not part of this bug. Deploy is an operator step (not a plan task).",
+      "allowed_files": ["worker/hooks/get-back-to-work-claude.sh"],
+      "depends_on": [2],
+      "steps": [
+        {"description": "Add the waiting-tool approve block to the tasks-in-progress gate (after the _gbtw_extract_in_flight block, before block_stop). Do NOT modify the continuation-suppression block or the text matcher."},
+        {"description": "Syntax check", "command": "bash -n worker/hooks/get-back-to-work-claude.sh", "expected": "no output, exit 0"},
+        {"description": "Helper called once — the gate (comment-proof pattern)", "command": "grep -c '_gbtw_recent_waiting_tool \"' worker/hooks/get-back-to-work-claude.sh", "expected": "1"},
+        {"description": "Helper defined once", "command": "grep -c '_gbtw_recent_waiting_tool()' worker/hooks/get-back-to-work-claude.sh", "expected": "1"},
+        {"description": "Continuation block left intact — assignment line unique (bare name appears on 3 lines)", "command": "grep -c \"_BG_RECENT_REQ_IDS=\" worker/hooks/get-back-to-work-claude.sh", "expected": "1"},
+        {"description": "Waiting suite stays GREEN", "command": "bash worker/hooks/tests/test-gbtw-waiting.sh", "expected": "results: 8 pass, 0 fail"},
+        {"description": "Classifier suite stays GREEN", "command": "bash worker/hooks/tests/test-gbtw-inflight.sh", "expected": "results: 10 pass, 0 fail"},
+        {"description": "Stage", "command": "git add worker/hooks/get-back-to-work-claude.sh"}
+      ]
+    }
+  ]
+}

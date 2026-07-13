@@ -1,0 +1,4 @@
+{"type":"assistant","requestId":"w3m","message":{"content":[{"type":"tool_use","name":"Monitor","input":{}}]}}
+{"type":"assistant","requestId":"w3t1","message":{"content":[{"type":"text","text":"a"}]}}
+{"type":"assistant","requestId":"w3t2","message":{"content":[{"type":"text","text":"b"}]}}
+{"type":"assistant","requestId":"w3t3","message":{"content":[{"type":"text","text":"c"}]}}

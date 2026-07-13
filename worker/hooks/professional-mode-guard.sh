@@ -6,6 +6,20 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/hook-logger.sh"
 source "$SCRIPT_DIR/bash-readonly-guard.sh"
+source "$SCRIPT_DIR/config-guard.sh" 2>/dev/null || true
+# FAIL CLOSED: if config-guard.sh failed to load, block ALL config-file operations
+# (revert to v1.0.19 hard-block) rather than silently allowing them.
+if ! type config_guard_decision >/dev/null 2>&1; then
+  config_guard_decision() {
+    local tool="$1" fp="$2" lc
+    lc=$(printf '%s' "$fp" | tr '[:upper:]' '[:lower:]')
+    case "$tool" in
+      Edit|MultiEdit|Write|Bash)
+        [[ "$lc" == *"ironclaude-hooks-config"* ]] && { echo "block"; return; } ;;
+    esac
+    echo "allow"
+  }
+fi
 run_hook "professional-mode-guard"
 
 INPUT=$(cat)
@@ -23,29 +37,24 @@ SAFE_SESSION=$(echo "$SESSION_TAG" | sed "s/'/''/g")
 # deactivation). Runs before the prof_mode branches, so it holds when PM is off.
 _HOOKS_CFG_BLOCK="BLOCKED — HUMAN-ONLY CONFIG
 
-~/.claude/ironclaude-hooks-config.json holds guardrail settings (including
-tier_up_review_policy) and can only be changed by a human editing it on disk.
+~/.claude/ironclaude-hooks-config.json holds guardrail settings. The guardrail keys
+(tier_up_review_policy, debug_allow_config_writes) can only be changed by a HUMAN editing
+the file on disk. The benign keys (validation_backend, ollama, timeout_seconds) may be
+changed via a full-file Write tool call that preserves the guardrail keys.
 
-Do NOT write this file."
-# NotebookEdit is intentionally omitted: line-15 extracts FILE_PATH from
-# .tool_input.file_path // .tool_input.command only, so a NotebookEdit event
-# (which carries notebook_path) would never populate FILE_PATH here — listing it
-# would be dead/misleading. The Bash branch below covers any redirect-based write.
-if [[ "$TOOL_NAME" == "Edit" || "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "MultiEdit" ]]; then
-  _CANON=$(realpath -m "$FILE_PATH" 2>/dev/null || echo "$FILE_PATH")
-  # Match the canonical path OR the basename (BSD realpath -m may no-op on macOS,
-  # so also catch any path ending in the config filename).
-  if [[ "$_CANON" == "$HOME/.claude/ironclaude-hooks-config.json" || "$FILE_PATH" == *"ironclaude-hooks-config.json" ]]; then
-    block_pretooluse "professional-mode-guard" "$_HOOKS_CFG_BLOCK"
-  fi
-fi
-if [[ "$TOOL_NAME" == "Bash" ]]; then
-  # FILE_PATH holds the command string for Bash. Block common write vectors that
-  # reference the config file: redirects, tee, sed -i, cp/mv, ln/rsync, truncate, dd.
-  if echo "$FILE_PATH" | grep -q "ironclaude-hooks-config\.json" \
-     && echo "$FILE_PATH" | grep -qE '(>>?|\btee\b|\bsed\b[^|]*-i|\bdd\b|\bcp\b|\bmv\b|\bln\b|\brsync\b|\btruncate\b|\binstall\b)'; then
-    block_pretooluse "professional-mode-guard" "$_HOOKS_CFG_BLOCK"
-  fi
+Do NOT change guardrail keys."
+# NotebookEdit is intentionally not routed: FILE_PATH (extracted at line ~15 from
+# .tool_input.file_path // .tool_input.command) is never populated for a NotebookEdit
+# event (notebook_path). config_guard_decision routes Edit/MultiEdit/Write/Bash; every
+# other tool falls through to "allow".
+#
+# Key-scoped anti-tamper for the hooks-config file. All routing + policy is in the tested
+# config_guard_decision (config-guard.sh): Write is key-scoped (benign keys allowed,
+# guardrail/unknown blocked, case-insensitive), Edit/MultiEdit are hard-blocked (partial
+# fragments), Bash is BEST-EFFORT (NOT provable — interpreter/split-filename/aliasing
+# writes evade it). Runs before the prof_mode branches, so it holds when PM is off.
+if [ "$(config_guard_decision "$TOOL_NAME" "$FILE_PATH" "$INPUT")" = "block" ]; then
+  block_pretooluse "professional-mode-guard" "$_HOOKS_CFG_BLOCK"
 fi
 
 # ─── Helper: query design/plan paths for SUGGESTED_NEXT_ACTION ───

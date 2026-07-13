@@ -3,6 +3,7 @@ import pytest
 from ironclaude.notifications import (
     _escape_mrkdwn,
     _fmt_tokens,
+    _fmt_duration,
     format_worker_spawned,
     format_worker_completed,
     format_worker_failed,
@@ -327,6 +328,37 @@ class TestHeartbeatBrainLine:
         msg = format_heartbeat([], brain_usage=brain_usage)
         assert "No active workers" in msg
         assert "🧠" not in msg
+
+    def test_heartbeat_zero_tokens_with_recent_activity(self):
+        workers = [{"id": "w-1", "description": "Your task: Fix auth", "workflow_stage": "executing"}]
+        brain_usage = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0, "seconds_since_last_activity": 180}
+        msg = format_heartbeat(workers, brain_usage=brain_usage)
+        assert "turn in progress" in msg
+        assert "3m ago" in msg
+
+    def test_heartbeat_zero_tokens_no_activity_signal(self):
+        workers = [{"id": "w-1", "description": "Your task: Fix auth", "workflow_stage": "executing"}]
+        brain_usage = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0, "seconds_since_last_activity": None}
+        msg = format_heartbeat(workers, brain_usage=brain_usage)
+        assert "turn in progress" not in msg
+        assert "0 tokens (0 in + 0 out)" in msg
+
+    def test_heartbeat_nonzero_tokens_unaffected(self):
+        workers = [{"id": "w-1", "description": "Your task: Fix auth", "workflow_stage": "executing"}]
+        brain_usage = {"total_tokens": 1000, "input_tokens": 400, "output_tokens": 600, "seconds_since_last_activity": 5}
+        msg = format_heartbeat(workers, brain_usage=brain_usage)
+        assert "turn in progress" not in msg
+
+
+class TestFmtDuration:
+    def test_fmt_duration_seconds(self):
+        assert _fmt_duration(45) == "45s"
+
+    def test_fmt_duration_minutes(self):
+        assert _fmt_duration(180) == "3m"
+
+    def test_fmt_duration_hours(self):
+        assert _fmt_duration(7200) == "2h"
 
 
 class TestHeartbeatWaits:

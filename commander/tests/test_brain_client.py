@@ -2542,7 +2542,10 @@ class TestTokenUsageAccumulation:
         """Fresh BrainClient returns all-zero usage."""
         client = BrainClient()
         usage = client.get_token_usage()
-        assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
+        assert usage == {
+            "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0,
+            "seconds_since_last_activity": None,
+        }
 
     def test_get_token_usage_reflects_accumulated_state(self):
         """get_token_usage() reads directly from accumulator attributes."""
@@ -2568,6 +2571,30 @@ class TestTokenUsageAccumulation:
         assert client._total_input_tokens == 0
         assert client._total_output_tokens == 0
         assert client._total_cost_usd == 0.0
+
+    def test_get_token_usage_seconds_since_last_activity_none_when_never_active(self):
+        """Fresh BrainClient has no last-activity signal — seconds_since_last_activity is None."""
+        client = BrainClient()
+        usage = client.get_token_usage()
+        assert usage["seconds_since_last_activity"] is None
+
+    def test_get_token_usage_seconds_since_last_activity_reflects_elapsed_time(self):
+        """seconds_since_last_activity reflects elapsed time since _last_response_time."""
+        client = BrainClient()
+        client._last_response_time = time.time() - 5
+        usage = client.get_token_usage()
+        assert usage["seconds_since_last_activity"] >= 5
+        assert usage["seconds_since_last_activity"] < 15
+
+    def test_restart_resets_last_activity_signal(self):
+        """restart() resets _last_response_time, so seconds_since_last_activity goes back to None."""
+        client = BrainClient()
+        client._last_response_time = time.time() - 100
+        client.start = lambda *a, **kw: setattr(client, '_running', True)
+        client._kill_brain_subprocess = lambda: None
+        client.restart("test prompt")
+        usage = client.get_token_usage()
+        assert usage["seconds_since_last_activity"] is None
 
 
 class TestSessionLogRotation:

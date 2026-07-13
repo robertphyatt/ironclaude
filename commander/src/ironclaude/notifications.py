@@ -84,6 +84,15 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
+def _fmt_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h"
+
+
 def format_heartbeat(
     workers: list[dict],
     brain_usage: dict | None = None,
@@ -111,7 +120,12 @@ def format_heartbeat(
         inp = brain_usage.get("input_tokens", 0)
         out = brain_usage.get("output_tokens", 0)
         total = brain_usage.get("total_tokens", 0)
-        lines.append(f"🧠 Brain: {_fmt_tokens(total)} tokens ({_fmt_tokens(inp)} in + {_fmt_tokens(out)} out)")
+        line = f"🧠 Brain: {_fmt_tokens(total)} tokens ({_fmt_tokens(inp)} in + {_fmt_tokens(out)} out)"
+        if total == 0:
+            age = brain_usage.get("seconds_since_last_activity")
+            if age is not None:
+                line += f" — turn in progress (last activity {_fmt_duration(age)} ago)"
+        lines.append(line)
     return "\n".join(lines)
 
 

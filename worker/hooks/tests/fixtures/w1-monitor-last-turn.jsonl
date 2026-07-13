@@ -1,0 +1,2 @@
+{"type":"assistant","requestId":"w1r1","message":{"content":[{"type":"text","text":"starting the suite"}]}}
+{"type":"assistant","requestId":"w1r2","message":{"content":[{"type":"tool_use","name":"Monitor","input":{"description":"watch test-all suite"}}]}}

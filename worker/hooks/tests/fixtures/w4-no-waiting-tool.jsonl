@@ -1,0 +1,2 @@
+{"type":"assistant","requestId":"w4r1","message":{"content":[{"type":"text","text":"thinking"}]}}
+{"type":"assistant","requestId":"w4r2","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/tmp/x"}}]}}

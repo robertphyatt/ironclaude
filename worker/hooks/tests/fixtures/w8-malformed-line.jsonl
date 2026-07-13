@@ -1,0 +1,2 @@
+{"type":"assistant","requestId":"w8v","message":{"content":[{"type":"tool_use","name":"Monitor","input":{}}]}}
+{ this is not valid json at all

@@ -27,7 +27,8 @@ def daemon(tmp_path):
     os.makedirs(tmux.log_dir, exist_ok=True)
     brain = MagicMock()
     brain.get_token_usage.return_value = {
-        "total_tokens": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0
+        "total_tokens": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+        "seconds_since_last_activity": None,
     }
     d = IroncladeDaemon(config, slack, None, registry, tmux, brain)
     return d

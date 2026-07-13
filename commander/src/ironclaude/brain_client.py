@@ -977,11 +977,13 @@ class BrainClient:
     def get_token_usage(self) -> dict:
         """Return accumulated token usage since last restart."""
         total = self._total_input_tokens + self._total_output_tokens
+        age = time.time() - self._last_response_time if self._last_response_time > 0 else None
         return {
             "input_tokens": self._total_input_tokens,
             "output_tokens": self._total_output_tokens,
             "total_tokens": total,
             "cost_usd": self._total_cost_usd,
+            "seconds_since_last_activity": age,
         }
 
     def _kill_brain_subprocess(self) -> None:

@@ -1,0 +1,140 @@
+{
+  "name": "Graphify Evaluation (d1343)",
+  "goal": "Produce an evidence-based recommendation document on whether to adopt Graphify as a third knowledge layer, based on hands-on testing against ironclaude and roleplaying-agents.",
+  "design_file": "docs/plans/2026-07-13-graphify-evaluation-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Install Graphify and verify it runs",
+      "description": "Fetch install instructions from the Graphify README, run the install command, verify the CLI runs, and record install evidence for the Integration Cost section. A persistent install failure is a valid completion state, not a task failure -- it becomes direct evidence for the Integration Cost / Recommendation sections.",
+      "allowed_files": ["docs/plans/2026-07-13-graphify-findings-install.md"],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Fetch install instructions and CLI invocation syntax from https://github.com/Graphify-Labs/graphify. If this URL 404s, use WebSearch for 'Graphify Labs code knowledge graph tree-sitter github' to locate the correct repository before proceeding. If the tool/repository cannot be located at all after the WebSearch attempt, treat this identically to an install failure: skip directly to the final step of this task and record STATUS: INSTALL_FAILED there. Determine: the exact output-directory flag syntax (e.g. --output, -o, --out-dir), and what output artifact(s) the README documents producing -- record this as a claim to verify, not an assumption (do not assume HTML+markdown+JSON specifically; Tasks 2/3 will record what actually gets produced).",
+          "expected": "Install command, prerequisite runtime, analyze-subcommand syntax, output-flag syntax, and claimed output artifact types identified -- or a determination that the tool cannot be located at all"
+        },
+        {
+          "description": "Run the install command identified in the previous step",
+          "expected": "Install completes with no error. If it fails, do one troubleshooting pass (check prerequisite runtime version, retry). If it still fails after that, this is a valid completion state for this step -- proceed to the final step and record the failure as the finding rather than treating this as a blocking task failure."
+        },
+        {
+          "description": "Verify the CLI is runnable (substitute the actual binary name discovered in Step 1 if different from 'graphify'). Skip this step entirely if the previous step recorded a persistent install failure.",
+          "command": "graphify --version",
+          "expected": "A version string is printed, not a command-not-found error -- or this step is skipped per the persistent-install-failure branch"
+        },
+        {
+          "description": "Create docs/plans/2026-07-13-graphify-findings-install.md. The FIRST LINE must be exactly 'STATUS: OK' if install succeeded and verified, or exactly 'STATUS: INSTALL_FAILED' if install failed persistently or the tool could not be located (this exact first-line marker, not a substring match, is what Tasks 2/3 check). Below that first line, record: exact commands run, time taken, any errors, the verified version string (or error details if failed), the output-flag syntax and claimed output artifact types from Step 1, and a best-effort note on whether the tool's own output/logs mentioned any network call (HTTP request, DNS lookup, 'downloading', 'fetching', telemetry) despite Graphify's 'local-first' claim -- this is a textual check of the tool's own output, not a definitive network-level test, since no packet-capture tooling is available in this environment; if nothing is mentioned, record 'no network activity mentioned in tool output' rather than asserting none occurred.",
+          "expected": "docs/plans/2026-07-13-graphify-findings-install.md exists, first line is exactly 'STATUS: OK' or 'STATUS: INSTALL_FAILED', and the body contains the evidence described above"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Run Graphify against ironclaude and extract findings",
+      "description": "Run Graphify against the ironclaude repo with output to this session's scratchpad, inspect the markdown report and JSON, cross-check against known architecture, and record findings. If Task 1 recorded a persistent install failure, this task still completes by recording that this repo could not be tested.",
+      "allowed_files": ["docs/plans/2026-07-13-graphify-findings-ironclaude.md"],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Read the first line of docs/plans/2026-07-13-graphify-findings-install.md. If it is exactly 'STATUS: INSTALL_FAILED', skip directly to the final step of this task: create docs/plans/2026-07-13-graphify-findings-ironclaude.md containing exactly 'NOT TESTED -- Graphify install failed, see docs/plans/2026-07-13-graphify-findings-install.md' and stop this task here. Otherwise continue to the next step.",
+          "expected": "Install status determined from the first line; task either short-circuits to the NOT TESTED finding or continues to live testing"
+        },
+        {
+          "description": "Identify this session's scratchpad directory from the 'Scratchpad Directory' section of the current session's system prompt, and run Graphify against /Users/roberthyatt/Code/ironclaude with --output pointed at <that literal absolute scratchpad path>/graphify-ironclaude, substituted directly into the command text -- not via a shell environment variable, since shell state does not persist between separate Bash invocations. Never reuse a scratchpad path from a previous session's transcript, plan document, or memory. Substitute the actual binary name/subcommand/output flag discovered in Task 1 Step 1 if different from 'graphify analyze --output'.",
+          "command": "graphify analyze /Users/roberthyatt/Code/ironclaude --output <this-session's-scratchpad-dir>/graphify-ironclaude",
+          "expected": "Exit code 0. Record what output file(s)/artifact(s) were actually produced in the output directory as an observation -- this is not a pass/fail gate on matching HTML+markdown+JSON specifically, since that's an unverified README claim; if the actual output differs from what Task 1 recorded as claimed, that discrepancy is itself Integration Cost evidence."
+        },
+        {
+          "description": "Inspect whatever output was actually produced in the previous step. If a markdown report exists, extract its clusters and god-nodes sections (per directive #9, don't read the whole file if large). If any graph/visualization file exists, confirm its existence and note its basic size -- full interactive inspection isn't required, but it must not be silently skipped as an artifact.",
+          "expected": "Identifiable list of architectural clusters and highest-connectivity nodes if a report exists; existence of any graph/visualization artifact confirmed"
+        },
+        {
+          "description": "Cross-check reported clusters/god-nodes against known ironclaude architecture (state-manager MCP, hooks, worker lifecycle, episodic memory, wiki)",
+          "expected": "Accuracy assessment: where the graph matches, contradicts, or misses known architecture"
+        },
+        {
+          "description": "Create docs/plans/2026-07-13-graphify-findings-ironclaude.md and record: cluster list, god-node list, accuracy assessment, example query results, the actual output artifacts produced (vs. what Task 1 recorded as claimed), and a best-effort note on any network activity mentioned in the tool's own output during this run",
+          "expected": "docs/plans/2026-07-13-graphify-findings-ironclaude.md exists with all findings for use in Task 4's Gap Analysis and Overlap Assessment sections"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Run Graphify against roleplaying-agents and verify GDScript support",
+      "description": "Run Graphify against the roleplaying-agents repo with output to this session's scratchpad, verify GDScript files were actually parsed (not silently skipped), inspect clusters/god-nodes, and record findings. If Task 1 recorded a persistent install failure, this task still completes by recording that this repo could not be tested.",
+      "allowed_files": ["docs/plans/2026-07-13-graphify-findings-roleplaying-agents.md"],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "Read the first line of docs/plans/2026-07-13-graphify-findings-install.md. If it is exactly 'STATUS: INSTALL_FAILED', skip directly to the final step of this task: create docs/plans/2026-07-13-graphify-findings-roleplaying-agents.md containing exactly 'NOT TESTED -- Graphify install failed, see docs/plans/2026-07-13-graphify-findings-install.md' and stop this task here. Otherwise continue to the next step.",
+          "expected": "Install status determined from the first line; task either short-circuits to the NOT TESTED finding or continues to live testing"
+        },
+        {
+          "description": "Identify this session's scratchpad directory from the 'Scratchpad Directory' section of the current session's system prompt, and run Graphify against /Users/roberthyatt/Code/roleplaying-agents with --output pointed at <that literal absolute scratchpad path>/graphify-roleplaying-agents, substituted directly into the command text -- not via a shell environment variable, since shell state does not persist between separate Bash invocations. Never reuse a scratchpad path from a previous session's transcript, plan document, or memory. Substitute the actual binary name/subcommand/output flag discovered in Task 1 Step 1 if different from 'graphify analyze --output'.",
+          "command": "graphify analyze /Users/roberthyatt/Code/roleplaying-agents --output <this-session's-scratchpad-dir>/graphify-roleplaying-agents",
+          "expected": "Exit code 0. Record what output file(s)/artifact(s) were actually produced as an observation -- not a pass/fail gate on matching a specific claimed set."
+        },
+        {
+          "description": "Check whatever report/JSON output exists for evidence .gd files were actually parsed with real call/inheritance edges, vs. silently skipped or errored (grep per directive #9)",
+          "expected": "Either confirmed working GDScript parsing, or confirmed absence/failure -- determined from actual output, not assumed"
+        },
+        {
+          "description": "Inspect clusters and god-nodes sections for this repo if a report exists. Also confirm any graph/visualization output file exists and note its basic size.",
+          "expected": "Identifiable cluster/god-node list, comparable in quality to the ironclaude result; existence of any graph/visualization artifact confirmed"
+        },
+        {
+          "description": "Create docs/plans/2026-07-13-graphify-findings-roleplaying-agents.md and record: GDScript support verdict, cluster/god-node list, quality comparison to Task 2, the actual output artifacts produced (vs. what Task 1 recorded as claimed), and a best-effort note on any network activity mentioned in the tool's own output during this run",
+          "expected": "docs/plans/2026-07-13-graphify-findings-roleplaying-agents.md exists with all findings for use in Task 4's per-repo recommendation split"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Write the analysis document",
+      "description": "Write the 5-section analysis document sourced from Task 1-3 findings, including explicit reconciliation with d1266's prior rejection of graph-based memory and format/rigor consistency with the prior evaluation. Handles both outcomes: live-tested findings, or an install-failure finding that itself supports a 'no, integration cost too high' recommendation.",
+      "allowed_files": ["docs/research/2026-07-13-graphify-evaluation.md"],
+      "depends_on": [3],
+      "steps": [
+        {
+          "description": "Read docs/plans/2026-07-13-graphify-findings-install.md, docs/plans/2026-07-13-graphify-findings-ironclaude.md, and docs/plans/2026-07-13-graphify-findings-roleplaying-agents.md in full. Note the STATUS: first line of the install findings file and whether either per-repo findings file is the NOT TESTED short-circuit.",
+          "expected": "All Task 1-3 findings loaded as evidence for the draft, including whether either or both repos were NOT TESTED due to install failure"
+        },
+        {
+          "description": "Read the wiki page at /Users/roberthyatt/.ironclaude/brain/wiki/agent-memory-techniques-evaluation.md (the d1266 evaluation summary, confirmed at this path during brainstorming -- use the absolute path, not a tilde-prefixed one, since the Read tool does not expand '~') to cross-reference document format/rigor and to quote the exact 'graph-based memory requires infrastructure not present in any system' rejection wording accurately",
+          "expected": "d1266's exact rejection rationale confirmed verbatim, and prior document's format/rigor noted for consistency"
+        },
+        {
+          "description": "Draft docs/research/2026-07-13-graphify-evaluation.md with 5 sections: Layer comparison, Gap analysis (including explicit d1266 reconciliation subsection quoting the confirmed wording), Overlap assessment, Integration cost (including the network-activity notes from Task 1-3), Recommendation (per-repo split if Task 3 found GDScript support meaningfully weaker than Task 2's result). If Task 1's findings file has first line 'STATUS: INSTALL_FAILED', sections 1-3 note that live testing could not be performed and the Recommendation is 'no, don't adopt' based on install cost alone as the direct Integration Cost evidence.",
+          "expected": "Document created with all 5 required sections, each citing Task 1-3 findings as evidence, covering both the live-tested and install-failure outcomes"
+        },
+        {
+          "description": "Self-check: re-read the draft and confirm every claim traces to a Task 1-3 finding, install log, or the wiki page read above -- not unverified README text. Fix any sentence that doesn't.",
+          "expected": "No claim in the document is sourced solely from Graphify's marketing/README text"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Adversarial review, revise, and stage",
+      "description": "Call advisor (or subagent fallback) to pressure-test the recommendation against the evidence, apply warranted revisions, and force-stage the document.",
+      "allowed_files": ["docs/research/2026-07-13-graphify-evaluation.md"],
+      "depends_on": [4],
+      "steps": [
+        {
+          "description": "Call advisor() on the drafted recommendation, framed to pressure-test it against the gathered evidence -- specifically the d1266 reconciliation and any per-repo split. If advisor() is unavailable, dispatch a subagent via the Agent tool (model=fable if available, else model=opus) with the same context and an adversarial-review-only prompt, per the Advisor Fallback rule in .claude/rules/behavioral.md",
+          "expected": "Adversarial findings returned, either confirming the recommendation or raising specific evidence-based concerns"
+        },
+        {
+          "description": "Apply warranted revisions to docs/research/2026-07-13-graphify-evaluation.md. Do not silently agree with invalid concerns -- push back with recorded Task 1-3 evidence per directive #8 if a concern is contradicted by observed tool output.",
+          "expected": "Document revised only where the review's concerns are evidence-supported"
+        },
+        {
+          "description": "Force-stage the document (docs/ is gitignored in this repo per established convention)",
+          "command": "git add -f docs/research/2026-07-13-graphify-evaluation.md",
+          "expected": "git status --short docs/research/2026-07-13-graphify-evaluation.md shows 'A  docs/research/2026-07-13-graphify-evaluation.md'"
+        }
+      ]
+    }
+  ]
+}

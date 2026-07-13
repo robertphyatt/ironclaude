@@ -1,0 +1,3 @@
+{"type":"assistant","requestId":"w2r1","message":{"content":[{"type":"tool_use","name":"Monitor","input":{"description":"watch suite"}}]}}
+{"type":"assistant","requestId":"w2r2","message":{"content":[{"type":"text","text":"monitor armed"}]}}
+{"type":"assistant","requestId":"w2r3","message":{"content":[{"type":"text","text":"waiting"}]}}

@@ -92,6 +92,39 @@ _gbtw_extract_in_flight() {
     return 0
 }
 
+# Print "true" (to stdout) iff any of the last 3 assistant turns used a *waiting*
+# tool — Monitor / TaskOutput / ScheduleWakeup / AskUserQuestion. Empty otherwise.
+# NOTE: run_in_background jobs are deliberately NOT matched here — those are already
+# tracked *completion-aware* by _gbtw_extract_in_flight (launched-minus-completed), so
+# matching them here (which is completion-BLIND, last-3-turns) would leave the gate
+# suppressed for up to 3 turns after a bg job has finished. This helper covers only the
+# persistent/waiting tools the classifier does not track. Callers OR the two signals.
+# Never crashes; on any error prints empty (fail-safe: absence of the signal -> caller
+# blocks / the continuation check fires).
+_gbtw_recent_waiting_tool() {
+    local transcript="$1"
+    if [ -z "$transcript" ] || [ ! -f "$transcript" ]; then
+        return 0
+    fi
+    if ! command -v jq &>/dev/null; then
+        return 0
+    fi
+    local recent_ids _req_id
+    recent_ids=$(tail -n 500 "$transcript" 2>/dev/null | \
+        jq -r 'select(.type == "assistant") | .requestId // empty' 2>/dev/null | tail -3)
+    [ -z "$recent_ids" ] && return 0
+    while IFS= read -r _req_id; do
+        [ -z "$_req_id" ] && continue
+        if tail -n 500 "$transcript" 2>/dev/null | grep -F "\"$_req_id\"" | \
+           jq -r '.message.content[]? | select(.type == "tool_use") | if .name == "Monitor" or .name == "TaskOutput" or .name == "ScheduleWakeup" or .name == "AskUserQuestion" then "true" else "false" end' \
+           2>/dev/null | grep -q "^true$" 2>/dev/null; then
+            printf 'true'
+            return 0
+        fi
+    done <<< "$recent_ids"
+    return 0
+}
+
 # Test-mode shim: sourcing with GBTW_TEST_MODE=1 exposes helpers without
 # running the hook body.
 if [ "${GBTW_TEST_MODE:-0}" = "1" ]; then
@@ -386,6 +419,16 @@ Do NOT skip fixing the issues. Do NOT proceed to the next task."
                 }'
                 exit 0
             fi
+        fi
+        # A persistent Monitor (or ScheduleWakeup/TaskOutput/AskUserQuestion) means the
+        # worker is legitimately WAITING, not stalled. The _gbtw_extract_in_flight check
+        # above already covers live (completion-aware) background Agent/Bash jobs; this
+        # helper covers the waiting *tools* it does not track. Consult it before blocking.
+        if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ] \
+           && [ "$(_gbtw_recent_waiting_tool "$TRANSCRIPT_PATH")" = "true" ]; then
+            log_hook "GET-BACK-TO-WORK" "Passed" "waiting tool active (Monitor/ScheduleWakeup/TaskOutput/AskUserQuestion)"
+            echo '{"decision": "approve", "reason": "Waiting tool active (Monitor/ScheduleWakeup/...)", "systemMessage": "[GET-BACK-TO-WORK]: Passed - waiting tool active (Monitor/ScheduleWakeup/...)"}'
+            exit 0
         fi
         # Tasks still in progress or pending -- block
         increment_block_counter
