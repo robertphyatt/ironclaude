@@ -1,0 +1,32 @@
+{
+  "name": "Graphify Investigation Synthesis Document",
+  "goal": "Produce docs/graphify-investigation.md synthesizing the completed Graphify evaluation into a single document answering five required questions.",
+  "design_file": "docs/plans/2026-07-13-graphify-investigation-doc-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Write docs/graphify-investigation.md",
+      "description": "Read the three existing Graphify evaluation source documents and synthesize them into docs/graphify-investigation.md, structured around five required questions, then self-check for accuracy and stage the file.",
+      "allowed_files": [
+        "docs/graphify-investigation.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Read docs/research/2026-07-13-graphify-evaluation.md, ~/.ironclaude/brain/wiki/graphify-evaluation.md, and ~/.ironclaude/brain/wiki/ironclaude-knowledge-stack.md in full."
+        },
+        {
+          "description": "Write docs/graphify-investigation.md with sections: Background, then the five required questions (Graphify vs. wiki/episodic coverage; complementary vs. redundant; concrete worker/Brain value; integration complexity; go/no-go recommendation), plus a brief relationship-to-d1266 note. Content must be drawn only from the three source documents."
+        },
+        {
+          "description": "Re-read the new doc against the three sources; confirm no contradictions, recommendation matches source recommendation exactly, and all five questions have substantive (non-placeholder) content."
+        },
+        {
+          "description": "Stage the file (docs/ is gitignored in this repo; force-add is the established convention for plan/doc artifacts).",
+          "command": "git add -f docs/graphify-investigation.md",
+          "expected": "docs/graphify-investigation.md staged"
+        }
+      ]
+    }
+  ]
+}
