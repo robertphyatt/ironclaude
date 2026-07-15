@@ -120,6 +120,66 @@ class TestConnectTimeoutShortcut:
         assert c._connect_timeout == 120
 
 
+class TestFailoverAndBreaker:
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_read_timeout_on_primary_falls_over_to_fallback(self, mock_post, client):
+        mock_post.side_effect = [requests.Timeout("read"), _make_response("from_fallback")]
+        assert client.post_generate({"model": "m", "prompt": "p", "stream": False}) == "from_fallback"
+        assert mock_post.call_count == 2
+
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_both_timeout_raises_timeout_with_both_urls(self, mock_post, client):
+        mock_post.side_effect = requests.Timeout("read")
+        with pytest.raises(OllamaTimeoutError) as ei:
+            client.post_generate({"model": "m", "prompt": "p", "stream": False})
+        assert "primary:11434" in str(ei.value) and "fallback:11434" in str(ei.value)
+
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_both_open_raises_without_network(self, mock_post, client):
+        from ironclaude.ollama_client import _BREAKERS
+        _BREAKERS.record_failure("http://primary:11434")
+        _BREAKERS.record_failure("http://fallback:11434")
+        mock_post.side_effect = AssertionError("no network when both breakers open")
+        with pytest.raises(OllamaConnectionError):
+            client.post_generate({"model": "m", "prompt": "p", "stream": False})
+        assert mock_post.call_count == 0
+
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_http_error_keeps_endpoint_healthy(self, mock_post, client):
+        from ironclaude.ollama_client import _BREAKERS
+        resp = MagicMock(); resp.raise_for_status.side_effect = requests.HTTPError("500")
+        mock_post.return_value = resp
+        with pytest.raises(OllamaHTTPError):
+            client.post_generate({"model": "m", "prompt": "p", "stream": False})
+        assert _BREAKERS.backoff_for("http://primary:11434") is None   # not tripped
+
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_success_keeps_breaker_closed(self, mock_post, client):
+        from ironclaude.ollama_client import _BREAKERS
+        mock_post.return_value = _make_response("not-json-but-http-200")
+        client.post_generate({"model": "m", "prompt": "p", "stream": False})
+        assert _BREAKERS.backoff_for("http://primary:11434") is None
+
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_primary_open_routes_to_fallback_one_call(self, mock_post, client):
+        from ironclaude.ollama_client import _BREAKERS
+        _BREAKERS.record_failure("http://primary:11434")   # primary open, fallback closed
+        mock_post.return_value = _make_response("from_fallback")
+        assert client.post_generate({"model": "m", "prompt": "p", "stream": False}) == "from_fallback"
+        assert mock_post.call_count == 1                    # primary skipped, one call
+        assert "fallback:11434" in mock_post.call_args[0][0]   # ...to the fallback URL
+
+    @patch("ironclaude.ollama_client.requests.post")
+    def test_unexpected_exception_does_not_leak_probe_slot(self, mock_post, client):
+        from ironclaude.ollama_client import _BREAKERS
+        _BREAKERS.record_failure("http://primary:11434")
+        _BREAKERS._breakers["http://primary:11434"].open_until = 0  # force half-open
+        mock_post.side_effect = ValueError("boom")          # non-Ollama escape
+        with pytest.raises(ValueError):
+            client.post_generate({"model": "m", "prompt": "p", "stream": False})
+        assert _BREAKERS._breakers["http://primary:11434"].probing is False
+
+
 class TestCreateModel:
     @patch("ironclaude.ollama_client.requests.post")
     def test_create_model_posts_to_api_create(self, mock_post, client_no_fallback):

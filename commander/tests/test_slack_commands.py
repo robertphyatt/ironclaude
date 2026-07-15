@@ -331,3 +331,20 @@ class TestDNSStartupRetry:
 
         assert MockApp.call_count == 5
         assert mock_sleep.call_count == 4  # 4 sleeps between 5 attempts
+
+
+def test_parse_login_command():
+    from ironclaude.slack_interface import parse_inbound_command
+    assert parse_inbound_command("/login") == {"type": "login"}
+    assert parse_inbound_command("login") == {"type": "login"}
+
+
+def test_parse_login_code_command():
+    from ironclaude.slack_interface import parse_inbound_command
+    assert parse_inbound_command("/login code ABC-123") == {"type": "login_code", "code": "ABC-123"}
+    assert parse_inbound_command("LOGIN CODE xyz789") == {"type": "login_code", "code": "xyz789"}
+
+
+def test_parse_login_not_shadowed_by_message():
+    from ironclaude.slack_interface import parse_inbound_command
+    assert parse_inbound_command("login")["type"] == "login"

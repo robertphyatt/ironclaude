@@ -362,23 +362,51 @@ class TestFmtDuration:
 
 
 class TestHeartbeatWaits:
-    """format_heartbeat surfaces 'waiting on operator' state in every heartbeat."""
+    """format_heartbeat surfaces 'waiting on commander'/'waiting on operator' state
+    in every heartbeat, as two always-paired labeled sections."""
 
-    def test_waits_shows_block_and_tags_worker(self):
+    def test_waits_shows_both_sections_and_tags_worker(self):
         workers = [{"id": "d1267", "description": "Your task: Fix band collapse", "workflow_stage": "executing"}]
         waits = {"d1267": {"question": "approve the migration?"}}
-        msg = format_heartbeat(workers, waits=waits)
-        assert "WAITING ON YOU" in msg
+        commander_waits = {"d1268": {"question": "deploy approved?"}}
+        msg = format_heartbeat(workers, waits=waits, commander_waits=commander_waits, operator_name="Robert")
+        assert "⏳ *WAITING ON COMMANDER:*" in msg
+        assert "⏳ *WAITING ON Robert:*" in msg
         assert "d1267" in msg
         assert "approve the migration?" in msg
-        # the worker's own line is tagged as waiting
+        # the worker's own line is tagged as waiting on the operator
         worker_line = next(ln for ln in msg.splitlines() if ln.startswith("•") and "d1267" in ln)
-        assert "waiting on you" in worker_line.lower()
+        assert "waiting on robert" in worker_line.lower()
+
+    def test_commander_section_omitted_when_empty(self):
+        """Regression guard for the confirmed d1389 bug: format_heartbeat always
+        rendered an empty '⏳ WAITING ON COMMANDER: / there is nothing' block
+        whenever any real operator wait existed, because no caller ever passes
+        commander_waits. The section must now be omitted entirely when empty."""
+        workers = [{"id": "d1267", "description": "Your task: Fix band collapse", "workflow_stage": "executing"}]
+        waits = {"d1267": {"question": "approve the migration?"}}
+        msg = format_heartbeat(workers, waits=waits, operator_name="Robert")
+        assert "⏳ *WAITING ON COMMANDER:*" not in msg
+        assert "there is nothing" not in msg
+
+    def test_operator_section_says_there_is_nothing_when_only_commander_populated(self):
+        """Symmetric fallback, exercised directly even though main.py never produces
+        this combination today (commander_waits is never populated by any caller)."""
+        workers = [{"id": "d1267", "description": "Your task: Fix band collapse", "workflow_stage": "executing"}]
+        commander_waits = {"d1267": {"question": "deploy approved?"}}
+        msg = format_heartbeat(workers, waits={}, commander_waits=commander_waits, operator_name="Robert")
+        assert "⏳ *WAITING ON COMMANDER:*" in msg
+        assert "deploy approved?" in msg
+        lines = msg.splitlines()
+        idx = lines.index("⏳ *WAITING ON Robert:*")
+        assert lines[idx + 1].strip() == "there is nothing"
+        worker_line = next(ln for ln in msg.splitlines() if ln.startswith("•") and "d1267" in ln)
+        assert "waiting on commander" in worker_line.lower()
 
     def test_waits_none_is_unchanged(self):
         workers = [{"id": "w1", "description": "Your task: Do stuff", "workflow_stage": "executing"}]
         assert format_heartbeat(workers, waits=None) == format_heartbeat(workers)
-        assert "WAITING ON YOU" not in format_heartbeat(workers, waits=None)
+        assert "WAITING ON" not in format_heartbeat(workers, waits=None)
 
     def test_waits_empty_is_unchanged(self):
         workers = [{"id": "w1", "description": "Your task: Do stuff", "workflow_stage": "executing"}]
@@ -387,9 +415,42 @@ class TestHeartbeatWaits:
     def test_waits_shown_even_with_no_active_workers(self):
         """A held wait must surface even if the worker session is no longer listed."""
         msg = format_heartbeat([], waits={"d1267": {"question": "approve?"}})
-        assert "WAITING ON YOU" in msg
+        assert "WAITING ON COMMANDER" not in msg
+        assert "WAITING ON Operator" in msg
         assert "d1267" in msg
         assert "approve?" in msg
+
+    def test_operator_name_defaults_to_operator(self):
+        msg = format_heartbeat([], waits={"d1267": {"question": "approve?"}})
+        assert "⏳ *WAITING ON Operator:*" in msg
+
+
+class TestHeartbeatActiveWorkersHeader:
+    def test_header_shown_when_waits_and_workers_present(self):
+        workers = [{"id": "d1366", "description": "Your task: Convergence work", "workflow_stage": "executing"}]
+        waits = {"d1397": {"question": "Status query about d1384"}}
+        msg = format_heartbeat(workers, waits=waits, operator_name="Robert")
+        assert "*Active Workers:*" in msg
+
+    def test_header_appears_between_waiting_section_and_worker_line(self):
+        workers = [{"id": "d1366", "description": "Your task: Convergence work", "workflow_stage": "executing"}]
+        waits = {"d1397": {"question": "Status query about d1384"}}
+        msg = format_heartbeat(workers, waits=waits, operator_name="Robert")
+        lines = msg.splitlines()
+        waiting_idx = next(i for i, ln in enumerate(lines) if "WAITING ON Robert" in ln)
+        header_idx = next(i for i, ln in enumerate(lines) if ln == "*Active Workers:*")
+        worker_idx = next(i for i, ln in enumerate(lines) if ln.startswith("•") and "d1366" in ln)
+        assert waiting_idx < header_idx < worker_idx
+
+    def test_header_absent_when_waits_empty(self):
+        workers = [{"id": "d1366", "description": "Your task: Convergence work", "workflow_stage": "executing"}]
+        msg = format_heartbeat(workers)
+        assert "*Active Workers:*" not in msg
+
+    def test_header_absent_when_workers_empty(self):
+        waits = {"d1397": {"question": "Status query about d1384"}}
+        msg = format_heartbeat([], waits=waits, operator_name="Robert")
+        assert "*Active Workers:*" not in msg
 
 
 class TestWorkerCheckinSlackNotification:
@@ -673,3 +734,23 @@ class TestFormatDirectiveReview:
         assert "_From your message:_ `run \\`ls\\` please`" in out, (
             f"Expected escaped source_text inside single-backtick span. Got:\n{out}"
         )
+
+
+def test_heartbeat_shows_ollama_degraded_marker():
+    from ironclaude.notifications import format_heartbeat
+    out = format_heartbeat([{"id": "d1", "description": "x", "workflow_stage": "executing"}],
+                           ollama_degraded=True)
+    assert "validator degraded" in out.lower()
+
+
+def test_heartbeat_no_marker_when_healthy():
+    from ironclaude.notifications import format_heartbeat
+    out = format_heartbeat([{"id": "d1", "description": "x", "workflow_stage": "executing"}],
+                           ollama_degraded=False)
+    assert "validator degraded" not in out.lower()
+
+
+def test_heartbeat_shows_marker_in_idle_no_workers_case():
+    from ironclaude.notifications import format_heartbeat
+    out = format_heartbeat([], ollama_degraded=True)   # no workers/waits -> early-return path
+    assert "validator degraded" in out.lower()

@@ -95,7 +95,7 @@ class TestGameClick:
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
             result = json.loads(tools.game_click(400, 300))
-        mock_run.assert_called_once_with(["cliclick", "c:400,300"])
+        mock_run.assert_called_once_with(["cliclick", "c:400,300"], capture_output=True, timeout=10)
         assert result == {"action": "click", "x": 400, "y": 300, "success": True}
 
     def test_click_reports_failure(self, tools):
@@ -110,7 +110,7 @@ class TestGameType:
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
             result = json.loads(tools.game_type("hello"))
-        mock_run.assert_called_once_with(["cliclick", "t:hello"])
+        mock_run.assert_called_once_with(["cliclick", "t:hello"], capture_output=True, timeout=10)
         assert result == {"action": "type", "text": "hello", "success": True}
 
 
@@ -119,20 +119,20 @@ class TestGameKey:
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
             result = json.loads(tools.game_key("Return"))
-        mock_run.assert_called_once_with(["cliclick", "kp:return"])
+        mock_run.assert_called_once_with(["cliclick", "kp:return"], capture_output=True, timeout=10)
         assert result["success"] is True
 
     def test_unmapped_key_lowercased(self, tools):
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
             tools.game_key("F1")
-        mock_run.assert_called_once_with(["cliclick", "kp:f1"])
+        mock_run.assert_called_once_with(["cliclick", "kp:f1"], capture_output=True, timeout=10)
 
     def test_escape_key(self, tools):
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
             tools.game_key("Escape")
-        mock_run.assert_called_once_with(["cliclick", "kp:escape"])
+        mock_run.assert_called_once_with(["cliclick", "kp:escape"], capture_output=True, timeout=10)
 
 
 @pytest.mark.skipif(not _has_display, reason="no display available for screencapture")

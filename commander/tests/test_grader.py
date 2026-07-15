@@ -183,3 +183,63 @@ class TestConfigLoading:
             fallback_url=None,
             timeout=120,
         )
+
+
+class TestTimeoutOverride:
+    def test_timeout_override_beats_config(self, tmp_path):
+        import json as _json
+        cfg = tmp_path / "c.json"
+        cfg.write_text(_json.dumps({"ollama": {"url": "http://x"}, "timeout_seconds": 600}))
+        assert LocalGrader(config_path=str(cfg), timeout=15)._get_client()._timeout == 15
+
+    def test_config_timeout_used_when_no_override(self, tmp_path):
+        import json as _json
+        cfg = tmp_path / "c.json"
+        cfg.write_text(_json.dumps({"ollama": {"url": "http://x"}, "timeout_seconds": 600}))
+        assert LocalGrader(config_path=str(cfg))._get_client()._timeout == 600
+
+
+class TestKeepAliveAndTruncation:
+    def test_keep_alive_in_payload_when_set(self):
+        grader = LocalGrader(config_path="/nonexistent/config.json", keep_alive="30m")
+        grader._client = MagicMock()
+        grader._client.post_generate.return_value = '{"valid": true}'
+        grader.grade("sys", "user", SIMPLE_SCHEMA)
+        assert grader._client.post_generate.call_args[0][0]["keep_alive"] == "30m"
+
+    def test_no_keep_alive_when_unset(self):
+        # guards the untouched 600s grader path: no keep_alive when not constructed with one
+        grader, mock_client = _make_grader()
+        mock_client.post_generate.return_value = '{"valid": true}'
+        grader.grade("sys", "user", SIMPLE_SCHEMA)
+        assert "keep_alive" not in mock_client.post_generate.call_args[0][0]
+
+    def test_truncate_middle_bounds_length(self):
+        from ironclaude.grader import truncate_middle
+        out = truncate_middle("A" * 5000, head=1500, tail=500)
+        assert len(out) <= 1500 + 500 + 60
+        assert out.startswith("A" * 100) and out.endswith("A" * 100)
+        assert truncate_middle("short", 1500, 500) == "short"
+
+
+class TestConfigHotReload:
+    def test_client_rebuilt_when_config_mtime_changes(self, tmp_path):
+        import json as _json, os
+        cfg = tmp_path / "c.json"
+        cfg.write_text(_json.dumps({"ollama": {"url": "http://old"}}))
+        g = LocalGrader(config_path=str(cfg))
+        c1 = g._get_client()
+        assert c1._url == "http://old"
+        cfg.write_text(_json.dumps({"ollama": {"url": "http://new"}}))
+        os.utime(str(cfg), (10_000, 10_000))    # bump mtime
+        c2 = g._get_client()
+        assert c2._url == "http://new" and c2 is not c1
+
+    def test_deleted_config_keeps_last_client_no_rebuild_spam(self, tmp_path):
+        import json as _json, os
+        cfg = tmp_path / "c.json"
+        cfg.write_text(_json.dumps({"ollama": {"url": "http://old"}}))
+        g = LocalGrader(config_path=str(cfg))
+        c1 = g._get_client()
+        os.remove(str(cfg))
+        assert g._get_client() is c1            # missing file -> keep cached client

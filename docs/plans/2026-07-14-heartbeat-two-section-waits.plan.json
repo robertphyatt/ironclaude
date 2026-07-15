@@ -1,0 +1,127 @@
+{
+  "name": "Heartbeat Two-Section Waiting Display",
+  "goal": "Split the Slack heartbeat's single WAITING ON YOU block into two always-paired labeled sections (WAITING ON COMMANDER, WAITING ON {operator_name}) with matching per-worker tags, each falling back to 'there is nothing' when empty.",
+  "design_file": "docs/plans/2026-07-14-heartbeat-two-section-waits-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "RED - format_heartbeat tests for two-section format",
+      "description": "Replace TestHeartbeatWaits in test_notifications.py with assertions for the two-section format, commander scaffold fallback, per-worker tag routing, and operator_name default. Run to confirm failure.",
+      "allowed_files": ["commander/tests/test_notifications.py"],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Replace TestHeartbeatWaits class (lines 364-392) with new two-section test assertions"
+        },
+        {
+          "description": "Run TestHeartbeatWaits to verify failure",
+          "command": "cd commander && python -m pytest tests/test_notifications.py::TestHeartbeatWaits -v",
+          "expected": "FAIL - TypeError: format_heartbeat() got an unexpected keyword argument 'operator_name'"
+        },
+        {
+          "description": "Update any remaining WAITING ON YOU literal elsewhere in the file to WAITING ON Operator"
+        },
+        {
+          "description": "Confirm no remaining WAITING ON YOU literal in the test file",
+          "command": "cd commander && grep -n \"WAITING ON YOU\\|waiting on you\" tests/test_notifications.py",
+          "expected": "no output"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/tests/test_notifications.py",
+          "expected": "changes staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "GREEN - implement two-section format_heartbeat",
+      "description": "Add operator_name and commander_waits params to format_heartbeat; render two always-paired labeled sections with independent there-is-nothing fallbacks; update per-worker tag dispatch.",
+      "allowed_files": ["commander/src/ironclaude/notifications.py"],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Replace format_heartbeat function (lines 96-129) with two-section implementation"
+        },
+        {
+          "description": "Run full notifications test file to verify pass",
+          "command": "cd commander && python -m pytest tests/test_notifications.py -v",
+          "expected": "all tests PASS"
+        },
+        {
+          "description": "Confirm no remaining WAITING ON YOU literal in source",
+          "command": "cd commander && grep -n \"WAITING ON YOU\\|waiting on you\" src/ironclaude/notifications.py",
+          "expected": "no output"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/notifications.py",
+          "expected": "changes staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "RED - update test_main_validate.py for new one-time-alert literal",
+      "description": "Update the two tests asserting the literal 'Waiting on you' one-time alert text to expect 'Waiting on Operator', and strengthen test_post_heartbeat_passes_waits to assert operator_name pass-through.",
+      "allowed_files": ["commander/tests/test_main_validate.py"],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Update test_awaiting_operator_message_captures_and_alerts assertion (line 424) to expect 'Waiting on Operator'"
+        },
+        {
+          "description": "Update test_alert_deduped_for_same_question filter (line 486) to expect 'Waiting on Operator'"
+        },
+        {
+          "description": "Add operator_name kwarg assertion to test_post_heartbeat_passes_waits"
+        },
+        {
+          "description": "Run TestOperatorWaits to verify failure",
+          "command": "cd commander && python -m pytest tests/test_main_validate.py::TestOperatorWaits -v",
+          "expected": "FAIL - literal assertions and operator_name kwarg assertion fail"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/tests/test_main_validate.py",
+          "expected": "changes staged"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "GREEN - thread operator_name through main.py callsites",
+      "description": "Update _maybe_capture_operator_wait's one-time alert literal and post_heartbeat's format_heartbeat call to read and pass config.get('operator_name', 'Operator').",
+      "allowed_files": ["commander/src/ironclaude/main.py"],
+      "depends_on": [2, 3],
+      "steps": [
+        {
+          "description": "Update _maybe_capture_operator_wait one-time alert (lines 1411-1415) to use operator_name"
+        },
+        {
+          "description": "Update post_heartbeat's format_heartbeat call (lines 2443-2447) to pass operator_name"
+        },
+        {
+          "description": "Run TestOperatorWaits to verify pass",
+          "command": "cd commander && python -m pytest tests/test_main_validate.py::TestOperatorWaits -v",
+          "expected": "all tests PASS"
+        },
+        {
+          "description": "Confirm no remaining literal in main.py",
+          "command": "cd commander && grep -n \"Waiting on you\\|waiting on you\" src/ironclaude/main.py",
+          "expected": "no output"
+        },
+        {
+          "description": "Run full commander test suite",
+          "command": "cd /Users/roberthyatt/Code/ironclaude && make test-ironclaude",
+          "expected": "all tests PASS"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/main.py",
+          "expected": "changes staged"
+        }
+      ]
+    }
+  ]
+}

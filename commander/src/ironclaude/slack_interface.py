@@ -313,6 +313,7 @@ SLASH_COMMANDS = {
     "help": "Show available commands",
     "summary": "Directive status report: in-progress, blocked, completed",
     "audit": "Reconcile Slack messages vs directives (last 72h)",
+    "login": "Switch Anthropic account: send `login` (then `login code <…>` if it shows a code)",
 }
 
 
@@ -376,6 +377,13 @@ def parse_inbound_command(text: str, registry=None) -> dict:
 
     if upper == "AUDIT":
         return {"type": "audit"}
+
+    login_code_match = re.match(r"^LOGIN\s+CODE\s+(\S+)$", text, re.IGNORECASE)
+    if login_code_match:
+        return {"type": "login_code", "code": login_code_match.group(1)}
+
+    if upper == "LOGIN":
+        return {"type": "login"}
 
     if registry is not None:
         plugin_result = registry.parse_command(text)

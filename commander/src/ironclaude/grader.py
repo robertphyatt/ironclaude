@@ -33,17 +33,27 @@ class LocalGrader:
     for handled error cases (OllamaError, empty response, non-JSON, missing fields).
     """
 
-    def __init__(self, config_path: str | None = None) -> None:
+    def __init__(self, config_path: str | None = None, timeout: int | None = None,
+                 keep_alive: str | None = None) -> None:
         self._config_path = config_path or _DEFAULT_CONFIG_PATH
         self._client: OllamaClient | None = None
         self._cfg: dict = {}
+        self._timeout_override = timeout
+        self._keep_alive = keep_alive     # message-path graders set "30m"; grader path leaves None
+        self._client_mtime: float | None = None
 
     @staticmethod
     def _build_infrastructure_error(detail: str) -> dict:
         return {"infrastructure_error": True, "error_detail": detail}
 
     def _get_client(self) -> OllamaClient:
-        if self._client is None:
+        try:
+            mtime = os.stat(self._config_path).st_mtime
+        except OSError:
+            mtime = None
+        # Rebuild only when there is no client yet, or the file exists AND its mtime
+        # changed. A deleted config keeps the last client (no per-call rebuild spam).
+        if self._client is None or (mtime is not None and mtime != self._client_mtime):
             try:
                 with open(self._config_path) as f:
                     cfg = json.load(f)
@@ -55,8 +65,10 @@ class LocalGrader:
             self._client = OllamaClient(
                 url=ollama_cfg.get("url", "http://localhost:11434"),
                 fallback_url=ollama_cfg.get("fallback_url"),
-                timeout=cfg.get("timeout_seconds", 120),
+                timeout=self._timeout_override if self._timeout_override is not None
+                        else cfg.get("timeout_seconds", 120),
             )
+            self._client_mtime = mtime
         return self._client
 
     def grade(self, system_prompt: str, user_prompt: str, schema: dict | None = None) -> dict:
@@ -73,6 +85,8 @@ class LocalGrader:
             "stream": False,
             "options": {"temperature": 0.1, "num_predict": -1},
         }
+        if self._keep_alive is not None:
+            payload["keep_alive"] = self._keep_alive
         if schema is not None:
             payload["format"] = schema
 
@@ -116,3 +130,10 @@ class LocalGrader:
                 return self._build_infrastructure_error(detail)
 
         return parsed
+
+
+def truncate_middle(text: str, head: int = 1500, tail: int = 500) -> str:
+    """Bound classifier input: keep the head and tail, elide the middle."""
+    if len(text) <= head + tail:
+        return text
+    return f"{text[:head]}\n…[{len(text) - head - tail} chars elided]…\n{text[-tail:]}"

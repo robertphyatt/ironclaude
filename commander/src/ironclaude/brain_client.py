@@ -184,7 +184,7 @@ class BrainClient:
         self,
         timeout_seconds: int = 600,
         operator_name: str = "Operator",
-        model: str = "opus",
+        model: str = "sonnet",
         effort_level: str = "high",
         on_fable_unavailable_transition: Optional[Callable[[str], None]] = None,
     ):
@@ -233,7 +233,7 @@ class BrainClient:
         self._session_log_path: str | None = None
         self._session_log_lock = threading.Lock()
         self._previous_session_context: str | None = None
-        self._grader = LocalGrader()
+        self._grader = LocalGrader(timeout=15, keep_alive="30m")
 
     def start(self, system_prompt: str, cwd: str | None = None) -> None:
         """Start the brain SDK client in a background thread."""
@@ -812,14 +812,16 @@ class BrainClient:
 
         try:
             await _run_session(_build_options(self._model))
-        except _ModelUnavailableFromMessage:
+        except _ModelUnavailableFromMessage as exc:
             failing_model = self._model
             resolved = "opus"
             logger.error(
                 f"BRAIN MODEL '{failing_model}' UNAVAILABLE (message-shaped) — resolving to '{resolved}'"
             )
             self._model = resolved
-            self._maybe_mark_fable_unavailable(failing_model, "brain-detected-message")
+            # Forward the REAL assistant text so fable_availability.classify_reason can
+            # size the recheck window (a genuine outage -> model_unavailable/24h).
+            self._maybe_mark_fable_unavailable(failing_model, str(exc))
             await _run_session(_build_options(resolved))
         except Exception as exc:
             if _is_model_unavailable(exc):
@@ -829,7 +831,9 @@ class BrainClient:
                     f"BRAIN MODEL '{failing_model}' NOT AVAILABLE — resolving to '{resolved}'"
                 )
                 self._model = resolved
-                self._maybe_mark_fable_unavailable(failing_model, "brain-detected-exception")
+                # Forward the richest available error text (stderr carries the outage
+                # detail matched by _is_model_unavailable) for the same reason.
+                self._maybe_mark_fable_unavailable(failing_model, getattr(exc, "stderr", "") or str(exc))
                 await _run_session(_build_options(resolved))
             else:
                 raise

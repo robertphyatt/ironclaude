@@ -2399,9 +2399,16 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
         # lookalike model name (e.g. a redirected opus command using an
         # operator-configured default_opus_model of "fable-nano") — OR-02.
         if spawn_used_fable:
-            clear_result = _clear_fable_unavailable()
-            if clear_result == "removed":
-                self._post_slack_safe(format_fable_recovered())
+            # Under an account-wide usage_limit, tmux readiness proves the CLI started (auth is
+            # up) but NOT that the limit lifted — the throttle bites at inference, not startup.
+            # Clearing here would re-open Fable into a still-throttled account (review M2). Only
+            # clear a non-usage block (a genuine outage the readiness proves is back; an expired
+            # flag reads as None and also clears).
+            from ironclaude.fable_availability import fable_block_category
+            if fable_block_category() != "usage_limit":
+                clear_result = _clear_fable_unavailable()
+                if clear_result == "removed":
+                    self._post_slack_safe(format_fable_recovered())
 
         # Stages 4-5: activate professional mode
         if ssh_host:
@@ -3550,13 +3557,20 @@ Has the worker genuinely completed its objective based on the evidence?
             "message": message,
         }
 
-    def restart_daemon(self) -> str:
+    def restart_daemon(self, directive_id: int | None = None) -> str:
         """Send SIGHUP to restart the daemon via a detached watchdog process.
 
         The MCP server is a grandchild of the daemon — when the daemon kills the
         brain subprocess on SIGHUP, this process dies too.  So we fork a fully
         detached watchdog (double-fork + setsid) that handles monitoring and
         self-healing independently.
+
+        Always pass directive_id when restarting the daemon as part of completing
+        a directive — this is the only safe way to mark a restart directive
+        complete given that the Brain dies when SIGHUP fires. When provided, the
+        directive is marked 'completed' in the DB before the fork (guaranteeing
+        the write survives even if SIGHUP kills this process immediately after
+        returning). An unknown directive_id refuses the restart entirely.
 
         Returns immediately with {"ok": true, "status": "restart_initiated"}.
         Guard check failures return {"ok": false, "error": "..."} without forking.
@@ -3603,6 +3617,26 @@ Has the worker genuinely completed its objective based on the evidence?
                 "ok": False,
                 "error": "Slack connection required — cannot restart without verified Slack connectivity",
             })
+
+        # Guard: confirm directive exists, then mark it completed before fork.
+        # This write MUST happen in the parent, before os.fork() — self._db is
+        # bound to the main thread and every forked child calls os._exit(),
+        # bypassing Python cleanup, so writing from a child would be unsafe.
+        if directive_id is not None:
+            row = self._db.execute(
+                "SELECT id FROM directives WHERE id=?", (directive_id,)
+            ).fetchone()
+            if row is None:
+                return json.dumps({
+                    "ok": False,
+                    "error": f"directive {directive_id} not found — refusing to restart",
+                })
+            self._db.execute(
+                "UPDATE directives SET status='completed', updated_at=datetime('now') WHERE id=?",
+                (directive_id,),
+            )
+            self._db.commit()
+            logger.info(f"restart_daemon: pre-marked directive {directive_id} completed before SIGHUP")
 
         # Ensure status directory exists before forking
         status_dir = Path("/tmp/ic")
@@ -4154,9 +4188,14 @@ def _create_mcp_server(tools: OrchestratorTools):
         return result
 
     @mcp.tool()
-    def restart_daemon() -> str:
-        """Send SIGHUP to the IronClaude daemon, triggering a graceful self-restart."""
-        return tools.restart_daemon()
+    def restart_daemon(directive_id: int | None = None) -> str:
+        """Send SIGHUP to the IronClaude daemon, triggering a graceful self-restart.
+
+        Always pass directive_id when restarting the daemon as part of completing
+        a directive — this is the only safe way to mark a restart directive
+        complete given that the Brain dies when SIGHUP fires.
+        """
+        return tools.restart_daemon(directive_id)
 
     @mcp.tool()
     def restart_mcp() -> str:

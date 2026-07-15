@@ -147,7 +147,6 @@ class TestCallLocalGrader:
             result = tools._call_local_grader("sys", "usr", GRADE_SCHEMA)
         assert result["infrastructure_error"] is True
         assert "timed out" in result["error_detail"].lower()
-        mock_post.assert_called_once()
 
     def test_malformed_response_missing_response_field(self, tools, ollama_config):
         tools._ollama_config = None

@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ironclaude.config import load_config, load_machines_config, DEFAULTS, make_opus_command
+from ironclaude.auth_relay import AuthRelay
 from ironclaude.slack_interface import SlackBot, DIRECTIVE_STATUS_EMOJI
 from ironclaude.slack_commands import SlackSocketHandler, format_help_text
 from ironclaude.db import init_db
@@ -39,7 +40,7 @@ from ironclaude.notifications import (
     format_worker_heartbeat_stuck_slack,
     _escape_mrkdwn,
 )
-from ironclaude.grader import LocalGrader
+from ironclaude.grader import LocalGrader, truncate_middle
 from ironclaude.fable_availability import (
     resolve_worker_type as _resolve_fable_worker_type,
     resolve_advisor_model as _resolve_fable_advisor_model,
@@ -74,9 +75,23 @@ _AWAITING_PHRASE_RE = re.compile(
     r"your (?:reply|response|input|decision)|pinned decision",
     re.IGNORECASE,
 )
+_NOT_AWAITING_RE = re.compile(
+    r"(?:holding|waiting)\s+(?:for|on)\s+(?:the\s+)?"
+    r"(?:subagent|sub-agent|worker|reviewer|fable|blind\s+review|tier[- ]?up|advisor)\b",
+    re.IGNORECASE,
+)
 _AWAITING_OP_SYSTEM = (
     "You classify a Brain status message. Determine whether the Brain is reporting that it is "
-    "WAITING ON THE OPERATOR (the human) to reply or decide before work can continue.\n\n"
+    "WAITING ON THE OPERATOR (the human) to make a decision or judgment call before work can "
+    "continue — NOT merely narrating that some autonomous system condition (a test suite "
+    "finishing, a worker completing, a heartbeat label going idle, a timer elapsing) has not "
+    "yet resolved on its own.\n\n"
+    "Examples of awaiting_operator=true: \"holding for your approval on the migration\", "
+    "\"waiting on your decision: ship now or wait for review?\", \"pinned decision needed from you\".\n"
+    "Examples of awaiting_operator=false (system state, not a human decision): "
+    "\"waiting for the heartbeat labels to become idle\", \"worker is waiting on tests to pass\", "
+    "\"holding until the build finishes\", \"holding for the Fable review result\", "
+    "\"waiting on subagent verdict\".\n\n"
     "If yes, extract the worker id it is waiting about (e.g. d1267; use null if it is the Brain itself) "
     "and a short paraphrase of what it is waiting for.\n\n"
     'Respond ONLY with valid JSON: {"awaiting_operator": true|false, "worker_id": "..."|null, "question": "..."|null}'
@@ -90,7 +105,7 @@ _AWAITING_OP_SCHEMA = {
     },
     "required": ["awaiting_operator"],
 }
-_OPERATOR_WAIT_TTL_SECONDS = 1800   # backstop: drop a wait the Brain stopped re-affirming
+_OPERATOR_WAIT_TTL_SECONDS = 600    # backstop: drop a wait the Brain stopped re-affirming
 _OPERATOR_WAIT_MAX = 32            # bound the in-memory map
 _BRAIN_DROP_NUDGE_MAX = 2         # max nudges per window (loop guard — see d1133)
 _BRAIN_DROP_NUDGE_WINDOW = 600    # seconds
@@ -114,6 +129,24 @@ _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+
+_LIMIT_COOLDOWN_S = 1800  # re-alert the SAME limit signal at most once per ~window
+# separators seen in the wild: middle-dot, colon, hyphen, em-dash; apostrophe may be straight or curly
+_ACCOUNT_LIMIT_RE = re.compile(r"you['’]?ve hit your limit(?:\s*[·:\-—]\s*(resets[^\n]*))?", re.IGNORECASE)
+_WORKER_LIMIT_RE = re.compile(r"(?<!no )(?:session limit hit|rate-limit menu)", re.IGNORECASE)  # not "no session limit hit"
+
+
+def detect_account_limit(text: str):
+    """Return a human reset string if `text` signals an account/worker usage limit, else None.
+    Shared signal set with the Fable-gate deferred usage detector ('hit your limit')."""
+    if not text:
+        return None
+    m = _ACCOUNT_LIMIT_RE.search(text)
+    if m:
+        return (m.group(1) or "reset time unknown").strip()
+    if _WORKER_LIMIT_RE.search(text):
+        return "reset time unknown"
+    return None
 
 
 def log_worker_event(event_type: str, **fields) -> None:
@@ -436,6 +469,15 @@ def _handle_restart(signum, frame):
     logger.info("Daemon restart requested via SIGHUP")
     _clean_shutdown = True
     if _daemon:
+        # Step 0: abort any in-progress /login relay so its `claude auth login` child isn't
+        # orphaned across the execvp (review M6). Non-destructive: an incomplete login never
+        # replaces the credential.
+        try:
+            if getattr(_daemon, "_auth_relay", None) and _daemon._auth_relay.in_progress():
+                logger.info("Restart step 0: abort in-progress /login relay")
+                _daemon._auth_relay.abort()
+        except Exception:
+            pass
         # Step 1: Poison brain retry loop BEFORE any subprocess kills
         try:
             logger.info("Restart step 1: poison brain retry loop")
@@ -675,13 +717,17 @@ class IroncladeDaemon:
         # Message aging state
         self._last_message_aging_check: float = 0.0
         self._message_aging_alerted: set[str] = set()
+        # /login account-switch relay (operator-triggered; SIGHUP-restart on verified success)
+        self._auth_relay = AuthRelay()
+        # Usage-limit surfacing: {reset-string: last-alert-epoch} for a per-window cooldown
+        self._limit_alerted: dict[str, float] = {}
         # Stuck worker detection state
         self._stuck_hash: dict[str, int] = {}
         self._stuck_since: dict[str, float] = {}
         self._stuck_alert_sent: dict[str, bool] = {}
         self._stuck_kill_deferred: dict[str, float] = {}
         self._last_stuck_check: float = 0.0
-        self._grader = LocalGrader()
+        self._grader = LocalGrader(timeout=15, keep_alive="30m")
         self._prompt_waiting_cache: dict[int, tuple[float, bool]] = {}
         self._stuck_liveness_count: dict[str, int] = {}
         self._pm_gate_slack_sent: dict[str, bool] = {}
@@ -734,7 +780,7 @@ class IroncladeDaemon:
             return False, _BLOCKED_NO_DIRECTIVE
         result = self._grader.grade(
             _BRAIN_MSG_VALIDATION_SYSTEM,
-            f"Validate this Brain message:\n{text}",
+            f"Validate this Brain message:\n{truncate_middle(text)}",
             _BRAIN_MSG_SCHEMA,
         )
         if result.get("infrastructure_error"):
@@ -897,6 +943,23 @@ class IroncladeDaemon:
             elif cmd_type == "resume":
                 self._paused = False
                 self.slack.post_message("Resumed.")
+            elif cmd_type == "login":
+                try:
+                    r = self._auth_relay.start()
+                    if r["state"] == "busy":
+                        self.slack.post_message("A sign-in is already in progress. If it showed a code, reply `login code <the-code>`.")
+                    else:
+                        self.slack.post_message("Starting sign-in — I'll post the link here in a moment.")
+                except Exception as exc:   # spawn failure must still be reported (principle #3)
+                    self.slack.post_message(f"Couldn't start sign-in: {exc}")
+            elif cmd_type == "login_code":
+                res = self._auth_relay.submit_code(parsed["code"])
+                if res == "sent":
+                    self.slack.post_message("Code submitted — finishing sign-in…")
+                elif res == "idle":
+                    self.slack.post_message("No sign-in is in progress. Send `login` first.")
+                else:
+                    self.slack.post_message("Couldn't submit the code — the sign-in may have ended. Send `login` to retry.")
             elif cmd_type == "message":
                 text = parsed.get("text", "")
                 msg_ts = item.get("ts", "")
@@ -932,6 +995,25 @@ class IroncladeDaemon:
                 pass  # handled by plugin
             else:
                 self.slack.post_message(f"Command `{cmd_type}` acknowledged (not yet implemented).")
+
+        # Advance the /login relay once per cycle (non-blocking). Restart ONLY on a verified success.
+        ev = self._auth_relay.tick()
+        if ev is not None:
+            st = ev["state"]
+            if st == "url":
+                self.slack.post_message(f"Open this to sign in, then I'll switch over:\n{ev['url']}\n(If it shows a code, reply `login code <the-code>`.)")
+            elif st == "already_logged_in":
+                self.slack.post_message(f"Already signed in as {ev.get('account') or 'the current account'}. Nothing to switch.")
+            elif st == "success":
+                self.slack.post_message(f"Signed in as {ev['account']}. Restarting onto the new credential…")
+                self.slack.flush_queue()   # deliver the notice before execvp discards the in-memory queue (review M5)
+                os.kill(os.getpid(), signal.SIGHUP)   # verify-gated: reached ONLY when status confirmed the account
+            elif st == "verify_failed":
+                self.slack.post_message("Signed in, but I couldn't confirm the account after retries — the switch may or may not have completed. Not restarting; send `login` again to be sure. (review I1: no false 'previous account intact' claim.)")
+            elif st == "timeout":
+                self.slack.post_message("Sign-in timed out — no change; the previous account is still active.")
+            elif st == "error":
+                self.slack.post_message(f"Sign-in didn't complete: {ev.get('detail','')[:300]} — previous account unchanged.")
 
     def _handle_directive_confirmation(self, text: str) -> bool:
         """Check if text is a yes/no reply to a pending directive confirmation.
@@ -1389,9 +1471,11 @@ class IroncladeDaemon:
         loop-break). Fail-safe: any classifier error/uncertainty -> not captured."""
         if not _AWAITING_PHRASE_RE.search(text):
             return False
+        if _NOT_AWAITING_RE.search(text):
+            return False
         try:
             result = self._grader.grade(
-                _AWAITING_OP_SYSTEM, f"Classify this Brain message:\n{text}", _AWAITING_OP_SCHEMA
+                _AWAITING_OP_SYSTEM, f"Classify this Brain message:\n{truncate_middle(text)}", _AWAITING_OP_SCHEMA
             )
         except Exception as e:
             logger.warning("awaiting-operator classify failed: %s — not capturing", e)
@@ -1410,8 +1494,9 @@ class IroncladeDaemon:
         # One-time alert per (worker, question) — heartbeat handles the repeat surfacing.
         if self._operator_wait_alerted.get(worker_id) != question:
             self._operator_wait_alerted[worker_id] = question
+            operator_name = self.config.get("operator_name", "Operator")
             self.slack.post_message(
-                f"⏳ *Waiting on you:* `{worker_id}` — {_escape_mrkdwn(question) or '(awaiting your reply)'}"
+                f"⏳ *Waiting on {operator_name}:* `{worker_id}` — {_escape_mrkdwn(question) or '(awaiting your reply)'}"
             )
         logger.info("operator_wait recorded for %s: %s", worker_id, question[:80])
         return True
@@ -1440,6 +1525,17 @@ class IroncladeDaemon:
         """Drain brain responses, validate context, and post to Slack."""
         for text in self.brain.get_pending_responses():
             logger.info(f"Brain response: {text[:100]}...")
+            # Usage-limit surfacing runs BEFORE the operator-wait continue so a limit
+            # message that also reads as "waiting" still prompts the operator to /login.
+            limit = detect_account_limit(text)
+            if limit:
+                now = time.time()
+                # prune expired keys so the map can't grow unbounded over the daemon's life (review M3)
+                self._limit_alerted = {k: t for k, t in self._limit_alerted.items() if now - t <= _LIMIT_COOLDOWN_S}
+                last = self._limit_alerted.get(limit)
+                if last is None or now - last > _LIMIT_COOLDOWN_S:
+                    self._limit_alerted[limit] = now
+                    self.slack.post_message(f"⚠️ Usage limit hit ({limit}). Send `login` to switch accounts.")
             # Awaiting-operator capture runs FIRST, for every message (whether or not it
             # would pass the directive-ref gate), converting a "holding" message into
             # structured heartbeat state instead of posting or silently dropping it.
@@ -2417,6 +2513,23 @@ class IroncladeDaemon:
             log_tail = self.tmux.read_log_tail(w["tmux_session"], lines=lines)
         self.slack.post_message(f"```{log_tail}```")
 
+    def _get_pending_confirmation_waits(self) -> dict[str, dict]:
+        """Deterministic operator-wait signal: directives sitting in pending_confirmation
+        are, by construction, waiting on the operator's confirm/reject Slack reaction —
+        no LLM classification needed, cannot false-positive."""
+        if self._db is None:
+            return {}
+        try:
+            rows = self._db.execute(
+                "SELECT id, interpretation FROM directives WHERE status='pending_confirmation'"
+            ).fetchall()
+        except Exception as e:
+            # Broad catch matches the existing pattern at main.py:2456-2470 — a query
+            # failure here must not crash the heartbeat.
+            logger.warning("pending_confirmation query skipped: %s", e)
+            return {}
+        return {f"d{row[0]}": {"question": (row[1] or "")[:150]} for row in rows}
+
     def post_heartbeat(self):
         """Post heartbeat to Slack at configured interval."""
         heartbeat_interval = self.config.get("heartbeat_interval_seconds", 900)
@@ -2442,8 +2555,20 @@ class IroncladeDaemon:
 
         brain_usage = self.brain.get_token_usage() if self.brain is not None else None
         self._prune_operator_waits(now)
+        operator_name = self.config.get("operator_name", "Operator")
+        # Deterministic signal is merged LAST so it wins over a same-id `_operator_waits`
+        # entry — a stale/false-positive classifier entry must never mask a real
+        # pending_confirmation directive sharing the same d{id} key.
+        merged_waits = {**dict(self._operator_waits), **self._get_pending_confirmation_waits()}
+        from ironclaude.ollama_client import ollama_degraded_urls
         self.slack.post_message(
-            format_heartbeat(worker_details, brain_usage=brain_usage, waits=dict(self._operator_waits))
+            format_heartbeat(
+                worker_details,
+                brain_usage=brain_usage,
+                waits=merged_waits,
+                operator_name=operator_name,
+                ollama_degraded=bool(ollama_degraded_urls()),
+            )
         )
 
         # Grader enforcement: if no alive workers but directives exist, nudge the Brain

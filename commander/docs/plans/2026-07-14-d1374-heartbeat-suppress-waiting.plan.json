@@ -1,0 +1,92 @@
+{
+  "name": "d1374 Heartbeat Suppress Waiting",
+  "goal": "Stop the daemon heartbeat from showing \"Waiting on Robert\" when no real operator action is pending, by backing the display with a deterministic pending_confirmation directive signal plus a tightened classifier prompt.",
+  "design_file": "commander/docs/plans/2026-07-14-d1374-heartbeat-suppress-waiting-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Tighten the awaiting-operator classifier prompt",
+      "description": "Replace _AWAITING_OP_SYSTEM in main.py to distinguish genuine operator decisions from autonomous-system-condition narration, using the confirmed d1362 false-positive as a negative example. Add a regression-documentation test to TestOperatorWaits; no true RED/GREEN cycle applies since the prompt text is not exercised by mocked-grader tests.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_main_validate.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Replace _AWAITING_OP_SYSTEM (main.py:77-83) with the tightened prompt text distinguishing operator decisions from system-state narration, including the d1362 phrasing as a negative example."
+        },
+        {
+          "description": "Add test_d1362_style_system_narration_falls_through_when_grader_says_no to TestOperatorWaits in tests/test_main_validate.py, mocking the grader to return awaiting_operator=False for the exact d1362 incident phrasing."
+        },
+        {
+          "description": "Run TestOperatorWaits test suite",
+          "command": "PYTHONUNBUFFERED=1 python -m pytest tests/test_main_validate.py -k TestOperatorWaits -v",
+          "expected": "All tests in TestOperatorWaits pass, including the new one."
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add src/ironclaude/main.py tests/test_main_validate.py",
+          "expected": "Changes staged (professional mode blocks commit)."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Add deterministic pending_confirmation signal to the heartbeat",
+      "description": "Add _get_pending_confirmation_waits() querying directives with status='pending_confirmation' and merge its result into the waits dict passed to format_heartbeat() from post_heartbeat(), so the WAITING ON section is backed by a real signal in addition to the (now-tightened) classifier.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_main_validate.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Add `import sqlite3` to tests/test_main_validate.py's imports if not already present, then write test_pending_confirmation_directive_surfaces_in_heartbeat_waits and test_no_pending_confirmation_and_no_operator_waits_suppresses_section in TestOperatorWaits, using an in-memory sqlite3 directives table. NEITHER test mocks format_heartbeat: both assert on the real rendered Slack message via _posts(d) — the first confirms directive-sourced rendering per the design's instruction, the second confirms the WAITING ON section is fully absent (the actual regression guard for the reported symptom)."
+        },
+        {
+          "description": "Run the new tests, expect the surfacing test to fail",
+          "command": "PYTHONUNBUFFERED=1 python -m pytest tests/test_main_validate.py -k \"pending_confirmation\" -v",
+          "expected": "test_pending_confirmation_directive_surfaces_in_heartbeat_waits FAILS (directive not yet merged into waits); suppression test may already pass."
+        },
+        {
+          "description": "Implement _get_pending_confirmation_waits() in main.py (placed immediately before post_heartbeat), catching Exception broadly (matching the existing pattern at main.py:2456-2470) so a query failure cannot crash the heartbeat. Modify post_heartbeat (lines 2444-2454) to build merged_waits = {**dict(self._operator_waits), **self._get_pending_confirmation_waits()} (deterministic signal merged LAST so it wins over a stale same-id classifier entry) and pass it as waits= to format_heartbeat."
+        },
+        {
+          "description": "Run TestOperatorWaits test suite",
+          "command": "PYTHONUNBUFFERED=1 python -m pytest tests/test_main_validate.py -k TestOperatorWaits -v",
+          "expected": "All tests in TestOperatorWaits pass, including both new tests and the existing test_post_heartbeat_passes_waits."
+        },
+        {
+          "description": "Run full test suite for regressions",
+          "command": "PYTHONUNBUFFERED=1 python -m pytest tests/ -v",
+          "expected": "No new failures; the unrelated [ACTION REQUIRED] daemon-to-Brain nudge flow tests are unaffected."
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add src/ironclaude/main.py tests/test_main_validate.py",
+          "expected": "Changes staged (professional mode blocks commit)."
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Restart daemon to deploy the fix, then verify live",
+      "description": "Operational step: after Tasks 1 and 2 are reviewed and committed, call restart_daemon(directive_id=1374) so the daemon picks up the new code and directive #1374 is atomically marked completed before the SIGHUP restart, per the d1364 restart-loop-fix convention. No code changes, no test framework applies. allowed_files lists the plan JSON itself only as a harmless non-empty placeholder (schema requires a non-empty list) — no file is actually edited by this task.",
+      "allowed_files": ["commander/docs/plans/2026-07-14-d1374-heartbeat-suppress-waiting.plan.json"],
+      "depends_on": [1, 2],
+      "steps": [
+        {
+          "description": "Confirm Tasks 1 and 2 passed code review and are committed."
+        },
+        {
+          "description": "Call the restart_daemon MCP tool with directive_id=1374.",
+          "expected": "Directive #1374 is marked status='completed' in the directives table before the daemon forks/restarts via SIGHUP."
+        },
+        {
+          "description": "Post-restart live verification (manual): over the next 1-2 heartbeat cycles, confirm the WAITING ON section does not appear during an autonomous-only period with no pending_confirmation directive. This is the only real-world check of Task 1's unverifiable-by-unit-test prompt change — do not skip it. If the false-positive pattern recurs with different wording, file a follow-up directive rather than treating this task as failed."
+        }
+      ]
+    }
+  ]
+}

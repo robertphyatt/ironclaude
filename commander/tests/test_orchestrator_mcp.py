@@ -1016,8 +1016,13 @@ class TestEffortLevel:
         cmd = t._get_worker_command("claude-sonnet")
         assert "CLAUDE_CODE_EFFORT_LEVEL=medium" in cmd
 
-    def test_get_worker_command_fable_effort_override(self, registry, mock_tmux, tmp_path, db_conn):
+    def test_get_worker_command_fable_effort_override(self, registry, mock_tmux, tmp_path, db_conn, monkeypatch):
         """Fable worker command uses configured effort_level."""
+        # Hermetic isolation: redirect the fable-availability state file into tmp so this test
+        # never reads a real ~/.ironclaude/state/fable_unavailable.json (a live flag would make
+        # resolve_worker_type redirect claude-fable -> claude-opus and fail the assertion).
+        from ironclaude import fable_availability as fa
+        monkeypatch.setattr(fa, "_STATE_PATH", tmp_path / "fable_state.json")
         ledger_path = str(tmp_path / "ledger.json")
         t = OrchestratorTools(
             registry, mock_tmux, ledger_path, db_conn=db_conn,
@@ -4541,6 +4546,63 @@ class TestRestartDaemon:
         assert data["ok"] is False
         assert "Slack connection required" in data["error"]
         mock_fork.assert_not_called()
+
+    def test_restart_daemon_marks_directive_completed_before_fork(self, tools, tmp_path, db_conn):
+        """directive_id is marked completed in the DB before the fork."""
+        pid_file = tmp_path / "ic-daemon.pid"
+        pid_file.write_text("12345")
+        tools._slack = MagicMock(is_reachable=MagicMock(return_value=True))
+        cursor = db_conn.execute(
+            "INSERT INTO directives (source_ts, source_text, interpretation, status) "
+            "VALUES ('1.0', 'restart daemon', 'Restart daemon after X', 'in_progress')"
+        )
+        db_conn.commit()
+        directive_id = cursor.lastrowid
+        with patch("ironclaude.orchestrator_mcp.PID_FILE", pid_file), \
+             patch("fcntl.flock", side_effect=BlockingIOError), \
+             patch("os.kill"), \
+             patch("os.fork", return_value=123), \
+             patch("os.waitpid"), \
+             patch("pathlib.Path.mkdir"):
+            result = tools.restart_daemon(directive_id=directive_id)
+        data = json.loads(result)
+        assert data["ok"] is True
+        row = db_conn.execute(
+            "SELECT status FROM directives WHERE id=?", (directive_id,)
+        ).fetchone()
+        assert row["status"] == "completed"
+
+    def test_restart_daemon_invalid_directive_id_refuses_restart(self, tools, tmp_path):
+        """Unknown directive_id refuses the restart without forking."""
+        pid_file = tmp_path / "ic-daemon.pid"
+        pid_file.write_text("12345")
+        tools._slack = MagicMock(is_reachable=MagicMock(return_value=True))
+        with patch("ironclaude.orchestrator_mcp.PID_FILE", pid_file), \
+             patch("fcntl.flock", side_effect=BlockingIOError), \
+             patch("os.kill"), \
+             patch("os.fork") as mock_fork:
+            result = tools.restart_daemon(directive_id=999999)
+        data = json.loads(result)
+        assert data["ok"] is False
+        assert "not found" in data["error"]
+        mock_fork.assert_not_called()
+
+    def test_restart_daemon_none_directive_id_unchanged_behavior(self, tools, tmp_path):
+        """Omitting directive_id preserves current behavior exactly."""
+        pid_file = tmp_path / "ic-daemon.pid"
+        pid_file.write_text("12345")
+        tools._slack = MagicMock(is_reachable=MagicMock(return_value=True))
+        with patch("ironclaude.orchestrator_mcp.PID_FILE", pid_file), \
+             patch("fcntl.flock", side_effect=BlockingIOError), \
+             patch("os.kill"), \
+             patch("os.fork", return_value=123) as mock_fork, \
+             patch("os.waitpid"), \
+             patch("pathlib.Path.mkdir"):
+            result = tools.restart_daemon()
+        data = json.loads(result)
+        assert data["ok"] is True
+        assert data["status"] == "restart_initiated"
+        mock_fork.assert_called_once()
 
 
 class TestRestartWatchdog:

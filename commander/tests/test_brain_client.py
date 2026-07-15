@@ -92,10 +92,12 @@ class TestBrainToolRestrictions:
 
 
 class TestBrainModelParameter:
-    def test_default_model_is_opus_4_6_1m(self):
-        """BrainClient defaults to opus."""
+    def test_default_model_is_sonnet(self):
+        """BrainClient defaults to sonnet, which gets 1M context natively
+        (bare model string, no [1m] suffix, no beta — see
+        TestBrain1MContextGating.test_sonnet_gets_bare_model_no_beta)."""
         client = BrainClient()
-        assert client._model == "opus"
+        assert client._model == "sonnet"
 
     def test_model_parameter_accepted(self):
         """BrainClient accepts custom model parameter."""
@@ -1894,13 +1896,17 @@ class TestModelUnavailableText:
         assert _is_model_unavailable_text("All checks passed, changes staged.") is False
         assert _is_model_unavailable_text("") is False
 
-    def test_message_shaped_unavailability_falls_back_to_opus(self):
+    def test_message_shaped_unavailability_falls_back_to_opus(self, tmp_path, monkeypatch):
         """A brain assistant MESSAGE signaling model-unavailable triggers fallback
         to opus and is not surfaced as a brain response."""
         import asyncio
         from unittest.mock import patch
         from claude_agent_sdk import AssistantMessage
         from claude_agent_sdk.types import TextBlock
+        # This drives the fable message path, which now marks fable unavailable — isolate
+        # the flag so the suite never writes the operator's real ~/.ironclaude state.
+        from ironclaude import fable_availability
+        monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "s.json")
 
         models_built = []
 
@@ -1977,8 +1983,9 @@ class TestModelUnavailableFableTransition:
         return models_built
 
     def test_ModelUnavailable_fable_model_calls_mark_and_callback(self, tmp_path, monkeypatch):
-        """Fallback from a failing fable model marks fable unavailable and
-        invokes the transition callback with a 'brain-detected' reason."""
+        """Fallback from a failing fable model marks fable unavailable, forwarding the
+        REAL assistant outage text (not a fixed label) so it classifies model_unavailable,
+        and invokes the transition callback with that text."""
         from unittest.mock import MagicMock
         from ironclaude import fable_availability
 
@@ -1994,11 +2001,13 @@ class TestModelUnavailableFableTransition:
 
         with_mark.assert_called_once()
         reason_arg = with_mark.call_args.args[0]
-        assert reason_arg.startswith("brain-detected")
+        assert "selected model" in reason_arg.lower()   # real assistant text, not a fixed label
+        # a genuine Fable outage -> model_unavailable (24h + downgrade to a working Opus)
+        assert fable_availability.fable_block_category() == "model_unavailable"
 
         callback.assert_called_once()
         callback_reason = callback.call_args.args[0]
-        assert "brain-detected" in callback_reason
+        assert "selected model" in callback_reason.lower()
 
         # Fallback still resolved to opus — existing behavior unchanged.
         assert client._model == "opus"

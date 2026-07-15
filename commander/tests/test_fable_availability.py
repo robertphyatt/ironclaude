@@ -50,10 +50,13 @@ def test_mark_transition_semantics():
     assert fa.mark_fable_unavailable("r") == "already_flagged"
 
 
-def test_mark_uses_24h_ttl():
-    fa.mark_fable_unavailable("r")
+def test_mark_model_unavailable_uses_24h_ttl():
+    # Repointed: the blanket 24h window is now scoped to model_unavailable only
+    # (usage/unknown get shorter re-probe windows). A model-outage reason keeps 24h.
+    fa.mark_fable_unavailable("Claude Fable 5 is currently unavailable")
     payload = json.loads(fa._STATE_PATH.read_text())
     assert payload["unavailable_until"] - time.time() > 86000
+    assert payload["category"] == "model_unavailable"
 
 
 def test_mark_creates_parent_dir(tmp_path, monkeypatch):
@@ -157,3 +160,160 @@ def test_concurrent_marks_serialized():
         t.join()
 
     assert sorted(results) == ["already_flagged", "transition"]
+
+
+class TestClassifyReason:
+    @pytest.mark.parametrize("reason", [
+        "5-hour limit reached - resets 3pm", "Usage limit exceeded", "rate limit",
+        "HTTP 429 Too Many Requests", "quota exceeded",
+    ])
+    def test_usage_limit(self, reason):
+        assert fa.classify_reason(reason) == "usage_limit"
+
+    @pytest.mark.parametrize("reason", [
+        "Claude Fable 5 is currently unavailable", "access denied", "HTTP 403 forbidden",
+        # the REAL message-shaped outage text the call site now forwards (brain_client.py):
+        "There's an issue with the selected model (fable[1m]). It may not exist or you may not have access to it.",
+    ])
+    def test_model_unavailable(self, reason):
+        assert fa.classify_reason(reason) == "model_unavailable"
+
+    @pytest.mark.parametrize("reason", [
+        "brain-detected-exception", "brain-detected-message", "spawn-died",
+        "unexpected capacity constraints, unable to respond", "", "weird",
+    ])
+    def test_unknown(self, reason):
+        assert fa.classify_reason(reason) == "unknown"
+
+    def test_bare_number_not_substring_matched(self):
+        # a request id containing 429/403 as a substring must NOT trigger a match
+        assert fa.classify_reason("request req_4290x11 failed") == "unknown"
+        assert fa.classify_reason("trace 14039 done") == "unknown"
+
+    def test_model_anchor_wins_over_incidental_usage_words(self):
+        # adversarial review M1: a real outage that also mentions a usage word must
+        # still classify model_unavailable (the anchor wins).
+        assert fa.classify_reason(
+            "There's an issue with the selected model (fable[1m]); rate limit / quota noise"
+        ) == "model_unavailable"
+        assert fa.classify_reason("selected model may not exist — too many requests") == "model_unavailable"
+
+
+class TestParseResetTime:
+    def test_resets_pm(self):
+        import datetime
+        now = datetime.datetime(2026, 7, 14, 13, 0, 0).timestamp()   # 1pm
+        got = fa.parse_reset_time("5-hour limit reached - resets 3pm", now)
+        assert got == datetime.datetime(2026, 7, 14, 15, 0, 0).timestamp()
+
+    def test_resets_next_day_when_past(self):
+        import datetime
+        now = datetime.datetime(2026, 7, 14, 23, 0, 0).timestamp()   # 11pm
+        got = fa.parse_reset_time("5-hour limit resets 12:30am - continuing with usage credits", now)
+        assert got == datetime.datetime(2026, 7, 15, 0, 30, 0).timestamp()
+
+    def test_no_reset_returns_none(self):
+        assert fa.parse_reset_time("some message without a reset time", 1000.0) is None
+        assert fa.parse_reset_time("", 1000.0) is None
+
+
+class TestMarkWindows:
+    def _read(self):
+        return json.loads(fa._STATE_PATH.read_text())
+
+    def test_usage_limit_uses_message_reset(self, monkeypatch):
+        import datetime
+        now = datetime.datetime(2026, 7, 14, 13, 0, 0).timestamp()   # 1pm
+        monkeypatch.setattr(fa, "_now", lambda: now)
+        assert fa.mark_fable_unavailable("5-hour limit reached - resets 3pm") == "transition"
+        p = self._read()
+        assert p["category"] == "usage_limit"
+        assert p["unavailable_until"] == datetime.datetime(2026, 7, 14, 15, 0, 0).timestamp()
+
+    def test_usage_limit_reset_at_wins(self, monkeypatch):
+        monkeypatch.setattr(fa, "_now", lambda: 1000.0)
+        fa.mark_fable_unavailable("usage limit", reset_at=1000.0 + 4000)
+        assert self._read()["unavailable_until"] == 5000.0
+
+    def test_usage_limit_retry_after(self, monkeypatch):
+        monkeypatch.setattr(fa, "_now", lambda: 1000.0)
+        fa.mark_fable_unavailable("rate limit", retry_after_seconds=120)
+        assert self._read()["unavailable_until"] == 1120.0
+
+    def test_usage_limit_fallback_reprobe(self, monkeypatch):
+        monkeypatch.setattr(fa, "_now", lambda: 1000.0)
+        fa.mark_fable_unavailable("usage limit")
+        assert self._read()["unavailable_until"] == 1000.0 + fa._USAGE_REPROBE
+
+    def test_usage_limit_clamped_to_max(self, monkeypatch):
+        # a reset_at 20h out (bad parse / skew) is clamped to now + _USAGE_MAX
+        monkeypatch.setattr(fa, "_now", lambda: 1000.0)
+        fa.mark_fable_unavailable("usage limit", reset_at=1000.0 + 20 * 3600)
+        assert self._read()["unavailable_until"] == 1000.0 + fa._USAGE_MAX
+
+    def test_model_unavailable_24h(self, monkeypatch):
+        monkeypatch.setattr(fa, "_now", lambda: 1000.0)
+        fa.mark_fable_unavailable("Claude Fable 5 is currently unavailable")
+        p = self._read()
+        assert p["category"] == "model_unavailable"
+        assert p["unavailable_until"] == 1000.0 + fa._MODEL_TTL
+
+    def test_unknown_reprobe(self, monkeypatch):
+        monkeypatch.setattr(fa, "_now", lambda: 1000.0)
+        fa.mark_fable_unavailable("brain-detected-exception")
+        p = self._read()
+        assert p["category"] == "unknown"
+        assert p["unavailable_until"] == 1000.0 + fa._UNKNOWN_REPROBE
+
+    def test_usage_limit_escalates_to_model_unavailable(self, monkeypatch):
+        # adversarial review I3: a genuine outage during a keep-Fable usage_limit window
+        # must be able to flip the category so resolve_* stops keeping Fable.
+        monkeypatch.setattr(fa, "_now", lambda: 1000.0)
+        assert fa.mark_fable_unavailable("usage limit") == "transition"
+        assert self._read()["category"] == "usage_limit"
+        assert fa.mark_fable_unavailable("issue with the selected model (fable[1m])") == "transition"
+        p = self._read()
+        assert p["category"] == "model_unavailable"
+        assert p["unavailable_until"] == 1000.0 + fa._MODEL_TTL
+
+    def test_usage_limit_not_re_marked_by_another_usage_limit(self, monkeypatch):
+        monkeypatch.setattr(fa, "_now", lambda: 1000.0)
+        assert fa.mark_fable_unavailable("usage limit") == "transition"
+        assert fa.mark_fable_unavailable("rate limit") == "already_flagged"   # same category -> dedup
+
+    def test_model_unavailable_not_downgraded_to_usage(self, monkeypatch):
+        # escalation is one-way: a model_unavailable window is NOT flipped to usage_limit.
+        monkeypatch.setattr(fa, "_now", lambda: 1000.0)
+        assert fa.mark_fable_unavailable("currently unavailable") == "transition"
+        assert fa.mark_fable_unavailable("usage limit") == "already_flagged"
+
+
+class TestResolveGating:
+    def _flag(self, category):
+        fa._STATE_PATH.write_text(json.dumps(
+            {"unavailable_until": time.time() + 9999, "category": category,
+             "reason": "x", "marked_at": time.time()}))
+
+    def test_usage_limit_keeps_fable(self):
+        self._flag("usage_limit")
+        assert fa.resolve_worker_type("claude-fable") == "claude-fable"
+        assert fa.resolve_advisor_model("fable") == "fable"
+
+    def test_model_unavailable_downgrades(self):
+        self._flag("model_unavailable")
+        assert fa.resolve_worker_type("claude-fable") == "claude-opus"
+        assert fa.resolve_advisor_model("fable") == "opus"
+
+    def test_unknown_downgrades(self):
+        self._flag("unknown")
+        assert fa.resolve_worker_type("claude-fable") == "claude-opus"
+
+    def test_legacy_flag_no_category_downgrades(self):
+        # active flag missing 'category' (legacy / unreadable-category race) -> downgrade (safe)
+        fa._STATE_PATH.write_text(json.dumps({"unavailable_until": time.time() + 9999}))
+        assert fa.resolve_worker_type("claude-fable") == "claude-opus"
+        assert fa.fable_block_category() == "unknown"
+
+    def test_available_passthrough(self):
+        assert fa.resolve_worker_type("claude-fable") == "claude-fable"
+        assert fa.fable_block_category() is None

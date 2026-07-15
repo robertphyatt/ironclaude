@@ -302,6 +302,10 @@ Do NOT run git commit, git push, git merge, or git rebase outside of plan execut
     fi
     # Exception: allow specific read-only commands during code review
     if [ "$TOOL_NAME" = "Bash" ] && [ "$WORKFLOW" = "reviewing" ]; then
+      # Locally-scoped -C normalization for the make-test member of the allowlist
+      # below only. A no-op for any non-make command, so it cannot affect the
+      # sqlite3/git/pytest/cat/etc. members of the same alternation.
+      MAKE_NORMALIZED_REVIEW=$(echo "$FILE_PATH" | sed -E 's/^([[:space:]]*make)[[:space:]]+-C[[:space:]]+[^[:space:]]+[[:space:]]+/\1 /')
       if _has_blocked_metachars "$FILE_PATH"; then
         block_pretooluse "professional-mode-guard" "BLOCKED — COMMAND CHAINING/REDIRECTION NOT ALLOWED DURING REVIEW
 
@@ -310,7 +314,7 @@ Shell chaining/redirection operators (; && || | backtick \$() > <) are not permi
 Allowed commands: sqlite3, git diff/status/log/show/blame/ls-files, pytest, make test, cat, head, tail, wc, grep, rg, find, ls
 
 Do NOT run commands with shell operators during the reviewing stage."
-      elif echo "$FILE_PATH" | grep -qE '^\s*(sqlite3|git\s+(diff|status|log|show|blame|ls-files)|pytest|make\s+test|cat|head|tail|wc|grep|rg|find|ls)\b'; then
+      elif echo "$MAKE_NORMALIZED_REVIEW" | grep -qE '^\s*(sqlite3|git\s+(diff|status|log|show|blame|ls-files)|pytest|make\s+test|cat|head|tail|wc|grep|rg|find|ls)\b'; then
         if echo "$FILE_PATH" | grep -qE '^\s*sqlite3\b' && echo "$FILE_PATH" | grep -qiE '\b(UPDATE|INSERT|DELETE|DROP|ALTER|CREATE|REPLACE)\b'; then
           block_pretooluse "professional-mode-guard" "BLOCKED — SQLITE WRITE OPERATIONS NOT ALLOWED DURING REVIEW
 
@@ -349,7 +353,10 @@ Do NOT run destructive or write commands during the reviewing stage."
     fi
     # Exception: allow make test* commands at any workflow stage — anchored, no chaining
     if [ "$TOOL_NAME" = "Bash" ]; then
-      if ! _has_blocked_metachars "$FILE_PATH" && echo "$FILE_PATH" | grep -qE '^\s*make\s+test'; then
+      # Locally-scoped -C normalization for this check only — does not touch $FILE_PATH,
+      # which is reused by unrelated git-command checks elsewhere in this file.
+      MAKE_NORMALIZED=$(echo "$FILE_PATH" | sed -E 's/^([[:space:]]*make)[[:space:]]+-C[[:space:]]+[^[:space:]]+[[:space:]]+/\1 /')
+      if ! _has_blocked_metachars "$FILE_PATH" && echo "$MAKE_NORMALIZED" | grep -qE '^\s*make\s+test'; then
         log_hook "professional-mode-guard" "Allowed" "make test* command"
         exit 0
       fi

@@ -321,6 +321,7 @@ The daemon connects to Slack, spawns the Brain session, and begins listening for
 3. **Workers execute under discipline** -- Each worker runs Claude Code with professional mode active, following the full brainstorm-plan-execute workflow with review gates
 4. **Supervise from Slack** -- Review plans with `/ironclaude detail`, approve with `/ironclaude approve`, check progress with `/ironclaude status`
 5. **The Brain manages the rest** -- It reviews completed work, reassigns failed tasks, and escalates decisions it can't make autonomously
+6. **Switch accounts when limits hit** -- If the active account hits its usage limit, IronClaude posts a throttled "⚠️ Usage limit hit — send `login` to switch accounts" alert. Send `login` (or `/ironclaude login`); the daemon relays a `claude auth login` sign-in URL to Slack — authorize it in a browser and reply `login code <the-code>` — then it verifies the new account and restarts the Brain + workers onto it. A failed or timed-out sign-in leaves the previous account untouched.
 
 You can do all of this from your phone.
 

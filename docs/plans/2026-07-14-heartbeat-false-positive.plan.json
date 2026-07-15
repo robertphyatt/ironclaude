@@ -1,0 +1,87 @@
+{
+  "name": "Fix Spurious WAITING ON Heartbeat Noise (d1389)",
+  "goal": "Eliminate the always-empty WAITING ON COMMANDER heartbeat noise and tighten the operator-wait classifier's fast-path exclusion for Brain self-narration about automated pipeline participants, plus shorten the false-positive TTL backstop.",
+  "design_file": "docs/plans/2026-07-14-heartbeat-false-positive-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "notifications.py: guard the empty COMMANDER section",
+      "description": "Update two existing tests that assert today's buggy always-render behavior, then guard the COMMANDER section in format_heartbeat so it only renders when commander_waits is non-empty.",
+      "allowed_files": [
+        "commander/src/ironclaude/notifications.py",
+        "commander/tests/test_notifications.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Update test_waits_shows_both_sections_and_tags_worker to pass a populated commander_waits (so its both-sections assertion stays meaningful post-fix); replace test_commander_section_says_there_is_nothing with test_commander_section_omitted_when_empty; update test_waits_shown_even_with_no_active_workers to assert COMMANDER section absence. All in commander/tests/test_notifications.py"
+        },
+        {
+          "description": "Run TestHeartbeatWaits to verify the two updated tests fail against current code",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_notifications.py::TestHeartbeatWaits -v",
+          "expected": "test_commander_section_omitted_when_empty and test_waits_shown_even_with_no_active_workers FAIL; other tests in the class PASS"
+        },
+        {
+          "description": "Guard the COMMANDER header+body in format_heartbeat's if waits or commander_waits: block with if commander_waits:, removing its else 'there is nothing' branch, in commander/src/ironclaude/notifications.py"
+        },
+        {
+          "description": "Run TestHeartbeatWaits to verify all tests pass",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_notifications.py::TestHeartbeatWaits -v",
+          "expected": "All tests PASS"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/notifications.py commander/tests/test_notifications.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "main.py: retargeted fast-path exclusion, classifier examples, shorter TTL",
+      "description": "Add three new tests for a fast-path negative-match regex, then add _NOT_AWAITING_RE, extend _AWAITING_OP_SYSTEM examples, wire the fast-path into _maybe_capture_operator_wait, and reduce _OPERATOR_WAIT_TTL_SECONDS from 1800 to 600.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_main_validate.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add test_not_awaiting_fast_path_skips_grader_for_fable_review, test_not_awaiting_fast_path_skips_grader_for_subagent_verdict, and test_not_awaiting_fast_path_does_not_exclude_genuine_operator_wait to TestOperatorWaits in commander/tests/test_main_validate.py. The two skip-grader tests must use messages with NO directive ref (e.g. no '#1389' prefix) so _validate_brain_message's own grader.grade call for message-format validation never fires either -- otherwise assert_not_called() fails for an unrelated reason."
+        },
+        {
+          "description": "Run TestOperatorWaits to verify the two skip-grader tests fail against current code",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_main_validate.py::TestOperatorWaits -v",
+          "expected": "test_not_awaiting_fast_path_skips_grader_for_fable_review and test_not_awaiting_fast_path_skips_grader_for_subagent_verdict FAIL; other tests PASS"
+        },
+        {
+          "description": "Add _NOT_AWAITING_RE constant after _AWAITING_PHRASE_RE in commander/src/ironclaude/main.py"
+        },
+        {
+          "description": "Extend _AWAITING_OP_SYSTEM false-positive examples with 'holding for the Fable review result' and 'waiting on subagent verdict' in commander/src/ironclaude/main.py"
+        },
+        {
+          "description": "Add _NOT_AWAITING_RE.search(text) early-return check to _maybe_capture_operator_wait, after the _AWAITING_PHRASE_RE check, in commander/src/ironclaude/main.py"
+        },
+        {
+          "description": "Change _OPERATOR_WAIT_TTL_SECONDS from 1800 to 600 in commander/src/ironclaude/main.py"
+        },
+        {
+          "description": "Run TestOperatorWaits to verify all tests pass",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_main_validate.py::TestOperatorWaits -v",
+          "expected": "All tests PASS"
+        },
+        {
+          "description": "Run the full test files for both touched modules to catch cross-effects",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_notifications.py tests/test_main_validate.py -v",
+          "expected": "All PASS"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/main.py commander/tests/test_main_validate.py",
+          "expected": "Changes staged"
+        }
+      ]
+    }
+  ]
+}

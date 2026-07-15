@@ -1,0 +1,51 @@
+{
+  "name": "restart_daemon Directive-Completion Race Fix",
+  "goal": "Add an optional directive_id parameter to restart_daemon() that atomically marks the directive completed in the DB before the pre-SIGHUP fork, closing the Brain restart-loop bug.",
+  "design_file": "docs/plans/2026-07-14-restart-daemon-directive-completion-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Add directive_id parameter to restart_daemon (method + MCP wrapper + tests)",
+      "description": "Insert a new guard clause in OrchestratorTools.restart_daemon() that, when directive_id is provided, validates the directive exists and marks it completed in the DB before os.fork(). Update the MCP tool wrapper to accept and pass through directive_id. Add three new tests to TestRestartDaemon covering: directive marked completed before fork, invalid directive_id refuses restart without forking, and directive_id=None preserves current behavior.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Write 3 new tests in TestRestartDaemon: test_restart_daemon_marks_directive_completed_before_fork, test_restart_daemon_invalid_directive_id_refuses_restart, test_restart_daemon_none_directive_id_unchanged_behavior",
+          "expected": "Tests added to tests/test_orchestrator_mcp.py, not yet passing"
+        },
+        {
+          "description": "Run the new tests to confirm they fail (RED)",
+          "command": "PYTHONUNBUFFERED=1 python -m pytest tests/test_orchestrator_mcp.py -k \"marks_directive_completed_before_fork or invalid_directive_id_refuses_restart or none_directive_id_unchanged_behavior\" -v",
+          "expected": "First two tests FAIL with TypeError: restart_daemon() got an unexpected keyword argument 'directive_id'"
+        },
+        {
+          "description": "Update restart_daemon() method signature, docstring, and insert the directive_id guard + pre-fork DB write before os.fork()",
+          "expected": "src/ironclaude/orchestrator_mcp.py updated at the method definition and the guard block before the fork"
+        },
+        {
+          "description": "Update the @mcp.tool() restart_daemon wrapper to accept and pass through directive_id",
+          "expected": "src/ironclaude/orchestrator_mcp.py MCP wrapper updated"
+        },
+        {
+          "description": "Run the restart_daemon test class to confirm all tests pass (GREEN)",
+          "command": "PYTHONUNBUFFERED=1 python -m pytest tests/test_orchestrator_mcp.py -k \"restart_daemon\" -v",
+          "expected": "All TestRestartDaemon tests pass, including the 3 new ones and all pre-existing ones"
+        },
+        {
+          "description": "Run the full test suite to confirm no regressions",
+          "command": "PYTHONUNBUFFERED=1 make test",
+          "expected": "All tests pass"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add src/ironclaude/orchestrator_mcp.py tests/test_orchestrator_mcp.py",
+          "expected": "Both files staged"
+        }
+      ]
+    }
+  ]
+}

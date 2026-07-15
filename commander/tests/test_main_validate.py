@@ -1,4 +1,5 @@
 """Tests for IroncladeDaemon._validate_brain_message and _detect_prompt_waiting."""
+import sqlite3
 import time
 import pytest
 from unittest.mock import MagicMock, patch
@@ -405,6 +406,8 @@ def _make_poll_daemon():
     d.config = {}
     d._heartbeat_state_history = {}
     d._heartbeat_stuck_notified = set()
+    from ironclaude.auth_relay import AuthRelay
+    d._auth_relay = AuthRelay()   # __new__ bypasses __init__; the new tick() needs this
     return d
 
 
@@ -421,7 +424,7 @@ class TestOperatorWaits:
         assert "d1267" in d._operator_waits
         assert d._operator_waits["d1267"]["question"] == "approve the migration?"
         posts = _posts(d)
-        assert "Waiting on you" in posts and "d1267" in posts and "approve the migration?" in posts
+        assert "Waiting on Operator" in posts and "d1267" in posts and "approve the migration?" in posts
         assert "*Brain:*" not in posts  # not posted as a normal brain message
         for c in d.brain.send_message.call_args_list:
             assert "CONTEXT REQUIRED" not in str(c.args[0])  # loop-break preserved
@@ -441,6 +444,21 @@ class TestOperatorWaits:
         d.poll_brain_responses()
         assert d._operator_waits == {}
         # has a directive ref (#1267) so it validates+posts normally
+        assert "*Brain:*" in _posts(d)
+
+    def test_d1362_style_system_narration_falls_through_when_grader_says_no(self):
+        """Regression anchor for the confirmed false positive (daemon.log:14222):
+        'operator_wait recorded for d1362: Waiting for the heartbeat labels to become idle.'
+        This asserts the WIRING correctly excludes a wait when the grader says False for
+        this exact phrasing — it does not prove the tightened prompt drives the real grader
+        to say False (unverifiable without a live grader call)."""
+        d = _make_poll_daemon()
+        d.brain.get_pending_responses.return_value = [
+            "#1362 heartbeat two-section labels shipped, waiting for the heartbeat labels to become idle"
+        ]
+        d._grader.grade.return_value = {"awaiting_operator": False, "worker_id": None, "question": None}
+        d.poll_brain_responses()
+        assert d._operator_waits == {}
         assert "*Brain:*" in _posts(d)
 
     def test_operator_slack_message_clears_waits(self):
@@ -468,6 +486,7 @@ class TestOperatorWaits:
             d.post_heartbeat()
         _, kwargs = fh.call_args
         assert "d1267" in (kwargs.get("waits") or {})
+        assert kwargs.get("operator_name") == "Operator"
 
     def test_brain_drop_nudge_throttled(self):
         d = _make_poll_daemon()
@@ -483,8 +502,77 @@ class TestOperatorWaits:
         d.poll_brain_responses()
         d.brain.get_pending_responses.return_value = ["still holding, awaiting your decision"]
         d.poll_brain_responses()
-        alerts = [c for c in d.slack.post_message.call_args_list if "Waiting on you" in str(c.args[0])]
+        alerts = [c for c in d.slack.post_message.call_args_list if "Waiting on Operator" in str(c.args[0])]
         assert len(alerts) == 1
+
+    def test_pending_confirmation_directive_surfaces_in_heartbeat_waits(self):
+        """Uses the REAL format_heartbeat (not mocked) to confirm a directive-sourced
+        entry renders sensibly in the actual Slack message, per the design's explicit
+        instruction to verify this rendering."""
+        d = _make_poll_daemon()
+        d._last_heartbeat = 0.0
+        d.config = {"heartbeat_interval_seconds": 0}
+        d.registry = MagicMock()
+        d.registry.get_recent_workers.return_value = []
+        d.brain.get_token_usage.return_value = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
+        d._db = sqlite3.connect(":memory:")
+        d._db.execute("CREATE TABLE directives (id INTEGER PRIMARY KEY, interpretation TEXT, status TEXT)")
+        d._db.execute(
+            "INSERT INTO directives (id, interpretation, status) VALUES "
+            "(1362, 'Heartbeat two-section waits', 'pending_confirmation')"
+        )
+        d._db.commit()
+        d._operator_waits = {}
+        d.post_heartbeat()
+        posted = _posts(d)
+        assert "d1362" in posted
+        assert "Heartbeat two-section waits" in posted
+
+    def test_no_pending_confirmation_and_no_operator_waits_suppresses_section(self):
+        """Uses the REAL format_heartbeat (not mocked) — this is the actual regression
+        guard for the reported symptom: no directive pending, no classified wait, so
+        the real rendered Slack message must contain no WAITING ON section at all."""
+        d = _make_poll_daemon()
+        d._last_heartbeat = 0.0
+        d.config = {"heartbeat_interval_seconds": 0}
+        d.registry = MagicMock()
+        d.registry.get_recent_workers.return_value = []
+        d.brain.get_token_usage.return_value = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
+        d._db = sqlite3.connect(":memory:")
+        d._db.execute("CREATE TABLE directives (id INTEGER PRIMARY KEY, interpretation TEXT, status TEXT)")
+        d._db.commit()
+        d._operator_waits = {}
+        d.post_heartbeat()
+        posted = _posts(d)
+        assert "WAITING ON" not in posted
+        assert "⏳" not in posted
+
+    def test_not_awaiting_fast_path_skips_grader_for_fable_review(self):
+        """No directive ref in the message, matching the existing
+        test_conversational_message_not_captured_and_dropped pattern — this ensures
+        _validate_brain_message's own grader.grade call (for message-format
+        validation, a separate concern) never fires either, so assert_not_called()
+        is unambiguous."""
+        d = _make_poll_daemon()
+        d.brain.get_pending_responses.return_value = ["holding for the Fable review result"]
+        d.poll_brain_responses()
+        assert d._operator_waits == {}
+        d._grader.grade.assert_not_called()
+
+    def test_not_awaiting_fast_path_skips_grader_for_subagent_verdict(self):
+        d = _make_poll_daemon()
+        d.brain.get_pending_responses.return_value = ["waiting on subagent verdict before proceeding"]
+        d.poll_brain_responses()
+        assert d._operator_waits == {}
+        d._grader.grade.assert_not_called()
+
+    def test_not_awaiting_fast_path_does_not_exclude_genuine_operator_wait(self):
+        d = _make_poll_daemon()
+        d._grader.grade.return_value = {"awaiting_operator": True, "worker_id": "d1267", "question": "approve the migration?"}
+        d.brain.get_pending_responses.return_value = ["holding for your approval on the migration"]
+        d.poll_brain_responses()
+        assert "d1267" in d._operator_waits
+        d._grader.grade.assert_called_once()
 
 
 class TestDeployWorkerHooks:
@@ -559,3 +647,174 @@ class TestDeployWorkerHooks:
                 str(tmp_path / "stable"),
                 str(tmp_path / "cache"),
             )
+
+
+def test_validate_truncates_long_message_before_grading():
+    daemon = _make_daemon()
+    daemon._grader.grade.return_value = {"valid": True}
+    huge = "d1 status " + ("X" * 50000)
+    daemon._validate_brain_message(huge)
+    forwarded = " ".join(str(a) for a in daemon._grader.grade.call_args[0])
+    assert ("X" * 50000) not in forwarded    # full body NOT forwarded (truncated)
+    assert ("X" * 100) in forwarded           # a chunk survives (truncated, not dropped)
+
+
+def test_operator_wait_infra_error_returns_false():
+    # design's 3rd per-site default: infra-error must NOT capture the wait
+    # (returning truthy would suppress the message from posting)
+    daemon = _make_daemon()
+    daemon._grader.grade.return_value = {"infrastructure_error": True, "error_detail": "down"}
+    assert not daemon._maybe_capture_operator_wait("holding for your reply on d1")
+
+
+# --- /login relay wiring (Task 4) ---
+
+class _FakeRelay:
+    def __init__(self, start_state="started", tick_events=()):
+        self._start = {"state": start_state}
+        self._ticks = list(tick_events)
+        self.submitted = []
+    def start(self):
+        return self._start
+    def submit_code(self, code):
+        self.submitted.append(code); return "sent"
+    def tick(self):
+        return self._ticks.pop(0) if self._ticks else None
+
+
+def _login_daemon(relay, command=None):
+    d = _make_poll_daemon()
+    d._db = None
+    d._auth_relay = relay
+    d.socket_handler = MagicMock()
+    items = [] if command is None else [{"parsed": command, "original_text": "/x"}]
+    d.socket_handler.drain.return_value = items
+    return d
+
+
+def test_login_dispatch_relays_start():
+    d = _login_daemon(_FakeRelay(start_state="started"), command={"type": "login"})
+    d.poll_slack_commands()
+    assert "Starting sign-in" in _posts(d)
+
+
+def test_login_dispatch_busy():
+    d = _login_daemon(_FakeRelay(start_state="busy"), command={"type": "login"})
+    d.poll_slack_commands()
+    assert "already in progress" in _posts(d)
+
+
+def test_login_code_dispatch():
+    relay = _FakeRelay()
+    d = _login_daemon(relay, command={"type": "login_code", "code": "Z9"})
+    d.poll_slack_commands()
+    assert relay.submitted == ["Z9"]
+    assert "Code submitted" in _posts(d)
+
+
+def test_login_tick_url_posts():
+    d = _login_daemon(_FakeRelay(tick_events=[{"state": "url", "url": "https://claude.ai/x"}]))
+    d.poll_slack_commands()
+    assert "https://claude.ai/x" in _posts(d)
+
+
+def test_login_tick_success_restarts(monkeypatch):
+    import signal
+    killed = []
+    monkeypatch.setattr("ironclaude.main.os.kill", lambda pid, sig: killed.append(sig))
+    d = _login_daemon(_FakeRelay(tick_events=[{"state": "success", "account": "a@b"}]))
+    d.poll_slack_commands()
+    assert "Signed in as a@b" in _posts(d)
+    assert killed == [signal.SIGHUP]
+
+
+def test_login_tick_verify_failed_no_restart(monkeypatch):
+    killed = []
+    monkeypatch.setattr("ironclaude.main.os.kill", lambda pid, sig: killed.append(sig))
+    d = _login_daemon(_FakeRelay(tick_events=[{"state": "verify_failed"}]))
+    d.poll_slack_commands()
+    assert "not restarting" in _posts(d).lower()
+    assert killed == []
+
+
+def test_login_tick_timeout_no_restart(monkeypatch):
+    killed = []
+    monkeypatch.setattr("ironclaude.main.os.kill", lambda pid, sig: killed.append(sig))
+    d = _login_daemon(_FakeRelay(tick_events=[{"state": "timeout"}]))
+    d.poll_slack_commands()
+    assert "timed out" in _posts(d).lower()
+    assert killed == []
+
+
+def test_login_tick_error_no_restart(monkeypatch):
+    killed = []
+    monkeypatch.setattr("ironclaude.main.os.kill", lambda pid, sig: killed.append(sig))
+    d = _login_daemon(_FakeRelay(tick_events=[{"state": "error", "detail": "boom"}]))
+    d.poll_slack_commands()
+    assert "didn't complete" in _posts(d).lower()
+    assert killed == []
+
+
+def test_login_tick_already_logged_in_no_restart(monkeypatch):
+    killed = []
+    monkeypatch.setattr("ironclaude.main.os.kill", lambda pid, sig: killed.append(sig))
+    d = _login_daemon(_FakeRelay(tick_events=[{"state": "already_logged_in", "account": "me@x"}]))
+    d.poll_slack_commands()
+    assert "Already signed in" in _posts(d)
+    assert killed == []
+
+
+# --- limit-surfacing detector (Task 5) ---
+
+def test_detect_account_limit_hit():
+    from ironclaude.main import detect_account_limit
+    assert detect_account_limit("You've hit your limit · resets 4:10am (America/Chicago)") == "resets 4:10am (America/Chicago)"
+
+
+def test_detect_worker_session_limit():
+    from ironclaude.main import detect_account_limit
+    assert detect_account_limit("d1393 session limit hit — resets 4:10am CT") is not None
+    assert detect_account_limit("worker stuck at rate-limit menu") is not None
+
+
+def test_detect_no_limit():
+    from ironclaude.main import detect_account_limit
+    assert detect_account_limit("Both workers alive. No action needed.") is None
+
+
+def test_detect_negated_worker_limit_is_not_a_hit():
+    # review M3: "no session limit hit" must NOT trigger a spurious alert.
+    from ironclaude.main import detect_account_limit
+    assert detect_account_limit("no session limit hit — all clear") is None
+
+
+def test_limit_alert_posts_once_then_throttled(monkeypatch):
+    from ironclaude.main import _LIMIT_COOLDOWN_S
+    d = _make_poll_daemon()
+    d._db = None
+    d._limit_alerted = {}
+    d._maybe_capture_operator_wait = lambda t: True   # continue right after the alert
+    clock = {"v": 1000.0}
+    monkeypatch.setattr("ironclaude.main.time.time", lambda: clock["v"])
+    msg = "You've hit your limit · resets 4:10am (America/Chicago)"
+    d.brain.get_pending_responses.return_value = [msg]
+    d.poll_brain_responses()
+    assert d.slack.post_message.call_count == 1          # alerted
+    d.brain.get_pending_responses.return_value = [msg]
+    d.poll_brain_responses()
+    assert d.slack.post_message.call_count == 1          # same window -> throttled
+    clock["v"] += _LIMIT_COOLDOWN_S + 1
+    d.brain.get_pending_responses.return_value = [msg]
+    d.poll_brain_responses()
+    assert d.slack.post_message.call_count == 2          # cooldown elapsed -> re-alert
+
+
+def test_limit_alert_fires_even_when_waiting(monkeypatch):
+    d = _make_poll_daemon()
+    d._db = None
+    d._limit_alerted = {}
+    monkeypatch.setattr("ironclaude.main.time.time", lambda: 1000.0)
+    d._maybe_capture_operator_wait = lambda t: True      # would continue immediately
+    d.brain.get_pending_responses.return_value = ["You've hit your limit · resets 4:10am (America/Chicago)"]
+    d.poll_brain_responses()
+    assert d.slack.post_message.called                   # alert fired BEFORE the continue

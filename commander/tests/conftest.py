@@ -93,3 +93,13 @@ def _isolate_ic_env(monkeypatch):
         "IC_LOG_DIR",
     ):
         monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_ollama_breakers():
+    """The Ollama circuit breaker is module-level global state with a real clock.
+    Reset it before every test so no test contaminates another's URL breakers."""
+    from ironclaude.ollama_client import _BREAKERS
+    _BREAKERS.reset()
+    yield
+    _BREAKERS.reset()

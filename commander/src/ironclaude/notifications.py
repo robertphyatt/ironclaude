@@ -97,24 +97,48 @@ def format_heartbeat(
     workers: list[dict],
     brain_usage: dict | None = None,
     waits: dict | None = None,
+    commander_waits: dict | None = None,
+    operator_name: str = "Operator",
+    ollama_degraded: bool = False,
 ) -> str:
     waits = waits or {}
-    if not workers and not waits:
-        return "*Heartbeat* | No active workers"
+    commander_waits = commander_waits or {}
+    if not workers and not waits and not commander_waits:
+        base = "*Heartbeat* | No active workers"
+        if ollama_degraded:
+            base += "\n⚠️ validator degraded (Ollama endpoint(s) down — see logs)"
+        return base
     lines = ["*Heartbeat*"]
-    if waits:
-        # Contract: if anything is holding on the operator, EVERY heartbeat says so.
-        lines.append("⏳ *WAITING ON YOU*")
-        for wid, info in waits.items():
-            question = _escape_mrkdwn(str((info or {}).get("question") or "").strip()) or "(awaiting your reply)"
-            lines.append(f"  • `{wid}` — {question}")
+    if waits or commander_waits:
+        # commander_waits is currently unwired by every caller (a future task must
+        # define what "waiting on commander" means) — only render its section when
+        # it actually has entries, instead of an always-empty "there is nothing" line.
+        if commander_waits:
+            lines.append("⏳ *WAITING ON COMMANDER:*")
+            for wid, info in commander_waits.items():
+                question = _escape_mrkdwn(str((info or {}).get("question") or "").strip()) or "(awaiting reply)"
+                lines.append(f"  • `{wid}` — {question}")
+        lines.append(f"⏳ *WAITING ON {operator_name}:*")
+        if waits:
+            for wid, info in waits.items():
+                question = _escape_mrkdwn(str((info or {}).get("question") or "").strip()) or "(awaiting your reply)"
+                lines.append(f"  • `{wid}` — {question}")
+        else:
+            lines.append("  there is nothing")
+    if waits and workers:
+        lines.append("*Active Workers:*")
     for w in workers:
         snippet = _extract_task_snippet(w.get("description"))
         desc = _escape_mrkdwn(snippet)
         if len(desc) > 60:
             desc = desc[:60] + "..."
         stage = w.get("workflow_stage") or "unknown"
-        tag = " — ⏳ waiting on you" if w["id"] in waits else ""
+        if w["id"] in commander_waits:
+            tag = " — ⏳ waiting on commander"
+        elif w["id"] in waits:
+            tag = f" — ⏳ waiting on {operator_name}"
+        else:
+            tag = ""
         lines.append(f'• {w["id"]} — "{desc}" ({stage}{tag})')
     if brain_usage is not None:
         inp = brain_usage.get("input_tokens", 0)
@@ -126,6 +150,8 @@ def format_heartbeat(
             if age is not None:
                 line += f" — turn in progress (last activity {_fmt_duration(age)} ago)"
         lines.append(line)
+    if ollama_degraded:
+        lines.append("⚠️ validator degraded (Ollama endpoint(s) down — see logs)")
     return "\n".join(lines)
 
 

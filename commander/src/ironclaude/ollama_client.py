@@ -33,6 +33,85 @@ class OllamaTimeoutError(OllamaError):
     """Read or connect timeout."""
 
 
+import threading
+import time as _time
+
+_BREAKER_BASE_BACKOFF = 5.0
+_BREAKER_MAX_BACKOFF = 300.0
+
+
+class _UrlBreaker:
+    __slots__ = ("open_until", "backoff", "probing")
+
+    def __init__(self) -> None:
+        self.open_until = 0.0
+        self.backoff = _BREAKER_BASE_BACKOFF
+        self.probing = False
+
+
+class _CircuitBreakerRegistry:
+    """Per-URL circuit breaker. Opens on the first transport failure; exactly ONE
+    caller is admitted as the half-open prober once open_until passes; exponential
+    backoff (base 5s x2, cap 300s) on repeated probe failure. Thread-safe (the
+    daemon has a second grader thread). The lock is never held across a network
+    call — callers do allow() (claims the probe slot), then the request, then
+    record_success/record_failure."""
+
+    def __init__(self, now=_time.monotonic) -> None:
+        self._now = now
+        self._lock = threading.Lock()
+        self._breakers: dict[str, _UrlBreaker] = {}
+
+    def allow(self, url: str) -> bool:
+        with self._lock:
+            b = self._breakers.get(url)
+            if b is None:
+                return True                       # closed
+            if self._now() < b.open_until:
+                return False                      # open, not yet
+            if b.probing:
+                return False                      # another caller is probing
+            b.probing = True                      # claim the probe slot
+            return True
+
+    def record_success(self, url: str) -> None:
+        with self._lock:
+            self._breakers.pop(url, None)         # closed = absent/reset
+
+    def record_failure(self, url: str) -> None:
+        with self._lock:
+            b = self._breakers.get(url)
+            if b is None:
+                b = _UrlBreaker()
+                self._breakers[url] = b
+            else:
+                b.backoff = min(b.backoff * 2, _BREAKER_MAX_BACKOFF)
+            b.probing = False
+            b.open_until = self._now() + b.backoff
+
+    def open_urls(self) -> list[str]:
+        with self._lock:
+            now = self._now()
+            return [u for u, b in self._breakers.items() if now < b.open_until]
+
+    def backoff_for(self, url: str):
+        with self._lock:
+            b = self._breakers.get(url)
+            return None if b is None else b.backoff
+
+    def reset(self) -> None:
+        with self._lock:
+            self._breakers.clear()
+
+
+_BREAKERS = _CircuitBreakerRegistry()
+
+
+def ollama_degraded_urls() -> list[str]:
+    """URLs whose breaker is currently open (for heartbeat observability)."""
+    return _BREAKERS.open_urls()
+
+
 def _http_error(url: str, err: "requests.HTTPError", verb: str = "request") -> OllamaHTTPError:
     """Build an OllamaHTTPError carrying the response status code (if available)."""
     status = getattr(getattr(err, "response", None), "status_code", None)
@@ -82,6 +161,39 @@ class OllamaClient:
         """
         return self._post("/api/generate", payload)
 
+    def _attempt(self, do_request):
+        """Try primary then fallback, consulting the per-URL breaker.
+        do_request(url) returns the result or raises an Ollama* error.
+        HTTPError (server responded 4xx/5xx) is not an outage: mark the endpoint
+        healthy and re-raise (no fallback, no trip). When every candidate URL is
+        exhausted, raise an error of the LAST failure's type whose message names
+        ALL endpoints (preserves the existing combined-error contract)."""
+        urls = [self._url] + ([self._fallback_url] if self._fallback_url else [])
+        last_err = None
+        tried = False
+        for url in urls:
+            if not _BREAKERS.allow(url):
+                continue
+            tried = True
+            try:
+                result = do_request(url)
+            except OllamaHTTPError:
+                _BREAKERS.record_success(url)     # endpoint responded -> healthy; clears probe
+                raise
+            except (OllamaConnectionError, OllamaTimeoutError) as e:
+                _BREAKERS.record_failure(url)
+                last_err = e
+                continue
+            except BaseException:
+                _BREAKERS.record_failure(url)     # never leak the half-open probe slot
+                raise
+            _BREAKERS.record_success(url)
+            return result
+        joined = ", ".join(urls)
+        if not tried:
+            raise OllamaConnectionError(f"Ollama circuit open for all endpoints: {joined}")
+        raise type(last_err)(f"Ollama failed at all endpoints ({joined}): {last_err}")
+
     def post_chat(self, payload: dict) -> tuple:
         """POST /api/chat. Returns (response_content_str, tool_calls_list).
 
@@ -89,43 +201,26 @@ class OllamaClient:
         Returns raw content without think-tag stripping (caller's responsibility).
         Raises OllamaConnectionError or OllamaTimeoutError on failure.
         """
-        timeout = (self._connect_timeout, self._timeout)
+        return self._attempt(lambda url: self._do_chat(url, payload))
+
+    def _do_chat(self, url: str, payload: dict) -> tuple:
         try:
             resp = requests.post(
-                f"{self._url}/api/chat",
-                json=payload,
-                timeout=timeout,
-                stream=False,
+                f"{url}/api/chat", json=payload,
+                timeout=(self._connect_timeout, self._timeout), stream=False,
             )
             resp.raise_for_status()
             return self._read_chat_response(resp)
         except requests.HTTPError as e:
-            raise _http_error(self._url, e) from e
+            raise _http_error(url, e) from e
         except requests.ConnectionError as e:
-            if self._fallback_url:
-                return self._chat_via_fallback(payload, str(e))
-            raise OllamaConnectionError(f"Ollama unreachable at {self._url}: {e}") from e
+            raise OllamaConnectionError(f"Ollama unreachable at {url}: {e}") from e
         except requests.Timeout:
-            raise OllamaTimeoutError(f"Ollama timed out after {self._timeout}s")
-        except requests.RequestException as e:
-            raise OllamaConnectionError(f"Ollama request failed: {e}") from e
-
-    def _chat_via_fallback(self, payload: dict, primary_error: str) -> tuple:
-        try:
-            resp = requests.post(
-                f"{self._fallback_url}/api/chat",
-                json=payload,
-                timeout=(self._connect_timeout, self._timeout),
-                stream=False,
+            raise OllamaTimeoutError(
+                f"Ollama timed out at {url} (connect={self._connect_timeout}s, read={self._timeout}s)"
             )
-            resp.raise_for_status()
-            return self._read_chat_response(resp)
-        except requests.HTTPError as e2:
-            raise _http_error(self._fallback_url, e2) from e2
-        except requests.RequestException as e2:
-            raise OllamaConnectionError(
-                f"Ollama failed at {self._url} (and fallback {self._fallback_url}): {e2}"
-            ) from e2
+        except requests.RequestException as e:
+            raise OllamaConnectionError(f"Ollama request failed at {url}: {e}") from e
 
     @staticmethod
     def _read_chat_response(resp) -> tuple:
@@ -170,7 +265,10 @@ class OllamaClient:
                 f"Ollama create_model failed at {self._url}: {e}"
             ) from e
         except requests.Timeout:
-            raise OllamaTimeoutError(f"Ollama create_model timed out after {self._timeout}s")
+            raise OllamaTimeoutError(
+                f"Ollama create_model timed out at {self._url} "
+                f"(connect={self._connect_timeout}s, read={self._timeout}s)"
+            )
         except requests.RequestException as e:
             raise OllamaConnectionError(f"Ollama create_model request failed: {e}") from e
 
@@ -185,72 +283,45 @@ class OllamaClient:
 
     def _post(self, path: str, payload: dict) -> str:
         is_streaming = payload.get("stream", False)
-        timeout = (self._connect_timeout, self._timeout)
+        return self._attempt(lambda url: self._do_post(url, path, payload, is_streaming))
 
+    def _do_post(self, url: str, path: str, payload: dict, is_streaming: bool) -> str:
         try:
             resp = requests.post(
-                f"{self._url}{path}",
-                json=payload,
-                timeout=timeout,
-                stream=is_streaming,
+                f"{url}{path}", json=payload,
+                timeout=(self._connect_timeout, self._timeout), stream=is_streaming,
             )
             _raise_for_status_closing(resp)
             return self._read_post_response(resp, is_streaming)
         except requests.HTTPError as e:
-            raise _http_error(self._url, e) from e
+            raise _http_error(url, e) from e
         except requests.ConnectionError as e:
-            if self._fallback_url:
-                return self._post_via_fallback(path, payload, is_streaming, str(e))
-            raise OllamaConnectionError(f"Ollama unreachable at {self._url}: {e}") from e
+            raise OllamaConnectionError(f"Ollama unreachable at {url}: {e}") from e
         except requests.Timeout:
-            raise OllamaTimeoutError(f"Ollama timed out after {self._timeout}s")
-        except requests.RequestException as e:
-            raise OllamaConnectionError(f"Ollama request failed: {e}") from e
-
-    def _post_via_fallback(
-        self, path: str, payload: dict, is_streaming: bool, primary_error: str
-    ) -> str:
-        try:
-            resp = requests.post(
-                f"{self._fallback_url}{path}",
-                json=payload,
-                timeout=(self._connect_timeout, self._timeout),
-                stream=is_streaming,
+            raise OllamaTimeoutError(
+                f"Ollama timed out at {url} (connect={self._connect_timeout}s, read={self._timeout}s)"
             )
-            _raise_for_status_closing(resp)
-            return self._read_post_response(resp, is_streaming)
-        except requests.HTTPError as e2:
-            raise _http_error(self._fallback_url, e2) from e2
-        except requests.RequestException as e2:
-            raise OllamaConnectionError(
-                f"Ollama failed at {self._url} (and fallback {self._fallback_url}): {e2}"
-            ) from e2
+        except requests.RequestException as e:
+            raise OllamaConnectionError(f"Ollama request failed at {url}: {e}") from e
 
     def _get(self, path: str) -> dict:
-        timeout = (self._connect_timeout, self._timeout)
+        return self._attempt(lambda url: self._do_get(url, path))
+
+    def _do_get(self, url: str, path: str) -> dict:
         try:
-            resp = requests.get(f"{self._url}{path}", timeout=timeout)
+            resp = requests.get(f"{url}{path}", timeout=(self._connect_timeout, self._timeout))
             resp.raise_for_status()
             return resp.json()
         except requests.HTTPError as e:
-            raise _http_error(self._url, e) from e
+            raise _http_error(url, e) from e
         except requests.ConnectionError as e:
-            if self._fallback_url:
-                try:
-                    resp = requests.get(f"{self._fallback_url}{path}", timeout=timeout)
-                    resp.raise_for_status()
-                    return resp.json()
-                except requests.HTTPError as e2:
-                    raise _http_error(self._fallback_url, e2) from e2
-                except requests.RequestException as e2:
-                    raise OllamaConnectionError(
-                        f"Ollama failed at {self._url} (and fallback {self._fallback_url}): {e2}"
-                    ) from e2
-            raise OllamaConnectionError(f"Ollama unreachable at {self._url}: {e}") from e
+            raise OllamaConnectionError(f"Ollama unreachable at {url}: {e}") from e
         except requests.Timeout:
-            raise OllamaTimeoutError(f"Ollama timed out after {self._timeout}s")
+            raise OllamaTimeoutError(
+                f"Ollama timed out at {url} (connect={self._connect_timeout}s, read={self._timeout}s)"
+            )
         except requests.RequestException as e:
-            raise OllamaConnectionError(f"Ollama request failed: {e}") from e
+            raise OllamaConnectionError(f"Ollama request failed at {url}: {e}") from e
 
     @staticmethod
     def _read_post_response(resp, is_streaming: bool) -> str:

@@ -33,8 +33,10 @@ if [ "$TOOL_NAME" = "Bash" ]; then
   # Normalize: strip -C <path> so downstream subcommand extraction works unchanged
   CMD=$(echo "$CMD" | sed -E 's/^([[:space:]]*git)[[:space:]]+-C[[:space:]]+[^[:space:]]+[[:space:]]+/\1 /')
 
-  # Allow make test* commands
-  if echo "$CMD" | grep -qE '^\s*make\s+test'; then
+  # Allow make test* commands (locally-scoped -C normalization — does not touch $CMD,
+  # which the git-subcommand extraction below still relies on)
+  MAKE_CMD=$(echo "$CMD" | sed -E 's/^([[:space:]]*make)[[:space:]]+-C[[:space:]]+[^[:space:]]+[[:space:]]+/\1 /')
+  if echo "$MAKE_CMD" | grep -qE '^\s*make\s+test'; then
     exit 0
   fi
 
