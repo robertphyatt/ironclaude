@@ -56,7 +56,7 @@ class SlackBot:
         self._client = WebClient(token=token)
         self._channel_id = channel_id
         self._prefix = "[IRONCLAUDE] "
-        self._notification_queue: list[str] = []
+        self._notification_queue: list[tuple[str, str | None]] = []
         self._user_client = WebClient(token=user_token) if user_token else None
         self._operator_user_id = operator_user_id
 
@@ -70,7 +70,7 @@ class SlackBot:
             return response["ts"]
         except Exception as e:
             logger.warning(f"Slack post_message failed: {e}")
-            self._notification_queue.append(prefixed)
+            self._notification_queue.append((prefixed, thread_ts))
             return None
 
     def upload_file(self, file_path: str, title: str = "", comment: str = "", thread_ts: str | None = None) -> str:
@@ -105,14 +105,16 @@ class SlackBot:
             fh.write(resp.content)
 
     def flush_queue(self) -> None:
-        """Retry sending queued messages."""
+        """Retry sending queued messages, preserving each message's thread."""
         remaining = []
-        for msg in self._notification_queue:
+        for prefixed, thread_ts in self._notification_queue:
             try:
-                self._client.chat_postMessage(channel=self._channel_id, text=msg)
+                self._client.chat_postMessage(
+                    channel=self._channel_id, text=prefixed, thread_ts=thread_ts,
+                )
             except Exception as e:
                 logger.warning(f"Slack flush retry failed: {e}")
-                remaining.append(msg)
+                remaining.append((prefixed, thread_ts))
         self._notification_queue = remaining
 
     def get_recent_messages(self, limit: int = 10, oldest: str = "0") -> list[dict]:
@@ -296,6 +298,31 @@ class SlackBot:
         except Exception as e:
             logger.warning(f"Slack get_message failed: {e}")
             return None
+
+    def get_permalink(self, message_ts: str) -> str | None:
+        """Fetch a Slack permalink for a message. Returns None on failure."""
+        try:
+            response = self._client.chat_getPermalink(
+                channel=self._channel_id, message_ts=message_ts,
+            )
+            return response.get("permalink")
+        except Exception as e:
+            logger.warning(f"Slack get_permalink failed: {e}")
+            return None
+
+    def update_message(self, ts: str, new_text: str) -> bool:
+        """Edit an existing message in place. new_text must already include
+        any prefix — this method sends it verbatim. Returns True on success."""
+        try:
+            self._client.chat_update(channel=self._channel_id, ts=ts, text=new_text)
+            return True
+        except Exception as e:
+            logger.warning(f"Slack update_message failed: {e}")
+            return False
+
+    @property
+    def prefix(self) -> str:
+        return self._prefix
 
 
 # --- Slash command definitions ---

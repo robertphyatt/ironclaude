@@ -269,20 +269,32 @@ def mark_fable_unavailable(
 def clear_fable_unavailable() -> Literal["removed", "not_present", "remove_failed"]:
     """Remove the on-disk flag.
 
+    Fail-open: if the file exists but cannot be unlinked (a transient disk or
+    permission error — both observed in production), fall back to truncating it
+    to empty. The fail-safe read path (is_fable_unavailable / fable_block_category)
+    treats an empty/corrupt flag as "Fable is AVAILABLE", and truncation allocates
+    no blocks, so it survives an ENOSPC that defeats unlink/atomic-replace. A flag
+    we cannot delete must never pin Fable down until its window expires.
+
     Returns:
-        "removed" — a file existed and was removed.
+        "removed" — the flag was removed, or (fallback) neutralized to empty.
         "not_present" — no file existed; nothing to do.
-        "remove_failed" — a file existed but removal raised.
+        "remove_failed" — a file existed and neither unlink nor truncate worked.
     """
     try:
-        existed = _STATE_PATH.exists()
-        if not existed:
+        if not _STATE_PATH.exists():
             return "not_present"
         _STATE_PATH.unlink()
         return "removed"
     except Exception as exc:
-        logger.warning("clear_fable_unavailable: remove failed: %s", exc)
-        return "remove_failed"
+        logger.warning("clear_fable_unavailable: unlink failed (%s) — neutralizing in place", exc)
+        try:
+            with _STATE_PATH.open("w"):
+                pass  # truncate-to-empty: read path treats empty as available
+            return "removed"
+        except Exception as exc2:
+            logger.error("clear_fable_unavailable: could not remove or neutralize flag: %s", exc2)
+            return "remove_failed"
 
 
 def resolve_worker_type(worker_type: str) -> str:

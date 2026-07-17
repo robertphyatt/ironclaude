@@ -134,9 +134,23 @@ def test_clear_returns_not_present_when_absent():
     assert fa.clear_fable_unavailable() == "not_present"
 
 
-def test_clear_returns_remove_failed_on_error(monkeypatch):
+def test_clear_neutralizes_when_unlink_fails(monkeypatch):
+    """Fail-open: if unlink fails (disk/permission), the flag is truncated to empty
+    so Fable reads as AVAILABLE — an undeletable flag must not pin Fable down."""
+    fa.mark_fable_unavailable("test")
+    assert fa.is_fable_unavailable() is True
+    monkeypatch.setattr(fa.Path, "unlink", MagicMock(side_effect=OSError("permission denied")))
+    assert fa.clear_fable_unavailable() == "removed"
+    # unlink was blocked, but the flag is neutralized in place → Fable available again
+    assert fa.is_fable_unavailable() is False
+    assert fa.fable_block_category() is None
+
+
+def test_clear_returns_remove_failed_when_unlink_and_truncate_both_fail(monkeypatch):
+    """Only when neither unlink nor the truncate fallback can touch the file."""
     fa.mark_fable_unavailable("test")
     monkeypatch.setattr(fa.Path, "unlink", MagicMock(side_effect=OSError("permission denied")))
+    monkeypatch.setattr(fa.Path, "open", MagicMock(side_effect=OSError("disk full")))
     assert fa.clear_fable_unavailable() == "remove_failed"
 
 

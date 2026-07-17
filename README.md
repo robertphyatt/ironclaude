@@ -325,6 +325,17 @@ The daemon connects to Slack, spawns the Brain session, and begins listening for
 
 You can do all of this from your phone.
 
+### How Slack Output Is Organized
+
+The Brain can be chatty, so the Commander organizes what reaches you rather than dumping everything into one channel. (The Brain also posts a periodic **heartbeat** — a short status summary of what the workers are doing, roughly every 15 minutes.)
+
+- **Direct replies are threaded under your message.** When you ask the Brain something in Slack, its answer comes back as a threaded reply to your message, and your message gets a ✅ reaction once it's answered — so you can tell a reply landed without scrolling the channel.
+- **Routine detail is threaded under the heartbeat.** Tactical chatter (progress notes, retries, "still working on X") is threaded under the most recent heartbeat instead of the main channel — expand the thread if you want it, ignore it if you don't.
+- **The main channel stays signal.** Directive status, plans awaiting approval, and escalations post to the channel itself.
+- **"Waiting on you" escalations link back to context.** When the Brain needs a decision from you, the alert includes a permalink that jumps straight to the message or context that needs your attention.
+
+Earlier versions kept the channel readable by silently discarding any Brain message that didn't reference a tracked directive — which also threw away the Brain's direct answers to your questions. Threading replaces that: nothing meaningful is dropped, but noise is tucked into threads instead of the main feed. (The one exception still suppressed is the Brain echoing the daemon's own internal control markers back at it, which would otherwise loop.)
+
 ### Worker Reliability
 
 The daemon monitors all active workers for stalled output. When a worker's log hash stops changing, a stale timer starts. Before killing, the daemon checks for CPU activity — if the process is still running hot, the kill is deferred 15 minutes. The daemon also checks available system memory before spawning workers, blocking new spawns when memory drops below the `min_available_memory_pct` threshold.

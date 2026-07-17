@@ -36,12 +36,28 @@ class TestSlackBot:
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
         bot = SlackBot(token="xoxb-test", channel_id="C123")
-        bot._notification_queue = ["[IRONCLAUDE] queued"]
+        bot._notification_queue = [("[IRONCLAUDE] queued", None)]
         bot.flush_queue()
         mock_client.chat_postMessage.assert_called_once_with(
-            channel="C123", text="[IRONCLAUDE] queued"
+            channel="C123", text="[IRONCLAUDE] queued", thread_ts=None
         )
         assert len(bot._notification_queue) == 0
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_flush_queue_preserves_thread_ts(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        # a failed threaded post queues (text, thread_ts)
+        mock_client.chat_postMessage.side_effect = Exception("boom")
+        bot.post_message("chatter", thread_ts="1700.1")
+        assert bot._notification_queue == [("[IRONCLAUDE] chatter", "1700.1")]
+        mock_client.chat_postMessage.side_effect = None
+        bot.flush_queue()
+        mock_client.chat_postMessage.assert_called_with(
+            channel="C123", text="[IRONCLAUDE] chatter", thread_ts="1700.1"
+        )
+        assert bot._notification_queue == []
 
     @patch("ironclaude.slack_interface.WebClient")
     def test_is_reachable_true(self, mock_client_cls):
@@ -804,3 +820,74 @@ class TestSlackBotDownloadFile:
         call = mock_requests.get.call_args
         assert call[1]["headers"] == {"Authorization": "Bearer xoxb-test"}
         assert Path(save_path).read_bytes() == b"ok"
+
+
+class TestGetPermalink:
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_get_permalink_returns_url_on_success(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.chat_getPermalink.return_value = {
+            "permalink": "https://workspace.slack.com/archives/C123/p1234567890"
+        }
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        result = bot.get_permalink("1234567890.123456")
+        assert result == "https://workspace.slack.com/archives/C123/p1234567890"
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_get_permalink_returns_none_on_api_failure(self, mock_client_cls, caplog):
+        mock_client = MagicMock()
+        mock_client.chat_getPermalink.side_effect = Exception("api error")
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        with caplog.at_level(logging.WARNING, logger="ironclaude.slack"):
+            result = bot.get_permalink("1234567890.123456")
+        assert result is None
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_get_permalink_uses_correct_channel_and_ts(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.chat_getPermalink.return_value = {"permalink": "https://x"}
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        bot.get_permalink("1234567890.123456")
+        mock_client.chat_getPermalink.assert_called_once_with(
+            channel="C123", message_ts="1234567890.123456"
+        )
+
+
+class TestUpdateMessage:
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_update_message_returns_true_on_success(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        result = bot.update_message("1234.5678", "updated text")
+        assert result is True
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_update_message_returns_false_on_api_failure(self, mock_client_cls, caplog):
+        mock_client = MagicMock()
+        mock_client.chat_update.side_effect = Exception("api error")
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        with caplog.at_level(logging.WARNING, logger="ironclaude.slack"):
+            result = bot.update_message("1234.5678", "updated text")
+        assert result is False
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_update_message_calls_correct_channel_ts_text(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        bot.update_message("1234.5678", "updated text")
+        mock_client.chat_update.assert_called_once_with(
+            channel="C123", ts="1234.5678", text="updated text"
+        )
+
+
+class TestSlackBotPrefixProperty:
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_prefix_property_returns_configured_prefix(self, mock_client_cls):
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+        assert bot.prefix == "[IRONCLAUDE] "

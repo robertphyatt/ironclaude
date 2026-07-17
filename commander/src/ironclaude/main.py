@@ -66,6 +66,8 @@ _BRAIN_MSG_SCHEMA = {
 }
 _DIRECTIVE_REF_RE = re.compile(r'(?:#\d+|d\d+|directive\s+\d+)', re.IGNORECASE)
 _BLOCKED_NO_DIRECTIVE = "no_directive_ref"
+_REPLY_TO_RE = re.compile(r'^\s*\[reply-to:([0-9.]+)\]\s*')   # brain-echoed operator msg ts -> threaded reply
+_BRAIN_POST_CHUNK = 39000   # keep each *Brain:* post under Slack's ~40000-char message limit
 
 # --- Awaiting-operator surfacing ---------------------------------------------
 # Cheap pre-check: only run the grader classifier on messages that look like the
@@ -107,8 +109,6 @@ _AWAITING_OP_SCHEMA = {
 }
 _OPERATOR_WAIT_TTL_SECONDS = 600    # backstop: drop a wait the Brain stopped re-affirming
 _OPERATOR_WAIT_MAX = 32            # bound the in-memory map
-_BRAIN_DROP_NUDGE_MAX = 2         # max nudges per window (loop guard — see d1133)
-_BRAIN_DROP_NUDGE_WINDOW = 600    # seconds
 
 _PROMPT_WAITING_SYSTEM = (
     "You detect whether a worker process is waiting for user input based on its log tail.\n\n"
@@ -694,6 +694,7 @@ class IroncladeDaemon:
         self._brain_paused = False
         self.plugin_registry = plugin_registry or PluginRegistry()
         self._last_heartbeat = 0.0
+        self._last_heartbeat_ts: str | None = None   # Slack ts of the last heartbeat (threads tactical chatter)
         self._decisions_dir = os.path.join(config.get("tmp_dir", "/tmp/ic"), "brain-decisions")
         self._ledger_path = os.path.join(config.get("tmp_dir", "/tmp/ic"), "task-ledger.json")
         self._db = db_conn
@@ -737,8 +738,6 @@ class IroncladeDaemon:
         # Awaiting-operator surfacing (in-memory; refreshed by Brain re-emission)
         self._operator_waits: dict[str, dict] = {}
         self._operator_wait_alerted: dict[str, str] = {}
-        self._brain_nudge_count: int = 0
-        self._brain_nudge_window_start: float = 0.0
         self._load_staleness_state()
 
     def shutdown(self):
@@ -1495,31 +1494,35 @@ class IroncladeDaemon:
         if self._operator_wait_alerted.get(worker_id) != question:
             self._operator_wait_alerted[worker_id] = question
             operator_name = self.config.get("operator_name", "Operator")
-            self.slack.post_message(
-                f"⏳ *Waiting on {operator_name}:* `{worker_id}` — {_escape_mrkdwn(question) or '(awaiting your reply)'}"
-            )
+            alert_body = f"⏳ *Waiting on {operator_name}:* `{worker_id}` — {_escape_mrkdwn(question) or '(awaiting your reply)'}"
+            ts = self.slack.post_message(alert_body)
+            if ts:
+                permalink = self.slack.get_permalink(ts)
+                if permalink:
+                    self.slack.update_message(ts, f"{self.slack.prefix}{alert_body}\nLink: {permalink}")
         logger.info("operator_wait recorded for %s: %s", worker_id, question[:80])
         return True
 
-    def _maybe_nudge_brain_on_drop(self, text: str) -> None:
-        """Bounded feedback to the Brain that a (non-waiting) message was dropped, throttled
-        so it cannot reopen the CONTEXT_REQUIRED feedback loop the silent drop was added (d1133) to break."""
-        # Never nudge the Brain's ack/echo of our own markers — that IS the exact
-        # exchange the silent drop (d1133) exists to break. Stay silent on those.
-        if "[CONTEXT REQUIRED]" in text or "[FYI]" in text:
-            return
-        now = time.time()
-        if now - self._brain_nudge_window_start > _BRAIN_DROP_NUDGE_WINDOW:
-            self._brain_nudge_window_start = now
-            self._brain_nudge_count = 0
-        if self._brain_nudge_count >= _BRAIN_DROP_NUDGE_MAX:
-            return
-        self._brain_nudge_count += 1
-        self.brain.send_message(
-            "[FYI] Your last message wasn't posted to Slack (no directive reference). "
-            "If you are waiting on the operator, that is surfaced automatically now — no action needed. "
-            "Otherwise tie status updates to a directive (#N or dN)."
-        )
+    def _post_brain_message(self, text: str, thread_ts: str | None = None) -> str | None:
+        """Post a Brain message to Slack as `*Brain:* ...`, chunked to stay under Slack's
+        ~40000-char per-message limit; every chunk shares thread_ts. Returns the ts of the
+        first SUCCESSFULLY posted chunk ONLY when every chunk landed; returns None if any
+        chunk failed (all-chunks-delivered semantics) so callers can gate a follow-up
+        action (e.g. the answered ✅) on FULL delivery. Failed chunks are enqueued for
+        retry by SlackBot.post_message (they will retry-deliver threaded via flush_queue).
+        Returns None (no post) for empty/whitespace-only text."""
+        if not text.strip():
+            return None
+        first_ts: str | None = None
+        all_ok = True
+        for i in range(0, len(text), _BRAIN_POST_CHUNK):
+            chunk = text[i:i + _BRAIN_POST_CHUNK]
+            ts = self.slack.post_message(f"*Brain:* {chunk}", thread_ts=thread_ts)
+            if first_ts is None and ts is not None:
+                first_ts = ts
+            if ts is None:
+                all_ok = False
+        return first_ts if all_ok else None
 
     def poll_brain_responses(self):
         """Drain brain responses, validate context, and post to Slack."""
@@ -1541,11 +1544,28 @@ class IroncladeDaemon:
             # structured heartbeat state instead of posting or silently dropping it.
             if self._maybe_capture_operator_wait(text):
                 continue
+            # Solicited reply: the Brain echoes the operator ts as [reply-to:<ts>].
+            # Thread the answer under the operator's message and mark it answered (✅).
+            m = _REPLY_TO_RE.match(text)
+            if m:
+                reply_ts = m.group(1)
+                cleaned = _REPLY_TO_RE.sub("", text, count=1).strip()
+                if self._post_brain_message(cleaned, thread_ts=reply_ts):
+                    self.slack.add_reaction("white_check_mark", reply_ts)
+                else:
+                    logger.info("Brain reply not delivered for reply_ts=%s (empty or chunk failure)", reply_ts)
+                continue
             valid, reason = self._validate_brain_message(text)
             if not valid:
                 if reason == _BLOCKED_NO_DIRECTIVE:
-                    logger.info("Brain response dropped (no directive ref): %s", text[:100])
-                    self._maybe_nudge_brain_on_drop(text)
+                    # Control-marker echoes stay silently dropped (preserves the d1133
+                    # loop-break); genuine ref-less chatter is threaded under the last
+                    # heartbeat — buried but never lost.
+                    if "[CONTEXT REQUIRED]" in text or "[FYI]" in text:
+                        logger.info("Brain control-echo dropped: %s", text[:100])
+                        continue
+                    logger.info("Brain chatter threaded under heartbeat: %s", text[:100])
+                    self._post_brain_message(text, thread_ts=self._last_heartbeat_ts)
                     continue
                 logger.warning(f"Brain message blocked: {reason} | text={text[:200]}")
                 self.brain.send_message(
@@ -1556,14 +1576,7 @@ class IroncladeDaemon:
                     f'Original message: "{text[:200]}..."'
                 )
                 continue
-            # Valid post — reset the drop-nudge throttle (successful post).
-            self._brain_nudge_count = 0
-            if len(text) > 39000:
-                chunks = [text[i:i+39000] for i in range(0, len(text), 39000)]
-                for chunk in chunks:
-                    self.slack.post_message(f"*Brain:* {chunk}")
-            else:
-                self.slack.post_message(f"*Brain:* {text}")
+            self._post_brain_message(text)
 
     def _handle_status(self):
         running = self.registry.get_running_workers()
@@ -2561,7 +2574,7 @@ class IroncladeDaemon:
         # pending_confirmation directive sharing the same d{id} key.
         merged_waits = {**dict(self._operator_waits), **self._get_pending_confirmation_waits()}
         from ironclaude.ollama_client import ollama_degraded_urls
-        self.slack.post_message(
+        self._last_heartbeat_ts = self.slack.post_message(
             format_heartbeat(
                 worker_details,
                 brain_usage=brain_usage,

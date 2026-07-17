@@ -220,7 +220,7 @@ class ShadowGrader:
             "model": self._model,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": 0.1, "num_ctx": self._num_ctx},
+            "options": {"temperature": 0.1, "num_ctx": self._num_ctx, "repeat_penalty": 1.3},
             "tools": SHADOW_TOOLS,
         }
 
@@ -287,7 +287,7 @@ class ShadowGrader:
             "model": self._model,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": 0.1, "num_ctx": self._num_ctx},
+            "options": {"temperature": 0.1, "num_ctx": self._num_ctx, "repeat_penalty": 1.3},
             "format": GRADER_VERDICT_SCHEMA,
         }
         logger.debug(

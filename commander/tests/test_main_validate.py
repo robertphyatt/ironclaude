@@ -1,4 +1,5 @@
 """Tests for IroncladeDaemon._validate_brain_message and _detect_prompt_waiting."""
+import logging
 import sqlite3
 import time
 import pytest
@@ -401,11 +402,10 @@ def _make_poll_daemon():
     d.brain = MagicMock()
     d._operator_waits = {}
     d._operator_wait_alerted = {}
-    d._brain_nudge_count = 0
-    d._brain_nudge_window_start = 0.0
     d.config = {}
     d._heartbeat_state_history = {}
     d._heartbeat_stuck_notified = set()
+    d._last_heartbeat_ts = None
     from ironclaude.auth_relay import AuthRelay
     d._auth_relay = AuthRelay()   # __new__ bypasses __init__; the new tick() needs this
     return d
@@ -429,13 +429,120 @@ class TestOperatorWaits:
         for c in d.brain.send_message.call_args_list:
             assert "CONTEXT REQUIRED" not in str(c.args[0])  # loop-break preserved
 
-    def test_conversational_message_not_captured_and_dropped(self):
+    def test_conversational_message_threaded_not_dropped(self):
         d = _make_poll_daemon()
+        d._last_heartbeat_ts = "1700.1"
         d.brain.get_pending_responses.return_value = ["Everything looks fine so far."]
         d.poll_brain_responses()
         assert d._operator_waits == {}
-        assert "*Brain:*" not in _posts(d)
+        d.slack.post_message.assert_called_once()
+        _, kwargs = d.slack.post_message.call_args
+        assert kwargs.get("thread_ts") == "1700.1"
         d._grader.grade.assert_not_called()  # no awaiting-phrase, no directive -> no grader call
+
+    def test_reply_marker_threads_under_operator_message(self):
+        d = _make_poll_daemon()
+        d.brain.get_pending_responses.return_value = [
+            "[reply-to:1699.5] Fair challenge — need to verify Stage 6"
+        ]
+        d.poll_brain_responses()
+        d.slack.post_message.assert_called_once()
+        args, kwargs = d.slack.post_message.call_args
+        assert kwargs.get("thread_ts") == "1699.5"
+        assert "[reply-to:" not in args[0]
+        assert "Fair challenge" in args[0]
+        d.slack.add_reaction.assert_called_once_with("white_check_mark", "1699.5")
+
+    def test_reply_with_empty_body_does_not_post_or_react(self):
+        d = _make_poll_daemon()
+        d.brain.get_pending_responses.return_value = ["[reply-to:1699.5]   "]
+        d.poll_brain_responses()
+        d.slack.post_message.assert_not_called()
+        d.slack.add_reaction.assert_not_called()
+
+    def test_refless_chatter_threads_under_heartbeat(self):
+        d = _make_poll_daemon()
+        d._last_heartbeat_ts = "1700.1"
+        d.brain.get_pending_responses.return_value = ["tactical: grader 0.82, retrying chunk 3"]
+        d.poll_brain_responses()
+        d.slack.post_message.assert_called_once()
+        _, kwargs = d.slack.post_message.call_args
+        assert kwargs.get("thread_ts") == "1700.1"
+        d.brain.send_message.assert_not_called()
+
+    def test_refless_chatter_falls_back_to_main_when_no_heartbeat(self):
+        d = _make_poll_daemon()
+        d._last_heartbeat_ts = None
+        d.brain.get_pending_responses.return_value = ["tactical note"]
+        d.poll_brain_responses()
+        _, kwargs = d.slack.post_message.call_args
+        assert kwargs.get("thread_ts") is None
+
+    def test_control_echo_still_dropped(self):
+        d = _make_poll_daemon()
+        d._last_heartbeat_ts = "1700.1"
+        d.brain.get_pending_responses.return_value = ["[FYI] ok I'll tie to a directive"]
+        d.poll_brain_responses()
+        d.slack.post_message.assert_not_called()
+        d.brain.send_message.assert_not_called()
+
+    def test_malformed_reply_marker_treated_as_chatter(self):
+        d = _make_poll_daemon()
+        d._last_heartbeat_ts = "1700.1"
+        d.brain.get_pending_responses.return_value = ["[reply-to:abc] not a real ts"]
+        d.poll_brain_responses()
+        # _REPLY_TO_RE only matches [0-9.]+, so a non-numeric marker falls through to chatter
+        d.slack.post_message.assert_called_once()
+        _, kwargs = d.slack.post_message.call_args
+        assert kwargs.get("thread_ts") == "1700.1"
+        d.slack.add_reaction.assert_not_called()
+
+    def test_reply_reaction_skipped_when_post_fails(self):
+        d = _make_poll_daemon()
+        d.slack.post_message.return_value = None  # the reply post fails
+        d.brain.get_pending_responses.return_value = ["[reply-to:1699.5] answer body"]
+        d.poll_brain_responses()
+        d.slack.add_reaction.assert_not_called()
+
+    def test_reply_all_chunks_semantics_skips_reaction_on_chunk_failure(self):
+        d = _make_poll_daemon()
+        # chunk 1 succeeds (truthy ts), chunk 2 fails (None) - all-chunks gate should hold
+        d.slack.post_message.side_effect = ["1699.6", None]
+        body = "y" * 40000  # forces 2 chunks under _BRAIN_POST_CHUNK=39000
+        d.brain.get_pending_responses.return_value = [f"[reply-to:1699.5] {body}"]
+        d.poll_brain_responses()
+        assert d.slack.post_message.call_count == 2
+        d.slack.add_reaction.assert_not_called()
+
+    def test_reply_undelivered_logs_info(self, caplog):
+        d = _make_poll_daemon()
+        d.brain.get_pending_responses.return_value = ["[reply-to:1699.5]   "]
+        with caplog.at_level(logging.INFO, logger="ironclaude"):
+            d.poll_brain_responses()
+        assert any(
+            "Brain reply not delivered" in r.message and "1699.5" in r.message
+            for r in caplog.records
+        )
+
+    def test_reply_long_text_is_chunked(self):
+        d = _make_poll_daemon()
+        body = "y" * 40000
+        d.brain.get_pending_responses.return_value = [f"[reply-to:1699.5] {body}"]
+        d.poll_brain_responses()
+        assert d.slack.post_message.call_count == 2
+        for c in d.slack.post_message.call_args_list:
+            assert c.kwargs.get("thread_ts") == "1699.5"
+            assert len(c.args[0]) <= 39000 + len("*Brain:* ")
+        d.slack.add_reaction.assert_called_once_with("white_check_mark", "1699.5")
+
+    def test_chatter_long_text_is_chunked_under_heartbeat(self):
+        d = _make_poll_daemon()
+        d._last_heartbeat_ts = "1700.1"
+        d.brain.get_pending_responses.return_value = ["z" * 40000]
+        d.poll_brain_responses()
+        assert d.slack.post_message.call_count == 2
+        for c in d.slack.post_message.call_args_list:
+            assert c.kwargs.get("thread_ts") == "1700.1"
 
     def test_awaiting_phrase_but_grader_says_no_falls_through(self):
         d = _make_poll_daemon()
@@ -488,12 +595,31 @@ class TestOperatorWaits:
         assert "d1267" in (kwargs.get("waits") or {})
         assert kwargs.get("operator_name") == "Operator"
 
-    def test_brain_drop_nudge_throttled(self):
+    def test_post_heartbeat_captures_ts(self):
         d = _make_poll_daemon()
-        d.brain.get_pending_responses.return_value = ["all good one", "all good two", "all good three"]
-        d.poll_brain_responses()
-        nudges = [c for c in d.brain.send_message.call_args_list if "wasn't posted" in str(c.args[0])]
-        assert 0 < len(nudges) <= 2  # at least one, throttled to <=2
+        d._last_heartbeat = 0.0
+        d.config = {"heartbeat_interval_seconds": 0}
+        d.registry = MagicMock()
+        d.registry.get_recent_workers.return_value = []
+        d.brain.get_token_usage.return_value = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
+        d._db = None
+        d.slack.post_message.return_value = "1700000000.000100"
+        with patch("ironclaude.main.format_heartbeat", return_value="hb"):
+            d.post_heartbeat()
+        assert d._last_heartbeat_ts == "1700000000.000100"
+
+    def test_post_heartbeat_ts_none_on_failure(self):
+        d = _make_poll_daemon()
+        d._last_heartbeat = 0.0
+        d.config = {"heartbeat_interval_seconds": 0}
+        d.registry = MagicMock()
+        d.registry.get_recent_workers.return_value = []
+        d.brain.get_token_usage.return_value = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
+        d._db = None
+        d.slack.post_message.return_value = None   # simulate a failed heartbeat post
+        with patch("ironclaude.main.format_heartbeat", return_value="hb"):
+            d.post_heartbeat()
+        assert d._last_heartbeat_ts is None
 
     def test_alert_deduped_for_same_question(self):
         d = _make_poll_daemon()

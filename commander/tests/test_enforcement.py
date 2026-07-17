@@ -362,7 +362,7 @@ class TestPollBrainResponsesEnforcement:
         msg = "#42 status update: worker completed testing and all tests pass."
         daemon.brain.get_pending_responses.return_value = [msg]
         daemon.poll_brain_responses()
-        daemon.slack.post_message.assert_called_once_with(f"*Brain:* {msg}")
+        daemon.slack.post_message.assert_called_once_with(f"*Brain:* {msg}", thread_ts=None)
 
     def test_invalid_message_blocked(self, daemon):
         """Brain returns a ref-bearing but grader-rejected message -> blocked, correction sent."""

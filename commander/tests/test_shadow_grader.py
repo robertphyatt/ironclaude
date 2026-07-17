@@ -415,6 +415,7 @@ class TestNumCtx:
         for call in mock_client.post_chat.call_args_list:
             payload = call[0][0]
             assert payload["options"]["num_ctx"] == 32768
+            assert payload["options"]["repeat_penalty"] == 1.3
 
 
 class TestAssistantAnalysisPreserved:

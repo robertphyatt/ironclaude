@@ -756,9 +756,11 @@ Every blocked-task escalation message posted to Slack MUST follow this template.
 **Prediction:** {OPERATOR_NAME} will likely choose Option <N> because <reasoning from episodic memory and known preferences>.
 
 **To unblock:** <specific action {OPERATOR_NAME} needs to take>
+
+**Link:** <link to the code, doc, or episodic-memory context grounding this decision — not a link to this message itself, which does not exist yet when this template is composed>
 ```
 
-Predictions must be grounded in episodic memory. Search for how {OPERATOR_NAME} has resolved similar blockers before composing the prediction.
+Predictions must be grounded in episodic memory. Search for how {OPERATOR_NAME} has resolved similar blockers before composing the prediction. The **Link:** field is required — point to whatever material best lets {OPERATOR_NAME} verify the recommendation without re-deriving it (a file:line, a design doc, or a prior decision).
 
 ### Debugging Slack
 If `get_operator_messages` returns empty, call `debug_slack_connection()` to

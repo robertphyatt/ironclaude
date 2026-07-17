@@ -1,0 +1,105 @@
+{
+  "name": "Slack Permalink for Waiting-on-Operator Escalations",
+  "goal": "Add a Slack permalink to daemon-posted \"Waiting on Operator\" escalation messages, and a Link field to the Brain-authored [BLOCKED] escalation template.",
+  "design_file": "docs/plans/2026-07-16-slack-operator-wait-permalink-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "SlackBot permalink + update-message support",
+      "description": "Add get_permalink, update_message, and a prefix property to SlackBot in slack_interface.py, with tests in test_slack_interface.py.",
+      "allowed_files": [
+        "commander/src/ironclaude/slack_interface.py",
+        "commander/tests/test_slack_interface.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Write tests: TestGetPermalink (3 tests), TestUpdateMessage (3 tests), TestSlackBotPrefixProperty (1 test) appended to test_slack_interface.py",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_slack_interface.py -v -k \"TestGetPermalink or TestUpdateMessage or TestSlackBotPrefixProperty\"",
+          "expected": "FAIL — AttributeError: 'SlackBot' object has no attribute 'get_permalink'"
+        },
+        {
+          "description": "Implement get_permalink, update_message, and prefix property on SlackBot in slack_interface.py",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_slack_interface.py -v",
+          "expected": "All tests PASS"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/slack_interface.py commander/tests/test_slack_interface.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Wire permalink enrichment into _maybe_capture_operator_wait",
+      "description": "Update _maybe_capture_operator_wait in main.py to fetch a permalink after posting and edit the message in place to include it, with new integration tests.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_main_operator_wait.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Write test_main_operator_wait.py with TestOperatorWaitPermalink (3 tests)",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_main_operator_wait.py -v",
+          "expected": "FAIL — test_operator_wait_updates_message_with_permalink fails because update_message is never called"
+        },
+        {
+          "description": "Replace the post_message call in _maybe_capture_operator_wait (main.py:1493-1498) with the post -> get_permalink -> update_message sequence",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/test_main_operator_wait.py -v",
+          "expected": "All 3 tests PASS"
+        },
+        {
+          "description": "Stage changes",
+          "command": "git add commander/src/ironclaude/main.py commander/tests/test_main_operator_wait.py",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Add required Link field to workflow.md Decision Format",
+      "description": "Add a required **Link:** field to the Decision Format template in workflow.md, pointing to context grounding the decision (not a self-referential Slack link).",
+      "allowed_files": [
+        "commander/src/brain/rules/workflow.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "No tests required: pure documentation/template content with no runtime code path to exercise.",
+          "command": null,
+          "expected": null
+        },
+        {
+          "description": "Edit the Decision Format block (workflow.md:736-761) to add the **Link:** field after **To unblock:**, plus guidance sentence",
+          "command": "git add commander/src/brain/rules/workflow.md",
+          "expected": "Changes staged"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Full suite verification and doc staging",
+      "description": "Run the full test suite to confirm no regressions, then stage the design and plan docs.",
+      "allowed_files": [
+        "docs/plans/2026-07-16-slack-operator-wait-permalink-design.md",
+        "docs/plans/2026-07-16-slack-operator-wait-permalink.md",
+        "docs/plans/2026-07-16-slack-operator-wait-permalink.plan.json"
+      ],
+      "depends_on": [1, 2, 3],
+      "steps": [
+        {
+          "description": "Run full test suite",
+          "command": "cd commander && PYTHONUNBUFFERED=1 python -m pytest tests/ -v",
+          "expected": "All tests PASS, including 10 new tests across the two modified test files, no regressions"
+        },
+        {
+          "description": "Stage design and plan docs",
+          "command": "git add -f docs/plans/2026-07-16-slack-operator-wait-permalink-design.md docs/plans/2026-07-16-slack-operator-wait-permalink.md docs/plans/2026-07-16-slack-operator-wait-permalink.plan.json",
+          "expected": "Design + plan docs staged"
+        }
+      ]
+    }
+  ]
+}

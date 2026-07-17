@@ -2595,20 +2595,18 @@ class TestBrainMessageFilter:
 class TestPollBrainResponsesFilter:
     """Tests for poll_brain_responses blocked-message split on _BLOCKED_NO_DIRECTIVE."""
 
-    def test_conversational_drop_not_posted_gets_bounded_feedback(self, daemon):
-        """Conversational drop: never posted to Slack; the Brain gets ONE bounded [FYI]
-        notice (not a CONTEXT_REQUIRED), so it stops blindly re-emitting. Throttled — see
-        _maybe_nudge_brain_on_drop — so it cannot reopen the d1133 feedback loop."""
+    def test_conversational_threaded_under_heartbeat(self, daemon):
+        """Ref-less chatter is threaded under the last heartbeat, not dropped or nudged."""
+        daemon._last_heartbeat_ts = "1699.5"
         daemon.brain.get_pending_responses.return_value = [
             "That was conversational output, not a Slack post"
         ]
         daemon._grader = MagicMock()
         daemon.poll_brain_responses()
-        daemon.slack.post_message.assert_not_called()
-        sends = [str(c.args[0]) for c in daemon.brain.send_message.call_args_list]
-        assert len(sends) == 1
-        assert "[FYI]" in sends[0]
-        assert "CONTEXT REQUIRED" not in sends[0]
+        daemon.slack.post_message.assert_called_once()
+        _, kwargs = daemon.slack.post_message.call_args
+        assert kwargs.get("thread_ts") == "1699.5"
+        assert daemon.brain.send_message.call_count == 0
 
     def test_context_required_ack_silently_dropped(self, daemon):
         """Brain ack to CONTEXT_REQUIRED: silently dropped, no feedback loop triggered."""

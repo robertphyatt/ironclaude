@@ -7319,6 +7319,46 @@ class TestCallGraderSubprocess:
             assert v not in env
 
 
+class TestCallGraderModelSuffixGate:
+    """The grader --model arg gets the 1M-context [1m] suffix ONLY for opus.
+    Fable 5 / Sonnet 5 have 1M natively and reject the suffix (passing
+    fable[1m] yields the 'issue with the selected model' error that blacks
+    out Fable via the availability gate)."""
+
+    def _tools_with_grader_model(self, registry, mock_tmux, tmp_path, db_conn, monkeypatch, grader_model):
+        # Mirror the `tools` fixture (empty ollama config so construction never
+        # reads the real hooks-config) while overriding grader_model.
+        empty_cfg = tmp_path / "empty_ollama.json"
+        empty_cfg.write_text("{}")
+        monkeypatch.setenv("IC_OLLAMA_CONFIG_PATH", str(empty_cfg))
+        return OrchestratorTools(
+            registry, mock_tmux, str(tmp_path / "task-ledger.json"),
+            db_conn=db_conn, grader_model=grader_model,
+        )
+
+    @pytest.mark.parametrize("grader_model, expected_model", [
+        ("opus", "opus[1m]"),   # opus needs the [1m] suffix — unchanged
+        ("fable", "fable"),     # 1M natively — must be bare
+        ("sonnet", "sonnet"),   # 1M natively — must be bare
+    ])
+    def test_call_grader_gates_1m_suffix_to_opus(
+        self, registry, mock_tmux, tmp_path, db_conn, monkeypatch, grader_model, expected_model
+    ):
+        import json as _json
+        tools = self._tools_with_grader_model(
+            registry, mock_tmux, tmp_path, db_conn, monkeypatch, grader_model)
+        envelope = _json.dumps([
+            {"type": "result", "subtype": "success",
+             "structured_output": {"grade": "A", "approved": True, "feedback": "ok"}},
+        ])
+        with patch("ironclaude.main.ensure_brain_trusted"), \
+             patch("ironclaude.orchestrator_mcp.subprocess.run") as m:
+            m.return_value = MagicMock(returncode=0, stdout=envelope, stderr="")
+            tools._call_grader("system prompt", "user prompt")
+        argv = m.call_args.args[0]
+        assert argv[argv.index("--model") + 1] == expected_model
+
+
 class TestGraderPromptsToolFree:
     def test_no_grader_system_prompt_instructs_read_and_bash(self):
         import pathlib

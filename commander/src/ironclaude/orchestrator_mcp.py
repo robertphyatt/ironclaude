@@ -33,6 +33,7 @@ import requests
 import shlex
 
 from ironclaude.config import make_opus_command
+from ironclaude.brain_client import _model_needs_1m_beta
 from ironclaude.fable_availability import (
     resolve_worker_type as _resolve_fable_worker_type,
     resolve_advisor_model as _resolve_fable_advisor_model,
@@ -732,7 +733,12 @@ class OrchestratorTools:
                     "--system-prompt-file", sysfile,
                     "--output-format", "json",
                     "--json-schema", json.dumps(schema),
-                    "--model", f"{self._grader_model}[1m]",
+                    # [1m] (+ context-1m beta) is only valid for models that need it to
+                    # unlock 1M context (opus). Fable 5 / Sonnet 5 have 1M natively and
+                    # REJECT the suffix — `fable[1m]`/`sonnet[1m]` is an invalid model id.
+                    "--model", (f"{self._grader_model}[1m]"
+                                if _model_needs_1m_beta(self._grader_model)
+                                else self._grader_model),
                     "--dangerously-skip-permissions",
                     # --dangerously-skip-permissions is required for a non-interactive
                     # run, so the grader must be starved of every mutating/agentic tool
