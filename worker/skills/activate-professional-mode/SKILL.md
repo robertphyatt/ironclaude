@@ -60,6 +60,8 @@ Create CLAUDE.md with the compact template (using the Write tool):
 7. **Subagent Discipline** — One task, one deliverable, set max_turns. No orchestration in subagents.
 8. **No Sycophantic Responses** — No performative agreement; push back with evidence; verify corrections.
 9. **Advisor Fallback** — If the `advisor` tool is unavailable, spawn a top-tier subagent (`Agent`, `model=fable` if Fable is available else `model=opus`) to do the same adversarial review; never skip the advisor step.
+10. **No Workflow Avoidance Under Stage/Context Restrictions** — Plan/task artifacts on disk ARE the checkpoint; do not self-checkpoint. Do not offload read-only queries to the operator when Bash is stage-blocked; open an investigation PM loop.
+11. **Boy Scout Rule** — Never dismiss an evidence-backed defect because it is pre-existing. Clean it up when it is safe, relevant, and within authorized task scope; otherwise describe the finding, evidence, proposed cleanup scope, and risk, then ask permission before proceeding.
 
 Full behavioral rules: [`.claude/rules/behavioral.md`](.claude/rules/behavioral.md)
 ```
@@ -118,18 +120,30 @@ Then create `.claude/rules/behavioral.md` with the full canonical principles (us
    - When the `advisor` tool returns unavailable, do NOT skip the advisor step or just reason it through yourself
    - Spawn a top-tier subagent via the `Agent` tool (`model=fable` if Fable is available, else `model=opus`) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
    - Weight its findings as you would the advisor's; "no advisor" means "use a subagent for the same effect," never "proceed unreviewed"
+
+10. **No Workflow Avoidance Under Stage/Context Restrictions**
+    - Do NOT propose to "checkpoint / bank progress / resume fresh / find a safe stopping point" mid-execution. Plan/task artifacts on disk ARE the checkpoint. Pauses are operator-initiated via `plan-interruption`.
+    - Do NOT ask the operator to run read-only queries (sqlite, grep, bash) because the current stage blocks Bash. The correct move is an investigation PM loop whose execute stage unblocks Bash — do it yourself.
+    - See `ironclaude:workflow-durability` for the decision table.
+
+11. **Boy Scout Rule — Leave It Better Than You Found It**
+    - Never dismiss an evidence-backed defect because it is pre-existing, adjacent, or outside the immediate change
+    - If cleanup is safe, relevant, and within the authorized task scope, fix it through the active workflow and verify the result
+    - If cleanup would materially expand scope, change behavior, require destructive action, affect external systems, or require new authority, describe the finding, evidence, proposed cleanup scope, and risk, then ask permission before proceeding
+    - If cleanup is blocked or unsafe, record the finding and explain the constraint instead of suppressing it
+    - Do not use this rule to justify speculative refactoring or unrequested features
 ```
 
 Display:
 ```
-Created CLAUDE.md (compact index) + .claude/rules/behavioral.md (9 principles)
+Created CLAUDE.md (compact index) + .claude/rules/behavioral.md (11 principles)
 ```
 
 Continue to Step 3.5.
 
 **If CLAUDE.md exists:**
 
-Perform semantic concept analysis. Use the Read tool to check `.claude/rules/behavioral.md` directly (this is the only rules file written by the activation skill). For each of the 9 concepts below, check the entire CLAUDE.md AND `.claude/rules/behavioral.md` (if it exists) and determine whether it's already covered — regardless of heading text, section structure, or wording. A concept is "covered" if CLAUDE.md or `.claude/rules/behavioral.md` contains instructions, rules, or guidance that address the same intent, even if expressed differently. When uncertain, err on the side of "covered" (don't add) rather than "missing" (add redundant content).
+Perform semantic concept analysis. Use the Read tool to check `.claude/rules/behavioral.md` directly (this is the only rules file written by the activation skill). For each of the 11 concepts below, check the entire CLAUDE.md AND `.claude/rules/behavioral.md` (if it exists) and determine whether it's already covered — regardless of heading text, section structure, or wording. A concept is "covered" if CLAUDE.md or `.claude/rules/behavioral.md` contains instructions, rules, or guidance that address the same intent, even if expressed differently. When uncertain, err on the side of "covered" (don't add) rather than "missing" (add redundant content).
 
 | # | Concept | Covered if the file contains... |
 |---|---------|----------------------------------|
@@ -142,6 +156,8 @@ Perform semantic concept analysis. Use the Read tool to check `.claude/rules/beh
 | 7 | Subagent Discipline | Instructions about keeping subagent prompts focused, setting max_turns, or avoiding orchestration in subagents |
 | 8 | No Sycophantic Responses | Instructions to avoid performative agreement, push back with evidence when disagreeing, or verify corrections before implementing them |
 | 9 | Advisor Fallback | Instructions to substitute a subagent (Fable if available, else Opus) for the advisor's review when the `advisor` tool is unavailable, rather than skipping the review |
+| 10 | No Workflow Avoidance Under Stage/Context Restrictions | Instructions to not self-checkpoint / bank progress / hand read-only work back to the operator when a stage restricts Bash; instructions to open an investigation PM loop instead. See `ironclaude:workflow-durability`. |
+| 11 | Boy Scout Rule | Instructions not to ignore evidence-backed pre-existing or adjacent defects; clean them up when within authorized task scope, ask permission before scope expansion, destructive action, or external-system effects after presenting finding/evidence/scope/risk, and record blocked or unsafe findings instead of suppressing them |
 
 Also check whether the workflow requirement concept (all changes must follow brainstorm → write-plans → execute-plans, no exceptions) is expressed anywhere in CLAUDE.md or `.claude/rules/behavioral.md`.
 
@@ -151,7 +167,7 @@ Also check whether the workflow requirement concept (all changes must follow bra
 
 Write missing concepts to `.claude/rules/behavioral.md`:
 
-- If `.claude/rules/behavioral.md` does not exist: create it with the full 9-principle template (same template as in the "CLAUDE.md doesn't exist" path above — use the Write tool).
+- If `.claude/rules/behavioral.md` does not exist: create it with the full 11-principle template (same template as in the "CLAUDE.md doesn't exist" path above — use the Write tool).
 - If `.claude/rules/behavioral.md` exists: append the missing concept(s) to the end of the file using the Edit tool.
 
 Do NOT append numbered directives to CLAUDE.md.
@@ -233,6 +249,24 @@ N. **Advisor Fallback**
    - Weight its findings as you would the advisor's; "no advisor" means "use a subagent for the same effect," never "proceed unreviewed"
 ```
 
+Concept 10 (No Workflow Avoidance Under Stage/Context Restrictions):
+```
+N. **No Workflow Avoidance Under Stage/Context Restrictions**
+   - Do NOT propose to "checkpoint / bank progress / resume fresh / find a safe stopping point" mid-execution. Plan/task artifacts on disk ARE the checkpoint. Pauses are operator-initiated via `plan-interruption`.
+   - Do NOT ask the operator to run read-only queries (sqlite, grep, bash) because the current stage blocks Bash. The correct move is an investigation PM loop whose execute stage unblocks Bash — do it yourself.
+   - See `ironclaude:workflow-durability` for the decision table.
+```
+
+Concept 11 (Boy Scout Rule):
+```
+N. **Boy Scout Rule — Leave It Better Than You Found It**
+    - Never dismiss an evidence-backed defect because it is pre-existing, adjacent, or outside the immediate change
+    - If cleanup is safe, relevant, and within the authorized task scope, fix it through the active workflow and verify the result
+    - If cleanup would materially expand scope, change behavior, require destructive action, affect external systems, or require new authority, describe the finding, evidence, proposed cleanup scope, and risk, then ask permission before proceeding
+    - If cleanup is blocked or unsafe, record the finding and explain the constraint instead of suppressing it
+    - Do not use this rule to justify speculative refactoring or unrequested features
+```
+
 Display: `Added missing directive(s) to .claude/rules/behavioral.md: [list of concept names]`
 
 **If workflow requirement is missing:**
@@ -244,7 +278,7 @@ Prepend at the top of the file (before any existing content):
 
 Display: `Added workflow requirement directive`
 
-**Edge case:** If CLAUDE.md exists but has no numbered directives at all, create `.claude/rules/behavioral.md` with the full 9-principle template (do not modify CLAUDE.md).
+**Edge case:** If CLAUDE.md exists but has no numbered directives at all, create `.claude/rules/behavioral.md` with the full 11-principle template (do not modify CLAUDE.md).
 
 **Error handling:** If Write/Edit to CLAUDE.md fails (permissions, etc.), display the error and continue with activation. CLAUDE.md upgrade is best-effort, not a blocker for professional mode.
 

@@ -56,6 +56,7 @@ def _default_status() -> Optional[str]:
 class AuthRelay:
     TIMEOUT_S = 300           # bounded so a hung login can't wedge the switch; the kill is non-destructive
     VERIFY_MAX_ATTEMPTS = 3   # re-check `claude auth status` across up to N ticks before verify_failed
+    WAITING_FEEDBACK_INTERVAL_S = 60   # throttle for periodic "still working" notice after a code is submitted
 
     def __init__(self, spawn: Callable[[], subprocess.Popen] = _default_spawn,
                  status: Callable[[], Optional[str]] = _default_status,
@@ -74,6 +75,10 @@ class AuthRelay:
                                   # never write into a new session's state (review I2)
         self._verifying = False   # login exited 0 with a URL; confirming the account (review I1)
         self._verify_attempts = 0
+        self._code_submitted_at: Optional[float] = None   # set by submit_code(); basis for the waiting-timer
+        self._last_feedback_ts: Optional[float] = None     # throttles repeated "waiting" events
+        self._needs_code = False                           # one-shot: a re-prompt was seen after submission
+        self._paste_prompt_seen = False                    # distinguishes initial request from rejected-code re-prompt
 
     def in_progress(self) -> bool:
         return self._proc is not None or self._verifying
@@ -91,6 +96,10 @@ class AuthRelay:
                         m = _URL_RE.search(line)
                         if m:
                             self._url = m.group(0)
+                    if "Paste code here" in line:
+                        if self._paste_prompt_seen and self._code_submitted_at is not None:
+                            self._needs_code = True   # CLI re-prompted after a code was already sent
+                        self._paste_prompt_seen = True
         except Exception as exc:
             logger.debug("reader loop ended: %s", exc)
 
@@ -103,6 +112,10 @@ class AuthRelay:
             self._buf = []
             self._url = None
             self._url_relayed = False
+            self._code_submitted_at = None
+            self._last_feedback_ts = None
+            self._needs_code = False
+            self._paste_prompt_seen = False
         proc = self._spawn()
         self._proc = proc
         self._started = self._now()
@@ -116,11 +129,20 @@ class AuthRelay:
         """'idle' if no login subprocess is live, 'sent' on write, 'failed' on write error."""
         if self._proc is None or self._proc.stdin is None:
             return "idle"
+        submitted_at = self._now()
+        with self._lock:
+            self._code_submitted_at = submitted_at
+            self._last_feedback_ts = None
+            self._needs_code = False
         try:
             self._proc.stdin.write(code + "\n")
             self._proc.stdin.flush()
             return "sent"
         except Exception as exc:
+            with self._lock:
+                if self._code_submitted_at == submitted_at:
+                    self._code_submitted_at = None
+                    self._last_feedback_ts = None
             logger.warning("submit_code failed: %s", exc)
             return "failed"
 
@@ -146,6 +168,11 @@ class AuthRelay:
         if url and not self._url_relayed:
             self._url_relayed = True
             return {"state": "url", "url": url}
+        with self._lock:
+            if self._needs_code:
+                self._needs_code = False
+                self._code_submitted_at = None   # pause the waiting-timer until a fresh code is sent
+                return {"state": "needs_code"}
         rc = proc.poll()
         if rc is not None:
             if self._reader is not None:
@@ -165,6 +192,7 @@ class AuthRelay:
                 return None   # keep verifying on the next tick(s)
             return {"state": "error", "detail": self._tail()}
         if self._now() - self._started > self.TIMEOUT_S:
+            logger.error("AuthRelay: login timed out after %ds — subprocess killed", self.TIMEOUT_S)
             try:
                 proc.kill()
                 proc.wait(timeout=5)   # reap the child so it doesn't linger as a zombie
@@ -174,6 +202,14 @@ class AuthRelay:
                 self._reader.join(timeout=1)
             self._proc = None
             return {"state": "timeout"}
+        with self._lock:
+            if self._code_submitted_at is not None:
+                now = self._now()
+                since_submit = now - self._code_submitted_at
+                since_feedback = (now - self._last_feedback_ts) if self._last_feedback_ts else since_submit
+                if since_submit > self.WAITING_FEEDBACK_INTERVAL_S and since_feedback >= self.WAITING_FEEDBACK_INTERVAL_S:
+                    self._last_feedback_ts = now
+                    return {"state": "waiting"}
         return None
 
     def abort(self) -> None:

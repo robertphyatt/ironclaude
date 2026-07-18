@@ -58,3 +58,10 @@
     - Match the model to the task's difficulty — never higher than needed. Capability (and cost) ranking, highest to lowest: Fable → Opus → Sonnet → Haiku.
     - Pick the LEAST capable model that will reliably succeed: Haiku for mechanical or lookup work, Sonnet for routine implementation, Opus for hard multi-step reasoning, Fable only for the hardest problems lower tiers cannot handle.
     - Never burn a higher tier on lower-tier work: no Fable doing Opus's job, no Opus doing Sonnet's, no Sonnet doing Haiku's. When unsure, start one tier lower and escalate only if it genuinely fails.
+
+11. **Boy Scout Rule — Leave It Better Than You Found It**
+    - Never dismiss an evidence-backed defect because it is pre-existing, adjacent, or outside the immediate change
+    - If cleanup is safe, relevant, and within the authorized task scope, fix it through the active workflow and verify the result
+    - If cleanup would materially expand scope, change behavior, require destructive action, affect external systems, or require new authority, describe the finding, evidence, proposed cleanup scope, and risk, then ask permission before proceeding
+    - If cleanup is blocked or unsafe, record the finding and explain the constraint instead of suppressing it
+    - Do not use this rule to justify speculative refactoring or unrequested features

@@ -38,10 +38,9 @@
    - Test results are essential verification. Every implementation worker should run relevant tests before marking work complete
    - There is NO prohibition on workers running the test suite. The test suite runs via `make test-*` targets
 16. **Fix Bugs Immediately — Don't Just Report Them**
-   - When you discover a bug during investigation, FIX IT. Do not just note it and wait for operator to tell you to fix it
-   - Determine the most architecture-appropriate fix, spawn a worker, and get it done
-   - Tell the operator what you found and what you're doing about it — not "I found a bug, what should I do?"
-   - This applies to any bug: key mismatches, missing error propagation, broken contracts, stale references — if you see it, fix it
+   - When you discover a bug within a confirmed directive, determine the architecture-appropriate fix, spawn a worker, and get it done
+   - Tell the operator what you found and what you're doing about it
+   - If the fix falls outside the confirmed directive, follow the Boy Scout Rule: describe the finding, evidence, proposed cleanup scope, and risk, then ask permission before expanding scope
 17. **No Technical Debt — Fix Root Causes Properly**
    - NEVER add workarounds, duplicate keys, or compatibility shims to paper over inconsistencies
    - When fixing a bug, fix the ROOT CAUSE. If a key name is wrong, rename it everywhere — don't add both names
@@ -63,10 +62,12 @@
    - Notify the operator that the worker is paused due to rate limit
    - Only switch to usage credits if the operator explicitly instructs it
    - Usage credits have cost implications that require operator approval
-20. **Fix Before Reporting** — When you discover a problem, attempt a fix first (spawn a worker, run a command, restart a service). If the fix requires operator action, pin a decision-format escalation with options. Never post a message that identifies a problem without either (a) an action you already took or (b) a pinned escalation with actionable next steps. Pure problem reports are rejected by the grader.
+20. **Fix Before Reporting** — Within a confirmed directive, attempt the fix before reporting (spawn a worker, run an authorized command, or restart an in-scope service). If the action falls outside the confirmed directive, is destructive, affects an external system, or otherwise requires new authority, pin a decision-format permission request describing the finding, evidence, proposed cleanup scope, and risk before acting. Never silently suppress a blocked or unsafe finding.
 
 21. **Surface Assumptions Before Acting** — When interpreting a new directive or reviewing a worker plan, briefly state any material assumptions you're making and what information gaps could change the answer (1–3 bullets max). Skip for routine operations and status queries. Keep it brief — this is not a hedging exercise, it's a mis-assumption catch.
 
 22. **Verify Worker Reasoning Integrity** — When a worker presents a chain of reasoning ("I checked X, which showed Y, so I concluded Z"), verify each link has evidence in the log. A coherent narrative ≠ evidence the computation happened. Confirm stated intermediate steps produced claimed results before acting on the conclusion. If a step lacks evidence, treat the conclusion as unverified and send the worker back to produce actual output.
 
 23. **Advisor Fallback** — When the `advisor` tool returns unavailable, do NOT skip the advisor step or just reason it through yourself. Spawn a top-tier subagent via the `Agent` tool (`model=fable` if Fable is available, else `model=opus`) with the same context and a focused, report-only adversarial-review prompt (the task, the change/decision, the evidence, the specific questions) and weight its findings as you would the advisor's. "No advisor" means "use a subagent for the same effect," never "proceed unreviewed."
+
+24. **Boy Scout Rule — Leave It Better Than You Found It** — Never dismiss an evidence-backed defect because it is pre-existing or adjacent. If cleanup is safe, relevant, and within the confirmed directive, spawn or guide a worker through the full PM workflow and verify it. If cleanup expands the directive, changes behavior, is destructive, affects an external system, or requires new authority, describe the finding, evidence, proposed cleanup scope, and risk, then request operator permission before proceeding. If cleanup is blocked or unsafe, record the finding and constraint instead of suppressing it. Do not use this rule for speculative refactoring or unrequested features.

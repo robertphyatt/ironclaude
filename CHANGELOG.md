@@ -3,8 +3,8 @@
 > **Versioning.** IronClaude uses a single monotonically-increasing `1.0.N`
 > patch series — by deliberate convention both features and fixes increment the
 > patch number (this is not strict semver). The version is declared in
-> `commander/pyproject.toml`, `worker/.claude-plugin/plugin.json`, and
-> `.claude-plugin/marketplace.json`, kept in lockstep by
+> `commander/pyproject.toml`, `worker/.claude-plugin/plugin.json`,
+> `worker/.codex-plugin/plugin.json`, and `.claude-plugin/marketplace.json`, kept in lockstep by
 > `commander/tests/test_version_consistency.py`. Each release commit is tagged
 > `vX.Y.Z`. Land changes under `## [Unreleased]` as you go, then rename that
 > heading to the new version at release time so the entry matches what shipped.
@@ -12,6 +12,35 @@
 ## [Unreleased]
 
 _Nothing yet._
+
+## 1.0.24: workflow durability, Codex compatibility, and Commander hardening
+
+Teaches the Worker that plan/design/task-state artifacts on disk are already durable, adds native direct-mode OpenAI Codex packaging, introduces scope-aware Boy Scout cleanup guidance, makes restricted-runner tests hermetic, and hardens Commander Slack interactions around account switching and operator-decision links.
+
+### Added
+- **New skill `ironclaude:workflow-durability`** teaches artifact durability under professional mode; names two anti-patterns (checkpoint anxiety, query offloading) and points at the correct workflow surfaces (`plan-interruption`, investigation PM loop).
+- **Shared multi-line `_ic_is_antipattern_proposal` lexicon helper** added to `worker/hooks/hook-logger.sh`, consumed by both `get-back-to-work-claude.sh` and `subagent-drift-detector.sh`. The predicate iterates lines and returns true if any line matches a checkpoint or query-offload lexicon and is not meta-discussion (heading, blockquote, table row, or code fence).
+- **New numbered behavioral rule "No Workflow Avoidance Under Stage/Context Restrictions"** added to the `activate-professional-mode` template (compact CLAUDE.md template + full behavioral.md template + concept detection table + canonical-texts library) so all plugin consumers pick it up on next activate. Repo dogfood copies (`.claude/rules/behavioral.md`, `worker/CLAUDE.md`) also updated.
+- **"Common Rationalizations" rows** in `executing-plans`, `code-review`, and `brainstorming` SKILL.md files calling out the checkpoint-anxiety, review-banking, and query-offloading rationalizations respectively.
+- **New tests** `worker/hooks/tests/{test-antipattern-lexicon,test-gbtw-antipattern-override,test-sad-antipattern}.sh` follow the existing `GBTW_TEST_MODE=1` source-and-call seam used by `test-gbtw-waiting.sh` / `test-gbtw-inflight.sh`.
+- **Native Codex plugin manifest** at `worker/.codex-plugin/plugin.json` registers Worker skills and embeds plugin-relative launch configuration for the `episodic-memory` and `state-manager` MCP servers. Claude Code's existing direct-map `.mcp.json` remains unchanged.
+- **Scope-aware Boy Scout Rule.** Every current and generated behavioral-instruction surface, including tracked root `AGENTS.md` for Codex repository guidance, rejects “pre-existing” as a reason for silence: clean up evidence-backed defects within authorized scope; otherwise describe the finding, evidence, proposed cleanup scope, and risk and ask permission. Blocked or unsafe findings are recorded rather than suppressed. A propagation guard covers every listed surface.
+
+### Changed
+- **`get-back-to-work-claude.sh` stop-hook**: a new `_gbtw_should_rearm_check` predicate is wired into **three** `FIRE_CONTINUATION=false` paths — the brainstorming case (previously an uncovered gap for AP-2 query-offloading, which happens exclusively in Bash-blocked design stages), the bg-tool suppression, and the holding/waiting suppression. An `AskUserQuestion` that IS a checkpoint or offload proposal now re-arms the continuation check rather than silently suppressing it. `CONTINUATION_PROMPT` extended with two new D/F examples plus a PROPOSING-vs-DESCRIBING guardrail (naming the anti-pattern in a design doc or skill discussion remains grade A).
+- **`subagent-drift-detector.sh`** (previously a 46-line no-op that only cleaned up the subagent_sessions link) now reads the subagent's last assistant text from the transcript and blocks anti-pattern proposals via `block_stop` across five workflow stages (`executing`, `reviewing`, `brainstorming`, `plan_ready`, `final_plan_prep`). Existing `DELETE FROM subagent_sessions` cleanup and `db_audit_log` run BEFORE the block check so no rows leak on a blocked stop.
+- **Codex-compatible background sync hook.** The SessionStart handler no longer sets Claude Code's `"async": true` metadata. Its existing `--background` CLI path already spawns a detached process and returns immediately, so behavior stays asynchronous without asking Codex to run an unsupported async hook.
+- **Operator-wait links now require matching decision context.** Commander retains only fully delivered top-level Brain posts as link candidates and adds a permalink only when the candidate references the same worker extracted from the wait. Threaded chatter, partial deliveries, unrelated workers, and missing context produce a linkless alert rather than a misleading link.
+- **Direct OpenAI Codex compatibility is explicit.** Direct Worker mode supports Claude Code and OpenAI Codex. Commander continues to orchestrate Claude Code sessions only; Codex-backed Commander workers are not included in v1.0.24.
+
+### Fixed
+- **Brainstorming-stage coverage gap for query offloading.** Prior wiring only touched the two downstream suppression blocks; the mainline `case *brainstorming*)` at the top of the case statement set `FIRE_CONTINUATION=false` unconditionally, so a subagent-based Stop event in brainstorming (the primary AP-2 surface — the stage where Bash is blocked) escaped the check entirely.
+- **Codex imports no longer omit episodic-memory sync or the state-manager MCP.** Codex skips handlers marked `async`, and the Claude-only plugin manifest did not expose either MCP server to Codex. The new Codex manifest plus synchronous hook declaration removes both registration failures.
+- **Slack `/login` handles noisy paste-back flows and silent waits.** Login-code parsing trims appended fragments, query strings, and URLs that cannot be part of a device code. The relay detects a CLI re-prompt after submission, emits throttled “still completing” feedback, surfaces a request for a fresh code, and logs the bounded hard timeout before killing and reaping the child process. Failed or incomplete sign-ins continue to preserve the previous account.
+- **Restricted-runner tests are hermetic.** Four orphan-worker tests now exercise tmux-selection contracts through deterministic doubles instead of the operator's live server, and the wiki redirect test uses `socket.socketpair()` instead of binding a TCP listener. Coverage is preserved without environment-dependent skips.
+- **Workflow-avoidance enforcement preserves multiline text and ordinary proposal grammar.** SubagentStop now classifies the complete final assistant text block, and the shared deterministic predicate recognizes common permission forms such as “Would you like me…”, “Do you want me…”, “Could we…”, and “May I…” while retaining line-scoped documentation exemptions.
+- **Slack login no longer loses an immediate rejected-code re-prompt.** Submission state is published before stdin delivery under the relay synchronization boundary and rolled back on delivery failure, so a concurrent CLI re-prompt reliably asks the operator for a fresh code.
+- **Hook regression harness fails on missing assertion paths.** The SubagentStop shell test rejects unexpected output and requires its exact expected pass count instead of allowing an unentered conditional to exit successfully.
 
 ## 1.0.23
 

@@ -20,6 +20,12 @@ Review completed work against the original plan, checking for code quality, bugs
 
 Whenever soliciting user input — choices, confirmations, or selections — ALWAYS use the `AskUserQuestion` tool. NEVER ask via prose. Follow the format in `.claude/rules/ask-user-question-format.md`: Re-ground context, Predict, Options.
 
+## Common Rationalizations (all wrong)
+
+| Rationalization | Why it's wrong |
+|----------------|---------------|
+| "Let me bank this review and resume fresh" | Reviews complete when they complete. Grade recorded via `record_review_verdict` is the durable artifact. See `ironclaude:workflow-durability`. |
+
 ## Process
 
 **Announce professional mode status:**

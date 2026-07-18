@@ -5,16 +5,30 @@
 
 # IronClaude
 
-**Workflow discipline and multi-agent orchestration for Claude Code.**
+**Workflow discipline and multi-agent orchestration for Claude Code and OpenAI Codex.**
 
-IronClaude adds workflow discipline and multi-session orchestration to Claude Code. Without structure, sessions tend to jump to implementation without planning, produce tests that pass but miss regressions, and can't coordinate work across multiple sessions. IronClaude addresses this with two components that work together:
+IronClaude adds workflow discipline to Claude Code and OpenAI Codex, plus multi-session Claude Code orchestration. Without structure, sessions tend to jump to implementation without planning, produce tests that pass but miss regressions, and can't coordinate work across multiple sessions. IronClaude addresses this with two components that work together:
 
-- **Worker** -- A Claude Code plugin that enforces disciplined development workflows (brainstorm, plan, execute) with review gates between every task
+- **Worker** -- A Claude Code and OpenAI Codex plugin that enforces disciplined development workflows (brainstorm, plan, execute) with review gates between every task
 - **Commander** -- A Python daemon that orchestrates multiple Worker sessions via Slack, with an autonomous Brain that decomposes objectives and assigns work
+
+> **Compatibility:** Direct Worker mode supports Claude Code and OpenAI Codex. Commander currently orchestrates Claude Code sessions only; Codex-backed Commander workers are not yet supported.
 
 The key insight: discipline and orchestration reinforce each other. The Worker's professional mode hooks guarantee that every autonomous session follows the full workflow -- so the Commander can trust the quality of work happening without your direct supervision. And because the Commander runs through Slack, you can supervise and direct multi-session autonomous work from your phone, from anywhere, without being at your terminal. The Brain acts as your proxy at the keyboard.
 
 You can use the Worker alone for single-session discipline, or add the Commander for multi-session orchestration.
+
+---
+
+## What's New in v1.0.24
+
+- New `ironclaude:workflow-durability` skill teaches that plan / design / task-state artifacts on disk are durable — no self-checkpointing, no offloading read-only queries to the operator when Bash is stage-blocked.
+- Stop-hook and SubagentStop-hook now detect and block checkpoint / query-offload proposals via a shared line-scoped lexicon helper across five workflow stages, preserving complete multiline assistant blocks and recognizing common permission-request forms.
+- Native Codex packaging now registers the Worker skills and both MCP servers; the episodic-memory startup hook relies on its existing self-backgrounding CLI instead of unsupported async-hook metadata.
+- Slack `/login` now strips pasted URL garbage, reports long-running and rejected-code states, and closes the submit/re-prompt race; operator-wait alerts link only to a fully delivered top-level Brain message verified to reference the same worker, otherwise remaining linkless.
+- New scope-aware Boy Scout Rule makes pre-existing defects actionable: clean them up when authorized, or present the finding, evidence, cleanup scope, and risk and ask permission before expanding scope. Tracked root `AGENTS.md` carries the Codex repository guidance and is covered by the propagation guard.
+- Commander tests no longer touch the operator's live tmux server or bind a TCP listener, so the complete suite runs hermetically in restricted environments without capability skips.
+- See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ---
 
@@ -24,7 +38,7 @@ You can use the Worker alone for single-session discipline, or add the Commander
 
 ### Direct Mode — Recommended Starting Point
 
-Install the Worker plugin into your own Claude Code session and use it yourself. You run the brainstorming, you approve the plans, you trigger execution, you read the code reviews. The state machine enforces the workflow on your session — you experience every phase transition, every review gate, every file access restriction firsthand.
+Install the Worker plugin into your own Claude Code or Codex session and use it yourself. You run the brainstorming, you approve the plans, you trigger execution, you read the code reviews. The state machine enforces the workflow on your session — you experience every phase transition, every review gate, every file access restriction firsthand.
 
 This is where to start. The discipline isn't just for autonomous workers; it's for you. Working through the brainstorm → write-plans → execute-plans cycle yourself builds the intuition you need to be a good orchestrator later.
 
@@ -35,7 +49,7 @@ Once you understand the workflow from the inside, use the Commander to spawn Wor
 The Worker is your avatar at the keyboard. It does what you do in direct mode, just without you there. When you've internalized the rules yourself, you know what the Worker is doing and why, which makes you a more effective orchestrator: decomposing objectives, approving plans, reviewing outcomes, rather than writing every implementation yourself.
 
 **Recommended progression:**
-1. Install the Worker plugin into Claude Code (`/plugin marketplace add robertphyatt/ironclaude` — see [Quick Start](#quick-start-worker-claude-code-plugin) for details)
+1. Install the Worker plugin into Claude Code or Codex (see [Quick Start](#quick-start-worker-claude-code-and-codex-plugin) for details)
 2. Activate professional mode: `/ironclaude:activate-professional-mode`
 3. Work through several features using the full workflow — brainstorm, plan, execute, review
 4. When the workflow feels natural, set up the Commander and begin delegating to Workers
@@ -74,9 +88,9 @@ Claude Code has a built-in plan mode (`EnterPlanMode`/`ExitPlanMode`) that provi
 
 ---
 
-## Quick Start: Worker (Claude Code Plugin)
+## Quick Start: Worker (Claude Code and Codex Plugin)
 
-The Worker is a Claude Code plugin that enforces the brainstorm-plan-execute workflow on every code change. Install it and activate professional mode to get disciplined single-session development.
+The Worker enforces the brainstorm-plan-execute workflow on every code change in Claude Code or OpenAI Codex. Install it and activate professional mode to get disciplined single-session development.
 
 ### Prerequisites
 
@@ -84,7 +98,7 @@ The Worker is a Claude Code plugin that enforces the brainstorm-plan-execute wor
 - Node.js 20+ (for MCP servers)
 - sqlite3 CLI (for hooks — pre-installed on macOS; `sudo apt install sqlite3` on Linux)
 
-### Install
+### Install in Claude Code
 
 ```bash
 # From within Claude Code:
@@ -98,11 +112,22 @@ The Worker is a Claude Code plugin that enforces the brainstorm-plan-execute wor
 
 > **First run:** The first time MCP servers start (~10-30s), they auto-build platform-specific binaries. Subsequent starts are instant. If startup fails, check `~/.claude/ironclaude-mcp-state-manager.log` and `~/.claude/ironclaude-mcp-episodic-memory.log`.
 
+### Install in Codex
+
+```bash
+codex plugin marketplace add robertphyatt/ironclaude
+codex plugin add ironclaude@ironclaude
+```
+
+Start a new Codex task after installation so it loads the Worker skills and MCP tools. Review and trust the bundled hooks before enabling professional mode; Codex does not automatically trust plugin hooks. The Codex manifest embeds plugin-relative MCP commands while the existing `.mcp.json` remains Claude Code-compatible.
+
 ### Activate Professional Mode
 
 ```
 /ironclaude:activate-professional-mode
 ```
+
+In Codex, invoke the `ironclaude:activate-professional-mode` skill from the composer.
 
 When active, Claude operates in architect mode -- planning and designing without making code changes unless executing an approved plan. Every write action is validated by hooks that check whether it's permitted in the current workflow phase.
 

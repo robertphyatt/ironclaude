@@ -28,25 +28,32 @@ def test_parse_md_preserves_html_body(tmp_path):
     assert "&lt;h1&gt;" not in body
 
 
-def test_wiki_prefix_no_slash_redirects(tmp_path, monkeypatch):
-    """GET /wiki (no trailing slash) returns 301 to /wiki/."""
-    import http.client
-    import threading
+def test_wiki_prefix_no_slash_redirects():
+    """GET /wiki returns 301 to /wiki/ without binding a network port."""
+    import socket
+    from types import SimpleNamespace
 
     import wiki_server
-    monkeypatch.setattr(wiki_server, "WIKI_DIR", tmp_path)
-    (tmp_path / "index.md").write_text("# Index\n")
 
-    server = wiki_server.ThreadingHTTPServer(("127.0.0.1", 0), wiki_server.WikiHandler)
-    port = server.server_address[1]
-    t = threading.Thread(target=server.handle_request, daemon=True)
-    t.start()
+    client, handler_socket = socket.socketpair()
+    try:
+        client.sendall(
+            b"GET /wiki HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        client.shutdown(socket.SHUT_WR)
+        server = SimpleNamespace(server_name="localhost", server_port=80)
+        wiki_server.WikiHandler(handler_socket, ("local", 0), server)
+        handler_socket.shutdown(socket.SHUT_WR)
 
-    conn = http.client.HTTPConnection("127.0.0.1", port)
-    conn.request("GET", "/wiki")
-    resp = conn.getresponse()
+        response = b""
+        while chunk := client.recv(4096):
+            response += chunk
+    finally:
+        client.close()
+        handler_socket.close()
 
-    assert resp.status == 301
-    assert resp.getheader("Location") == "/wiki/"
-    t.join(timeout=2)
-    server.server_close()
+    headers = response.decode("iso-8859-1").split("\r\n\r\n", 1)[0]
+    assert headers.startswith("HTTP/1.0 301 ")
+    assert "\r\nLocation: /wiki/\r\n" in f"\r\n{headers}\r\n"

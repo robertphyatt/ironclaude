@@ -406,6 +406,7 @@ def _make_poll_daemon():
     d._heartbeat_state_history = {}
     d._heartbeat_stuck_notified = set()
     d._last_heartbeat_ts = None
+    d._last_brain_context = None
     from ironclaude.auth_relay import AuthRelay
     d._auth_relay = AuthRelay()   # __new__ bypasses __init__; the new tick() needs this
     return d
@@ -860,6 +861,7 @@ def test_login_tick_verify_failed_no_restart(monkeypatch):
     d = _login_daemon(_FakeRelay(tick_events=[{"state": "verify_failed"}]))
     d.poll_slack_commands()
     assert "not restarting" in _posts(d).lower()
+    assert "review I1" not in _posts(d)
     assert killed == []
 
 
@@ -887,6 +889,24 @@ def test_login_tick_already_logged_in_no_restart(monkeypatch):
     d = _login_daemon(_FakeRelay(tick_events=[{"state": "already_logged_in", "account": "me@x"}]))
     d.poll_slack_commands()
     assert "Already signed in" in _posts(d)
+    assert killed == []
+
+
+def test_login_tick_waiting_posts_notice(monkeypatch):
+    killed = []
+    monkeypatch.setattr("ironclaude.main.os.kill", lambda pid, sig: killed.append(sig))
+    d = _login_daemon(_FakeRelay(tick_events=[{"state": "waiting"}]))
+    d.poll_slack_commands()
+    assert "still completing" in _posts(d).lower()
+    assert killed == []
+
+
+def test_login_tick_needs_code_prompts_resubmit(monkeypatch):
+    killed = []
+    monkeypatch.setattr("ironclaude.main.os.kill", lambda pid, sig: killed.append(sig))
+    d = _login_daemon(_FakeRelay(tick_events=[{"state": "needs_code"}]))
+    d.poll_slack_commands()
+    assert "needs a new code" in _posts(d).lower()
     assert killed == []
 
 

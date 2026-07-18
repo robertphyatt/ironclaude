@@ -1,0 +1,56 @@
+{
+  "name": "ironclaude",
+  "version": "1.0.24",
+  "description": "Ironclad workflow discipline for Codex and Claude Code \u2014 professional mode, systematic planning, and multi-session orchestration",
+  "author": {
+    "name": "Robert Hyatt",
+    "url": "https://github.com/robertphyatt"
+  },
+  "homepage": "https://github.com/robertphyatt/ironclaude",
+  "repository": "https://github.com/robertphyatt/ironclaude",
+  "keywords": [
+    "workflow",
+    "planning",
+    "code-review",
+    "professional-mode"
+  ],
+  "skills": "./skills/",
+  "mcpServers": {
+    "episodic-memory": {
+      "command": "node",
+      "args": [
+        "./mcp-servers/episodic-memory/cli/mcp-server-wrapper.js"
+      ],
+      "cwd": ".",
+      "env": {}
+    },
+    "state-manager": {
+      "command": "node",
+      "args": [
+        "./mcp-servers/state-manager/cli/mcp-server-wrapper.js"
+      ],
+      "cwd": ".",
+      "env": {}
+    }
+  },
+  "interface": {
+    "displayName": "IronClaude",
+    "shortDescription": "Enforced planning, execution, and review workflows",
+    "longDescription": "Adds professional-mode workflow discipline, systematic planning, execution gates, code review, and persistent state management to Codex and Claude Code.",
+    "developerName": "Robert Hyatt",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Workflow enforcement",
+      "Planning",
+      "Code review",
+      "MCP tools"
+    ],
+    "websiteURL": "https://github.com/robertphyatt/ironclaude",
+    "brandColor": "#B7410E",
+    "defaultPrompt": [
+      "Activate professional mode for this project.",
+      "Brainstorm and plan this change with IronClaude.",
+      "Execute the approved IronClaude plan."
+    ]
+  }
+}

@@ -17,8 +17,8 @@ class TestWorkerClaudeMdTemplate:
         content = TEMPLATE_PATH.read_text()
         assert "WORKFLOW REQUIREMENT" in content
 
-    def test_template_contains_all_nine_directives(self):
-        """Template must contain all 9 numbered behavioral directives."""
+    def test_template_contains_all_twelve_directives(self):
+        """Template must contain all 12 numbered behavioral directives."""
         content = TEMPLATE_PATH.read_text()
         expected = [
             "Challenge Assumptions",
@@ -30,6 +30,9 @@ class TestWorkerClaudeMdTemplate:
             "Subagent Discipline",
             "No Sycophantic Responses",
             "Handle Large Files with Decomposition",
+            "Compressed Output",
+            "Right-Size Every Subagent",
+            "Boy Scout Rule",
         ]
         for directive in expected:
             assert directive in content, f"Missing directive: {directive}"

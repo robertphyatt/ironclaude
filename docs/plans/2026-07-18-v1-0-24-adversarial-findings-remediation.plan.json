@@ -1,0 +1,377 @@
+{
+  "name": "v1.0.24 Adversarial Findings Remediation",
+  "goal": "Remediate all seven verified v1.0.24 findings, track Codex guidance with Boy Scout parity, and fully verify the release before a separate main-context amend with no push.",
+  "design_file": "docs/plans/2026-07-18-v1-0-24-adversarial-findings-remediation-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Track Codex guidance and enforce Boy Scout parity",
+      "description": "Add the existing root AGENTS.md to source control, give it the complete five-clause Boy Scout directive, and extend the exact propagation guard.",
+      "allowed_files": [
+        "AGENTS.md",
+        "commander/tests/test_boy_scout_directive.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: In commander/tests/test_boy_scout_directive.py replace DIRECT_SURFACES with the exact list AGENTS.md, CLAUDE.md, worker/CLAUDE.md, commander/CLAUDE.md, .claude/rules/behavioral.md, commander/src/ironclaude/templates/worker_claude_md.md, preserving the existing marker and exact-body assertions."
+        },
+        {
+          "description": "Run the single propagation regression before editing AGENTS.md.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_boy_scout_directive.py::test_directive_in_every_direct_behavioral_surface -q",
+          "expected": "FAIL containing 'Missing Boy Scout Rule in AGENTS.md'."
+        },
+        {
+          "description": "GREEN: In AGENTS.md, after principle 9 and before Plan Mode Replacement, add principle 10 'Boy Scout Rule — Leave It Better Than You Found It' with these exact clauses: never dismiss an evidence-backed pre-existing/adjacent/outside-immediate-change defect; fix safe relevant authorized cleanup through the workflow and verify; for material scope/behavior/destructive/external/new-authority expansion describe finding, evidence, proposed scope, risk and ask permission; record blocked/unsafe findings; prohibit speculative refactoring and unrequested features. Preserve Codex-specific title and Plan Mode text."
+        },
+        {
+          "description": "Run all propagation and worker-template checks.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_boy_scout_directive.py commander/tests/test_worker_claude_md_template.py -q",
+          "expected": "All tests pass."
+        },
+        {
+          "description": "Stage only the task files; do not commit.",
+          "command": "git add AGENTS.md commander/tests/test_boy_scout_directive.py",
+          "expected": "Both exact paths staged."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Preserve multiline hook text and cover common proposal grammar",
+      "description": "Fix the lossy final-assistant extractor, split checkpoint proposal framing from prohibited actions, add common modal forms, and make the shell harness assert every check executed.",
+      "allowed_files": [
+        "worker/hooks/subagent-drift-detector.sh",
+        "worker/hooks/hook-logger.sh",
+        "worker/hooks/tests/test-antipattern-lexicon.sh",
+        "worker/hooks/tests/test-gbtw-antipattern-override.sh",
+        "worker/hooks/tests/test-sad-antipattern.sh"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: Append true lexicon cases for 'Would you like me to checkpoint here?', 'Do you want me to pause here?', 'Could we find a natural stopping point?', and 'May I bank progress and resume fresh?'. Append an executing-stage GBTW true case for 'Would you like me to checkpoint here?'. In test-sad-antipattern.sh add: a multiline fixture with 'Shall we checkpoint here?\\nWaiting on your answer.' asserting exact extraction and predicate true; a malformed JSONL fixture asserting empty/no crash; an unreadable chmod-000 fixture asserting empty/no crash and restoring mode; an unconditional else failure for every empty-output fixture; EXPECTED_PASSES=9 with exit nonzero unless FAILS=0 and PASSES=9."
+        },
+        {
+          "description": "Run the lexicon regression before production changes.",
+          "command": "bash worker/hooks/tests/test-antipattern-lexicon.sh",
+          "expected": "New modal cases J-M fail against c923949."
+        },
+        {
+          "description": "Run the GBTW regression before production changes.",
+          "command": "bash worker/hooks/tests/test-gbtw-antipattern-override.sh",
+          "expected": "New modal re-arm case 11 fails against c923949."
+        },
+        {
+          "description": "Run the SAD regression before production changes.",
+          "command": "bash worker/hooks/tests/test-sad-antipattern.sh",
+          "expected": "Multiline exact-extraction/predicate checks fail; malformed and unreadable fail-open checks pass."
+        },
+        {
+          "description": "GREEN extractor: Replace _sad_last_assistant_text pipeline with: tail -50 \"$transcript\" | jq -s -r '[.[] | select(.type==\"assistant\") | .message.content[]? | select(.type==\"text\") | .text // empty] | last // empty' 2>/dev/null. Update comment from final content line to final text content block."
+        },
+        {
+          "description": "GREEN predicate: Define _IC_CHECKPOINT_PROPOSAL_FRAME='(shall|should|can|could|may) (we|I)|(would you like|do you want) (me|us) to|let'\\''s|let me'; _IC_CHECKPOINT_ACTION='checkpoint|bank progress|bank the|resume fresh|pause here|find a (safe|natural) stopping point'; _IC_CHECKPOINT_QUESTION='safe stopping point\\?|natural stopping point\\?|checkpoint and (resume|continue) fresh'; retain query-offload and meta regexes. Rewrite _ic_is_antipattern_proposal as a here-string line loop: skip meta lines; return true for query-offload; return true when the same line matches both proposal frame and action; return true for the legacy checkpoint-question regex; otherwise print false after the loop."
+        },
+        {
+          "description": "Run the complete lexicon test after implementation.",
+          "command": "bash worker/hooks/tests/test-antipattern-lexicon.sh",
+          "expected": "All lexicon cases pass."
+        },
+        {
+          "description": "Run the complete GBTW override test after implementation.",
+          "command": "bash worker/hooks/tests/test-gbtw-antipattern-override.sh",
+          "expected": "All GBTW cases pass."
+        },
+        {
+          "description": "Run the complete SAD test after implementation.",
+          "command": "bash worker/hooks/tests/test-sad-antipattern.sh",
+          "expected": "Nine expected checks pass and zero fail."
+        },
+        {
+          "description": "Run Bash syntax checks after implementation.",
+          "command": "bash -n worker/hooks/hook-logger.sh worker/hooks/get-back-to-work-claude.sh worker/hooks/subagent-drift-detector.sh",
+          "expected": "bash -n exits 0."
+        },
+        {
+          "description": "Stage the five exact hook/task files; do not commit.",
+          "command": "git add worker/hooks/hook-logger.sh worker/hooks/subagent-drift-detector.sh worker/hooks/tests/test-antipattern-lexicon.sh worker/hooks/tests/test-gbtw-antipattern-override.sh worker/hooks/tests/test-sad-antipattern.sh",
+          "expected": "Five exact paths staged."
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Close the auth relay submission and re-prompt race",
+      "description": "Distinguish the initial paste prompt from later rejection prompts, publish login-code submission state before subprocess delivery, roll back failed delivery, and verify both concurrent reader paths.",
+      "allowed_files": [
+        "commander/src/ironclaude/auth_relay.py",
+        "commander/tests/test_auth_relay.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: Add test_reprompt_during_submit_is_not_lost using a FakeProc whose initial paste prompt is drained before replacing stdin with RacingStdin; RacingStdin.write() calls relay._read_loop on a second 'Paste code here if prompted >\\n', then assert submit_code returns sent, tick returns {'state':'needs_code'}, and _code_submitted_at becomes None. Add test_delayed_initial_prompt_during_submit_is_not_a_reprompt using an initially prompt-free FakeProc whose stdin emits the first paste prompt during write; assert submit returns sent, tick is None, and submission remains active. Add test_new_login_resets_initial_prompt_tracking with two spawned FakeProcs: drain the first session's initial prompt, complete it, start the second session, emit its first prompt during stdin.write, then assert tick is None; this proves start() resets _paste_prompt_seen. Extend write-error test to assert _code_submitted_at and _last_feedback_ts are None and _needs_code is False. Add test_submit_code_failed_on_flush_rolls_back_state with stdin.write returning length and flush raising OSError; assert failed and all three shared fields reset. Add test_submit_code_flush_failure_preserves_concurrent_reprompt: drain an initial prompt, make stdin.write feed a second prompt through _read_loop and flush raise OSError, then assert failed, submission timestamp cleared, and tick returns needs_code."
+        },
+        {
+          "description": "Run the six exact tests before implementation.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_auth_relay.py::TestAuthRelay::test_reprompt_during_submit_is_not_lost commander/tests/test_auth_relay.py::TestAuthRelay::test_delayed_initial_prompt_during_submit_is_not_a_reprompt commander/tests/test_auth_relay.py::TestAuthRelay::test_new_login_resets_initial_prompt_tracking commander/tests/test_auth_relay.py::TestAuthRelay::test_submit_code_failed_on_write_error commander/tests/test_auth_relay.py::TestAuthRelay::test_submit_code_failed_on_flush_rolls_back_state commander/tests/test_auth_relay.py::TestAuthRelay::test_submit_code_flush_failure_preserves_concurrent_reprompt -q",
+          "expected": "Rejected-code race fails against c923949; delayed-initial-prompt establishes the inverse boundary; write/flush rollback tests establish transactional cleanup."
+        },
+        {
+          "description": "GREEN: Add _paste_prompt_seen=False in __init__ and reset it in start(). In the reader, on 'Paste code here', set _needs_code only when _paste_prompt_seen is already true and _code_submitted_at is active, then set _paste_prompt_seen=true. In submit_code, compute submitted_at=self._now(); under _lock set _code_submitted_at=submitted_at, _last_feedback_ts=None, _needs_code=False before stdin write/flush. On exception, reacquire _lock and, when timestamp still equals submitted_at, reset only _code_submitted_at and _last_feedback_ts; preserve _needs_code so a reader-observed concurrent re-prompt survives, while ordinary failures remain false from pre-delivery initialization. Remove post-write state publication. Wrap tick waiting-feedback calculation/update in _lock using one now value. Preserve generation, return values, timeout, and verification."
+        },
+        {
+          "description": "Run all auth relay tests.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_auth_relay.py -q",
+          "expected": "All relay tests pass."
+        },
+        {
+          "description": "Compile auth relay source.",
+          "command": "commander/.venv/bin/python -m compileall -q commander/src/ironclaude/auth_relay.py",
+          "expected": "compileall exits 0."
+        },
+        {
+          "description": "Stage only auth relay source and tests; do not commit.",
+          "command": "git add commander/src/ironclaude/auth_relay.py commander/tests/test_auth_relay.py",
+          "expected": "Both exact paths staged."
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Associate operator-wait links conservatively and clean Slack output",
+      "description": "Track evidence-bearing top-level Brain context, omit unrelated links, preserve partial-delivery semantics, and remove an internal operator-facing annotation.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_main_operator_wait.py",
+        "commander/tests/test_main_validate.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED tests: Change both daemon test helpers from _last_brain_post_ts=None to _last_brain_context=None. Seed successful context as ('9999.0001','Status for d1267: choose approach A or B') in both the successful permalink test and test_operator_wait_skips_update_when_permalink_returns_none; the latter must still call get_permalink, receive None, and skip only update_message. Add unrelated-context test expecting no permalink/update; worker_id None/brain test with a Brain context candidate expecting no permalink/update; threaded-chatter test where top-level d1267 context remains after thread_ts='heartbeat-ts'; partial-delivery test where side_effect ['first-ts',None] on 39001 chars leaves prior context unchanged; rename timestamp tracking test to assert ('1111.2222','hello'). Add assert 'review I1' not in _posts(d) to verify_failed test."
+        },
+        {
+          "description": "Run operator-wait and message regressions before implementation.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_main_operator_wait.py commander/tests/test_main_validate.py::test_login_tick_verify_failed_no_restart -q",
+          "expected": "Failures show timestamp-only state, threaded/partial overwrite, missing worker association, and internal annotation."
+        },
+        {
+          "description": "GREEN context state: Replace __init__ field with self._last_brain_context: tuple[str,str] | None = None. At _post_brain_message end set it to (first_ts,text) only when all_ok, first_ts is not None, and thread_ts is None. Return behavior remains first_ts if all_ok else None."
+        },
+        {
+          "description": "GREEN link association: In _maybe_capture_operator_wait snapshot candidate=self._last_brain_context. Only when alert ts, candidate exists, and worker_id!='brain', compile rf'(?<![A-Za-z0-9_-]){re.escape(worker_id)}(?![A-Za-z0-9_-])'; if it matches candidate text, get permalink for candidate ts and update the alert. Otherwise leave alert linkless. Replace verify_failed message with exactly: Signed in, but I couldn't confirm the account after retries — the switch may or may not have completed. Not restarting; send `login` again to be sure."
+        },
+        {
+          "description": "Run complete focused operator-wait and validation tests.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_main_operator_wait.py commander/tests/test_main_validate.py -q",
+          "expected": "All focused tests pass."
+        },
+        {
+          "description": "Compile Commander main source.",
+          "command": "commander/.venv/bin/python -m compileall -q commander/src/ironclaude/main.py",
+          "expected": "compileall exits 0."
+        },
+        {
+          "description": "Stage main and both exact test files; do not commit.",
+          "command": "git add commander/src/ironclaude/main.py commander/tests/test_main_operator_wait.py commander/tests/test_main_validate.py",
+          "expected": "Three exact paths staged."
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Align release documentation, stage artifacts, and verify v1.0.24",
+      "description": "Make release claims precise, stage all workflow artifacts, run focused/full validation, audit tests for theatre, and hand a verified staged tree back for the main-context amend.",
+      "allowed_files": [
+        "README.md",
+        "CHANGELOG.md",
+        "docs/reviews/2026-07-18-v1-0-24-commit-findings.md",
+        "docs/plans/2026-07-18-v1-0-24-adversarial-findings-remediation-design.md",
+        "docs/plans/2026-07-18-v1-0-24-adversarial-findings-remediation.md",
+        "docs/plans/2026-07-18-v1-0-24-adversarial-findings-remediation.plan.json"
+      ],
+      "depends_on": [1, 2, 3, 4],
+      "steps": [
+        {
+          "description": "Update README v1.0.24 bullets: state tracked root AGENTS.md carries Codex Boy Scout guidance and is propagation-tested; state operator alerts link only to a fully delivered top-level Brain post verified to reference the same worker, otherwise no link; state hook enforcement preserves complete multiline blocks and common permission forms. Preserve direct Worker Codex / Commander Claude Code-only boundary."
+        },
+        {
+          "description": "Update CHANGELOG v1.0.24: Boy Scout Added bullet names tracked root AGENTS.md and propagation guard; operator-wait Changed bullet requires fully delivered top-level same-worker context and linkless fallback; add Fixed bullets for multiline/common grammar, pre-delivery auth state with rollback, and exact-count hook regression harness."
+        },
+        {
+          "description": "Run focused Python remediation verification.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_boy_scout_directive.py commander/tests/test_worker_claude_md_template.py commander/tests/test_auth_relay.py commander/tests/test_main_operator_wait.py commander/tests/test_main_validate.py -q",
+          "expected": "All focused Python tests pass without warnings or hidden errors."
+        },
+        {
+          "description": "Run focused lexicon verification.",
+          "command": "bash worker/hooks/tests/test-antipattern-lexicon.sh",
+          "expected": "All lexicon checks pass."
+        },
+        {
+          "description": "Run focused GBTW override verification.",
+          "command": "bash worker/hooks/tests/test-gbtw-antipattern-override.sh",
+          "expected": "All GBTW override checks pass."
+        },
+        {
+          "description": "Run focused SAD verification.",
+          "command": "bash worker/hooks/tests/test-sad-antipattern.sh",
+          "expected": "Nine SAD checks pass and zero fail."
+        },
+        {
+          "description": "Run Bash syntax validation.",
+          "command": "bash -n worker/hooks/hook-logger.sh worker/hooks/get-back-to-work-claude.sh worker/hooks/subagent-drift-detector.sh",
+          "expected": "bash -n exits 0."
+        },
+        {
+          "description": "Compile changed Commander sources.",
+          "command": "commander/.venv/bin/python -m compileall -q commander/src/ironclaude/auth_relay.py commander/src/ironclaude/main.py commander/src/ironclaude/slack_interface.py",
+          "expected": "compileall exits 0."
+        },
+        {
+          "description": "Run version consistency validation.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_version_consistency.py -q",
+          "expected": "Version consistency test passes."
+        },
+        {
+          "description": "Run the exact generic Codex plugin validator. Any failure stops execution; do not use a fallback, mutate marketplace configuration, or add a cachebuster.",
+          "command": "python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py worker",
+          "expected": "Plugin validation passed for the worker plugin root."
+        },
+        {
+          "description": "Run hook test 1 of 6.",
+          "command": "bash worker/hooks/tests/test-antipattern-lexicon.sh",
+          "expected": "Exit 0."
+        },
+        {
+          "description": "Run hook test 2 of 6.",
+          "command": "bash worker/hooks/tests/test-bash-readonly-guard.sh",
+          "expected": "Exit 0."
+        },
+        {
+          "description": "Run hook test 3 of 6.",
+          "command": "bash worker/hooks/tests/test-gbtw-antipattern-override.sh",
+          "expected": "Exit 0."
+        },
+        {
+          "description": "Run hook test 4 of 6.",
+          "command": "bash worker/hooks/tests/test-gbtw-inflight.sh",
+          "expected": "Exit 0."
+        },
+        {
+          "description": "Run hook test 5 of 6.",
+          "command": "bash worker/hooks/tests/test-gbtw-waiting.sh",
+          "expected": "Exit 0."
+        },
+        {
+          "description": "Run hook test 6 of 6.",
+          "command": "bash worker/hooks/tests/test-sad-antipattern.sh",
+          "expected": "Exit 0 with nine passes and zero failures."
+        },
+        {
+          "description": "Run complete Commander tests.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests -q",
+          "expected": "Exit 0, no failures; report any existing intentional skip by identity."
+        },
+        {
+          "description": "Testing-theatre audit exact changed tests: commander/tests/test_boy_scout_directive.py, test_auth_relay.py, test_main_operator_wait.py, test_main_validate.py, and three worker hook regression scripts. Verify no skips; unconditional behavioral assertions; exact shell pass/fail accounting; mocks invoke real production methods; RED evidence exists. Record result in execution summary."
+        },
+        {
+          "description": "Stage README and CHANGELOG normally; do not commit.",
+          "command": "git add README.md CHANGELOG.md",
+          "expected": "README.md and CHANGELOG.md staged."
+        },
+        {
+          "description": "Force-add the exact review/design/plan artifacts because workflow artifact paths may be ignored; do not commit.",
+          "command": "git add -f docs/reviews/2026-07-18-v1-0-24-commit-findings.md docs/plans/2026-07-18-v1-0-24-adversarial-findings-remediation-design.md docs/plans/2026-07-18-v1-0-24-adversarial-findings-remediation.md docs/plans/2026-07-18-v1-0-24-adversarial-findings-remediation.plan.json",
+          "expected": "Four exact workflow artifacts staged."
+        },
+        {
+          "description": "Check staged whitespace.",
+          "command": "git diff --cached --check",
+          "expected": "Exit 0 with no output."
+        },
+        {
+          "description": "Print staged statistics.",
+          "command": "git diff --cached --stat",
+          "expected": "Only authorized remediation/release paths listed."
+        },
+        {
+          "description": "Print worktree/staging state.",
+          "command": "git status --short",
+          "expected": "No unexpected staged path."
+        },
+        {
+          "description": "Verify amend target remains unchanged.",
+          "command": "git rev-parse HEAD",
+          "expected": "c923949edf1a92219996653043e5b603e1eb99d7"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "name": "Final review and release handoff",
+      "description": "Run the complete staged-remediation review and finding probes, verify the exact amend target, then hand the staged tree back for a main-context-only amend after execution completes.",
+      "allowed_files": [
+        "docs/reviews/2026-07-18-v1-0-24-commit-findings.md",
+        "docs/plans/2026-07-18-v1-0-24-adversarial-findings-remediation-design.md",
+        "docs/plans/2026-07-18-v1-0-24-adversarial-findings-remediation.md",
+        "docs/plans/2026-07-18-v1-0-24-adversarial-findings-remediation.plan.json"
+      ],
+      "depends_on": [5],
+      "steps": [
+        {
+          "description": "Invoke ironclaude:code-review against the complete staged remediation. Require a passing grade and verify every adversarial finding closure against the review report and approved design; any finding reopens its owning task."
+        },
+        {
+          "description": "Re-run the exact SAD multiline extractor and exact-count harness probe.",
+          "command": "bash worker/hooks/tests/test-sad-antipattern.sh",
+          "expected": "SAD reports exactly 9 passes and zero failures."
+        },
+        {
+          "description": "Re-run the exact common permission-grammar lexicon probe.",
+          "command": "bash worker/hooks/tests/test-antipattern-lexicon.sh",
+          "expected": "Proposal cases J-M classify true."
+        },
+        {
+          "description": "Re-run the exact executing-stage GBTW proposal probe.",
+          "command": "bash worker/hooks/tests/test-gbtw-antipattern-override.sh",
+          "expected": "GBTW reports 11 true cases."
+        },
+        {
+          "description": "Re-run the exact auth submit/re-prompt, delayed-initial-prompt, new-session reset, and flush-failure re-prompt preservation probes.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_auth_relay.py::TestAuthRelay::test_reprompt_during_submit_is_not_lost commander/tests/test_auth_relay.py::TestAuthRelay::test_delayed_initial_prompt_during_submit_is_not_a_reprompt commander/tests/test_auth_relay.py::TestAuthRelay::test_new_login_resets_initial_prompt_tracking commander/tests/test_auth_relay.py::TestAuthRelay::test_submit_code_flush_failure_preserves_concurrent_reprompt -q",
+          "expected": "All four auth race/reset/rollback probes pass."
+        },
+        {
+          "description": "Re-run the exact unrelated-worker, Brain, threaded-chatter, and partial-delivery Slack association probes.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_main_operator_wait.py::TestOperatorWaitPermalink::test_operator_wait_omits_link_for_unrelated_context commander/tests/test_main_operator_wait.py::TestOperatorWaitPermalink::test_operator_wait_for_brain_is_always_linkless commander/tests/test_main_operator_wait.py::TestPostBrainMessageTracksLastTs::test_threaded_chatter_does_not_replace_top_level_context commander/tests/test_main_operator_wait.py::TestPostBrainMessageTracksLastTs::test_partial_top_level_delivery_does_not_replace_context -q",
+          "expected": "All four Slack association probes pass."
+        },
+        {
+          "description": "Check final staged whitespace.",
+          "command": "git diff --cached --check",
+          "expected": "Exit 0 with no output."
+        },
+        {
+          "description": "Print final staged path inventory.",
+          "command": "git diff --cached --name-only",
+          "expected": "Only authorized remediation, release, review, design, and plan paths."
+        },
+        {
+          "description": "Verify the pre-amend HEAD exactly.",
+          "command": "git rev-parse HEAD",
+          "expected": "c923949edf1a92219996653043e5b603e1eb99d7"
+        },
+        {
+          "description": "Submit Task 6 for task-boundary review and let executing-plans reach execution_complete. Do not commit, tag, reinstall, or push while this task is active."
+        },
+        {
+          "description": "DEFERRED MAIN-CONTEXT HANDOFF AFTER execution_complete: re-check HEAD/status/staged names; run the exact git commit --amend message documented in the human plan; verify git log, clean status, git diff HEAD^ --check, origin/main...HEAD counts, and no-push status. Verify committed artifact presence with git ls-tree for AGENTS.md, the review, design, human plan, and machine plan. Verify amended object content with git show HEAD:<path> piped to rg -q for 'Boy Scout Rule', 'jq -s -r', '_paste_prompt_seen', and '_last_brain_context'. Stop without pushing or reinstalling because configured ironclaude marketplace source is the GitHub repository and cannot see the unpushed amendment. After separately authorized deployment, run codex plugin marketplace upgrade ironclaude, codex plugin add ironclaude@ironclaude, and codex plugin list; require installed/enabled version 1.0.24, then start a new Codex task. This step records the terminal contract and must not execute inside an active plan task."
+        }
+      ]
+    }
+  ]
+}

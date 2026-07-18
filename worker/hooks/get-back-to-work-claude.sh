@@ -125,6 +125,20 @@ _gbtw_recent_waiting_tool() {
     return 0
 }
 
+# _gbtw_should_rearm_check STAGE RECENT_CONTEXT
+# Echoes 'true' if a suppressed continuation check should be RE-ARMED because
+# the trailing prose contains an anti-pattern proposal (checkpoint or query
+# offload). Delegates the lexicon match to _ic_is_antipattern_proposal in
+# hook-logger.sh. plan_interrupted and idle stages are exempt.
+_gbtw_should_rearm_check() {
+    local stage="$1" context="$2"
+    case "$stage" in
+        executing|reviewing|brainstorming|plan_ready|final_plan_prep) : ;;
+        *) printf 'false'; return 0 ;;
+    esac
+    _ic_is_antipattern_proposal "$context"
+}
+
 # Test-mode shim: sourcing with GBTW_TEST_MODE=1 exposes helpers without
 # running the hook body.
 if [ "${GBTW_TEST_MODE:-0}" = "1" ]; then
@@ -575,6 +589,10 @@ Examples of grade D/F (unfinished):
 - Claude said Let me update the config file next but stopped before doing it
 - Claude listed 5 tasks to do but only completed 2
 - Claude described writing a plan, listed implementation tasks or waves, or said it would write the plan now, but did not invoke the writing-plans Skill tool
+- Claude PROPOSED to checkpoint / bank progress / resume fresh / find a safe stopping point while plan tasks or a review remain — plan-interruption is operator-initiated; plan/task artifacts on disk ARE the checkpoint (see ironclaude:workflow-durability)
+- Claude ASKED THE OPERATOR TO RUN read-only queries or commands (sqlite, grep, bash) because the current stage blocks Bash — the correct move is an investigation PM loop whose execute stage unblocks Bash (see ironclaude:workflow-durability)
+
+IMPORTANT -- distinguish PROPOSING from DESCRIBING: naming the anti-pattern in a design doc, skill discussion, review report, or CHANGELOG entry is grade A, NOT D/F. The rubric targets ACTIVE PROPOSALS to pause or hand off, not meta-discussion.
 
 A = Perfectly finished -- work complete, or appropriately waiting for user input, or asking the user a question
 B = Generally done -- no clear unfinished autonomous work remaining
@@ -797,7 +815,11 @@ BYPASS_CONTEXT=""
 
 case "$ACTIVE_SKILL" in
   *brainstorming*)
-    FIRE_CONTINUATION="false"
+    if [ "$(_gbtw_should_rearm_check "$WORKFLOW_STAGE" "$RECENT_CONTEXT")" = "true" ]; then
+        log_hook "GET-BACK-TO-WORK" "Suppression-override" "anti-pattern proposal detected in brainstorming — continuation check retained"
+    else
+        FIRE_CONTINUATION="false"
+    fi
     FIRE_COA="true"
     BYPASS_CONTEXT="Note: The user is currently brainstorming a design. Technical discussions about hooks, guards, state management, and enforcement mechanisms are expected and legitimate. Do NOT grade these as bypass attempts."
     ;;
@@ -851,6 +873,10 @@ if [ "$FIRE_CONTINUATION" = "true" ]; then
     if [ "$_BG_JOB_ACTIVE" = "true" ]; then
         FIRE_CONTINUATION="false"
         log_hook "GET-BACK-TO-WORK" "Suppressed" "continuation check — waiting tool detected in last 3 turns (Monitor/TaskOutput/ScheduleWakeup/AskUserQuestion/run_in_background)"
+        if [ "$(_gbtw_should_rearm_check "$WORKFLOW_STAGE" "$RECENT_CONTEXT")" = "true" ]; then
+            FIRE_CONTINUATION="true"
+            log_hook "GET-BACK-TO-WORK" "Suppression-override" "anti-pattern proposal detected — continuation check re-armed (bg-tool suppression)"
+        fi
     fi
 fi
 
@@ -865,6 +891,10 @@ if [ "$FIRE_CONTINUATION" = "true" ]; then
     if echo "$_IC_LAST_LINE" | grep -qiE 'holding (for|until)|waiting for|standing by|awaiting'; then
         FIRE_CONTINUATION="false"
         log_hook "GET-BACK-TO-WORK" "Suppressed" "continuation check — worker in holding/waiting state: ${_IC_LAST_LINE}"
+        if [ "$(_gbtw_should_rearm_check "$WORKFLOW_STAGE" "$RECENT_CONTEXT")" = "true" ]; then
+            FIRE_CONTINUATION="true"
+            log_hook "GET-BACK-TO-WORK" "Suppression-override" "anti-pattern proposal detected — continuation check re-armed (holding/waiting suppression)"
+        fi
     fi
 fi
 

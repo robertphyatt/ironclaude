@@ -407,7 +407,13 @@ def parse_inbound_command(text: str, registry=None) -> dict:
 
     login_code_match = re.match(r"^LOGIN\s+CODE\s+(\S+)$", text, re.IGNORECASE)
     if login_code_match:
-        return {"type": "login_code", "code": login_code_match.group(1)}
+        raw = login_code_match.group(1)
+        # Device codes observed as base64url-only ([A-Za-z0-9_-]); none of these markers
+        # can appear in a genuine code, so cutting at the earliest one strips clipboard/URL
+        # garbage accidentally appended to a pasted code without risking a false trim.
+        cut_at = [p for p in (raw.find("#"), raw.find("?"), raw.find("http://"), raw.find("https://")) if p != -1]
+        code = raw[:min(cut_at)] if cut_at else raw
+        return {"type": "login_code", "code": code}
 
     if upper == "LOGIN":
         return {"type": "login"}

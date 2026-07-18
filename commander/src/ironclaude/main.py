@@ -695,6 +695,7 @@ class IroncladeDaemon:
         self.plugin_registry = plugin_registry or PluginRegistry()
         self._last_heartbeat = 0.0
         self._last_heartbeat_ts: str | None = None   # Slack ts of the last heartbeat (threads tactical chatter)
+        self._last_brain_context: tuple[str, str] | None = None   # fully delivered top-level (ts, text) eligible for operator-wait links
         self._decisions_dir = os.path.join(config.get("tmp_dir", "/tmp/ic"), "brain-decisions")
         self._ledger_path = os.path.join(config.get("tmp_dir", "/tmp/ic"), "task-ledger.json")
         self._db = db_conn
@@ -1008,11 +1009,15 @@ class IroncladeDaemon:
                 self.slack.flush_queue()   # deliver the notice before execvp discards the in-memory queue (review M5)
                 os.kill(os.getpid(), signal.SIGHUP)   # verify-gated: reached ONLY when status confirmed the account
             elif st == "verify_failed":
-                self.slack.post_message("Signed in, but I couldn't confirm the account after retries — the switch may or may not have completed. Not restarting; send `login` again to be sure. (review I1: no false 'previous account intact' claim.)")
+                self.slack.post_message("Signed in, but I couldn't confirm the account after retries — the switch may or may not have completed. Not restarting; send `login` again to be sure.")
             elif st == "timeout":
                 self.slack.post_message("Sign-in timed out — no change; the previous account is still active.")
             elif st == "error":
                 self.slack.post_message(f"Sign-in didn't complete: {ev.get('detail','')[:300]} — previous account unchanged.")
+            elif st == "waiting":
+                self.slack.post_message("Still completing sign-in…")
+            elif st == "needs_code":
+                self.slack.post_message("Sign-in needs a new code — reply `login code <the-code>` with just the code (no extra text).")
 
     def _handle_directive_confirmation(self, text: str) -> bool:
         """Check if text is a yes/no reply to a pending directive confirmation.
@@ -1496,10 +1501,16 @@ class IroncladeDaemon:
             operator_name = self.config.get("operator_name", "Operator")
             alert_body = f"⏳ *Waiting on {operator_name}:* `{worker_id}` — {_escape_mrkdwn(question) or '(awaiting your reply)'}"
             ts = self.slack.post_message(alert_body)
-            if ts:
-                permalink = self.slack.get_permalink(ts)
-                if permalink:
-                    self.slack.update_message(ts, f"{self.slack.prefix}{alert_body}\nLink: {permalink}")
+            candidate = self._last_brain_context
+            if ts and candidate and worker_id != "brain":
+                context_ts, context_text = candidate
+                worker_token = re.compile(
+                    rf"(?<![A-Za-z0-9_-]){re.escape(worker_id)}(?![A-Za-z0-9_-])"
+                )
+                if worker_token.search(context_text):
+                    permalink = self.slack.get_permalink(context_ts)
+                    if permalink:
+                        self.slack.update_message(ts, f"{self.slack.prefix}{alert_body}\nLink: {permalink}")
         logger.info("operator_wait recorded for %s: %s", worker_id, question[:80])
         return True
 
@@ -1522,6 +1533,8 @@ class IroncladeDaemon:
                 first_ts = ts
             if ts is None:
                 all_ok = False
+        if all_ok and first_ts is not None and thread_ts is None:
+            self._last_brain_context = (first_ts, text)
         return first_ts if all_ok else None
 
     def poll_brain_responses(self):

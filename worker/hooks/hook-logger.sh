@@ -219,6 +219,45 @@ block_pretooluse() {
   exit 2
 }
 
+# Anti-pattern lexicons — proposal framing plus checkpoint actions, matching
+# PROPOSING/ASKING PERMISSION rather than descriptive mentions. See
+# ironclaude:workflow-durability skill.
+_IC_CHECKPOINT_PROPOSAL_FRAME='(shall|should|can|could|may) (we|I)|(would you like|do you want) (me|us) to|let'\''s|let me'
+_IC_CHECKPOINT_ACTION='checkpoint|bank progress|bank the|resume fresh|pause here|find a (safe|natural) stopping point'
+_IC_CHECKPOINT_QUESTION='safe stopping point\?|natural stopping point\?|checkpoint and (resume|continue) fresh'
+_IC_QUERY_OFFLOAD_LEXICON='(you|operator) (run|paste|type|execute) (these|the|those|this) (queries|commands|sqlite|grep|bash)( yourself)?|after a ! and paste|professional mode makes this a you-action|(these|the|those) (queries|commands) (yourself|are (yours|your action))'
+# Meta-discussion prefixes: heading `#`, blockquote `> `, table row `|`, code fence ```
+# NOTE: bare `- ` bullets are NOT meta (option bullets like `- Yes / - No` must not escape).
+_IC_META_DISCUSSION='^[[:space:]]*(#|> |\|)|^```'
+
+# _ic_is_antipattern_proposal MULTI_LINE_TEXT
+# Echoes 'true' if any line matches an anti-pattern lexicon AND is not meta-discussion.
+# Echoes 'false' otherwise. Used by both get-back-to-work-claude.sh and
+# subagent-drift-detector.sh via source-and-call.
+_ic_is_antipattern_proposal() {
+  local text="$1"
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    if printf '%s\n' "$line" | grep -qE "$_IC_META_DISCUSSION"; then
+      continue
+    fi
+    if printf '%s\n' "$line" | grep -qiE "$_IC_QUERY_OFFLOAD_LEXICON"; then
+      printf 'true'
+      return 0
+    fi
+    if printf '%s\n' "$line" | grep -qiE "$_IC_CHECKPOINT_PROPOSAL_FRAME" \
+      && printf '%s\n' "$line" | grep -qiE "$_IC_CHECKPOINT_ACTION"; then
+      printf 'true'
+      return 0
+    fi
+    if printf '%s\n' "$line" | grep -qiE "$_IC_CHECKPOINT_QUESTION"; then
+      printf 'true'
+      return 0
+    fi
+  done <<< "$text"
+  printf 'false'
+}
+
 # block_stop HOOK_NAME REASON
 # Outputs combined JSON for Stop hook blocking
 # Combines systemMessage (for user) with decision (for Claude Code)

@@ -18,8 +18,13 @@ def _pyproject_version() -> str:
     return m.group(1)
 
 
-def _plugin_json_version() -> str:
+def _claude_plugin_json_version() -> str:
     data = json.loads((REPO_ROOT / "worker" / ".claude-plugin" / "plugin.json").read_text())
+    return data["version"]
+
+
+def _codex_plugin_json_version() -> str:
+    data = json.loads((REPO_ROOT / "worker" / ".codex-plugin" / "plugin.json").read_text())
     return data["version"]
 
 
@@ -40,7 +45,8 @@ def _makefile_pinned_version():
 def test_version_sources_match():
     versions = {
         "commander/pyproject.toml": _pyproject_version(),
-        "worker/.claude-plugin/plugin.json": _plugin_json_version(),
+        "worker/.claude-plugin/plugin.json": _claude_plugin_json_version(),
+        "worker/.codex-plugin/plugin.json": _codex_plugin_json_version(),
         ".claude-plugin/marketplace.json": _marketplace_version(),
     }
     makefile_version = _makefile_pinned_version()

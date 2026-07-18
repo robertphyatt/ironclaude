@@ -29,15 +29,20 @@ def test_directive_in_brain_behavioral():
 
 def test_directive_in_activation_skill():
     text = _read("worker/skills/activate-professional-mode/SKILL.md")
-    # assert each of the FIVE distinct edits individually. '9. **Advisor Fallback**'
-    # alone is shared by the compact one-liner AND the full block, so guard them
-    # apart: the compact one-liner via its em-dash form, and the two full-form
-    # blocks (full template + Concept 9) via a bulleted phrase they alone carry.
+    # assert each of the FIVE distinct Advisor-Fallback edits individually.
+    # '9. **Advisor Fallback**' alone is shared by the compact one-liner AND the
+    # full block, so guard them apart: the compact one-liner via its em-dash
+    # form, and the two full-form blocks (full template + Concept 9) via a
+    # bulleted phrase they alone carry.
     assert "**Advisor Fallback** — If the" in text            # compact CLAUDE.md one-liner
     assert text.count("just reason it through") >= 2          # full template block + Concept 9 block
     assert "| 9 | Advisor Fallback |" in text                 # concept-detection table row (propagation vector)
     assert "Concept 9 (Advisor Fallback):" in text            # append-path canonical block header
-    assert "9 concepts" in text                                # count string bumped 8->9
-    assert "(9 principles)" in text                            # count string bumped 8->9
-    assert "9-principle template" in text                      # both 8-principle mentions bumped
+    # v1.0.24 added an 11th concept (Boy Scout Rule) after No Workflow Avoidance Under Stage/Context
+    # Restrictions) — count strings track the whole rule set, not the Advisor
+    # Fallback rule specifically. Kept as pins so a future edit that adds a
+    # concept but forgets to bump the count is caught.
+    assert "11 concepts" in text                               # count string bumped 10 -> 11
+    assert "(11 principles)" in text                           # count string bumped 10 -> 11
+    assert "11-principle template" in text                     # cross-references bumped 10 -> 11
     assert PRIMARY in text and FALLBACK in text                # tier-relative fallback named

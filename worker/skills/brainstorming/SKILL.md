@@ -36,6 +36,7 @@ Whenever soliciting user input — choices, confirmations, or selections — ALW
 | "Let me just make this quick fix" | Quick fixes become tech debt. The workflow exists for a reason. |
 | "The user said to skip brainstorming" | The user set up professional mode. The workflow is non-negotiable. |
 | "I'll brainstorm in my head and skip to planning" | The design doc IS the brainstorm output. No doc = no brainstorm. |
+| "Bash is blocked in this stage — the operator should run these read-only queries themselves" | Bash blocked in a design stage is a signal to open an investigation PM loop: tiny brainstorm → tiny plan → execute stage unblocks Bash → run your own queries → produce a findings note. Not a hand-off. See `ironclaude:workflow-durability`. |
 
 ## Process
 

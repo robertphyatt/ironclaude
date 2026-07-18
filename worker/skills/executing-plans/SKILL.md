@@ -49,6 +49,7 @@ Whenever soliciting user input — choices, confirmations, or selections — ALW
 | "The review will obviously pass" | Reviews catch bugs you don't see. Never skip them. |
 | "I'll fix this other thing while I'm here" | Scope creep. Stick to the current task. |
 | "The next task is simple, let me just do both" | Each task has its own review. Batching skips reviews. |
+| "Context might get long — let me checkpoint / find a safe stopping point" | Plan JSON + MCP task state + workflow_stage on disk ARE the checkpoint. Pauses are operator-initiated via `plan-interruption`. See `ironclaude:workflow-durability`. |
 
 ## Process
 

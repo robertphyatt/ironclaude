@@ -16,8 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/episodic-memory-sync.sh --background",
-            "async": true
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/episodic-memory-sync.sh --background"
           }
         ]
       },

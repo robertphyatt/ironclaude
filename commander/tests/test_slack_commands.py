@@ -345,6 +345,13 @@ def test_parse_login_code_command():
     assert parse_inbound_command("LOGIN CODE xyz789") == {"type": "login_code", "code": "xyz789"}
 
 
+def test_parse_login_code_strips_url_fragment():
+    from ironclaude.slack_interface import parse_inbound_command
+    assert parse_inbound_command("login code abc123#fragment?x=1") == {"type": "login_code", "code": "abc123"}
+    assert parse_inbound_command("login code abc123https://claude.com/cai/oauth/authorize?code=true") == {"type": "login_code", "code": "abc123"}
+    assert parse_inbound_command("LOGIN CODE xyz789") == {"type": "login_code", "code": "xyz789"}
+
+
 def test_parse_login_not_shadowed_by_message():
     from ironclaude.slack_interface import parse_inbound_command
     assert parse_inbound_command("login")["type"] == "login"

@@ -1,0 +1,157 @@
+{
+  "name": "Boy Scout Rule and Hermetic Test Cleanup",
+  "goal": "Add a scope-aware Boy Scout Rule to every IronClaude instruction path, make five restricted-runner tests hermetic, and document direct OpenAI Codex support without implying Commander support.",
+  "design_file": "docs/plans/2026-07-18-boy-scout-rule-and-hermetic-tests-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Propagate and guard the Boy Scout Rule",
+      "description": "Add the scope-aware directive to current, generated, activation, and Brain instruction surfaces with regression guards.",
+      "allowed_files": [
+        "CLAUDE.md",
+        "worker/CLAUDE.md",
+        "commander/CLAUDE.md",
+        ".claude/rules/behavioral.md",
+        "commander/src/ironclaude/templates/worker_claude_md.md",
+        "worker/skills/activate-professional-mode/SKILL.md",
+        "commander/src/brain/rules/behavioral.md",
+        "commander/src/brain/orchestrator_claude.md",
+        "commander/tests/test_boy_scout_directive.py",
+        "commander/tests/test_worker_claude_md_template.py",
+        "commander/tests/test_advisor_fallback_directive.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Create commander/tests/test_boy_scout_directive.py with REPO_ROOT/read helper; exact DIRECTIVE_BODY assertions across CLAUDE.md, worker/CLAUDE.md, commander/CLAUDE.md, .claude/rules/behavioral.md, and worker template; exact COMPACT_DIRECTIVE and DETECTION_ROW; exact BRAIN_FIX_BUGS directive 16, BRAIN_FIX_BEFORE_REPORTING directive 20, and complete BRAIN_DIRECTIVE 24; activation counts 11 concepts/(11 principles)/11-principle template; and stale 18-count rejection. Use four-space child bullets for two-digit directives.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest commander/tests/test_boy_scout_directive.py -q",
+          "expected": "Fails because the directive is absent."
+        },
+        {
+          "description": "Append the exact five-bullet canonical block from Markdown Task 1 Step 2 as directive 10 in CLAUDE.md, 13 in worker/CLAUDE.md, 11 in commander/CLAUDE.md, 12 in .claude/rules/behavioral.md, and 12 in commander/src/ironclaude/templates/worker_claude_md.md.",
+          "expected": "Every direct surface has identical evidence, authorized cleanup, destructive/external permission, blocked/unsafe recording, and YAGNI language."
+        },
+        {
+          "description": "In worker/skills/activate-professional-mode/SKILL.md add exact compact directive 11, exact full canonical directive 11, exact semantic row 11, and exact Concept 11 append block from Markdown Task 1 Step 3; replace the single 10 concepts and (10 principles) strings plus every 10-principle template string with 11 equivalents.",
+          "expected": "All activation propagation vectors are complete and exact."
+        },
+        {
+          "description": "Replace Brain directives 16 and 20 with the exact confirmed-directive and permission boundaries in Markdown Task 1 Step 4; append exact Brain directive 24 including destructive/external and blocked/unsafe branches; replace orchestrator_claude.md's counted behavioral description with the exact count-free description.",
+          "expected": "Brain directives are internally consistent with operator authorization."
+        },
+        {
+          "description": "Rename worker-template inventory test to test_template_contains_all_twelve_directives with the exact 12-item list; update commander/tests/test_advisor_fallback_directive.py count-pin comments and strings from 10 to 11 without changing Advisor Fallback semantics.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest commander/tests/test_boy_scout_directive.py commander/tests/test_worker_claude_md_template.py commander/tests/test_advisor_fallback_directive.py -q",
+          "expected": "All focused propagation tests pass."
+        },
+        {
+          "description": "Stage every Task 1 allowed file.",
+          "command": "git add CLAUDE.md worker/CLAUDE.md commander/CLAUDE.md .claude/rules/behavioral.md commander/src/ironclaude/templates/worker_claude_md.md worker/skills/activate-professional-mode/SKILL.md commander/src/brain/rules/behavioral.md commander/src/brain/orchestrator_claude.md commander/tests/test_boy_scout_directive.py commander/tests/test_worker_claude_md_template.py commander/tests/test_advisor_fallback_directive.py",
+          "expected": "Only Task 1 files are newly staged."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Replace privileged test resources with hermetic seams",
+      "description": "Remove live tmux-server and TCP-listener dependencies while preserving behavior coverage.",
+      "allowed_files": [
+        "commander/tests/test_kill_orphan_workers.py",
+        "commander/tests/test_wiki_server.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Reproduce the five restricted-runner failures before edits.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest commander/tests/test_kill_orphan_workers.py commander/tests/test_wiki_server.py::test_wiki_prefix_no_slash_redirects -q",
+          "expected": "Four tmux Operation not permitted failures and one socket.bind PermissionError."
+        },
+        {
+          "description": "Replace commander/tests/test_kill_orphan_workers.py with a MagicMock(spec=TmuxManager), MagicMock(spec=WorkerRegistry), _dependencies(sessions, registered) returning worker dicts, and four exact tests: unregistered calls list_sessions(prefix='ic-') and kill_session; registered and ic-brain never kill; empty list still asserts prefix request and no kill. Remove subprocess/pytest/DB fixtures entirely.",
+          "expected": "No subprocess, live tmux session, or operator socket access remains."
+        },
+        {
+          "description": "Replace the wiki redirect test with socket.socketpair(); send raw GET /wiki HTTP/1.1 bytes and shutdown client write; construct WikiHandler with SimpleNamespace(server_name='localhost', server_port=80); shutdown handler_socket write after handler returns; recv to EOF; close both sockets in finally; decode iso-8859-1 headers; assert HTTP/1.0 301 prefix and Location: /wiki/ header.",
+          "expected": "Real HTTP 301 and Location behavior without bind/listen or EOF deadlock."
+        },
+        {
+          "description": "Rerun the exact formerly failing five-test selector in the restricted runner.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest commander/tests/test_kill_orphan_workers.py commander/tests/test_wiki_server.py::test_wiki_prefix_no_slash_redirects -q",
+          "expected": "5 passed."
+        },
+        {
+          "description": "Run both complete affected files in the restricted runner.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest commander/tests/test_kill_orphan_workers.py commander/tests/test_wiki_server.py -q",
+          "expected": "7 passed without tmux access, TCP bind, or hang."
+        },
+        {
+          "description": "Stage both Task 2 allowed files.",
+          "command": "git add commander/tests/test_kill_orphan_workers.py commander/tests/test_wiki_server.py",
+          "expected": "Only the two hermetic test files are newly staged."
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Document compatibility and verify the release",
+      "description": "Make the direct OpenAI Codex versus Claude Code-only Commander boundary explicit, document the release changes, and run complete verification.",
+      "allowed_files": ["README.md", "CHANGELOG.md"],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "In README replace headline with '**Workflow discipline and multi-agent orchestration for Claude Code and OpenAI Codex.**'; replace opening lead with 'IronClaude adds workflow discipline to Claude Code and OpenAI Codex, plus multi-session Claude Code orchestration.' while retaining its remaining explanation; change Worker lead to 'A Claude Code and OpenAI Codex plugin...'; add exact Compatibility callout; preserve quick-start heading/anchor; replace quick-start first paragraph with exact OpenAI Codex sentence; add exact two v1.0.24 bullets from the human plan.",
+          "expected": "Compatibility boundary is explicit and existing navigation remains valid."
+        },
+        {
+          "description": "In CHANGELOG replace v1.0.24 summary with the exact sentence in the human plan; add exact Added bullet 'Scope-aware Boy Scout Rule', exact Changed bullet 'Direct OpenAI Codex compatibility is explicit', and exact Fixed bullet 'Restricted-runner tests are hermetic', preserving all existing release entries.",
+          "expected": "Release notes accurately describe the integrated release."
+        },
+        {
+          "description": "Run focused behavioral, version, and affected-file tests.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest commander/tests/test_boy_scout_directive.py commander/tests/test_worker_claude_md_template.py commander/tests/test_advisor_fallback_directive.py commander/tests/test_version_consistency.py commander/tests/test_kill_orphan_workers.py commander/tests/test_wiki_server.py -q",
+          "expected": "All focused tests pass."
+        },
+        {
+          "description": "Validate the Codex plugin manifest.",
+          "command": "python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py worker",
+          "expected": "Plugin validation succeeds."
+        },
+        {
+          "description": "Run all 11 exact hook scripts in one fail-fast loop.",
+          "command": "for script in worker/hooks/test-bg-detection.sh worker/hooks/test-config-guard-integration.sh worker/hooks/test-config-guard.sh worker/hooks/test-guard-security.sh worker/hooks/test-poll-dedup.sh worker/hooks/tests/test-antipattern-lexicon.sh worker/hooks/tests/test-bash-readonly-guard.sh worker/hooks/tests/test-gbtw-antipattern-override.sh worker/hooks/tests/test-gbtw-inflight.sh worker/hooks/tests/test-gbtw-waiting.sh worker/hooks/tests/test-sad-antipattern.sh; do bash \"$script\" || exit 1; done",
+          "expected": "All 11 scripts exit 0."
+        },
+        {
+          "description": "Run the complete Commander suite in the restricted runner.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest commander/tests -q",
+          "expected": "1969 passed, 1 skipped, 0 failed."
+        },
+        {
+          "description": "Stage release documentation.",
+          "command": "git add README.md CHANGELOG.md",
+          "expected": "README.md and CHANGELOG.md are staged."
+        },
+        {
+          "description": "Inspect worktree scope.",
+          "command": "git status --short",
+          "expected": "Only approved files are staged and AGENTS.md remains untracked."
+        },
+        {
+          "description": "Inspect staged file statistics.",
+          "command": "git diff --cached --stat",
+          "expected": "Only approved design, plan, instruction, test, and release files appear."
+        },
+        {
+          "description": "Check staged whitespace.",
+          "command": "git diff --cached --check",
+          "expected": "No output and exit 0."
+        },
+        {
+          "description": "Verify pre-amend history baseline.",
+          "command": "git log --oneline --decorate -2",
+          "expected": "One local v1.0.24 commit sits above origin/main v1.0.23."
+        }
+      ]
+    }
+  ]
+}
