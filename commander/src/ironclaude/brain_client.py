@@ -796,7 +796,6 @@ class BrainClient:
                                 and "opus" not in self._model.lower()
                             ):
                                 raise _ModelUnavailableFromMessage(full_text)
-                            self._response_queue.put(full_text)
                             self._executing_tool = False
                             self._session_log_write(f"MSG_SEND chars={len(full_text)} preview={full_text[:100]!r}")
                             logger.info(f"Brain response received ({len(full_text)} chars)")

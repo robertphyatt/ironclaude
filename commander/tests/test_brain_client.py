@@ -1942,6 +1942,40 @@ class TestModelUnavailableText:
         drained = client.get_pending_responses()
         assert all(unavailable_text not in r for r in drained)
 
+    def test_plain_conversational_text_not_queued_for_slack_relay(self):
+        """Plain AssistantMessage text (no tool call, not model-unavailable
+        signature) must NOT be queued for Slack relay. post_message is the
+        only path that should reach Slack — see
+        docs/plans/2026-07-19-agent-message-hook-slack-filter-design.md."""
+        import asyncio
+        from unittest.mock import patch, MagicMock
+        from claude_agent_sdk import AssistantMessage
+        from claude_agent_sdk.types import TextBlock
+
+        class CapturingOptions:
+            def __init__(self, **kwargs):
+                pass
+
+        conversational_text = "Let me check the logs for d1435 before reporting back."
+
+        async def fake_query(prompt=None, options=None):
+            yield AssistantMessage(content=[TextBlock(text=conversational_text)], model="sonnet")
+
+        client = BrainClient()
+        # Stub the grader so the permission-seeking correction path (still
+        # invoked unconditionally on full_text at line 803, independent of
+        # the queue-push removal) doesn't make a real Ollama HTTP call —
+        # this test only asserts queueing behavior. Same pattern as
+        # TestPermissionSeekingFilter._mk() elsewhere in this file.
+        client._grader = MagicMock()
+        client._grader.grade.return_value = {"permission_seeking": False}
+        with patch("claude_agent_sdk.ClaudeAgentOptions", CapturingOptions), \
+             patch("claude_agent_sdk.query", fake_query):
+            client._episodic_memory_path = "/fake/memory.js"
+            asyncio.run(client._brain_session("my-prompt", None, None))
+
+        assert client.get_pending_responses() == []
+
 
 class TestModelUnavailableFableTransition:
     """Fable-specific fallback side effects: mark_fable_unavailable + optional
