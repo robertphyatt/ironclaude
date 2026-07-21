@@ -1,0 +1,103 @@
+{
+  "name": "Plan-Authoring Fidelity (v1.0.26)",
+  "goal": "Ship v1.0.26 — restore the v1.1 design's plan-parity wording to MP-W10's semantically-identical requirement, add live-source grounding and a review-history prohibition to the plan-authoring skills, and land it on both clients.",
+  "requirements_file": "docs/plans/2026-07-19-multi-provider-v1-1-requirements.md",
+  "design_file": "docs/plans/2026-07-21-plan-authoring-fidelity-design.md",
+  "estimated_memory_gb": 2,
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Amend the v1.1 design to MP-W10 semantic-parity wording",
+      "description": "Restate design lines 106, 107, 108, 303, 417 from byte-parity/canonical-renderer language to MP-W10 semantic-parity, retaining the live-source grounding clause on line 108. No tests required: design prose; correctness checked by Task 6 review and the grep verifications in steps 6-7.",
+      "allowed_files": ["docs/plans/2026-07-19-multi-provider-v1-1-design.md"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Restate line 106 (canonical-PlanJson/duplicated-mirror) to semantic-parity per plan.md Task 1 Step 1"},
+        {"description": "Restate line 107 (deterministic-rendering/byte-parity) to lockstep + parity audit per plan.md Task 1 Step 2"},
+        {"description": "Restate line 108 (strict-schema/byte-parity) to parity audit + live-source grounding, RETAINING the grounding clause, per plan.md Task 1 Step 3"},
+        {"description": "Restate line 303 (Testing Strategy canonical-object bullet) to semantic-parity per plan.md Task 1 Step 4"},
+        {"description": "Restate line 417 (acceptance criterion 19 byte-parity) to semantic-parity per plan.md Task 1 Step 5"},
+        {"description": "Verify no byte-parity language remains", "command": "grep -n 'byte parity' docs/plans/2026-07-19-multi-provider-v1-1-design.md || echo \"OK: no byte-parity language remains\"", "expected": "OK: no byte-parity language remains"},
+        {"description": "Verify no renderer language remains", "command": "grep -n 'deterministic rendering' docs/plans/2026-07-19-multi-provider-v1-1-design.md || echo \"OK: no renderer language remains\"", "expected": "OK: no renderer language remains"},
+        {"description": "Confirm live-source grounding language survived", "command": "grep -c 'live-source grounding' docs/plans/2026-07-19-multi-provider-v1-1-design.md", "expected": "1 or higher"},
+        {"description": "Stage changes (docs/ is gitignored per .gitignore:24 and this design doc is untracked, so -f is required or git add errors non-zero)", "command": "git add -f docs/plans/2026-07-19-multi-provider-v1-1-design.md", "expected": "no output"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Add live-source grounding + review-history prohibition to writing-plans",
+      "description": "Insert a Step 1.6 live-source grounding subsection after Phase 1 Step 1 (SKILL.md:119) and a 'No review history in plan artifacts' Key Principle. No tests required in this task; pinned by Task 4. Verified by grep in steps 3-4.",
+      "allowed_files": ["worker/skills/writing-plans/SKILL.md"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Add Step 1.6 grounding subsection after the requirements_file paragraph per plan.md Task 2 Step 1"},
+        {"description": "Add 'No review history in plan artifacts' bullet to Key Principles per plan.md Task 2 Step 2"},
+        {"description": "Verify grounding language landed", "command": "grep -c 'Ground every plan fact in live source' worker/skills/writing-plans/SKILL.md", "expected": "1"},
+        {"description": "Verify verified-rather-than-inferred phrase landed", "command": "grep -c 'verified rather than inferred' worker/skills/writing-plans/SKILL.md", "expected": "1 or higher"},
+        {"description": "Verify prohibition language landed", "command": "grep -c 'No review history in plan artifacts' worker/skills/writing-plans/SKILL.md", "expected": "1"},
+        {"description": "Stage changes", "command": "git add worker/skills/writing-plans/SKILL.md", "expected": "no output"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Mirror the review-history prohibition into executing-plans regeneration",
+      "description": "Append a no-history sentence to the step-8 plan-only-defect paragraph at executing-plans SKILL.md:277-280. No tests required in this task; pinned by Task 4. Verified by grep in steps 2-3.",
+      "allowed_files": ["worker/skills/executing-plans/SKILL.md"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Append the no-prior-review-content sentence to the step-8 plan-only-defect bullet per plan.md Task 3 Step 1"},
+        {"description": "Verify the mirror landed", "command": "grep -c 'carries no prior-review content forward' worker/skills/executing-plans/SKILL.md", "expected": "1"},
+        {"description": "Confirm the existing create_plan instruction is intact", "command": "grep -c 'RE-CALL' worker/skills/executing-plans/SKILL.md", "expected": "1"},
+        {"description": "Stage changes", "command": "git add worker/skills/executing-plans/SKILL.md", "expected": "no output"}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Add skill-contract tests pinning grounding, prohibition, and regeneration mirror",
+      "description": "Append phrase-assertion tests to both skill-contract suites using the existing _skill_text()/_read() helpers. Tests are GREEN on first run because Tasks 2-3 added the asserted content; they serve as regression pins. Task 6 confirms each assertion maps to a real added line so they are not vacuous.",
+      "allowed_files": ["commander/tests/test_writing_plans_skill.py", "commander/tests/test_executing_plans_skill.py"],
+      "depends_on": [2, 3],
+      "steps": [
+        {"description": "Add three tests to test_writing_plans_skill.py per plan.md Task 4 Step 1: test_writing_plans_requires_live_source_grounding, test_writing_plans_forbids_review_history_in_plan_artifacts, and test_writing_plans_does_not_instruct_recording_review_rounds (the design Testing Strategy item-3 negative assertion, pinning that the 'regression obligations retained' and 'reviewer-driven correction' antipattern headers never appear — both absent from the prohibition bullet so the asserts are non-tautological)"},
+        {"description": "Add test_executing_plans_regeneration_carries_no_review_history to test_executing_plans_skill.py per plan.md Task 4 Step 2 (4th new test overall)"},
+        {"description": "Run the two suites GREEN (tests are regression pins, not RED-first, because the skill edits already landed in Tasks 2-3)", "command": "commander/.venv/bin/python -m pytest commander/tests/test_writing_plans_skill.py commander/tests/test_executing_plans_skill.py -q", "expected": "all pass (existing + 4 new)"},
+        {"description": "Stage changes", "command": "git add commander/tests/test_writing_plans_skill.py commander/tests/test_executing_plans_skill.py", "expected": "no output"}
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Version bump (four files) + CHANGELOG",
+      "description": "Bump to 1.0.26 in the four files test_version_consistency.py requires to agree, generating a fresh cachebuster at execution time, and add a CHANGELOG entry. No tests required: metadata; test_version_consistency.py is the gate.",
+      "allowed_files": ["commander/pyproject.toml", "worker/.claude-plugin/plugin.json", ".claude-plugin/marketplace.json", "worker/.codex-plugin/plugin.json", "CHANGELOG.md", "Makefile"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Confirm whether the Makefile is a fifth version site", "command": "grep -nE 'ironclaude/ironclaude/[0-9]+\\.[0-9]+\\.[0-9]+' Makefile || echo \"OK: Makefile has no hardcoded version\"", "expected": "OK: Makefile has no hardcoded version"},
+        {"description": "Bump commander/pyproject.toml line 4 to version = \"1.0.26\""},
+        {"description": "Bump worker/.claude-plugin/plugin.json line 3 to \"version\": \"1.0.26\","},
+        {"description": "Bump .claude-plugin/marketplace.json plugins[0] version to 1.0.26"},
+        {"description": "Generate a fresh cachebuster at execution time", "command": "date -u +%Y%m%d%H%M%S", "expected": "a 14-digit UTC timestamp strictly greater than 20260721191336"},
+        {"description": "Bump worker/.codex-plugin/plugin.json line 3 to \"version\": \"1.0.26+codex.<CACHEBUSTER>\" using the generated value"},
+        {"description": "Verify all version sources agree", "command": "cd commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_version_consistency.py -v", "expected": "PASS"},
+        {"description": "Update CHANGELOG.md: rename [Unreleased] to '## 1.0.26: plan-authoring fidelity' with the Fixed entry, add fresh ## [Unreleased] above, preserve 1.0.25 and below exactly", "expected": "CHANGELOG head shows fresh empty [Unreleased], then the 1.0.26 section, then the unchanged 1.0.25 section"},
+        {"description": "Stage changes", "command": "git add commander/pyproject.toml worker/.claude-plugin/plugin.json .claude-plugin/marketplace.json worker/.codex-plugin/plugin.json CHANGELOG.md", "expected": "no output"}
+      ]
+    },
+    {
+      "id": 6,
+      "name": "Full regression gates, final staging, dual-client ship runbook",
+      "description": "Run every existing suite to confirm no regressions, confirm dist needs no rebuild, stage plan and design docs with -f, and present the operator-gated dual-client ship runbook with a both-caches verification gate. No tests required: runs existing suites and stages; authors no new behavior.",
+      "allowed_files": ["docs/plans/2026-07-21-plan-authoring-fidelity.md", "docs/plans/2026-07-21-plan-authoring-fidelity-design.md", "docs/plans/2026-07-21-plan-authoring-fidelity.plan.json"],
+      "depends_on": [1, 2, 3, 4, 5],
+      "steps": [
+        {"description": "Skill-contract + version + preflight gates", "command": "cd commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_writing_plans_skill.py tests/test_executing_plans_skill.py tests/test_version_consistency.py tests/test_workflow_transition_preflight.py -v", "expected": "all pass"},
+        {"description": "Commander full suite", "command": "make -C commander test", "expected": "exactly 2007 passed (2003 baseline + 4 new tests from Task 4), 0 failed"},
+        {"description": "state-manager full suite", "command": "cd worker/mcp-servers/state-manager && npx vitest run", "expected": "134 passed, 0 failed"},
+        {"description": "Hook suite", "command": "bash worker/hooks/tests/test-workflow-transition-idempotency.sh", "expected": "44 pass, 0 fail"},
+        {"description": "Confirm no dist rebuild needed", "command": "git diff --staged --name-only | grep 'state-manager/dist' || echo \"OK: dist untouched — no rebuild\"", "expected": "OK: dist untouched — no rebuild"},
+        {"description": "Review the complete staged set", "command": "git status --short", "expected": "only intended files staged; nothing unstaged in worker/skills, commander/tests, version files, or the amended design"},
+        {"description": "Stage plan and design docs (docs/ gitignored — requires -f)", "command": "git add -f docs/plans/2026-07-21-plan-authoring-fidelity-design.md docs/plans/2026-07-21-plan-authoring-fidelity.md docs/plans/2026-07-21-plan-authoring-fidelity.plan.json", "expected": "no output"},
+        {"description": "Present the dual-client ship runbook to the operator per plan.md Task 6 Step 8, including the both-caches grep verification gate. Execution ends here; commit, push, and install are operator-gated."}
+      ]
+    }
+  ]
+}

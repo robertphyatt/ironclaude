@@ -277,7 +277,11 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    - Plan-only defects: regenerate one coherent human/machine plan candidate from
      the unchanged requirements and approved design. Do not apply a patch list.
      Re-stage and **RE-CALL `create_plan` with the revised plan JSON** so the MCP
-     reloads `session.plan_json` and rebuilds `wave_tasks`.
+     reloads `session.plan_json` and rebuilds `wave_tasks`. The regenerated plan
+     carries no prior-review content forward — no findings, verdicts, fix rationale,
+     drift audit, or round-by-round table. That content stays in workflow-private
+     state (`tier_up_reviews`, `retreat` reasons); a plan that embeds it breaks the
+     next blind review (MP-W02).
 9. Dispatch a BRAND-NEW blind reviewer against the current four artifacts. Never
    pass earlier findings, repair rationale, a diff, revision history, or reviewer
    identity. Repeat only while current evidence identifies a material defect; there

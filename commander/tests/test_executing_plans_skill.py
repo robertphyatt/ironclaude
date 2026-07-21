@@ -155,3 +155,8 @@ def test_roadmap_names_wave_1r_and_removes_unconditional_new_task_boundary():
     assert "reopen the same" in roadmap
     assert "opening a new task" not in roadmap
     assert "runtime fingerprint" in roadmap and "changed:true" in roadmap
+
+
+def test_executing_plans_regeneration_carries_no_review_history():
+    text = _read().lower()
+    assert "carries no prior-review content forward" in text

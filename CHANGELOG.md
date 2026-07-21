@@ -13,6 +13,12 @@
 
 _Nothing yet._
 
+## 1.0.26: plan-authoring fidelity
+
+### Fixed
+
+- **Plan-authoring fidelity.** A v1.1.0 blind review surfaced two fidelity defects no plan revision could repair: the human plan embedded six rounds of prior-review history (breaking blind review — MP-W02/MP-R07, confirmed empirically when a fresh reviewer reported receiving those rounds through the plan), and the plan pair failed a canonical-PlanJson/byte-parity contract. Investigation showed the operator requirement MP-W10 asks only for "semantically identical" human and machine plans; the v1.1 design had unilaterally escalated that to byte parity with a deterministic renderer, contradicting the already-shipped anti-flailing design's explicit "instruction-and-test contract, not a new renderer" decision. This release restores the v1.1 design's parity wording to the requirement, adds a live-source grounding step to `writing-plans` (every asserted file, symbol, signature, column, key, and command is verified against current source before it is written — the missing half of MP-W10 that produced two fabricated-symbol defects during v1.0.25 authoring), and prohibits plan artifacts from containing review history in both `writing-plans` and the `executing-plans` regeneration path. Instruction-and-test only: no renderer, no MCP tool, no schema change, no `dist` rebuild.
+
 ## 1.0.25: plan-review verdict calibration
 
 Fixes a plan-review loop that could not terminate, and completes a working set whose staged subset would not have compiled.

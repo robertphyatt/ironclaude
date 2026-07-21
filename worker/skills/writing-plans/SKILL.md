@@ -118,6 +118,19 @@ requirements. Record this path as `requirements_file` in the human plan and mach
 plan; a professional blind review must evaluate original requirements, not only the
 author's design interpretation.
 
+### Step 1.6: Ground every plan fact in live source (REQUIRED)
+
+Before writing any task, inspect the current implementation, tests, schemas, and
+call sites that constrain it. Every file path, function name, signature, DB column,
+config key, and command the plan asserts MUST be verified against current source —
+read it, do not infer it from design prose, an earlier plan, or a summary. A
+symbol you did not open does not exist for planning purposes. Speculative
+replacement snippets are not implementation authority; any indispensable code
+fragment must be derived from and checked against the current source contract.
+
+This is verified rather than inferred: if a plan names `foo()` at `bar.py:42`, open
+`bar.py:42` and confirm `foo` is there with the signature the plan assumes.
+
 ### Phase 2: Break Down Into Tasks
 
 **Step 2: Identify major components**
@@ -400,3 +413,4 @@ Invoke executing-plans skill:
 - **TDD cycle**: Write test → run to fail → implement → run to pass → stage
 - **Professional mode aware**: All steps use "git add" to stage, never commit
 - **Explicit skill invocation**: Use Skill tool for executing-plans
+- **No review history in plan artifacts**: A plan (human or machine) MUST NOT contain prior-review findings, verdicts, fix rationale, reviewer-drift audits, or round-by-round obligation tables. Because the human plan is a mandatory blind-reviewer input, any such content reaches the reviewer and breaks blind review (MP-W02, MP-R07). This content already has durable homes — `tier_up_reviews` rows, `retreat` reasons, and workflow-private session state. Never record it in the plan.
