@@ -1,0 +1,94 @@
+{
+  "name": "Plan-Review Verdict Calibration + Working-Tree Completion (v1.0.25)",
+  "goal": "Ship v1.0.25 — recalibrate the tier-up reviewer prompt so SOLID is reachable and nitpicks stop blocking execution, complete an incomplete staged commit that would otherwise crash the MCP server for Claude users, and land the result on both the Codex and Claude installs.",
+  "design_file": "docs/plans/2026-07-21-review-verdict-calibration-design.md",
+  "requirements_file": "docs/plans/2026-07-21-review-verdict-calibration-design.md",
+  "estimated_memory_gb": 2,
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Complete the staged set (fix broken-commit hazard)",
+      "description": "git add seven ship-together files whose staged/unstaged split currently produces a commit that does not compile and an MCP server that dies at startup for Claude users. session-identity.ts is untracked but imported by four staged modules; db.ts is unstaged but its getLatestTierUpReview() is imported by staged write-tools.ts; worker/.mcp.json is unstaged but supplies IRONCLAUDE_CLIENT=claude which the new index.ts requires at module load. No tests required: the action changes no file content; correctness is proven by the tsc --noEmit and vitest gates in steps 3-4.",
+      "allowed_files": [
+        "worker/mcp-servers/state-manager/src/session-identity.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/session-identity.test.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/tool-dispatch.test.ts",
+        "worker/mcp-servers/state-manager/src/db.ts",
+        "worker/mcp-servers/state-manager/src/tools/write-tools.tier-up.test.ts",
+        "worker/.mcp.json",
+        "commander/tests/test_writing_plans_skill.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Confirm the hazard exists before fixing it", "command": "git status --short worker/mcp-servers/state-manager/src/session-identity.ts worker/mcp-servers/state-manager/src/db.ts worker/.mcp.json", "expected": "session-identity.ts shows ?? (untracked); db.ts and worker/.mcp.json show unstaged M in column 2"},
+        {"description": "Stage the seven ship-together files per plan.md Task 1 Step 2", "command": "git add worker/mcp-servers/state-manager/src/session-identity.ts worker/mcp-servers/state-manager/src/__tests__/session-identity.test.ts worker/mcp-servers/state-manager/src/__tests__/tool-dispatch.test.ts worker/mcp-servers/state-manager/src/db.ts worker/mcp-servers/state-manager/src/tools/write-tools.tier-up.test.ts worker/.mcp.json commander/tests/test_writing_plans_skill.py", "expected": "no output"},
+        {"description": "Verify the staged tree compiles", "command": "cd worker/mcp-servers/state-manager && npx tsc --noEmit", "expected": "no output, exit 0"},
+        {"description": "Verify state-manager tests still pass", "command": "cd worker/mcp-servers/state-manager && npx vitest run", "expected": "134 passed, 0 failed"},
+        {"description": "Confirm no state-manager sources remain unstaged", "command": "git status --short | grep -E '^\\?\\?|^ M' | grep -E 'state-manager/src|worker/\\.mcp\\.json' || echo \"CLEAN: no unstaged state-manager sources\"", "expected": "CLEAN: no unstaged state-manager sources"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Recalibrate the reviewer prompt",
+      "description": "Replace the fenced reviewer-prompt body in worker/skills/executing-plans/SKILL.md with a version carrying an explicit MATERIAL decision test, a mechanical verdict rubric (SOLID = zero material findings), a latent-defect hunt naming five failure archetypes, and a capped non-blocking Observations bucket. Remove the open-ended 'Hidden risks, ambiguities' nitpick license and the undefined Minor tier. Append one coherence sentence to orchestration step 6 so step 9's existing 'material defect' language refers to a standard the reviewer has actually been given. No new tests required: skill-contract document, constrained by two existing suites run as gates in step 4.",
+      "allowed_files": [
+        "worker/skills/executing-plans/SKILL.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Read SKILL.md lines 170-220 and confirm the anchor text matches what plan.md Task 2 Step 1 expects; STOP and report if it differs"},
+        {"description": "Replace the text between the fences with the new prompt body per plan.md Task 2 Step 2 (three-space indentation is load-bearing; leave both fences in place)"},
+        {"description": "Append the MATERIAL coherence sentence to orchestration step 6 per plan.md Task 2 Step 3"},
+        {"description": "Run the skill-contract gates", "command": "cd commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_executing_plans_skill.py tests/test_workflow_transition_preflight.py -v", "expected": "all pass — required phrases, requirements/design/plan ordering, and preflight windows intact"},
+        {"description": "Verify intended content landed and the nitpick license is gone (|| true on each grep — a zero count exits 1, which must not read as step failure)", "command": "grep -c 'MATERIAL' worker/skills/executing-plans/SKILL.md || true; grep -c 'Observations (non-blocking)' worker/skills/executing-plans/SKILL.md || true; grep -c 'Hidden risks, ambiguities' worker/skills/executing-plans/SKILL.md || true", "expected": "three numbers in order: MATERIAL >= 5, Observations (non-blocking) = 1, Hidden risks = 0"},
+        {"description": "Stage changes", "command": "git add worker/skills/executing-plans/SKILL.md", "expected": "no output"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Version bump (four files) + CHANGELOG",
+      "description": "Bump to 1.0.25 in all four files test_version_consistency.py requires to agree, generating a fresh cachebuster at execution time rather than shipping a hardcoded example. Verify first whether the Makefile is still a fifth version site (it was in v1.0.6 and v1.0.12; investigation indicates it now derives the version at runtime). Add the CHANGELOG entry following repo convention: rename [Unreleased] to the version heading and add a fresh empty [Unreleased] above. No tests required: version strings and release notes are metadata; test_version_consistency.py is the gate.",
+      "allowed_files": [
+        "commander/pyproject.toml",
+        "worker/.claude-plugin/plugin.json",
+        ".claude-plugin/marketplace.json",
+        "worker/.codex-plugin/plugin.json",
+        "CHANGELOG.md",
+        "Makefile"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Confirm whether the Makefile is a fifth version site", "command": "grep -nE 'ironclaude/ironclaude/[0-9]+\\.[0-9]+\\.[0-9]+' Makefile || echo \"OK: Makefile has no hardcoded version\"", "expected": "OK: Makefile has no hardcoded version — if a version IS found, bump it too and note the deviation"},
+        {"description": "Bump commander/pyproject.toml line 4 from version = \"1.0.24\" to version = \"1.0.25\""},
+        {"description": "Bump worker/.claude-plugin/plugin.json line 3 to \"version\": \"1.0.25\","},
+        {"description": "Bump .claude-plugin/marketplace.json plugins[0] version to 1.0.25 (ironclaude entry only)"},
+        {"description": "Generate a fresh cachebuster at execution time", "command": "date -u +%Y%m%d%H%M%S", "expected": "a 14-digit UTC timestamp matching [a-z0-9-]+"},
+        {"description": "Bump worker/.codex-plugin/plugin.json line 3 to \"version\": \"1.0.25+codex.<CACHEBUSTER>\", using the value from the previous step"},
+        {"description": "Verify all version sources agree", "command": "cd commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_version_consistency.py -v", "expected": "PASS — a failure lists the mismatching sources"},
+        {"description": "Update CHANGELOG.md per plan.md Task 3 Step 8: rename [Unreleased] to '## 1.0.25: plan-review verdict calibration' with Fixed and Changed entries, add fresh ## [Unreleased] with _Nothing yet._ above, preserve 1.0.24 and below exactly"},
+        {"description": "Stage changes", "command": "git add commander/pyproject.toml worker/.claude-plugin/plugin.json .claude-plugin/marketplace.json worker/.codex-plugin/plugin.json CHANGELOG.md", "expected": "no output"}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Full regression gates, final staging, dual-client ship runbook",
+      "description": "Run every existing suite to confirm no regressions, confirm dist/ needs no rebuild (this release changes no non-test src/*.ts), stage plan and design docs with -f since docs/ is gitignored, and present the operator-gated dual-client ship runbook including the both-caches verification gate. No tests required: this task runs existing suites and stages; it authors no new behavior.",
+      "allowed_files": [
+        "docs/plans/2026-07-21-review-verdict-calibration.md",
+        "docs/plans/2026-07-21-review-verdict-calibration-design.md",
+        "docs/plans/2026-07-21-review-verdict-calibration.plan.json",
+        "worker/mcp-servers/state-manager/dist/index.js"
+      ],
+      "depends_on": [1, 2, 3],
+      "steps": [
+        {"description": "Commander full suite", "command": "make -C commander test", "expected": "2003 passed, 0 failed (this plan adds no test cases; any deviation from 2003 is a regression to investigate)"},
+        {"description": "state-manager full suite", "command": "cd worker/mcp-servers/state-manager && npx vitest run", "expected": "134 passed, 0 failed"},
+        {"description": "Hook suite", "command": "bash worker/hooks/tests/test-workflow-transition-idempotency.sh", "expected": "44 pass, 0 fail"},
+        {"description": "Verify dist/index.js was built from the current src. This plan edits no src/*.ts, but the staged release diff legitimately contains six pre-existing non-test src files, so a diff-based proxy cannot answer this. Test the property directly using two symbols verified by reading the source: captureRuntimeFingerprintFromPaths (runtime-fingerprint.ts:44) and getLatestTierUpReview (imported at write-tools.ts:39). The bundle is non-minified esbuild, so identifiers survive.", "command": "grep -c 'captureRuntimeFingerprintFromPaths' worker/mcp-servers/state-manager/dist/index.js || true; grep -c 'getLatestTierUpReview' worker/mcp-servers/state-manager/dist/index.js || true", "expected": "both counts >= 1, proving dist was built from the current tree"}, {"description": "CONDITIONAL — only if either count in the previous step was 0: rebuild the stale bundle, stage it, then RE-RUN the same greps and confirm both are now >= 1 before continuing. Do not proceed on an unverified rebuild.", "command": "cd worker/mcp-servers/state-manager && npm run build && cd - && git add worker/mcp-servers/state-manager/dist/index.js && grep -c 'captureRuntimeFingerprintFromPaths' worker/mcp-servers/state-manager/dist/index.js && grep -c 'getLatestTierUpReview' worker/mcp-servers/state-manager/dist/index.js", "expected": "SKIP this step entirely if the previous step already showed both counts >= 1. If run: both re-verified counts >= 1"},
+        {"description": "Review the complete staged set", "command": "git status --short && git diff --staged --stat", "expected": "every intended file staged; no unstaged modifications to state-manager/src, worker/skills, or version files"},
+        {"description": "Stage plan and design docs (docs/ is gitignored — requires -f)", "command": "git add -f docs/plans/2026-07-21-review-verdict-calibration-design.md docs/plans/2026-07-21-review-verdict-calibration.md docs/plans/2026-07-21-review-verdict-calibration.plan.json", "expected": "no output"},
+        {"description": "Present the dual-client ship runbook to the operator per plan.md Task 4 Step 7, including the both-caches grep verification gate. Execution ends here; commit and push are operator-gated."}
+      ]
+    }
+  ]
+}

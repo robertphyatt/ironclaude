@@ -690,6 +690,17 @@ export function getTierUpReviewByHash(
   return db.prepare(`
     SELECT * FROM tier_up_reviews
     WHERE terminal_session = ? AND plan_hash = ?
-    ORDER BY created_at DESC LIMIT 1
+    ORDER BY id DESC LIMIT 1
   `).get(sessionId, planHash) as TierUpReviewEntry | undefined;
+}
+
+export function getLatestTierUpReview(
+  db: Database.Database,
+  sessionId: string,
+): TierUpReviewEntry | undefined {
+  return db.prepare(`
+    SELECT * FROM tier_up_reviews
+    WHERE terminal_session = ?
+    ORDER BY id DESC LIMIT 1
+  `).get(sessionId) as TierUpReviewEntry | undefined;
 }

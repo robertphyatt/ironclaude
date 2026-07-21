@@ -13,6 +13,18 @@
 
 _Nothing yet._
 
+## 1.0.25: plan-review verdict calibration
+
+Fixes a plan-review loop that could not terminate, and completes a working set whose staged subset would not have compiled.
+
+### Fixed
+
+- **Plan-review verdict calibration.** The tier-up plan review could not converge: one recorded session made 15 `submit_tier_up_review` calls including a run of 8 consecutive `HAS-ISSUES` without ever reaching `SOLID`, and reviewers routinely described a plan as "largely SOLID" while scoring it `HAS-ISSUES` anyway. Three defects in the reviewer prompt caused it — `SOLID` was never defined, a `Minor` severity tier had no stated effect on the verdict, and an open-ended "hidden risks, ambiguities, or edge cases" criterion licensed unbounded nitpicking. A materiality standard already existed but lived in the orchestrator's instructions where the reviewer never saw it, while `start_execution` gates on the verdict — so the standard was structurally unable to take effect. The reviewer prompt now carries an explicit MATERIAL decision test, a mechanical verdict rubric (`SOLID` = zero material findings; "no material defect found", not "nothing could be improved"), a latent-defect hunt naming five failure archetypes, and a capped `Observations` section where non-material findings land without touching the verdict. The orchestrator's `HAS-ISSUES` handling now applies the same test, making its pre-existing "repeat only while evidence identifies a material defect" rule coherent for the first time. This fix is prompt-only: it required no change to verdict values, the MCP schema, or the compiled bundle.
+
+### Changed
+
+- Completed the state-manager working set so the committed tree compiles and starts. `src/session-identity.ts` (value-imported by `index.ts`, plus three type importers), `src/db.ts` (`getLatestTierUpReview`, called from `write-tools.ts`), and `worker/.mcp.json` (`IRONCLAUDE_CLIENT=claude`, read at MCP module load and fatal when unset) now ship together with the already-tracked code that depends on them. Previously these sat outside the index while their consumers were staged.
+
 ## 1.0.24: workflow durability, Codex compatibility, and Commander hardening
 
 Teaches the Worker that plan/design/task-state artifacts on disk are already durable, adds native direct-mode OpenAI Codex packaging, introduces scope-aware Boy Scout cleanup guidance, makes restricted-runner tests hermetic, and hardens Commander Slack interactions around account switching and operator-decision links.

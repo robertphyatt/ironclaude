@@ -1,6 +1,6 @@
 {
   "name": "ironclaude",
-  "version": "1.0.24",
+  "version": "1.0.25+codex.20260721191336",
   "description": "Ironclad workflow discipline for Codex and Claude Code \u2014 professional mode, systematic planning, and multi-session orchestration",
   "author": {
     "name": "Robert Hyatt",
@@ -30,7 +30,9 @@
         "./mcp-servers/state-manager/cli/mcp-server-wrapper.js"
       ],
       "cwd": ".",
-      "env": {}
+      "env": {
+        "IRONCLAUDE_CLIENT": "codex"
+      }
     }
   },
   "interface": {

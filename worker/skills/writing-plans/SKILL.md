@@ -32,6 +32,19 @@ not to start implementing it. The executing-plans skill handles implementation.
 | "Let me test if this approach works first" | That's prototyping, not planning. Design validates approach. |
 | "This task is too small for a full plan" | Small tasks get the same plan structure. No exceptions. |
 
+## Mandatory Direct Transition Preflight
+
+Before every direct workflow-transition MCP call:
+
+1. Call `get_resume_state` and validate that its session identity is the
+   provider-native root session for the active task. Missing or mismatched
+   identity: fail closed; stop and report the mismatch.
+2. Compare its current workflow stage to the requested target. On an
+   equal-target result, skip the transition call and preserve all state.
+3. Make one different-target call only and require returned `changed:true`. If the
+   call errors or returns unexpected `changed:false`, stop and report it; do not
+   retry without a fresh `get_resume_state` read. No blind retry.
+
 ## Process
 
 **Announce professional mode status:**
@@ -99,6 +112,12 @@ Read the design document completely to understand:
 - Data flow
 - Testing strategy
 
+Identify the operator-approved requirements artifact used to approve the design.
+If none exists, STOP and return to brainstorming to document and approve the
+requirements. Record this path as `requirements_file` in the human plan and machine
+plan; a professional blind review must evaluate original requirements, not only the
+author's design interpretation.
+
 ### Phase 2: Break Down Into Tasks
 
 **Step 2: Identify major components**
@@ -163,6 +182,8 @@ Save to `docs/plans/YYYY-MM-DD-<feature-name>.md`:
 
 **Goal:** [One sentence describing what this builds]
 
+**Requirements:** [Path to operator-approved requirements artifact]
+
 **Architecture:** [2-3 sentences about approach from design]
 
 **Tech Stack:** [Key technologies/libraries]
@@ -224,6 +245,7 @@ The JSON must follow this exact schema:
 {
   "name": "Feature Name",
   "goal": "One sentence describing what this builds",
+  "requirements_file": "docs/plans/YYYY-MM-DD-requirements.md",
   "design_file": "docs/plans/YYYY-MM-DD-<feature-name>-design.md",
   "tasks": [
     {
@@ -249,6 +271,8 @@ Rules:
 - `depends_on` references other task IDs (must exist, no circular deps)
 - `allowed_files` must be exact paths (no globs) — these are the only files the MCP will permit editing during that task
 - The JSON is the source of truth for the MCP server; the markdown is for human review
+- `requirements_file` must name the same operator-approved requirements artifact
+  shown in the human plan
 - The MCP validates schema, dependency integrity, and cycle-freedom before accepting
 
 Stage the JSON file alongside the markdown:
@@ -256,9 +280,26 @@ Stage the JSON file alongside the markdown:
 git add docs/plans/YYYY-MM-DD-<feature-name>.plan.json
 ```
 
-**Step 5.6: Signal plan files written**
+**Step 5.6: Requirements → design → plan parity audit**
 
-Call MCP `mcp__plugin_ironclaude_state-manager__mark_plan_ready` to transition the session to `plan_ready`. The statusline will show orange "plan_ready" until executing-plans is invoked.
+Before calling `mark_plan_ready`, audit the complete plan as one coherent candidate.
+Verify the human and machine plans express the same:
+- operator requirements and design coverage;
+- task IDs and `depends_on` relationships;
+- exact `allowed_files` lists;
+- ordered steps and commands;
+- tests and expected results.
+
+If any item differs or any requirement/design decision is missing, regenerate the
+plan coherently before proceeding. Do not patch one representation independently.
+
+**Step 5.7: Signal plan files written**
+
+Run Mandatory Direct Transition Preflight for target `plan_ready`. Only after a
+different-target result, call MCP
+`mcp__plugin_ironclaude_state-manager__mark_plan_ready` once to transition the
+session to `plan_ready`. The statusline will show orange "plan_ready" until
+executing-plans is invoked.
 
 If `mcp__plugin_ironclaude_state-manager__mark_plan_ready` returns an error (wrong stage), display the error to the user. Do NOT proceed to Phase 5 until it succeeds.
 

@@ -11,46 +11,23 @@
 
 import type Database from 'better-sqlite3';
 import type { Session, WaveTask, PlanJson } from '../types.js';
+import type { SessionIdentity } from '../session-identity.js';
+import {
+  verifyRuntimeActivation,
+  type RuntimeFingerprintCapture,
+  type RuntimeFingerprintExpectation,
+} from '../runtime-fingerprint.js';
 import { getSession, getWaveTasks, getPlanHistory, isDesignConsumed } from '../db.js';
 import { canTransitionTo } from '../state-machine.js';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
 
-// ---------------------------------------------------------------------------
-// Session ID management
-// ---------------------------------------------------------------------------
-
-let _currentSessionId: string | null = null;
-
-export function setCurrentSession(sessionId: string): void {
-  _currentSessionId = sessionId;
-}
-
-let _sessionBindingSource: 'env' | 'ppid_file' | 'none' = 'none';
-
-export function setSessionBindingSource(source: 'env' | 'ppid_file' | 'none'): void {
-  _sessionBindingSource = source;
-}
-
-/**
- * Resolve the session ID to use. Hard-fails if no session ID is available.
- * NEVER falls back to "most recent session" — that silently uses the wrong session.
- */
-function resolveSessionId(db: Database.Database, explicitId?: string): string {
-  if (explicitId) {
-    return explicitId;
+function requireSessionId(sessionId: string): string {
+  if (!sessionId) {
+    throw new Error('Resolved session ID is required before read tool handling');
   }
-  if (_currentSessionId) {
-    return _currentSessionId;
-  }
-
-  throw new Error(
-    'No session ID available. ' +
-    'CLAUDE_SESSION_ID env var not set and no explicit session_id provided. ' +
-    `CLAUDE_SESSION_ID=${process.env.CLAUDE_SESSION_ID || 'unset'}. ` +
-    'Check plugin.json env config and session-init.sh.'
-  );
+  return sessionId;
 }
 
 // ---------------------------------------------------------------------------
@@ -157,15 +134,28 @@ export const readToolDefinitions = [
   {
     name: 'run_diagnostics',
     description:
-      'Run infrastructure health checks. Tests sqlite3 availability, DB existence, WAL mode, session row, read/write/read-back cycle, and audit log. Returns structured results.',
+      'Run infrastructure health checks and report the provider-native startup runtime fingerprint. Optionally verifies exact expected runtime identity.',
     inputSchema: {
       type: 'object' as const,
-      properties: {},
+      properties: {
+        expected_runtime: {
+          type: 'object' as const,
+          properties: {
+            plugin_version: { type: 'string' as const },
+            plugin_root: { type: 'string' as const },
+            manifest_sha256: { type: 'string' as const },
+            bundle_sha256: { type: 'string' as const },
+            client: { type: 'string' as const, enum: ['claude', 'codex'] },
+          },
+          required: ['plugin_version', 'plugin_root', 'manifest_sha256', 'bundle_sha256', 'client'],
+          additionalProperties: false,
+        },
+      },
       required: [] as string[],
       additionalProperties: false,
     },
     annotations: {
-      readOnlyHint: false,
+      readOnlyHint: true,
       destructiveHint: false,
       idempotentHint: true,
     },
@@ -221,8 +211,10 @@ export function handleReadTool(
   args: Record<string, unknown>,
   db: Database.Database,
   sessionId: string,
+  identity?: SessionIdentity,
+  runtimeFingerprint?: RuntimeFingerprintCapture,
 ): { content: Array<{ type: string; text: string }> } {
-  const resolvedId = resolveSessionId(db, sessionId);
+  const resolvedId = requireSessionId(sessionId);
 
   switch (name) {
     // ----- get_plan_status -----
@@ -525,18 +517,15 @@ export function handleReadTool(
     case 'run_diagnostics': {
       const results: Array<{test: string, status: string, detail: string}> = [];
 
-      // Test 0: Session ID bound
-      const envSessionId = process.env.CLAUDE_SESSION_ID ?? null;
-      const boundSessionId = _currentSessionId;
-      if (boundSessionId && !boundSessionId.startsWith('${')) {
-        results.push({ test: 'Session ID bound', status: 'PASS', detail: `source=${_sessionBindingSource}, bound=${boundSessionId}` });
-      } else if (boundSessionId && boundSessionId.startsWith('${')) {
-        results.push({ test: 'Session ID bound', status: 'FAIL', detail: `UNEXPANDED env var: ${boundSessionId}` });
-      } else if (envSessionId) {
-        results.push({ test: 'Session ID bound', status: 'WARN', detail: `source=${_sessionBindingSource}, env set but not bound: ${envSessionId}` });
-      } else {
-        results.push({ test: 'Session ID bound', status: 'FAIL', detail: `source=${_sessionBindingSource}, CLAUDE_SESSION_ID not set and no bound session` });
+      // Test 0: Per-call provider-native identity resolved
+      if (!identity || identity.sessionId !== resolvedId) {
+        throw new Error('Resolved session identity context is required for diagnostics');
       }
+      results.push({
+        test: 'Session identity resolved',
+        status: 'PASS',
+        detail: `client=${identity.client}, session=${identity.sessionId}, source=${identity.source}, invocation=${identity.invocationThreadId ?? 'root'}`,
+      });
 
       // Test 1: DB file exists
       const dbPath = path.join(os.homedir(), '.claude', 'ironclaude.db');
@@ -579,30 +568,48 @@ export function handleReadTool(
         results.push({ test: 'Read workflow_stage', status: 'FAIL', detail: String(e) });
       }
 
-      // Test 6: Write test (harmless timestamp)
+      // Tests 6-8: transactional write/read-back/audit probe. Always emit all
+      // three named checks and roll back, even when an earlier operation fails.
       const diagTs = new Date().toISOString();
+      let savepointActive = false;
       try {
-        const info = db.prepare('UPDATE sessions SET updated_at = ? WHERE terminal_session = ?').run(diagTs, resolvedId);
-        results.push({ test: 'Write test (updated_at)', status: info.changes > 0 ? 'PASS' : 'FAIL', detail: `changes=${info.changes}` });
+        db.exec('SAVEPOINT ironclaude_diagnostics');
+        savepointActive = true;
       } catch (e) {
-        results.push({ test: 'Write test (updated_at)', status: 'FAIL', detail: String(e) });
+        const detail = `Could not open diagnostics savepoint: ${String(e)}`;
+        results.push({ test: 'Write test (updated_at)', status: 'FAIL', detail });
+        results.push({ test: 'Read-back verification', status: 'FAIL', detail });
+        results.push({ test: 'Audit log writable', status: 'FAIL', detail });
       }
 
-      // Test 7: Read-back verification
-      try {
-        const row = db.prepare('SELECT updated_at FROM sessions WHERE terminal_session = ?').get(resolvedId) as {updated_at: string} | undefined;
-        const matches = row?.updated_at === diagTs;
-        results.push({ test: 'Read-back verification', status: matches ? 'PASS' : 'FAIL', detail: `expected=${diagTs}, got=${row?.updated_at}` });
-      } catch (e) {
-        results.push({ test: 'Read-back verification', status: 'FAIL', detail: String(e) });
-      }
+      if (savepointActive) {
+        try {
+          const info = db.prepare('UPDATE sessions SET updated_at = ? WHERE terminal_session = ?').run(diagTs, resolvedId);
+          results.push({ test: 'Write test (updated_at)', status: info.changes > 0 ? 'PASS' : 'FAIL', detail: `changes=${info.changes}` });
+        } catch (e) {
+          results.push({ test: 'Write test (updated_at)', status: 'FAIL', detail: String(e) });
+        }
 
-      // Test 8: Audit log writable
-      try {
-        const info = db.prepare("INSERT INTO audit_log (terminal_session, actor, action, old_value, new_value, context) VALUES (?, ?, ?, ?, ?, ?)").run(resolvedId, 'diagnostics', 'diag_test', null, diagTs, null);
-        results.push({ test: 'Audit log writable', status: info.changes > 0 ? 'PASS' : 'FAIL', detail: `changes=${info.changes}` });
-      } catch (e) {
-        results.push({ test: 'Audit log writable', status: 'FAIL', detail: String(e) });
+        try {
+          const row = db.prepare('SELECT updated_at FROM sessions WHERE terminal_session = ?').get(resolvedId) as {updated_at: string} | undefined;
+          const matches = row?.updated_at === diagTs;
+          results.push({ test: 'Read-back verification', status: matches ? 'PASS' : 'FAIL', detail: `expected=${diagTs}, got=${row?.updated_at}` });
+        } catch (e) {
+          results.push({ test: 'Read-back verification', status: 'FAIL', detail: String(e) });
+        }
+
+        try {
+          const auditInfo = db.prepare("INSERT INTO audit_log (terminal_session, actor, action, old_value, new_value, context) VALUES (?, ?, ?, ?, ?, ?)").run(resolvedId, 'diagnostics', 'diag_test', null, diagTs, null);
+          results.push({ test: 'Audit log writable', status: auditInfo.changes > 0 ? 'PASS' : 'FAIL', detail: `changes=${auditInfo.changes}` });
+        } catch (e) {
+          results.push({ test: 'Audit log writable', status: 'FAIL', detail: String(e) });
+        }
+
+        try {
+          db.exec('ROLLBACK TO ironclaude_diagnostics');
+        } finally {
+          db.exec('RELEASE ironclaude_diagnostics');
+        }
       }
 
       // Test 9: No stale port/token files
@@ -610,20 +617,52 @@ export function handleReadTool(
       const tokenExists = fs.existsSync(path.join(os.homedir(), '.claude', '.hook-token'));
       results.push({ test: 'No stale port/token files', status: (!portExists && !tokenExists) ? 'PASS' : 'WARN', detail: `port=${portExists}, token=${tokenExists}` });
 
-      // Test 10: PPID file exists (MCP-only — hooks use JSON payload session_id)
-      const claudePpid = process.env.CLAUDE_PPID ?? String(process.ppid);
-      const ppidFile = path.join(os.homedir(), '.claude', `ironclaude-session-${claudePpid}.id`);
-      const ppidFileExists = fs.existsSync(ppidFile);
-      let ppidFileDetail = `CLAUDE_PPID=${process.env.CLAUDE_PPID ?? 'NOT SET'}, path=${ppidFile}, exists=${ppidFileExists}`;
-      if (ppidFileExists) {
-        try {
-          const content = fs.readFileSync(ppidFile, 'utf-8').trim();
-          ppidFileDetail += `, content=${content}`;
-        } catch {
-          ppidFileDetail += ', content=UNREADABLE';
+      // Test 10: provider-specific identity transport
+      if (identity.client === 'claude') {
+        const claudePpid = process.env.CLAUDE_PPID ?? String(process.ppid);
+        const ppidFile = path.join(os.homedir(), '.claude', `ironclaude-session-${claudePpid}.id`);
+        const ppidFileExists = fs.existsSync(ppidFile);
+        let ppidFileDetail = `CLAUDE_PPID=${process.env.CLAUDE_PPID ?? 'NOT SET'}, path=${ppidFile}, exists=${ppidFileExists}`;
+        if (ppidFileExists) {
+          try {
+            const content = fs.readFileSync(ppidFile, 'utf-8').trim();
+            ppidFileDetail += `, content=${content}`;
+          } catch {
+            ppidFileDetail += ', content=UNREADABLE';
+          }
         }
+        results.push({ test: 'PPID file exists (MCP-only)', status: ppidFileExists ? 'PASS' : 'WARN', detail: ppidFileDetail });
+      } else {
+        results.push({
+          test: 'Codex metadata binding',
+          status: 'PASS',
+          detail: `client=codex, session=${identity.sessionId}, source=${identity.source}`,
+        });
       }
-      results.push({ test: 'PPID file exists (MCP-only)', status: ppidFileExists ? 'PASS' : 'WARN', detail: ppidFileDetail });
+
+      if (runtimeFingerprint?.ok) {
+        results.push({
+          test: 'Runtime fingerprint',
+          status: 'PASS',
+          detail: `client=${runtimeFingerprint.runtime.client}, version=${runtimeFingerprint.runtime.plugin_version}, root=${runtimeFingerprint.runtime.plugin_root}`,
+        });
+      } else {
+        results.push({
+          test: 'Runtime fingerprint',
+          status: 'FAIL',
+          detail: runtimeFingerprint?.error ?? 'Runtime fingerprint capture is missing',
+        });
+      }
+
+      const expectedRuntime = args.expected_runtime as RuntimeFingerprintExpectation | undefined;
+      if (expectedRuntime !== undefined) {
+        const verification = verifyRuntimeActivation(runtimeFingerprint, expectedRuntime);
+        results.push({
+          test: 'Runtime activation match',
+          status: verification.ok ? 'PASS' : 'FAIL',
+          detail: verification.ok ? 'All expected runtime fields match startup capture' : verification.errors.join('; '),
+        });
+      }
 
       const passed = results.filter(r => r.status === 'PASS').length;
       const total = results.length;
@@ -632,7 +671,12 @@ export function handleReadTool(
       return {
         content: [{
           type: 'text',
-          text: `Diagnostics: ${passed}/${total} PASSED\n\n${summary}\n\n${JSON.stringify({results, passed, total}, null, 2)}`,
+          text: `Diagnostics: ${passed}/${total} PASSED\n\n${summary}\n\n${JSON.stringify({
+            results,
+            passed,
+            total,
+            ...(runtimeFingerprint?.ok ? { runtime: runtimeFingerprint.runtime } : {}),
+          }, null, 2)}`,
         }],
       };
     }

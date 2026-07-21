@@ -1,0 +1,249 @@
+{
+  "name": "Workflow Transition Idempotency",
+  "goal": "Make every explicit workflow transition use caller-side state preflight and a shared server-side same-target changed:false no-op without state, artifact, flag, wave, hook, timestamp, or audit side effects.",
+  "requirements_file": "docs/plans/2026-07-19-multi-provider-v1-1-requirements.md",
+  "design_file": "docs/plans/2026-07-20-workflow-transition-idempotency-design.md",
+  "estimated_memory_gb": 2,
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Centralize and make explicit workflow transitions idempotent",
+      "description": "TDD the shared transactional workflow-transition path and route every explicit state-manager transition through it. Same-target detection precedes prerequisites, review gates, callbacks, timestamps, artifacts, flags, waves, and audits. Preserve compound create_plan/reset behavior and provider-native identity binding.",
+      "allowed_files": [
+        "worker/mcp-servers/state-manager/src/__tests__/workflow-transition-idempotency.test.ts",
+        "worker/mcp-servers/state-manager/src/state-machine.ts",
+        "worker/mcp-servers/state-manager/src/tools/write-tools.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Create the Vitest in-memory regression suite with full session/design/task/review snapshots, including both review_grades and tier_up_reviews, plus plan-history and audit snapshots. Cover same-target mark_design_ready, mark_plan_ready, mark_brainstorming, mark_debugging, start_execution, mark_executing, and both retreat targets; assert exact success:true, changed:false, from, to, session_id and deep before/after equality including updated_at. Cover valid changed:true transitions with one audit, invalid different-state errors with no mutation, revised create_plan reload from final_plan_prep, reset_session cleanup from idle, and idempotentHint metadata only on explicit transition tools. Add an audit-insert trigger that raises ABORT during a valid changed transition and prove the thrown database failure rolls back both stage mutation and audit with full snapshot equality."
+        },
+        {
+          "description": "Run the new focused suite and record exact RED counts. Existing handlers must fail for rejection, mutation, missing result fields, or metadata while compound-operation preservation remains green.",
+          "command": "npm --prefix worker/mcp-servers/state-manager test -- src/__tests__/workflow-transition-idempotency.test.ts",
+          "expected": "FAIL with exact evidence for current same-target defects; compound-operation preservation tests remain green."
+        },
+        {
+          "description": "In state-machine.ts add one exported transactional workflow-transition outcome/helper. It must re-read only the dispatcher-resolved native session, return changed:false before validation/callback/mutation when current equals target, validate different-state requests through the existing state machine plus explicitly tested execution recovery, run guards/artifact callbacks only for changed valid transitions, update stage and transition fields once, insert exactly one audit, and return changed:true. Refactor retreat artifact preservation so it does not separately update stage or audit."
+        },
+        {
+          "description": "In write-tools.ts route mark_design_ready, mark_plan_ready, mark_brainstorming, mark_debugging, start_execution, mark_executing, and retreat through the helper; map exact MCP success/error results; place tier-up/review guards after the helper's equality defense; preserve active-task execution recovery with one correction audit; mark only explicit transitions idempotent. Keep create_plan/reset domain work active at same stage while omitting redundant workflow-stage assignments/claims."
+        },
+        {
+          "description": "Run focused and related state-manager suites covering idempotency, review gates, revised plan reload, session identity, dispatch, and diagnostics. Report exact file/test counts and stop on any failure.",
+          "command": "npm --prefix worker/mcp-servers/state-manager test -- src/__tests__/workflow-transition-idempotency.test.ts src/__tests__/mark-executing-review-gate.test.ts src/tools/write-tools.test.ts src/tools/write-tools.tier-up.test.ts src/__tests__/session-identity.test.ts src/__tests__/tool-dispatch.test.ts src/__tests__/run-diagnostics.test.ts",
+          "expected": "All selected test files and tests pass; no required case is skipped."
+        },
+        {
+          "description": "Stage only the Task 1 source and test files; do not commit.",
+          "command": "git add worker/mcp-servers/state-manager/src/state-machine.ts worker/mcp-servers/state-manager/src/tools/write-tools.ts worker/mcp-servers/state-manager/src/__tests__/workflow-transition-idempotency.test.ts",
+          "expected": "Exactly the three Task 1 paths are added to the staged work; no commit exists."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Enforce caller preflight and suppress no-op hook effects",
+      "description": "TDD identity-bound caller preflight in workflow skills, same-target skip in skill-state-bridge, and changed:false suppression in mcp-state-logger. Preserve create_plan reload and unrelated workflow behavior.",
+      "allowed_files": [
+        "commander/tests/test_workflow_transition_preflight.py",
+        "worker/hooks/tests/test-workflow-transition-idempotency.sh",
+        "worker/skills/brainstorming/SKILL.md",
+        "worker/skills/writing-plans/SKILL.md",
+        "worker/skills/executing-plans/SKILL.md",
+        "worker/hooks/skill-state-bridge.sh",
+        "worker/hooks/mcp-state-logger.sh"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Create pytest skill-contract tests requiring get_resume_state, provider-native session_id verification, workflow_stage comparison, equal-target skip, one different-target call, fail-closed identity handling, and no blind retry before mark_brainstorming, mark_design_ready, mark_plan_ready, start_execution, mark_executing, and retreat. Assert stage equality never skips create_plan reload. Assert the direct caller inventory is exact: no current skill directly calls mark_debugging because systematic-debugging reaches debugging through skill-state-bridge; do not require or introduce a duplicate skill-side transition."
+        },
+        {
+          "description": "Create an executable Bash harness with temporary HOME/WAL database/config. Use systematic-debugging as the real hook caller into debugging: assert a same-target payload leaves complete session/audit snapshots and stdout unchanged, then assert the same payload from an allowed different stage mutates/audits once. Verify mcp-state-logger parses tool_output object/string plus legacy tool_response so changed:false is silent and changed:true logs once. Add malformed object, string, and MCP content text inputs; require exit 0, no transition output, and byte-for-byte unchanged session/audit snapshots."
+        },
+        {
+          "description": "Run the skill-contract suite and record exact RED evidence.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_workflow_transition_preflight.py -q",
+          "expected": "FAIL because current skill transition instructions lack mandatory preflight/skip contracts."
+        },
+        {
+          "description": "Run the hook harness and record exact RED evidence.",
+          "command": "bash worker/hooks/tests/test-workflow-transition-idempotency.sh",
+          "expected": "FAIL because same-target bridge calls still update/audit and the MCP logger ignores changed:false."
+        },
+        {
+          "description": "Update brainstorming, writing-plans, and executing-plans transition instructions with one shared behavioral contract: get_resume_state; validate current provider-native root session_id; skip when workflow_stage equals target; otherwise call once; require changed:true for requested different-state transition; report errors and do not retry without a fresh read. Apply before debugging return, design ready, plan ready, execution start, review return, and retreat. Keep create_plan explicitly outside stage-only skipping."
+        },
+        {
+          "description": "Update skill-state-bridge.sh to exit the workflow-transition path before DB write, activation audit, or hook output when CURRENT_STAGE equals TARGET_STAGE; do not change any active-skill or flag field on that path. Update mcp-state-logger.sh to parse tool_output first and legacy tool_response, including objects, JSON strings, and MCP content[].text; exit before DB read/log on changed:false; retain best-effort logging for changed/legacy output and never mutate state on malformed data."
+        },
+        {
+          "description": "Run focused Commander skill contracts including the existing anti-flailing contracts and report exact counts.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_workflow_transition_preflight.py commander/tests/test_executing_plans_skill.py commander/tests/test_writing_plans_skill.py -q",
+          "expected": "All selected Commander tests pass."
+        },
+        {
+          "description": "Run the hook harness and require every case to print PASS with exit code 0.",
+          "command": "bash worker/hooks/tests/test-workflow-transition-idempotency.sh",
+          "expected": "All hook cases pass; no same-target state or log side effects."
+        },
+        {
+          "description": "Stage exactly the seven Task 2 paths; do not commit.",
+          "command": "git add commander/tests/test_workflow_transition_preflight.py worker/hooks/tests/test-workflow-transition-idempotency.sh worker/skills/brainstorming/SKILL.md worker/skills/writing-plans/SKILL.md worker/skills/executing-plans/SKILL.md worker/hooks/skill-state-bridge.sh worker/hooks/mcp-state-logger.sh",
+          "expected": "Exactly the seven Task 2 paths are added to staged work; no commit exists."
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Build, verify, hot-deploy, and record Wave 1 evidence",
+      "description": "Rebuild generated state-manager distribution, repair the evidence-backed Codex cachebuster/version-consistency contract, run every focused and complete regression gate, validate and cachebust the local plugin, reinstall from the authorized local marketplace, prove SHA-256 parity, and write restart-pending evidence. Tasks 1 and 2 own transition coverage; this task adds only the focused Commander contract required by its cachebuster deployment step.",
+      "allowed_files": [
+        "commander/tests/test_version_consistency.py",
+        "worker/mcp-servers/state-manager/dist/index.js",
+        "worker/.codex-plugin/plugin.json",
+        "docs/validation/2026-07-20-workflow-transition-idempotency.md"
+      ],
+      "depends_on": [1, 2],
+      "steps": [
+        {
+          "description": "Build TypeScript and generated state-manager distribution.",
+          "command": "npm --prefix worker/mcp-servers/state-manager run build",
+          "expected": "TypeScript and esbuild succeed; dist/index.js contains the verified implementation."
+        },
+        {
+          "description": "Run the full focused state-manager gate and report exact counts.",
+          "command": "npm --prefix worker/mcp-servers/state-manager test -- src/__tests__/workflow-transition-idempotency.test.ts src/__tests__/mark-executing-review-gate.test.ts src/tools/write-tools.test.ts src/tools/write-tools.tier-up.test.ts src/__tests__/session-identity.test.ts src/__tests__/tool-dispatch.test.ts src/__tests__/run-diagnostics.test.ts",
+          "expected": "All selected files/tests pass; identity, dispatch, diagnostics, review gates, and revised-plan reload remain green."
+        },
+        {
+          "description": "Run focused Commander contracts.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_workflow_transition_preflight.py commander/tests/test_executing_plans_skill.py commander/tests/test_writing_plans_skill.py -q",
+          "expected": "All selected Commander tests pass."
+        },
+        {
+          "description": "Run the hook harness.",
+          "command": "bash worker/hooks/tests/test-workflow-transition-idempotency.sh",
+          "expected": "Every hook case prints PASS and exits 0."
+        },
+        {
+          "description": "Use the captured full-suite RED (test_version_sources_match rejected 1.0.24+codex.20260720062826 while 1989 tests passed) and add focused parameterized cases for a pure Codex-manifest release-version helper: unchanged release version without metadata; one valid +codex.<lowercase-alphanumeric-or-hyphen-token> suffix normalized to its release prefix; empty, repeated, non-Codex, or malformed metadata rejected. Run before implementation.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_version_consistency.py -q",
+          "expected": "RED because the normalizer does not exist or the raw cachebusted Codex version still participates in exact release-version equality."
+        },
+        {
+          "description": "Implement the smallest helper in commander/tests/test_version_consistency.py and apply it only to worker/.codex-plugin/plugin.json; keep Commander, Claude plugin, marketplace, and any Makefile version exact. Rerun focused version consistency.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_version_consistency.py -q",
+          "expected": "All version-consistency cases pass for the current cachebusted manifest and invalid metadata remains rejected."
+        },
+        {
+          "description": "Run the complete state-manager suite.",
+          "command": "npm --prefix worker/mcp-servers/state-manager test",
+          "expected": "Every state-manager test file and test passes."
+        },
+        {
+          "description": "Run the complete Commander regression suite; do not substitute a narrow suite even though this is long-running.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests -q",
+          "expected": "Complete Commander suite passes with exact counts."
+        },
+        {
+          "description": "Check unstaged patch whitespace.",
+          "command": "git diff --check",
+          "expected": "No whitespace errors in unstaged changes."
+        },
+        {
+          "description": "Check staged patch whitespace so Tasks 1 and 2 cannot evade the gate.",
+          "command": "git diff --cached --check",
+          "expected": "No whitespace errors in staged changes."
+        },
+        {
+          "description": "Validate the source plugin before cachebusting.",
+          "command": "python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py worker",
+          "expected": "Plugin validation passed."
+        },
+        {
+          "description": "Replace the prior Codex cachebuster while preserving base version 1.0.24.",
+          "command": "python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/update_plugin_cachebuster.py worker",
+          "expected": "One new 1.0.24+codex.<timestamp> version is written."
+        },
+        {
+          "description": "Re-run plugin validation after cachebusting.",
+          "command": "python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py worker",
+          "expected": "Plugin validation passed."
+        },
+        {
+          "description": "Re-run the focused version-consistency contract against the final cachebusted source manifest.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_version_consistency.py -q",
+          "expected": "All version-consistency tests pass after the final cachebuster mutation."
+        },
+        {
+          "description": "Confirm the configured IronClaude marketplace is the local repository.",
+          "command": "codex plugin marketplace list",
+          "expected": "Marketplace ironclaude root is /Users/roberthyatt/Code/ironclaude."
+        },
+        {
+          "description": "Reinstall IronClaude from the local marketplace.",
+          "command": "codex plugin add ironclaude@ironclaude",
+          "expected": "Plugin installs successfully and reports the new cache path."
+        },
+        {
+          "description": "Read the cachebusted manifest version and compare SHA-256 for the manifest, transition sources/test/dist, three skills, two hooks, and hook harness between worker source and the exact installed cache. Stop on missing or mismatched pairs.",
+          "command": "set -euo pipefail\nIRONCLAUDE_W1_VERSION=$(node -p \"require('./worker/.codex-plugin/plugin.json').version\")\nIRONCLAUDE_W1_CACHE=\"/Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/$IRONCLAUDE_W1_VERSION\"\ntest -d \"$IRONCLAUDE_W1_CACHE\"\nfor IRONCLAUDE_W1_REL in '.codex-plugin/plugin.json' 'mcp-servers/state-manager/src/state-machine.ts' 'mcp-servers/state-manager/src/tools/write-tools.ts' 'mcp-servers/state-manager/src/__tests__/workflow-transition-idempotency.test.ts' 'mcp-servers/state-manager/dist/index.js' 'skills/brainstorming/SKILL.md' 'skills/writing-plans/SKILL.md' 'skills/executing-plans/SKILL.md' 'hooks/skill-state-bridge.sh' 'hooks/mcp-state-logger.sh' 'hooks/tests/test-workflow-transition-idempotency.sh'; do\n  test -f \"worker/$IRONCLAUDE_W1_REL\"\n  test -f \"$IRONCLAUDE_W1_CACHE/$IRONCLAUDE_W1_REL\"\n  cmp -s \"worker/$IRONCLAUDE_W1_REL\" \"$IRONCLAUDE_W1_CACHE/$IRONCLAUDE_W1_REL\"\n  echo \"MATCH $IRONCLAUDE_W1_REL $(shasum -a 256 \"worker/$IRONCLAUDE_W1_REL\" | awk '{print $1}')\"\ndone",
+          "expected": "Every required source/installed pair reports MATCH."
+        },
+        {
+          "description": "Write docs/validation/2026-07-20-workflow-transition-idempotency.md with requirement/design/plan paths, root cause, transition RED/GREEN and full-suite counts, captured version-consistency RED plus focused and post-cachebuster GREEN counts, build/validation/install evidence, version/cache path, one hash row per file, side-effect-free and MP-W11 evidence, real mark_debugging/systematic-debugging caller topology, the complete MP-001 through MP-C07 named future-loop mapping with explicit release-blocking status, restart-pending status plus same-task resume instruction, queued Wave 11 requirements_file schema mismatch, and explicit no-commit/no-push statement."
+        },
+        {
+          "description": "Stage built distribution and manifest; do not commit.",
+          "command": "git add commander/tests/test_version_consistency.py worker/mcp-servers/state-manager/dist/index.js worker/.codex-plugin/plugin.json",
+          "expected": "Version-consistency regression, generated distribution, and manifest are staged."
+        },
+        {
+          "description": "Force-stage the ignored validation artifact; do not commit or push.",
+          "command": "git add -f docs/validation/2026-07-20-workflow-transition-idempotency.md",
+          "expected": "Validation evidence is staged. Submit Task 3 for review; after a passing review, leave Task 4 pending and stop for a full Codex quit/restart of this same task before marking Wave 1 complete."
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Resume after restart and prove live runtime activation",
+      "description": "After Task 3 passes review, fully quit and relaunch Codex, reopen this same native task, verify the cachebusted plugin is loaded, prove session and durable-plan continuity, rerun source/cache parity and state-manager diagnostics, and finalize activation evidence without changing source.",
+      "allowed_files": [
+        "docs/validation/2026-07-20-workflow-transition-idempotency.md"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {
+          "description": "After full Codex quit/relaunch, reopen this same task and call mcp__state_manager__get_resume_state({}) before any transition. Verify native session_id equals this Codex thread ID, professional mode is on, plan name is Workflow Transition Idempotency, Tasks 1-3 are review-passed, Task 4 is pending or in progress, and workflow stage is valid for execution resume. Do not create a new task or reload a different plan.",
+          "expected": "Durable plan and provider-native task identity resume exactly; any missing, ambiguous, or mismatched identity blocks completion."
+        },
+        {
+          "description": "Confirm the reloaded Codex process reports the cachebusted IronClaude version from the source manifest and the local marketplace.",
+          "command": "codex plugin list",
+          "expected": "ironclaude@ironclaude reports the exact worker manifest version and marketplace /Users/roberthyatt/Code/ironclaude."
+        },
+        {
+          "description": "Re-run the exact deterministic Step 3 source/cache comparison after restart.",
+          "command": "set -euo pipefail\nIRONCLAUDE_W1_VERSION=$(node -p \"require('./worker/.codex-plugin/plugin.json').version\")\nIRONCLAUDE_W1_CACHE=\"/Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/$IRONCLAUDE_W1_VERSION\"\ntest -d \"$IRONCLAUDE_W1_CACHE\"\nfor IRONCLAUDE_W1_REL in '.codex-plugin/plugin.json' 'mcp-servers/state-manager/src/state-machine.ts' 'mcp-servers/state-manager/src/tools/write-tools.ts' 'mcp-servers/state-manager/src/__tests__/workflow-transition-idempotency.test.ts' 'mcp-servers/state-manager/dist/index.js' 'skills/brainstorming/SKILL.md' 'skills/writing-plans/SKILL.md' 'skills/executing-plans/SKILL.md' 'hooks/skill-state-bridge.sh' 'hooks/mcp-state-logger.sh' 'hooks/tests/test-workflow-transition-idempotency.sh'; do\n  test -f \"worker/$IRONCLAUDE_W1_REL\"\n  test -f \"$IRONCLAUDE_W1_CACHE/$IRONCLAUDE_W1_REL\"\n  cmp -s \"worker/$IRONCLAUDE_W1_REL\" \"$IRONCLAUDE_W1_CACHE/$IRONCLAUDE_W1_REL\"\n  echo \"MATCH $IRONCLAUDE_W1_REL $(shasum -a 256 \"worker/$IRONCLAUDE_W1_REL\" | awk '{print $1}')\"\ndone",
+          "expected": "All eleven source/installed pairs report MATCH from the cache directory named by the exact loaded version."
+        },
+        {
+          "description": "Call mcp__state_manager__run_diagnostics({}) through the reloaded state manager and require every check to pass with hook and MCP resolution bound to this same native Codex task; diagnostics must report no fallback, collision, cross-client identity, or live-state mutation.",
+          "expected": "Every diagnostic passes and both ingress paths resolve this task's native Codex session ID."
+        },
+        {
+          "description": "Replace restart-pending in the validation artifact with restart timestamp, same-task session ID, loaded version/cache path, post-restart hashes, diagnostic counts/identity evidence, runtime-active: verified, and no-commit/no-push confirmation."
+        },
+        {
+          "description": "Force-stage the finalized ignored validation artifact; do not commit or push.",
+          "command": "git add -f docs/validation/2026-07-20-workflow-transition-idempotency.md",
+          "expected": "Final live-activation evidence is staged. A passing Task 4 review completes Roadmap Wave 1 and permits Wave 2 brainstorming."
+        }
+      ]
+    }
+  ]
+}

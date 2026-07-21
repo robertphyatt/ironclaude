@@ -1,0 +1,226 @@
+{
+  "name": "Codex Runtime Activation Fingerprint and Same-Task Restart",
+  "goal": "Make IronClaude self-updates verifiably active after a full Codex restart while preserving the same native task, using provider-specific startup fingerprints and a behavioral transition proof.",
+  "requirements_file": "docs/plans/2026-07-19-multi-provider-v1-1-requirements.md",
+  "design_file": "docs/plans/2026-07-20-codex-runtime-activation-fingerprint-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Capture startup runtime identity and expose it through diagnostics",
+      "description": "Add provider-specific immutable startup fingerprint capture, diagnostic wiring, and anti-theatre tests while preserving identity and rollback guarantees.",
+      "allowed_files": [
+        "worker/mcp-servers/state-manager/src/runtime-fingerprint.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/runtime-fingerprint.test.ts",
+        "worker/mcp-servers/state-manager/src/index.ts",
+        "worker/mcp-servers/state-manager/src/tool-dispatch.ts",
+        "worker/mcp-servers/state-manager/src/tools/read-tools.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/run-diagnostics.test.ts",
+        "worker/mcp-servers/state-manager/dist/index.js"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Write runtime-fingerprint and run-diagnostics RED tests covering provider-active manifests, exact SHA-256 values, immutable startup capture, executable expected-runtime verification, explicit failures, structured output, and rollback preservation.",
+          "expected": "Tests are present before implementation."
+        },
+        {
+          "description": "Run focused RED tests and record exact failures.",
+          "command": "npm --prefix worker/mcp-servers/state-manager test -- src/__tests__/runtime-fingerprint.test.ts src/__tests__/run-diagnostics.test.ts",
+          "expected": "FAIL because runtime-fingerprint module and runtime diagnostics do not exist; record exact counts."
+        },
+        {
+          "description": "Implement runtime-fingerprint.ts capture and verifyRuntimeActivation, then thread one startup capture from index.ts through dispatchTool to run_diagnostics with optional expected_runtime and no call-time recomputation or provider fallback.",
+          "expected": "Codex selects .codex-plugin, Claude selects .claude-plugin, missing/failed capture is explicit FAIL, and exact expected runtime is executable PASS/FAIL logic."
+        },
+        {
+          "description": "Run focused identity, dispatch, diagnostic, and fingerprint tests.",
+          "command": "npm --prefix worker/mcp-servers/state-manager test -- src/__tests__/runtime-fingerprint.test.ts src/__tests__/run-diagnostics.test.ts src/__tests__/session-identity.test.ts src/__tests__/tool-dispatch.test.ts",
+          "expected": "All selected files/tests pass; health diagnostics report 12/12, matched expected runtime reports 13/13, and stale/mismatch cases mutate no state."
+        },
+        {
+          "description": "Typecheck without emitting per-source dist files.",
+          "command": "worker/mcp-servers/state-manager/node_modules/.bin/tsc --noEmit -p worker/mcp-servers/state-manager/tsconfig.json",
+          "expected": "TypeScript succeeds without writing dist declarations or per-source JavaScript."
+        },
+        {
+          "description": "Bundle only generated state-manager entrypoint.",
+          "command": "npm --prefix worker/mcp-servers/state-manager run bundle",
+          "expected": "esbuild writes only dist/index.js containing runtime activation contracts."
+        },
+        {
+          "description": "Stage Task 1 source and tests only.",
+          "command": "git add worker/mcp-servers/state-manager/src/runtime-fingerprint.ts worker/mcp-servers/state-manager/src/__tests__/runtime-fingerprint.test.ts worker/mcp-servers/state-manager/src/index.ts worker/mcp-servers/state-manager/src/tool-dispatch.ts worker/mcp-servers/state-manager/src/tools/read-tools.ts worker/mcp-servers/state-manager/src/__tests__/run-diagnostics.test.ts",
+          "expected": "Exactly Task 1 source/test paths staged; no commit."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Enforce same-task self-update restart and fail-closed recovery contracts",
+      "description": "Implement MP-W12 in execution, README, and roadmap contracts so full restart plus same-task reopen is default and new-task handoff is recovery-only.",
+      "allowed_files": [
+        "commander/tests/test_executing_plans_skill.py",
+        "worker/skills/executing-plans/SKILL.md",
+        "README.md",
+        "docs/plans/2026-07-20-v1-1-overall-roadmap.md"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Add RED contract tests for cachebuster-before-build, full process restart, same-task identity, runtime fingerprint, changed:true, fail-closed recovery, and insufficient installation-only evidence.",
+          "expected": "New contract assertions are present before guidance changes."
+        },
+        {
+          "description": "Run focused RED self-update contract tests.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_executing_plans_skill.py -q",
+          "expected": "FAIL on new self-update contract assertions; existing tier-up tests remain green."
+        },
+        {
+          "description": "Update executing-plans, README, and roadmap with narrow self-update boundary and Wave 1R wording.",
+          "expected": "Same-task reopen is default; new task is recovery-only; no reload subsystem or new workflow surface."
+        },
+        {
+          "description": "Run focused skill, transition, and version contracts.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_executing_plans_skill.py commander/tests/test_workflow_transition_preflight.py commander/tests/test_version_consistency.py -q",
+          "expected": "All selected tests pass with exact count recorded."
+        },
+        {
+          "description": "Check Task 2 whitespace.",
+          "command": "git diff --check",
+          "expected": "No whitespace errors."
+        },
+        {
+          "description": "Stage Task 2 paths.",
+          "command": "git add README.md docs/plans/2026-07-20-v1-1-overall-roadmap.md worker/skills/executing-plans/SKILL.md commander/tests/test_executing_plans_skill.py",
+          "expected": "Exactly Task 2 paths staged; no commit."
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Build cachebust validate reinstall and prove same-task runtime pickup",
+      "description": "Run full gates, default-cachebust before final build, reinstall locally, fully restart Codex, reopen this task, and verify startup runtime identity before review.",
+      "allowed_files": [
+        "worker/.codex-plugin/plugin.json",
+        "worker/mcp-servers/state-manager/dist/index.js"
+      ],
+      "depends_on": [1, 2],
+      "steps": [
+        {
+          "description": "Run complete pre-cachebuster state-manager suite.",
+          "command": "npm --prefix worker/mcp-servers/state-manager test",
+          "expected": "Complete state-manager suite passes with exact counts."
+        },
+        {
+          "description": "Run complete pre-cachebuster Commander suite.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests -q",
+          "expected": "Complete Commander suite passes with exact count."
+        },
+        {
+          "description": "Validate plugin before cachebuster.",
+          "command": "python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py worker",
+          "expected": "Plugin validation passes."
+        },
+        {
+          "description": "Apply plugin-creator default cachebuster before final build.",
+          "command": "python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/update_plugin_cachebuster.py worker",
+          "expected": "One new 1.0.24+codex.<UTC timestamp> version in worker/.codex-plugin/plugin.json."
+        },
+        {
+          "description": "Typecheck after cachebuster without emitting per-source dist files.",
+          "command": "worker/mcp-servers/state-manager/node_modules/.bin/tsc --noEmit -p worker/mcp-servers/state-manager/tsconfig.json",
+          "expected": "TypeScript succeeds without writing additional dist paths."
+        },
+        {
+          "description": "Bundle final entrypoint after cachebuster.",
+          "command": "npm --prefix worker/mcp-servers/state-manager run bundle",
+          "expected": "esbuild writes only dist/index.js using new cachebuster manifest."
+        },
+        {
+          "description": "Run complete post-build state-manager suite.",
+          "command": "npm --prefix worker/mcp-servers/state-manager test",
+          "expected": "Complete state-manager suite passes after final build."
+        },
+        {
+          "description": "Run complete post-build Commander suite.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests -q",
+          "expected": "Complete Commander suite passes after cachebuster/build."
+        },
+        {
+          "description": "Validate plugin after cachebuster/build.",
+          "command": "python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py worker",
+          "expected": "Plugin validation passes after cachebuster/build."
+        },
+        {
+          "description": "Check post-build whitespace.",
+          "command": "git diff --check",
+          "expected": "No whitespace errors."
+        },
+        {
+          "description": "Confirm ironclaude@ironclaude is surfaced from the local repository marketplace.",
+          "command": "codex plugin list",
+          "expected": "ironclaude@ironclaude resolves to /Users/roberthyatt/Code/ironclaude; otherwise stop."
+        },
+        {
+          "description": "Reinstall from confirmed local marketplace.",
+          "command": "codex plugin add ironclaude@ironclaude",
+          "expected": "Exact new cachebuster installed from /Users/roberthyatt/Code/ironclaude; marketplace files unchanged."
+        },
+        {
+          "description": "Compare exact modified worker source/test/skill/manifest/bundle files with installed cache and record SHA-256 values.",
+          "command": "node -e 'const fs=require(\"fs\"),os=require(\"os\"),path=require(\"path\"),crypto=require(\"crypto\");const v=JSON.parse(fs.readFileSync(\"worker/.codex-plugin/plugin.json\",\"utf8\")).version;const root=path.join(os.homedir(),\".codex/plugins/cache/ironclaude/ironclaude\",v);const files=[\".codex-plugin/plugin.json\",\"mcp-servers/state-manager/dist/index.js\",\"mcp-servers/state-manager/src/runtime-fingerprint.ts\",\"mcp-servers/state-manager/src/index.ts\",\"mcp-servers/state-manager/src/tool-dispatch.ts\",\"mcp-servers/state-manager/src/tools/read-tools.ts\",\"mcp-servers/state-manager/src/__tests__/runtime-fingerprint.test.ts\",\"mcp-servers/state-manager/src/__tests__/run-diagnostics.test.ts\",\"skills/executing-plans/SKILL.md\"];for(const f of files){const a=fs.readFileSync(path.join(\"worker\",f)),b=fs.readFileSync(path.join(root,f));if(!a.equals(b))throw new Error(`mismatch: ${f}`);console.log(`${crypto.createHash(\"sha256\").update(a).digest(\"hex\")}  ${f}`)}'",
+          "expected": "Every source/cache pair matches byte-for-byte."
+        },
+        {
+          "description": "Record native task ID, fully quit/relaunch Codex, reopen same task, verify the injected executing-plans skill locator names the new cachebuster, then verify get_resume_state plus run_diagnostics(expected_runtime) before submission.",
+          "expected": "Same task ID, professional mode on, plan preserved, current skill locator, 13/13 diagnostics including Runtime activation match, and exact startup manifest/bundle hashes and installed root/version/client."
+        },
+        {
+          "description": "Stage manifest and bundle, submit Task 3, and require normal review return transition changed:true.",
+          "command": "git add worker/.codex-plugin/plugin.json worker/mcp-servers/state-manager/dist/index.js",
+          "expected": "Task 3 reviewed through normal flow; mark_executing returns changed:true and response is preserved for Task 4."
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Record durable live activation evidence and close Wave 1R",
+      "description": "Correct prior activation claim and record exact same-task restart, startup fingerprint, parity, diagnostics, transition, test, and no-commit/no-push evidence.",
+      "allowed_files": [
+        "docs/validation/2026-07-20-workflow-transition-idempotency.md"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {
+          "description": "Update validation artifact with pre-restart limitation, same-task ID before/after, new cachebuster/root, current skill locator, 13/13 expected-runtime verification, startup hashes, changed:true, parity, and no commit/push.",
+          "expected": "Evidence distinguishes installation from loaded process and does not claim a new task was required."
+        },
+        {
+          "description": "Run final focused state-manager regressions.",
+          "command": "npm --prefix worker/mcp-servers/state-manager test -- src/__tests__/runtime-fingerprint.test.ts src/__tests__/run-diagnostics.test.ts src/__tests__/session-identity.test.ts src/__tests__/tool-dispatch.test.ts src/__tests__/workflow-transition-idempotency.test.ts",
+          "expected": "All selected files/tests pass with exact count recorded."
+        },
+        {
+          "description": "Run final focused Commander contracts and version consistency.",
+          "command": "commander/.venv/bin/python -m pytest commander/tests/test_executing_plans_skill.py commander/tests/test_workflow_transition_preflight.py commander/tests/test_version_consistency.py -q",
+          "expected": "All selected tests pass."
+        },
+        {
+          "description": "Run unstaged whitespace check.",
+          "command": "git diff --check",
+          "expected": "No unstaged whitespace errors."
+        },
+        {
+          "description": "Run staged whitespace check.",
+          "command": "git diff --cached --check",
+          "expected": "No staged whitespace errors."
+        },
+        {
+          "description": "Stage validation artifact.",
+          "command": "git add -f docs/validation/2026-07-20-workflow-transition-idempotency.md",
+          "expected": "Validation artifact staged; no commit or push."
+        }
+      ]
+    }
+  ]
+}

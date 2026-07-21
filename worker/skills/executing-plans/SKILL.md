@@ -41,6 +41,23 @@ not see one, call mcp__plugin_ironclaude_state-manager__get_resume_state before 
 
 Whenever soliciting user input — choices, confirmations, or selections — ALWAYS use the `AskUserQuestion` tool. NEVER ask via prose. Follow the format in `.claude/rules/ask-user-question-format.md`: Re-ground context, Predict, Options.
 
+## Mandatory Direct Transition Preflight
+
+Before every direct workflow-transition MCP call:
+
+1. Call `get_resume_state` and validate that its session identity is the
+   provider-native root session for the active task. Missing or mismatched
+   identity: fail closed; stop and report the mismatch.
+2. Compare its current workflow stage to the requested target. On an
+   equal-target result, skip the transition call and preserve all state.
+3. Make one different-target call only and require returned `changed:true`. If the
+   call errors or returns unexpected `changed:false`, stop and report it; do not
+   retry without a fresh `get_resume_state` read. No blind retry.
+
+The create_plan reload is exempt from target comparison: it is a domain operation
+that must reload a revised plan even when its resulting workflow stage is
+unchanged. Do not treat that exemption as permission to retry it blindly.
+
 ## Common Rationalizations (all wrong)
 
 | Rationalization | Why it's wrong |
@@ -148,23 +165,35 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    `~/.ironclaude/state/fable_unavailable.json`; if it exists and `unavailable_until`
    > the current epoch time, Fable is unavailable. Fail-safe: on any read error treat
    Fable as available.
-2. Dispatch a fresh, blind reviewer with the Agent tool
+2. Read `requirements_file` from the machine plan. It must identify the
+   operator-approved requirements artifact. If it is absent, STOP: return to
+   writing-plans and add it to both the human plan and machine plan before review.
+3. Dispatch a fresh, blind reviewer with the Agent tool
    (`subagent_type="general-purpose"`, `model=<resolved model>`), using this exact
-   prompt template (carried over verbatim from the former writing-plans Phase 4.5 —
-   do not paraphrase). It MUST NOT receive your rationale, this conversation,
-   prior-round findings, or a diff — it reviews the plan cold, report-only:
+   prompt template. It MUST NOT receive author rationale, this conversation,
+   prior-round findings, repair explanation, a diff, revision history, or the
+   previous reviewer identity. It reviews current artifacts cold and report-only:
    ```
    You are reviewing an implementation plan with fresh eyes. You have NOT seen
    this plan before and know nothing about how it was written.
 
    Read these files:
+   - Requirements (operator-approved): <REQUIREMENTS_MD_PATH>
+   - Design (approved): <DESIGN_MD_PATH>
    - Plan (human): <PLAN_MD_PATH>
    - Plan (machine): <PLAN_JSON_PATH>
-   - Design (source of intent): <DESIGN_MD_PATH>
 
-   Evaluate the plan against the design and these criteria:
-   - Design coverage: every component/requirement in the design has a
-     corresponding task; nothing silently dropped.
+   Your verdict answers exactly two questions:
+   - FIDELITY: does the plan implement the operator's approved requirements
+     and design with no drift?
+   - EFFICACY: will executing the plan exactly as written succeed?
+
+   Evaluate in this order:
+   1. Requirements → design fidelity: every operator requirement is preserved;
+      nothing is weakened, reinterpreted, silently deferred, or invented.
+   2. Design → plan fidelity: every approved design component has a task and
+      acceptance/test coverage; nothing is silently dropped.
+   3. Technical executability:
    - Task ordering: depends_on is correct and cycle-free; foundations before
      dependents; tests after the code they cover.
    - allowed_files completeness: each task lists EVERY file its steps touch
@@ -174,26 +203,85 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    - TDD structure where the task involves executable code (RED→GREEN→stage),
      or an explicit "No tests required: [reason]".
    - JSON↔markdown consistency and schema validity.
-   - Hidden risks, ambiguities, or edge cases an implementer would trip on.
+   4. Latent-defect hunt — the findings this review exists for. Trace every
+      code block in the plan as if you were the compiler and then the runtime:
+      follow return values, types, and control flow. Open the current source
+      files and verify every identifier the plan asserts — function names and
+      signatures, DB columns, schema fields, config keys, file paths,
+      commands. Hunt these archetypes specifically:
+   - a refactor that silently drops or changes a return value or side effect
+     in a way no type checker or existing test will flag;
+   - symbols, columns, APIs, fixtures, or files that do not exist as written
+     in the current source;
+   - a file a step modifies that is missing from that task's allowed_files;
+   - a test or verification step that cannot fail when the behavior it
+     guards is broken;
+   - a partial update to a set that must change together (version
+     declarations, generated artifacts, human/machine plan pairs) — find the
+     repo's consistency checks and confirm every member is covered.
 
-   Output a verdict line (SOLID or HAS-ISSUES), then findings grouped
-   Critical / Important / Minor. Each finding cites a specific task/step and
-   states the concrete problem. IDENTIFY PROBLEMS ONLY — do not rewrite the
-   plan or propose fixes. Do not edit any files.
+   Classify every candidate finding with this decision test. A finding is
+   MATERIAL only if executing the plan exactly as written would:
+   (a) violate an operator requirement or approved design decision; or
+   (b) ship wrong behavior that no step, test, or check in the plan would
+       catch; or
+   (c) make a step, command, or test fail or be unrunnable as written; or
+   (d) leave a required verification unable to detect the failure it exists
+       to catch.
+   A MATERIAL finding must cite the artifact and the source evidence you
+   personally verified. A suspicion you did not verify is not MATERIAL.
+   Everything else is an OBSERVATION: style, redundancy, count or wording
+   mismatches with no behavioral effect, tests that are weaker than ideal
+   but still fail on real regressions, hypothetical edge cases with no
+   concrete failure path. Report at most 5 observations, one line each;
+   they are non-blocking and have zero effect on the verdict.
+
+   Verdict rubric — apply it mechanically:
+   - SOLID: zero MATERIAL findings. SOLID means "no material defect found",
+     not "nothing could be improved". If everything you found is an
+     observation, the verdict IS SOLID.
+   - HAS-ISSUES: one or more MATERIAL findings.
+   A verdict that contradicts your own findings is an invalid review.
+
+   Output the verdict line (SOLID or HAS-ISSUES), then MATERIAL findings
+   grouped Critical / Important, each citing the specific task/step and the
+   verified evidence, then "Observations (non-blocking)". IDENTIFY PROBLEMS
+   ONLY — do not rewrite the plan or propose fixes. Do not edit any files.
    ```
-3. Present the findings (verdict + Critical/Important/Minor). The operator chooses
-   Revise / Proceed / Abort. On **Revise**: edit the plan files (`.md` + `.plan.json`)
-   to address the findings, re-stage, then **RE-CALL `create_plan` with the revised
-   plan JSON** — REQUIRED: `create_plan` reloads `session.plan_json` and rebuilds
-   `wave_tasks` from the revised plan (it is allowed from `final_plan_prep`). Without
-   it, the OLD plan executes and the fixes never run. Then dispatch a BRAND-NEW blind
-   reviewer against the revised plan (fresh context; never pass prior findings or a
-   diff) and, when the operator proceeds, call `submit_tier_up_review` again (it binds
-   to the NEW plan hash). After 3 rounds, note the count.
-4. When the operator proceeds, record the review:
+4. Record every completed review immediately with
    `mcp__plugin_ironclaude_state-manager__submit_tier_up_review` with
-   `reviewer_model=<resolved model>` and `verdict=<reviewer's summary verdict>`.
+   `reviewer_model=<resolved model>` and exact verdict `SOLID` or `HAS-ISSUES`.
    The server binds it to sha256 of the loaded plan.
+5. If verdict is `SOLID`, proceed to Step 2.
+6. If verdict is `HAS-ISSUES`, execution is blocked. Reviewer output is evidence, not authority.
+   Independently verify every finding against the four current
+   artifacts and cited current source. Reject unsupported findings without changing
+   operator requirements, design, or plan. Apply the reviewer's MATERIAL decision
+   test yourself: only findings that survive it gate execution. Observations are
+   non-blocking and never, alone, justify changing any artifact.
+7. The first verified `HAS-ISSUES` activates the convergence rule.
+   Finding-by-finding plan patching is forbidden. Before
+   changing any artifact, perform one holistic invariant audit covering:
+   - every active requirement → approved design decision;
+   - every design decision → plan task and acceptance/test evidence;
+   - task IDs, `depends_on`, `allowed_files`, ordered steps/commands, tests, and
+     expected results;
+   - semantic consistency between human and machine plans.
+8. Handle the verified audit result without drift:
+   - Requirements/design conflict or infeasibility: do not repair the plan. Run
+     Mandatory Direct Transition Preflight for target `brainstorming`. Only after a
+     different-target result, call MCP
+     `mcp__plugin_ironclaude_state-manager__retreat` once with `to: "brainstorming"`,
+     present the conflict to the operator, and preserve their requirements unless they
+     explicitly change them.
+   - Plan-only defects: regenerate one coherent human/machine plan candidate from
+     the unchanged requirements and approved design. Do not apply a patch list.
+     Re-stage and **RE-CALL `create_plan` with the revised plan JSON** so the MCP
+     reloads `session.plan_json` and rebuilds `wave_tasks`.
+9. Dispatch a BRAND-NEW blind reviewer against the current four artifacts. Never
+   pass earlier findings, repair rationale, a diff, revision history, or reviewer
+   identity. Repeat only while current evidence identifies a material defect; there
+   is no round-count target, reviewer coaching, or forced `SOLID`.
 
 **Top-tier note (Fable):** if your current model IS Fable, there is no tier above
 you. Display "Already at top model tier (Fable); no tier-up review available." Under
@@ -207,7 +295,10 @@ the human's lever is `tier_up_review_policy`. Report the block to the operator.
 
 **Step 2: Start execution**
 
-Call the MCP `mcp__plugin_ironclaude_state-manager__start_execution` tool to transition the workflow from plan_ready to executing.
+Run Mandatory Direct Transition Preflight for target `executing`. Only after a
+different-target result, call the MCP
+`mcp__plugin_ironclaude_state-manager__start_execution` tool once to transition
+the workflow from plan_ready to executing.
 
 Display:
 ```
@@ -303,7 +394,10 @@ When dispatching tasks via the Task tool, follow these rules to prevent context 
    - If critical issues are found, fix them before proceeding
    - The task-completion-validator hook validates that completed work matches the task description. The code-review skill calls `mcp__plugin_ironclaude_state-manager__record_review_verdict` to record the grade, and GBTW advances tasks on passing grades.
    - Once review passes, the MCP clears review_pending
-   - After code-review returns, call MCP `mcp__plugin_ironclaude_state-manager__mark_executing` to transition back from `reviewing` to `executing`
+   - After code-review returns, run Mandatory Direct Transition Preflight for
+     target `executing`; only after a different-target result, call MCP
+     `mcp__plugin_ironclaude_state-manager__mark_executing` once to transition
+     back from `reviewing` to `executing`
 
 7. **After task completes (MUST be the last output for each task):**
    ```
@@ -347,7 +441,10 @@ If any step fails:
 **Handling retreat:**
 
 If a task fails repeatedly or the approach is fundamentally wrong:
-- Call the MCP `mcp__plugin_ironclaude_state-manager__retreat` tool with `to: "brainstorming"` and `reason: "explanation"`
+- Run Mandatory Direct Transition Preflight for target `brainstorming`. Only after a
+  different-target result, call the MCP
+  `mcp__plugin_ironclaude_state-manager__retreat` tool once with
+  `to: "brainstorming"` and `reason: "explanation"`.
 - This preserves progress history and transitions back to brainstorming
 - The user can rethink the approach and create a new plan
 
@@ -357,6 +454,41 @@ If user appears to be changing topic or requesting different work during executi
 1. Recognize this as a potential interruption
 2. Invoke the `plan-interruption` skill
 3. Follow that skill's process to handle the state transition
+
+### IronClaude self-update boundary
+
+A self-update means IronClaude installs or updates its own Codex plugin while an
+IronClaude PM loop is active. The main orchestrator owns this boundary; never
+delegate restart, identity verification, workflow transitions, or recovery to a
+subagent.
+
+For an IronClaude self-update:
+
+1. Finish all planned source tests and plugin validation.
+2. Apply the plugin-creator cachebuster before the final build, then build the
+   cachebusted source. A pre-cachebuster bundle cannot certify the installed
+   runtime.
+3. Reinstall through the confirmed local marketplace and preserve the current
+   native task ID plus its task/goal state.
+4. Fully quit and relaunch Codex. Compaction or reinstall alone is insufficient.
+5. Reopen the same native task before submitting the self-update task. Require
+   `get_resume_state.session_id` to equal the preserved native task ID.
+6. Require a complete `run_diagnostics.runtime` containing the provider-active
+   manifest, `plugin_root`, `plugin_version`, `manifest_sha256`,
+   `bundle_sha256`, and `client`. Compare its startup hashes with the intended
+   installed-cache hashes. Pass those same installed-cache values back as
+   `expected_runtime` and require `Runtime activation match ... PASS`.
+7. Before the next PM loop, perform one normal valid different-stage workflow
+   transition and require `changed:true`.
+8. Missing runtime fields, any fingerprint/identity mismatch, or a failed
+   behavioral transition must fail closed. Create a new task only if same-task
+   verification fails, using the native handoff context required by the roadmap.
+
+`codex plugin list`, reinstall success, filesystem parity, and source/cache
+hashes are installation evidence only; none proves that the current process
+loaded the intended runtime. Do not add a workflow stage, do not add an MCP
+tool, do not add a cache copier, and do not add transcript migration for this
+boundary.
 
 ### Phase 3: Completion
 

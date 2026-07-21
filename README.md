@@ -119,7 +119,17 @@ codex plugin marketplace add robertphyatt/ironclaude
 codex plugin add ironclaude@ironclaude
 ```
 
-Start a new Codex task after installation so it loads the Worker skills and MCP tools. Review and trust the bundled hooks before enabling professional mode; Codex does not automatically trust plugin hooks. The Codex manifest embeds plugin-relative MCP commands while the existing `.mcp.json` remains Claude Code-compatible.
+After initial installation or any update, preserve the current native task ID,
+fully quit and relaunch Codex, then reopen the same task so Codex loads the
+installed Worker skills and MCP tools. Verify the provider-specific runtime
+fingerprint against the intended installed cache and require the next valid
+different-stage workflow transition to return `changed:true`. `codex plugin
+list`, reinstall success, and filesystem parity are installation evidence, not
+proof that the running process loaded the new plugin. Create a replacement task
+only if same-task fingerprint or behavioral verification fails. Review and
+trust the bundled hooks before enabling professional mode; Codex does not
+automatically trust plugin hooks. The Codex manifest embeds plugin-relative MCP
+commands while the existing `.mcp.json` remains Claude Code-compatible.
 
 ### Activate Professional Mode
 

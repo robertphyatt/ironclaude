@@ -8,6 +8,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -23,9 +25,16 @@ def _claude_plugin_json_version() -> str:
     return data["version"]
 
 
+def _release_version_from_codex_cachebuster(version: str) -> str:
+    match = re.fullmatch(r"(?P<release>[^+]+)(?:\+codex\.[a-z0-9-]+)?", version)
+    if match is None:
+        raise ValueError(f"invalid Codex cachebuster version: {version!r}")
+    return match.group("release")
+
+
 def _codex_plugin_json_version() -> str:
     data = json.loads((REPO_ROOT / "worker" / ".codex-plugin" / "plugin.json").read_text())
-    return data["version"]
+    return _release_version_from_codex_cachebuster(data["version"])
 
 
 def _marketplace_version() -> str:
@@ -40,6 +49,34 @@ def _makefile_pinned_version():
     text = (REPO_ROOT / "Makefile").read_text()
     m = re.search(r"/ironclaude/ironclaude/(\d+\.\d+\.\d+)/hooks", text)
     return m.group(1) if m else None
+
+
+@pytest.mark.parametrize(
+    ("version", "expected_release"),
+    [
+        ("1.0.24", "1.0.24"),
+        ("1.0.24+codex.20260720062826", "1.0.24"),
+    ],
+)
+def test_codex_cachebuster_release_version(version, expected_release):
+    assert _release_version_from_codex_cachebuster(version) == expected_release
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "1.0.24+codex.",
+        "1.0.24+codex.first+codex.second",
+        "1.0.24+build.20260720062826",
+        "1.0.24+codex.CACHEBUSTER",
+        "1.0.24+codex.cache_buster",
+        "1.0.24+codex.cache.buster",
+        "1.0.24+codex.cache!buster",
+    ],
+)
+def test_codex_cachebuster_release_version_rejects_malformed_metadata(version):
+    with pytest.raises(ValueError, match="invalid Codex cachebuster version"):
+        _release_version_from_codex_cachebuster(version)
 
 
 def test_version_sources_match():
