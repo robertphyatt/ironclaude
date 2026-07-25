@@ -36,44 +36,22 @@ import {
   clearReviewGrades,
   insertTierUpReview,
   getTierUpReviewByHash,
+  getLatestTierUpReview,
 } from '../db.js';
 import {
-  validateWorkflowTransition,
   validateProfessionalModeTransition,
   validatePlanJson,
   computeNextWave,
-  executeRetreat,
-  canTransitionTo,
+  executeWorkflowTransition,
+  prepareRetreatArtifacts,
 } from '../state-machine.js';
+import type { WorkflowTransitionOutcome } from '../state-machine.js';
 
-// ---------------------------------------------------------------------------
-// Session ID management (mirrors read-tools.ts pattern)
-// ---------------------------------------------------------------------------
-
-let _currentSessionId: string | null = null;
-
-export function setCurrentSession(sessionId: string): void {
-  _currentSessionId = sessionId;
-}
-
-/**
- * Resolve the session ID to use. Hard-fails if no session ID is available.
- * NEVER falls back to "most recent session" — that silently uses the wrong session.
- */
-function resolveSessionId(db: Database.Database, explicitId?: string): string {
-  if (explicitId) {
-    return explicitId;
+function requireSessionId(sessionId: string): string {
+  if (!sessionId) {
+    throw new Error('Resolved session ID is required before write tool handling');
   }
-  if (_currentSessionId) {
-    return _currentSessionId;
-  }
-
-  throw new Error(
-    'No session ID available. ' +
-    'CLAUDE_SESSION_ID env var not set and no explicit session_id provided. ' +
-    `CLAUDE_SESSION_ID=${process.env.CLAUDE_SESSION_ID || 'unset'}. ` +
-    'Check plugin.json env config and session-init.sh.'
-  );
+  return sessionId;
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +70,36 @@ function err(message: string, extra?: Record<string, unknown>): ToolResult {
       { type: 'text', text: JSON.stringify({ error: message, ...extra }, null, 2) },
     ],
   };
+}
+
+function workflowTransitionResult(
+  outcome: WorkflowTransitionOutcome,
+  changedFields: Record<string, unknown> = {},
+): ToolResult {
+  if (!outcome.ok) {
+    return err(outcome.error, {
+      ...(outcome.from !== undefined && { from: outcome.from }),
+      to: outcome.to,
+      session_id: outcome.session_id,
+    });
+  }
+  if (!outcome.changed) {
+    return ok({
+      success: true,
+      changed: false,
+      from: outcome.from,
+      to: outcome.to,
+      session_id: outcome.session_id,
+    });
+  }
+  return ok({
+    success: true,
+    changed: true,
+    from: outcome.from,
+    to: outcome.to,
+    session_id: outcome.session_id,
+    ...changedFields,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +131,17 @@ export function getTierUpPolicy(): TierUpPolicy {
  *  the identical session.plan_json string, so an unchanged plan always matches. */
 export function hashPlan(planJson: string): string {
   return createHash('sha256').update(planJson).digest('hex');
+}
+
+const TIER_UP_VERDICTS = ['SOLID', 'HAS-ISSUES', 'top-tier-self'] as const;
+type TierUpVerdict = typeof TIER_UP_VERDICTS[number];
+
+function isTierUpVerdict(value: string): value is TierUpVerdict {
+  return (TIER_UP_VERDICTS as readonly string[]).includes(value);
+}
+
+function isPassingTierUpVerdict(value: string): boolean {
+  return value === 'SOLID' || value === 'top-tier-self';
 }
 
 // ---------------------------------------------------------------------------
@@ -311,7 +330,7 @@ export const writeToolDefinitions = [
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: false,
+      idempotentHint: true,
     },
   },
   {
@@ -327,7 +346,7 @@ export const writeToolDefinitions = [
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: false,
+      idempotentHint: true,
     },
   },
   {
@@ -343,7 +362,7 @@ export const writeToolDefinitions = [
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: false,
+      idempotentHint: true,
     },
   },
   {
@@ -359,7 +378,7 @@ export const writeToolDefinitions = [
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: false,
+      idempotentHint: true,
     },
   },
   {
@@ -375,7 +394,7 @@ export const writeToolDefinitions = [
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: false,
+      idempotentHint: true,
     },
   },
   {
@@ -401,7 +420,7 @@ export const writeToolDefinitions = [
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: false,
+      idempotentHint: true,
     },
   },
   {
@@ -510,7 +529,11 @@ export const writeToolDefinitions = [
       type: 'object' as const,
       properties: {
         reviewer_model: { type: 'string' as const, description: 'The reviewer model used, e.g. "opus" or "fable".' },
-        verdict: { type: 'string' as const, description: 'The reviewer\'s summary verdict/label.' },
+        verdict: {
+          type: 'string' as const,
+          enum: [...TIER_UP_VERDICTS],
+          description: 'Exact review verdict: SOLID, HAS-ISSUES, or top-tier-self.',
+        },
       },
       required: ['reviewer_model', 'verdict'],
       additionalProperties: false,
@@ -535,7 +558,7 @@ export function handleWriteTool(
   db: Database.Database,
   sessionId: string,
 ): ToolResult {
-  const resolvedId = resolveSessionId(db, sessionId);
+  const resolvedId = requireSessionId(sessionId);
 
   switch (name) {
     // ----- register_design -----
@@ -679,7 +702,9 @@ export function handleWriteTool(
           plan_json: JSON.stringify(planJson),
           plan_name: planJson.name,
           current_wave: 1,
-          workflow_stage: 'final_plan_prep',
+          ...(session.workflow_stage === 'final_plan_prep'
+            ? {}
+            : { workflow_stage: 'final_plan_prep' as WorkflowStage }),
           review_pending: 0,
         });
 
@@ -725,64 +750,49 @@ export function handleWriteTool(
 
     // ----- start_execution -----
     case 'start_execution': {
-      const session = getSession(db, resolvedId);
-      if (!session) {
-        return err('Session not found', { session_id: resolvedId });
-      }
-
-      // Validate transition
-      const transitionResult = validateWorkflowTransition(
-        session.workflow_stage,
-        'executing',
-        {
-          hasDesign: true, // Already past design stage
+      const outcome = executeWorkflowTransition(db, resolvedId, 'executing', {
+        action: 'start_execution',
+        auditContext: 'Transitioned to executing',
+        prerequisites: (session) => ({
+          hasDesign: true,
           designConsumed: true,
           hasPlan: !!session.plan_json,
+        }),
+        guard: ({ session }) => {
+          const tierUpPolicy = getTierUpPolicy();
+          if (tierUpPolicy === 'off') return null;
+          if (!session.plan_json) {
+            return 'BLOCKED — tier-up review gate: no plan loaded. Call create_plan first.';
+          }
+          const planHash = hashPlan(session.plan_json);
+          const review = getTierUpReviewByHash(db, resolvedId, planHash);
+          const latestReview = getLatestTierUpReview(db, resolvedId);
+          const passRequired = tierUpPolicy === 'enforced'
+            || latestReview?.verdict === 'HAS-ISSUES';
+
+          if (passRequired && !review) {
+            return `BLOCKED — passing tier-up review required (tier_up_review_policy=${tierUpPolicy}). ` +
+              (latestReview?.verdict === 'HAS-ISSUES'
+                ? 'The latest review was HAS-ISSUES; perform the holistic requirements/design/plan audit, revise coherently, and obtain a fresh SOLID review. '
+                : '') +
+              'Dispatch a blind higher-tier reviewer for THIS plan and call ' +
+              'submit_tier_up_review, then retry start_execution. If the plan changed ' +
+              'after a prior review, re-review is required (the hash no longer matches). ' +
+              'To change this requirement, a human must edit tier_up_review_policy in ' +
+              '~/.claude/ironclaude-hooks-config.json (the commander cannot change it).';
+          }
+          if (passRequired && review && !isPassingTierUpVerdict(review.verdict)) {
+            return `BLOCKED — current plan tier-up verdict is ${review.verdict}. ` +
+              'Execution requires SOLID (or top-tier-self at the highest model tier). ' +
+              'Verify findings, perform the holistic requirements/design/plan audit, ' +
+              'revise coherently, and obtain a fresh blind review.';
+          }
+          return null;
         },
-      );
-
-      if (!transitionResult.valid) {
-        return err(transitionResult.reason);
-      }
-
-      // ----- Tier-up review gate (policy-controlled, fail-secure) -----
-      if (getTierUpPolicy() === 'enforced') {
-        if (!session.plan_json) {
-          return err(
-            'BLOCKED — tier-up review gate: no plan loaded. Call create_plan first.',
-          );
-        }
-        const planHash = hashPlan(session.plan_json);
-        const review = getTierUpReviewByHash(db, resolvedId, planHash);
-        if (!review) {
-          return err(
-            'BLOCKED — tier-up review required (tier_up_review_policy=enforced). ' +
-            'Dispatch a blind higher-tier reviewer for THIS plan and call ' +
-            'submit_tier_up_review, then retry start_execution. If the plan changed ' +
-            'after a prior review, re-review is required (the hash no longer matches). ' +
-            'To change this requirement, a human must edit tier_up_review_policy in ' +
-            '~/.claude/ironclaude-hooks-config.json (the commander cannot change it).',
-          );
-        }
-      }
-
-      // Update workflow (clear stale review_pending from prior plans)
-      updateSession(db, resolvedId, { workflow_stage: 'executing', review_pending: 0 });
-
-      insertAuditLog(db, {
-        terminal_session: resolvedId,
-        actor: 'claude',
-        action: 'start_execution',
-        old_value: session.workflow_stage,
-        new_value: 'executing',
-        context: 'Transitioned to executing',
+        updateFields: { review_pending: 0 },
       });
 
-      return ok({
-        success: true,
-        workflow_stage: 'executing',
-        session_id: resolvedId,
-      });
+      return workflowTransitionResult(outcome, { workflow_stage: 'executing' });
     }
 
     // ----- get_next_tasks -----
@@ -1065,178 +1075,113 @@ export function handleWriteTool(
 
     // ----- mark_design_ready -----
     case 'mark_design_ready': {
-      const session = getSession(db, resolvedId);
-      if (!session) {
-        return err('Session not found', { session_id: resolvedId });
-      }
-
-      if (session.workflow_stage !== 'brainstorming') {
-        return err(
-          `Cannot mark design ready: workflow_stage must be 'brainstorming', got '${session.workflow_stage}'`,
-        );
-      }
-
-      // Auto-register and consume design if file provided
       const file = args.file as string | undefined;
-      if (file) {
-        dbRegisterDesign(db, file, resolvedId);
-        dbConsumeDesign(db, file);
-      }
-
-      updateSession(db, resolvedId, { workflow_stage: 'design_ready' });
-
-      insertAuditLog(db, {
-        terminal_session: resolvedId,
-        actor: 'claude',
+      const outcome = executeWorkflowTransition(db, resolvedId, 'design_ready', {
         action: 'mark_design_ready',
-        old_value: 'brainstorming',
-        new_value: 'design_ready',
-        context: file ? `Brainstorming complete, design ready (auto-registered: ${file})` : 'Brainstorming complete, design ready',
+        auditContext: file
+          ? `Brainstorming complete, design ready (auto-registered: ${file})`
+          : 'Brainstorming complete, design ready',
+        validate: ({ from }, result) => result.valid
+          ? result
+          : {
+              valid: false,
+              reason: `Cannot mark design ready: workflow_stage must be 'brainstorming', got '${from}'`,
+            },
+        applyArtifacts: () => {
+          if (file) {
+            dbRegisterDesign(db, file, resolvedId);
+            dbConsumeDesign(db, file);
+          }
+        },
       });
 
-      return ok({ success: true, workflow_stage: 'design_ready', session_id: resolvedId });
+      return workflowTransitionResult(outcome, { workflow_stage: 'design_ready' });
     }
 
     // ----- mark_plan_ready -----
     case 'mark_plan_ready': {
-      const session = getSession(db, resolvedId);
-      if (!session) {
-        return err('Session not found', { session_id: resolvedId });
-      }
-
-      const validPlanReadyFrom: WorkflowStage[] = ['design_ready', 'design_marked_for_use'];
-      if (!validPlanReadyFrom.includes(session.workflow_stage)) {
-        return err(
-          `Cannot mark plan ready: workflow_stage must be 'design_ready' or 'design_marked_for_use', got '${session.workflow_stage}'`,
-        );
-      }
-
-      updateSession(db, resolvedId, { workflow_stage: 'plan_ready' });
-
-      insertAuditLog(db, {
-        terminal_session: resolvedId,
-        actor: 'claude',
+      const outcome = executeWorkflowTransition(db, resolvedId, 'plan_ready', {
         action: 'mark_plan_ready',
-        old_value: session.workflow_stage,
-        new_value: 'plan_ready',
-        context: 'Plan files written to disk',
+        auditContext: 'Plan files written to disk',
+        validate: ({ from }, result) => result.valid
+          ? result
+          : {
+              valid: false,
+              reason: `Cannot mark plan ready: workflow_stage must be 'design_ready' or 'design_marked_for_use', got '${from}'`,
+            },
       });
 
-      return ok({ success: true, workflow_stage: 'plan_ready', session_id: resolvedId });
+      return workflowTransitionResult(outcome, { workflow_stage: 'plan_ready' });
     }
 
     // ----- mark_brainstorming -----
     case 'mark_brainstorming': {
-      const session = getSession(db, resolvedId);
-      if (!session) {
-        return err('Session not found', { session_id: resolvedId });
-      }
-
-      if (!canTransitionTo(session.workflow_stage, 'brainstorming')) {
-        return err(
-          `Cannot mark brainstorming: invalid transition from '${session.workflow_stage}'`,
-        );
-      }
-
-      updateSession(db, resolvedId, { workflow_stage: 'brainstorming' });
-
-      insertAuditLog(db, {
-        terminal_session: resolvedId,
-        actor: 'claude',
+      const outcome = executeWorkflowTransition(db, resolvedId, 'brainstorming', {
         action: 'mark_brainstorming',
-        old_value: session.workflow_stage,
-        new_value: 'brainstorming',
-        context: `Transitioning to brainstorming from ${session.workflow_stage}`,
+        auditContext: ({ from }) => `Transitioning to brainstorming from ${from}`,
+        validate: ({ from }, result) => result.valid
+          ? result
+          : { valid: false, reason: `Cannot mark brainstorming: invalid transition from '${from}'` },
       });
 
-      return ok({ success: true, workflow_stage: 'brainstorming', session_id: resolvedId });
+      return workflowTransitionResult(outcome, { workflow_stage: 'brainstorming' });
     }
 
     // ----- mark_debugging -----
     case 'mark_debugging': {
-      const session = getSession(db, resolvedId);
-      if (!session) {
-        return err('Session not found', { session_id: resolvedId });
-      }
-
-      if (!canTransitionTo(session.workflow_stage, 'debugging')) {
-        return err(
-          `Cannot mark debugging: invalid transition from '${session.workflow_stage}'`,
-        );
-      }
-
-      updateSession(db, resolvedId, { workflow_stage: 'debugging' });
-
-      insertAuditLog(db, {
-        terminal_session: resolvedId,
-        actor: 'claude',
+      const outcome = executeWorkflowTransition(db, resolvedId, 'debugging', {
         action: 'mark_debugging',
-        old_value: session.workflow_stage,
-        new_value: 'debugging',
-        context: `Transitioning to debugging from ${session.workflow_stage}`,
+        auditContext: ({ from }) => `Transitioning to debugging from ${from}`,
+        validate: ({ from }, result) => result.valid
+          ? result
+          : { valid: false, reason: `Cannot mark debugging: invalid transition from '${from}'` },
       });
 
-      return ok({ success: true, workflow_stage: 'debugging', session_id: resolvedId });
+      return workflowTransitionResult(outcome, { workflow_stage: 'debugging' });
     }
 
     // ----- mark_executing -----
     case 'mark_executing': {
-      const session = getSession(db, resolvedId);
-      if (!session) {
-        return err('Session not found', { session_id: resolvedId });
-      }
-
       let recovered = false;
-      if (session.workflow_stage !== 'reviewing') {
-        const activeTaskCount = (db.prepare(
-          `SELECT COUNT(*) as count FROM wave_tasks
-           WHERE terminal_session = ? AND status IN ('pending', 'in_progress', 'submitted')`,
-        ).get(resolvedId) as { count: number }).count;
-
-        if (activeTaskCount > 0) {
-          insertAuditLog(db, {
-            terminal_session: resolvedId,
-            actor: 'system:state-correction',
-            action: 'workflow_stage_recovery',
-            old_value: session.workflow_stage,
-            new_value: 'executing',
-            context: `Force-corrected workflow_stage from '${session.workflow_stage}' to 'executing' — ${activeTaskCount} active wave_tasks prove execution is in progress`,
-          });
-          recovered = true;
-        } else {
-          return err(
-            `Cannot mark executing: workflow_stage must be 'reviewing', got '${session.workflow_stage}'`,
-          );
-        }
-      }
-
-      const passingReview = db.prepare(
-        `SELECT 1 FROM review_grades
-         WHERE terminal_session = ? AND wave_number = ? AND grade IN ('A', 'B') AND task_boundary = 1
-         ORDER BY created_at DESC LIMIT 1`,
-      ).get(resolvedId, session.current_wave);
-
-      if (!passingReview) {
-        return err(
-          'Cannot mark executing: no passing review verdict (A or B) recorded for current wave. ' +
-          'Call record_review_verdict first.',
-        );
-      }
-
-      updateSession(db, resolvedId, { workflow_stage: 'executing', review_pending: 0, review_block_count: 0 });
-
-      insertAuditLog(db, {
-        terminal_session: resolvedId,
-        actor: 'claude',
-        action: 'mark_executing',
-        old_value: recovered ? session.workflow_stage : 'reviewing',
-        new_value: 'executing',
-        context: recovered
-          ? `Code review complete, returning to executing (recovered from '${session.workflow_stage}')`
+      let activeTaskCount = 0;
+      const outcome = executeWorkflowTransition(db, resolvedId, 'executing', {
+        action: () => recovered ? 'workflow_stage_recovery' : 'mark_executing',
+        actor: () => recovered ? 'system:state-correction' : 'claude',
+        auditContext: ({ from }) => recovered
+          ? `Force-corrected workflow_stage from '${from}' to 'executing' — ${activeTaskCount} active wave_tasks prove execution is in progress`
           : 'Code review complete, returning to executing',
+        validate: ({ from }, result) => {
+          if (result.valid) return result;
+          activeTaskCount = (db.prepare(
+            `SELECT COUNT(*) as count FROM wave_tasks
+             WHERE terminal_session = ? AND status IN ('pending', 'in_progress', 'submitted')`,
+          ).get(resolvedId) as { count: number }).count;
+          if (activeTaskCount > 0) {
+            recovered = true;
+            return { valid: true, reason: 'Active wave tasks prove execution recovery' };
+          }
+          return {
+            valid: false,
+            reason: `Cannot mark executing: workflow_stage must be 'reviewing', got '${from}'`,
+          };
+        },
+        guard: ({ session }) => {
+          const passingReview = db.prepare(
+            `SELECT 1 FROM review_grades
+             WHERE terminal_session = ? AND wave_number = ? AND grade IN ('A', 'B') AND task_boundary = 1
+             ORDER BY created_at DESC LIMIT 1`,
+          ).get(resolvedId, session.current_wave);
+          return passingReview
+            ? null
+            : 'Cannot mark executing: no passing review verdict (A or B) recorded for current wave. ' +
+              'Call record_review_verdict first.';
+        },
+        updateFields: { review_pending: 0, review_block_count: 0 },
       });
 
-      return ok({ success: true, workflow_stage: 'executing', session_id: resolvedId, ...(recovered && { recovered: true }) });
+      const changedFields: Record<string, unknown> = { workflow_stage: 'executing' };
+      if (recovered) changedFields.recovered = true;
+      return workflowTransitionResult(outcome, changedFields);
     }
 
     // ----- retreat -----
@@ -1253,30 +1198,18 @@ export function handleWriteTool(
         return err('Missing or empty required parameter: reason');
       }
 
-      const session = getSession(db, resolvedId);
-      if (!session) {
-        return err('Session not found', { session_id: resolvedId });
-      }
-
-      const from = session.workflow_stage;
-
-      // Validate retreat is allowed via transition table
-      if (!canTransitionTo(from, to)) {
-        return err(
-          `Cannot retreat from '${from}' to '${to}': transition not allowed`,
-        );
-      }
-
-      // Execute retreat (handles artifact preservation, audit log, state updates)
-      executeRetreat(db, resolvedId, from, to, reason);
-
-      return ok({
-        success: true,
-        from,
-        to,
-        reason,
-        session_id: resolvedId,
+      const outcome = executeWorkflowTransition(db, resolvedId, to, {
+        action: 'retreat',
+        actor: 'system',
+        auditContext: reason,
+        validate: ({ from }, result) => result.valid
+          ? result
+          : { valid: false, reason: `Cannot retreat from '${from}' to '${to}': transition not allowed` },
+        applyArtifacts: ({ session, from }) =>
+          prepareRetreatArtifacts(db, resolvedId, session, from, reason),
       });
+
+      return workflowTransitionResult(outcome, { reason });
     }
 
     // ----- reset_session -----
@@ -1293,7 +1226,7 @@ export function handleWriteTool(
         plan_json: null,
         plan_name: null,
         current_wave: 0,
-        workflow_stage: 'idle',
+        ...(oldStage === 'idle' ? {} : { workflow_stage: 'idle' as WorkflowStage }),
         review_pending: 0,
         circuit_breaker: 0,
       });
@@ -1474,6 +1407,11 @@ export function handleWriteTool(
       if (!verdict || typeof verdict !== 'string') {
         return err('Missing or empty required parameter: verdict');
       }
+      if (!isTierUpVerdict(verdict)) {
+        return err(
+          `Invalid verdict: "${verdict}". Must be one of: ${TIER_UP_VERDICTS.join(', ')}`,
+        );
+      }
 
       const session = getSession(db, resolvedId);
       if (!session) {
@@ -1501,7 +1439,7 @@ export function handleWriteTool(
         context: `Tier-up review recorded (model=${reviewerModel}, plan_hash=${planHash.slice(0, 12)}…)`,
       });
 
-      return ok({ success: true, plan_hash: planHash, reviewer_model: reviewerModel, session_id: resolvedId });
+      return ok({ success: true, plan_hash: planHash, reviewer_model: reviewerModel, verdict, session_id: resolvedId });
     }
 
     default:

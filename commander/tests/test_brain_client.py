@@ -9,6 +9,32 @@ import pytest
 from ironclaude.brain_client import BrainClient, _backoff_seconds, _is_model_unavailable
 
 
+@pytest.fixture(autouse=True)
+def _close_leaked_event_loops():
+    """Close any event loop a test creates via ``asyncio.new_event_loop()`` but forgets
+    to close (several tests assign a fake loop to ``client._loop`` and never clean it up).
+    Without this, the loop is GC'd unclosed and ``BaseEventLoop.__del__`` raises a
+    ``ResourceWarning`` that ``-W error`` promotes to a (cross-attributed) failure. Only
+    loops that actually leaked — unclosed AND not running — are closed; running loops are
+    left to their owner."""
+    created = []
+    real_new_event_loop = asyncio.new_event_loop
+
+    def _tracking_new_event_loop():
+        loop = real_new_event_loop()
+        created.append(loop)
+        return loop
+
+    asyncio.new_event_loop = _tracking_new_event_loop
+    try:
+        yield
+    finally:
+        asyncio.new_event_loop = real_new_event_loop
+        for loop in created:
+            if not loop.is_closed() and not loop.is_running():
+                loop.close()
+
+
 class TestBrainClient:
     def test_is_alive_initially_false(self):
         """Brain is not alive before start."""
@@ -140,6 +166,31 @@ class TestIsModelUnavailable:
         exc.stderr = "selected model"
         # no exit_code attribute — not a ProcessError
         assert _is_model_unavailable(exc) is False
+
+
+class TestIsUsageLimitText:
+    def test_matches_the_real_hit_your_limit_string(self):
+        from ironclaude.brain_client import _is_usage_limit_text
+        assert _is_usage_limit_text(
+            "You've hit your limit · resets 4:10am (America/Chicago)"
+        ) is True
+
+    def test_case_insensitive(self):
+        from ironclaude.brain_client import _is_usage_limit_text
+        assert _is_usage_limit_text("YOU'VE HIT YOUR LIMIT") is True
+
+    def test_does_not_match_ordinary_text_or_none(self):
+        from ironclaude.brain_client import _is_usage_limit_text
+        assert _is_usage_limit_text("here is a normal answer") is False
+        assert _is_usage_limit_text("") is False
+        assert _is_usage_limit_text(None) is False
+
+    def test_does_not_match_model_unavailable_string(self):
+        # Keeps the two detectors disjoint.
+        from ironclaude.brain_client import _is_usage_limit_text
+        assert _is_usage_limit_text(
+            "There's an issue with the selected model (fable[1m])."
+        ) is False
 
 
 class TestBrainModelFallback:
@@ -1942,15 +1993,17 @@ class TestModelUnavailableText:
         drained = client.get_pending_responses()
         assert all(unavailable_text not in r for r in drained)
 
-    def test_plain_conversational_text_not_queued_for_slack_relay(self):
-        """Plain AssistantMessage text (no tool call, not model-unavailable
-        signature) must NOT be queued for Slack relay. post_message is the
-        only path that should reach Slack — see
-        docs/plans/2026-07-19-agent-message-hook-slack-filter-design.md."""
+    def test_plain_conversational_text_queued_as_narration(self):
+        """Plain AssistantMessage text is queued as [NARRATION]-tagged narration for
+        THREAD-ONLY relay (main.py's poll_brain_responses threads it under the last
+        heartbeat, bypassing the directive-ref/reason gate so it never triggers the
+        [CONTEXT REQUIRED] feedback loop). It must NOT be posted top-level. The
+        operator-facing channel remains the post_message MCP tool (top-level)."""
         import asyncio
         from unittest.mock import patch, MagicMock
         from claude_agent_sdk import AssistantMessage
         from claude_agent_sdk.types import TextBlock
+        from ironclaude.brain_client import _NARRATION_PREFIX
 
         class CapturingOptions:
             def __init__(self, **kwargs):
@@ -1962,11 +2015,8 @@ class TestModelUnavailableText:
             yield AssistantMessage(content=[TextBlock(text=conversational_text)], model="sonnet")
 
         client = BrainClient()
-        # Stub the grader so the permission-seeking correction path (still
-        # invoked unconditionally on full_text at line 803, independent of
-        # the queue-push removal) doesn't make a real Ollama HTTP call —
-        # this test only asserts queueing behavior. Same pattern as
-        # TestPermissionSeekingFilter._mk() elsewhere in this file.
+        # Stub the grader so the permission-seeking correction path (still invoked
+        # unconditionally on full_text) doesn't make a real Ollama HTTP call.
         client._grader = MagicMock()
         client._grader.grade.return_value = {"permission_seeking": False}
         with patch("claude_agent_sdk.ClaudeAgentOptions", CapturingOptions), \
@@ -1974,7 +2024,7 @@ class TestModelUnavailableText:
             client._episodic_memory_path = "/fake/memory.js"
             asyncio.run(client._brain_session("my-prompt", None, None))
 
-        assert client.get_pending_responses() == []
+        assert client.get_pending_responses() == [f"{_NARRATION_PREFIX}{conversational_text}"]
 
 
 class TestModelUnavailableFableTransition:

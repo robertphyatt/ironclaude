@@ -120,3 +120,5 @@ def test_restart_e2e_real_sighup(pid_file, monkeypatch, capsys):
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+        if proc.stdout:
+            proc.stdout.close()

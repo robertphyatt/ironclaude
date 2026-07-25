@@ -499,7 +499,8 @@ class TestFileOperations:
         """write_file writes to local filesystem."""
         path = str(tmp_path / "out.txt")
         assert tmux_ssh.write_file(path, "hello") is True
-        assert open(path).read() == "hello"
+        with open(path) as f:
+            assert f.read() == "hello"
 
     def test_remove_file_local(self, tmux_ssh, tmp_path):
         """remove_file deletes local files."""

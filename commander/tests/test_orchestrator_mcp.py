@@ -1723,7 +1723,7 @@ class TestSpawnWorkerPmParams:
             pm_max_retries=5,
         )
         tools._activate_pm_via_sqlite.assert_called_once_with(
-            "ic-w1", timeout=600, max_retries=5
+            "ic-w1", timeout=600, max_retries=5, client="claude"
         )
 
     def test_default_pm_params(self, tools, mock_tmux, registry):
@@ -1737,7 +1737,7 @@ class TestSpawnWorkerPmParams:
             objective="Do work",
         )
         tools._activate_pm_via_sqlite.assert_called_once_with(
-            "ic-w1", timeout=300, max_retries=3
+            "ic-w1", timeout=300, max_retries=3, client="claude"
         )
 
     def test_raises_on_zero_max_retries(self, tools):
@@ -2426,7 +2426,7 @@ class TestActivatePmViaSqliteRetry:
         """Retries up to max_retries times on sqlite errors, returns None on eventual success."""
         call_count = 0
 
-        def side_effect(session_name, value, timeout, _claude_dir=None):
+        def side_effect(session_name, value, timeout, _claude_dir=None, client="claude"):
             nonlocal call_count
             call_count += 1
             if call_count < 3:
@@ -2473,7 +2473,7 @@ class TestActivatePmViaSqliteRetry:
         """Logs a warning on each sqlite retry attempt."""
         call_count = 0
 
-        def side_effect(session_name, value, timeout, _claude_dir=None):
+        def side_effect(session_name, value, timeout, _claude_dir=None, client="claude"):
             nonlocal call_count
             call_count += 1
             if call_count < 2:

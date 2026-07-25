@@ -103,3 +103,40 @@ def _reset_ollama_breakers():
     _BREAKERS.reset()
     yield
     _BREAKERS.reset()
+
+
+@pytest.fixture
+def base_config():
+    def make_config():
+        return {
+            "clients": {
+                "claude": {
+                    "enabled": True,
+                    "path": "claude",
+                    "models": {
+                        "haiku": "haiku",
+                        "sonnet": "sonnet",
+                        "opus": "opus",
+                        "fable": "fable",
+                    },
+                },
+                "codex": {
+                    "enabled": False,
+                    "path": "codex",
+                    "models": {
+                        "haiku": "gpt-5.6-luna",
+                        "sonnet": "gpt-5.6-terra",
+                        "opus": "gpt-5.6-sol",
+                    },
+                },
+            },
+            "roles": {
+                "brain": {"preferred": "claude", "clients": ["claude"]},
+                "worker": {"preferred": "claude", "clients": ["claude"]},
+                "grader": {"preferred": "claude", "clients": ["claude"]},
+                "advisor": {"preferred": "claude", "clients": ["claude"]},
+            },
+            "shadow_mode": False,
+        }
+
+    return make_config

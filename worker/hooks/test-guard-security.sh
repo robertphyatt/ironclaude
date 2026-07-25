@@ -52,7 +52,7 @@ is_readonly_git() {
   local cmd="$1"
   if _has_blocked_metachars "$cmd"; then
     echo "blocked"
-  elif echo "$cmd" | grep -qE '^\s*git\s+(diff|status|log|show|blame|branch|rev-list|ls-files|ls-tree|tag|remote|reflog|stash)\b'; then
+  elif echo "$cmd" | grep -qE '^\s*git\s+(diff|status|log|show|blame|branch|rev-list|ls-files|ls-tree|check-ignore|tag|remote|reflog|stash)\b'; then
     echo "allowed"
   else
     echo "blocked"
@@ -99,7 +99,7 @@ is_reviewing_allowed() {
   local cmd="$1"
   if echo "$cmd" | grep -qE '[;&|`]|\$\('; then
     echo "blocked"
-  elif echo "$cmd" | grep -qE '^\s*(sqlite3|git\s+(diff|status|log|show|blame|ls-files)|pytest|make\s+test|cat|head|tail|wc|grep|rg|find|ls)\b'; then
+  elif echo "$cmd" | grep -qE '^\s*(sqlite3|git\s+(diff|status|log|show|blame|ls-files|check-ignore)|pytest|make\s+test|cat|head|tail|wc|grep|rg|find|ls)\b'; then
     echo "allowed"
   else
     echo "blocked"
@@ -202,6 +202,20 @@ assert_eq "BYPASS curl -o with trailing git log: blocked" "blocked" "$(is_readon
 assert_eq "BYPASS cp overwrite with trailing git show: blocked" "blocked" "$(is_readonly_git 'cp /dev/null /tmp/settings git show')"
 assert_eq "BYPASS git diff process-sub: blocked" "blocked" "$(is_readonly_git 'git diff <(rm -rf /tmp/x)')"
 assert_eq "BYPASS git show redirect: blocked" "blocked" "$(is_readonly_git 'git show HEAD:f > /tmp/out')"
+assert_eq "plain git check-ignore: allowed" "allowed" \
+  "$(is_readonly_git 'git check-ignore docs/plans/example.md')"
+assert_eq "leading whitespace git check-ignore: allowed" "allowed" \
+  "$(is_readonly_git '  git check-ignore .env')"
+assert_eq "git check-ignore during review: allowed" "allowed" \
+  "$(is_reviewing_allowed 'git check-ignore docs/plans/example.md')"
+assert_eq "BYPASS mid-string check-ignore: blocked" "blocked" \
+  "$(is_readonly_git 'echo nope git check-ignore .env')"
+assert_eq "BYPASS chained check-ignore: blocked" "blocked" \
+  "$(is_readonly_git 'git check-ignore .env && rm -rf /tmp/x')"
+assert_eq "BYPASS redirected check-ignore: blocked" "blocked" \
+  "$(is_readonly_git 'git check-ignore .env > /tmp/result')"
+assert_eq "BYPASS process-sub check-ignore: blocked" "blocked" \
+  "$(is_readonly_git 'git check-ignore <(touch /tmp/x)')"
 
 # ─── CR-3 TESTS: Undecided mkdir Exception Anchoring ───
 echo "=== CR-3: Undecided mkdir .claude/rules Exception ==="
@@ -225,6 +239,177 @@ assert_eq "make test: allowed" "allowed" "$(is_brain_chaining_blocked 'make test
 assert_eq "BYPASS process-sub: blocked" "blocked" "$(is_brain_chaining_blocked 'git diff <(rm -rf /tmp/x)')"
 assert_eq "BYPASS redirect write: blocked" "blocked" "$(is_brain_chaining_blocked 'git show HEAD:f > /tmp/settings.json')"
 assert_eq "BYPASS input redirect: blocked" "blocked" "$(is_brain_chaining_blocked 'git apply < /tmp/patch')"
+
+echo "=== CR-4: Real Hook Allows git check-ignore ==="
+REAL_GUARD="$SCRIPT_DIR/professional-mode-guard.sh"
+TEST_HOME=$(mktemp -d)
+trap 'rm -rf "$TEST_HOME"' EXIT
+mkdir -p "$TEST_HOME/.claude"
+sqlite3 "$TEST_HOME/.claude/ironclaude.db" <<'SQL'
+PRAGMA journal_mode=WAL;
+CREATE TABLE sessions (
+  terminal_session TEXT PRIMARY KEY,
+  professional_mode TEXT NOT NULL,
+  workflow_stage TEXT NOT NULL
+);
+INSERT INTO sessions VALUES ('check-ignore-test', 'on', 'brainstorming');
+SQL
+printf '{"verbose_hook_logs":false}\n' > "$TEST_HOME/.claude/ironclaude-hooks-config.json"
+
+run_real_guard() {
+  local command="$1"
+  printf '%s' "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$command\"},\"session_id\":\"check-ignore-test\"}" \
+    | HOME="$TEST_HOME" bash "$REAL_GUARD" 2>&1
+}
+
+set_real_stage() {
+  sqlite3 "$TEST_HOME/.claude/ironclaude.db" \
+    "UPDATE sessions SET workflow_stage='$1' WHERE terminal_session='check-ignore-test'"
+}
+
+assert_real_allowed() {
+  local description="$1" stage="$2" command="$3" output status
+  set_real_stage "$stage"
+  output=$(run_real_guard "$command")
+  status=$?
+  assert_eq "$description exit status" "0" "$status"
+  assert_eq "$description output" "" "$output"
+}
+
+assert_real_blocked() {
+  local description="$1" stage="$2" command="$3" output
+  set_real_stage "$stage"
+  output=$(run_real_guard "$command")
+  # An infrastructure failure (non-WAL DB, missing session row) also prints
+  # "BLOCKED — DATABASE ERROR" and exits before the guard ever evaluates the
+  # command. Matching bare "BLOCKED" would make every bypass assertion pass
+  # vacuously. Treat an infrastructure block as a harness failure, not a pass.
+  if printf '%s' "$output" | grep -q 'DATABASE ERROR'; then
+    assert_eq "$description" "blocked" "harness-db-error"
+  elif printf '%s' "$output" | grep -q 'BLOCKED'; then
+    assert_eq "$description" "blocked" "blocked"
+  else
+    assert_eq "$description" "blocked" "allowed"
+  fi
+}
+
+for stage in \
+  idle brainstorming debugging design_ready design_marked_for_use \
+  plan_ready plan_marked_for_use final_plan_prep executing reviewing \
+  execution_complete plan_interrupted
+do
+  assert_real_allowed "real hook $stage check-ignore" "$stage" \
+    "git check-ignore docs/plans/example.md"
+done
+
+# Executing intentionally permits general Bash. Every non-executing stage must
+# still reject shell forms that try to smuggle writes through the read-only path.
+for stage in \
+  idle brainstorming debugging design_ready design_marked_for_use \
+  plan_ready plan_marked_for_use final_plan_prep reviewing \
+  execution_complete plan_interrupted
+do
+  assert_real_blocked "real hook $stage mid-string" "$stage" \
+    "echo nope git check-ignore .env"
+  assert_real_blocked "real hook $stage chained" "$stage" \
+    "git check-ignore .env && rm -rf /tmp/x"
+  assert_real_blocked "real hook $stage redirected" "$stage" \
+    "git check-ignore .env > /tmp/result"
+  assert_real_blocked "real hook $stage process-substitution" "$stage" \
+    "git check-ignore <(touch /tmp/x)"
+done
+
+# ─── WG TESTS: Reviewing-Stage Write-Guard allowed_files Exception ───
+echo "=== WG: Reviewing-Stage Write-Guard (allowed_files exception) ==="
+WG_SESSION="wg-review-test"
+TEST_HOME_WG=$(mktemp -d)
+# Re-set EXIT trap to clean BOTH temp dirs (CR-4's TEST_HOME + ours).
+trap 'rm -rf "$TEST_HOME" "$TEST_HOME_WG"' EXIT
+mkdir -p "$TEST_HOME_WG/.claude"
+WG_ALLOWED_FILE="$TEST_HOME_WG/allowed_impl.py"
+WG_BLOCKED_FILE="$TEST_HOME_WG/secret.py"
+sqlite3 "$TEST_HOME_WG/.claude/ironclaude.db" <<SQL
+PRAGMA journal_mode=WAL;
+CREATE TABLE sessions (
+  terminal_session TEXT PRIMARY KEY,
+  professional_mode TEXT NOT NULL,
+  workflow_stage TEXT NOT NULL,
+  current_wave INTEGER DEFAULT 0,
+  review_pending INTEGER DEFAULT 0,
+  review_block_count INTEGER DEFAULT 0
+);
+CREATE TABLE wave_tasks (
+  terminal_session TEXT NOT NULL,
+  wave_number INTEGER NOT NULL,
+  allowed_files TEXT,
+  status TEXT
+);
+INSERT INTO sessions (terminal_session, professional_mode, workflow_stage, current_wave, review_pending, review_block_count)
+  VALUES ('$WG_SESSION', 'on', 'reviewing', 1, 1, 0);
+INSERT INTO wave_tasks (terminal_session, wave_number, allowed_files, status)
+  VALUES ('$WG_SESSION', 1, '["$WG_ALLOWED_FILE"]', 'submitted');
+SQL
+printf '{"verbose_hook_logs":false}\n' > "$TEST_HOME_WG/.claude/ironclaude-hooks-config.json"
+
+run_wg_guard() {
+  local tool_name="$1" file_path="$2"
+  printf '%s' "{\"tool_name\":\"$tool_name\",\"tool_input\":{\"file_path\":\"$file_path\"},\"session_id\":\"$WG_SESSION\"}" \
+    | HOME="$TEST_HOME_WG" bash "$REAL_GUARD" 2>&1
+}
+
+assert_wg_blocked() {
+  local description="$1" output="$2"
+  if printf '%s' "$output" | grep -q 'DATABASE ERROR'; then
+    assert_eq "$description" "blocked" "harness-db-error"
+  elif printf '%s' "$output" | grep -q 'BLOCKED'; then
+    assert_eq "$description" "blocked" "blocked"
+  else
+    assert_eq "$description" "blocked" "allowed"
+  fi
+}
+
+# Allowed file during reviewing → permitted (exit 0, empty output).
+# RED anchor: on the PRE-FIX hook this is BLOCKED at the write-tools gate, so both
+# assertions fail — proving the deadlock exists and the seed reaches gate #1.
+WG_OUT=$(run_wg_guard "Edit" "$WG_ALLOWED_FILE"); WG_STATUS=$?
+assert_eq "WG allowed file during reviewing: exit 0" "0" "$WG_STATUS"
+assert_eq "WG allowed file during reviewing: empty output" "" "$WG_OUT"
+
+# Not-allowed file during reviewing → still blocked (file guard preserved).
+WG_OUT=$(run_wg_guard "Edit" "$WG_BLOCKED_FILE")
+assert_wg_blocked "WG not-allowed file during reviewing: blocked" "$WG_OUT"
+
+# Fail-closed: reviewing with current_wave=0 → allowed-looking file still blocked.
+sqlite3 "$TEST_HOME_WG/.claude/ironclaude.db" \
+  "UPDATE sessions SET current_wave=0 WHERE terminal_session='$WG_SESSION'"
+WG_OUT=$(run_wg_guard "Edit" "$WG_ALLOWED_FILE")
+assert_wg_blocked "WG fail-closed (current_wave=0): blocked" "$WG_OUT"
+sqlite3 "$TEST_HOME_WG/.claude/ironclaude.db" \
+  "UPDATE sessions SET current_wave=1 WHERE terminal_session='$WG_SESSION'"
+
+# ─── NB TESTS: NotebookEdit subject to executing-stage allowed_files ───
+echo "=== NB: NotebookEdit allowed_files whitelist (executing) ==="
+# Reuse TEST_HOME_WG DB (session wg-review-test, wave 1 allowed_files=[WG_ALLOWED_FILE]).
+# Flip to executing + clear review_pending so the allowed_files check is the only gate.
+sqlite3 "$TEST_HOME_WG/.claude/ironclaude.db" \
+  "UPDATE sessions SET workflow_stage='executing', review_pending=0 WHERE terminal_session='$WG_SESSION'"
+
+run_nb_guard() {
+  local notebook_path="$1"
+  printf '%s' "{\"tool_name\":\"NotebookEdit\",\"tool_input\":{\"notebook_path\":\"$notebook_path\"},\"session_id\":\"$WG_SESSION\"}" \
+    | HOME="$TEST_HOME_WG" bash "$REAL_GUARD" 2>&1
+}
+
+# Not-allowed NotebookEdit during executing → BLOCKED (file guard).
+# RED anchor: on the PRE-FIX hook FILE_PATH is empty for NotebookEdit, so the
+# allowed_files check is skipped and this is ALLOWED — the "blocked" assertion fails.
+NB_OUT=$(run_nb_guard "$WG_BLOCKED_FILE")
+assert_wg_blocked "NB not-allowed notebook during executing: blocked" "$NB_OUT"
+
+# Allowed NotebookEdit during executing → permitted (exit 0, empty output), no over-block.
+NB_OUT=$(run_nb_guard "$WG_ALLOWED_FILE"); NB_STATUS=$?
+assert_eq "NB allowed notebook during executing: exit 0" "0" "$NB_STATUS"
+assert_eq "NB allowed notebook during executing: empty output" "" "$NB_OUT"
 
 # ─── SUMMARY ───
 echo ""

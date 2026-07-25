@@ -26,7 +26,7 @@ INPUT=$(cat)
 init_session_id
 
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null || true)
-FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.command // empty' 2>/dev/null || true)
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.notebook_path // .tool_input.command // empty' 2>/dev/null || true)
 FILE_PATH=$(normalize_path "$FILE_PATH")
 
 SAFE_SESSION=$(echo "$SESSION_TAG" | sed "s/'/''/g")
@@ -43,10 +43,10 @@ the file on disk. The benign keys (validation_backend, ollama, timeout_seconds) 
 changed via a full-file Write tool call that preserves the guardrail keys.
 
 Do NOT change guardrail keys."
-# NotebookEdit is intentionally not routed: FILE_PATH (extracted at line ~15 from
-# .tool_input.file_path // .tool_input.command) is never populated for a NotebookEdit
-# event (notebook_path). config_guard_decision routes Edit/MultiEdit/Write/Bash; every
-# other tool falls through to "allow".
+# NotebookEdit is not routed to config_guard_decision: it is tool-gated to
+# Edit/MultiEdit/Write/Bash, so NotebookEdit falls through to "allow" here regardless.
+# FILE_PATH IS populated for NotebookEdit (from .tool_input.notebook_path at the
+# extraction above) so the executing-stage allowed_files whitelist applies to it.
 #
 # Key-scoped anti-tamper for the hooks-config file. All routing + policy is in the tested
 # config_guard_decision (config-guard.sh): Write is key-scoped (benign keys allowed,
@@ -296,7 +296,7 @@ Do NOT run git commit, git push, git merge, or git rebase outside of plan execut
       fi
     fi
     # Exception: allow read-only git commands at any workflow stage (no chaining — mirrors git-add guard above)
-    if [ "$TOOL_NAME" = "Bash" ] && ! _has_blocked_metachars "$FILE_PATH" && echo "$FILE_PATH" | grep -qE '^\s*git\s+(diff|status|log|show|blame|branch|rev-list|ls-files|ls-tree|tag|remote|reflog|stash)\b'; then
+    if [ "$TOOL_NAME" = "Bash" ] && ! _has_blocked_metachars "$FILE_PATH" && echo "$FILE_PATH" | grep -qE '^\s*git\s+(diff|status|log|show|blame|branch|rev-list|ls-files|ls-tree|check-ignore|tag|remote|reflog|stash)\b'; then
       log_hook "professional-mode-guard" "Allowed" "read-only git command"
       exit 0
     fi
@@ -311,10 +311,10 @@ Do NOT run git commit, git push, git merge, or git rebase outside of plan execut
 
 Shell chaining/redirection operators (; && || | backtick \$() > <) are not permitted during code review.
 
-Allowed commands: sqlite3, git diff/status/log/show/blame/ls-files, pytest, make test, cat, head, tail, wc, grep, rg, find, ls
+Allowed commands: sqlite3, git diff/status/log/show/blame/ls-files/check-ignore, pytest, make test, cat, head, tail, wc, grep, rg, find, ls
 
 Do NOT run commands with shell operators during the reviewing stage."
-      elif echo "$MAKE_NORMALIZED_REVIEW" | grep -qE '^\s*(sqlite3|git\s+(diff|status|log|show|blame|ls-files)|pytest|make\s+test|cat|head|tail|wc|grep|rg|find|ls)\b'; then
+      elif echo "$MAKE_NORMALIZED_REVIEW" | grep -qE '^\s*(sqlite3|git\s+(diff|status|log|show|blame|ls-files|check-ignore)|pytest|make\s+test|cat|head|tail|wc|grep|rg|find|ls)\b'; then
         if echo "$FILE_PATH" | grep -qE '^\s*sqlite3\b' && echo "$FILE_PATH" | grep -qiE '\b(UPDATE|INSERT|DELETE|DROP|ALTER|CREATE|REPLACE)\b'; then
           block_pretooluse "professional-mode-guard" "BLOCKED — SQLITE WRITE OPERATIONS NOT ALLOWED DURING REVIEW
 
@@ -335,7 +335,7 @@ Use find for searching only."
         block_pretooluse "professional-mode-guard" "BLOCKED — COMMAND NOT ALLOWED DURING REVIEW
 
 Only the following commands are allowed during code review:
-  sqlite3, git diff/status/log/show/blame/ls-files, pytest, make test,
+  sqlite3, git diff/status/log/show/blame/ls-files/check-ignore, pytest, make test,
   cat, head, tail, wc, grep, rg, find, ls
 
 Do NOT run destructive or write commands during the reviewing stage."
@@ -359,6 +359,49 @@ Do NOT run destructive or write commands during the reviewing stage."
       if ! _has_blocked_metachars "$FILE_PATH" && echo "$MAKE_NORMALIZED" | grep -qE '^\s*make\s+test'; then
         log_hook "professional-mode-guard" "Allowed" "make test* command"
         exit 0
+      fi
+    fi
+    # Exception: allow Edit/Write/MultiEdit to allowed_files DURING code review.
+    # code-review Step 7.1 (Fix-First Pass) makes mechanical edits while
+    # workflow_stage='reviewing'; without this they deadlock. FAIL-CLOSED: exit 0
+    # ONLY on a positive allowed-file match. Any state where membership cannot be
+    # determined (no wave, empty allowed_files, missing jq, query failure) does NOT
+    # exit — it falls through to the write-tools block below. Distinct REVIEW_*
+    # vars avoid clobbering the executing-stage check's vars.
+    if [ "$WORKFLOW" = "reviewing" ] \
+       && { [ "$TOOL_NAME" = "Edit" ] || [ "$TOOL_NAME" = "Write" ] || [ "$TOOL_NAME" = "MultiEdit" ] || [ "$TOOL_NAME" = "NotebookEdit" ]; } \
+       && [ -n "$FILE_PATH" ]; then
+      REVIEW_WAVE=$(sqlite3 "$DB_PATH" ".timeout 10000" \
+        "SELECT current_wave FROM sessions WHERE terminal_session='${SAFE_SESSION}';" 2>/dev/null || echo "0")
+      SAFE_REVIEW_WAVE=$(echo "$REVIEW_WAVE" | sed "s/'/''/g")
+      if [ -n "$REVIEW_WAVE" ] && [ "$REVIEW_WAVE" != "0" ]; then
+        REVIEW_ALLOWED_FILES=$(sqlite3 "$DB_PATH" ".timeout 10000" \
+          "SELECT allowed_files FROM wave_tasks WHERE terminal_session='${SAFE_SESSION}' AND wave_number='${SAFE_REVIEW_WAVE}';" 2>/dev/null || true)
+        if [ -n "$REVIEW_ALLOWED_FILES" ] && command -v jq &>/dev/null; then
+          REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+          if [ -n "$REPO_ROOT" ]; then
+            REVIEW_NORMALIZED_FILE="${FILE_PATH#${REPO_ROOT}/}"
+          else
+            REVIEW_NORMALIZED_FILE="$FILE_PATH"
+          fi
+          REVIEW_FILE_ALLOWED="false"
+          while IFS= read -r allowed_json; do
+            if echo "$allowed_json" | jq -e 'type == "array"' &>/dev/null; then
+              if echo "$allowed_json" | jq -r '.[]' 2>/dev/null | grep -qxF "$FILE_PATH"; then
+                REVIEW_FILE_ALLOWED="true"
+                break
+              fi
+              if echo "$allowed_json" | jq -r '.[]' 2>/dev/null | grep -qxF "$REVIEW_NORMALIZED_FILE"; then
+                REVIEW_FILE_ALLOWED="true"
+                break
+              fi
+            fi
+          done <<< "$REVIEW_ALLOWED_FILES"
+          if [ "$REVIEW_FILE_ALLOWED" = "true" ]; then
+            log_hook "professional-mode-guard" "Allowed" "reviewing-stage edit to allowed_file"
+            exit 0
+          fi
+        fi
       fi
     fi
     # Build SUGGESTED_NEXT_ACTION based on current workflow stage

@@ -7,6 +7,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 MARKER = "Advisor Fallback"
 PRIMARY = "model=fable"   # preferred subagent tier
 FALLBACK = "model=opus"   # required fallback when Fable is unavailable
+CODEX_MARKER = "codex exec"   # the codex-native advisor branch (codex has no /advisor or Agent tool)
 
 
 def _read(rel: str) -> str:
@@ -25,6 +26,15 @@ def test_directive_in_brain_behavioral():
     text = _read("commander/src/brain/rules/behavioral.md")
     assert MARKER in text
     assert PRIMARY in text and FALLBACK in text
+
+
+def test_directive_in_agents_md():
+    """Codex workers load AGENTS.md (root), NOT .claude/rules/behavioral.md. The advisor
+    directive must exist there AND name the codex-native path (codex exec), so a codex worker
+    is not left advisor-less and a future edit cannot silently drop codex advisor parity."""
+    text = _read("AGENTS.md")
+    assert MARKER in text
+    assert CODEX_MARKER in text
 
 
 def test_directive_in_activation_skill():

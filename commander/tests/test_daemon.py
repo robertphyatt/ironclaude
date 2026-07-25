@@ -34,6 +34,34 @@ def daemon(tmp_path):
     return d
 
 
+class TestBrainNarrationThreading:
+    """Brain narration ([NARRATION]-tagged) is threaded under the last heartbeat and NEVER
+    re-messages the Brain (no [CONTEXT REQUIRED] feedback loop = the d1435 bug). Dropped when
+    no heartbeat thread exists yet (thread_ts=None would post top-level)."""
+    def test_narration_posts_to_heartbeat_thread_and_never_messages_brain(self, daemon):
+        from ironclaude.brain_client import _NARRATION_PREFIX
+        daemon.brain.get_pending_responses = lambda: [f"{_NARRATION_PREFIX}Working on d5 now."]
+        daemon._last_heartbeat_ts = "1234.5"
+        daemon.poll_brain_responses()
+        assert daemon.slack.post_message.called
+        # EVERY post is threaded under the heartbeat ts — a top-level post (thread_ts None/absent)
+        # is a thread-only violation and must fail this test.
+        assert all(
+            kw.get("thread_ts") == "1234.5"
+            for _args, kw in daemon.slack.post_message.call_args_list
+        )
+        # NEVER re-messages the Brain (no [CONTEXT REQUIRED] feedback loop).
+        daemon.brain.send_message.assert_not_called()
+
+    def test_narration_dropped_when_no_heartbeat(self, daemon):
+        from ironclaude.brain_client import _NARRATION_PREFIX
+        daemon.brain.get_pending_responses = lambda: [f"{_NARRATION_PREFIX}chatter"]
+        daemon._last_heartbeat_ts = None
+        daemon.poll_brain_responses()
+        daemon.brain.send_message.assert_not_called()
+        daemon.slack.post_message.assert_not_called()
+
+
 class TestCheckWorkersDoneMarker:
     def test_done_marker_notifies_brain_idle(self, daemon):
         """Worker with .done marker triggers idle notification, NOT completion."""
@@ -2831,3 +2859,132 @@ class TestHeartbeatStateCleanup:
             daemon._last_heartbeat = 0
             daemon.post_heartbeat()
         assert "w1" in daemon._heartbeat_state_history
+
+
+class TestProviderCommand:
+    """`/provider` must never persist a change the router would silently ignore:
+    ProviderRouter falls back to `preferred` when the sticky client is not in the
+    role's configured `clients` list."""
+
+    def _prep(self, daemon):
+        # The shared `daemon` fixture builds the daemon with db_conn=None, so a real
+        # connection must be attached before ProviderState can be used (same pattern as
+        # TestHandleSummary / reaction_daemon). A bare sqlite3.connect is insufficient —
+        # provider_role_state only exists in db.py's schema.
+        from ironclaude.db import init_db
+        daemon._db = init_db(":memory:")
+        daemon.config = {
+            "providers": {
+                "clients": {
+                    "claude": {"enabled": True, "path": "claude", "models": {}},
+                    "codex": {"enabled": True, "path": "codex", "models": {}},
+                },
+                "roles": {
+                    "brain": {"preferred": "claude", "clients": ["claude"]},
+                    "worker": {"preferred": "claude", "clients": ["claude", "codex"]},
+                    "grader": {"preferred": "claude", "clients": ["claude"]},
+                    "advisor": {"preferred": "claude", "clients": ["claude"]},
+                },
+            }
+        }
+        daemon.slack.post_message.reset_mock()
+        return daemon
+
+    def _posted(self, daemon):
+        return " ".join(str(c) for c in daemon.slack.post_message.call_args_list)
+
+    def _current(self, daemon, role):
+        from ironclaude.provider_state import ProviderState
+        return ProviderState(daemon._db).get_current_client(role)
+
+    def test_status_lists_every_role(self, daemon):
+        d = self._prep(daemon)
+        d._handle_provider_command([])
+        out = self._posted(d)
+        for role in ("brain", "worker", "grader", "advisor"):
+            assert role in out
+
+    def test_valid_set_persists(self, daemon):
+        d = self._prep(daemon)
+        d._handle_provider_command(["worker", "codex"])
+        assert self._current(d, "worker") == "codex"
+
+    def test_client_not_in_role_clients_is_rejected(self, daemon):
+        d = self._prep(daemon)
+        d._handle_provider_command(["grader", "codex"])
+        assert self._current(d, "grader") is None, (
+            "must not persist a client the router would ignore (not in the role's clients list)"
+        )
+        assert "clients" in self._posted(d).lower()
+
+    def test_unknown_role_is_rejected(self, daemon):
+        d = self._prep(daemon)
+        d._handle_provider_command(["bogus", "codex"])
+        assert self._current(d, "bogus") is None
+
+    def test_unknown_client_is_rejected(self, daemon):
+        d = self._prep(daemon)
+        d._handle_provider_command(["worker", "bogus"])
+        assert self._current(d, "worker") is None
+
+    def test_disabled_client_is_rejected(self, daemon):
+        d = self._prep(daemon)
+        d.config["providers"]["clients"]["codex"]["enabled"] = False
+        d._handle_provider_command(["worker", "codex"])
+        assert self._current(d, "worker") is None
+        assert "disabled" in self._posted(d).lower()
+
+    def test_wrong_arity_returns_usage(self, daemon):
+        d = self._prep(daemon)
+        d._handle_provider_command(["worker"])
+        assert "usage" in self._posted(d).lower()
+        assert self._current(d, "worker") is None
+
+    # NOTE on `split("\\n")` below: `_posted` joins `str(mock_call)`, and repr-ing the call
+    # turns a real newline into the TWO characters backslash+n. So the literal "\\n" here is
+    # correct. Do NOT "fix" it to "\n": the split would then return one blob containing every
+    # role's line, and `current: *claude*` from another role would satisfy the assertion —
+    # making the test pass pre-fix (pure theatre).
+
+    def test_status_reports_effective_client_not_stale_sticky(self, daemon):
+        """A sticky client no longer in the role's clients list is IGNORED by
+        ProviderRouter (it falls back to preferred), so status must not report it."""
+        from ironclaude.provider_state import ProviderState
+        d = self._prep(daemon)
+        ProviderState(d._db).set_current_client("worker", "codex")
+        # Operator later narrows the config so codex is no longer allowed for worker.
+        d.config["providers"]["roles"]["worker"]["clients"] = ["claude"]
+        d.slack.post_message.reset_mock()
+        d._handle_provider_command([])
+        out = self._posted(d)
+        worker_line = [ln for ln in out.split("\\n") if "`worker`" in ln]
+        assert worker_line, out
+        assert "current: *claude*" in worker_line[0], (
+            f"status must report what the router would actually use; got {worker_line[0]}"
+        )
+
+    def test_status_notes_the_ignored_sticky_value(self, daemon):
+        from ironclaude.provider_state import ProviderState
+        d = self._prep(daemon)
+        ProviderState(d._db).set_current_client("worker", "codex")
+        d.config["providers"]["roles"]["worker"]["clients"] = ["claude"]
+        d.slack.post_message.reset_mock()
+        d._handle_provider_command([])
+        out = self._posted(d)
+        assert "ignor" in out.lower() and "codex" in out, (
+            "the discrepancy must be surfaced, not silently corrected"
+        )
+
+    def test_status_reports_a_valid_sticky_client(self, daemon):
+        from ironclaude.provider_state import ProviderState
+        d = self._prep(daemon)
+        ProviderState(d._db).set_current_client("worker", "codex")
+        d.slack.post_message.reset_mock()
+        d._handle_provider_command([])
+        worker_line = [ln for ln in self._posted(d).split("\\n") if "`worker`" in ln]
+        assert worker_line and "current: *codex*" in worker_line[0]
+
+    def test_status_without_sticky_row_has_no_note(self, daemon):
+        d = self._prep(daemon)
+        d._handle_provider_command([])
+        assert "ignor" not in self._posted(d).lower()

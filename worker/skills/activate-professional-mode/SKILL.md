@@ -119,6 +119,7 @@ Then create `.claude/rules/behavioral.md` with the full canonical principles (us
 9. **Advisor Fallback**
    - When the `advisor` tool returns unavailable, do NOT skip the advisor step or just reason it through yourself
    - Spawn a top-tier subagent via the `Agent` tool (`model=fable` if Fable is available, else `model=opus`) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
+   - Client-aware: that is the Claude path; a Codex session has no `Agent` tool, so it invokes a one-tier-up `codex exec -m <one-up>` review instead (`luna→terra→sol`, `sol` ceiling = same-tier blind) — see the `ironclaude:advisor-fallback` skill
    - Weight its findings as you would the advisor's; "no advisor" means "use a subagent for the same effect," never "proceed unreviewed"
 
 10. **No Workflow Avoidance Under Stage/Context Restrictions**
@@ -246,6 +247,7 @@ Concept 9 (Advisor Fallback):
 N. **Advisor Fallback**
    - When the `advisor` tool returns unavailable, do NOT skip the advisor step or just reason it through yourself
    - Spawn a top-tier subagent via the `Agent` tool (`model=fable` if Fable is available, else `model=opus`) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
+   - Client-aware: that is the Claude path; a Codex session has no `Agent` tool, so it invokes a one-tier-up `codex exec -m <one-up>` review instead (`luna→terra→sol`, `sol` ceiling = same-tier blind) — see the `ironclaude:advisor-fallback` skill
    - Weight its findings as you would the advisor's; "no advisor" means "use a subagent for the same effect," never "proceed unreviewed"
 ```
 

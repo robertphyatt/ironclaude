@@ -104,8 +104,17 @@ describe('submit_tier_up_review', () => {
 
   it('errors when workflow stage is not final_plan_prep/executing', () => {
     seed(db, 'plan_ready');
-    const r = parse(handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'ok' }, db, SESSION_ID));
+    const r = parse(handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'SOLID' }, db, SESSION_ID));
     expect(r.error).toContain('final_plan_prep');
+  });
+
+  it('rejects unknown verdicts without inserting review state', () => {
+    seed(db, 'final_plan_prep');
+    const r = parse(handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'proceed anyway' }, db, SESSION_ID));
+    expect(r.error).toContain('verdict');
+    const count = db.prepare(`SELECT COUNT(*) AS count FROM tier_up_reviews WHERE terminal_session=?`)
+      .get(SESSION_ID) as { count: number };
+    expect(count.count).toBe(0);
   });
 
   it('errors when required args missing', () => {
@@ -139,6 +148,22 @@ describe('start_execution — tier-up gate', () => {
     expect(stage()).toBe('executing');
   });
 
+  it('enforced + matching HAS-ISSUES review → BLOCKS', () => {
+    setPolicy('enforced');
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'HAS-ISSUES' }, db, SESSION_ID);
+    const r = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
+    expect(r.error).toContain('HAS-ISSUES');
+    expect(stage()).toBe('final_plan_prep');
+  });
+
+  it('enforced + matching top-tier-self review → advances', () => {
+    setPolicy('enforced');
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'fable', verdict: 'top-tier-self' }, db, SESSION_ID);
+    const r = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
+    expect(r.error).toBeUndefined();
+    expect(stage()).toBe('executing');
+  });
+
   it('enforced + review row for a DIFFERENT plan (hash mismatch) → BLOCKS', () => {
     setPolicy('enforced');
     handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'SOLID' }, db, SESSION_ID);
@@ -156,8 +181,32 @@ describe('start_execution — tier-up gate', () => {
     expect(stage()).toBe('executing');
   });
 
+  it('commander-choice + latest review HAS-ISSUES requires a current-plan pass', () => {
+    setPolicy('commander-choice');
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'HAS-ISSUES' }, db, SESSION_ID);
+    const revised = JSON.stringify({ name: 'P2', goal: 'g2', design_file: 'd-design.md', tasks: [] });
+    db.prepare(`UPDATE sessions SET plan_json=? WHERE terminal_session=?`).run(revised, SESSION_ID);
+
+    const blocked = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
+    expect(blocked.error).toContain('HAS-ISSUES');
+    expect(stage()).toBe('final_plan_prep');
+
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'SOLID' }, db, SESSION_ID);
+    const passed = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
+    expect(passed.error).toBeUndefined();
+    expect(stage()).toBe('executing');
+  });
+
   it('off + no row → advances (no gate)', () => {
     setPolicy('off');
+    const r = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
+    expect(r.error).toBeUndefined();
+    expect(stage()).toBe('executing');
+  });
+
+  it('off remains the explicit human override after HAS-ISSUES', () => {
+    setPolicy('off');
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'HAS-ISSUES' }, db, SESSION_ID);
     const r = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
     expect(r.error).toBeUndefined();
     expect(stage()).toBe('executing');

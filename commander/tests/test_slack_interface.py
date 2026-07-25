@@ -891,3 +891,36 @@ class TestSlackBotPrefixProperty:
     def test_prefix_property_returns_configured_prefix(self, mock_client_cls):
         bot = SlackBot(token="xoxb-test", channel_id="C123")
         assert bot.prefix == "[IRONCLAUDE] "
+
+
+class TestProviderCommandParsing:
+    def test_bare_provider_has_no_args(self):
+        from ironclaude.slack_interface import parse_inbound_command
+        parsed = parse_inbound_command("provider")
+        assert parsed["type"] == "provider"
+        assert parsed["args"] == []
+
+    def test_role_and_client_args(self):
+        from ironclaude.slack_interface import parse_inbound_command
+        assert parse_inbound_command("provider worker codex") == {
+            "type": "provider", "args": ["worker", "codex"],
+        }
+
+    def test_case_insensitive_and_extra_whitespace(self):
+        from ironclaude.slack_interface import parse_inbound_command
+        assert parse_inbound_command("  PROVIDER   Worker    CODEX ") == {
+            "type": "provider", "args": ["worker", "codex"],
+        }
+
+    def test_partial_command_is_still_a_provider_command(self):
+        """A half-typed command must NOT fall through to {"type": "message"} — the daemon
+        forwards those to the Brain as an OPERATOR MESSAGE, turning a typo into a directive."""
+        from ironclaude.slack_interface import parse_inbound_command
+        parsed = parse_inbound_command("provider worker")
+        assert parsed["type"] == "provider", parsed
+        assert parsed["args"] == ["worker"]
+
+    def test_provider_listed_in_help(self):
+        from ironclaude.slack_interface import SLASH_COMMANDS, format_help_text
+        assert "provider" in SLASH_COMMANDS
+        assert "provider" in format_help_text()

@@ -28,7 +28,7 @@ from ironclaude.slack_interface import SlackBot, DIRECTIVE_STATUS_EMOJI
 from ironclaude.slack_commands import SlackSocketHandler, format_help_text
 from ironclaude.db import init_db
 from ironclaude.tmux_manager import TmuxManager, _strip_ansi
-from ironclaude.brain_client import BrainClient
+from ironclaude.brain_client import BrainClient, _NARRATION_PREFIX
 from ironclaude.worker_registry import WorkerRegistry
 from ironclaude.protocol import read_pending_decisions, read_task_ledger, write_decision
 from ironclaude.notifications import (
@@ -130,6 +130,71 @@ _UUID_RE = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 
+_SESSION_SWEEP_MAX_AGE_HOURS = 24
+
+
+def _scan_session_id_files(claude_dir):
+    """Partition ``claude_dir/ironclaude-session-<pid>.id`` files into
+    ``(live_uuids, dead_files)``. A file whose pid is alive (``os.kill(pid, 0)``
+    succeeds, or raises ``PermissionError`` — the process exists under another uid)
+    contributes its UUID to the live set and is kept; a file whose pid is dead
+    (``ProcessLookupError``) is returned for removal. Mirrors the ``kill -0`` liveness
+    precedent in session-init.sh:288-302. Unix-only (``os.kill``)."""
+    live_uuids: set[str] = set()
+    dead_files: list[Path] = []
+    try:
+        candidates = list(claude_dir.glob("ironclaude-session-*.id"))
+    except OSError:
+        return live_uuids, dead_files
+    for f in candidates:
+        pid_str = f.name[len("ironclaude-session-"):-len(".id")]
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue  # malformed name — leave it alone
+        alive = True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True  # exists under another uid — fail-safe: protect
+        except OSError:
+            alive = True  # unknown error — fail-safe: protect
+        if alive:
+            try:
+                uuid = f.read_text().strip()
+            except OSError:
+                continue
+            if _UUID_RE.match(uuid):
+                live_uuids.add(uuid)
+        else:
+            dead_files.append(f)
+    return live_uuids, dead_files
+
+
+def _sweep_stale_sessions(db_path, live_uuids, max_age_hours):
+    """Delete ``idle``+``undecided`` sessions rows older than ``max_age_hours`` whose
+    UUID is not in ``live_uuids``. Returns the count deleted. Filtering the live set in
+    Python avoids the empty ``NOT IN ()`` SQL hazard."""
+    conn = sqlite3.connect(db_path, timeout=10)
+    try:
+        cutoff = f"-{int(max_age_hours)} hours"
+        rows = conn.execute(
+            "SELECT terminal_session FROM sessions "
+            "WHERE workflow_stage='idle' AND professional_mode='undecided' "
+            "AND updated_at < datetime('now', ?)",
+            (cutoff,),
+        ).fetchall()
+        stale = [(r[0],) for r in rows if r[0] not in live_uuids]
+        if stale:
+            conn.executemany("DELETE FROM sessions WHERE terminal_session=?", stale)
+            conn.commit()
+        return len(stale)
+    finally:
+        conn.close()
+
+
 _LIMIT_COOLDOWN_S = 1800  # re-alert the SAME limit signal at most once per ~window
 # separators seen in the wild: middle-dot, colon, hyphen, em-dash; apostrophe may be straight or curly
 _ACCOUNT_LIMIT_RE = re.compile(r"you['’]?ve hit your limit(?:\s*[·:\-—]\s*(resets[^\n]*))?", re.IGNORECASE)
@@ -192,6 +257,26 @@ STAGE_STALENESS_MULTIPLIER = {
     "brainstorming": 0.75,
     "debugging": 0.75,
 }
+
+def select_brain_class():
+    """Choose the Brain implementation.
+
+    Codex is reachable ONLY via an explicit ``BRAIN_CLIENT=codex`` opt-in. The
+    provider-router route is unavailable: ``provider_config.py`` rejects a role
+    that lists a globally-disabled client, and ``load_config()`` runs that
+    validator unguarded at startup, so adding ``"codex"`` to
+    ``roles.brain.clients`` while ``clients.codex.enabled`` is False would crash
+    the daemon on the stock config.
+
+    Any unrecognised value falls back to Claude — never fail to start over a typo.
+    The env var is read at call time (not import time) so tests can monkeypatch it.
+    """
+    if os.environ.get("BRAIN_CLIENT", "").strip().lower() == "codex":
+        from ironclaude.codex_brain_client import CodexBrainClient
+
+        return CodexBrainClient
+    return BrainClient
+
 
 _daemon = None
 _pid_lock_fd: int | None = None
@@ -900,6 +985,26 @@ class IroncladeDaemon:
         except Exception as e:
             logger.warning(f"Maintenance: audit_log pruning failed: {e}")
 
+        # 4. Sweep stale idle/undecided session artifacts (rows + dead-pid id files)
+        try:
+            claude_dir = Path(self._state_manager_db_path).parent
+            live_uuids, dead_files = _scan_session_id_files(claude_dir)
+            for f in dead_files:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            deleted = _sweep_stale_sessions(
+                self._state_manager_db_path, live_uuids, _SESSION_SWEEP_MAX_AGE_HOURS
+            )
+            if deleted or dead_files:
+                logger.info(
+                    "Maintenance: session sweep removed %d stale rows, %d dead id files",
+                    deleted, len(dead_files),
+                )
+        except Exception as e:
+            logger.warning(f"Maintenance: session sweep failed: {e}")
+
     def poll_slack_commands(self):
         """Drain and process Slack commands."""
         if not self.socket_handler:
@@ -991,6 +1096,8 @@ class IroncladeDaemon:
                 self._handle_summary()
             elif cmd_type == "audit":
                 self._handle_audit()
+            elif cmd_type == "provider":
+                self._handle_provider_command(parsed.get("args"))
             elif self.plugin_registry.handle_command(self, cmd_type, parsed):
                 pass  # handled by plugin
             else:
@@ -1018,6 +1125,85 @@ class IroncladeDaemon:
                 self.slack.post_message("Still completing sign-in…")
             elif st == "needs_code":
                 self.slack.post_message("Sign-in needs a new code — reply `login code <the-code>` with just the code (no extra text).")
+
+    def _handle_provider_command(self, args) -> None:
+        """Show or set provider routing.
+
+        A set is REJECTED unless the client is in the role's configured `clients` list and
+        globally enabled — ProviderRouter falls back to `preferred` otherwise, so persisting
+        it would look like it worked and then be silently ignored.
+        """
+        from ironclaude.provider_config import CLIENT_NAMES, ROLE_NAMES
+        from ironclaude.provider_state import ProviderState
+
+        usage = "Usage: `/ironclaude provider` (status) or `/ironclaude provider <role> <client>`."
+        args = list(args or [])
+        if len(args) not in (0, 2):
+            self.slack.post_message(usage)
+            return
+
+        providers = (self.config or {}).get("providers", {})
+        roles = providers.get("roles", {})
+        clients = providers.get("clients", {})
+
+        if not args:
+            try:
+                state = ProviderState(self._db)
+                lines = ["*Provider routing:*"]
+                for name in ROLE_NAMES:
+                    cfg = roles.get(name, {})
+                    preferred = cfg.get("preferred", "?")
+                    allowed_list = cfg.get("clients", [])
+                    allowed = ", ".join(allowed_list) or "-"
+                    # Mirror ProviderRouter.resolve: a sticky client that is no longer in the
+                    # role's clients list is IGNORED and the router falls back to preferred.
+                    # Reporting the raw sticky value here would misstate what is actually routing.
+                    sticky = state.get_current_client(name)
+                    effective = sticky if sticky in allowed_list else preferred
+                    note = ""
+                    if sticky and sticky not in allowed_list:
+                        note = f" — stored `{sticky}` is ignored (not in clients)"
+                    lines.append(
+                        f"• `{name}` — current: *{effective}* (preferred: {preferred}; clients: {allowed}){note}"
+                    )
+                enabled = [c for c in CLIENT_NAMES if clients.get(c, {}).get("enabled")]
+                lines.append(f"\nEnabled clients: {', '.join(enabled) or 'none'}")
+                lines.append(usage)
+                self.slack.post_message("\n".join(lines))
+            except Exception as e:
+                self.slack.post_message(f"Couldn't read provider routing: {e}")
+            return
+
+        role, client = args
+        if role not in ROLE_NAMES:
+            self.slack.post_message(f"Unknown role `{role}`. Valid roles: {', '.join(ROLE_NAMES)}.")
+            return
+        if client not in CLIENT_NAMES:
+            self.slack.post_message(f"Unknown client `{client}`. Valid clients: {', '.join(CLIENT_NAMES)}.")
+            return
+        allowed = roles.get(role, {}).get("clients", [])
+        if client not in allowed:
+            # NOTE: adding a client to a role's `clients` WITHOUT also enabling it makes
+            # provider_config reject the config at startup (load_config validates unguarded),
+            # so the guidance must name both edits.
+            self.slack.post_message(
+                f"`{client}` is not in `{role}`'s clients list ({', '.join(allowed) or 'none'}) — "
+                f"the router would ignore it. Add it to providers.roles.{role}.clients AND set "
+                f"providers.clients.{client}.enabled=true (both, or the daemon won't start), then restart."
+            )
+            return
+        if not clients.get(client, {}).get("enabled"):
+            self.slack.post_message(
+                f"Client `{client}` is disabled — enable providers.clients.{client}.enabled first."
+            )
+            return
+
+        try:
+            ProviderState(self._db).set_current_client(role, client)
+        except Exception as e:
+            self.slack.post_message(f"Failed to set provider for `{role}`: {e}")
+            return
+        self.slack.post_message(f"`{role}` now routes to *{client}*.")
 
     def _handle_directive_confirmation(self, text: str) -> bool:
         """Check if text is a yes/no reply to a pending directive confirmation.
@@ -1567,6 +1753,17 @@ class IroncladeDaemon:
                     self.slack.add_reaction("white_check_mark", reply_ts)
                 else:
                     logger.info("Brain reply not delivered for reply_ts=%s (empty or chunk failure)", reply_ts)
+                continue
+            if text.startswith(_NARRATION_PREFIX):
+                # Brain narration: thread-only under the last heartbeat, and NEVER through
+                # the directive-ref/reason gate below (that path sends [CONTEXT REQUIRED]
+                # back to the Brain — the d1435 flood/restart-loop). No heartbeat yet ⇒ drop
+                # (thread_ts=None would post top-level, violating thread-only).
+                body = text[len(_NARRATION_PREFIX):]
+                if self._last_heartbeat_ts is not None:
+                    self._post_brain_message(body, thread_ts=self._last_heartbeat_ts)
+                else:
+                    logger.debug("Brain narration dropped (no heartbeat thread yet): %s", body[:80])
                 continue
             valid, reason = self._validate_brain_message(text)
             if not valid:
@@ -2303,7 +2500,8 @@ class IroncladeDaemon:
             last_contact = 0.0
             if os.path.exists(contact_path):
                 try:
-                    last_contact = float(open(contact_path).read().strip())
+                    with open(contact_path) as f:
+                        last_contact = float(f.read().strip())
                 except (ValueError, OSError):
                     pass
 
@@ -2825,7 +3023,7 @@ def main():
     tmux = TmuxManager(log_dir=config.get("log_dir", "/tmp/ic-logs"), ssh_manager=ssh_manager)
     registry = WorkerRegistry(conn)
     _kill_orphan_workers(tmux, registry)
-    brain = BrainClient(
+    brain = select_brain_class()(
         timeout_seconds=config.get("brain_timeout_seconds", 600),
         operator_name=config.get("operator_name", "Operator"),
         model=config.get("brain_model", "opus"),

@@ -96,6 +96,18 @@ def _is_model_unavailable_text(text: str) -> bool:
     return any(phrase in t for phrase in _MODEL_UNAVAILABLE_TEXT_PHRASES)
 
 
+def _is_usage_limit_text(text: str) -> bool:
+    """Return True if brain assistant TEXT signals an account usage limit, e.g.
+    "You've hit your limit · resets 4:10am (America/Chicago)". The distinctive
+    anchor is "hit your limit"; the reset time is parsed downstream by
+    fable_availability.parse_reset_time, so this predicate matches the phrase only
+    (no reset-regex duplication). Disjoint from _is_model_unavailable_text — a real
+    account usage limit never says "selected model"."""
+    if not text:
+        return False
+    return "hit your limit" in text.lower()
+
+
 class _ModelUnavailableFromMessage(Exception):
     """Raised when the brain's assistant TEXT (not an exception) signals the model
     is unavailable, so the outer handler can fall back to opus — mirroring the
@@ -115,6 +127,13 @@ def _model_needs_1m_beta(model: str) -> bool:
     """
     model_lower = model.lower()
     return any(token in model_lower for token in _MODELS_NEEDING_1M_BETA)
+
+
+# Tag for Brain narration relayed to Slack. main.py's poll_brain_responses routes
+# `[NARRATION] `-prefixed items THREAD-ONLY (under the last heartbeat), bypassing the
+# directive-ref/reason gate so narration never triggers the [CONTEXT REQUIRED] feedback
+# loop (the d1435 restart-loop bug).
+_NARRATION_PREFIX = "[NARRATION] "
 
 
 class BrainClient:
@@ -787,18 +806,29 @@ class BrainClient:
                                 text_parts.append(block.text)
                         if text_parts:
                             full_text = "\n\n".join(text_parts)
-                            # Message-shaped model-unavailability: the SDK returned the
-                            # error as normal assistant text rather than raising, so the
-                            # exception fallback never fires. Detect it and fall back to
-                            # opus (unless we are already on opus — nothing higher to try).
+                            # Message-shaped model-unavailability OR account usage-limit:
+                            # the SDK returned the error as normal assistant text rather
+                            # than raising, so the exception fallback never fires. Detect
+                            # it and fall back to opus (unless already on opus — nothing
+                            # higher to try). A usage-limit reason is sized to the account
+                            # reset time by fable_availability; a genuine outage to 24h.
                             if (
-                                _is_model_unavailable_text(full_text)
+                                (_is_model_unavailable_text(full_text)
+                                 or _is_usage_limit_text(full_text))
                                 and "opus" not in self._model.lower()
                             ):
                                 raise _ModelUnavailableFromMessage(full_text)
                             self._executing_tool = False
                             self._session_log_write(f"MSG_SEND chars={len(full_text)} preview={full_text[:100]!r}")
                             logger.info(f"Brain response received ({len(full_text)} chars)")
+                            # Thread-only narration relay: operators see the Brain thinking
+                            # under the heartbeat thread. Tagged so poll_brain_responses routes
+                            # it around the directive-ref/reason gate (never [CONTEXT REQUIRED]).
+                            # Skip outage/limit text (belt-and-braces for the opus edge where
+                            # the raise above is bypassed) — that is surfaced separately.
+                            if not (_is_model_unavailable_text(full_text)
+                                    or _is_usage_limit_text(full_text)):
+                                self._response_queue.put(f"{_NARRATION_PREFIX}{full_text}")
                             correction = await self._maybe_correct_permission_seeking(full_text)
                             if correction is not None:
                                 await self._message_queue.put(correction)

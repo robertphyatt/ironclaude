@@ -3222,8 +3222,8 @@ var require_utils = __commonJS({
       }
       return ind;
     }
-    function removeDotSegments(path5) {
-      let input = path5;
+    function removeDotSegments(path6) {
+      let input = path6;
       const output = [];
       let nextSlash = -1;
       let len = 0;
@@ -3422,8 +3422,8 @@ var require_schemes = __commonJS({
         wsComponent.secure = void 0;
       }
       if (wsComponent.resourceName) {
-        const [path5, query] = wsComponent.resourceName.split("?");
-        wsComponent.path = path5 && path5 !== "/" ? path5 : void 0;
+        const [path6, query] = wsComponent.resourceName.split("?");
+        wsComponent.path = path6 && path6 !== "/" ? path6 : void 0;
         wsComponent.query = query;
         wsComponent.resourceName = void 0;
       }
@@ -4224,7 +4224,7 @@ var require_core = __commonJS({
       errorsText(errors = this.errors, { separator = ", ", dataVar = "data" } = {}) {
         if (!errors || errors.length === 0)
           return "No errors";
-        return errors.map((e) => `${dataVar}${e.instancePath} ${e.message}`).reduce((text, msg) => text + separator + msg);
+        return errors.map((e) => `${dataVar}${e.instancePath} ${e.message}`).reduce((text2, msg) => text2 + separator + msg);
       }
       $dataMetaSchema(metaSchema, keywordsJsonPointers) {
         const rules = this.RULES.all;
@@ -7276,8 +7276,8 @@ function getErrorMap() {
 
 // node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue = (params) => {
-  const { data, path: path5, errorMaps, issueData } = params;
-  const fullPath = [...path5, ...issueData.path || []];
+  const { data, path: path6, errorMaps, issueData } = params;
+  const fullPath = [...path6, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -7289,15 +7289,15 @@ var makeIssue = (params) => {
       message: issueData.message
     };
   }
-  let errorMessage = "";
+  let errorMessage2 = "";
   const maps = errorMaps.filter((m) => !!m).slice().reverse();
   for (const map of maps) {
-    errorMessage = map(fullIssue, { data, defaultError: errorMessage }).message;
+    errorMessage2 = map(fullIssue, { data, defaultError: errorMessage2 }).message;
   }
   return {
     ...issueData,
     path: fullPath,
-    message: errorMessage
+    message: errorMessage2
   };
 };
 var EMPTY_PATH = [];
@@ -7393,11 +7393,11 @@ var errorUtil;
 
 // node_modules/zod/v3/types.js
 var ParseInputLazyPath = class {
-  constructor(parent, value, path5, key) {
+  constructor(parent, value, path6, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path5;
+    this._path = path6;
     this._key = key;
   }
   get path() {
@@ -12645,8 +12645,7 @@ var StdioServerTransport = class {
 };
 
 // src/index.ts
-import { fileURLToPath } from "url";
-import path4 from "path";
+import path5 from "path";
 import fs4 from "fs";
 import os4 from "os";
 
@@ -13103,8 +13102,155 @@ function getTierUpReviewByHash(db, sessionId, planHash) {
   return db.prepare(`
     SELECT * FROM tier_up_reviews
     WHERE terminal_session = ? AND plan_hash = ?
-    ORDER BY created_at DESC LIMIT 1
+    ORDER BY id DESC LIMIT 1
   `).get(sessionId, planHash);
+}
+function getLatestTierUpReview(db, sessionId) {
+  return db.prepare(`
+    SELECT * FROM tier_up_reviews
+    WHERE terminal_session = ?
+    ORDER BY id DESC LIMIT 1
+  `).get(sessionId);
+}
+
+// src/session-identity.ts
+function record(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Missing or invalid ${label}`);
+  }
+  return value;
+}
+function text(value, label) {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`Missing or invalid ${label}`);
+  }
+  return value;
+}
+function parseIronClaudeClient(value) {
+  if (value === "claude" || value === "codex") return value;
+  throw new Error(`IRONCLAUDE_CLIENT must be "claude" or "codex", got ${String(value)}`);
+}
+function resolveSessionIdentity(client2, requestMeta, claudePpidSession) {
+  if (client2 === "claude") {
+    const meta2 = requestMeta && typeof requestMeta === "object" ? requestMeta : {};
+    if ("threadId" in meta2 || "x-codex-turn-metadata" in meta2) {
+      throw new Error("Codex request metadata cannot identify a Claude session");
+    }
+    return {
+      client: client2,
+      sessionId: text(claudePpidSession, "Claude PPID session ID"),
+      invocationThreadId: null,
+      source: "ppid_file"
+    };
+  }
+  const meta = record(requestMeta, "Codex request metadata");
+  const invocationThreadId = text(meta.threadId, "Codex threadId");
+  const turn = record(meta["x-codex-turn-metadata"], "x-codex-turn-metadata");
+  const sessionId = text(turn.session_id, "Codex root session_id");
+  const nestedThreadId = text(turn.thread_id, "Codex thread_id");
+  const threadSource = text(turn.thread_source, "Codex thread_source");
+  if (invocationThreadId !== nestedThreadId) {
+    throw new Error("Codex top-level threadId disagrees with nested thread_id");
+  }
+  if (threadSource === "subagent") {
+    const parentThreadId = text(turn.parent_thread_id, "Codex parent_thread_id");
+    const forkedFromThreadId = text(turn.forked_from_thread_id, "Codex forked_from_thread_id");
+    if (sessionId !== parentThreadId || sessionId !== forkedFromThreadId) {
+      throw new Error("Codex subagent root session fields disagree");
+    }
+  } else if (sessionId !== invocationThreadId) {
+    throw new Error("Codex root session_id disagrees with root threadId");
+  }
+  return { client: client2, sessionId, invocationThreadId, source: "codex_meta" };
+}
+
+// src/runtime-fingerprint.ts
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import path2 from "node:path";
+import { fileURLToPath } from "node:url";
+var MANIFEST_BY_CLIENT = {
+  codex: ".codex-plugin/plugin.json",
+  claude: ".claude-plugin/plugin.json"
+};
+function sha256(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+function captureRuntimeFingerprintFromPaths(pluginRoot, bundlePath, client2) {
+  const resolvedRoot = path2.resolve(pluginRoot);
+  const resolvedBundle = path2.resolve(bundlePath);
+  const manifestPath = path2.join(resolvedRoot, MANIFEST_BY_CLIENT[client2]);
+  try {
+    const manifestBytes = readFileSync(manifestPath);
+    const bundleBytes = readFileSync(resolvedBundle);
+    let manifest;
+    try {
+      manifest = JSON.parse(manifestBytes.toString("utf8"));
+    } catch (error) {
+      throw new Error(`Could not parse runtime manifest ${manifestPath}: ${errorMessage(error)}`);
+    }
+    if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+      throw new Error(`Runtime manifest ${manifestPath} must contain a JSON object`);
+    }
+    const record2 = manifest;
+    if (record2.name !== "ironclaude") {
+      throw new Error(`Runtime manifest ${manifestPath} must have name "ironclaude"`);
+    }
+    if (typeof record2.version !== "string" || record2.version.trim().length === 0) {
+      throw new Error(`Runtime manifest ${manifestPath} must have a non-empty string version`);
+    }
+    return {
+      ok: true,
+      runtime: Object.freeze({
+        plugin_name: record2.name,
+        plugin_version: record2.version,
+        plugin_root: resolvedRoot,
+        manifest_path: manifestPath,
+        manifest_sha256: sha256(manifestBytes),
+        bundle_path: resolvedBundle,
+        bundle_sha256: sha256(bundleBytes),
+        client: client2
+      })
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: `Runtime fingerprint capture failed for manifest ${manifestPath} and bundle ${resolvedBundle}: ${errorMessage(error)}`
+    };
+  }
+}
+function captureRuntimeFingerprint(moduleUrl, client2) {
+  try {
+    const bundlePath = fileURLToPath(moduleUrl);
+    const pluginRoot = path2.resolve(path2.dirname(bundlePath), "..", "..", "..");
+    return captureRuntimeFingerprintFromPaths(pluginRoot, bundlePath, client2);
+  } catch (error) {
+    return { ok: false, error: `Runtime fingerprint module URL is invalid: ${errorMessage(error)}` };
+  }
+}
+function verifyRuntimeActivation(capture, expected) {
+  if (!capture) {
+    return { ok: false, errors: ["Runtime fingerprint capture is missing"] };
+  }
+  if (!capture.ok) {
+    return { ok: false, errors: [`Runtime fingerprint capture failed: ${capture.error}`] };
+  }
+  const fields = [
+    "plugin_version",
+    "plugin_root",
+    "manifest_sha256",
+    "bundle_sha256",
+    "client"
+  ];
+  const errors = fields.flatMap((field) => {
+    const actual = capture.runtime[field];
+    const wanted = expected?.[field];
+    return actual === wanted ? [] : [`${field} mismatch: expected=${String(wanted)}, actual=${String(actual)}`];
+  });
+  return errors.length === 0 ? { ok: true } : { ok: false, errors };
 }
 
 // src/state-machine.ts
@@ -13232,6 +13378,86 @@ function validateWorkflowTransition(current, target, context) {
     reason: `Valid forward transition: ${current} -> ${target}`
   };
 }
+function executeWorkflowTransition(db, sessionId, target, options) {
+  const transition = db.transaction(() => {
+    const session = getSession(db, sessionId);
+    if (!session) {
+      return {
+        ok: false,
+        error: `Session not found: ${sessionId}`,
+        to: target,
+        session_id: sessionId
+      };
+    }
+    const from = session.workflow_stage;
+    if (from === target) {
+      return {
+        ok: true,
+        changed: false,
+        from,
+        to: target,
+        session_id: sessionId
+      };
+    }
+    const context = {
+      session,
+      from,
+      to: target,
+      sessionId
+    };
+    const prerequisites = options.prerequisites?.(session) ?? {
+      hasDesign: true,
+      designConsumed: true,
+      hasPlan: true
+    };
+    let validation = validateWorkflowTransition(from, target, prerequisites);
+    validation = options.validate?.(context, validation) ?? validation;
+    if (!validation.valid) {
+      return {
+        ok: false,
+        error: validation.reason,
+        from,
+        to: target,
+        session_id: sessionId
+      };
+    }
+    const guardError = options.guard?.(context);
+    if (guardError) {
+      return {
+        ok: false,
+        error: guardError,
+        from,
+        to: target,
+        session_id: sessionId
+      };
+    }
+    const artifactFields = options.applyArtifacts?.(context) ?? {};
+    updateSession(db, sessionId, {
+      ...options.updateFields,
+      ...artifactFields,
+      workflow_stage: target
+    });
+    const action = typeof options.action === "function" ? options.action(context) : options.action;
+    const actor = typeof options.actor === "function" ? options.actor(context) : options.actor ?? "claude";
+    const auditContext = typeof options.auditContext === "function" ? options.auditContext(context) : options.auditContext;
+    insertAuditLog(db, {
+      terminal_session: sessionId,
+      actor,
+      action,
+      old_value: from,
+      new_value: target,
+      context: auditContext
+    });
+    return {
+      ok: true,
+      changed: true,
+      from,
+      to: target,
+      session_id: sessionId
+    };
+  });
+  return transition();
+}
 function computeNextWave(planJson, completedTaskIds) {
   const completedSet = new Set(completedTaskIds);
   return planJson.tasks.filter((task) => {
@@ -13335,11 +13561,11 @@ function validatePlanJson(json) {
     errors
   };
 }
-function executeRetreat(db, sessionId, from, to, reason) {
-  const session = getSession(db, sessionId);
-  if (!session) {
-    throw new Error(`Session not found: ${sessionId}`);
-  }
+function prepareRetreatArtifacts(db, sessionId, session, from, reason) {
+  const sessionFields = {
+    review_pending: 0,
+    circuit_breaker: 0
+  };
   if (from === "executing" && session.plan_json) {
     let planData = null;
     try {
@@ -13361,11 +13587,9 @@ function executeRetreat(db, sessionId, from, to, reason) {
         retreat_reason: reason
       });
     }
-    updateSession(db, sessionId, {
-      plan_json: null,
-      current_wave: 0,
-      plan_name: null
-    });
+    sessionFields.plan_json = null;
+    sessionFields.current_wave = 0;
+    sessionFields.plan_name = null;
   }
   if (["plan_ready", "plan_marked_for_use", "final_plan_prep", "executing", "reviewing", "plan_interrupted"].includes(from)) {
     let designFile = null;
@@ -13390,43 +13614,18 @@ function executeRetreat(db, sessionId, from, to, reason) {
       unconsumeDesign(db, designFile);
     }
   }
-  updateSession(db, sessionId, {
-    workflow_stage: to,
-    review_pending: 0,
-    circuit_breaker: 0
-  });
-  insertAuditLog(db, {
-    terminal_session: sessionId,
-    actor: "system",
-    action: "retreat",
-    old_value: from,
-    new_value: to,
-    context: reason
-  });
+  return sessionFields;
 }
 
 // src/tools/read-tools.ts
-import path2 from "path";
+import path3 from "path";
 import os2 from "os";
 import fs2 from "fs";
-var _currentSessionId = null;
-function setCurrentSession(sessionId) {
-  _currentSessionId = sessionId;
-}
-var _sessionBindingSource = "none";
-function setSessionBindingSource(source) {
-  _sessionBindingSource = source;
-}
-function resolveSessionId(db, explicitId) {
-  if (explicitId) {
-    return explicitId;
+function requireSessionId(sessionId) {
+  if (!sessionId) {
+    throw new Error("Resolved session ID is required before read tool handling");
   }
-  if (_currentSessionId) {
-    return _currentSessionId;
-  }
-  throw new Error(
-    `No session ID available. CLAUDE_SESSION_ID env var not set and no explicit session_id provided. CLAUDE_SESSION_ID=${process.env.CLAUDE_SESSION_ID || "unset"}. Check plugin.json env config and session-init.sh.`
-  );
+  return sessionId;
 }
 var readToolDefinitions = [
   {
@@ -13522,15 +13721,28 @@ var readToolDefinitions = [
   },
   {
     name: "run_diagnostics",
-    description: "Run infrastructure health checks. Tests sqlite3 availability, DB existence, WAL mode, session row, read/write/read-back cycle, and audit log. Returns structured results.",
+    description: "Run infrastructure health checks and report the provider-native startup runtime fingerprint. Optionally verifies exact expected runtime identity.",
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        expected_runtime: {
+          type: "object",
+          properties: {
+            plugin_version: { type: "string" },
+            plugin_root: { type: "string" },
+            manifest_sha256: { type: "string" },
+            bundle_sha256: { type: "string" },
+            client: { type: "string", enum: ["claude", "codex"] }
+          },
+          required: ["plugin_version", "plugin_root", "manifest_sha256", "bundle_sha256", "client"],
+          additionalProperties: false
+        }
+      },
       required: [],
       additionalProperties: false
     },
     annotations: {
-      readOnlyHint: false,
+      readOnlyHint: true,
       destructiveHint: false,
       idempotentHint: true
     }
@@ -13567,8 +13779,8 @@ var readToolDefinitions = [
   }
 ];
 var readToolNames = new Set(readToolDefinitions.map((t) => t.name));
-function handleReadTool(name, args, db, sessionId) {
-  const resolvedId = resolveSessionId(db, sessionId);
+function handleReadTool(name, args, db, sessionId, identity, runtimeFingerprint2) {
+  const resolvedId = requireSessionId(sessionId);
   switch (name) {
     // ----- get_plan_status -----
     case "get_plan_status": {
@@ -13834,18 +14046,15 @@ function handleReadTool(name, args, db, sessionId) {
     // ----- run_diagnostics -----
     case "run_diagnostics": {
       const results = [];
-      const envSessionId = process.env.CLAUDE_SESSION_ID ?? null;
-      const boundSessionId = _currentSessionId;
-      if (boundSessionId && !boundSessionId.startsWith("${")) {
-        results.push({ test: "Session ID bound", status: "PASS", detail: `source=${_sessionBindingSource}, bound=${boundSessionId}` });
-      } else if (boundSessionId && boundSessionId.startsWith("${")) {
-        results.push({ test: "Session ID bound", status: "FAIL", detail: `UNEXPANDED env var: ${boundSessionId}` });
-      } else if (envSessionId) {
-        results.push({ test: "Session ID bound", status: "WARN", detail: `source=${_sessionBindingSource}, env set but not bound: ${envSessionId}` });
-      } else {
-        results.push({ test: "Session ID bound", status: "FAIL", detail: `source=${_sessionBindingSource}, CLAUDE_SESSION_ID not set and no bound session` });
+      if (!identity || identity.sessionId !== resolvedId) {
+        throw new Error("Resolved session identity context is required for diagnostics");
       }
-      const dbPath = path2.join(os2.homedir(), ".claude", "ironclaude.db");
+      results.push({
+        test: "Session identity resolved",
+        status: "PASS",
+        detail: `client=${identity.client}, session=${identity.sessionId}, source=${identity.source}, invocation=${identity.invocationThreadId ?? "root"}`
+      });
+      const dbPath = path3.join(os2.homedir(), ".claude", "ironclaude.db");
       const dbExists = fs2.existsSync(dbPath);
       results.push({ test: "DB file exists", status: dbExists ? "PASS" : "FAIL", detail: dbPath });
       let walOk = false;
@@ -13877,41 +14086,88 @@ function handleReadTool(name, args, db, sessionId) {
         results.push({ test: "Read workflow_stage", status: "FAIL", detail: String(e) });
       }
       const diagTs = (/* @__PURE__ */ new Date()).toISOString();
+      let savepointActive = false;
       try {
-        const info = db.prepare("UPDATE sessions SET updated_at = ? WHERE terminal_session = ?").run(diagTs, resolvedId);
-        results.push({ test: "Write test (updated_at)", status: info.changes > 0 ? "PASS" : "FAIL", detail: `changes=${info.changes}` });
+        db.exec("SAVEPOINT ironclaude_diagnostics");
+        savepointActive = true;
       } catch (e) {
-        results.push({ test: "Write test (updated_at)", status: "FAIL", detail: String(e) });
+        const detail = `Could not open diagnostics savepoint: ${String(e)}`;
+        results.push({ test: "Write test (updated_at)", status: "FAIL", detail });
+        results.push({ test: "Read-back verification", status: "FAIL", detail });
+        results.push({ test: "Audit log writable", status: "FAIL", detail });
       }
-      try {
-        const row = db.prepare("SELECT updated_at FROM sessions WHERE terminal_session = ?").get(resolvedId);
-        const matches = row?.updated_at === diagTs;
-        results.push({ test: "Read-back verification", status: matches ? "PASS" : "FAIL", detail: `expected=${diagTs}, got=${row?.updated_at}` });
-      } catch (e) {
-        results.push({ test: "Read-back verification", status: "FAIL", detail: String(e) });
-      }
-      try {
-        const info = db.prepare("INSERT INTO audit_log (terminal_session, actor, action, old_value, new_value, context) VALUES (?, ?, ?, ?, ?, ?)").run(resolvedId, "diagnostics", "diag_test", null, diagTs, null);
-        results.push({ test: "Audit log writable", status: info.changes > 0 ? "PASS" : "FAIL", detail: `changes=${info.changes}` });
-      } catch (e) {
-        results.push({ test: "Audit log writable", status: "FAIL", detail: String(e) });
-      }
-      const portExists = fs2.existsSync(path2.join(os2.homedir(), ".claude", ".hook-port"));
-      const tokenExists = fs2.existsSync(path2.join(os2.homedir(), ".claude", ".hook-token"));
-      results.push({ test: "No stale port/token files", status: !portExists && !tokenExists ? "PASS" : "WARN", detail: `port=${portExists}, token=${tokenExists}` });
-      const claudePpid = process.env.CLAUDE_PPID ?? String(process.ppid);
-      const ppidFile = path2.join(os2.homedir(), ".claude", `ironclaude-session-${claudePpid}.id`);
-      const ppidFileExists = fs2.existsSync(ppidFile);
-      let ppidFileDetail = `CLAUDE_PPID=${process.env.CLAUDE_PPID ?? "NOT SET"}, path=${ppidFile}, exists=${ppidFileExists}`;
-      if (ppidFileExists) {
+      if (savepointActive) {
         try {
-          const content = fs2.readFileSync(ppidFile, "utf-8").trim();
-          ppidFileDetail += `, content=${content}`;
-        } catch {
-          ppidFileDetail += ", content=UNREADABLE";
+          const info = db.prepare("UPDATE sessions SET updated_at = ? WHERE terminal_session = ?").run(diagTs, resolvedId);
+          results.push({ test: "Write test (updated_at)", status: info.changes > 0 ? "PASS" : "FAIL", detail: `changes=${info.changes}` });
+        } catch (e) {
+          results.push({ test: "Write test (updated_at)", status: "FAIL", detail: String(e) });
+        }
+        try {
+          const row = db.prepare("SELECT updated_at FROM sessions WHERE terminal_session = ?").get(resolvedId);
+          const matches = row?.updated_at === diagTs;
+          results.push({ test: "Read-back verification", status: matches ? "PASS" : "FAIL", detail: `expected=${diagTs}, got=${row?.updated_at}` });
+        } catch (e) {
+          results.push({ test: "Read-back verification", status: "FAIL", detail: String(e) });
+        }
+        try {
+          const auditInfo = db.prepare("INSERT INTO audit_log (terminal_session, actor, action, old_value, new_value, context) VALUES (?, ?, ?, ?, ?, ?)").run(resolvedId, "diagnostics", "diag_test", null, diagTs, null);
+          results.push({ test: "Audit log writable", status: auditInfo.changes > 0 ? "PASS" : "FAIL", detail: `changes=${auditInfo.changes}` });
+        } catch (e) {
+          results.push({ test: "Audit log writable", status: "FAIL", detail: String(e) });
+        }
+        try {
+          db.exec("ROLLBACK TO ironclaude_diagnostics");
+        } finally {
+          db.exec("RELEASE ironclaude_diagnostics");
         }
       }
-      results.push({ test: "PPID file exists (MCP-only)", status: ppidFileExists ? "PASS" : "WARN", detail: ppidFileDetail });
+      const portExists = fs2.existsSync(path3.join(os2.homedir(), ".claude", ".hook-port"));
+      const tokenExists = fs2.existsSync(path3.join(os2.homedir(), ".claude", ".hook-token"));
+      results.push({ test: "No stale port/token files", status: !portExists && !tokenExists ? "PASS" : "WARN", detail: `port=${portExists}, token=${tokenExists}` });
+      if (identity.client === "claude") {
+        const claudePpid = process.env.CLAUDE_PPID ?? String(process.ppid);
+        const ppidFile = path3.join(os2.homedir(), ".claude", `ironclaude-session-${claudePpid}.id`);
+        const ppidFileExists = fs2.existsSync(ppidFile);
+        let ppidFileDetail = `CLAUDE_PPID=${process.env.CLAUDE_PPID ?? "NOT SET"}, path=${ppidFile}, exists=${ppidFileExists}`;
+        if (ppidFileExists) {
+          try {
+            const content = fs2.readFileSync(ppidFile, "utf-8").trim();
+            ppidFileDetail += `, content=${content}`;
+          } catch {
+            ppidFileDetail += ", content=UNREADABLE";
+          }
+        }
+        results.push({ test: "PPID file exists (MCP-only)", status: ppidFileExists ? "PASS" : "WARN", detail: ppidFileDetail });
+      } else {
+        results.push({
+          test: "Codex metadata binding",
+          status: "PASS",
+          detail: `client=codex, session=${identity.sessionId}, source=${identity.source}`
+        });
+      }
+      if (runtimeFingerprint2?.ok) {
+        results.push({
+          test: "Runtime fingerprint",
+          status: "PASS",
+          detail: `client=${runtimeFingerprint2.runtime.client}, version=${runtimeFingerprint2.runtime.plugin_version}, root=${runtimeFingerprint2.runtime.plugin_root}`
+        });
+      } else {
+        results.push({
+          test: "Runtime fingerprint",
+          status: "FAIL",
+          detail: runtimeFingerprint2?.error ?? "Runtime fingerprint capture is missing"
+        });
+      }
+      const expectedRuntime = args.expected_runtime;
+      if (expectedRuntime !== void 0) {
+        const verification = verifyRuntimeActivation(runtimeFingerprint2, expectedRuntime);
+        results.push({
+          test: "Runtime activation match",
+          status: verification.ok ? "PASS" : "FAIL",
+          detail: verification.ok ? "All expected runtime fields match startup capture" : verification.errors.join("; ")
+        });
+      }
       const passed = results.filter((r) => r.status === "PASS").length;
       const total = results.length;
       const summary = results.map((r) => `${r.test} ... ${r.status} (${r.detail})`).join("\n");
@@ -13922,7 +14178,12 @@ function handleReadTool(name, args, db, sessionId) {
 
 ${summary}
 
-${JSON.stringify({ results, passed, total }, null, 2)}`
+${JSON.stringify({
+            results,
+            passed,
+            total,
+            ...runtimeFingerprint2?.ok ? { runtime: runtimeFingerprint2.runtime } : {}
+          }, null, 2)}`
         }]
       };
     }
@@ -13992,24 +14253,15 @@ ${JSON.stringify({ results, passed, total }, null, 2)}`
 }
 
 // src/tools/write-tools.ts
-import path3 from "path";
+import path4 from "path";
 import fs3 from "fs";
 import os3 from "os";
-import { createHash } from "crypto";
-var _currentSessionId2 = null;
-function setCurrentSession2(sessionId) {
-  _currentSessionId2 = sessionId;
-}
-function resolveSessionId2(db, explicitId) {
-  if (explicitId) {
-    return explicitId;
+import { createHash as createHash2 } from "crypto";
+function requireSessionId2(sessionId) {
+  if (!sessionId) {
+    throw new Error("Resolved session ID is required before write tool handling");
   }
-  if (_currentSessionId2) {
-    return _currentSessionId2;
-  }
-  throw new Error(
-    `No session ID available. CLAUDE_SESSION_ID env var not set and no explicit session_id provided. CLAUDE_SESSION_ID=${process.env.CLAUDE_SESSION_ID || "unset"}. Check plugin.json env config and session-init.sh.`
-  );
+  return sessionId;
 }
 function ok(data) {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
@@ -14021,8 +14273,34 @@ function err(message, extra) {
     ]
   };
 }
+function workflowTransitionResult(outcome, changedFields = {}) {
+  if (!outcome.ok) {
+    return err(outcome.error, {
+      ...outcome.from !== void 0 && { from: outcome.from },
+      to: outcome.to,
+      session_id: outcome.session_id
+    });
+  }
+  if (!outcome.changed) {
+    return ok({
+      success: true,
+      changed: false,
+      from: outcome.from,
+      to: outcome.to,
+      session_id: outcome.session_id
+    });
+  }
+  return ok({
+    success: true,
+    changed: true,
+    from: outcome.from,
+    to: outcome.to,
+    session_id: outcome.session_id,
+    ...changedFields
+  });
+}
 function getTierUpPolicy() {
-  const configPath = process.env.IRONCLAUDE_HOOKS_CONFIG_PATH || path3.join(os3.homedir(), ".claude", "ironclaude-hooks-config.json");
+  const configPath = process.env.IRONCLAUDE_HOOKS_CONFIG_PATH || path4.join(os3.homedir(), ".claude", "ironclaude-hooks-config.json");
   try {
     const cfg = JSON.parse(fs3.readFileSync(configPath, "utf-8"));
     const v = cfg.tier_up_review_policy;
@@ -14033,7 +14311,14 @@ function getTierUpPolicy() {
   }
 }
 function hashPlan(planJson) {
-  return createHash("sha256").update(planJson).digest("hex");
+  return createHash2("sha256").update(planJson).digest("hex");
+}
+var TIER_UP_VERDICTS = ["SOLID", "HAS-ISSUES", "top-tier-self"];
+function isTierUpVerdict(value) {
+  return TIER_UP_VERDICTS.includes(value);
+}
+function isPassingTierUpVerdict(value) {
+  return value === "SOLID" || value === "top-tier-self";
 }
 var writeToolDefinitions = [
   {
@@ -14208,7 +14493,7 @@ var writeToolDefinitions = [
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: false
+      idempotentHint: true
     }
   },
   {
@@ -14223,7 +14508,7 @@ var writeToolDefinitions = [
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: false
+      idempotentHint: true
     }
   },
   {
@@ -14238,7 +14523,7 @@ var writeToolDefinitions = [
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: false
+      idempotentHint: true
     }
   },
   {
@@ -14253,7 +14538,7 @@ var writeToolDefinitions = [
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: false
+      idempotentHint: true
     }
   },
   {
@@ -14268,7 +14553,7 @@ var writeToolDefinitions = [
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: false
+      idempotentHint: true
     }
   },
   {
@@ -14293,7 +14578,7 @@ var writeToolDefinitions = [
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: false
+      idempotentHint: true
     }
   },
   {
@@ -14389,7 +14674,11 @@ var writeToolDefinitions = [
       type: "object",
       properties: {
         reviewer_model: { type: "string", description: 'The reviewer model used, e.g. "opus" or "fable".' },
-        verdict: { type: "string", description: "The reviewer's summary verdict/label." }
+        verdict: {
+          type: "string",
+          enum: [...TIER_UP_VERDICTS],
+          description: "Exact review verdict: SOLID, HAS-ISSUES, or top-tier-self."
+        }
       },
       required: ["reviewer_model", "verdict"],
       additionalProperties: false
@@ -14399,7 +14688,7 @@ var writeToolDefinitions = [
 ];
 var writeToolNames = new Set(writeToolDefinitions.map((t) => t.name));
 function handleWriteTool(name, args, db, sessionId) {
-  const resolvedId = resolveSessionId2(db, sessionId);
+  const resolvedId = requireSessionId2(sessionId);
   switch (name) {
     // ----- register_design -----
     case "register_design": {
@@ -14505,7 +14794,7 @@ function handleWriteTool(name, args, db, sessionId) {
           plan_json: JSON.stringify(planJson),
           plan_name: planJson.name,
           current_wave: 1,
-          workflow_stage: "final_plan_prep",
+          ...session.workflow_stage === "final_plan_prep" ? {} : { workflow_stage: "final_plan_prep" },
           review_pending: 0
         });
         clearReviewGrades(db, resolvedId);
@@ -14542,51 +14831,35 @@ function handleWriteTool(name, args, db, sessionId) {
     }
     // ----- start_execution -----
     case "start_execution": {
-      const session = getSession(db, resolvedId);
-      if (!session) {
-        return err("Session not found", { session_id: resolvedId });
-      }
-      const transitionResult = validateWorkflowTransition(
-        session.workflow_stage,
-        "executing",
-        {
+      const outcome = executeWorkflowTransition(db, resolvedId, "executing", {
+        action: "start_execution",
+        auditContext: "Transitioned to executing",
+        prerequisites: (session) => ({
           hasDesign: true,
-          // Already past design stage
           designConsumed: true,
           hasPlan: !!session.plan_json
-        }
-      );
-      if (!transitionResult.valid) {
-        return err(transitionResult.reason);
-      }
-      if (getTierUpPolicy() === "enforced") {
-        if (!session.plan_json) {
-          return err(
-            "BLOCKED \u2014 tier-up review gate: no plan loaded. Call create_plan first."
-          );
-        }
-        const planHash = hashPlan(session.plan_json);
-        const review = getTierUpReviewByHash(db, resolvedId, planHash);
-        if (!review) {
-          return err(
-            "BLOCKED \u2014 tier-up review required (tier_up_review_policy=enforced). Dispatch a blind higher-tier reviewer for THIS plan and call submit_tier_up_review, then retry start_execution. If the plan changed after a prior review, re-review is required (the hash no longer matches). To change this requirement, a human must edit tier_up_review_policy in ~/.claude/ironclaude-hooks-config.json (the commander cannot change it)."
-          );
-        }
-      }
-      updateSession(db, resolvedId, { workflow_stage: "executing", review_pending: 0 });
-      insertAuditLog(db, {
-        terminal_session: resolvedId,
-        actor: "claude",
-        action: "start_execution",
-        old_value: session.workflow_stage,
-        new_value: "executing",
-        context: "Transitioned to executing"
+        }),
+        guard: ({ session }) => {
+          const tierUpPolicy = getTierUpPolicy();
+          if (tierUpPolicy === "off") return null;
+          if (!session.plan_json) {
+            return "BLOCKED \u2014 tier-up review gate: no plan loaded. Call create_plan first.";
+          }
+          const planHash = hashPlan(session.plan_json);
+          const review = getTierUpReviewByHash(db, resolvedId, planHash);
+          const latestReview = getLatestTierUpReview(db, resolvedId);
+          const passRequired = tierUpPolicy === "enforced" || latestReview?.verdict === "HAS-ISSUES";
+          if (passRequired && !review) {
+            return `BLOCKED \u2014 passing tier-up review required (tier_up_review_policy=${tierUpPolicy}). ` + (latestReview?.verdict === "HAS-ISSUES" ? "The latest review was HAS-ISSUES; perform the holistic requirements/design/plan audit, revise coherently, and obtain a fresh SOLID review. " : "") + "Dispatch a blind higher-tier reviewer for THIS plan and call submit_tier_up_review, then retry start_execution. If the plan changed after a prior review, re-review is required (the hash no longer matches). To change this requirement, a human must edit tier_up_review_policy in ~/.claude/ironclaude-hooks-config.json (the commander cannot change it).";
+          }
+          if (passRequired && review && !isPassingTierUpVerdict(review.verdict)) {
+            return `BLOCKED \u2014 current plan tier-up verdict is ${review.verdict}. Execution requires SOLID (or top-tier-self at the highest model tier). Verify findings, perform the holistic requirements/design/plan audit, revise coherently, and obtain a fresh blind review.`;
+          }
+          return null;
+        },
+        updateFields: { review_pending: 0 }
       });
-      return ok({
-        success: true,
-        workflow_stage: "executing",
-        session_id: resolvedId
-      });
+      return workflowTransitionResult(outcome, { workflow_stage: "executing" });
     }
     // ----- get_next_tasks -----
     case "get_next_tasks": {
@@ -14811,146 +15084,89 @@ function handleWriteTool(name, args, db, sessionId) {
     }
     // ----- mark_design_ready -----
     case "mark_design_ready": {
-      const session = getSession(db, resolvedId);
-      if (!session) {
-        return err("Session not found", { session_id: resolvedId });
-      }
-      if (session.workflow_stage !== "brainstorming") {
-        return err(
-          `Cannot mark design ready: workflow_stage must be 'brainstorming', got '${session.workflow_stage}'`
-        );
-      }
       const file = args.file;
-      if (file) {
-        registerDesign(db, file, resolvedId);
-        consumeDesign(db, file);
-      }
-      updateSession(db, resolvedId, { workflow_stage: "design_ready" });
-      insertAuditLog(db, {
-        terminal_session: resolvedId,
-        actor: "claude",
+      const outcome = executeWorkflowTransition(db, resolvedId, "design_ready", {
         action: "mark_design_ready",
-        old_value: "brainstorming",
-        new_value: "design_ready",
-        context: file ? `Brainstorming complete, design ready (auto-registered: ${file})` : "Brainstorming complete, design ready"
+        auditContext: file ? `Brainstorming complete, design ready (auto-registered: ${file})` : "Brainstorming complete, design ready",
+        validate: ({ from }, result) => result.valid ? result : {
+          valid: false,
+          reason: `Cannot mark design ready: workflow_stage must be 'brainstorming', got '${from}'`
+        },
+        applyArtifacts: () => {
+          if (file) {
+            registerDesign(db, file, resolvedId);
+            consumeDesign(db, file);
+          }
+        }
       });
-      return ok({ success: true, workflow_stage: "design_ready", session_id: resolvedId });
+      return workflowTransitionResult(outcome, { workflow_stage: "design_ready" });
     }
     // ----- mark_plan_ready -----
     case "mark_plan_ready": {
-      const session = getSession(db, resolvedId);
-      if (!session) {
-        return err("Session not found", { session_id: resolvedId });
-      }
-      const validPlanReadyFrom = ["design_ready", "design_marked_for_use"];
-      if (!validPlanReadyFrom.includes(session.workflow_stage)) {
-        return err(
-          `Cannot mark plan ready: workflow_stage must be 'design_ready' or 'design_marked_for_use', got '${session.workflow_stage}'`
-        );
-      }
-      updateSession(db, resolvedId, { workflow_stage: "plan_ready" });
-      insertAuditLog(db, {
-        terminal_session: resolvedId,
-        actor: "claude",
+      const outcome = executeWorkflowTransition(db, resolvedId, "plan_ready", {
         action: "mark_plan_ready",
-        old_value: session.workflow_stage,
-        new_value: "plan_ready",
-        context: "Plan files written to disk"
+        auditContext: "Plan files written to disk",
+        validate: ({ from }, result) => result.valid ? result : {
+          valid: false,
+          reason: `Cannot mark plan ready: workflow_stage must be 'design_ready' or 'design_marked_for_use', got '${from}'`
+        }
       });
-      return ok({ success: true, workflow_stage: "plan_ready", session_id: resolvedId });
+      return workflowTransitionResult(outcome, { workflow_stage: "plan_ready" });
     }
     // ----- mark_brainstorming -----
     case "mark_brainstorming": {
-      const session = getSession(db, resolvedId);
-      if (!session) {
-        return err("Session not found", { session_id: resolvedId });
-      }
-      if (!canTransitionTo(session.workflow_stage, "brainstorming")) {
-        return err(
-          `Cannot mark brainstorming: invalid transition from '${session.workflow_stage}'`
-        );
-      }
-      updateSession(db, resolvedId, { workflow_stage: "brainstorming" });
-      insertAuditLog(db, {
-        terminal_session: resolvedId,
-        actor: "claude",
+      const outcome = executeWorkflowTransition(db, resolvedId, "brainstorming", {
         action: "mark_brainstorming",
-        old_value: session.workflow_stage,
-        new_value: "brainstorming",
-        context: `Transitioning to brainstorming from ${session.workflow_stage}`
+        auditContext: ({ from }) => `Transitioning to brainstorming from ${from}`,
+        validate: ({ from }, result) => result.valid ? result : { valid: false, reason: `Cannot mark brainstorming: invalid transition from '${from}'` }
       });
-      return ok({ success: true, workflow_stage: "brainstorming", session_id: resolvedId });
+      return workflowTransitionResult(outcome, { workflow_stage: "brainstorming" });
     }
     // ----- mark_debugging -----
     case "mark_debugging": {
-      const session = getSession(db, resolvedId);
-      if (!session) {
-        return err("Session not found", { session_id: resolvedId });
-      }
-      if (!canTransitionTo(session.workflow_stage, "debugging")) {
-        return err(
-          `Cannot mark debugging: invalid transition from '${session.workflow_stage}'`
-        );
-      }
-      updateSession(db, resolvedId, { workflow_stage: "debugging" });
-      insertAuditLog(db, {
-        terminal_session: resolvedId,
-        actor: "claude",
+      const outcome = executeWorkflowTransition(db, resolvedId, "debugging", {
         action: "mark_debugging",
-        old_value: session.workflow_stage,
-        new_value: "debugging",
-        context: `Transitioning to debugging from ${session.workflow_stage}`
+        auditContext: ({ from }) => `Transitioning to debugging from ${from}`,
+        validate: ({ from }, result) => result.valid ? result : { valid: false, reason: `Cannot mark debugging: invalid transition from '${from}'` }
       });
-      return ok({ success: true, workflow_stage: "debugging", session_id: resolvedId });
+      return workflowTransitionResult(outcome, { workflow_stage: "debugging" });
     }
     // ----- mark_executing -----
     case "mark_executing": {
-      const session = getSession(db, resolvedId);
-      if (!session) {
-        return err("Session not found", { session_id: resolvedId });
-      }
       let recovered = false;
-      if (session.workflow_stage !== "reviewing") {
-        const activeTaskCount = db.prepare(
-          `SELECT COUNT(*) as count FROM wave_tasks
-           WHERE terminal_session = ? AND status IN ('pending', 'in_progress', 'submitted')`
-        ).get(resolvedId).count;
-        if (activeTaskCount > 0) {
-          insertAuditLog(db, {
-            terminal_session: resolvedId,
-            actor: "system:state-correction",
-            action: "workflow_stage_recovery",
-            old_value: session.workflow_stage,
-            new_value: "executing",
-            context: `Force-corrected workflow_stage from '${session.workflow_stage}' to 'executing' \u2014 ${activeTaskCount} active wave_tasks prove execution is in progress`
-          });
-          recovered = true;
-        } else {
-          return err(
-            `Cannot mark executing: workflow_stage must be 'reviewing', got '${session.workflow_stage}'`
-          );
-        }
-      }
-      const passingReview = db.prepare(
-        `SELECT 1 FROM review_grades
-         WHERE terminal_session = ? AND wave_number = ? AND grade IN ('A', 'B') AND task_boundary = 1
-         ORDER BY created_at DESC LIMIT 1`
-      ).get(resolvedId, session.current_wave);
-      if (!passingReview) {
-        return err(
-          "Cannot mark executing: no passing review verdict (A or B) recorded for current wave. Call record_review_verdict first."
-        );
-      }
-      updateSession(db, resolvedId, { workflow_stage: "executing", review_pending: 0, review_block_count: 0 });
-      insertAuditLog(db, {
-        terminal_session: resolvedId,
-        actor: "claude",
-        action: "mark_executing",
-        old_value: recovered ? session.workflow_stage : "reviewing",
-        new_value: "executing",
-        context: recovered ? `Code review complete, returning to executing (recovered from '${session.workflow_stage}')` : "Code review complete, returning to executing"
+      let activeTaskCount = 0;
+      const outcome = executeWorkflowTransition(db, resolvedId, "executing", {
+        action: () => recovered ? "workflow_stage_recovery" : "mark_executing",
+        actor: () => recovered ? "system:state-correction" : "claude",
+        auditContext: ({ from }) => recovered ? `Force-corrected workflow_stage from '${from}' to 'executing' \u2014 ${activeTaskCount} active wave_tasks prove execution is in progress` : "Code review complete, returning to executing",
+        validate: ({ from }, result) => {
+          if (result.valid) return result;
+          activeTaskCount = db.prepare(
+            `SELECT COUNT(*) as count FROM wave_tasks
+             WHERE terminal_session = ? AND status IN ('pending', 'in_progress', 'submitted')`
+          ).get(resolvedId).count;
+          if (activeTaskCount > 0) {
+            recovered = true;
+            return { valid: true, reason: "Active wave tasks prove execution recovery" };
+          }
+          return {
+            valid: false,
+            reason: `Cannot mark executing: workflow_stage must be 'reviewing', got '${from}'`
+          };
+        },
+        guard: ({ session }) => {
+          const passingReview = db.prepare(
+            `SELECT 1 FROM review_grades
+             WHERE terminal_session = ? AND wave_number = ? AND grade IN ('A', 'B') AND task_boundary = 1
+             ORDER BY created_at DESC LIMIT 1`
+          ).get(resolvedId, session.current_wave);
+          return passingReview ? null : "Cannot mark executing: no passing review verdict (A or B) recorded for current wave. Call record_review_verdict first.";
+        },
+        updateFields: { review_pending: 0, review_block_count: 0 }
       });
-      return ok({ success: true, workflow_stage: "executing", session_id: resolvedId, ...recovered && { recovered: true } });
+      const changedFields = { workflow_stage: "executing" };
+      if (recovered) changedFields.recovered = true;
+      return workflowTransitionResult(outcome, changedFields);
     }
     // ----- retreat -----
     case "retreat": {
@@ -14964,24 +15180,14 @@ function handleWriteTool(name, args, db, sessionId) {
       if (!reason || typeof reason !== "string" || reason.trim() === "") {
         return err("Missing or empty required parameter: reason");
       }
-      const session = getSession(db, resolvedId);
-      if (!session) {
-        return err("Session not found", { session_id: resolvedId });
-      }
-      const from = session.workflow_stage;
-      if (!canTransitionTo(from, to)) {
-        return err(
-          `Cannot retreat from '${from}' to '${to}': transition not allowed`
-        );
-      }
-      executeRetreat(db, resolvedId, from, to, reason);
-      return ok({
-        success: true,
-        from,
-        to,
-        reason,
-        session_id: resolvedId
+      const outcome = executeWorkflowTransition(db, resolvedId, to, {
+        action: "retreat",
+        actor: "system",
+        auditContext: reason,
+        validate: ({ from }, result) => result.valid ? result : { valid: false, reason: `Cannot retreat from '${from}' to '${to}': transition not allowed` },
+        applyArtifacts: ({ session, from }) => prepareRetreatArtifacts(db, resolvedId, session, from, reason)
       });
+      return workflowTransitionResult(outcome, { reason });
     }
     // ----- reset_session -----
     case "reset_session": {
@@ -14994,7 +15200,7 @@ function handleWriteTool(name, args, db, sessionId) {
         plan_json: null,
         plan_name: null,
         current_wave: 0,
-        workflow_stage: "idle",
+        ...oldStage === "idle" ? {} : { workflow_stage: "idle" },
         review_pending: 0,
         circuit_breaker: 0
       });
@@ -15066,7 +15272,7 @@ function handleWriteTool(name, args, db, sessionId) {
       if (value === void 0 || typeof value !== "boolean") {
         return err("Missing or invalid required parameter: value (must be boolean)");
       }
-      const configPath = path3.join(os3.homedir(), ".claude", "ironclaude-hooks-config.json");
+      const configPath = path4.join(os3.homedir(), ".claude", "ironclaude-hooks-config.json");
       let config = {};
       try {
         if (fs3.existsSync(configPath)) {
@@ -15145,6 +15351,11 @@ function handleWriteTool(name, args, db, sessionId) {
       if (!verdict || typeof verdict !== "string") {
         return err("Missing or empty required parameter: verdict");
       }
+      if (!isTierUpVerdict(verdict)) {
+        return err(
+          `Invalid verdict: "${verdict}". Must be one of: ${TIER_UP_VERDICTS.join(", ")}`
+        );
+      }
       const session = getSession(db, resolvedId);
       if (!session) {
         return err("Session not found", { session_id: resolvedId });
@@ -15168,15 +15379,29 @@ function handleWriteTool(name, args, db, sessionId) {
         new_value: verdict,
         context: `Tier-up review recorded (model=${reviewerModel}, plan_hash=${planHash.slice(0, 12)}\u2026)`
       });
-      return ok({ success: true, plan_hash: planHash, reviewer_model: reviewerModel, session_id: resolvedId });
+      return ok({ success: true, plan_hash: planHash, reviewer_model: reviewerModel, verdict, session_id: resolvedId });
     }
     default:
       throw new Error(`Unknown write tool: ${name}`);
   }
 }
 
+// src/tool-dispatch.ts
+function dispatchTool(name, args, db, identity, runtimeFingerprint2) {
+  if (!identity.sessionId) {
+    throw new Error("Resolved session ID is required before tool dispatch");
+  }
+  if (readToolNames.has(name)) {
+    return handleReadTool(name, args, db, identity.sessionId, identity, runtimeFingerprint2);
+  }
+  if (writeToolNames.has(name)) {
+    return handleWriteTool(name, args, db, identity.sessionId);
+  }
+  throw new Error(`Unknown tool: ${name}`);
+}
+
 // src/index.ts
-var ERROR_LOG_PATH = path4.join(os4.homedir(), ".claude", "ironclaude-errors.log");
+var ERROR_LOG_PATH = path5.join(os4.homedir(), ".claude", "ironclaude-errors.log");
 function appendErrorLog(tool, sessionId, error) {
   try {
     const ts = (/* @__PURE__ */ new Date()).toISOString();
@@ -15187,8 +15412,9 @@ function appendErrorLog(tool, sessionId, error) {
   }
 }
 var _ppidFilePath = null;
-var _currentSessionId3 = null;
 var _initialBindComplete = false;
+var client = parseIronClaudeClient(process.env.IRONCLAUDE_CLIENT);
+var runtimeFingerprint = captureRuntimeFingerprint(import.meta.url, client);
 function readSessionFromPpidFile(filePath) {
   try {
     const sid = fs4.readFileSync(filePath, "utf-8").trim();
@@ -15199,17 +15425,25 @@ function readSessionFromPpidFile(filePath) {
   }
   return null;
 }
-function readPluginVersion() {
-  try {
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = path4.dirname(__filename);
-    const pluginJsonPath = path4.resolve(__dirname, "..", "..", "..", ".claude-plugin", "plugin.json");
-    const pluginJson = JSON.parse(fs4.readFileSync(pluginJsonPath, "utf-8"));
-    return pluginJson.version || "unknown";
-  } catch {
-    console.error("Warning: Could not read plugin.json for version");
-    return "unknown";
+async function readClaudeSessionForCall() {
+  if (!_ppidFilePath) return null;
+  if (_initialBindComplete) {
+    return readSessionFromPpidFile(_ppidFilePath);
   }
+  const maxAttempts = 5;
+  const delayMs = 300;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const sessionId = readSessionFromPpidFile(_ppidFilePath);
+    if (sessionId) {
+      _initialBindComplete = true;
+      console.error(`Resolved Claude session via PPID file (attempt ${attempt}/${maxAttempts})`);
+      return sessionId;
+    }
+    if (attempt < maxAttempts) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  return null;
 }
 function handleError(error) {
   if (error instanceof Error) {
@@ -15220,7 +15454,7 @@ function handleError(error) {
 var server = new Server(
   {
     name: "state-manager",
-    version: readPluginVersion()
+    version: runtimeFingerprint.ok ? runtimeFingerprint.runtime.plugin_version : "unknown"
   },
   {
     capabilities: {
@@ -15237,52 +15471,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  let resolvedSessionId = "UNRESOLVED";
   try {
-    if (_ppidFilePath) {
-      if (!_initialBindComplete) {
-        const maxAttempts = 5;
-        const delayMs = 300;
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          const sid = readSessionFromPpidFile(_ppidFilePath);
-          if (sid) {
-            setCurrentSession(sid);
-            setCurrentSession2(sid);
-            setSessionBindingSource("ppid_file");
-            _currentSessionId3 = sid;
-            _initialBindComplete = true;
-            console.error(`Bound to session via PPID file: ${sid} (attempt ${attempt}/${maxAttempts})`);
-            break;
-          }
-          if (attempt < maxAttempts) {
-            await new Promise((resolve) => setTimeout(resolve, delayMs));
-          }
-        }
-      } else {
-        const sid = readSessionFromPpidFile(_ppidFilePath);
-        if (sid) {
-          if (sid !== _currentSessionId3) {
-            console.error(`Session rebind: ${_currentSessionId3 || "none"} -> ${sid}`);
-          }
-          setCurrentSession(sid);
-          setCurrentSession2(sid);
-          _currentSessionId3 = sid;
-        }
-      }
-    }
     const { name, arguments: args } = request.params;
+    const claudeSession = client === "claude" ? await readClaudeSessionForCall() : null;
+    const identity = resolveSessionIdentity(client, request.params._meta, claudeSession);
+    resolvedSessionId = identity.sessionId;
     const db = initDb();
-    if (readToolNames.has(name)) {
-      return handleReadTool(name, args ?? {}, db, "");
-    }
-    if (writeToolNames.has(name)) {
-      return handleWriteTool(name, args ?? {}, db, "");
-    }
-    throw new Error(`Unknown tool: ${name}`);
+    return dispatchTool(name, args ?? {}, db, identity, runtimeFingerprint);
   } catch (error) {
     const errorMsg = handleError(error);
     const toolName = request.params?.name ?? "unknown";
-    const sessionTag = _ppidFilePath ?? "UNKNOWN";
-    appendErrorLog(toolName, sessionTag, errorMsg);
+    appendErrorLog(toolName, resolvedSessionId, errorMsg);
     return {
       content: [{ type: "text", text: errorMsg }],
       isError: true
@@ -15292,12 +15492,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const db = initDb();
   console.error("Database initialized");
-  const claudePpid = process.env.CLAUDE_PPID;
-  if (claudePpid) {
-    _ppidFilePath = path4.join(os4.homedir(), ".claude", `ironclaude-session-${claudePpid}.id`);
-    console.error(`Will bind to session via PPID file on first tool call: ${_ppidFilePath}`);
+  if (client === "claude") {
+    const claudePpid = process.env.CLAUDE_PPID;
+    if (claudePpid) {
+      _ppidFilePath = path5.join(os4.homedir(), ".claude", `ironclaude-session-${claudePpid}.id`);
+      console.error(`Will resolve Claude session via PPID file on each tool call: ${_ppidFilePath}`);
+    } else {
+      console.error("CRITICAL: CLAUDE_PPID not set. Claude session resolution will fail.");
+    }
   } else {
-    console.error(`CRITICAL: CLAUDE_PPID not set. Session binding will fail.`);
+    console.error("Will resolve Codex root session from native MCP metadata on each tool call");
   }
   console.error("State Manager MCP server running via stdio");
   const transport = new StdioServerTransport();

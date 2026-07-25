@@ -31,6 +31,21 @@ not to start implementing it. The executing-plans skill handles implementation.
 | "The plan is obvious, I don't need to write it down" | Plans catch missing steps. "Obvious" plans miss edge cases. |
 | "Let me test if this approach works first" | That's prototyping, not planning. Design validates approach. |
 | "This task is too small for a full plan" | Small tasks get the same plan structure. No exceptions. |
+| "The deployed build is obviously just the repo" | Both clients cache; a local marketplace still runs from cache. Check the wrapper log for the path that actually executed. |
+| "Empty output means there were no matches" | It may mean the command failed, the glob aborted, or a `head` truncated it away. Make absence provable. |
+
+## Mandatory Direct Transition Preflight
+
+Before every direct workflow-transition MCP call:
+
+1. Call `get_resume_state` and validate that its session identity is the
+   provider-native root session for the active task. Missing or mismatched
+   identity: fail closed; stop and report the mismatch.
+2. Compare its current workflow stage to the requested target. On an
+   equal-target result, skip the transition call and preserve all state.
+3. Make one different-target call only and require returned `changed:true`. If the
+   call errors or returns unexpected `changed:false`, stop and report it; do not
+   retry without a fresh `get_resume_state` read. No blind retry.
 
 ## Process
 
@@ -99,6 +114,67 @@ Read the design document completely to understand:
 - Data flow
 - Testing strategy
 
+Identify the operator-approved requirements artifact used to approve the design.
+If none exists, STOP and return to brainstorming to document and approve the
+requirements. Record this path as `requirements_file` in the human plan and machine
+plan; a professional blind review must evaluate original requirements, not only the
+author's design interpretation.
+
+### Step 1.6: Ground every plan fact in live source (REQUIRED)
+
+Before writing any task, inspect the current implementation, tests, schemas, and
+call sites that constrain it. Every file path, function name, signature, DB column,
+config key, and command the plan asserts MUST be verified against current source —
+read it, do not infer it from design prose, an earlier plan, or a summary. A
+symbol you did not open does not exist for planning purposes. Speculative
+replacement snippets are not implementation authority; any indispensable code
+fragment must be derived from and checked against the current source contract.
+
+This is verified rather than inferred: if a plan names `foo()` at `bar.py:42`, open
+`bar.py:42` and confirm `foo` is there with the signature the plan assumes.
+
+**Verify the artifact that RAN, not the one you expect.** Before asserting what a
+deployed component does, establish which file actually executed. Do not reason from
+install layout: "local marketplace" does NOT imply run-from-source, and both clients
+cache. Use the evidence:
+- `~/.claude/ironclaude-mcp-state-manager.log` — the wrapper logs
+  `Starting state-manager wrapper (PID=…, PPID=…)` then
+  `Launching MCP server: <absolute path>` on every start. Match your process's PPID to
+  get the exact path that executed.
+- `runtime-fingerprint` — `plugin_root`, `plugin_version`, `manifest_sha256`,
+  `bundle_path`, `bundle_sha256`.
+
+Beware a `dist/<module>.js` sibling: when the entrypoint is a bundle, that file may be
+an inert build leftover that never runs, and the bundle itself may be stale.
+
+**Absence is not evidence.** Before calling missing code a defect, run
+`git log -S "<the exact line>" --oneline --all` — it may have been removed on purpose,
+and "restoring" it would regress an intentional fix. Before concluding a capability is
+absent, require a positive control proving the mechanism was exercised at all; a null
+result with no control is UNCERTAIN, not a finding.
+
+### Step 1.7: Execution invariants (carry these into the plan)
+
+Every command you author must satisfy these, and the plan document MUST state them so
+the blind reviewer can check the commands against a declared standard:
+
+- **Shell state does NOT persist between steps.** Each step is its own invocation — use
+  literal absolute paths; never rely on a variable exported by an earlier step (an empty
+  variable can make a guard fail OPEN).
+- **Bash cwd is `commander/`, not the repo root.** Use `git -C <repo-root>` and absolute
+  paths for writes; a bare `git add docs/…` silently resolves to `commander/docs/…`.
+- **zsh has `nomatch`.** Quote globs (`'--include=*.py'`); an unquoted zero-match glob
+  aborts the command before it runs.
+- **Foreground `sleep` is blocked.** Split waits across steps and re-verify instead.
+- **`docs/` is gitignored** — plan and findings artifacts need `git add -f`.
+- **An empty result must be distinguishable from a failed command.** No `2>/dev/null` on
+  evidence commands; list names, not counts; never `head`-truncate a grep whose purpose
+  is proving absence or completeness; give a decisive term its own uncapped search so a
+  broad alternation branch cannot bury it.
+- **Evidence outlives cleanup.** Author the deliverable BEFORE deleting what it quotes;
+  give each run its own log so a later run cannot clobber an earlier one's evidence.
+- **Enumerate; never hard-code the answer a discovery step is meant to find.**
+
 ### Phase 2: Break Down Into Tasks
 
 **Step 2: Identify major components**
@@ -163,6 +239,8 @@ Save to `docs/plans/YYYY-MM-DD-<feature-name>.md`:
 
 **Goal:** [One sentence describing what this builds]
 
+**Requirements:** [Path to operator-approved requirements artifact]
+
 **Architecture:** [2-3 sentences about approach from design]
 
 **Tech Stack:** [Key technologies/libraries]
@@ -224,6 +302,7 @@ The JSON must follow this exact schema:
 {
   "name": "Feature Name",
   "goal": "One sentence describing what this builds",
+  "requirements_file": "docs/plans/YYYY-MM-DD-requirements.md",
   "design_file": "docs/plans/YYYY-MM-DD-<feature-name>-design.md",
   "tasks": [
     {
@@ -249,6 +328,8 @@ Rules:
 - `depends_on` references other task IDs (must exist, no circular deps)
 - `allowed_files` must be exact paths (no globs) — these are the only files the MCP will permit editing during that task
 - The JSON is the source of truth for the MCP server; the markdown is for human review
+- `requirements_file` must name the same operator-approved requirements artifact
+  shown in the human plan
 - The MCP validates schema, dependency integrity, and cycle-freedom before accepting
 
 Stage the JSON file alongside the markdown:
@@ -256,9 +337,26 @@ Stage the JSON file alongside the markdown:
 git add docs/plans/YYYY-MM-DD-<feature-name>.plan.json
 ```
 
-**Step 5.6: Signal plan files written**
+**Step 5.6: Requirements → design → plan parity audit**
 
-Call MCP `mcp__plugin_ironclaude_state-manager__mark_plan_ready` to transition the session to `plan_ready`. The statusline will show orange "plan_ready" until executing-plans is invoked.
+Before calling `mark_plan_ready`, audit the complete plan as one coherent candidate.
+Verify the human and machine plans express the same:
+- operator requirements and design coverage;
+- task IDs and `depends_on` relationships;
+- exact `allowed_files` lists;
+- ordered steps and commands;
+- tests and expected results.
+
+If any item differs or any requirement/design decision is missing, regenerate the
+plan coherently before proceeding. Do not patch one representation independently.
+
+**Step 5.7: Signal plan files written**
+
+Run Mandatory Direct Transition Preflight for target `plan_ready`. Only after a
+different-target result, call MCP
+`mcp__plugin_ironclaude_state-manager__mark_plan_ready` once to transition the
+session to `plan_ready`. The statusline will show orange "plan_ready" until
+executing-plans is invoked.
 
 If `mcp__plugin_ironclaude_state-manager__mark_plan_ready` returns an error (wrong stage), display the error to the user. Do NOT proceed to Phase 5 until it succeeds.
 
@@ -359,3 +457,4 @@ Invoke executing-plans skill:
 - **TDD cycle**: Write test → run to fail → implement → run to pass → stage
 - **Professional mode aware**: All steps use "git add" to stage, never commit
 - **Explicit skill invocation**: Use Skill tool for executing-plans
+- **No review history in plan artifacts**: A plan (human or machine) MUST NOT contain prior-review findings, verdicts, fix rationale, reviewer-drift audits, or round-by-round obligation tables. Because the human plan is a mandatory blind-reviewer input, any such content reaches the reviewer and breaks blind review (MP-W02, MP-R07). This content already has durable homes — `tier_up_reviews` rows, `retreat` reasons, and workflow-private session state. Never record it in the plan.

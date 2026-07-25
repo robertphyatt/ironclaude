@@ -92,6 +92,14 @@ class WorkerRegistry:
         )
         self._conn.commit()
 
+    def set_worker_provider(self, worker_id: str, client: str, model: str) -> None:
+        """Persist the resolved provider client + model for a spawned worker."""
+        self._conn.execute(
+            "UPDATE workers SET client = ?, model = ? WHERE id = ?",
+            (client, model, worker_id),
+        )
+        self._conn.commit()
+
     def get_worker(self, worker_id: str) -> dict | None:
         row = self._conn.execute(
             "SELECT * FROM workers WHERE id = ?", (worker_id,)

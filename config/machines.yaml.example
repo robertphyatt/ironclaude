@@ -1,11 +1,21 @@
 # Remote machine definitions for IronClaude worker spawning.
 # Copy to config/machines.yaml and customize for your environment.
 # Each machine must have Claude Code + ironclaude plugin pre-installed.
+#
+# Client configuration:
+#   - Legacy `claude_path` (as on my-server below) is equivalent to a
+#     Claude-only `clients: {claude: {enabled: true, path: ...}}` block.
+#   - `clients` supports `claude` and/or `codex`, each with its own
+#     `enabled` flag and `path`. A machine needs at least one enabled client.
+#   - Installing the Codex CLI on a host does NOT enable it here — you must
+#     explicitly set `codex.enabled: true`. Each host with Codex enabled must
+#     also independently run `codex login` — Codex auth is per-machine and is
+#     not distributed by IronClaude.
 
 machines:
   - name: my-server
     host: my-server            # SSH config alias or user@hostname
-    purpose: "General purpose development server"
+    purpose: "General purpose development server (Claude-only, legacy claude_path)"
     claude_path: ~/.claude/local/claude
     log_dir: /tmp/ic-logs      # remote log/marker directory (default: /tmp/ic-logs)
     repos:
@@ -14,10 +24,32 @@ machines:
     env:                       # optional: env vars for remote claude sessions
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
 
+  # - name: codex-box
+  #   host: user@codex.internal
+  #   purpose: "Codex-only worker host"
+  #   # Codex must be installed AND explicitly enabled AND logged in
+  #   # (`codex login` run on codex-box) before this host is usable.
+  #   clients:
+  #     codex:
+  #       enabled: true
+  #       path: /usr/local/bin/codex
+  #   repos:
+  #     - /opt/codex/training-repo
+  #   env:
+  #     ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+
   # - name: gpu-box
   #   host: user@gpu.internal
-  #   purpose: "ML training and inference"
-  #   claude_path: /usr/local/bin/claude
+  #   purpose: "ML training and inference (dual-client: both Claude and Codex enabled)"
+  #   # Both clients enabled here — Codex still requires its own `codex login`
+  #   # on gpu-box even though claude_path/claude auth already works.
+  #   clients:
+  #     claude:
+  #       enabled: true
+  #       path: /usr/local/bin/claude
+  #     codex:
+  #       enabled: true
+  #       path: /usr/local/bin/codex
   #   repos:
   #     - /opt/ml/training-repo
   #   env:

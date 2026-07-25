@@ -2,8 +2,10 @@
 """Tests for config loading — ironclaude.json and machines.yaml."""
 import json
 import os
+from pathlib import Path
 import pytest
 from ironclaude.config import load_config, load_machines_config
+from ironclaude.provider_config import ProviderConfigError
 
 
 class TestLoadConfig:
@@ -331,3 +333,63 @@ machines:
 """)
         with pytest.raises(ValueError, match="host"):
             load_machines_config(str(p))
+
+
+def test_invalid_provider_config_fails_startup(tmp_path, base_config):
+    raw = base_config()
+    raw["clients"]["codex"]["enabled"] = "false"
+    path = tmp_path / "ironclaude.json"
+    path.write_text(json.dumps({"providers": raw}))
+    with pytest.raises(ProviderConfigError, match="boolean"):
+        load_config(str(path))
+
+
+def test_codex_only_and_dual_client_machines(tmp_path):
+    path = tmp_path / "machines.yaml"
+    path.write_text("""
+machines:
+  - name: codex-only
+    host: codex-only
+    repos: [/repo]
+    clients:
+      codex: {enabled: true, path: /opt/codex}
+  - name: dual
+    host: dual
+    repos: [/repo]
+    clients:
+      claude: {enabled: true, path: /opt/claude}
+      codex: {enabled: true, path: /opt/codex}
+""")
+    machines = load_machines_config(str(path))
+    assert set(machines[0]["clients"]) == {"codex"}
+    assert set(machines[1]["clients"]) == {"claude", "codex"}
+
+
+def test_machine_without_enabled_client_fails(tmp_path):
+    path = tmp_path / "machines.yaml"
+    path.write_text("""
+machines:
+  - name: empty
+    host: empty
+    repos: [/repo]
+    clients:
+      codex: {enabled: false, path: /opt/codex}
+""")
+    with pytest.raises(ProviderConfigError, match="enabled client"):
+        load_machines_config(str(path))
+
+
+def test_shipped_configuration_examples_parse():
+    import json
+    repo_root = Path(__file__).resolve().parents[2]
+    json_example = repo_root / "config/ironclaude.json.example"
+    # Parse the example directly so a malformed or missing shipped example raises
+    # HERE. load_config() swallows JSONDecodeError/FileNotFoundError and falls back
+    # to DEFAULTS (config.py:104-109); asserting only on the merged config would
+    # pass green even for a broken example, since DEFAULTS also has codex disabled.
+    json.loads(json_example.read_text())
+    cfg = load_config(str(json_example))
+    assert cfg["providers"]["clients"]["codex"]["enabled"] is False
+    machines = load_machines_config(str(repo_root / "config/machines.yaml.example"))
+    assert machines
+    assert any(client["enabled"] for client in machines[0]["clients"].values())

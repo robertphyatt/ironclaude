@@ -212,6 +212,13 @@ class TestClassifyReason:
         ) == "model_unavailable"
         assert fa.classify_reason("selected model may not exist — too many requests") == "model_unavailable"
 
+    def test_hit_your_limit_classifies_usage_limit(self):
+        # The real usage-limit string (with the middle dot) must classify usage_limit
+        # so the writer honors the reset time and keeps Fable.
+        assert fa.classify_reason(
+            "You've hit your limit · resets 4:10am (America/Chicago)"
+        ) == "usage_limit"
+
 
 class TestParseResetTime:
     def test_resets_pm(self):
@@ -243,6 +250,17 @@ class TestMarkWindows:
         p = self._read()
         assert p["category"] == "usage_limit"
         assert p["unavailable_until"] == datetime.datetime(2026, 7, 14, 15, 0, 0).timestamp()
+
+    def test_hit_your_limit_uses_reset_not_unknown(self, monkeypatch):
+        import datetime
+        now = datetime.datetime(2026, 7, 14, 1, 0, 0).timestamp()   # 1am, before the 4:10am reset
+        monkeypatch.setattr(fa, "_now", lambda: now)
+        fa.mark_fable_unavailable("You've hit your limit · resets 4:10am (America/Chicago)")
+        p = self._read()
+        # usage_limit -> honors the parsed 4:10 reset, NOT the 1h unknown reprobe.
+        assert p["category"] == "usage_limit"
+        assert p["unavailable_until"] == datetime.datetime(2026, 7, 14, 4, 10, 0).timestamp()
+        assert p["unavailable_until"] != now + fa._UNKNOWN_REPROBE
 
     def test_usage_limit_reset_at_wins(self, monkeypatch):
         monkeypatch.setattr(fa, "_now", lambda: 1000.0)

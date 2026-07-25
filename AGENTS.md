@@ -60,6 +60,12 @@
     - If cleanup is blocked or unsafe, record the finding and explain the constraint instead of suppressing it
     - Do not use this rule to justify speculative refactoring or unrequested features
 
+11. **Advisor Fallback (advisor unavailable ≠ skip the advisor)**
+    - The reliable advisor is a manual tiered-up adversarial reviewer you invoke yourself — codex has no `/advisor` command, so this is your ONLY advisor path. Do NOT skip the advisor step or just reason it through yourself.
+    - Fire it at the natural, discretionary points a normal advisor would be consulted (agent judgment — before substantive work, when stuck, before declaring done). NOT every task, NOT every review gate.
+    - Invoke a one-tier-up reviewer with `codex exec -m <one-tier-up-model>` over the work (pass the code/diff to review inline). Tier ladder: `luna (haiku) → terra (sonnet) → sol (opus)`; codex has no `fable`, so at the `sol` ceiling run a same-tier BLIND pass (`sol → sol`). Keep the reviewer a codex model — codex is its own advisor peer. See the `ironclaude:advisor-fallback` skill for the exact command and gotchas.
+    - Report-only: weigh the findings as an adversary's evidence, reconcile conflicts with evidence; "no advisor" means "run this manual reviewer instead," never "proceed unreviewed."
+
 ## Plan Mode Replacement
 
 IronClaude replaces Codex's built-in `EnterPlanMode`/`ExitPlanMode` tools with a three-stage workflow: brainstorming → writing-plans → executing-plans. When professional mode is active, `EnterPlanMode` is blocked by hooks — this is intentional, not a bug. The brainstorming skill is your planning phase.

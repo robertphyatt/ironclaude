@@ -284,3 +284,12 @@ def create_research_mcp_server(tools: ResearchTools | None = None):
         return result
 
     return mcp
+
+
+def main() -> None:
+    """Entry point when run as an MCP server subprocess (stdio transport)."""
+    create_research_mcp_server().run()
+
+
+if __name__ == "__main__":
+    main()

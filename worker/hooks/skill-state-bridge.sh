@@ -69,10 +69,18 @@ case "$SKILL_NAME" in
     ;;
 esac
 
+# A repeated skill activation is not a workflow transition.  Leave the complete
+# session row and audit trail untouched so resume/retry behavior is idempotent.
+if [ -n "$STAGE_CHANGE" ] && [ -n "$CURRENT_STAGE" ]; then
+  TARGET_STAGE="${STAGE_CHANGE#workflow_stage=}"
+  if [ "$CURRENT_STAGE" = "$TARGET_STAGE" ]; then
+    exit 0
+  fi
+fi
+
 # Validate transition is legal per state machine (H2 fix)
 # Warn but don't block — skills may need to activate post-compaction
 if [ -n "$STAGE_CHANGE" ] && [ -n "$CURRENT_STAGE" ]; then
-  TARGET_STAGE="${STAGE_CHANGE#workflow_stage=}"
   if [ "$CURRENT_STAGE" != "$TARGET_STAGE" ]; then
     VALID="false"
     case "$TARGET_STAGE" in

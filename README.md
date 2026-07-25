@@ -1,8 +1,3 @@
-> ⚠️ **History Rewrite Notice**
-> This repository underwent a history rewrite on 2026-04-15. If you cloned before this date, your local copy is no longer compatible with `origin/main`.
-> **Option A (recommended):** Delete your local clone and re-clone.
-> **Option B:** `git fetch --all && git reset --hard origin/main` (discards any local changes).
-
 # IronClaude
 
 **Workflow discipline and multi-agent orchestration for Claude Code and OpenAI Codex.**
@@ -12,7 +7,7 @@ IronClaude adds workflow discipline to Claude Code and OpenAI Codex, plus multi-
 - **Worker** -- A Claude Code and OpenAI Codex plugin that enforces disciplined development workflows (brainstorm, plan, execute) with review gates between every task
 - **Commander** -- A Python daemon that orchestrates multiple Worker sessions via Slack, with an autonomous Brain that decomposes objectives and assigns work
 
-> **Compatibility:** Direct Worker mode supports Claude Code and OpenAI Codex. Commander currently orchestrates Claude Code sessions only; Codex-backed Commander workers are not yet supported.
+> **Compatibility:** Direct Worker mode supports Claude Code and OpenAI Codex. Commander now runs Codex as **workers and grader** alongside Claude, and the Codex **Brain** runs the disciplined brainstorm → plan → execute workflow and episodic memory. Codex-Brain worker orchestration and Codex advisor wiring land in v1.1.1. See [CODEX_SETUP.md](CODEX_SETUP.md).
 
 The key insight: discipline and orchestration reinforce each other. The Worker's professional mode hooks guarantee that every autonomous session follows the full workflow -- so the Commander can trust the quality of work happening without your direct supervision. And because the Commander runs through Slack, you can supervise and direct multi-session autonomous work from your phone, from anywhere, without being at your terminal. The Brain acts as your proxy at the keyboard.
 
@@ -20,14 +15,11 @@ You can use the Worker alone for single-session discipline, or add the Commander
 
 ---
 
-## What's New in v1.0.24
+## What's New in v1.1.0
 
-- New `ironclaude:workflow-durability` skill teaches that plan / design / task-state artifacts on disk are durable — no self-checkpointing, no offloading read-only queries to the operator when Bash is stage-blocked.
-- Stop-hook and SubagentStop-hook now detect and block checkpoint / query-offload proposals via a shared line-scoped lexicon helper across five workflow stages, preserving complete multiline assistant blocks and recognizing common permission-request forms.
-- Native Codex packaging now registers the Worker skills and both MCP servers; the episodic-memory startup hook relies on its existing self-backgrounding CLI instead of unsupported async-hook metadata.
-- Slack `/login` now strips pasted URL garbage, reports long-running and rejected-code states, and closes the submit/re-prompt race; operator-wait alerts link only to a fully delivered top-level Brain message verified to reference the same worker, otherwise remaining linkless.
-- New scope-aware Boy Scout Rule makes pre-existing defects actionable: clean them up when authorized, or present the finding, evidence, cleanup scope, and risk and ask permission before expanding scope. Tracked root `AGENTS.md` carries the Codex repository guidance and is covered by the propagation guard.
-- Commander tests no longer touch the operator's live tmux server or bind a TCP listener, so the complete suite runs hermetically in restricted environments without capability skips.
+- **Codex↔Claude parity for workers and grader.** A provider router lets those roles run on OpenAI Codex (`gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-5.6-sol`), selected per role in `config/ironclaude.json`. See [CODEX_SETUP.md](CODEX_SETUP.md).
+- **Codex Brain (workflow + memory).** The Brain can run as a persistent `codex app-server` (`BRAIN_CLIENT=codex`) with a read-only sandbox, on-request approval, and a git-command allowlist guard, driving the full brainstorm → plan → execute workflow and episodic memory. Worker-orchestration from the Codex Brain, Brain tool-gating, and Codex advisor wiring are v1.1.1.
+- **Reliability & hygiene.** A periodic session-artifact sweep prunes stale session rows and dead-PID id files; Brain narration is threaded into Slack without re-triggering the earlier restart loop; the Commander test suite runs warning-clean.
 - See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ---
@@ -61,6 +53,8 @@ The Worker is your avatar at the keyboard. It does what you do in direct mode, j
 ## How IronClaude Compares
 
 IronClaude was inspired by several projects in this space. Here's how it differs:
+
+> *Comparison as of 2026-04-01 — a point-in-time snapshot of when these projects were surveyed. This space moves quickly, so details may have changed since.*
 
 ### vs. Superpowers
 
@@ -119,7 +113,17 @@ codex plugin marketplace add robertphyatt/ironclaude
 codex plugin add ironclaude@ironclaude
 ```
 
-Start a new Codex task after installation so it loads the Worker skills and MCP tools. Review and trust the bundled hooks before enabling professional mode; Codex does not automatically trust plugin hooks. The Codex manifest embeds plugin-relative MCP commands while the existing `.mcp.json` remains Claude Code-compatible.
+After initial installation or any update, preserve the current native task ID,
+fully quit and relaunch Codex, then reopen the same task so Codex loads the
+installed Worker skills and MCP tools. Verify the provider-specific runtime
+fingerprint against the intended installed cache and require the next valid
+different-stage workflow transition to return `changed:true`. `codex plugin
+list`, reinstall success, and filesystem parity are installation evidence, not
+proof that the running process loaded the new plugin. Create a replacement task
+only if same-task fingerprint or behavioral verification fails. Review and
+trust the bundled hooks before enabling professional mode; Codex does not
+automatically trust plugin hooks. The Codex manifest embeds plugin-relative MCP
+commands while the existing `.mcp.json` remains Claude Code-compatible.
 
 ### Activate Professional Mode
 
@@ -535,6 +539,8 @@ Three convergence mechanisms keep the wiki current:
 
 **Environment variable overrides** (take precedence over `ironclaude.json`):
 `POLL_INTERVAL_SECONDS`, `HEARTBEAT_INTERVAL_SECONDS`, `DB_PATH`, `BRAIN_TIMEOUT_SECONDS`, `BRAIN_MODEL`, `GRADER_MODEL`, `EFFORT_LEVEL`
+
+**Codex provider.** To run roles or the Brain on OpenAI Codex, enable the codex client and add `"codex"` to a role's `clients` under the `providers` block in `config/ironclaude.json`, and set `BRAIN_CLIENT=codex` for the Brain. See [CODEX_SETUP.md](CODEX_SETUP.md) for the full guide.
 
 ---
 

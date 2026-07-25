@@ -17,6 +17,8 @@ class TestInitDb:
         assert "objectives" in tables
         assert "tasks" in tables
         assert "workers" in tables
+        assert "provider_role_state" in tables
+        assert "provider_capability_state" in tables
         conn.close()
 
     def test_wal_mode_enabled(self, tmp_path):
@@ -52,6 +54,7 @@ class TestInitDb:
         # no losses. Asserting the set equality (rather than a hardcoded count)
         # keeps this robust as the schema grows.
         assert tables2 == tables1
+        assert {"provider_role_state", "provider_capability_state"} <= tables2
         assert tables1, "init_db must create at least one table"
         conn2.close()
 

@@ -41,6 +41,10 @@ from ironclaude.fable_availability import (
     clear_fable_unavailable as _clear_fable_unavailable,
 )
 from ironclaude.grader import LocalGrader
+from ironclaude.provider_config import provider_config_from_commander, _semantic_tier, ProviderConfigError
+from ironclaude.provider_state import ProviderState
+from ironclaude.provider_capabilities import CapabilityRegistry, CapabilityProbe
+from ironclaude.provider_router import ProviderRouter, NoCapabilityAvailable
 from ironclaude.notifications import format_directive_review, format_fable_unavailable, format_fable_recovered
 from ironclaude.shadow_grader import ShadowGrader
 from ironclaude.ollama_client import OllamaClient, OllamaError
@@ -120,6 +124,11 @@ def log_worker_event(event_type: str, **fields) -> None:
 WORKER_COMMANDS = {
     "claude-sonnet": "export CLAUDE_CODE_EFFORT_LEVEL=high; exec claude --model 'sonnet' --dangerously-skip-permissions",
 }
+
+# Maps a semantic worker_type to the provider-router TIER it requests (client is
+# decided by the router). Unknown types map to None -> legacy path (preserves the
+# existing ValueError for invalid worker types).
+_WORKER_TYPE_TIER = {"claude-opus": "opus", "claude-fable": "fable", "claude-sonnet": "sonnet"}
 
 VALID_DIRECTIVE_STATUSES = frozenset({
     "pending_confirmation", "awaiting_changes", "superseded",
@@ -456,6 +465,7 @@ class OrchestratorTools:
         self._local_grader = LocalGrader(config_path=self._ollama_config_path)
         self._shadow_grader = ShadowGrader(config_path=self._ollama_config_path)
         self._last_grader_delta: str = ""
+        self._grader_router_cache = None
 
     def _advisor_model_for(self, worker_type: str) -> str:
         """Return the tiered advisor model for a given worker type.
@@ -489,9 +499,45 @@ class OrchestratorTools:
         if slack is not None and hasattr(slack, "post_message"):
             slack.post_message(message)
 
+    def _codex_worker_command(self, model: str) -> str:
+        """Interactive `codex` worker command (design spec — no CLAUDE_CODE_EFFORT_LEVEL;
+        the IC_ROLE/IC_WORKER_ID/ENABLE_STOP_REVIEW prefix is added by
+        `_build_worker_launch_cmd`). No `[1m]` (claude-only); ChatGPT-sub auth via codex CLI."""
+        codex_path = (self._config.get("providers", {}).get("clients", {})
+                      .get("codex", {}).get("path", "codex"))
+        return (f"exec {codex_path} --model {shlex.quote(model)} "
+                f"--dangerously-bypass-approvals-and-sandbox")
+
+    def _resolve_worker_client(self, worker_type: str):
+        """ProviderHandle for the worker, or None to use the legacy claude path.
+
+        None for: ollama (unrouted), unknown worker_type (so the legacy body still raises
+        ValueError), a config with no provider block (ProviderConfigError), or no usable
+        client (NoCapabilityAvailable). Probes the requested tier AND, for a fable request,
+        the 'opus' degrade target (the router degrades fable->opus for non-claude clients)."""
+        if worker_type == "ollama":
+            return None
+        tier = _WORKER_TYPE_TIER.get(_resolve_fable_worker_type(worker_type))
+        if tier is None:
+            return None
+        try:
+            self._ensure_role_capabilities("worker", tier)
+            if tier == "fable":
+                self._ensure_role_capabilities("worker", "opus")
+            router, _c, _s, _r = self._provider_router()
+            return router.resolve("worker", tier, ["local"])
+        except NoCapabilityAvailable:
+            return None
+        except ProviderConfigError:
+            return None
+
     def _get_worker_command(self, worker_type: str, model_name: str = "") -> str:
         """Build worker command, using advisor config for model selection."""
         worker_type = _resolve_fable_worker_type(worker_type)
+        _handle = self._resolve_worker_client(worker_type)
+        if _handle is not None and _handle.client == "codex":
+            return self._codex_worker_command(_handle.model)
+        # else: fall through to the existing byte-identical claude/ollama logic
         advisor = self._advisor_cfg
         if worker_type == "ollama":
             self._get_ollama_client()  # populate _ollama_cfg_cache
@@ -510,32 +556,35 @@ class OrchestratorTools:
 
     def _build_worker_launch_cmd(
         self, worker_type: str, model_name: str, worker_id: str, machine_cfg,
-    ) -> str:
-        """Build the full non-ollama worker launch command for either a local or
-        remote (machine_cfg) target.
+    ):
+        """Build the full non-ollama worker launch command for a local or remote target.
+
+        Returns ``(cmd, handle)`` where ``handle`` is the resolved worker ProviderHandle
+        (or None). Remote (machine_cfg) is claude-only this slice, so its handle is None.
 
         For a remote machine: env prefix (IC_ROLE/IC_WORKER_ID) + machine_cfg.env
         + machine_cfg.claude_path invocation — no local `_get_worker_command`
         involved, since the remote binary path and env are machine-specific.
 
-        For local: `_get_worker_command`'s resolved command, with the
-        IC_ROLE/IC_WORKER_ID/ENABLE_STOP_REVIEW prefix needed for stop-hook
-        completion detection.
+        For local: `_get_worker_command`'s resolved command (claude verbatim, or codex
+        when the router selects it), with the IC_ROLE/IC_WORKER_ID/ENABLE_STOP_REVIEW
+        prefix needed for stop-hook completion detection.
 
         Used by both the initial spawn and the spawn-died-on-fable retry-as-opus
         path (OR-03), so a remote retry gets the same machine-specific shape as
         the initial remote spawn instead of silently falling back to a local
         `exec claude` command.
         """
+        handle = None if machine_cfg else self._resolve_worker_client(worker_type)
         if machine_cfg:
             cmd_parts = ["export IC_ROLE=worker", f"export IC_WORKER_ID={shlex.quote(worker_id)}"]
             for k, v in machine_cfg.env.items():
                 cmd_parts.append(f"export {k}={shlex.quote(v)}")
             model = model_name or self._opus_model
             cmd_parts.append(f"{machine_cfg.claude_path} --model {shlex.quote(model)} --dangerously-skip-permissions")
-            return "; ".join(cmd_parts)
+            return "; ".join(cmd_parts), handle
         cmd = self._get_worker_command(worker_type, model_name)
-        return f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; export ENABLE_STOP_REVIEW=0; {cmd}"
+        return f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; export ENABLE_STOP_REVIEW=0; {cmd}", handle
 
     def _get_ollama_client(self) -> OllamaClient:
         """Lazy-initialize and return the shared OllamaClient.
@@ -687,6 +736,127 @@ class OrchestratorTools:
         f = {"grade": "F", "approved": False, "feedback": feedback}
         return [f] if batch else f
 
+    def _claude_grader_argv(self, schema: dict, sysfile: str, model: str) -> list:
+        """The exact ``claude -p`` grader argv. Kept byte-identical to the historical
+        command; only ``model`` is now a parameter (was self._grader_model)."""
+        return [
+            "claude", "-p",
+            "--system-prompt-file", sysfile,
+            "--output-format", "json",
+            "--json-schema", json.dumps(schema),
+            # [1m] (+ context-1m beta) is only valid for models that need it to
+            # unlock 1M context (opus). Fable 5 / Sonnet 5 have 1M natively and
+            # REJECT the suffix — `fable[1m]`/`sonnet[1m]` is an invalid model id.
+            "--model", (f"{model}[1m]" if _model_needs_1m_beta(model) else model),
+            "--dangerously-skip-permissions",
+            # --dangerously-skip-permissions is required for a non-interactive
+            # run, so the grader must be starved of every mutating/agentic tool
+            # by name (the prompt embeds worker-controlled log text — treat it as
+            # untrusted). --strict-mcp-config drops the plugin MCP servers so no
+            # `mcp__*` state-manager mutators are reachable; the disallow list
+            # removes the built-in file/exec tools AND the agentic ones (Skill,
+            # Workflow, worktree, cron, wakeup, remote-trigger, messaging). The
+            # StructuredOutput verdict tool is intentionally NOT disallowed.
+            "--strict-mcp-config",
+            "--disallowedTools",
+            "Task,Bash,Read,Edit,Write,NotebookEdit,Grep,Glob,WebFetch,WebSearch,"
+            "Skill,Workflow,ToolSearch,SendMessage,EnterWorktree,ExitWorktree,"
+            "CronCreate,CronDelete,CronList,ScheduleWakeup,RemoteTrigger",
+        ]
+
+    def _parse_claude_grader_output(self, proc, batch: bool):
+        """Parse a ``claude -p --output-format json`` grader result into the verdict
+        dict/list. Verbatim relocation of the historical parse.
+
+        `claude -p --output-format json` normally emits a JSON ARRAY of events; the
+        type=="result" element carries the schema verdict in structured_output. Some
+        CLI builds emit a single result OBJECT instead — handle both shapes so a CLI
+        version change cannot silently degrade every grade to F.
+        """
+        try:
+            payload = json.loads(proc.stdout)
+            if isinstance(payload, dict):
+                result_event = payload if (
+                    payload.get("type") == "result" or "structured_output" in payload
+                ) else None
+            else:
+                result_event = next(
+                    (e for e in payload if isinstance(e, dict) and e.get("type") == "result"), None
+                )
+            out = result_event.get("structured_output") if result_event else None
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            out = None
+        if out is None:
+            return self._grader_failure(batch, f"Grader produced no structured_output: {proc.stdout[:300]}")
+        if batch:
+            # batch schema wraps the array in an object: {"verdicts": [...]}
+            verdicts = out.get("verdicts") if isinstance(out, dict) else None
+            return verdicts if isinstance(verdicts, list) else self._grader_failure(
+                True, f"Grader batch output missing 'verdicts' list: {str(out)[:200]}")
+        if not isinstance(out, dict):
+            # non-batch schema is an object; a non-dict slipping through would make
+            # out.get(...) raise and crash the caller — return F instead.
+            return self._grader_failure(False, f"Grader verdict not an object: {out!r}"[:300])
+        return {
+            "grade": out.get("grade", "F"),
+            "approved": out.get("approved", False),
+            "feedback": out.get("feedback", ""),
+            **({"recommended_model": out["recommended_model"]} if "recommended_model" in out else {}),
+        }
+
+    def _codex_grader_env(self) -> dict:
+        """Env for the codex grader subprocess. Unlike the claude grader, codex
+        authenticates via its own ChatGPT-subscription login, so we do NOT strip
+        ANTHROPIC_*/Bedrock/Vertex (those are claude-only) — pass the process env
+        through, only pinning the reasoning-effort level for parity."""
+        env = dict(os.environ)
+        env["CLAUDE_CODE_EFFORT_LEVEL"] = self._effort_level
+        return env
+
+    def _codex_grader_argv(self, schema_file: str, model: str) -> list:
+        """``codex exec`` grader argv (validated by the codex-grader-exec live probe).
+
+        --output-schema takes a FILE; --ephemeral (no session litter) and
+        --skip-git-repo-check (grader_home is not a git repo) are required; -s read-only
+        pins the sandbox; NO [1m] suffix (claude-only). The concatenated system+user prompt
+        is delivered on stdin via the trailing ``-``."""
+        codex_path = (
+            self._config.get("providers", {}).get("clients", {})
+            .get("codex", {}).get("path", "codex")
+        )
+        return [
+            codex_path, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
+            "--output-schema", schema_file, "-s", "read-only", "-m", model, "-",
+        ]
+
+    def _parse_codex_grader_output(self, proc, batch: bool):
+        """Parse ``codex exec --json`` grader output. The schema-constrained verdict is the
+        text of the last ``item.completed`` whose ``item.type == "agent_message"``."""
+        text = None
+        try:
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                ev = json.loads(line)
+                if ev.get("type") == "item.completed" and ev.get("item", {}).get("type") == "agent_message":
+                    text = ev["item"].get("text")
+            out = json.loads(text) if text is not None else None
+        except (json.JSONDecodeError, TypeError, AttributeError, KeyError):
+            out = None
+        if not isinstance(out, dict):
+            return self._grader_failure(batch, f"Codex grader produced no verdict JSON: {proc.stdout[:300]}")
+        if batch:
+            verdicts = out.get("verdicts")
+            return verdicts if isinstance(verdicts, list) else self._grader_failure(
+                True, f"Codex batch output missing 'verdicts' list: {str(out)[:200]}")
+        return {
+            "grade": out.get("grade", "F"),
+            "approved": out.get("approved", False),
+            "feedback": out.get("feedback", ""),
+            **({"recommended_model": out["recommended_model"]} if "recommended_model" in out else {}),
+        }
+
     def _call_grader(self, system_prompt: str, user_prompt: str, batch: bool = False) -> dict | list:
         """Grade via a per-call ``claude -p`` headless subprocess with no file/exec tools.
 
@@ -709,7 +879,31 @@ class OrchestratorTools:
         When batch=True the schema is an OBJECT wrapping the verdict array
         (`{"verdicts": [...]}`, because the API rejects a top-level array schema); the
         unwrapped list of verdicts is returned.
+
+        The grader client/model is resolved via the provider foundation
+        (``ProviderRouter``). For a claude-default config the resolved model equals
+        ``self._grader_model`` so the ``claude -p`` command stays byte-identical; a
+        codex-configured grader routes to the codex client. No usable capability -> grade F.
         """
+        # Route the grader client + model through the provider foundation. Never raises:
+        #  - a config with no provider block (legacy/minimal config) -> byte-identical
+        #    legacy claude path (ProviderConfigError). In production the config always
+        #    carries a providers block (config DEFAULTS + load-time validation), so routing
+        #    is active there.
+        #  - a config whose grader role has no usable client -> grade F (NoCapabilityAvailable).
+        try:
+            tier = _semantic_tier(self._grader_model, "grader_model", "opus")
+            self._ensure_role_capabilities("grader", tier)
+            router, _config, _state, _registry = self._provider_router()
+            handle = router.resolve("grader", tier, ["local"])
+            grader_client, grader_model = handle.client, handle.model
+        except NoCapabilityAvailable as exc:
+            logger.warning("No grader capability available: %s", exc)
+            return self._grader_failure(batch, f"No grader capability available: {exc}")
+        except ProviderConfigError:
+            # No provider config -> legacy claude grader, byte-identical to pre-routing.
+            grader_client, grader_model = "claude", self._grader_model
+
         from ironclaude.main import ensure_brain_trusted
         # The Anthropic tool input_schema (what --json-schema becomes) MUST be a
         # top-level object — a top-level array is rejected (400 ...type: 'object').
@@ -728,32 +922,34 @@ class OrchestratorTools:
                 with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as sf:
                     sf.write(system_prompt)
                     sysfile = sf.name
-                cmd = [
-                    "claude", "-p",
-                    "--system-prompt-file", sysfile,
-                    "--output-format", "json",
-                    "--json-schema", json.dumps(schema),
-                    # [1m] (+ context-1m beta) is only valid for models that need it to
-                    # unlock 1M context (opus). Fable 5 / Sonnet 5 have 1M natively and
-                    # REJECT the suffix — `fable[1m]`/`sonnet[1m]` is an invalid model id.
-                    "--model", (f"{self._grader_model}[1m]"
-                                if _model_needs_1m_beta(self._grader_model)
-                                else self._grader_model),
-                    "--dangerously-skip-permissions",
-                    # --dangerously-skip-permissions is required for a non-interactive
-                    # run, so the grader must be starved of every mutating/agentic tool
-                    # by name (the prompt embeds worker-controlled log text — treat it as
-                    # untrusted). --strict-mcp-config drops the plugin MCP servers so no
-                    # `mcp__*` state-manager mutators are reachable; the disallow list
-                    # removes the built-in file/exec tools AND the agentic ones (Skill,
-                    # Workflow, worktree, cron, wakeup, remote-trigger, messaging). The
-                    # StructuredOutput verdict tool is intentionally NOT disallowed.
-                    "--strict-mcp-config",
-                    "--disallowedTools",
-                    "Task,Bash,Read,Edit,Write,NotebookEdit,Grep,Glob,WebFetch,WebSearch,"
-                    "Skill,Workflow,ToolSearch,SendMessage,EnterWorktree,ExitWorktree,"
-                    "CronCreate,CronDelete,CronList,ScheduleWakeup,RemoteTrigger",
-                ]
+                if grader_client == "codex":
+                    schema_file = None
+                    try:
+                        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as scf:
+                            json.dump(schema, scf)
+                            schema_file = scf.name
+                        codex_proc = subprocess.run(
+                            self._codex_grader_argv(schema_file, grader_model),
+                            input=f"{system_prompt}\n\n{user_prompt}",
+                            cwd=self._grader_home, env=self._codex_grader_env(),
+                            capture_output=True, text=True, timeout=self.GRADER_TIMEOUT_SECONDS,
+                        )
+                    except subprocess.TimeoutExpired:
+                        return self._grader_failure(
+                            batch, f"Codex grader timed out after {self.GRADER_TIMEOUT_SECONDS}s")
+                    except Exception as exc:  # noqa: BLE001 — a grader failure must never crash the caller
+                        return self._grader_failure(batch, f"Codex grader error: {exc}")
+                    finally:
+                        if schema_file is not None:
+                            try:
+                                os.unlink(schema_file)
+                            except OSError:
+                                pass
+                    if codex_proc.returncode != 0:
+                        return self._grader_failure(
+                            batch, f"Codex grader exited {codex_proc.returncode}: {codex_proc.stderr[:300]}")
+                    return self._parse_codex_grader_output(codex_proc, batch)
+                cmd = self._claude_grader_argv(schema, sysfile, grader_model)
                 proc = subprocess.run(
                     cmd, input=user_prompt, cwd=self._grader_home, env=self._grader_env(),
                     capture_output=True, text=True, timeout=self.GRADER_TIMEOUT_SECONDS,
@@ -776,44 +972,40 @@ class OrchestratorTools:
 
             if proc.returncode != 0:
                 return self._grader_failure(batch, f"Grader exited {proc.returncode}: {proc.stderr[:300]}")
-            # `claude -p --output-format json` normally emits a JSON ARRAY of events; the
-            # type=="result" element carries the schema verdict in structured_output. Some
-            # CLI builds emit a single result OBJECT instead — handle both shapes so a CLI
-            # version change cannot silently degrade every grade to F.
-            try:
-                payload = json.loads(proc.stdout)
-                if isinstance(payload, dict):
-                    result_event = payload if (
-                        payload.get("type") == "result" or "structured_output" in payload
-                    ) else None
-                else:
-                    result_event = next(
-                        (e for e in payload if isinstance(e, dict) and e.get("type") == "result"), None
-                    )
-                out = result_event.get("structured_output") if result_event else None
-            except (json.JSONDecodeError, TypeError, AttributeError):
-                out = None
-            if out is None:
-                return self._grader_failure(batch, f"Grader produced no structured_output: {proc.stdout[:300]}")
-            if batch:
-                # batch schema wraps the array in an object: {"verdicts": [...]}
-                verdicts = out.get("verdicts") if isinstance(out, dict) else None
-                return verdicts if isinstance(verdicts, list) else self._grader_failure(
-                    True, f"Grader batch output missing 'verdicts' list: {str(out)[:200]}")
-            if not isinstance(out, dict):
-                # non-batch schema is an object; a non-dict slipping through would make
-                # out.get(...) raise and crash the caller — return F instead.
-                return self._grader_failure(False, f"Grader verdict not an object: {out!r}"[:300])
-            return {
-                "grade": out.get("grade", "F"),
-                "approved": out.get("approved", False),
-                "feedback": out.get("feedback", ""),
-                **({"recommended_model": out["recommended_model"]} if "recommended_model" in out else {}),
-            }
+            return self._parse_claude_grader_output(proc, batch)
 
     def _call_local_grader(self, system_prompt: str, user_prompt: str, format_schema: dict) -> dict:
         """Call Ollama for local grading. Delegates to self._local_grader."""
         return self._local_grader.grade(system_prompt, user_prompt, format_schema)
+
+    def _provider_router(self):
+        """Lazily build + cache (router, config, state, registry) for provider routing.
+
+        Built from self._config['providers'] (always present via config DEFAULTS) and
+        self._db (the live sqlite conn from init_db, which owns the provider_* tables).
+        """
+        if self._grader_router_cache is None:
+            config = provider_config_from_commander(self._config)
+            state = ProviderState(self._db)
+            registry = CapabilityRegistry(state)
+            router = ProviderRouter(config, state, registry)
+            self._grader_router_cache = (router, config, state, registry)
+        return self._grader_router_cache
+
+    def _ensure_role_capabilities(self, role: str, tier: str) -> None:
+        """Probe + cache local capability for each configured client of `role`, once.
+
+        Lazy: only probes a (client, role, tier, local) tuple with no prior observation.
+        Never raises — a probe error is logged and leaves the capability unobserved.
+        """
+        _router, config, state, registry = self._provider_router()
+        probe = CapabilityProbe()
+        for client in config.roles[role].clients:
+            if state.capability_observation("local", client, role, tier) is None:
+                try:
+                    registry.record(probe.probe_local(config, client, role, tier))
+                except Exception as exc:  # noqa: BLE001 — probing must never crash grading
+                    logger.warning("%s capability probe failed for %s: %s", role, client, exc)
 
     def _parse_tool_calls_from_delta(self, delta: str) -> list:
         """Extract Claude Code tool invocations from tmux log delta (best-effort).
@@ -1571,28 +1763,56 @@ class OrchestratorTools:
             logger.warning(f"Failed to write CLAUDE.md to {repo}: {e}")
 
     def _wait_for_ready(self, session_name: str, timeout: int = 30,
-                        ssh_host: str | None = None) -> bool:
+                        ssh_host: str | None = None, client: str = "claude") -> bool:
         """Poll tmux log until the worker is ready or timeout exceeded.
 
-        Returns True if a ready indicator ("ironclaude v") is found,
-        False if the timeout is exceeded without seeing one.
-        Dismisses trust dialogs by sending Enter if detected.
+        Returns True if the client's ready indicator is found (claude: "ironclaude v";
+        codex: the ">_ OpenAI Codex" welcome box), False on timeout. Dismisses the
+        client's trust dialog by sending Enter (codex: only once — its prompt text
+        persists in the tail after acceptance).
         """
         deadline = time.time() + timeout
+        codex_trust_dismissed = False
         while time.time() < deadline:
             output = self.tmux.read_log_tail(session_name, lines=50, ssh_host=ssh_host)
             if output:
                 lower = output.lower()
-                if "trust this folder" in lower:
-                    self.tmux.send_keys(session_name, "", ssh_host=ssh_host)
-                if "ironclaude v" in output:
-                    return True
+                if client == "codex":
+                    if not codex_trust_dismissed and "do you trust" in lower:
+                        self.tmux.send_keys(session_name, "", ssh_host=ssh_host)  # Enter accepts default "Yes"
+                        codex_trust_dismissed = True
+                    if ">_ openai codex" in lower:
+                        return True
+                else:
+                    if "trust this folder" in lower:
+                        self.tmux.send_keys(session_name, "", ssh_host=ssh_host)
+                    if "ironclaude v" in output:
+                        return True
             time.sleep(1)
         return False
 
+    def _descendant_pids(self, pid: int) -> list:
+        """pid + all descendant PIDs (best-effort, POSIX ``pgrep -P``). Used by the codex
+        PM-activation path: codex writes its SessionStart id file keyed to an intermediate
+        process PID, not the tmux pane_pid, so we search the worker's whole process tree."""
+        out = [pid]
+        frontier = [pid]
+        while frontier:
+            p = frontier.pop()
+            try:
+                r = subprocess.run(["pgrep", "-P", str(p)], capture_output=True, text=True)
+                kids = [int(x) for x in r.stdout.split()] if r.returncode == 0 else []
+            except Exception:  # noqa: BLE001 — a walk failure just yields fewer candidates
+                kids = []
+            for k in kids:
+                if k not in out:
+                    out.append(k)
+                    frontier.append(k)
+        return out
+
     def _set_pm_via_sqlite(
         self, session_name: str, value: str,
-        timeout: int = 30, _claude_dir: Path | None = None,
+        timeout: int = 30, _claude_dir: Path | None = None, client: str = "claude",
     ) -> str | None:
         """Shared implementation for activate/deactivate PM via direct SQLite write.
 
@@ -1601,6 +1821,8 @@ class OrchestratorTools:
             value: 'on' or 'off'
             timeout: seconds to wait for session ID file to appear
             _claude_dir: override ~/.claude path (for testing)
+            client: 'claude' (poll ironclaude-session-<pane_pid>.id) or 'codex' (the id
+                file is keyed to an intermediate PID, so search the pane_pid process tree)
 
         Returns None on success, or a failure reason string on any failure.
         """
@@ -1627,16 +1849,30 @@ class OrchestratorTools:
             logger.warning(f"{reason} for {session_name}")
             return reason
 
-        # Step 2: Poll for session ID file
-        session_id_file = claude_dir / f"ironclaude-session-{pane_pid}.id"
+        # Step 2: Poll for the session ID file. Claude keys it to the pane_pid; codex keys
+        # it to an intermediate process PID, so search the pane_pid's process subtree and
+        # take the newest valid (36-char) id file.
         deadline = time.time() + timeout
         session_uuid = None
         while time.time() < deadline:
-            if session_id_file.exists():
-                candidate = session_id_file.read_text().strip()
-                if len(candidate) == 36:
-                    session_uuid = candidate
+            if client == "codex":
+                candidates = []
+                for p in self._descendant_pids(int(pane_pid)):
+                    f = claude_dir / f"ironclaude-session-{p}.id"
+                    if f.exists():
+                        txt = f.read_text().strip()
+                        if len(txt) == 36:
+                            candidates.append((f.stat().st_mtime, txt))
+                if candidates:
+                    session_uuid = max(candidates)[1]  # newest by mtime
                     break
+            else:
+                session_id_file = claude_dir / f"ironclaude-session-{pane_pid}.id"
+                if session_id_file.exists():
+                    candidate = session_id_file.read_text().strip()
+                    if len(candidate) == 36:
+                        session_uuid = candidate
+                        break
             time.sleep(1)
 
         if session_uuid is None:
@@ -1736,16 +1972,17 @@ class OrchestratorTools:
 
     def _activate_pm_via_sqlite(
         self, session_name: str, timeout: int = 30,
-        max_retries: int = 3, _claude_dir: Path | None = None
+        max_retries: int = 3, _claude_dir: Path | None = None, client: str = "claude"
     ) -> str | None:
         """Activate professional mode by writing directly to ironclaude.db.
 
         Retries up to max_retries times on transient sqlite errors.
         Session ID timeout and tmux failures are not retryable.
+        `client` selects the id-file discovery strategy (see _set_pm_via_sqlite).
         """
         last_error: str | None = None
         for attempt in range(max_retries):
-            result = self._set_pm_via_sqlite(session_name, "on", timeout, _claude_dir)
+            result = self._set_pm_via_sqlite(session_name, "on", timeout, _claude_dir, client=client)
             if result is None:
                 return None
             last_error = result
@@ -2296,8 +2533,10 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             # Inject worker ID for stop hook completion detection (local only)
             if not machine_cfg:
                 cmd = f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; export ENABLE_STOP_REVIEW=0; {cmd}"
+            worker_handle = None  # ollama runs the claude binary -> claude PM/ready path
         else:
-            cmd = self._build_worker_launch_cmd(worker_type, model_name, worker_id, machine_cfg)
+            cmd, worker_handle = self._build_worker_launch_cmd(worker_type, model_name, worker_id, machine_cfg)
+        worker_client = worker_handle.client if worker_handle is not None else "claude"
 
         session_name = f"ic-{worker_id}"
 
@@ -2327,7 +2566,7 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             )
 
         # Stage 3: wait for ready
-        ready = self._wait_for_ready(session_name, timeout=30, ssh_host=ssh_host)
+        ready = self._wait_for_ready(session_name, timeout=30, ssh_host=ssh_host, client=worker_client)
         if not ready:
             log_tail = self.tmux.read_log_tail(
                 session_name, lines=30, ssh_host=ssh_host, remote_log_dir=remote_log_dir,
@@ -2355,7 +2594,8 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                     # This retry never targets Fable regardless of what the initial
                     # resolve found — the recovery check below must not fire for it.
                     spawn_used_fable = False
-                    cmd = self._build_worker_launch_cmd(worker_type, model_name, worker_id, machine_cfg)
+                    cmd, worker_handle = self._build_worker_launch_cmd(worker_type, model_name, worker_id, machine_cfg)
+                    worker_client = worker_handle.client if worker_handle is not None else "claude"
 
                     retry_success = self.tmux.spawn_session(
                         session_name, cmd, cwd=repo, ssh_host=ssh_host, remote_log_dir=remote_log_dir,
@@ -2365,7 +2605,7 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                             f"Failed to spawn tmux session for worker '{worker_id}' (opus retry)"
                         )
 
-                    ready = self._wait_for_ready(session_name, timeout=30, ssh_host=ssh_host)
+                    ready = self._wait_for_ready(session_name, timeout=30, ssh_host=ssh_host, client=worker_client)
                     if not ready:
                         retry_log_tail = self.tmux.read_log_tail(
                             session_name, lines=30, ssh_host=ssh_host, remote_log_dir=remote_log_dir,
@@ -2421,15 +2661,17 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             pm_failure = self._activate_pm_remote(session_name, ssh_host)
         else:
             pm_failure = self._activate_pm_via_sqlite(
-                session_name, timeout=pm_timeout, max_retries=pm_max_retries
+                session_name, timeout=pm_timeout, max_retries=pm_max_retries, client=worker_client
             )
         if pm_failure is not None:
             self.tmux.kill_session(session_name, ssh_host=ssh_host)
             return {"error": f"PM activation failed for worker '{worker_id}': {pm_failure}"}
 
         # Stage 5.5: enable advisor if configured (skip for claude-fable — top tier,
-        # no higher advisor available)
-        if self._advisor_cfg.get("enabled") and worker_type != "claude-fable":
+        # no higher advisor available; and for codex — `/advisor` is a Claude slash
+        # command codex does not understand, so codex workers spawn advisor-less this slice).
+        if (worker_client != "codex" and self._advisor_cfg.get("enabled")
+                and worker_type != "claude-fable"):
             advisor_model = self._advisor_model_for(worker_type)
             advisor_model = _resolve_fable_advisor_model(advisor_model)
             self.tmux.send_keys(session_name, f"/advisor {advisor_model}", ssh_host=ssh_host)
@@ -2444,7 +2686,7 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             if planned_use_goal_override is not None
             else bool(self._dispatch_cfg.get("use_goal"))
         )
-        if effective_use_goal:
+        if effective_use_goal and worker_client != "codex":  # /goal is a Claude slash command
             self.tmux.send_keys(
                 session_name,
                 "/goal the assigned objective is complete and code review has passed",
@@ -2455,6 +2697,8 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
         # Stage 6: send objective
         self.registry.register_worker(worker_id, worker_type, session_name, repo=repo,
                                        machine=machine, description=objective)
+        if worker_handle is not None:
+            self.registry.set_worker_provider(worker_id, worker_handle.client, worker_handle.model)
         self.tmux.send_keys(session_name, objective, ssh_host=ssh_host)
         self.registry.log_event(
             "worker_spawned",

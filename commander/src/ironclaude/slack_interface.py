@@ -341,6 +341,7 @@ SLASH_COMMANDS = {
     "summary": "Directive status report: in-progress, blocked, completed",
     "audit": "Reconcile Slack messages vs directives (last 72h)",
     "login": "Switch Anthropic account: send `login` (then `login code <…>` if it shows a code)",
+    "provider": "Show or set provider routing: /ironclaude provider [<role> <client>]",
 }
 
 
@@ -417,6 +418,12 @@ def parse_inbound_command(text: str, registry=None) -> dict:
 
     if upper == "LOGIN":
         return {"type": "login"}
+
+    # Catch-all on the VERB, not a fixed arity: a half-typed `provider worker` must not fall
+    # through to {"type": "message"}, which the daemon forwards to the Brain as a directive.
+    provider_match = re.match(r"^PROVIDER\b\s*(.*)$", text, re.IGNORECASE | re.DOTALL)
+    if provider_match:
+        return {"type": "provider", "args": provider_match.group(1).lower().split()}
 
     if registry is not None:
         plugin_result = registry.parse_command(text)

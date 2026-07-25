@@ -27,6 +27,22 @@ DESIGN, not IMPLEMENT.
 
 Whenever soliciting user input — choices, confirmations, or selections — ALWAYS use the `AskUserQuestion` tool. NEVER ask via prose. Follow the format in `.claude/rules/ask-user-question-format.md`: Re-ground context, Predict, Options. This produces structured UI and enforces one-question-at-a-time discipline.
 
+## Mandatory Direct Transition Preflight
+
+Before every direct workflow-transition MCP call:
+
+1. Call `get_resume_state` and validate that its session identity is the
+   provider-native root session for the active task. Missing or mismatched
+   identity: fail closed; stop and report the mismatch.
+2. Compare its current workflow stage to the requested target. On an
+   equal-target result, skip the transition call and preserve all state.
+3. Make one different-target call only and require returned `changed:true`. If the
+   call errors or returns unexpected `changed:false`, stop and report it; do not
+   retry without a fresh `get_resume_state` read. No blind retry.
+
+The `skill-state-bridge` owns entry to `debugging` for the
+`systematic-debugging` skill. Do not call `mark_debugging` directly.
+
 ## Common Rationalizations (all wrong)
 
 | Rationalization | Why it's wrong |
@@ -129,7 +145,10 @@ Examine current state:
 
 **After debugging completes, resume brainstorming:**
 
-Before continuing, call MCP `mcp__plugin_ironclaude_state-manager__mark_brainstorming` to transition workflow_stage back to `brainstorming`. If it fails (wrong stage), report the error to the user before proceeding.
+Run Mandatory Direct Transition Preflight for target `brainstorming`. Only after
+a different-target result, call MCP
+`mcp__plugin_ironclaude_state-manager__mark_brainstorming` once. If it fails
+(wrong stage), report the error to the user before proceeding.
 
 - The debugging results become inputs to Phase 2 (Explore Approaches)
 - Use confirmed evidence instead of guesswork when exploring approaches
@@ -328,7 +347,12 @@ git add docs/plans/YYYY-MM-DD-<topic>-design.md
 
 **Step 8.5: Signal design complete**
 
-Call MCP `mcp__plugin_ironclaude_state-manager__mark_design_ready` with the `file` parameter set to the design document path (e.g., `docs/plans/YYYY-MM-DD-topic-design.md`) to transition the session to `design_ready` and auto-register the design.
+Run Mandatory Direct Transition Preflight for target `design_ready`. Only after
+a different-target result, call MCP
+`mcp__plugin_ironclaude_state-manager__mark_design_ready` with the `file`
+parameter set to the design document path (e.g.,
+`docs/plans/YYYY-MM-DD-topic-design.md`) to transition the session to
+`design_ready` and auto-register the design. Call it once.
 
 If `mcp__plugin_ironclaude_state-manager__mark_design_ready` returns an error (wrong stage), display the error to the user. Do NOT proceed to Step 9 until it succeeds.
 

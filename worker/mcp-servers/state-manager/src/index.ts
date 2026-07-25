@@ -13,12 +13,14 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 
-import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
 
 import { initDb } from './db.js';
+import { parseIronClaudeClient, resolveSessionIdentity } from './session-identity.js';
+import { dispatchTool } from './tool-dispatch.js';
+import { captureRuntimeFingerprint } from './runtime-fingerprint.js';
 
 // Error sideband: write MCP tool errors to a file that hooks can surface
 const ERROR_LOG_PATH = path.join(os.homedir(), '.claude', 'ironclaude-errors.log');
@@ -33,10 +35,11 @@ function appendErrorLog(tool: string, sessionId: string, error: string): void {
   }
 }
 
-// Session binding state
+// Claude PPID transport state. Codex never reads this path.
 let _ppidFilePath: string | null = null;
-let _currentSessionId: string | null = null;
 let _initialBindComplete = false;
+const client = parseIronClaudeClient(process.env.IRONCLAUDE_CLIENT);
+const runtimeFingerprint = captureRuntimeFingerprint(import.meta.url, client);
 
 /**
  * Read session ID from PPID file.
@@ -54,21 +57,31 @@ function readSessionFromPpidFile(filePath: string): string | null {
   return null;
 }
 
-import { readToolDefinitions, readToolNames, handleReadTool, setCurrentSession as setReadSession, setSessionBindingSource } from './tools/read-tools.js';
-import { writeToolDefinitions, writeToolNames, handleWriteTool, setCurrentSession as setWriteSession } from './tools/write-tools.js';
+import { readToolDefinitions } from './tools/read-tools.js';
+import { writeToolDefinitions } from './tools/write-tools.js';
 
-// Read plugin version from plugin.json (single source of truth)
-function readPluginVersion(): string {
-  try {
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = path.dirname(__filename);
-    const pluginJsonPath = path.resolve(__dirname, '..', '..', '..', '.claude-plugin', 'plugin.json');
-    const pluginJson = JSON.parse(fs.readFileSync(pluginJsonPath, 'utf-8'));
-    return pluginJson.version || 'unknown';
-  } catch {
-    console.error('Warning: Could not read plugin.json for version');
-    return 'unknown';
+async function readClaudeSessionForCall(): Promise<string | null> {
+  if (!_ppidFilePath) return null;
+
+  if (_initialBindComplete) {
+    return readSessionFromPpidFile(_ppidFilePath);
   }
+
+  const maxAttempts = 5;
+  const delayMs = 300;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const sessionId = readSessionFromPpidFile(_ppidFilePath);
+    if (sessionId) {
+      _initialBindComplete = true;
+      console.error(`Resolved Claude session via PPID file (attempt ${attempt}/${maxAttempts})`);
+      return sessionId;
+    }
+    if (attempt < maxAttempts) {
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+
+  return null;
 }
 
 // Error Handling Utility
@@ -85,7 +98,7 @@ function handleError(error: unknown): string {
 const server = new Server(
   {
     name: 'state-manager',
-    version: readPluginVersion(),
+    version: runtimeFingerprint.ok ? runtimeFingerprint.runtime.plugin_version : 'unknown',
   },
   {
     capabilities: {
@@ -108,61 +121,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 // Handle Tool Calls
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  let resolvedSessionId = 'UNRESOLVED';
   try {
-    // Session binding: first call uses retry loop, subsequent calls re-read on every call
-    if (_ppidFilePath) {
-      if (!_initialBindComplete) {
-        // First call: retry loop (PPID file may not exist yet)
-        const maxAttempts = 5;
-        const delayMs = 300;
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          const sid = readSessionFromPpidFile(_ppidFilePath);
-          if (sid) {
-            setReadSession(sid);
-            setWriteSession(sid);
-            setSessionBindingSource('ppid_file');
-            _currentSessionId = sid;
-            _initialBindComplete = true;
-            console.error(`Bound to session via PPID file: ${sid} (attempt ${attempt}/${maxAttempts})`);
-            break;
-          }
-          if (attempt < maxAttempts) {
-            await new Promise(resolve => setTimeout(resolve, delayMs));
-          }
-        }
-      } else {
-        // Subsequent calls: single read, rebind if changed
-        const sid = readSessionFromPpidFile(_ppidFilePath);
-        if (sid) {
-          if (sid !== _currentSessionId) {
-            console.error(`Session rebind: ${_currentSessionId || 'none'} -> ${sid}`);
-          }
-          setReadSession(sid);
-          setWriteSession(sid);
-          _currentSessionId = sid;
-        }
-      }
-    }
-
     const { name, arguments: args } = request.params;
+    const claudeSession = client === 'claude' ? await readClaudeSessionForCall() : null;
+    const identity = resolveSessionIdentity(client, request.params._meta, claudeSession);
+    resolvedSessionId = identity.sessionId;
     const db = initDb();
-
-    // Read-only tools
-    if (readToolNames.has(name)) {
-      return handleReadTool(name, (args ?? {}) as Record<string, unknown>, db, '');
-    }
-
-    // Write tools
-    if (writeToolNames.has(name)) {
-      return handleWriteTool(name, (args ?? {}) as Record<string, unknown>, db, '');
-    }
-
-    throw new Error(`Unknown tool: ${name}`);
+    return dispatchTool(name, (args ?? {}) as Record<string, unknown>, db, identity, runtimeFingerprint);
   } catch (error) {
     const errorMsg = handleError(error);
     const toolName = request.params?.name ?? 'unknown';
-    const sessionTag = _ppidFilePath ?? 'UNKNOWN';
-    appendErrorLog(toolName, sessionTag, errorMsg);
+    appendErrorLog(toolName, resolvedSessionId, errorMsg);
     return {
       content: [{ type: 'text', text: errorMsg }],
       isError: true,
@@ -177,13 +147,17 @@ async function main() {
   const db = initDb();
   console.error('Database initialized');
 
-  // Bind MCP server to its Claude Code session via PPID file (lazy on first tool call)
-  const claudePpid = process.env.CLAUDE_PPID;
-  if (claudePpid) {
-    _ppidFilePath = path.join(os.homedir(), '.claude', `ironclaude-session-${claudePpid}.id`);
-    console.error(`Will bind to session via PPID file on first tool call: ${_ppidFilePath}`);
+  // Claude uses its PPID file transport. Codex resolves native metadata per call.
+  if (client === 'claude') {
+    const claudePpid = process.env.CLAUDE_PPID;
+    if (claudePpid) {
+      _ppidFilePath = path.join(os.homedir(), '.claude', `ironclaude-session-${claudePpid}.id`);
+      console.error(`Will resolve Claude session via PPID file on each tool call: ${_ppidFilePath}`);
+    } else {
+      console.error('CRITICAL: CLAUDE_PPID not set. Claude session resolution will fail.');
+    }
   } else {
-    console.error(`CRITICAL: CLAUDE_PPID not set. Session binding will fail.`);
+    console.error('Will resolve Codex root session from native MCP metadata on each tool call');
   }
 
   console.error('State Manager MCP server running via stdio');

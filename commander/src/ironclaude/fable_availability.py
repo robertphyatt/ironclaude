@@ -45,11 +45,11 @@ _USAGE_REPROBE = 1800     # 30m — usage limit with no extractable reset; re-pr
 _UNKNOWN_REPROBE = 3600   # 1h  — unclassified/transient overload; downgrade but re-probe soon.
 _USAGE_MAX = 6 * 3600     # hard upper bound on any usage_limit window (guards a bad parse/skew).
 
-# Usage-limit phrases: present so the usage_limit machinery/tests work, but NOTE no live
-# detector currently forwards usage-limit text to mark_fable_unavailable (deferred — needs a
-# captured real usage-limit error string; the brain_client detectors only match model outages).
+# Usage-limit phrases. `_is_usage_limit_text` in brain_client.py (anchored on "hit your
+# limit") now forwards the real captured usage-limit message here, so the usage_limit
+# machinery is live: classify -> usage_limit -> parse_reset_time honors the account reset.
 _USAGE_PHRASES = ("5-hour limit", "5 hour limit", "usage limit", "rate limit",
-                  "too many requests", "quota")
+                  "too many requests", "quota", "hit your limit")
 # Strong model-outage ANCHORS — unambiguous Fable-specific outage signals, ALIGNED to the
 # real detectors in brain_client.py (_is_model_unavailable / _MODEL_UNAVAILABLE_TEXT_PHRASES).
 # Checked BEFORE usage phrases so a model-outage message that incidentally also mentions

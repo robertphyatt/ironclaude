@@ -16,6 +16,7 @@ import type {
   WorkflowStage,
   PlanJson,
   PlanTask,
+  Session,
 } from './types.js';
 import {
   getSession,
@@ -220,6 +221,148 @@ export function validateWorkflowTransition(
   };
 }
 
+export type WorkflowTransitionOutcome =
+  | { ok: true; changed: false; from: WorkflowStage; to: WorkflowStage; session_id: string }
+  | { ok: true; changed: true; from: WorkflowStage; to: WorkflowStage; session_id: string }
+  | { ok: false; error: string; from?: WorkflowStage; to: WorkflowStage; session_id: string };
+
+type WorkflowPrerequisiteContext = {
+  hasDesign: boolean;
+  designConsumed: boolean;
+  hasPlan: boolean;
+};
+
+type WorkflowTransitionValidation = { valid: boolean; reason: string };
+
+type WorkflowTransitionContext = {
+  session: Session;
+  from: WorkflowStage;
+  to: WorkflowStage;
+  sessionId: string;
+};
+
+type WorkflowTransitionOptions = {
+  action: string | ((context: WorkflowTransitionContext) => string);
+  actor?: string | ((context: WorkflowTransitionContext) => string);
+  auditContext: string | ((context: WorkflowTransitionContext) => string);
+  prerequisites?: (session: Session) => WorkflowPrerequisiteContext;
+  validate?: (
+    context: WorkflowTransitionContext,
+    result: WorkflowTransitionValidation,
+  ) => WorkflowTransitionValidation;
+  guard?: (context: WorkflowTransitionContext) => string | null | undefined;
+  applyArtifacts?: (
+    context: WorkflowTransitionContext,
+  ) => Partial<Omit<Session, 'terminal_session'>> | void;
+  updateFields?: Partial<Omit<Session, 'terminal_session'>>;
+};
+
+/**
+ * Execute one explicit workflow-stage transition atomically.
+ *
+ * The dispatcher supplies the provider-native root session ID. Equality is
+ * resolved before validation, guards, callbacks, mutations, timestamps, or
+ * audits, making a same-target request an exact side-effect-free no-op.
+ */
+export function executeWorkflowTransition(
+  db: Database.Database,
+  sessionId: string,
+  target: WorkflowStage,
+  options: WorkflowTransitionOptions,
+): WorkflowTransitionOutcome {
+  const transition = db.transaction((): WorkflowTransitionOutcome => {
+    const session = getSession(db, sessionId);
+    if (!session) {
+      return {
+        ok: false,
+        error: `Session not found: ${sessionId}`,
+        to: target,
+        session_id: sessionId,
+      };
+    }
+
+    const from = session.workflow_stage;
+    if (from === target) {
+      return {
+        ok: true,
+        changed: false,
+        from,
+        to: target,
+        session_id: sessionId,
+      };
+    }
+
+    const context: WorkflowTransitionContext = {
+      session,
+      from,
+      to: target,
+      sessionId,
+    };
+    const prerequisites = options.prerequisites?.(session) ?? {
+      hasDesign: true,
+      designConsumed: true,
+      hasPlan: true,
+    };
+    let validation = validateWorkflowTransition(from, target, prerequisites);
+    validation = options.validate?.(context, validation) ?? validation;
+    if (!validation.valid) {
+      return {
+        ok: false,
+        error: validation.reason,
+        from,
+        to: target,
+        session_id: sessionId,
+      };
+    }
+
+    const guardError = options.guard?.(context);
+    if (guardError) {
+      return {
+        ok: false,
+        error: guardError,
+        from,
+        to: target,
+        session_id: sessionId,
+      };
+    }
+
+    const artifactFields = options.applyArtifacts?.(context) ?? {};
+    updateSession(db, sessionId, {
+      ...options.updateFields,
+      ...artifactFields,
+      workflow_stage: target,
+    });
+
+    const action = typeof options.action === 'function'
+      ? options.action(context)
+      : options.action;
+    const actor = typeof options.actor === 'function'
+      ? options.actor(context)
+      : (options.actor ?? 'claude');
+    const auditContext = typeof options.auditContext === 'function'
+      ? options.auditContext(context)
+      : options.auditContext;
+    insertAuditLog(db, {
+      terminal_session: sessionId,
+      actor,
+      action,
+      old_value: from,
+      new_value: target,
+      context: auditContext,
+    });
+
+    return {
+      ok: true,
+      changed: true,
+      from,
+      to: target,
+      session_id: sessionId,
+    };
+  });
+
+  return transition();
+}
+
 // ---------------------------------------------------------------------------
 // 3. Wave computation
 // ---------------------------------------------------------------------------
@@ -385,8 +528,9 @@ export function validatePlanJson(json: unknown): { valid: boolean; errors: strin
 // ---------------------------------------------------------------------------
 
 /**
- * Execute a retreat from a later workflow stage back to brainstorming or
- * debugging. Handles artifact preservation per the design doc:
+ * Prepare artifact mutations for a retreat from a later workflow stage back
+ * to brainstorming or debugging. The shared transition transaction applies
+ * returned session fields and owns the single stage update and audit:
  *
  *   From EXECUTING:
  *     - Snapshot progress to plan_history (plan_name, design_file, completed
@@ -396,24 +540,22 @@ export function validatePlanJson(json: unknown): { valid: boolean; errors: strin
  *   From PLAN_READY or EXECUTING:
  *     - Unconsume design (mark consumed=0 so it's available again)
  *
- *   Always:
- *     - Update session: workflow_stage = to, review_pending = 0, circuit_breaker = 0
- *     - Insert audit log entry
+ *   Always return:
+ *     - Session fields that clear review_pending and circuit_breaker
  */
-export function executeRetreat(
+export function prepareRetreatArtifacts(
   db: Database.Database,
   sessionId: string,
+  session: Session,
   from: WorkflowStage,
-  to: 'brainstorming' | 'debugging',
   reason: string,
-): void {
-  // 1. Read current session
-  const session = getSession(db, sessionId);
-  if (!session) {
-    throw new Error(`Session not found: ${sessionId}`);
-  }
+): Partial<Omit<Session, 'terminal_session'>> {
+  const sessionFields: Partial<Omit<Session, 'terminal_session'>> = {
+    review_pending: 0,
+    circuit_breaker: 0,
+  };
 
-  // 2. If retreating from 'executing': snapshot progress, clear plan state
+  // 1. If retreating from 'executing': snapshot progress, clear plan state
   if (from === 'executing' && session.plan_json) {
     let planData: PlanJson | null = null;
     try {
@@ -443,15 +585,12 @@ export function executeRetreat(
       });
     }
 
-    // Clear plan state
-    updateSession(db, sessionId, {
-      plan_json: null,
-      current_wave: 0,
-      plan_name: null,
-    });
+    sessionFields.plan_json = null;
+    sessionFields.current_wave = 0;
+    sessionFields.plan_name = null;
   }
 
-  // 3. If retreating from plan-phase or execution-phase: unconsume design
+  // 2. If retreating from plan-phase or execution-phase: unconsume design
   if (['plan_ready', 'plan_marked_for_use', 'final_plan_prep', 'executing', 'reviewing', 'plan_interrupted'].includes(from)) {
     // Find the design file associated with this session
     let designFile: string | null = null;
@@ -485,20 +624,5 @@ export function executeRetreat(
     }
   }
 
-  // 4. Update session: workflow_stage, review_pending, circuit_breaker
-  updateSession(db, sessionId, {
-    workflow_stage: to,
-    review_pending: 0,
-    circuit_breaker: 0,
-  });
-
-  // 5. Audit log
-  insertAuditLog(db, {
-    terminal_session: sessionId,
-    actor: 'system',
-    action: 'retreat',
-    old_value: from,
-    new_value: to,
-    context: reason,
-  });
+  return sessionFields;
 }

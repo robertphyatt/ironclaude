@@ -24,5 +24,35 @@
     "enabled": true,
     "executor_model": "sonnet",
     "advisor_model": "opus"
+  },
+  "providers": {
+    "clients": {
+      "claude": {
+        "enabled": true,
+        "path": "claude",
+        "models": {
+          "haiku": "haiku",
+          "sonnet": "sonnet",
+          "opus": "opus",
+          "fable": "fable"
+        }
+      },
+      "codex": {
+        "enabled": false,
+        "path": "codex",
+        "models": {
+          "haiku": "gpt-5.6-luna",
+          "sonnet": "gpt-5.6-terra",
+          "opus": "gpt-5.6-sol"
+        }
+      }
+    },
+    "roles": {
+      "brain": {"preferred": "claude", "clients": ["claude"]},
+      "worker": {"preferred": "claude", "clients": ["claude"]},
+      "grader": {"preferred": "claude", "clients": ["claude"]},
+      "advisor": {"preferred": "claude", "clients": ["claude"]}
+    },
+    "shadow_mode": false
   }
 }

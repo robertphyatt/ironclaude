@@ -39,7 +39,9 @@ CREATE TABLE IF NOT EXISTS workers (
     status TEXT NOT NULL DEFAULT 'running',
     task_id INTEGER REFERENCES tasks(id),
     spawned_at TEXT NOT NULL DEFAULT (datetime('now')),
-    finished_at TEXT
+    finished_at TEXT,
+    client TEXT,
+    model TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -116,6 +118,29 @@ CREATE TABLE IF NOT EXISTS shadow_concordance (
 
 CREATE INDEX IF NOT EXISTS idx_shadow_concordance_worker_id ON shadow_concordance(worker_id);
 CREATE INDEX IF NOT EXISTS idx_shadow_concordance_created_at ON shadow_concordance(created_at);
+
+CREATE TABLE IF NOT EXISTS provider_role_state (
+    role TEXT PRIMARY KEY,
+    current_client TEXT NOT NULL CHECK (current_client IN ('claude', 'codex')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS provider_capability_state (
+    host TEXT NOT NULL,
+    client TEXT NOT NULL CHECK (client IN ('claude', 'codex')),
+    role TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    configured INTEGER NOT NULL DEFAULT 0,
+    supported INTEGER NOT NULL DEFAULT 0,
+    installed INTEGER NOT NULL DEFAULT 0,
+    authenticated INTEGER,
+    available INTEGER NOT NULL DEFAULT 0,
+    category TEXT,
+    reason TEXT,
+    observed_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (host, client, role, tier)
+);
 """
 
 # Indexes that depend on columns added by _DIRECTIVES_MIGRATION_COLUMNS.
@@ -168,6 +193,17 @@ def init_db(db_path: str) -> sqlite3.Connection:
                     "directives.%s already present, skipping migration: %s",
                     column_name, exc,
                 )
+            else:
+                raise
+    # Migrate pre-existing `workers` tables that predate the client/model columns
+    # (the resolved provider client + model, persisted at spawn).
+    for _wcol in ("client", "model"):
+        try:
+            conn.execute(f"ALTER TABLE workers ADD COLUMN {_wcol} TEXT")
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if "duplicate column name" in msg or "already has column" in msg:
+                logger.debug("workers.%s already present, skipping migration: %s", _wcol, exc)
             else:
                 raise
     for stmt in _POST_MIGRATION_INDEXES:

@@ -10,6 +10,12 @@ import os
 import re as _re
 import shlex
 
+from ironclaude.provider_config import (
+    ProviderConfigError,
+    normalize_machine_clients,
+    provider_config_from_commander,
+)
+
 logger = logging.getLogger("ironclaude.config")
 
 # Allowed effort levels. Interpolated unquoted into make_opus_command's shell
@@ -48,6 +54,36 @@ DEFAULTS = {
         "advisor_models": {"claude-sonnet": "opus", "claude-opus": "fable"},  # one-tier-up map per worker type
     },
     "dispatch": {"use_goal": False},
+    "providers": {
+        "clients": {
+            "claude": {
+                "enabled": True,
+                "path": "claude",
+                "models": {
+                    "haiku": "haiku",
+                    "sonnet": "sonnet",
+                    "opus": "opus",
+                    "fable": "fable",
+                },
+            },
+            "codex": {
+                "enabled": False,
+                "path": "codex",
+                "models": {
+                    "haiku": "gpt-5.6-luna",
+                    "sonnet": "gpt-5.6-terra",
+                    "opus": "gpt-5.6-sol",
+                },
+            },
+        },
+        "roles": {
+            "brain": {"preferred": "claude", "clients": ["claude"]},
+            "worker": {"preferred": "claude", "clients": ["claude"]},
+            "grader": {"preferred": "claude", "clients": ["claude"]},
+            "advisor": {"preferred": "claude", "clients": ["claude"]},
+        },
+        "shadow_mode": False,
+    },
 }
 
 # Env vars that override JSON config (env name -> config key, type)
@@ -74,7 +110,7 @@ ENV_DIRECT = {
 
 _ENV_VAR_RE = _re.compile(r'\$\{(\w+)\}')
 
-REQUIRED_MACHINE_FIELDS = ("name", "host", "claude_path", "repos")
+REQUIRED_MACHINE_FIELDS = ("name", "host", "repos")
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -145,6 +181,11 @@ def load_config(config_path: str = "config/ironclaude.json") -> dict:
         )
         cfg["effort_level"] = DEFAULT_EFFORT_LEVEL
 
+    # Validate provider configuration (raises ProviderConfigError on failure).
+    # Later adapters call provider_config_from_commander(cfg) again to obtain
+    # the immutable ProviderConfig with legacy role/tier model overrides.
+    provider_config_from_commander(cfg)
+
     return cfg
 
 
@@ -194,5 +235,7 @@ def load_machines_config(config_path: str = "config/machines.yaml") -> list[dict
         # Interpolate env vars
         if "env" in m:
             m["env"] = {k: _interpolate_env(v) for k, v in m["env"].items()}
+
+        m["clients"] = normalize_machine_clients(m)
 
     return machines

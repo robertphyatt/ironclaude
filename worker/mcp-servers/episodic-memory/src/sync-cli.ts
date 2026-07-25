@@ -3,6 +3,7 @@ import { getArchiveDir } from './paths.js';
 import path from 'path';
 import os from 'os';
 import { spawn } from 'child_process';
+import { syncCodexConversations } from './codex-sync.js';
 
 const args = process.argv.slice(2);
 
@@ -59,6 +60,7 @@ if (isBackground) {
 }
 
 const sourceDir = path.join(os.homedir(), '.claude', 'projects');
+const codexSourceDir = path.join(os.homedir(), '.codex', 'sessions');
 const destDir = getArchiveDir();
 
 console.log('Syncing conversations...');
@@ -76,6 +78,20 @@ syncConversations(sourceDir, destDir)
     if (result.errors.length > 0) {
       console.log(`\n⚠️  Errors: ${result.errors.length}`);
       result.errors.forEach(err => console.log(`  ${err.file}: ${err.error}`));
+    }
+  })
+  .then(async () => {
+    console.log('\nSyncing Codex conversations...');
+    console.log(`Source: ${codexSourceDir}`);
+    const codexResult = await syncCodexConversations(codexSourceDir, destDir);
+    console.log(`\n✅ Codex sync complete!`);
+    console.log(`  Copied: ${codexResult.copied}`);
+    console.log(`  Skipped: ${codexResult.skipped}`);
+    console.log(`  Indexed: ${codexResult.indexed}`);
+    console.log(`  Summarized: ${codexResult.summarized}`);
+    if (codexResult.errors.length > 0) {
+      console.log(`\n⚠️  Codex errors: ${codexResult.errors.length}`);
+      codexResult.errors.forEach(err => console.log(`  ${err.file}: ${err.error}`));
     }
   })
   .catch(error => {

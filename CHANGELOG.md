@@ -1,8 +1,8 @@
 # Changelog
 
-> **Versioning.** IronClaude uses a single monotonically-increasing `1.0.N`
-> patch series — by deliberate convention both features and fixes increment the
-> patch number (this is not strict semver). The version is declared in
+> **Versioning.** IronClaude is not strict semver: within a minor series both
+> features and fixes increment the patch number (`1.0.N`), and a minor bump
+> (`1.1.0`) marks a release significant enough to warrant one. The version is declared in
 > `commander/pyproject.toml`, `worker/.claude-plugin/plugin.json`,
 > `worker/.codex-plugin/plugin.json`, and `.claude-plugin/marketplace.json`, kept in lockstep by
 > `commander/tests/test_version_consistency.py`. Each release commit is tagged
@@ -12,6 +12,66 @@
 ## [Unreleased]
 
 _Nothing yet._
+
+## 1.1.0: Codex worker/grader parity, the Codex Brain, and Slack provider controls
+
+### Added
+
+- **Codex as a worker and grader peer.** A provider router resolves the client and model per role, so `worker` and `grader` can run on OpenAI Codex (`gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-5.6-sol`) by enabling `providers.clients.codex` and adding `"codex"` to a role's `clients`. See [CODEX_SETUP.md](CODEX_SETUP.md).
+- **Codex Brain (workflow + memory).** `BRAIN_CLIENT=codex` runs the Brain as a persistent `codex app-server`: read-only sandbox, on-request approval, a git-command allowlist on exec approvals, the operator-selected model resolved through the codex tier map, and an `IC_ROLE=brain` marker scoped to its own spawn. It drives the full brainstorm → plan → execute workflow and episodic memory.
+- **Slack `/provider`.** `/ironclaude provider` reports each role's preferred client, allowed clients, and the client the router will actually use; `/ironclaude provider <role> <client>` sets it. Changes the router would silently ignore (client absent from the role's `clients` list, or globally disabled) are rejected with a specific message instead of being persisted.
+- **Session-artifact sweep.** Hourly maintenance prunes stale `idle`/`undecided` session rows and dead-PID session id files, guarded so a live or active session is never touched.
+
+### Fixed
+
+- **`research` and `ollama` MCP servers never started.** Both modules lacked a `__main__` entrypoint, so launching them as subprocesses defined a factory and exited 0 — the Brain silently had neither toolset. They now serve stdio.
+- **A rejected `turn/start` could be reported as success.** `_await_response` consumed a shared cursor, so an out-of-order or concurrent waiter could skip past another's response and time out; `send_message` then returned success and skipped the retry. It now scans without mutating shared state.
+- **`/provider` status could misreport routing.** It showed the stored sticky client even when the router ignores it (not in the role's `clients` list) and falls back to `preferred`; it now reports the effective client and names any ignored stored value.
+- **Slack Brain narration** is threaded under the latest heartbeat instead of being dropped or looping back through the directive gate.
+
+### Changed
+
+- README documents the codex compatibility surface and carries an explicit as-of date on the project comparison; new [CODEX_SETUP.md](CODEX_SETUP.md) covers setup, model tiers, security posture, and limitations.
+- The Commander test suite runs warning-clean (`filterwarnings = ["error"]`).
+
+### Not in this release
+
+Codex-Brain worker orchestration (the orchestrator MCP server is not wired for the Codex Brain) and
+Brain tool-gating; Codex advisor wiring (Commander Codex workers spawn advisor-less); cross-provider
+failover; Codex workers via batch `spawn_workers`; remote Codex over SSH.
+
+## 1.0.27: Codex peer parity — Stop-hook fix, grader + worker adapters, selective reviews
+
+### Fixed
+
+- **Codex Stop-hook enforcement.** The shared `worker/hooks/get-back-to-work-claude.sh` emitted Claude's `{decision,reason}` JSON, which Codex's hook-output schema rejects ("invalid stop hook JSON output"). The fixed-path hook is now a client-aware wrapper over a byte-identical relocated `get-back-to-work-impl.sh`: non-codex `exec`s the impl (byte-identical stdout+exit); codex captures and translates the verdict to codex's shape (approve→`{}`, block→`{systemMessage}`). Client detection uses `PLUGIN_ROOT`/`CLAUDE_PLUGIN_ROOT` (the real Stop-hook env). Live-verified (codex Stop failure marker 2→0).
+
+### Added
+
+- **Codex grader client (router-wired).** `OrchestratorTools._call_grader` now resolves the grader client/model through the committed `ProviderRouter` and can dispatch to a Codex grader (`codex exec --json --output-schema`), returning the identical verdict contract + never-raise fallback. The `claude -p` grader path is byte-identical when the grader role resolves to claude; a legacy config with no `providers` block falls back to it.
+- **Codex worker adapter (router-wired, local).** Worker spawn resolves the worker client/model through `ProviderRouter`; a Codex worker spawns interactively (`codex --dangerously-bypass-approvals-and-sandbox`), dismisses its trust dialog, activates professional mode via a process-subtree-walk of the SessionStart id-file (Codex keys it to an intermediate PID, not the tmux pane_pid), uses a client-aware ready marker, and gates the Claude-only `/advisor`+`/goal` slash commands. Resolved client+model persist on the `workers` row. Claude/ollama worker path byte-identical (full commander suite green).
+
+### Changed
+
+- **Selective LLM-judgment tier-up reviews.** `executing-plans` Step 1.5 now defaults to a same-tier blind plan review with an LLM blast-radius judgment that escalates to a one-tier-up review only when a change warrants it; a new Phase-3 tier-up adversarial review over the staged diff runs under the same judgment. In interactive sessions the commander surfaces the tier-up as a suggestion (AskUserQuestion) on both reviews. Per-task reviews unchanged. Skill-only; activates on relaunch.
+
+## 1.0.26: plan-authoring fidelity
+
+### Fixed
+
+- **Plan-authoring fidelity.** A v1.1.0 blind review surfaced two fidelity defects no plan revision could repair: the human plan embedded six rounds of prior-review history (breaking blind review — MP-W02/MP-R07, confirmed empirically when a fresh reviewer reported receiving those rounds through the plan), and the plan pair failed a canonical-PlanJson/byte-parity contract. Investigation showed the operator requirement MP-W10 asks only for "semantically identical" human and machine plans; the v1.1 design had unilaterally escalated that to byte parity with a deterministic renderer, contradicting the already-shipped anti-flailing design's explicit "instruction-and-test contract, not a new renderer" decision. This release restores the v1.1 design's parity wording to the requirement, adds a live-source grounding step to `writing-plans` (every asserted file, symbol, signature, column, key, and command is verified against current source before it is written — the missing half of MP-W10 that produced two fabricated-symbol defects during v1.0.25 authoring), and prohibits plan artifacts from containing review history in both `writing-plans` and the `executing-plans` regeneration path. Instruction-and-test only: no renderer, no MCP tool, no schema change, no `dist` rebuild.
+
+## 1.0.25: plan-review verdict calibration
+
+Fixes a plan-review loop that could not terminate, and completes a working set whose staged subset would not have compiled.
+
+### Fixed
+
+- **Plan-review verdict calibration.** The tier-up plan review could not converge: one recorded session made 15 `submit_tier_up_review` calls including a run of 8 consecutive `HAS-ISSUES` without ever reaching `SOLID`, and reviewers routinely described a plan as "largely SOLID" while scoring it `HAS-ISSUES` anyway. Three defects in the reviewer prompt caused it — `SOLID` was never defined, a `Minor` severity tier had no stated effect on the verdict, and an open-ended "hidden risks, ambiguities, or edge cases" criterion licensed unbounded nitpicking. A materiality standard already existed but lived in the orchestrator's instructions where the reviewer never saw it, while `start_execution` gates on the verdict — so the standard was structurally unable to take effect. The reviewer prompt now carries an explicit MATERIAL decision test, a mechanical verdict rubric (`SOLID` = zero material findings; "no material defect found", not "nothing could be improved"), a latent-defect hunt naming five failure archetypes, and a capped `Observations` section where non-material findings land without touching the verdict. The orchestrator's `HAS-ISSUES` handling now applies the same test, making its pre-existing "repeat only while evidence identifies a material defect" rule coherent for the first time. This fix is prompt-only: it required no change to verdict values, the MCP schema, or the compiled bundle.
+
+### Changed
+
+- Completed the state-manager working set so the committed tree compiles and starts. `src/session-identity.ts` (value-imported by `index.ts`, plus three type importers), `src/db.ts` (`getLatestTierUpReview`, called from `write-tools.ts`), and `worker/.mcp.json` (`IRONCLAUDE_CLIENT=claude`, read at MCP module load and fatal when unset) now ship together with the already-tracked code that depends on them. Previously these sat outside the index while their consumers were staged.
 
 ## 1.0.24: workflow durability, Codex compatibility, and Commander hardening
 

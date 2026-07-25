@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"th_abc"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"agent_message","text":"{\"grade\":\"B\",\"approved\":true,\"feedback\":\"looks fine\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}

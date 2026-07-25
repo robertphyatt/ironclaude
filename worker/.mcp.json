@@ -7,6 +7,8 @@
   "state-manager": {
     "command": "node",
     "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-servers/state-manager/cli/mcp-server-wrapper.js"],
-    "env": {}
+    "env": {
+      "IRONCLAUDE_CLIENT": "claude"
+    }
   }
 }
