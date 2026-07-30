@@ -50,3 +50,91 @@ describe('syncCodexConversations end-to-end', () => {
     expect(hits.some(h => h.exchange.project === '-Users-roberthyatt-Code-ironclaude')).toBe(true);
   }, 120000);
 });
+
+// A real codex session_meta embeds payload.base_instructions.text — the entire system
+// prompt — so line 1 now routinely approaches 64KB. A fixed-buffer read truncated it,
+// JSON.parse threw, and the session silently lost BOTH its project grouping and its
+// summary. These pin the boundary.
+const PAD_MARKER = '@@PAD@@';
+const FOUR_BYTE_CHAR = '\u{1F600}'; // 4 UTF-8 bytes
+
+function oversizedMetaLine(
+  sessionId: string,
+  cwd: string,
+  opts: { straddleBoundary: boolean },
+): string {
+  const template = JSON.stringify({
+    timestamp: '2026-07-25T08:46:31.157Z',
+    type: 'session_meta',
+    payload: { session_id: sessionId, cwd, base_instructions: { text: PAD_MARKER } },
+  });
+  const markerIndex = template.indexOf(PAD_MARKER);
+  const prefixBytes = Buffer.byteLength(template.slice(0, markerIndex), 'utf-8');
+
+  let pad: string;
+  if (opts.straddleBoundary) {
+    // Land a 4-byte character across byte offset 65536 so a chunk-at-a-time reader
+    // that decoded per chunk would corrupt it.
+    pad = 'x'.repeat(65536 - prefixBytes - 2) + FOUR_BYTE_CHAR + 'y'.repeat(6000);
+  } else {
+    pad = 'x'.repeat(70000);
+  }
+  return template.slice(0, markerIndex) + pad + template.slice(markerIndex + PAD_MARKER.length);
+}
+
+function writeRollout(name: string, firstLine: string, extraLines: string[] = []): string {
+  const file = path.join(tmp, name);
+  fs.writeFileSync(file, [firstLine, ...extraLines].join('\n'), 'utf-8');
+  return file;
+}
+
+describe('readSessionMeta first-line handling', () => {
+  it('recovers session_id and cwd when line 1 exceeds 64KB', async () => {
+    const { readSessionMeta } = await import('./codex-sync.js');
+    const line = oversizedMetaLine('019f9873-e9b2-78e0-a73a-746b4c26244e', '/Users/x/repo', {
+      straddleBoundary: false,
+    });
+    expect(Buffer.byteLength(line, 'utf-8')).toBeGreaterThan(65536);
+
+    const meta = readSessionMeta(writeRollout('rollout-oversized.jsonl', line, ['{"type":"event_msg"}']));
+
+    expect(meta.sessionId).toBe('019f9873-e9b2-78e0-a73a-746b4c26244e');
+    expect(meta.cwd).toBe('/Users/x/repo');
+  });
+
+  it('recovers meta when a multi-byte character straddles the 64KB boundary', async () => {
+    const { readSessionMeta } = await import('./codex-sync.js');
+    const line = oversizedMetaLine('019f0000-0000-7000-8000-000000000001', '/Users/y/repo', {
+      straddleBoundary: true,
+    });
+    expect(Buffer.byteLength(line, 'utf-8')).toBeGreaterThan(65536);
+
+    const meta = readSessionMeta(writeRollout('rollout-multibyte.jsonl', line, ['{"type":"event_msg"}']));
+
+    expect(meta.sessionId).toBe('019f0000-0000-7000-8000-000000000001');
+    expect(meta.cwd).toBe('/Users/y/repo');
+  });
+
+  it('still reads a small session_meta line', async () => {
+    const { readSessionMeta } = await import('./codex-sync.js');
+    const line = JSON.stringify({
+      type: 'session_meta',
+      payload: { session_id: 'small-session', cwd: '/tmp/small' },
+    });
+
+    const meta = readSessionMeta(writeRollout('rollout-small.jsonl', line, ['{"type":"event_msg"}']));
+
+    expect(meta.sessionId).toBe('small-session');
+    expect(meta.cwd).toBe('/tmp/small');
+  });
+
+  it('returns empty for a file whose first line is not session_meta', async () => {
+    const { readSessionMeta } = await import('./codex-sync.js');
+
+    const meta = readSessionMeta(
+      writeRollout('rollout-nometa.jsonl', JSON.stringify({ type: 'event_msg' })),
+    );
+
+    expect(meta).toEqual({});
+  });
+});

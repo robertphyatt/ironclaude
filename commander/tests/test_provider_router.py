@@ -169,6 +169,39 @@ def test_unavailable_current_falls_through_without_mutating_state(tmp_path, base
     assert state.get_current_client("worker") == "claude"
 
 
+def test_explicit_cutover_fresh_success_routes_selected_client(tmp_path, base_config):
+    router, state, registry = setup_router(tmp_path, base_config, dual=True)
+    state.mark_unavailable(
+        "local", "codex", "worker", "sonnet", "usage_limit", "old limit"
+    )
+
+    state.set_current_client("worker", "codex", reset_capabilities=True)
+    record(
+        registry,
+        cap("claude", "worker", "sonnet"),
+        cap("codex", "worker", "sonnet"),
+    )
+
+    assert router.resolve("worker", "sonnet", ["local"]).client == "codex"
+
+
+def test_explicit_cutover_fresh_failure_uses_existing_fallback(tmp_path, base_config):
+    router, state, registry = setup_router(tmp_path, base_config, dual=True)
+    state.mark_unavailable(
+        "local", "codex", "worker", "sonnet", "usage_limit", "old limit"
+    )
+
+    state.set_current_client("worker", "codex", reset_capabilities=True)
+    record(
+        registry,
+        cap("claude", "worker", "sonnet"),
+        cap("codex", "worker", "sonnet", usable=False),
+    )
+
+    assert router.resolve("worker", "sonnet", ["local"]).client == "claude"
+    assert state.get_current_client("worker") == "codex"
+
+
 def test_router_selects_first_eligible_host_with_capability(tmp_path, base_config):
     router, _, registry = setup_router(tmp_path, base_config)
     record(

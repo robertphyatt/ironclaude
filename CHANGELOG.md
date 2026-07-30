@@ -13,6 +13,47 @@
 
 _Nothing yet._
 
+## 1.1.1: Codex Brain tool gating, provider capability quarantine, and one plan review per lineage
+
+Closes the parity defects that a blind full-tree recertification found in the 1.1.0 Codex
+surface, and replaces the unbounded plan-review retry loop with a single review plus a tier-up
+advisor.
+
+### Added
+
+- **Codex Brain tool gating.** `worker/hooks/codex-brain-gated-actions.sh` is a PreToolUse gate for the Codex Brain covering episodic-memory, orchestrator, and ollama MCP actions. MCP tool calls never reach codex's approval channel, so the hook is the only control on that path; the gate uses an arm-then-act pattern (first call denies with an explanation, an immediate repeat proceeds) so a destructive action cannot fire on a single unconsidered call. Ships with a self-contained test suite.
+- **Provider capability quarantine.** A new `directive_capability_blocks` table plus a backoff and notification state machine records when a directive cannot run because a provider capability is unavailable, instead of retrying it blindly. Blocked capabilities surface in the heartbeat and in Slack status, and `ProviderState.unavailable_capabilities()` exposes them to the router. Recovery is reported once and the directive is released.
+- **`research` and `ollama` MCP servers on the Codex Brain.** `CodexBrainClient._optional_mcp_overrides()` registers both through `-c mcp_servers.*` overrides, existence-guarded so a missing module is skipped rather than fatal. It deliberately does **not** clone `default_tools_approval_mode`: doing so would auto-approve ollama's `pull_model`/`remove_model`/`create_model`, which are precisely the actions the gate above exists to hold.
+- **Codex reasoning effort.** The Codex Brain and the Codex grader now pass `-c model_reasoning_effort="<level>"`. Previously the effort level was exported as `CLAUDE_CODE_EFFORT_LEVEL`, a Claude-only environment variable with no effect on a `codex exec` process, so the operator's effort selection was silently dropped on both.
+- **Provider-native professional-mode activation.** `activate-professional-mode` now binds its file operations to explicit `<READ_INSTRUCTION_FILE>` / `<WRITE_INSTRUCTION_FILE>` tokens resolved per client (Claude: `Read`/`Write`; Codex: a `node_repl` program and native `apply_patch`), adds a `verify-only` mode that checks an already-active surface without writing, and specifies an exact diagnostic contract that names every uncovered behavioral concept rather than reporting a count.
+- **`get_professional_mode` returns the trusted client and session id.** The tool now answers `{professional_mode, client, session_id}`. Skills previously had to infer the active client from tool availability or environment variables to pick a provider-native branch; that inference is now unnecessary and explicitly forbidden.
+- **Codex root-`AGENTS.md` bootstrap.** `professional-mode-guard.sh` accepts exactly one native `apply_patch` targeting root `AGENTS.md` while professional mode is `undecided`, so a Codex session can write its own instruction surface during activation. The payload is validated strictly — exact tool name, a `tool_input` whose only key is `command`, one Add/Update operation, no `Move to:`, no symlinked or externally-owned target.
+
+### Fixed
+
+- **Codex session metadata was truncated at 64KB.** `codex-sync.ts` read a fixed 64KB buffer to locate the first line of a rollout file. A session whose first JSON line exceeded that — reachable with a large instruction payload — produced a partial line, failed to parse, and the session was skipped from episodic-memory sync. It now reads until the first newline regardless of length.
+- **The Codex Stop hook emitted a verdict shape Codex rejects.** The shared Stop hook returned Claude's `{decision, reason}` JSON. `get-back-to-work-claude.sh` is now a client-aware wrapper that translates the impl's verdict into the shape the active client accepts, with an explicit failure path when the verdict cannot be verified after continuation.
+- **The Codex Brain gate watched MCP tool-name forms Codex may never emit.** The gate and the `hooks.json` matchers were keyed to a single prefix. Both now accept the plugin-prefixed and bare forms (`mcp__(plugin_ironclaude_)?episodic[-_]memory__*`, and the same for the state-manager PostToolUse matcher), so a gate cannot be bypassed by a prefix the manifest did not anticipate. **Which form Codex emits at runtime remains unverified** — see "Known gaps" below.
+- **The ollama arms of the Codex Brain gate covered only the plugin prefix.** Registering the ollama server through `-c` overrides makes `pull_model`, `remove_model`, and `create_model` reachable under the bare `mcp__ollama__*` form, which the gate did not match — the destructive tools were reachable but ungated. Both forms are now covered.
+- **Directive 6 told Codex workers to use a tool they do not have.** The behavioral directive instructed workers to search episodic memory via the `ironclaude:search-conversations` agent and forbade "raw MCP tools". The Codex plugin declares no `agents`, while `episodic-memory` *is* registered for it — so the instruction was inverted, forbidding the only path Codex has. The directive now diverges per client, naming the server and capability rather than a Claude-specific tool.
+
+### Changed
+
+- **A plan lineage now gets exactly one blind review.** `HAS-ISSUES` was previously a retry signal: verify findings, revise, dispatch a brand-new blind reviewer, repeat. Measured across 20 sessions, 142 tier-up reviews formed 42 chains averaging 3.38 rounds, and the 69% of chains needing more than one round consumed 91% of review spend — because the model that wrote the flawed plan also fixed it, made correlated mistakes, and failed the next review. `HAS-ISSUES` is now terminal. It dispatches a **mandatory one-tier-up advisor** that returns, per finding, `CONFIRMED` (the specific change), `REJECTED` (the evidence refuting it, so a non-defect is not "fixed"), or `REQUIRES-RETREAT` (the broken design premise a plan-level fix cannot repair). After the advisor-guided revision the author records the new `advisor-remediated` verdict, and `start_execution` accepts either `SOLID` at the current plan hash, or `HAS-ISSUES` at an earlier hash paired with `advisor-remediated` at the current one. A bare `advisor-remediated` with no preceding `HAS-ISSUES` is rejected. Verification is not removed, it moves: per-task code review still runs at every task boundary, so a defect the advisor misses surfaces there — later, cheaper, and against real code rather than a document.
+- **`writing-plans` gained execution invariants and live-source grounding.** Plans must now state the invariants their commands satisfy, so a blind reviewer can check the commands against a declared standard: shell state does not persist between steps, `docs/` is gitignored, an empty result must be distinguishable from a failed command, and — the two that caused real defects — never author an `expected:` value you have not measured, and prove every verification can fail. `executing-plans` gained matching reviewer archetypes for a predicted-rather-than-measured `expected:` and a guard whose expected value the change itself moves.
+- **The professional-mode guard no longer hard-fails on a missing session row.** It previously blocked every tool call when the session row was absent; it now resolves to `undecided`, which permits read-only tools, the mode-toggle skills, and the root instruction files. This is a deliberate relaxation to let a provider-native session bootstrap its own instruction surface, and it applies to both clients.
+
+### Known gaps
+
+Recorded from the blind recertification rather than fixed, so they are not mistaken for covered ground:
+
+- **Codex's native `apply_patch` receives no professional-mode enforcement.** `apply_patch` appears in no PreToolUse matcher, and the guard's branches are gated on Claude tool names, so a Codex worker's writes bypass the config anti-tamper, the non-executing write block, the `allowed_files` whitelist, and the review-pending gate. Codex workers additionally spawn with `--dangerously-bypass-approvals-and-sandbox`, making hooks the only remaining control. A design and plan exist; the change is not in this release.
+- **No CI runs any shell hook suite.** `test-guard-security.sh`, `test-codex-brain-gated-actions.sh`, and `test-stop-wrapper.sh` are manual-invocation only — no build file references them and there is no workflow directory — so "the suite passes" from `make test` says nothing about the hook layer where the Codex parity work lives.
+- **Batch-spawned Codex workers get no advisor.** Single spawn sends the Codex advisor instruction; `spawn_workers` gates the advisor block on `client == "claude"`.
+- **Reasoning effort reaches two of four Codex surfaces.** The Brain and grader pass it; Codex worker spawn and resume do not.
+- **`make deploy-hooks` does not ship `hooks.json`.** It copies `worker/hooks/*.sh` only, so matcher changes reach a runtime through plugin reinstall, not that target.
+- **Unverified without a live Codex:** which MCP tool-name prefix Codex actually emits, whether Codex loads `worker/hooks/hooks.json` at all (neither plugin manifest declares a `hooks` key), and the interaction between `default_tools_approval_mode` and PreToolUse hooks.
+
 ## 1.1.0: Codex worker/grader parity, the Codex Brain, and Slack provider controls
 
 ### Added

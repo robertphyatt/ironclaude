@@ -31,10 +31,19 @@ def test_writing_plans_requires_operator_requirements_in_both_artifacts():
     assert "human plan" in text and "machine plan" in text
 
 
+def test_writing_plans_preserves_original_authority_above_requirements_file():
+    text = " ".join(_skill_text().lower().split())
+    assert "operator directives and full brainstorming are original authority" in text
+    assert "derived, operator-reviewed contract" in text
+    assert "audit" in text and "before using it" in text
+    assert "professional blind review must evaluate original requirements" not in text
+
+
 def test_writing_plans_requires_pre_ready_holistic_parity_audit():
-    text = _skill_text().lower()
-    assert "requirements → design → plan parity audit" in text
+    text = " ".join(_skill_text().lower().split())
+    assert "operator → brainstorming → requirements/design → plan parity audit" in text
     assert "before" in text and "mark_plan_ready" in text
+    assert "do not start from the derived requirements document" in text
     for contract in (
         "task ids",
         "depends_on",

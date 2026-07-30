@@ -13112,6 +13112,14 @@ function getLatestTierUpReview(db, sessionId) {
     ORDER BY id DESC LIMIT 1
   `).get(sessionId);
 }
+function hasEarlierTierUpVerdict(db, sessionId, verdict, beforeId) {
+  const row = db.prepare(`
+    SELECT 1 AS found FROM tier_up_reviews
+    WHERE terminal_session = ? AND verdict = ? AND id < ?
+    LIMIT 1
+  `).get(sessionId, verdict, beforeId);
+  return row !== void 0;
+}
 
 // src/session-identity.ts
 function record(value, label) {
@@ -13645,7 +13653,7 @@ var readToolDefinitions = [
   },
   {
     name: "get_professional_mode",
-    description: 'Returns the current professional mode setting: "undecided", "on", or "off".',
+    description: 'Returns the current professional mode setting, trusted active client, and provider-native root session: {professional_mode: "undecided"|"on"|"off", client: "claude"|"codex", session_id: string}.',
     inputSchema: {
       type: "object",
       properties: {},
@@ -13823,17 +13831,32 @@ function handleReadTool(name, args, db, sessionId, identity, runtimeFingerprint2
     }
     // ----- get_professional_mode -----
     case "get_professional_mode": {
+      if (!identity) {
+        throw new Error("Resolved session identity is required for get_professional_mode");
+      }
       const session = getSession(db, resolvedId);
       if (!session) {
         return {
-          content: [{ type: "text", text: JSON.stringify({ professional_mode: "undecided", note: "Session not found, returning default" }) }]
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              professional_mode: "undecided",
+              client: identity.client,
+              session_id: resolvedId,
+              note: "Session not found, returning default"
+            })
+          }]
         };
       }
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ professional_mode: session.professional_mode })
+            text: JSON.stringify({
+              professional_mode: session.professional_mode,
+              client: identity.client,
+              session_id: resolvedId
+            })
           }
         ]
       };
@@ -14313,7 +14336,7 @@ function getTierUpPolicy() {
 function hashPlan(planJson) {
   return createHash2("sha256").update(planJson).digest("hex");
 }
-var TIER_UP_VERDICTS = ["SOLID", "HAS-ISSUES", "top-tier-self"];
+var TIER_UP_VERDICTS = ["SOLID", "HAS-ISSUES", "top-tier-self", "advisor-remediated"];
 function isTierUpVerdict(value) {
   return TIER_UP_VERDICTS.includes(value);
 }
@@ -14677,7 +14700,7 @@ var writeToolDefinitions = [
         verdict: {
           type: "string",
           enum: [...TIER_UP_VERDICTS],
-          description: "Exact review verdict: SOLID, HAS-ISSUES, or top-tier-self."
+          description: "Exact review verdict: SOLID, HAS-ISSUES, top-tier-self, or advisor-remediated."
         }
       },
       required: ["reviewer_model", "verdict"],
@@ -14851,6 +14874,12 @@ function handleWriteTool(name, args, db, sessionId) {
           const passRequired = tierUpPolicy === "enforced" || latestReview?.verdict === "HAS-ISSUES";
           if (passRequired && !review) {
             return `BLOCKED \u2014 passing tier-up review required (tier_up_review_policy=${tierUpPolicy}). ` + (latestReview?.verdict === "HAS-ISSUES" ? "The latest review was HAS-ISSUES; perform the holistic requirements/design/plan audit, revise coherently, and obtain a fresh SOLID review. " : "") + "Dispatch a blind higher-tier reviewer for THIS plan and call submit_tier_up_review, then retry start_execution. If the plan changed after a prior review, re-review is required (the hash no longer matches). To change this requirement, a human must edit tier_up_review_policy in ~/.claude/ironclaude-hooks-config.json (the commander cannot change it).";
+          }
+          if (passRequired && review && review.verdict === "advisor-remediated") {
+            if (hasEarlierTierUpVerdict(db, resolvedId, "HAS-ISSUES", review.id)) {
+              return null;
+            }
+            return "BLOCKED \u2014 advisor-remediated requires a prior HAS-ISSUES review. This verdict records that a tier-up advisor guided the response to a failed review; with no earlier HAS-ISSUES row in this session it is not a valid execution gate. Obtain a blind review first.";
           }
           if (passRequired && review && !isPassingTierUpVerdict(review.verdict)) {
             return `BLOCKED \u2014 current plan tier-up verdict is ${review.verdict}. Execution requires SOLID (or top-tier-self at the highest model tier). Verify findings, perform the holistic requirements/design/plan audit, revise coherently, and obtain a fresh blind review.`;

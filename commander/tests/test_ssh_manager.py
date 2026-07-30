@@ -62,6 +62,37 @@ class TestRegisterMachines:
         m = ssh_mgr.get_machine("x")
         assert m.role == "worker"
 
+    def test_normalized_clients_are_preserved(self, ssh_mgr):
+        clients = {
+            "claude": {"enabled": True, "path": "/opt/claude"},
+            "codex": {"enabled": True, "path": "/opt/codex"},
+        }
+        ssh_mgr.register_machines([
+            {"name": "dual", "host": "dual", "clients": clients, "repos": ["/r"]},
+        ])
+
+        machine = ssh_mgr.get_machine("dual")
+        assert machine.clients == clients
+        assert machine.client_path("claude") == "/opt/claude"
+        assert machine.client_path("codex") == "/opt/codex"
+
+    def test_codex_only_machine_needs_no_claude_path(self, ssh_mgr):
+        ssh_mgr.register_machines([
+            {
+                "name": "codex-only",
+                "host": "codex-only",
+                "clients": {
+                    "codex": {"enabled": True, "path": "~/.local/bin/codex"},
+                },
+                "repos": ["/r"],
+            },
+        ])
+
+        machine = ssh_mgr.get_machine("codex-only")
+        assert machine.claude_path is None
+        assert machine.client_path("codex") == "~/.local/bin/codex"
+        assert machine.client_path("claude") is None
+
 
 class TestGetSSHArgs:
     def test_returns_correct_args(self, ssh_mgr):
@@ -108,60 +139,53 @@ class TestHealthCheck:
         mock_run.return_value = MagicMock(returncode=0, stdout="ok\n")
         result = ssh_mgr.health_check("k")
         assert result.ok is True
-        assert mock_run.call_count == 2  # SSH + claude only, no tmux
+        assert mock_run.call_count == 1  # SSH only, no client or tmux probe
 
     @patch("ironclaude.ssh_manager.subprocess.run")
-    def test_worker_checks_tmux(self, mock_run, ssh_mgr):
+    def test_transport_only_worker_health_checks_ssh_and_tmux(self, mock_run, ssh_mgr):
         machines = [{"name": "k", "host": "k", "claude_path": "/c", "repos": ["/r"], "role": "worker"}]
         ssh_mgr.register_machines(machines)
         mock_run.return_value = MagicMock(returncode=0, stdout="ok\n")
         result = ssh_mgr.health_check("k")
         assert result.ok is True
-        assert mock_run.call_count == 3  # SSH + claude + tmux
+        assert mock_run.call_count == 2
+        remote_commands = [call.args[0][-1] for call in mock_run.call_args_list]
+        assert remote_commands == ["true", "tmux -V"]
 
     @patch("ironclaude.ssh_manager.subprocess.run")
-    def test_claude_path_metacharacters_are_neutralized(self, mock_run, ssh_mgr):
-        # A malicious/mistyped claude_path with shell metacharacters must not
-        # break out of the remote `which ...` command.
-        malicious = "/opt/claude; rm -rf ~"
-        machines = [{"name": "k", "host": "k", "claude_path": malicious, "repos": ["/r"]}]
-        ssh_mgr.register_machines(machines)
-        mock_run.return_value = MagicMock(returncode=0, stdout="ok\n")
-        ssh_mgr.health_check("k")
-
-        # Find the remote command string that runs `which` for the claude binary.
-        which_cmds = [
-            c.args[0][-1]
-            for c in mock_run.call_args_list
-            if isinstance(c.args[0][-1], str) and c.args[0][-1].startswith("which ")
-        ]
-        assert len(which_cmds) == 1
-        remote_cmd = which_cmds[0]
-        # The metacharacters must appear only inside the shlex-quoted form,
-        # never as a bare, executable `; rm` sequence.
+    def test_run_argv_neutralizes_metacharacters(self, mock_run, ssh_mgr):
         import shlex
-        assert shlex.quote(malicious) in remote_cmd
-        assert "; rm" not in remote_cmd.replace(shlex.quote(malicious), "")
+
+        malicious_executable = "/opt/claude; rm -rf ~"
+        malicious_arg = "value; touch /tmp/pwned"
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="ok\n", stderr="",
+        )
+
+        ssh_mgr.run_argv("k", [malicious_executable, malicious_arg])
+
+        remote_cmd = mock_run.call_args.args[0][-1]
+        assert shlex.quote(malicious_executable) in remote_cmd
+        assert shlex.quote(malicious_arg) in remote_cmd
+        assert "; rm" not in remote_cmd.replace(
+            shlex.quote(malicious_executable), "",
+        )
+        assert "; touch" not in remote_cmd.replace(shlex.quote(malicious_arg), "")
 
     @patch("ironclaude.ssh_manager.subprocess.run")
-    def test_home_tilde_path_still_expands(self, mock_run, ssh_mgr):
-        # A legitimate ~/path must still resolve $HOME on the remote host.
-        machines = [{"name": "k", "host": "k",
-                     "claude_path": "~/.claude/local/claude", "repos": ["/r"]}]
-        ssh_mgr.register_machines(machines)
-        mock_run.return_value = MagicMock(returncode=0, stdout="ok\n")
-        ssh_mgr.health_check("k")
+    def test_run_argv_home_tilde_executable_still_expands(
+        self, mock_run, ssh_mgr,
+    ):
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="ok\n", stderr="",
+        )
 
-        which_cmds = [
-            c.args[0][-1]
-            for c in mock_run.call_args_list
-            if isinstance(c.args[0][-1], str) and c.args[0][-1].startswith("which ")
-        ]
-        assert len(which_cmds) == 1
-        remote_cmd = which_cmds[0]
-        # $HOME stays unquoted so the remote shell expands it; the rest is quoted.
+        ssh_mgr.run_argv("k", ["~/.claude/local/claude", "--version"])
+
+        remote_cmd = mock_run.call_args.args[0][-1]
         assert "$HOME" in remote_cmd
         assert "~" not in remote_cmd
+        assert remote_cmd.endswith(" --version")
 
 
 class TestTeardown:

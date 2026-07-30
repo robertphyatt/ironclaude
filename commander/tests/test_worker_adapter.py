@@ -193,6 +193,11 @@ def _spawn_tools(tmp_path, cfg, advisor_enabled=False, monkeypatch=None, ready_o
     t.ensure_worker_trusted = MagicMock()
     t._ensure_claude_md = MagicMock()
     t._activate_pm_via_sqlite = MagicMock(return_value=None)
+    t._read_pm_state_via_sqlite = MagicMock(return_value={
+        "professional_mode": "on",
+        "workflow_stage": "idle",
+        "session_uuid": _UUID,
+    })
     t._wait_for_ready = MagicMock(return_value=True)
     t._call_grader = MagicMock(return_value={"grade": "A", "approved": True, "feedback": ""})
     t._call_local_grader = MagicMock(return_value={"grade": "A", "approved": True, "feedback": ""})
@@ -215,8 +220,16 @@ def test_spawn_codex_threads_client_and_gates_slash(tmp_path, monkeypatch):
     keys = [c.args[1] for c in tmux.send_keys.call_args_list]
     assert not any(k.startswith("/advisor") for k in keys)
     assert not any(k.startswith("/goal") for k in keys)
-    # client+model persisted
-    registry.set_worker_provider.assert_called_once_with("w1", "codex", "gpt-5.6-sol")
+    # native identity + client/model persisted atomically
+    tools._read_pm_state_via_sqlite.assert_called_once_with(
+        "ic-w1", client="codex",
+    )
+    registry.register_worker.assert_called_once()
+    register_call = registry.register_worker.call_args
+    assert register_call.args[0] == "w1"
+    assert register_call.kwargs["client"] == "codex"
+    assert register_call.kwargs["model"] == "gpt-5.6-sol"
+    assert register_call.kwargs["native_session_id"] == _UUID
 
 
 def test_spawn_claude_still_sends_advisor(tmp_path, monkeypatch):

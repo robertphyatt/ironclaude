@@ -78,7 +78,8 @@ def test_directive_in_brain_surfaces():
 def test_activation_skill_propagates_all_boy_scout_paths():
     text = _read("worker/skills/activate-professional-mode/SKILL.md")
     assert COMPACT_DIRECTIVE in text
-    assert text.count(DIRECTIVE_BODY) == 2
+    # Codex full template + Claude full template + Claude append-path block.
+    assert text.count(DIRECTIVE_BODY) == 3
     assert DETECTION_ROW in text
     assert "Concept 11 (Boy Scout Rule):" in text
     assert "11 concepts" in text

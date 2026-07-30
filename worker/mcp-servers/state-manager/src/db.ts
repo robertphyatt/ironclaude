@@ -704,3 +704,28 @@ export function getLatestTierUpReview(
     ORDER BY id DESC LIMIT 1
   `).get(sessionId) as TierUpReviewEntry | undefined;
 }
+
+/**
+ * Existence check: did a review with `verdict` land in this session BEFORE row `beforeId`?
+ *
+ * Deliberately NOT scoped by plan_hash. The advisor-remediated gate pairs a HAS-ISSUES
+ * review of plan vN with an advisor-remediated review of the revised plan vN+1, and those
+ * bind different hashes — filtering by the current hash would never find the HAS-ISSUES row.
+ *
+ * Ordered by `id`, never `created_at`: created_at defaults to datetime('now') at
+ * second resolution, so two reviews submitted within the same second tie and a strict
+ * comparison is ambiguous. `id` is AUTOINCREMENT and monotonic.
+ */
+export function hasEarlierTierUpVerdict(
+  db: Database.Database,
+  sessionId: string,
+  verdict: string,
+  beforeId: number,
+): boolean {
+  const row = db.prepare(`
+    SELECT 1 AS found FROM tier_up_reviews
+    WHERE terminal_session = ? AND verdict = ? AND id < ?
+    LIMIT 1
+  `).get(sessionId, verdict, beforeId) as { found: number } | undefined;
+  return row !== undefined;
+}

@@ -37,6 +37,7 @@ import {
   insertTierUpReview,
   getTierUpReviewByHash,
   getLatestTierUpReview,
+  hasEarlierTierUpVerdict,
 } from '../db.js';
 import {
   validateProfessionalModeTransition,
@@ -133,7 +134,7 @@ export function hashPlan(planJson: string): string {
   return createHash('sha256').update(planJson).digest('hex');
 }
 
-const TIER_UP_VERDICTS = ['SOLID', 'HAS-ISSUES', 'top-tier-self'] as const;
+const TIER_UP_VERDICTS = ['SOLID', 'HAS-ISSUES', 'top-tier-self', 'advisor-remediated'] as const;
 type TierUpVerdict = typeof TIER_UP_VERDICTS[number];
 
 function isTierUpVerdict(value: string): value is TierUpVerdict {
@@ -532,7 +533,7 @@ export const writeToolDefinitions = [
         verdict: {
           type: 'string' as const,
           enum: [...TIER_UP_VERDICTS],
-          description: 'Exact review verdict: SOLID, HAS-ISSUES, or top-tier-self.',
+          description: 'Exact review verdict: SOLID, HAS-ISSUES, top-tier-self, or advisor-remediated.',
         },
       },
       required: ['reviewer_model', 'verdict'],
@@ -780,6 +781,20 @@ export function handleWriteTool(
               'after a prior review, re-review is required (the hash no longer matches). ' +
               'To change this requirement, a human must edit tier_up_review_policy in ' +
               '~/.claude/ironclaude-hooks-config.json (the commander cannot change it).';
+          }
+          // advisor-remediated: HAS-ISSUES is terminal when a tier-up advisor guided the
+          // response. Not expressible via isPassingTierUpVerdict — that is a pure
+          // verdict-string predicate, and this condition depends on a SECOND row existing.
+          // The paired HAS-ISSUES belongs to the pre-revision plan (different hash), so the
+          // lookup is session-scoped and ordered by id.
+          if (passRequired && review && review.verdict === 'advisor-remediated') {
+            if (hasEarlierTierUpVerdict(db, resolvedId, 'HAS-ISSUES', review.id)) {
+              return null;
+            }
+            return 'BLOCKED — advisor-remediated requires a prior HAS-ISSUES review. ' +
+              'This verdict records that a tier-up advisor guided the response to a failed ' +
+              'review; with no earlier HAS-ISSUES row in this session it is not a valid ' +
+              'execution gate. Obtain a blind review first.';
           }
           if (passRequired && review && !isPassingTierUpVerdict(review.verdict)) {
             return `BLOCKED — current plan tier-up verdict is ${review.verdict}. ` +

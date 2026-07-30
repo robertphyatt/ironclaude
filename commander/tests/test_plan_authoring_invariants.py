@@ -41,3 +41,17 @@ def test_rationalization_rows_present():
     text = _read(SKILL)
     assert "deployed build is obviously" in text
     assert "Empty output means" in text
+
+
+def test_verification_quality_invariants_present():
+    """The author-side counterpart to the reviewer's 'cannot fail' archetype.
+
+    Each marker is copied character-for-character from the bullet it guards — the rule
+    the fourth marker states applies to this test itself.
+    """
+    text = _read(SKILL)
+    for marker in ("you have not measured",
+                   "Prove every verification can fail",
+                   "must not perturb its own measurement",
+                   "EXACT case and spacing"):
+        assert marker in text, marker

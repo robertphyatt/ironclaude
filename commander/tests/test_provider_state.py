@@ -1,3 +1,7 @@
+import sqlite3
+
+import pytest
+
 from ironclaude.db import init_db
 from ironclaude.provider_state import ProviderState
 
@@ -115,3 +119,173 @@ def test_capability_observation_preserves_quarantine_until_explicit_recovery(tmp
     assert recovered["reason"] is None
     assert state.unavailable_reason("host-a", "claude", "worker", "sonnet") is None
     assert state.get_current_client("worker") == "codex"
+
+
+def test_explicit_cutover_reset_removes_only_target_client_role_capabilities(tmp_path):
+    state = make_state(tmp_path)
+    state.mark_unavailable(
+        "host-a", "codex", "worker", "sonnet", "usage_limit", "worker limit"
+    )
+    state.mark_unavailable(
+        "host-a", "codex", "grader", "opus", "usage_limit", "grader limit"
+    )
+    state.mark_unavailable(
+        "host-b", "claude", "worker", "sonnet", "usage_limit", "claude limit"
+    )
+
+    state.set_current_client("worker", "codex", reset_capabilities=True)
+
+    assert state.get_current_client("worker") == "codex"
+    assert state.capability_observation(
+        "host-a", "codex", "worker", "sonnet"
+    ) is None
+    assert state.is_available("host-a", "codex", "grader", "opus") is False
+    assert state.is_available("host-b", "claude", "worker", "sonnet") is False
+
+
+def test_explicit_cutover_reset_rolls_back_delete_when_sticky_upsert_fails(tmp_path):
+    state = make_state(tmp_path)
+    state.mark_unavailable(
+        "local", "codex", "worker", "sonnet", "usage_limit", "keep on rollback"
+    )
+    state._conn.execute(
+        """
+        CREATE TRIGGER reject_provider_role_insert
+        BEFORE INSERT ON provider_role_state
+        BEGIN
+            SELECT RAISE(ABORT, 'forced sticky failure');
+        END
+        """
+    )
+    state._conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced sticky failure"):
+        state.set_current_client("worker", "codex", reset_capabilities=True)
+
+    assert state.is_available("local", "codex", "worker", "sonnet") is False
+    assert state.get_current_client("worker") is None
+
+
+def test_ordinary_sticky_write_preserves_provider_quarantine(tmp_path):
+    state = make_state(tmp_path)
+    state.mark_unavailable(
+        "local", "codex", "worker", "sonnet", "usage_limit", "still limited"
+    )
+
+    state.set_current_client("worker", "codex")
+
+    assert state.is_available("local", "codex", "worker", "sonnet") is False
+
+
+def _record_probe(state, *, reason, available):
+    state.record_capability(
+        "host-a", "codex", "worker", "sonnet",
+        configured=True, supported=True, installed=True,
+        authenticated=None if available else False,
+        reason=reason, available=available,
+    )
+
+
+@pytest.mark.parametrize(
+    "reason", ["probe_timeout", "not_authenticated", "executable_probe_failed"]
+)
+def test_transient_quarantine_clears_on_successful_probe(tmp_path, reason):
+    state = make_state(tmp_path)
+    _record_probe(state, reason=reason, available=False)
+    assert state.is_available("host-a", "codex", "worker", "sonnet") is False
+
+    _record_probe(state, reason=None, available=True)
+
+    assert state.is_available("host-a", "codex", "worker", "sonnet") is True
+    observed = state.capability_observation("host-a", "codex", "worker", "sonnet")
+    assert observed["reason"] is None
+    assert state.unavailable_reason("host-a", "codex", "worker", "sonnet") is None
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "not_configured",
+        "unsupported",
+        "missing_executable",
+        "unsupported_auth_mode",
+        "executable_error",
+    ],
+)
+def test_hard_quarantine_survives_successful_probe(tmp_path, reason):
+    state = make_state(tmp_path)
+    _record_probe(state, reason=reason, available=False)
+
+    _record_probe(state, reason=None, available=True)
+
+    assert state.is_available("host-a", "codex", "worker", "sonnet") is False
+    assert state.unavailable_reason("host-a", "codex", "worker", "sonnet") == {
+        "category": "probe_failure",
+        "reason": reason,
+    }
+
+
+def test_unknown_reason_survives_successful_probe(tmp_path):
+    state = make_state(tmp_path)
+    _record_probe(state, reason="some_future_reason", available=False)
+
+    _record_probe(state, reason=None, available=True)
+
+    assert state.is_available("host-a", "codex", "worker", "sonnet") is False
+
+
+def test_failed_probe_still_forces_unavailable_over_available_row(tmp_path):
+    state = make_state(tmp_path)
+    _record_probe(state, reason=None, available=True)
+
+    _record_probe(state, reason="probe_timeout", available=False)
+
+    assert state.is_available("host-a", "codex", "worker", "sonnet") is False
+
+
+def test_cleared_transient_row_leaves_unavailable_capabilities(tmp_path):
+    state = make_state(tmp_path)
+    _record_probe(state, reason="probe_timeout", available=False)
+    assert state.unavailable_capabilities("codex", "worker") != []
+
+    _record_probe(state, reason=None, available=True)
+
+    assert state.unavailable_capabilities("codex", "worker") == []
+
+
+def test_transient_reason_set_is_exact():
+    from ironclaude.provider_state import TRANSIENT_UNAVAILABLE_REASONS
+
+    assert tuple(TRANSIENT_UNAVAILABLE_REASONS) == (
+        "probe_timeout",
+        "not_authenticated",
+        "executable_probe_failed",
+    )
+
+
+def test_unavailable_capabilities_reports_selected_client_role_only(tmp_path):
+    state = make_state(tmp_path)
+    state.mark_unavailable(
+        "local", "codex", "worker", "sonnet", "usage_limit", "worker limit"
+    )
+    state.mark_unavailable(
+        "remote-a", "codex", "worker", "opus", "expired_auth", "login"
+    )
+    state.mark_unavailable(
+        "local", "codex", "grader", "opus", "usage_limit", "grader limit"
+    )
+
+    assert state.unavailable_capabilities("codex", "worker") == [
+        {
+            "host": "local",
+            "tier": "sonnet",
+            "category": "usage_limit",
+            "reason": "worker limit",
+        },
+        {
+            "host": "remote-a",
+            "tier": "opus",
+            "category": "expired_auth",
+            "reason": "login",
+        },
+    ]

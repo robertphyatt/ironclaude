@@ -60,6 +60,18 @@ class TestSystemNotifications:
         msg = format_heartbeat([])
         assert "No active workers" in msg
 
+    def test_heartbeat_blocked_capability(self):
+        msg = format_heartbeat([], blocked_directives=[{
+            "directive_id": 7,
+            "capabilities": ["workspace_write"],
+            "denial_scope": "codex_sandbox",
+            "reason": "denied",
+        }])
+        assert "Blocked directives" in msg
+        assert "#7" in msg
+        assert "workspace_write" in msg
+        assert "codex_sandbox" in msg
+
     def test_heartbeat_truncates_long_description(self):
         workers = [{"id": "w1", "description": "Your task: " + "A" * 80, "workflow_stage": "executing"}]
         msg = format_heartbeat(workers)

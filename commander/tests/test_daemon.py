@@ -8,12 +8,50 @@ import subprocess
 from ironclaude.db import init_db
 import time
 import json
+from pathlib import Path
 
 import psutil
 import pytest
 from unittest.mock import MagicMock, patch
 
 from ironclaude.main import CHECKIN_CADENCE, PM_GATE_STAGES, PM_GATE_SLACK_SECONDS, IroncladeDaemon, ensure_brain_trusted
+
+
+def _brain_instruction_surfaces() -> list[str]:
+    root = Path(__file__).resolve().parents[1] / "src" / "brain"
+    return [
+        (root / "system_prompt.md").read_text(),
+        (root / "rules" / "workflow.md").read_text(),
+    ]
+
+
+def test_brain_blocked_capability_contract_reporting_and_recheck():
+    for text in _brain_instruction_surfaces():
+        assert "report_directive_capability_block" in text
+        assert "report_directive_capability_recovery" in text
+        assert "workspace_write" in text
+        assert "ollama_loopback" in text
+        assert "process_inspection" in text
+        assert "project_permission" in text
+        assert "codex_sandbox" in text
+        assert "host_runtime" in text
+        assert "exactly one non-mutating probe" in text
+        assert "one aggregate result" in text
+
+
+def test_brain_blocked_capability_contract_forbids_monitor_chatter():
+    for text in _brain_instruction_surfaces():
+        assert "Do not create a monitor worker" in text
+        assert "Do not run repeated minute probes" in text
+        assert "Do not post per-check Slack chatter" in text
+        assert "wait for the daemon's recovery dispatch" in text
+
+
+def test_brain_blocked_capability_contract_startup_exemption_preserves_resources():
+    for text in _brain_instruction_surfaces():
+        assert "daemon-issued `[CAPABILITY RECHECK]`" in text
+        assert "startup, context recovery, or ordinary attention sweeps" in text
+        assert "resource-blocked work remains unchanged" in text
 
 
 @pytest.fixture
@@ -871,6 +909,134 @@ class TestHeartbeatWorkerListing:
             daemon.post_heartbeat()
         msg = daemon.slack.post_message.call_args[0][0]
         assert "Fix the bug" in msg
+
+
+class TestDirectiveCapabilityQuiescence:
+    @pytest.fixture
+    def blocked_daemon(self, tmp_path):
+        conn = init_db(str(tmp_path / "daemon.db"))
+        conn.execute(
+            "INSERT INTO directives (source_ts, source_text, interpretation, status) "
+            "VALUES ('b1', 'blocked', 'Blocked directive', 'blocked')"
+        )
+        directive_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "INSERT INTO directive_capability_blocks "
+            "(directive_id, capabilities_json, denial_scope, target, reason, "
+            "fingerprint, state, first_observed_at, last_observed_at, "
+            "next_recheck_at, backoff_seconds, generation) "
+            "VALUES (?, '[\"workspace_write\"]', 'codex_sandbox', '/repo', "
+            "'sandbox denied', 'fp', 'blocked', 1, 1, 160, 60, 1)",
+            (directive_id,),
+        )
+        conn.commit()
+        slack = MagicMock()
+        slack.post_message.return_value = "1.2"
+        registry = MagicMock()
+        registry.get_running_workers.return_value = []
+        registry.get_recent_workers.return_value = []
+        tmux = MagicMock()
+        tmux.log_dir = str(tmp_path / "logs")
+        os.makedirs(tmux.log_dir, exist_ok=True)
+        brain = MagicMock()
+        brain.send_message.return_value = True
+        brain.get_token_usage.return_value = None
+        daemon = IroncladeDaemon(
+            {"tmp_dir": str(tmp_path), "heartbeat_interval_seconds": 900},
+            slack, None, registry, tmux, brain, db_conn=conn,
+        )
+        return daemon, conn, directive_id
+
+    def test_daemon_blocked_quiescence_deduplicates_notification(self, blocked_daemon):
+        daemon, conn, directive_id = blocked_daemon
+        daemon.check_directive_capability_blocks(now=100)
+        daemon.check_directive_capability_blocks(now=101)
+        assert daemon.slack.post_message.call_count == 1
+        assert conn.execute(
+            "SELECT notification_state FROM directive_capability_blocks "
+            "WHERE directive_id=?", (directive_id,)
+        ).fetchone()[0] == "submitted"
+
+    def test_heartbeat_blocked_capability_is_stable_without_idle_nudge(self, blocked_daemon):
+        daemon, _conn, _directive_id = blocked_daemon
+        daemon._last_heartbeat = 0
+        daemon.post_heartbeat(now=1000)
+        heartbeat = daemon.slack.post_message.call_args_list[0].args[0]
+        assert "Blocked directives" in heartbeat
+        assert "workspace_write" in heartbeat
+        daemon.brain.send_message.assert_not_called()
+
+    def test_blocked_recheck_backoff_retry_and_no_early_duplicate(self, blocked_daemon):
+        daemon, conn, directive_id = blocked_daemon
+        daemon.check_directive_capability_blocks(now=160)
+        assert daemon.brain.send_message.call_count == 1
+        row = conn.execute(
+            "SELECT next_recheck_at, backoff_seconds FROM directive_capability_blocks "
+            "WHERE directive_id=?", (directive_id,)
+        ).fetchone()
+        assert tuple(row) == (280, 120)
+        daemon.check_directive_capability_blocks(now=200)
+        assert daemon.brain.send_message.call_count == 1
+        daemon.brain.send_message.return_value = False
+        daemon.check_directive_capability_blocks(now=280)
+        retry = conn.execute(
+            "SELECT next_recheck_at, backoff_seconds FROM directive_capability_blocks "
+            "WHERE directive_id=?", (directive_id,)
+        ).fetchone()
+        assert tuple(retry) == (280, 120)
+
+    def test_blocked_recheck_initial_backoff_clamps_to_heartbeat(self, blocked_daemon):
+        daemon, conn, directive_id = blocked_daemon
+        daemon.config["heartbeat_interval_seconds"] = 30
+        conn.execute(
+            "UPDATE directive_capability_blocks SET last_observed_at=1, "
+            "next_recheck_at=61, backoff_seconds=60 WHERE directive_id=?",
+            (directive_id,),
+        )
+        conn.commit()
+        daemon.check_directive_capability_blocks(now=31)
+        assert daemon.brain.send_message.call_count == 1
+        assert tuple(conn.execute(
+            "SELECT next_recheck_at, backoff_seconds FROM directive_capability_blocks "
+            "WHERE directive_id=?", (directive_id,)
+        ).fetchone()) == (61, 30)
+
+    def test_blocked_recheck_stale_generation_compare_and_swap(self, blocked_daemon):
+        daemon, conn, directive_id = blocked_daemon
+        loaded = daemon._load_directive_capability_blocks()
+        conn.execute(
+            "UPDATE directive_capability_blocks SET generation=2, fingerprint='new' "
+            "WHERE directive_id=?", (directive_id,)
+        )
+        conn.commit()
+        daemon._process_directive_capability_block(loaded[0], now=160)
+        daemon.brain.send_message.assert_not_called()
+        assert tuple(conn.execute(
+            "SELECT generation, next_recheck_at FROM directive_capability_blocks "
+            "WHERE directive_id=?", (directive_id,)
+        ).fetchone()) == (2, 160)
+
+    def test_blocked_recovery_redispatch_once_and_suppresses_generic_paths(self, blocked_daemon):
+        daemon, conn, directive_id = blocked_daemon
+        conn.execute(
+            "UPDATE directive_capability_blocks SET state='recovered', "
+            "capabilities_json='[]', recovery_dispatch_state='pending' "
+            "WHERE directive_id=?", (directive_id,)
+        )
+        conn.commit()
+        daemon.check_directive_capability_blocks(now=200)
+        assert daemon.brain.send_message.call_count == 1
+        assert conn.execute(
+            "SELECT status FROM directives WHERE id=?", (directive_id,)
+        ).fetchone()[0] == "confirmed"
+        daemon.brain.send_message.reset_mock()
+        daemon.check_directive_capability_blocks(now=201)
+        daemon.check_confirmed_directives()
+        daemon._last_idle_check = 0
+        daemon.check_idle_enforcement()
+        daemon._last_heartbeat = 0
+        daemon.post_heartbeat(now=1000)
+        daemon.brain.send_message.assert_not_called()
 
 
 class TestDirectiveReactionHandling:
@@ -2909,6 +3075,26 @@ class TestProviderCommand:
         d._handle_provider_command(["worker", "codex"])
         assert self._current(d, "worker") == "codex"
 
+    def test_explicit_cutover_resets_only_selected_routed_quarantine(self, daemon):
+        from ironclaude.provider_state import ProviderState
+        d = self._prep(daemon)
+        state = ProviderState(d._db)
+        state.mark_unavailable(
+            "local", "codex", "worker", "sonnet", "usage_limit", "worker limit"
+        )
+        state.mark_unavailable(
+            "local", "codex", "grader", "opus", "usage_limit", "grader limit"
+        )
+
+        d._handle_provider_command(["worker", "codex"])
+
+        assert state.capability_observation(
+            "local", "codex", "worker", "sonnet"
+        ) is None
+        assert state.is_available("local", "codex", "grader", "opus") is False
+        posted = self._posted(d).lower()
+        assert "selected" in posted and "next use" in posted
+
     def test_client_not_in_role_clients_is_rejected(self, daemon):
         d = self._prep(daemon)
         d._handle_provider_command(["grader", "codex"])
@@ -2983,6 +3169,63 @@ class TestProviderCommand:
         d._handle_provider_command([])
         worker_line = [ln for ln in self._posted(d).split("\\n") if "`worker`" in ln]
         assert worker_line and "current: *codex*" in worker_line[0]
+
+    def test_status_reports_selected_client_quarantine_and_fallback(self, daemon):
+        from ironclaude.provider_state import ProviderState
+        d = self._prep(daemon)
+        state = ProviderState(d._db)
+        state.set_current_client("worker", "codex")
+        state.mark_unavailable(
+            "local", "codex", "worker", "sonnet", "usage_limit", "limit"
+        )
+
+        d.slack.post_message.reset_mock()
+        d._handle_provider_command([])
+
+        worker_line = [ln for ln in self._posted(d).split("\\n") if "`worker`" in ln]
+        assert worker_line
+        assert "quarantined" in worker_line[0].lower()
+        assert "local/sonnet" in worker_line[0]
+        assert "fallback" in worker_line[0].lower()
+
+    def test_status_reports_persisted_brain_after_config_removal(self, daemon):
+        from ironclaude.provider_state import ProviderState
+        d = self._prep(daemon)
+        ProviderState(d._db).set_current_client("brain", "codex")
+        d.config["providers"]["roles"]["brain"]["clients"] = ["claude"]
+        d.slack.post_message.reset_mock()
+        d._handle_provider_command([])
+        brain_line = [ln for ln in self._posted(d).split("\\n") if "`brain`" in ln]
+        assert brain_line and "current: *codex*" in brain_line[0]
+        assert "ignor" not in brain_line[0].lower()
+
+    def test_brain_cutover_persists_flushes_and_requests_restart(self, daemon):
+        import signal
+        d = self._prep(daemon)
+
+        with patch("ironclaude.main.os.getpid", return_value=12345), \
+             patch("ironclaude.main.os.kill") as kill:
+            d._handle_provider_command(["brain", "codex"])
+
+        assert self._current(d, "brain") == "codex"
+        d.slack.flush_queue.assert_called_once_with()
+        kill.assert_called_once_with(12345, signal.SIGHUP)
+        assert "restart" in self._posted(d).lower()
+
+    def test_brain_status_distinguishes_selected_from_active_until_restart(self, daemon):
+        from ironclaude.provider_state import ProviderState
+        d = self._prep(daemon)
+        d.config["providers"]["roles"]["brain"]["clients"] = ["claude", "codex"]
+        ProviderState(d._db).set_current_client("brain", "codex")
+
+        d.slack.post_message.reset_mock()
+        d._handle_provider_command([])
+
+        brain_line = [ln for ln in self._posted(d).split("\\n") if "`brain`" in ln]
+        assert brain_line
+        assert "current: *codex*" in brain_line[0]
+        assert "active: *claude*" in brain_line[0]
+        assert "restart pending" in brain_line[0].lower()
 
     def test_status_without_sticky_row_has_no_note(self, daemon):
         d = self._prep(daemon)

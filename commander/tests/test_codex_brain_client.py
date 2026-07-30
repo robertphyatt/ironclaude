@@ -1,5 +1,9 @@
+import json
 import os
+import subprocess
+import sys
 import time
+from pathlib import Path
 import pytest
 from unittest.mock import MagicMock
 from ironclaude.codex_brain_client import CodexBrainClient
@@ -43,6 +47,9 @@ class TestSpawnHardening:
             "-c", 'sandbox_mode="read-only"',
             "-c", 'approval_policy="on-request"',
             "-c", 'model="gpt-5.6-terra"',
+            "-c", 'model_reasoning_effort="high"',
+            *c._orchestrator_mcp_overrides(),
+            *c._optional_mcp_overrides(),
             "--stdio",
         ]
 
@@ -564,6 +571,7 @@ class TestBrainRoleDiscriminator:
 
         monkeypatch.setattr(m.subprocess, "Popen", fake_popen)
         c = CodexBrainClient()
+        monkeypatch.setattr(c, "_preflight_orchestrator", lambda: None)
         monkeypatch.setattr(c, "_reader_loop", lambda: None)
         monkeypatch.setattr(c, "_stderr_loop", lambda: None)
         c.start("system prompt", cwd="/tmp")
@@ -572,3 +580,504 @@ class TestBrainRoleDiscriminator:
         # env= REPLACES inheritance: pin the MERGED env at the Popen boundary so an
         # implementation passing a bare {"IC_ROLE": "brain"} (stripping auth/PATH) fails.
         assert recorded["env"].get("IC_TEST_AMBIENT") == "kept"
+
+
+class TestBrainGateEnvironment:
+    def test_spawn_env_marks_codex_and_stable_gate_session(self):
+        client = CodexBrainClient()
+        first = client._spawn_env()
+        second = client._spawn_env()
+        assert first["IRONCLAUDE_CLIENT"] == "codex"
+        assert first["IRONCLAUDE_BRAIN_GATE_SESSION"]
+        assert second["IRONCLAUDE_BRAIN_GATE_SESSION"] == first["IRONCLAUDE_BRAIN_GATE_SESSION"]
+
+    def test_gate_session_is_unique_per_client(self):
+        first = CodexBrainClient()._spawn_env()["IRONCLAUDE_BRAIN_GATE_SESSION"]
+        second = CodexBrainClient()._spawn_env()["IRONCLAUDE_BRAIN_GATE_SESSION"]
+        assert first != second
+
+    def test_gate_markers_do_not_leak_into_daemon_environment(self, monkeypatch):
+        monkeypatch.delenv("IC_ROLE", raising=False)
+        monkeypatch.delenv("IRONCLAUDE_CLIENT", raising=False)
+        monkeypatch.delenv("IRONCLAUDE_BRAIN_GATE_SESSION", raising=False)
+        CodexBrainClient()._spawn_env()
+        assert "IC_ROLE" not in os.environ
+        assert "IRONCLAUDE_CLIENT" not in os.environ
+        assert "IRONCLAUDE_BRAIN_GATE_SESSION" not in os.environ
+
+    def test_startup_reset_clears_lookback_only(self, tmp_path, monkeypatch):
+        import ironclaude.codex_brain_client as module
+
+        monkeypatch.setattr(module, "_BRAIN_GATE_ROOT", tmp_path)
+        client = CodexBrainClient()
+        state_dir = tmp_path / client._brain_gate_session
+        state_dir.mkdir()
+        for marker in ("lookback-slack", "lookback-ledger", "memory-armed", "wiki-queried"):
+            (state_dir / marker).touch()
+
+        client._reset_brain_gate_startup_state()
+
+        assert not (state_dir / "lookback-slack").exists()
+        assert not (state_dir / "lookback-ledger").exists()
+        assert (state_dir / "memory-armed").exists()
+        assert (state_dir / "wiki-queried").exists()
+
+    def test_restart_keeps_same_gate_session(self, monkeypatch):
+        client = CodexBrainClient()
+        gate_session = client._brain_gate_session
+        monkeypatch.setattr(client, "shutdown", lambda: None)
+
+        def fake_start(*_args, **_kwargs):
+            client._running = True
+            client._proc = MagicMock()
+            client._proc.poll.return_value = None
+
+        monkeypatch.setattr(client, "start", fake_start)
+        assert client.restart("prompt") is True
+        assert client._brain_gate_session == gate_session
+
+
+class TestOrchestratorMcpWiring:
+    def test_app_server_argv_registers_production_orchestrator(self):
+        client = CodexBrainClient()
+        client._cwd = "/tmp/brain"
+        argv = client._app_server_argv()
+        joined = "\n".join(argv)
+        assert f"mcp_servers.orchestrator.command={json.dumps(sys.executable)}" in joined
+        assert "orchestrator_mcp.py" in joined
+        assert "commander/data/db/ironclaude.db" in joined
+        assert "mcp_servers.orchestrator.enabled=true" in joined
+        assert 'mcp_servers.orchestrator.default_tools_approval_mode="approve"' in joined
+        assert "mcp_servers.orchestrator.startup_timeout_sec=120" in joined
+        assert "mcp_servers.orchestrator.cwd=" in joined
+        assert (
+            'mcp_servers.orchestrator.env_vars=["SUPABASE_URL","SUPABASE_ANON_KEY"]'
+            in joined
+        )
+        assert (
+            "mcp_servers.orchestrator.env.IC_BRAIN_CWD="
+            + json.dumps("/tmp/brain")
+        ) in joined
+        assert "mcp_servers.orchestrator.env.IC_MACHINES_CONFIG=" in joined
+        assert argv[-1] == "--stdio"
+
+    def test_secret_stays_in_spawn_env_and_out_of_argv(self, monkeypatch):
+        monkeypatch.setenv("SUPABASE_ANON_KEY", "secret-sentinel")
+        client = CodexBrainClient()
+        assert client._spawn_env()["SUPABASE_ANON_KEY"] == "secret-sentinel"
+        assert "secret-sentinel" not in "\n".join(client._app_server_argv())
+
+    def test_preflight_uses_same_interpreter_cwd_and_environment(self, monkeypatch):
+        import ironclaude.codex_brain_client as module
+
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            captured.update(kwargs)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        monkeypatch.setenv("SUPABASE_ANON_KEY", "secret-sentinel")
+        monkeypatch.setattr(module.subprocess, "run", fake_run)
+        client = CodexBrainClient()
+        assert client._preflight_orchestrator() is None
+        assert captured["argv"] == [
+            sys.executable,
+            "-c",
+            "import ironclaude.orchestrator_mcp",
+        ]
+        assert captured["cwd"] == str(client._commander_root())
+        assert captured["env"]["SUPABASE_ANON_KEY"] == "secret-sentinel"
+        assert captured["timeout"] == 30
+
+    def test_import_preflight_reports_nonzero_exit(self, monkeypatch):
+        import ironclaude.codex_brain_client as module
+
+        monkeypatch.setattr(
+            module.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1, "", "boom"),
+        )
+        error = CodexBrainClient()._preflight_orchestrator()
+        assert error is not None
+        assert "import preflight failed" in error
+        assert "boom" in error
+
+    def test_import_preflight_reports_timeout(self, monkeypatch):
+        import ironclaude.codex_brain_client as module
+
+        def timeout(*args, **kwargs):
+            raise subprocess.TimeoutExpired(args[0], 30)
+
+        monkeypatch.setattr(module.subprocess, "run", timeout)
+        error = CodexBrainClient()._preflight_orchestrator()
+        assert error is not None
+        assert "import preflight failed" in error
+        assert "timed out" in error
+
+    def test_missing_orchestrator_fails_before_spawn_and_is_visible(
+        self, monkeypatch, tmp_path
+    ):
+        import ironclaude.codex_brain_client as module
+
+        client = CodexBrainClient()
+        monkeypatch.setattr(
+            client, "_orchestrator_source_path", lambda: tmp_path / "missing.py"
+        )
+        popen = MagicMock()
+        monkeypatch.setattr(module.subprocess, "Popen", popen)
+        client.start("", cwd=str(tmp_path))
+        assert not popen.called
+        assert client.is_alive() is False
+        assert "orchestrator" in client.restart_reason.lower()
+        assert any(
+            "[CODEX BRAIN ERROR]" in item
+            for item in client.get_pending_responses()
+        )
+
+
+class TestOrchestratorStartupReadiness:
+    REQUIRED = {
+        "wiki_query",
+        "get_operator_messages",
+        "update_ledger",
+        "spawn_worker",
+        "spawn_workers",
+        "approve_plan",
+        "reject_plan",
+        "send_to_worker",
+        "kill_worker",
+    }
+
+    @staticmethod
+    def _inventory(tools=None, next_cursor=None):
+        names = tools if tools is not None else TestOrchestratorStartupReadiness.REQUIRED
+        return {
+            "result": {
+                "data": [{
+                    "name": "orchestrator",
+                    "tools": {
+                        name: {"name": name, "inputSchema": {}}
+                        for name in names
+                    },
+                }],
+                "nextCursor": next_cursor,
+            },
+        }
+
+    def test_early_ready_notification_is_latched(self):
+        client = CodexBrainClient()
+        client._thread_id = "thread-1"
+        client._handle_event({
+            "method": "mcpServer/startupStatus/updated",
+            "params": {
+                "threadId": "thread-1",
+                "name": "orchestrator",
+                "status": "ready",
+            },
+        })
+        assert client._mcp_startup_status["orchestrator"]["status"] == "ready"
+        assert client._mcp_startup_status["orchestrator"]["threadId"] == "thread-1"
+        assert client._await_orchestrator_ready(timeout=0.01) is None
+
+    @pytest.mark.parametrize("status", ["failed", "cancelled"])
+    def test_terminal_startup_failure_is_visible(self, status):
+        client = CodexBrainClient()
+        client._thread_id = "thread-1"
+        client._handle_event({
+            "method": "mcpServer/startupStatus/updated",
+            "params": {
+                "threadId": "thread-1",
+                "name": "orchestrator",
+                "status": status,
+                "error": "boom",
+            },
+        })
+        error = client._await_orchestrator_ready(timeout=0.01)
+        assert error is not None
+        assert status in error
+        assert "boom" in error
+
+    def test_ready_wait_detects_dead_process(self):
+        client = CodexBrainClient()
+        client._thread_id = "thread-1"
+        client._proc = MagicMock()
+        client._proc.poll.return_value = 1
+        assert "exited" in client._await_orchestrator_ready(timeout=0.01)
+
+    def test_ready_wait_times_out(self):
+        client = CodexBrainClient()
+        client._thread_id = "thread-1"
+        client._proc = MagicMock()
+        client._proc.poll.return_value = None
+        assert "timed out" in client._await_orchestrator_ready(timeout=0.01)
+
+    def test_ready_for_another_thread_does_not_satisfy_wait(self):
+        client = CodexBrainClient()
+        client._thread_id = "thread-1"
+        client._proc = MagicMock()
+        client._proc.poll.return_value = None
+        client._handle_event({
+            "method": "mcpServer/startupStatus/updated",
+            "params": {
+                "threadId": "thread-2",
+                "name": "orchestrator",
+                "status": "ready",
+            },
+        })
+        assert "timed out" in client._await_orchestrator_ready(timeout=0.01)
+
+    def test_inventory_paginates_with_full_detail(self, monkeypatch):
+        client = CodexBrainClient()
+        client._thread_id = "thread-1"
+        sent = []
+        responses = [
+            {"result": {"data": [], "nextCursor": "opaque-2"}},
+            self._inventory(),
+        ]
+        monkeypatch.setattr(client, "_write", lambda payload: sent.append(payload) or True)
+        monkeypatch.setattr(
+            client,
+            "_await_response",
+            lambda request_id, timeout: responses.pop(0),
+        )
+        inventory, error = client._list_mcp_server_inventory()
+        assert error is None
+        assert inventory is not None
+        assert self.REQUIRED <= set(inventory["orchestrator"]["tools"])
+        calls = [item for item in sent if item.get("method") == "mcpServerStatus/list"]
+        assert calls[0]["params"] == {
+            "detail": "full",
+            "threadId": "thread-1",
+        }
+        assert calls[1]["params"] == {
+            "detail": "full",
+            "threadId": "thread-1",
+            "cursor": "opaque-2",
+        }
+
+    def test_inventory_requires_thread_id_before_write(self, monkeypatch):
+        client = CodexBrainClient()
+        write = MagicMock()
+        monkeypatch.setattr(client, "_write", write)
+        monkeypatch.setattr(
+            client,
+            "_await_response",
+            lambda request_id, timeout: self._inventory(),
+        )
+        inventory, error = client._list_mcp_server_inventory()
+        assert inventory is None
+        assert "thread id" in error
+        write.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("response", "fragment"),
+        [
+            (None, "timed out"),
+            ({"error": {"message": "boom"}}, "boom"),
+            ({"result": []}, "malformed"),
+            ({"result": {"data": "bad", "nextCursor": None}}, "malformed"),
+            ({"result": {"data": [], "nextCursor": 7}}, "malformed"),
+        ],
+    )
+    def test_inventory_reports_response_failures(
+        self, monkeypatch, response, fragment
+    ):
+        client = CodexBrainClient()
+        client._thread_id = "thread-1"
+        monkeypatch.setattr(client, "_write", lambda payload: True)
+        monkeypatch.setattr(
+            client, "_await_response", lambda request_id, timeout: response
+        )
+        inventory, error = client._list_mcp_server_inventory()
+        assert inventory is None
+        assert fragment in error
+
+    def test_inventory_rejects_repeated_cursor(self, monkeypatch):
+        client = CodexBrainClient()
+        client._thread_id = "thread-1"
+        monkeypatch.setattr(client, "_write", lambda payload: True)
+        monkeypatch.setattr(
+            client,
+            "_await_response",
+            lambda request_id, timeout: {
+                "result": {"data": [], "nextCursor": "repeat"}
+            },
+        )
+        inventory, error = client._list_mcp_server_inventory()
+        assert inventory is None
+        assert "repeated cursor" in error
+
+    @pytest.mark.parametrize(
+        ("inventory", "fragment"),
+        [
+            ({}, "missing server"),
+            (
+                {"orchestrator": {"tools": {"wiki_query": {"name": "wiki_query"}}}},
+                "missing tools",
+            ),
+        ],
+    )
+    def test_verify_requires_server_and_all_tools(
+        self, monkeypatch, inventory, fragment
+    ):
+        client = CodexBrainClient()
+        monkeypatch.setattr(client, "_await_orchestrator_ready", lambda timeout: None)
+        monkeypatch.setattr(
+            client,
+            "_list_mcp_server_inventory",
+            lambda: (inventory, None),
+        )
+        assert fragment in client._verify_orchestrator_mcp()
+
+    def test_verify_requires_ready_before_inventory(self, monkeypatch):
+        client = CodexBrainClient()
+        inventory = MagicMock()
+        monkeypatch.setattr(
+            client,
+            "_await_orchestrator_ready",
+            lambda timeout: "not ready",
+        )
+        monkeypatch.setattr(client, "_list_mcp_server_inventory", inventory)
+        assert client._verify_orchestrator_mcp() == "not ready"
+        inventory.assert_not_called()
+
+    def test_verify_requires_episodic_memory_present(self, monkeypatch):
+        """Parity with Claude Brain, which refuses to start without episodic-memory."""
+        client = CodexBrainClient()
+        orchestrator = {name: {"name": name} for name in self.REQUIRED}
+        monkeypatch.setattr(client, "_await_orchestrator_ready", lambda timeout: None)
+        monkeypatch.setattr(
+            client,
+            "_list_mcp_server_inventory",
+            lambda: ({"orchestrator": {"tools": orchestrator}}, None),
+        )
+
+        reason = client._verify_orchestrator_mcp()
+
+        assert reason is not None
+        assert "episodic-memory" in reason
+
+    def test_verify_passes_when_episodic_memory_present(self, monkeypatch):
+        """Over-tightening guard: a check that always fails would still pass the case above.
+
+        The EMPTY tools dict is deliberate. Claude Brain's mandate is existence-only
+        (brain_client.discover_episodic_memory_path globs a path and raises
+        FileNotFoundError); it never inspects which tools episodic-memory exposes. This
+        pins that semantics, so a later change that starts requiring named tools breaks
+        here rather than silently making Codex stricter than Claude.
+        """
+        client = CodexBrainClient()
+        orchestrator = {name: {"name": name} for name in self.REQUIRED}
+        monkeypatch.setattr(client, "_await_orchestrator_ready", lambda timeout: None)
+        monkeypatch.setattr(
+            client,
+            "_list_mcp_server_inventory",
+            lambda: (
+                {
+                    "orchestrator": {"tools": orchestrator},
+                    "episodic-memory": {"tools": {}},
+                },
+                None,
+            ),
+        )
+
+        assert client._verify_orchestrator_mcp() is None
+
+    def test_start_failure_occurs_after_thread_start_before_first_turn(self, monkeypatch):
+        import ironclaude.codex_brain_client as module
+
+        class FakeProc:
+            pid = 4321
+            stdin = MagicMock()
+            stdout = MagicMock()
+            stderr = MagicMock()
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        client = CodexBrainClient()
+        sent = []
+        responses = [
+            {"result": {}},
+            {"result": {"thread": {"id": "thread-1"}}},
+        ]
+        monkeypatch.setattr(client, "_preflight_orchestrator", lambda: None)
+        monkeypatch.setattr(client, "_reader_loop", lambda: None)
+        monkeypatch.setattr(client, "_stderr_loop", lambda: None)
+        monkeypatch.setattr(client, "_write", lambda payload: sent.append(payload) or True)
+        monkeypatch.setattr(
+            client,
+            "_await_response",
+            lambda request_id, timeout: responses.pop(0),
+        )
+
+        def fail_verification():
+            assert client._thread_id == "thread-1"
+            assert client._running is False
+            assert client.send_message("forbidden") is False
+            return "orchestrator not ready"
+
+        monkeypatch.setattr(client, "_verify_orchestrator_mcp", fail_verification)
+        monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: FakeProc())
+        client.start("", cwd="/tmp")
+        assert sum(item.get("method") == "thread/start" for item in sent) == 1
+        assert not any(item.get("method") == "turn/start" for item in sent)
+        assert "orchestrator not ready" in client.restart_reason
+        assert any(
+            "[CODEX BRAIN ERROR]" in item
+            for item in client.get_pending_responses()
+        )
+
+
+def test_app_server_argv_pins_configured_reasoning_effort():
+    """A non-default effort proves _effort_level is read rather than hardcoded."""
+    c = CodexBrainClient(effort_level="low")
+    assert 'model_reasoning_effort="low"' in c._app_server_argv()
+
+
+def test_optional_mcp_overrides_registers_research_and_ollama():
+    """Claude Brain registers research + ollama (brain_client.py:716-725); codex must too."""
+    c = CodexBrainClient()
+    overrides = c._optional_mcp_overrides()
+    joined = " ".join(overrides)
+    assert "mcp_servers.research.enabled=true" in overrides
+    assert "mcp_servers.ollama.enabled=true" in overrides
+    assert "research_mcp.py" in joined
+    assert "ollama_mcp.py" in joined
+
+
+def test_optional_mcp_overrides_skips_a_missing_server(monkeypatch):
+    """Mirrors brain_client.py:280-286, which registers a server only if its file exists.
+
+    Without this the existence guard is untested and could be dropped silently.
+    """
+    c = CodexBrainClient()
+    monkeypatch.setattr(
+        CodexBrainClient,
+        "_optional_mcp_source_path",
+        lambda self, name: Path("/nonexistent") / f"{name}_mcp.py",
+    )
+    assert c._optional_mcp_overrides() == []
+
+
+def test_optional_mcp_servers_are_not_auto_approved():
+    """ollama's pull/remove/create_model are gated by codex-brain-gated-actions.sh:63-65.
+
+    The orchestrator arm sets default_tools_approval_mode="approve"; copying that here
+    would auto-approve exactly those destructive tools. This test is what catches a later
+    edit that clones the orchestrator arm wholesale.
+    """
+    c = CodexBrainClient()
+    joined = " ".join(c._optional_mcp_overrides())
+    assert "mcp_servers.research.default_tools_approval_mode" not in joined
+    assert "mcp_servers.ollama.default_tools_approval_mode" not in joined

@@ -158,7 +158,9 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
 
 **Run the review (commander-choice=yes or enforced):**
 
-1. **Decide the reviewer tier (LLM blast-radius judgment).** The reviewer defaults to the
+1. Call `mcp__plugin_ironclaude_state-manager__get_professional_mode` first and
+   retain its trusted `client` field. **Decide the reviewer tier (LLM blast-radius
+   judgment).** The reviewer defaults to the
    **SAME tier** as your current model — a fresh, blind reviewer catches author blind spots
    regardless of tier, which is where most review value is. Escalate to **one tier up** ONLY if
    you judge this plan high-blast-radius/complex enough that a same-tier blind review would miss
@@ -168,42 +170,110 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    - **Operator interacting directly:** when you judge a tier-up warranted, do NOT silently
      escalate — SURFACE it via AskUserQuestion ("This plan looks high-blast-radius — run a
      one-tier-up plan review? / Yes, tier up (Recommended) | No, same-tier") and honor the choice.
-   Resolve the reviewer model: **same-tier** = your current model. **tier-up** = one tier above your
-   current model (Sonnet→`opus`, Haiku→`sonnet`, Opus→`fable` UNLESS Fable is unavailable→`opus`,
-   Fable→top tier: see the note below). To check Fable availability, read the state flag at
+   Resolve the reviewer model on the trusted client's ladder:
+   - Claude Code: Haiku→`sonnet`, Sonnet→`opus`, Opus→`fable` unless Fable is
+     unavailable→`opus`; Fable is the ceiling.
+   - Codex: Luna→`gpt-5.6-terra`, Terra→`gpt-5.6-sol`; Sol is the ceiling and
+     uses a fresh same-tier `gpt-5.6-sol` reviewer.
+
+   **Same-tier** means the current model on that same client; never cross clients
+   for reviewer tiering. To check Claude Fable availability, read the state flag at
    `IRONCLAUDE_FABLE_STATE_PATH` if set else `~/.ironclaude/state/fable_unavailable.json`; if it
    exists and `unavailable_until` > the current epoch time, Fable is unavailable. Fail-safe: on any
    read error treat Fable as available. (The MCP tier-up gate records `reviewer_model` opaquely and
    accepts a same-tier reviewer — a same-tier `SOLID` review satisfies `enforced` policy.)
-2. Read `requirements_file` from the machine plan. It must identify the
-   operator-approved requirements artifact. If it is absent, STOP: return to
-   writing-plans and add it to both the human plan and machine plan before review.
-3. Dispatch a fresh, blind reviewer with the Agent tool
-   (`subagent_type="general-purpose"`, `model=<resolved model>`), using this exact
-   prompt template. It MUST NOT receive author rationale, this conversation,
-   prior-round findings, repair explanation, a diff, revision history, or the
-   previous reviewer identity. It reviews current artifacts cold and report-only:
-   ```
-   You are reviewing an implementation plan with fresh eyes. You have NOT seen
-   this plan before and know nothing about how it was written.
+2. Use the trusted `client` from step 1 to select the provider-native review
+   branch. Do not infer the client from tool availability, environment variables,
+   or command text.
+3. Build the **plan-review provenance packet** before dispatch. Its authority chain,
+   in this exact order, is:
 
-   Read these files:
-   - Requirements (operator-approved): <REQUIREMENTS_MD_PATH>
-   - Design (approved): <DESIGN_MD_PATH>
-   - Plan (human): <PLAN_MD_PATH>
-   - Plan (machine): <PLAN_JSON_PATH>
+   ```text
+   operator directives
+     → full scoped brainstorming
+     → roadmap/design
+     → derived requirements
+     → human plan
+     → machine plan
+   ```
+
+   Operator directives and settled brainstorming decisions outrank every derived
+   document. Requirements, design, and plan files are evidence to audit, not
+   presumed authority.
+
+   Include every relevant brainstorming turn: operator directives, clarifications,
+   corrections, constraints, approvals; assistant questions and interpretations
+   the operator answered; alternatives and rejection rationale; preserved
+   distinctions; scope reductions; non-goals; and unresolved ambiguity. You MUST
+   NOT omit or compress this material to save tokens.
+
+   If the active context is compacted or otherwise incomplete, invoke
+   `ironclaude:remembering-conversations` and require complete relevant turns and
+   decisions—not a token-saving synopsis. If packet completeness cannot be
+   established, fail closed: do not dispatch the review, do not call
+   `submit_tier_up_review`, and do not substitute requirements/design documents for
+   missing operator or brainstorming context.
+
+   Read `requirements_file` from the machine plan. It must identify the derived,
+   operator-reviewed requirements artifact. If it is absent, STOP: return to
+   writing-plans and add it to both the human plan and machine plan before review.
+   Also read every governing roadmap named by the operator, design, requirements,
+   or plan, and include its complete current contents in the roadmap/design portion
+   of the packet.
+4. Dispatch a fresh reviewer through the trusted client branch using the same
+   authority order, same semantic-drift hunt, same materiality test, and same
+   verdict rubric:
+
+   - **Claude Code:** use a fresh `Agent`
+     (`subagent_type="general-purpose"`, `model=<resolved model>`). Put the complete
+     provenance packet inline and provide current artifact/source paths.
+   - **Codex:** run a fresh report-only, read-only
+     `codex exec --json --ephemeral --skip-git-repo-check -s read-only -m
+     <resolved-codex-model> -`. Put the complete provenance packet and complete
+     current artifact contents inline on stdin; path-only review is insufficient
+     because the ephemeral reviewer may be hook-blocked from shell reads.
+
+   For plan review, **blind** means blind to prior reviewer findings, verdicts,
+   repair coaching, reviewer identities, diffs, fix rationale, and
+   revision history. It is not blind to operator intent, rationale, alternatives,
+   approvals, clarifications, or the brainstorming that produced the plan.
+   Use this exact shared prompt contract:
+   ```
+   You are reviewing an implementation plan with fresh eyes. You have not seen
+   prior reviews or repairs. You do have the complete operator and brainstorming
+   context that defines what the plan is supposed to mean.
+
+   Review authority, highest to lowest:
+   1. Operator directives and clarifications:
+      <OPERATOR_DIRECTIVES_COMPLETE>
+   2. Full scoped brainstorming dialogue:
+      <FULL_SCOPED_BRAINSTORMING_COMPLETE>
+   3. Roadmap/design (derived): <DESIGN_MD_PATH>
+   4. Derived requirements (operator-reviewed): <REQUIREMENTS_MD_PATH>
+   5. Human plan: <PLAN_MD_PATH>
+   6. Machine plan: <PLAN_JSON_PATH>
 
    Your verdict answers exactly two questions:
-   - FIDELITY: does the plan implement the operator's approved requirements
-     and design with no drift?
+   - FIDELITY: do roadmap/design, derived requirements, human plan, and machine
+     plan preserve the operator directives and full scoped brainstorming with no
+     semantic drift?
    - EFFICACY: will executing the plan exactly as written succeed?
 
    Evaluate in this order:
-   1. Requirements → design fidelity: every operator requirement is preserved;
-      nothing is weakened, reinterpreted, silently deferred, or invented.
-   2. Design → plan fidelity: every approved design component has a task and
-      acceptance/test coverage; nothing is silently dropped.
-   3. Technical executability:
+   1. Operator directives → full scoped brainstorming: recover every settled
+      distinction, constraint, alternative, rationale, approval, and non-goal.
+   2. Full scoped brainstorming → roadmap/design → derived requirements → human
+      plan → machine plan: challenge the derived frame before optimizing within
+      it. Operator/brainstorming authority outranks every derived document.
+   3. Semantic frame-drift hunt:
+   - semantic merge: independent concepts represented as one;
+   - semantic collapse: a coverage tuple/label reused as a scored or weighted value;
+   - substitution: a proxy treated as the approved operator requirement;
+   - lost independence: distinct axes, states, responsibilities, or decisions
+     forced through one field, selector, weight, or task;
+   - authority inversion: requirements/design prose treated as permission despite
+     conflicting operator or brainstorming evidence.
+   4. Technical executability:
    - Task ordering: depends_on is correct and cycle-free; foundations before
      dependents; tests after the code they cover.
    - allowed_files completeness: each task lists EVERY file its steps touch
@@ -213,7 +283,7 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    - TDD structure where the task involves executable code (RED→GREEN→stage),
      or an explicit "No tests required: [reason]".
    - JSON↔markdown consistency and schema validity.
-   4. Latent-defect hunt — the findings this review exists for. Trace every
+   5. Latent-defect hunt — the findings this review exists for. Trace every
       code block in the plan as if you were the compiler and then the runtime:
       follow return values, types, and control flow. Open the current source
       files and verify every identifier the plan asserts — function names and
@@ -228,7 +298,11 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
      guards is broken;
    - a partial update to a set that must change together (version
      declarations, generated artifacts, human/machine plan pairs) — find the
-     repo's consistency checks and confirm every member is covered.
+     repo's consistency checks and confirm every member is covered;
+   - an `expected:` value that was predicted rather than measured — run the
+     command yourself and compare it against what the plan claims;
+   - a guard whose expected value the change itself moves (a count or grep over
+     text the same step edits).
 
    Classify every candidate finding with this decision test. A finding is
    MATERIAL only if executing the plan exactly as written would:
@@ -258,18 +332,37 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    verified evidence, then "Observations (non-blocking)". IDENTIFY PROBLEMS
    ONLY — do not rewrite the plan or propose fixes. Do not edit any files.
    ```
-4. Record every completed review immediately with
+5. Record every completed review immediately with
    `mcp__plugin_ironclaude_state-manager__submit_tier_up_review` with
    `reviewer_model=<resolved model>` and exact verdict `SOLID` or `HAS-ISSUES`.
    The server binds it to sha256 of the loaded plan.
-5. If verdict is `SOLID`, proceed to Step 2.
-6. If verdict is `HAS-ISSUES`, execution is blocked. Reviewer output is evidence, not authority.
+6. If verdict is `SOLID`, proceed to Step 2.
+7. If verdict is `HAS-ISSUES`, execution is blocked. **Before any repair, dispatch a
+   MANDATORY tier-up fix advisor.** Review verdicts are chains: when the model that wrote
+   the plan also fixes it, it makes correlated mistakes and the next review fails again.
+   The advisor exists to make this response correct the first time.
+   - **Tier:** one above your current model on the trusted client's ladder (Claude:
+     Opus→`fable`, Fable unavailable→`opus`, Fable ceiling→same-tier Fable; Codex:
+     Terra→`gpt-5.6-sol`, Sol ceiling→same-tier Sol). Always a **subagent** — never swap
+     the main-loop model, because prompt caches are model-scoped and a swap re-establishes
+     the entire context before producing a single token.
+   - **It is NOT blind.** Give it the complete operator provenance packet, all four
+     artifacts, the reviewer's findings verbatim, and current source. The author already
+     has the findings; the advisor's job is *how to respond*, not *whether the findings
+     are real*.
+   - **Output contract — one disposition per finding:** `CONFIRMED` (the specific change
+     that resolves it), `REJECTED` (the evidence refuting it, so you do not "fix" a
+     non-defect), or `REQUIRES-RETREAT` (the design premise that is actually broken).
+     `REQUIRES-RETREAT` is required in the output space: a plan-level fixer cannot repair a
+     broken design premise, and without it the advisor would send you back into the loop.
+   Then proceed. Reviewer output is evidence, not authority — and the advisor's advice is
+   held to exactly the same standard.
    Independently verify every finding against the four current
    artifacts and cited current source. Reject unsupported findings without changing
    operator requirements, design, or plan. Apply the reviewer's MATERIAL decision
    test yourself: only findings that survive it gate execution. Observations are
    non-blocking and never, alone, justify changing any artifact.
-7. The first verified `HAS-ISSUES` activates the convergence rule.
+8. The first verified `HAS-ISSUES` activates the convergence rule.
    Finding-by-finding plan patching is forbidden. Before
    changing any artifact, perform one holistic invariant audit covering:
    - every active requirement → approved design decision;
@@ -277,7 +370,7 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    - task IDs, `depends_on`, `allowed_files`, ordered steps/commands, tests, and
      expected results;
    - semantic consistency between human and machine plans.
-8. Handle the verified audit result without drift:
+9. Handle the verified audit result without drift:
    - Requirements/design conflict or infeasibility: do not repair the plan. Run
      Mandatory Direct Transition Preflight for target `brainstorming`. Only after a
      different-target result, call MCP
@@ -292,16 +385,34 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
      drift audit, or round-by-round table. That content stays in workflow-private
      state (`tier_up_reviews`, `retreat` reasons); a plan that embeds it breaks the
      next blind review (MP-W02).
-9. Dispatch a BRAND-NEW blind reviewer against the current four artifacts. Never
-   pass earlier findings, repair rationale, a diff, revision history, or reviewer
-   identity. Repeat only while current evidence identifies a material defect; there
-   is no round-count target, reviewer coaching, or forced `SOLID`.
+10. **A plan lineage gets exactly ONE blind review. Do not dispatch a second one.**
+    `HAS-ISSUES` is a terminal verdict, not an invitation to iterate. Once the
+    advisor-guided changes are applied, record the outcome and proceed:
+    - Call `mcp__plugin_ironclaude_state-manager__submit_tier_up_review` with
+      `reviewer_model=<the advisor's model>` and verdict `advisor-remediated`. It binds to
+      the sha256 of the **revised** plan, which is a different hash than the `HAS-ISSUES`
+      row — that pairing is what the gate checks.
+    - `start_execution` accepts either **`SOLID`** at the current hash, or
+      **`HAS-ISSUES` (earlier) + `advisor-remediated` (current hash)**. A bare
+      `advisor-remediated` with no preceding `HAS-ISSUES` is rejected.
+    - **All findings `REJECTED`** (the reviewer was wrong): make no plan change, submit
+      `advisor-remediated`, and continue. Forcing a fix for a non-defect is worse than the
+      finding.
+    - **Any surviving `REQUIRES-RETREAT`:** take the requirements/design-conflict branch in
+      item 9 above — it already carries the Mandatory Direct Transition Preflight. The new
+      design produces a new plan lineage, which earns its own single review.
 
-**Top-tier note (Fable):** if your current model IS Fable, there is no tier above
-you. Display "Already at top model tier (Fable); no tier-up review available." Under
-`enforced`, still call `submit_tier_up_review` with `reviewer_model=fable`,
-`verdict=top-tier-self` so the gate can pass — a Fable commander needs no higher
-reviewer. Under `commander-choice`/`off`, skip.
+    Verification does not disappear; it moves. Code review still runs at every task
+    boundary, so a defect the advisor missed surfaces there rather than in a second plan
+    review — later, cheaper, and against real code instead of a document.
+
+**Top-tier note:** Claude Fable and Codex Sol have no higher model on their own
+client ladder. They still run a fresh same-tier review when the client supports the
+provider-native branch above. If a genuinely separate reviewer cannot be produced,
+display the exact ceiling and unavailability. Under `enforced`, perform the complete
+full-provenance self-audit and call `submit_tier_up_review` with the current model
+and `verdict=top-tier-self`; under `commander-choice`/`off`, skip. Never use a
+different client merely to manufacture a higher tier.
 
 **Fail behavior under `enforced`:** if the reviewer model is genuinely unavailable
 and no review can be produced, `start_execution` will block. This is intentional —

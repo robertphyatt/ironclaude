@@ -3,6 +3,17 @@ from __future__ import annotations
 
 import sqlite3
 
+# Probe failures that self-heal. A later successful observation clears these, and the
+# local probe guard re-runs for them. Everything else (not_configured, unsupported,
+# missing_executable, unsupported_auth_mode, executable_error) stays sticky and needs
+# explicit operator action via `/provider <role> <client>`.
+# Tuple, not set: expanded positionally into SQL bind parameters, so order matters.
+TRANSIENT_UNAVAILABLE_REASONS = (
+    "probe_timeout",
+    "not_authenticated",
+    "executable_probe_failed",
+)
+
 
 class ProviderState:
     def __init__(self, conn: sqlite3.Connection):
@@ -18,10 +29,23 @@ class ProviderState:
     def current_client(self, role: str, default: str) -> str:
         return self.get_current_client(role) or default
 
-    def set_current_client(self, role: str, client: str) -> None:
+    def set_current_client(
+        self,
+        role: str,
+        client: str,
+        reset_capabilities: bool = False,
+    ) -> None:
         if client not in ("claude", "codex"):
             raise ValueError(f"unsupported client: {client}")
         with self._conn:
+            if reset_capabilities:
+                self._conn.execute(
+                    """
+                    DELETE FROM provider_capability_state
+                    WHERE client=? AND role=?
+                    """,
+                    (client, role),
+                )
             self._conn.execute(
                 """
                 INSERT INTO provider_role_state (role, current_client)
@@ -32,6 +56,28 @@ class ProviderState:
                 """,
                 (role, client),
             )
+
+    def unavailable_capabilities(
+        self, client: str, role: str
+    ) -> list[dict[str, str]]:
+        rows = self._conn.execute(
+            """
+            SELECT host, tier, category, reason
+            FROM provider_capability_state
+            WHERE client=? AND role=? AND available=0
+            ORDER BY host, tier
+            """,
+            (client, role),
+        ).fetchall()
+        return [
+            {
+                "host": row[0],
+                "tier": row[1],
+                "category": row[2],
+                "reason": row[3],
+            }
+            for row in rows
+        ]
 
     def is_available(self, host: str, client: str, role: str, tier: str) -> bool:
         row = self._conn.execute(
@@ -48,9 +94,10 @@ class ProviderState:
         installed, authenticated, reason, available,
     ) -> None:
         auth_value = None if authenticated is None else int(authenticated)
+        transient = ",".join("?" for _ in TRANSIENT_UNAVAILABLE_REASONS)
         with self._conn:
             self._conn.execute(
-                """
+                f"""
                 INSERT INTO provider_capability_state
                     (host, client, role, tier, configured, supported, installed,
                      authenticated, available, category, reason, observed_at)
@@ -60,12 +107,21 @@ class ProviderState:
                     supported=excluded.supported,
                     installed=excluded.installed,
                     authenticated=excluded.authenticated,
-                    available=CASE WHEN excluded.available=0
-                        THEN 0 ELSE provider_capability_state.available END,
-                    category=CASE WHEN excluded.available=0
-                        THEN excluded.category ELSE provider_capability_state.category END,
-                    reason=CASE WHEN excluded.available=0
-                        THEN excluded.reason ELSE provider_capability_state.reason END,
+                    available=CASE
+                        WHEN excluded.available=0 THEN 0
+                        WHEN provider_capability_state.reason IN ({transient})
+                            THEN 1
+                        ELSE provider_capability_state.available END,
+                    category=CASE
+                        WHEN excluded.available=0 THEN excluded.category
+                        WHEN provider_capability_state.reason IN ({transient})
+                            THEN NULL
+                        ELSE provider_capability_state.category END,
+                    reason=CASE
+                        WHEN excluded.available=0 THEN excluded.reason
+                        WHEN provider_capability_state.reason IN ({transient})
+                            THEN NULL
+                        ELSE provider_capability_state.reason END,
                     observed_at=datetime('now'),
                     updated_at=datetime('now')
                 """,
@@ -73,6 +129,9 @@ class ProviderState:
                     host, client, role, tier, int(configured), int(supported),
                     int(installed), auth_value, int(available),
                     None if available else "probe_failure", reason,
+                    *TRANSIENT_UNAVAILABLE_REASONS,
+                    *TRANSIENT_UNAVAILABLE_REASONS,
+                    *TRANSIENT_UNAVAILABLE_REASONS,
                 ),
             )
 

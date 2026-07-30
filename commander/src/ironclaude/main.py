@@ -258,20 +258,35 @@ STAGE_STALENESS_MULTIPLIER = {
     "debugging": 0.75,
 }
 
-def select_brain_class():
-    """Choose the Brain implementation.
+def select_brain_class(config: dict, conn: sqlite3.Connection):
+    """Choose and persist the sticky Brain implementation.
 
-    Codex is reachable ONLY via an explicit ``BRAIN_CLIENT=codex`` opt-in. The
-    provider-router route is unavailable: ``provider_config.py`` rejects a role
-    that lists a globally-disabled client, and ``load_config()`` runs that
-    validator unguarded at startup, so adding ``"codex"`` to
-    ``roles.brain.clients`` while ``clients.codex.enabled`` is False would crash
-    the daemon on the stock config.
-
-    Any unrecognised value falls back to Claude — never fail to start over a typo.
-    The env var is read at call time (not import time) so tests can monkeypatch it.
+    A valid persisted operator choice is authoritative. ``BRAIN_CLIENT`` remains
+    a backward-compatible first-start seed independent of provider-role config;
+    after that seed is persisted, stale launch environment cannot override an
+    explicit ``/provider brain`` cutover. With neither, configured preference
+    seeds the same durable state.
     """
-    if os.environ.get("BRAIN_CLIENT", "").strip().lower() == "codex":
+    from ironclaude.provider_state import ProviderState
+
+    state = ProviderState(conn)
+    selected = state.get_current_client("brain")
+    if selected not in ("claude", "codex"):
+        env_selected = os.environ.get("BRAIN_CLIENT", "").strip().lower()
+        preferred = (
+            (config.get("providers") or {})
+            .get("roles", {})
+            .get("brain", {})
+            .get("preferred", "claude")
+        )
+        selected = (
+            env_selected
+            if env_selected in ("claude", "codex")
+            else preferred
+        )
+        state.set_current_client("brain", selected)
+
+    if selected == "codex":
         from ironclaude.codex_brain_client import CodexBrainClient
 
         return CodexBrainClient
@@ -1129,9 +1144,10 @@ class IroncladeDaemon:
     def _handle_provider_command(self, args) -> None:
         """Show or set provider routing.
 
-        A set is REJECTED unless the client is in the role's configured `clients` list and
-        globally enabled — ProviderRouter falls back to `preferred` otherwise, so persisting
-        it would look like it worked and then be silently ignored.
+        Routed-role sets are rejected unless the client is in the role's configured
+        `clients` list and globally enabled — ProviderRouter falls back to `preferred`
+        otherwise. Brain is a direct sticky construction path, so its explicit selection
+        requires only a globally enabled client.
         """
         from ironclaude.provider_config import CLIENT_NAMES, ROLE_NAMES
         from ironclaude.provider_state import ProviderState
@@ -1155,14 +1171,37 @@ class IroncladeDaemon:
                     preferred = cfg.get("preferred", "?")
                     allowed_list = cfg.get("clients", [])
                     allowed = ", ".join(allowed_list) or "-"
-                    # Mirror ProviderRouter.resolve: a sticky client that is no longer in the
-                    # role's clients list is IGNORED and the router falls back to preferred.
-                    # Reporting the raw sticky value here would misstate what is actually routing.
                     sticky = state.get_current_client(name)
-                    effective = sticky if sticky in allowed_list else preferred
+                    # Brain construction treats its persisted choice as authoritative even
+                    # after config drift; other roles retain ProviderRouter semantics.
+                    sticky_is_effective = (
+                        sticky in CLIENT_NAMES
+                        and (name == "brain" or sticky in allowed_list)
+                    )
+                    effective = sticky if sticky_is_effective else preferred
                     note = ""
-                    if sticky and sticky not in allowed_list:
+                    if sticky and not sticky_is_effective:
                         note = f" — stored `{sticky}` is ignored (not in clients)"
+                    if name in ("worker", "grader") and effective in CLIENT_NAMES:
+                        unavailable = state.unavailable_capabilities(effective, name)
+                        if unavailable:
+                            scopes = ", ".join(
+                                f"{item['host']}/{item['tier']}"
+                                for item in unavailable
+                            )
+                            note += (
+                                f" — selected client quarantined at {scopes}; "
+                                "routing may use fallback"
+                            )
+                    if name == "brain":
+                        from ironclaude.codex_brain_client import CodexBrainClient
+                        active = (
+                            "codex"
+                            if isinstance(self.brain, CodexBrainClient)
+                            else "claude"
+                        )
+                        if active != effective:
+                            note += f" — active: *{active}*; restart pending"
                     lines.append(
                         f"• `{name}` — current: *{effective}* (preferred: {preferred}; clients: {allowed}){note}"
                     )
@@ -1182,7 +1221,7 @@ class IroncladeDaemon:
             self.slack.post_message(f"Unknown client `{client}`. Valid clients: {', '.join(CLIENT_NAMES)}.")
             return
         allowed = roles.get(role, {}).get("clients", [])
-        if client not in allowed:
+        if role != "brain" and client not in allowed:
             # NOTE: adding a client to a role's `clients` WITHOUT also enabling it makes
             # provider_config reject the config at startup (load_config validates unguarded),
             # so the guidance must name both edits.
@@ -1199,9 +1238,28 @@ class IroncladeDaemon:
             return
 
         try:
-            ProviderState(self._db).set_current_client(role, client)
+            state = ProviderState(self._db)
+            if role in ("worker", "grader"):
+                state.set_current_client(
+                    role, client, reset_capabilities=True,
+                )
+            else:
+                state.set_current_client(role, client)
         except Exception as e:
             self.slack.post_message(f"Failed to set provider for `{role}`: {e}")
+            return
+        if role == "brain":
+            self.slack.post_message(
+                f"`brain` selected *{client}*. Restarting to activate it."
+            )
+            self.slack.flush_queue()
+            os.kill(os.getpid(), signal.SIGHUP)
+            return
+        if role in ("worker", "grader"):
+            self.slack.post_message(
+                f"`{role}` selected *{client}*. Capabilities will be rechecked "
+                "on next use; existing fallback rules still apply."
+            )
             return
         self.slack.post_message(f"`{role}` now routes to *{client}*.")
 
@@ -2585,7 +2643,9 @@ class IroncladeDaemon:
         now = time.time()
         try:
             rows = self._db.execute(
-                "SELECT id, interpretation FROM directives WHERE status='confirmed'"
+                "SELECT id, interpretation FROM directives d WHERE status='confirmed' "
+                "AND NOT EXISTS (SELECT 1 FROM directive_capability_blocks b "
+                "WHERE b.directive_id=d.id AND b.state='recovered')"
             ).fetchall()
         except sqlite3.OperationalError:
             return
@@ -2638,7 +2698,9 @@ class IroncladeDaemon:
             try:
                 rows = self._db.execute(
                     "SELECT id, status, interpretation FROM directives "
-                    "WHERE status IN ('confirmed', 'in_progress')"
+                    "WHERE status IN ('confirmed', 'in_progress') "
+                    "AND NOT EXISTS (SELECT 1 FROM directive_capability_blocks b "
+                    "WHERE b.directive_id=directives.id AND b.state='recovered')"
                 ).fetchall()
                 unworked_directives = rows
             except Exception:
@@ -2754,10 +2816,149 @@ class IroncladeDaemon:
             return {}
         return {f"d{row[0]}": {"question": (row[1] or "")[:150]} for row in rows}
 
-    def post_heartbeat(self):
+    def _load_directive_capability_blocks(self) -> list[dict]:
+        if self._db is None:
+            return []
+        try:
+            rows = self._db.execute(
+                "SELECT b.*, d.status AS directive_status, d.interpretation "
+                "FROM directive_capability_blocks b "
+                "JOIN directives d ON d.id=b.directive_id "
+                "WHERE (b.state='blocked' AND d.status='blocked') "
+                "OR (b.state='recovered' AND b.recovery_dispatch_state='pending' "
+                "AND d.status='blocked')"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["capabilities"] = json.loads(item["capabilities_json"])
+            result.append(item)
+        return result
+
+    def _process_directive_capability_block(self, block: dict, now: float) -> None:
+        if self._db is None or block["directive_status"] != "blocked":
+            return
+        directive_id = block["directive_id"]
+        generation = block["generation"]
+        if block["state"] == "recovered":
+            delivered = self.brain.send_message(
+                f"[CAPABILITY RECOVERED] Directive #{directive_id} capabilities recovered. "
+                "Run one fresh attention sweep and make one dispatch decision."
+            )
+            if delivered:
+                with self._db:
+                    changed = self._db.execute(
+                        "UPDATE directive_capability_blocks "
+                        "SET recovery_dispatch_state='accepted' "
+                        "WHERE directive_id=? AND generation=? AND state='recovered' "
+                        "AND recovery_dispatch_state='pending' "
+                        "AND EXISTS (SELECT 1 FROM directives d WHERE d.id=? "
+                        "AND d.status='blocked')",
+                        (directive_id, generation, directive_id),
+                    ).rowcount
+                    if changed:
+                        self._db.execute(
+                            "UPDATE directives SET status='confirmed', "
+                            "updated_at=datetime('now') WHERE id=? AND status='blocked'",
+                            (directive_id,),
+                        )
+            return
+
+        if block["notification_state"] == "pending":
+            with self._db:
+                claimed = self._db.execute(
+                    "UPDATE directive_capability_blocks SET notification_state='submitted' "
+                    "WHERE directive_id=? AND generation=? AND state='blocked' "
+                    "AND notification_state='pending' "
+                    "AND EXISTS (SELECT 1 FROM directives d WHERE d.id=? "
+                    "AND d.status='blocked')",
+                    (directive_id, generation, directive_id),
+                ).rowcount
+            if claimed:
+                capabilities = ", ".join(block["capabilities"])
+                self.slack.post_message(
+                    f"*Directive #{directive_id} blocked* — {capabilities} "
+                    f"({block['denial_scope']}): {block['reason']}"
+                )
+
+        heartbeat = max(1, int(self.config.get("heartbeat_interval_seconds", 900)))
+        initial_deadline = block["last_observed_at"] + min(60, heartbeat)
+        if heartbeat < 60 and (
+            block["backoff_seconds"] > heartbeat
+            or block["next_recheck_at"] > initial_deadline
+        ):
+            with self._db:
+                clamped = self._db.execute(
+                    "UPDATE directive_capability_blocks "
+                    "SET next_recheck_at=?, backoff_seconds=? "
+                    "WHERE directive_id=? AND generation=? AND state='blocked' "
+                    "AND next_recheck_at=? AND backoff_seconds=? "
+                    "AND EXISTS (SELECT 1 FROM directives d WHERE d.id=? "
+                    "AND d.status='blocked')",
+                    (
+                        initial_deadline, min(60, heartbeat), directive_id,
+                        generation, block["next_recheck_at"],
+                        block["backoff_seconds"], directive_id,
+                    ),
+                ).rowcount
+            if not clamped:
+                return
+            block["next_recheck_at"] = initial_deadline
+            block["backoff_seconds"] = min(60, heartbeat)
+
+        if now < block["next_recheck_at"]:
+            return
+        current_backoff = min(float(block["backoff_seconds"]), heartbeat)
+        next_backoff = min(current_backoff * 2, heartbeat)
+        next_deadline = now + next_backoff
+        with self._db:
+            claimed = self._db.execute(
+                "UPDATE directive_capability_blocks "
+                "SET next_recheck_at=?, backoff_seconds=? "
+                "WHERE directive_id=? AND generation=? AND state='blocked' "
+                "AND next_recheck_at=? AND backoff_seconds=? "
+                "AND EXISTS (SELECT 1 FROM directives d WHERE d.id=? "
+                "AND d.status='blocked')",
+                (
+                    next_deadline, next_backoff, directive_id, generation,
+                    block["next_recheck_at"], block["backoff_seconds"], directive_id,
+                ),
+            ).rowcount
+        if not claimed:
+            return
+        delivered = self.brain.send_message(
+            f"[CAPABILITY RECHECK] Directive #{directive_id}: perform exactly one "
+            f"non-mutating probe for each capability ({', '.join(block['capabilities'])}) "
+            "in this turn and report one aggregate result through the structured "
+            "capability block/recovery tools. Do not start a monitor."
+        )
+        if not delivered:
+            with self._db:
+                self._db.execute(
+                    "UPDATE directive_capability_blocks "
+                    "SET next_recheck_at=?, backoff_seconds=? "
+                    "WHERE directive_id=? AND generation=? AND state='blocked' "
+                    "AND next_recheck_at=? AND backoff_seconds=? "
+                    "AND EXISTS (SELECT 1 FROM directives d WHERE d.id=? "
+                    "AND d.status='blocked')",
+                    (
+                        block["next_recheck_at"], block["backoff_seconds"],
+                        directive_id, generation, next_deadline, next_backoff,
+                        directive_id,
+                    ),
+                )
+
+    def check_directive_capability_blocks(self, now: float | None = None) -> None:
+        observed_at = time.time() if now is None else now
+        for block in self._load_directive_capability_blocks():
+            self._process_directive_capability_block(block, observed_at)
+
+    def post_heartbeat(self, now: float | None = None):
         """Post heartbeat to Slack at configured interval."""
         heartbeat_interval = self.config.get("heartbeat_interval_seconds", 900)
-        now = time.time()
+        now = time.time() if now is None else now
         if now - self._last_heartbeat < heartbeat_interval:
             return
         self._last_heartbeat = now
@@ -2778,6 +2979,10 @@ class IroncladeDaemon:
             })
 
         brain_usage = self.brain.get_token_usage() if self.brain is not None else None
+        blocked_directives = [
+            block for block in self._load_directive_capability_blocks()
+            if block["state"] == "blocked"
+        ]
         self._prune_operator_waits(now)
         operator_name = self.config.get("operator_name", "Operator")
         # Deterministic signal is merged LAST so it wins over a same-id `_operator_waits`
@@ -2792,6 +2997,7 @@ class IroncladeDaemon:
                 waits=merged_waits,
                 operator_name=operator_name,
                 ollama_degraded=bool(ollama_degraded_urls()),
+                blocked_directives=blocked_directives,
             )
         )
 
@@ -2799,7 +3005,10 @@ class IroncladeDaemon:
         if not worker_details and self._db is not None:
             try:
                 unworked = self._db.execute(
-                    "SELECT count(*) FROM directives WHERE status IN ('confirmed', 'in_progress')"
+                    "SELECT count(*) FROM directives d "
+                    "WHERE status IN ('confirmed', 'in_progress') "
+                    "AND NOT EXISTS (SELECT 1 FROM directive_capability_blocks b "
+                    "WHERE b.directive_id=d.id AND b.state='recovered')"
                 ).fetchone()[0]
                 if unworked > 0:
                     self.brain.send_message(
@@ -2865,6 +3074,7 @@ class IroncladeDaemon:
                 self.check_brain()
                 self.process_brain_decisions()
                 self.check_workers()
+                self.check_directive_capability_blocks()
                 self.check_confirmed_directives()
                 self.check_idle_enforcement()
                 self.check_post_kill_sweep()
@@ -3023,7 +3233,7 @@ def main():
     tmux = TmuxManager(log_dir=config.get("log_dir", "/tmp/ic-logs"), ssh_manager=ssh_manager)
     registry = WorkerRegistry(conn)
     _kill_orphan_workers(tmux, registry)
-    brain = select_brain_class()(
+    brain = select_brain_class(config, conn)(
         timeout_seconds=config.get("brain_timeout_seconds", 600),
         operator_name=config.get("operator_name", "Operator"),
         model=config.get("brain_model", "opus"),

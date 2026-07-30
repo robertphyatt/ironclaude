@@ -1,10 +1,33 @@
 # tests/test_worker_claude_md_template.py
-"""Tests for the worker CLAUDE.md template file."""
+"""Tests for provider-native worker instruction templates."""
 
+import re
 from pathlib import Path
 
 
 TEMPLATE_PATH = Path(__file__).parent.parent / "src" / "ironclaude" / "templates" / "worker_claude_md.md"
+AGENTS_TEMPLATE_PATH = Path(__file__).parent.parent / "src" / "ironclaude" / "templates" / "worker_agents.md"
+ACTIVATION_SKILL_PATH = (
+    Path(__file__).parents[2]
+    / "worker"
+    / "skills"
+    / "activate-professional-mode"
+    / "SKILL.md"
+)
+
+
+def _markdown_fence_after(content: str, marker: str) -> str:
+    remainder = content.split(marker, 1)[1]
+    return remainder.split("```markdown\n", 1)[1].split("\n```", 1)[0] + "\n"
+
+
+def _concept_headings(content: str) -> list[str]:
+    headings = re.findall(r"^\d+\. \*\*(.+?)\*\*", content, re.MULTILINE)
+    return [
+        "Advisor Fallback" if heading.startswith("Advisor Fallback") else
+        "Boy Scout Rule" if heading.startswith("Boy Scout Rule") else heading
+        for heading in headings
+    ]
 
 
 class TestWorkerClaudeMdTemplate:
@@ -17,9 +40,36 @@ class TestWorkerClaudeMdTemplate:
         content = TEMPLATE_PATH.read_text()
         assert "WORKFLOW REQUIREMENT" in content
 
-    def test_template_contains_all_twelve_directives(self):
-        """Template must contain all 12 numbered behavioral directives."""
-        content = TEMPLATE_PATH.read_text()
+    def test_claude_worker_template_matches_activation_canonical_contract(self):
+        """Packaged CLAUDE.md composes canonical workflow + full Claude rules."""
+        activation = ACTIVATION_SKILL_PATH.read_text()
+        compact = _markdown_fence_after(
+            activation, "If `CLAUDE.md` is absent in `update` mode"
+        )
+        rules = _markdown_fence_after(
+            activation, "create it with the\nfull canonical template"
+        )
+        workflow = compact.split("\n\n", 1)[0]
+        assert TEMPLATE_PATH.read_text() == f"{workflow}\n\n{rules}"
+
+    def test_codex_worker_template_matches_activation_canonical_contract(self):
+        """Packaged AGENTS.md is the exact canonical Codex template."""
+        activation = ACTIVATION_SKILL_PATH.read_text()
+        canonical = _markdown_fence_after(
+            activation,
+            "When root `AGENTS.md` is absent, create it with this canonical template",
+        )
+        assert AGENTS_TEMPLATE_PATH.read_text() == canonical
+
+    def test_worker_templates_have_semantic_concept_parity(self):
+        """Both provider templates carry one workflow and the same 11 concepts."""
+        claude = TEMPLATE_PATH.read_text()
+        codex = AGENTS_TEMPLATE_PATH.read_text()
+        workflow = (
+            "> **WORKFLOW REQUIREMENT (when professional mode is active):**"
+        )
+        assert claude.count(workflow) == 1
+        assert codex.count(workflow) == 1
         expected = [
             "Challenge Assumptions",
             "Verify with Evidence",
@@ -29,10 +79,13 @@ class TestWorkerClaudeMdTemplate:
             "Search Before Guessing",
             "Subagent Discipline",
             "No Sycophantic Responses",
-            "Handle Large Files with Decomposition",
-            "Compressed Output",
-            "Right-Size Every Subagent",
+            "Advisor Fallback",
+            "No Workflow Avoidance Under Stage/Context Restrictions",
             "Boy Scout Rule",
         ]
-        for directive in expected:
-            assert directive in content, f"Missing directive: {directive}"
+        assert _concept_headings(claude) == expected
+        assert _concept_headings(codex) == expected
+        assert "`Agent` tool (`model=fable`" in claude
+        assert "`model=opus`" in claude
+        assert "`codex exec -m <one-tier-up-model>`" in codex
+        assert "`luna → terra → sol`" in codex

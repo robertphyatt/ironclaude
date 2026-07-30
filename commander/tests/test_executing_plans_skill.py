@@ -36,8 +36,9 @@ def test_executing_plans_tier_up_is_blind_and_policy_aware():
         "tier-up review lost the on-disk Fable-availability check"
 
 
-def test_blind_review_receives_original_requirements_and_no_revision_context():
+def test_plan_review_receives_derived_artifacts_and_no_revision_context():
     text = _read()
+    lower = text.lower()
     for artifact in (
         "<REQUIREMENTS_MD_PATH>",
         "<DESIGN_MD_PATH>",
@@ -45,21 +46,91 @@ def test_blind_review_receives_original_requirements_and_no_revision_context():
         "<PLAN_JSON_PATH>",
     ):
         assert artifact in text, f"blind review packet lost {artifact}"
-    assert "operator-approved requirements" in text.lower()
+    assert "derived requirements" in lower
     for forbidden in (
-        "author rationale",
-        "prior-round findings",
-        "repair explanation",
+        "prior reviewer findings",
+        "repair coaching",
         "revision history",
-        "previous reviewer",
+        "reviewer identities",
     ):
-        assert forbidden in text.lower(), f"blindness rule lost '{forbidden}'"
+        assert forbidden in lower, f"blindness rule lost '{forbidden}'"
+
+
+def test_plan_review_receives_full_brainstorming_authority_chain():
+    text = _read().lower()
+    normalized = " ".join(text.split())
+    markers = (
+        "operator directives",
+        "full scoped brainstorming",
+        "roadmap/design",
+        "derived requirements",
+        "human plan",
+        "machine plan",
+    )
+    positions = [text.index(marker) for marker in markers]
+    assert positions == sorted(positions), "plan-review authority chain is out of order"
+    assert "operator directives" in text
+    assert "settled brainstorming decisions outrank every derived" in text
+    assert "must not omit or compress" in normalized
+    assert "save tokens" in normalized
+
+
+def test_plan_review_blindness_keeps_intent_but_excludes_review_history():
+    text = _read().lower()
+    assert "blind to prior reviewer findings" in text
+    assert "not blind to operator intent" in text
+    for included in ("rationale", "alternatives", "approvals", "clarifications"):
+        assert included in text
+    for excluded in (
+        "prior reviewer findings",
+        "verdicts",
+        "repair coaching",
+        "reviewer identities",
+        "revision history",
+    ):
+        assert excluded in text
+
+
+def test_plan_review_recovers_compacted_context_and_fails_closed():
+    text = _read().lower()
+    assert "ironclaude:remembering-conversations" in text
+    assert "compacted" in text
+    assert "complete relevant turns" in text
+    assert "token-saving synopsis" in text
+    assert "fail closed" in text
+    assert "do not substitute" in text
+
+
+def test_plan_review_dispatch_is_provider_native_with_shared_contract():
+    text = _read()
+    normalized = " ".join(text.split())
+    assert "get_professional_mode" in text
+    assert "Claude Code" in text and "`Agent`" in text
+    assert "Codex" in text and "`codex exec" in text
+    assert "complete current artifact contents inline" in normalized
+    assert "same authority order" in normalized
+    assert "same materiality" in normalized
+
+
+def test_plan_review_hunts_semantic_frame_drift_before_executability():
+    text = _read().lower()
+    frame = text.index("challenge the derived frame")
+    technical = text.index("technical executability")
+    assert frame < technical
+    for archetype in (
+        "semantic merge",
+        "semantic collapse",
+        "substitution",
+        "lost independence",
+        "authority inversion",
+    ):
+        assert archetype in text
 
 
 def test_review_order_and_finding_verification_preserve_operator_guidance():
     text = _read().lower()
-    req_design = text.index("requirements → design")
-    design_plan = text.index("design → plan")
+    req_design = text.index("roadmap/design → derived requirements")
+    design_plan = text.index("derived requirements → human")
     technical = text.index("technical executability")
     assert req_design < design_plan < technical
     assert "reviewer output is evidence, not authority" in text
@@ -75,7 +146,12 @@ def test_first_failure_forces_holistic_audit_not_patch_churn():
     assert "finding-by-finding" in lower and "forbidden" in lower
     assert "requirements/design" in lower and "retreat" in lower
     assert "plan-only" in lower and "regenerate" in lower
-    assert "brand-new blind reviewer" in lower
+    # One review per plan lineage: a HAS-ISSUES verdict now dispatches a mandatory
+    # tier-up advisor instead of a second blind review.
+    assert "mandatory tier-up fix advisor" in lower
+    assert "advisor-remediated" in lower
+    assert "exactly one blind review" in lower
+    assert "brand-new blind reviewer" not in lower
     assert "Revise / Proceed / Abort" not in text
     assert "After 3 rounds" not in text
 
@@ -160,3 +236,16 @@ def test_roadmap_names_wave_1r_and_removes_unconditional_new_task_boundary():
 def test_executing_plans_regeneration_carries_no_review_history():
     text = _read().lower()
     assert "carries no prior-review content forward" in text
+
+
+def test_reviewer_archetypes_cover_verification_quality():
+    """The detector half of the verification-quality rules.
+
+    An author-side invariant only warns; a reviewer archetype detects, and the reviewer
+    has source access. Neither an unmeasured `expected:` nor a guard the change itself
+    moves was covered by the original five archetypes.
+    """
+    text = _read()
+    for marker in ("predicted rather than measured",
+                   "the change itself moves"):
+        assert marker in text, marker

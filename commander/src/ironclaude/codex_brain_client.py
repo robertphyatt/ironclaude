@@ -28,8 +28,11 @@ import logging
 import os
 import queue
 import subprocess
+import sys
 import threading
 import time
+import uuid
+from pathlib import Path
 
 from ironclaude.config import DEFAULTS
 
@@ -45,6 +48,11 @@ _CODEX_TIER_MODELS = DEFAULTS["providers"]["clients"]["codex"]["models"]
 # marker is scoped to its spawn — mutating the daemon's own environment would leak
 # IC_ROLE=brain into later worker spawns, which must be IC_ROLE=worker.
 _BRAIN_ROLE_ENV = {"IC_ROLE": "brain"}
+_BRAIN_GATE_ROOT = Path("/tmp/ic/codex-brain-gate")
+
+# Optional Brain MCP servers. Claude registers these when their files are present
+# (brain_client.py:279-286); codex reaches them only through -c overrides.
+_OPTIONAL_MCP_SERVERS = ("research", "ollama")
 
 # NOTE: `BrainClient.discover_episodic_memory_path` is deliberately NOT ported.
 # It resolves a path inside the Claude Code plugin cache
@@ -65,6 +73,19 @@ _MESSAGE_BUFFER_CAP = 1000
 # Bounded wait for the turn/start response so a rejected turn is detected without materially
 # blocking a working Brain (a JSON-RPC error arrives in ms; a success ack returns fast).
 _TURN_START_ACK_TIMEOUT = 1.0
+
+_ORCHESTRATOR_REQUIRED_TOOLS = frozenset({
+    "wiki_query",
+    "get_operator_messages",
+    "update_ledger",
+    "spawn_worker",
+    "spawn_workers",
+    "approve_plan",
+    "reject_plan",
+    "send_to_worker",
+    "kill_worker",
+})
+_ORCHESTRATOR_STARTUP_TIMEOUT = 120.0
 
 
 # Ported byte-for-byte from brain_client._tool_guard_logic (:357-374) + GIT_ALLOWED_COMMANDS
@@ -135,6 +156,7 @@ class CodexBrainClient:
         # side-effect free; all subprocess work happens in `start()`.
         self._system_prompt: str | None = None
         self._cwd: str | None = None
+        self._brain_gate_session = uuid.uuid4().hex
         self._next_id = 1
         self._id_lock = threading.Lock()
         self._write_lock = threading.Lock()
@@ -151,6 +173,8 @@ class CodexBrainClient:
         # Hang detection: a turn is "in flight" when _last_message_time > _last_response_time.
         self._last_message_time = 0.0
         self._last_response_time = 0.0
+        self._mcp_status_condition = threading.Condition()
+        self._mcp_startup_status: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Protocol seams
@@ -178,8 +202,94 @@ class CodexBrainClient:
             "-c", 'sandbox_mode="read-only"',
             "-c", 'approval_policy="on-request"',
             "-c", f'model="{self._resolve_model()}"',
+            "-c", f'model_reasoning_effort="{self._effort_level}"',
+            *self._orchestrator_mcp_overrides(),
+            *self._optional_mcp_overrides(),
             "--stdio",
         ]
+
+    def _orchestrator_source_path(self) -> Path:
+        return Path(__file__).parent / "orchestrator_mcp.py"
+
+    def _commander_root(self) -> Path:
+        return Path(__file__).parents[2]
+
+    def _orchestrator_mcp_overrides(self) -> list[str]:
+        source = self._orchestrator_source_path()
+        commander_root = self._commander_root()
+        database = commander_root / "data" / "db" / "ironclaude.db"
+        machines = Path(__file__).parents[3] / "config" / "machines.yaml"
+        values = [
+            f"mcp_servers.orchestrator.command={json.dumps(sys.executable)}",
+            "mcp_servers.orchestrator.args="
+            + json.dumps([str(source), str(database)], separators=(",", ":")),
+            f"mcp_servers.orchestrator.cwd={json.dumps(str(commander_root))}",
+            "mcp_servers.orchestrator.enabled=true",
+            'mcp_servers.orchestrator.default_tools_approval_mode="approve"',
+            "mcp_servers.orchestrator.startup_timeout_sec=120",
+            'mcp_servers.orchestrator.env_vars=["SUPABASE_URL","SUPABASE_ANON_KEY"]',
+            "mcp_servers.orchestrator.env.IC_BRAIN_CWD="
+            + json.dumps(self._cwd or ""),
+            "mcp_servers.orchestrator.env.IC_MACHINES_CONFIG="
+            + json.dumps(str(machines)),
+        ]
+        return [part for value in values for part in ("-c", value)]
+
+    def _optional_mcp_source_path(self, name: str) -> Path:
+        return Path(__file__).parent / f"{name}_mcp.py"
+
+    def _optional_mcp_overrides(self) -> list[str]:
+        """``-c`` pairs for the optional Brain MCP servers, mirroring the Claude path.
+
+        Existence-guarded like brain_client.py:280-286, so a trimmed install degrades the
+        same way on both clients. Deliberately NO default_tools_approval_mode: cloning the
+        orchestrator arm would auto-approve ollama's pull/remove/create_model, which are the
+        tools codex-brain-gated-actions.sh:63-65 exists to gate.
+        """
+        values: list[str] = []
+        for name in _OPTIONAL_MCP_SERVERS:
+            source = self._optional_mcp_source_path(name)
+            if not source.exists():
+                continue
+            values.extend([
+                f"mcp_servers.{name}.command={json.dumps(sys.executable)}",
+                f"mcp_servers.{name}.args="
+                + json.dumps([str(source)], separators=(",", ":")),
+                f"mcp_servers.{name}.enabled=true",
+            ])
+        return [part for value in values for part in ("-c", value)]
+
+    def _fail_start(self, reason: str) -> None:
+        self._running = False
+        self._restart_reason = reason
+        logger.error(reason)
+        self._responses.put(f"[CODEX BRAIN ERROR] {reason}")
+        self.shutdown()
+
+    def _preflight_orchestrator(self) -> str | None:
+        source = self._orchestrator_source_path()
+        if not source.is_file():
+            return f"orchestrator MCP source missing: {source}"
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", "import ironclaude.orchestrator_mcp"],
+                cwd=str(self._commander_root()),
+                env=self._spawn_env(),
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"orchestrator MCP import preflight failed: {exc}"
+        if result.returncode != 0:
+            detail = (
+                result.stderr.strip()
+                or result.stdout.strip()
+                or f"exit {result.returncode}"
+            )
+            return f"orchestrator MCP import preflight failed: {detail}"
+        return None
 
     def _extract_thread_id(self, result: dict) -> str | None:
         """The thread id from a thread/start response. The real shape nests it under
@@ -204,6 +314,20 @@ class CodexBrainClient:
         params = msg.get("params") or {}
         if not isinstance(params, dict):
             params = {}
+
+        if method == "mcpServer/startupStatus/updated":
+            name = params.get("name")
+            status = params.get("status")
+            if isinstance(name, str) and isinstance(status, str):
+                with self._mcp_status_condition:
+                    self._mcp_startup_status[name] = {
+                        "threadId": params.get("threadId"),
+                        "status": status,
+                        "error": params.get("error"),
+                        "failureReason": params.get("failureReason"),
+                    }
+                    self._mcp_status_condition.notify_all()
+            return
 
         if method == "item/completed":
             self._last_response_time = time.time()
@@ -457,6 +581,125 @@ class CodexBrainClient:
             time.sleep(0.02)
         return None
 
+    def _await_orchestrator_ready(self, timeout: float) -> str | None:
+        thread_id = self._thread_id
+        if not thread_id:
+            return "orchestrator MCP startup missing thread id"
+        deadline = time.time() + timeout
+        with self._mcp_status_condition:
+            while True:
+                state = self._mcp_startup_status.get("orchestrator")
+                if state is not None and state.get("threadId") == thread_id:
+                    status = state.get("status")
+                    if status == "ready":
+                        return None
+                    if status in ("failed", "cancelled"):
+                        detail = (
+                            state.get("error")
+                            or state.get("failureReason")
+                            or "no detail"
+                        )
+                        return f"orchestrator MCP startup {status}: {detail}"
+                if self._proc is not None and self._proc.poll() is not None:
+                    return "orchestrator MCP startup failed: app-server exited"
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return "orchestrator MCP startup timed out waiting for ready"
+                self._mcp_status_condition.wait(timeout=min(remaining, 0.1))
+
+    def _list_mcp_server_inventory(
+        self,
+    ) -> tuple[dict[str, dict] | None, str | None]:
+        thread_id = self._thread_id
+        if not thread_id:
+            return None, "orchestrator MCP inventory missing thread id"
+        inventory: dict[str, dict] = {}
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+
+        while True:
+            request_id = self._alloc_id()
+            params: dict = {"detail": "full", "threadId": thread_id}
+            if cursor is not None:
+                params["cursor"] = cursor
+            if not self._write({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "mcpServerStatus/list",
+                "params": params,
+            }):
+                return None, "orchestrator MCP inventory write failed"
+
+            response = self._await_response(
+                request_id, timeout=_ORCHESTRATOR_STARTUP_TIMEOUT
+            )
+            if response is None:
+                return None, "orchestrator MCP inventory timed out"
+            error = response.get("error")
+            if error:
+                if isinstance(error, dict):
+                    detail = error.get("message") or json.dumps(error, sort_keys=True)
+                else:
+                    detail = str(error)
+                return None, f"orchestrator MCP inventory failed: {detail}"
+
+            result = response.get("result")
+            if not isinstance(result, dict):
+                return None, "orchestrator MCP inventory response malformed: result"
+            data = result.get("data")
+            if not isinstance(data, list):
+                return None, "orchestrator MCP inventory response malformed: data"
+
+            for server in data:
+                if not isinstance(server, dict):
+                    return None, "orchestrator MCP inventory response malformed: server"
+                name = server.get("name")
+                tools = server.get("tools")
+                if not isinstance(name, str) or not isinstance(tools, dict):
+                    return None, "orchestrator MCP inventory response malformed: server fields"
+                if name in inventory:
+                    return None, f"orchestrator MCP inventory duplicated server: {name}"
+                inventory[name] = server
+
+            next_cursor = result.get("nextCursor")
+            if next_cursor is None:
+                return inventory, None
+            if not isinstance(next_cursor, str) or not next_cursor:
+                return None, "orchestrator MCP inventory response malformed: nextCursor"
+            if next_cursor in seen_cursors:
+                return None, "orchestrator MCP inventory repeated cursor"
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+    def _verify_orchestrator_mcp(self) -> str | None:
+        ready_error = self._await_orchestrator_ready(
+            timeout=_ORCHESTRATOR_STARTUP_TIMEOUT
+        )
+        if ready_error is not None:
+            return ready_error
+
+        inventory, inventory_error = self._list_mcp_server_inventory()
+        if inventory_error is not None:
+            return inventory_error
+        if inventory is None or "orchestrator" not in inventory:
+            return "orchestrator MCP inventory missing server"
+        tools = inventory["orchestrator"].get("tools")
+        if not isinstance(tools, dict):
+            return "orchestrator MCP inventory malformed tools"
+        missing = sorted(_ORCHESTRATOR_REQUIRED_TOOLS - set(tools))
+        if missing:
+            return f"orchestrator MCP inventory missing tools: {', '.join(missing)}"
+        # Parity with Claude Brain, which refuses to start when episodic-memory cannot be
+        # found (brain_client.discover_episodic_memory_path raises FileNotFoundError).
+        # Claude's mandate is EXISTENCE ONLY — it never inspects which tools the server
+        # exposes and never awaits a readiness notification — so this must not either, or
+        # Codex becomes stricter than Claude, which is not parity. Codex loads
+        # installed-plugin MCP servers implicitly (probe-verified 2026-07-28), so presence
+        # in the inventory is the equivalent evidence to Claude's path glob.
+        if "episodic-memory" not in inventory:
+            return "episodic-memory MCP inventory missing server"
+        return None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -466,7 +709,23 @@ class CodexBrainClient:
         `env=` REPLACES inheritance, so the ambient environment is copied forward
         explicitly; without the copy the app-server would lose auth/PATH/config.
         """
-        return {**os.environ, **_BRAIN_ROLE_ENV}
+        return {
+            **os.environ,
+            **_BRAIN_ROLE_ENV,
+            "IRONCLAUDE_CLIENT": "codex",
+            "IRONCLAUDE_BRAIN_GATE_SESSION": self._brain_gate_session,
+        }
+
+    def _reset_brain_gate_startup_state(self) -> None:
+        """Reset startup-only gates while retaining same-client memory/wiki arms."""
+        state_dir = _BRAIN_GATE_ROOT / self._brain_gate_session
+        for marker in ("lookback-slack", "lookback-ledger"):
+            try:
+                (state_dir / marker).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning("Failed to reset Codex Brain gate marker %s: %s", marker, exc)
 
     def start(self, system_prompt: str, cwd: str | None = None) -> None:
         """Spawn the app-server and open a thread. Never raises — records a reason."""
@@ -474,6 +733,14 @@ class CodexBrainClient:
         self._cwd = cwd
         self._stop_event.clear()
         self._restart_reason = ""
+        self._reset_brain_gate_startup_state()
+        with self._mcp_status_condition:
+            self._mcp_startup_status.clear()
+
+        preflight_error = self._preflight_orchestrator()
+        if preflight_error is not None:
+            self._fail_start(preflight_error)
+            return
 
         try:
             self._proc = subprocess.Popen(
@@ -488,9 +755,7 @@ class CodexBrainClient:
             )
         except (OSError, ValueError) as exc:
             self._proc = None
-            self._running = False
-            self._restart_reason = f"spawn failed: {exc}"
-            logger.error(f"Failed to spawn codex app-server: {exc}")
+            self._fail_start(f"spawn failed: {exc}")
             return
 
         self._brain_pid = self._proc.pid
@@ -515,11 +780,8 @@ class CodexBrainClient:
         })
         init_response = self._await_response(init_id, timeout=30.0)
         if init_response is None or init_response.get("error"):
-            self._running = False
             detail = (init_response or {}).get("error") if init_response else "timeout"
-            self._restart_reason = f"initialize failed: {detail}"
-            logger.error(f"codex app-server initialize failed: {detail}")
-            self.shutdown()
+            self._fail_start(f"initialize failed: {detail}")
             return
 
         self._write({"jsonrpc": "2.0", "method": "initialized", "params": {}})
@@ -533,30 +795,30 @@ class CodexBrainClient:
         })
         thread_response = self._await_response(thread_id_req, timeout=60.0)
         if thread_response is None or thread_response.get("error"):
-            self._running = False
             detail = (thread_response or {}).get("error") if thread_response else "timeout"
             # Loud on purpose: the #1 cause is a missing/incorrect threadSource,
             # and retrying WITHOUT it produces a Brain whose every MCP call fails.
-            self._restart_reason = (
+            self._fail_start(
                 f"thread/start failed with threadSource={self.THREAD_SOURCE!r}: {detail}. "
                 "NOT retrying without threadSource — omitting it makes every MCP call "
                 "fail with 'Missing or invalid Codex thread_source'."
             )
-            logger.error(self._restart_reason)
-            self.shutdown()
             return
 
         result = thread_response.get("result") or {}
         self._thread_id = self._extract_thread_id(result)
         if not self._thread_id:
-            self._running = False
-            self._restart_reason = (
+            self._fail_start(
                 "thread/start returned no thread id (expected result['thread']['id']); "
                 "without it every turn/start fails with -32600."
             )
-            logger.error(self._restart_reason)
-            self.shutdown()
             return
+
+        orchestrator_error = self._verify_orchestrator_mcp()
+        if orchestrator_error is not None:
+            self._fail_start(orchestrator_error)
+            return
+
         self._running = True
         self._last_activity = time.time()
 

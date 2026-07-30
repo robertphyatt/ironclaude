@@ -585,6 +585,11 @@ def test_directive_status_emoji_confirmed_is_thumbsup():
     assert DIRECTIVE_STATUS_EMOJI["confirmed"] == "thumbsup"
 
 
+def test_blocked_directive_status_has_emoji():
+    from ironclaude.slack_interface import DIRECTIVE_STATUS_EMOJI
+    assert DIRECTIVE_STATUS_EMOJI["blocked"] == "no_entry"
+
+
 class TestAuditCommand:
     def test_audit_command_uppercase(self):
         cmd = parse_inbound_command("AUDIT")

@@ -19,7 +19,34 @@ class TestInitDb:
         assert "workers" in tables
         assert "provider_role_state" in tables
         assert "provider_capability_state" in tables
+        assert "directive_capability_blocks" in tables
         conn.close()
+
+    def test_directive_capability_block_survives_reopen(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        conn = init_db(db_path)
+        conn.execute(
+            "INSERT INTO directives (source_ts, source_text, interpretation, status) "
+            "VALUES ('1', 'x', 'x', 'blocked')"
+        )
+        directive_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "INSERT INTO directive_capability_blocks "
+            "(directive_id, capabilities_json, denial_scope, target, reason, "
+            "fingerprint, state, first_observed_at, last_observed_at, "
+            "next_recheck_at, backoff_seconds, generation) "
+            "VALUES (?, '[\"workspace_write\"]', 'codex_sandbox', '/repo', "
+            "'denied', 'fp', 'blocked', 1, 1, 61, 60, 1)",
+            (directive_id,),
+        )
+        conn.commit()
+        conn.close()
+        reopened = init_db(db_path)
+        row = reopened.execute(
+            "SELECT capabilities_json, generation FROM directive_capability_blocks "
+            "WHERE directive_id=?", (directive_id,)
+        ).fetchone()
+        assert tuple(row) == ('["workspace_write"]', 1)
 
     def test_wal_mode_enabled(self, tmp_path):
         db_path = str(tmp_path / "test.db")

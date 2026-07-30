@@ -117,8 +117,15 @@ Read the design document completely to understand:
 Identify the operator-approved requirements artifact used to approve the design.
 If none exists, STOP and return to brainstorming to document and approve the
 requirements. Record this path as `requirements_file` in the human plan and machine
-plan; a professional blind review must evaluate original requirements, not only the
-author's design interpretation.
+plan.
+
+Operator directives and full brainstorming are original authority. The
+`requirements_file` is a derived, operator-reviewed contract—not a substitute for
+the dialogue that produced it. The later plan reviewer must audit this derived
+contract against the complete scoped operator/brainstorming provenance before using
+it to judge design or plan fidelity. If those sources conflict, operator statements
+and settled brainstorming decisions win; do not silently repair the conflict while
+writing the plan.
 
 ### Step 1.6: Ground every plan fact in live source (REQUIRED)
 
@@ -174,6 +181,20 @@ the blind reviewer can check the commands against a declared standard:
 - **Evidence outlives cleanup.** Author the deliverable BEFORE deleting what it quotes;
   give each run its own log so a later run cannot clobber an earlier one's evidence.
 - **Enumerate; never hard-code the answer a discovery step is meant to find.**
+- **Never author an `expected:` you have not measured.** If a step's expected output is a
+  count, a line number, a set of names, or a pass/fail state, run the command while
+  planning and paste its actual output. A predicted expectation makes the guard a coin
+  flip: it fails against a correct implementation, or passes against a broken one.
+- **Prove every verification can fail.** Name the broken state each check exists to catch,
+  and confirm the check would NOT hold in that state. A check that holds against the
+  ambient environment, against the default value, or against a hardcoded constant verifies
+  nothing — prefer a non-default value and an equality that fails on any deviation.
+- **A step's own edits must not perturb its own measurement.** If the change adds or
+  removes text that a guard counts or greps for, the expected value moves with the change;
+  anchor the guard on a form the change does not touch.
+- **A presence guard must assert marker strings in the EXACT case and spacing they are
+  written in.** Python `in` is case-sensitive; a marker copied from memory rather than
+  character-for-character turns green when the edit lands and red at the task boundary.
 
 ### Phase 2: Break Down Into Tasks
 
@@ -337,11 +358,14 @@ Stage the JSON file alongside the markdown:
 git add docs/plans/YYYY-MM-DD-<feature-name>.plan.json
 ```
 
-**Step 5.6: Requirements → design → plan parity audit**
+**Step 5.6: Operator → brainstorming → requirements/design → plan parity audit**
 
 Before calling `mark_plan_ready`, audit the complete plan as one coherent candidate.
-Verify the human and machine plans express the same:
-- operator requirements and design coverage;
+Start from the active operator directives and full scoped brainstorming; do not
+start from the derived requirements document. Verify the complete authority chain:
+operator directives → full brainstorming → requirements/design → human plan →
+machine plan. Then verify the human and machine plans express the same:
+- operator/brainstorming decisions and derived requirements/design coverage;
 - task IDs and `depends_on` relationships;
 - exact `allowed_files` lists;
 - ordered steps and commands;
@@ -457,4 +481,4 @@ Invoke executing-plans skill:
 - **TDD cycle**: Write test → run to fail → implement → run to pass → stage
 - **Professional mode aware**: All steps use "git add" to stage, never commit
 - **Explicit skill invocation**: Use Skill tool for executing-plans
-- **No review history in plan artifacts**: A plan (human or machine) MUST NOT contain prior-review findings, verdicts, fix rationale, reviewer-drift audits, or round-by-round obligation tables. Because the human plan is a mandatory blind-reviewer input, any such content reaches the reviewer and breaks blind review (MP-W02, MP-R07). This content already has durable homes — `tier_up_reviews` rows, `retreat` reasons, and workflow-private session state. Never record it in the plan.
+- **No review history in plan artifacts**: A plan (human or machine) MUST NOT contain prior-review findings, verdicts, fix rationale, reviewer-drift audits, or round-by-round obligation tables. Because the human plan is a mandatory plan-review input, any such content anchors the fresh reviewer and breaks review-history blindness (MP-W02, MP-R07). Full scoped operator/brainstorming provenance is supplied separately at review dispatch; it is not review history. Prior review content already has durable homes — `tier_up_reviews` rows, `retreat` reasons, and workflow-private session state. Never record it in the plan.

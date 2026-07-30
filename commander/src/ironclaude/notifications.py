@@ -100,15 +100,25 @@ def format_heartbeat(
     commander_waits: dict | None = None,
     operator_name: str = "Operator",
     ollama_degraded: bool = False,
+    blocked_directives: list[dict] | None = None,
 ) -> str:
     waits = waits or {}
     commander_waits = commander_waits or {}
-    if not workers and not waits and not commander_waits:
+    blocked_directives = blocked_directives or []
+    if not workers and not waits and not commander_waits and not blocked_directives:
         base = "*Heartbeat* | No active workers"
         if ollama_degraded:
             base += "\n⚠️ validator degraded (Ollama endpoint(s) down — see logs)"
         return base
     lines = ["*Heartbeat*"]
+    if blocked_directives:
+        lines.append("⛔ *Blocked directives:*")
+        for block in blocked_directives:
+            capabilities = ", ".join(block.get("capabilities") or [])
+            lines.append(
+                f"  • #{block['directive_id']} — {capabilities} "
+                f"({block['denial_scope']}): {_escape_mrkdwn(block.get('reason') or '')}"
+            )
     if waits or commander_waits:
         # commander_waits is currently unwired by every caller (a future task must
         # define what "waiting on commander" means) — only render its section when

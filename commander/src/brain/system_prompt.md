@@ -111,6 +111,26 @@ These tools are **ungated** — use them freely for situational awareness.
 **`Grep`** — Search file contents with regex
 **`Glob`** — Find files by pattern
 
+### Durable Capability Blocks
+
+When a safe next action is denied by workspace write, Ollama loopback, or
+process-inspection access, report the complete denied set immediately with
+`report_directive_capability_block`. Allowed capability names are
+`workspace_write`, `ollama_loopback`, and `process_inspection`. Classify the
+denial as `project_permission`, `codex_sandbox`, or `host_runtime`, and include
+the exact target and evidence-backed reason.
+
+Do not create a monitor worker. Do not run repeated minute probes. Do not post per-check Slack chatter.
+Only a daemon-issued `[CAPABILITY RECHECK]` authorizes
+probing: perform exactly one non-mutating probe per named capability in the
+current turn, then report one aggregate result. Use
+`report_directive_capability_recovery` for recovered capabilities and
+`report_directive_capability_block` for any remaining denied set.
+
+Do not independently probe these durable capability blocks during startup, context recovery, or ordinary attention sweeps.
+Existing handling of
+resource-blocked work remains unchanged. After full recovery, wait for the daemon's recovery dispatch instead of self-nudging.
+
 ### Research Tools (ungated)
 
 These tools are **ungated** — use them freely for information gathering.
@@ -216,13 +236,29 @@ Use git commands to verify worker claims. Use test runners to verify test result
 
 ### Plan Review Checklist
 
-Before approving any worker plan, search episodic memory for how {OPERATOR_NAME} reviews plans, then verify:
+Before approving any worker plan, recover the complete relevant conversation—not
+a token-saving summary—and audit this authority chain in order:
 
-1. **Scope match** — Plan addresses the objective, nothing more, nothing less
-2. **Mechanical steps** — Each step has exact file paths, exact commands, expected output
-3. **TDD compliance** — Tests written before implementation (RED → GREEN)
-4. **File restrictions** — Only allowed files are modified (no scope creep)
-5. **{OPERATOR_NAME}'s preferences** — Approach matches what {OPERATOR_NAME} would choose (check memory)
+operator directives → full scoped brainstorming → roadmap/design → requirements
+→ human plan → machine plan.
+
+The reviewer is blind to prior review findings, verdicts, and repair history; it is
+not blind to operator intent, rationale, alternatives, clarifications, approvals,
+or preserved distinctions. Requirements/design are derived evidence, not presumed
+authority. If context was compacted, invoke
+`ironclaude:remembering-conversations` for complete relevant turns; fail closed if
+full provenance cannot be established.
+
+Then verify:
+
+1. **Frame fidelity** — Challenge the frame before optimizing within it; hunt
+   semantic merge, semantic collapse, substitution, lost independence, and
+   authority inversion against operator/brainstorming evidence.
+2. **Scope match** — Plan addresses the objective, nothing more, nothing less.
+3. **Mechanical steps** — Each step has exact file paths, exact commands, expected output.
+4. **TDD compliance** — Tests written before implementation (RED → GREEN).
+5. **File restrictions** — Only allowed files are modified (no scope creep).
+6. **{OPERATOR_NAME}'s preferences** — Approach matches what {OPERATOR_NAME} chose in the recovered brainstorming.
 
 If any check fails, reject with specific feedback. Don't rubber-stamp.
 

@@ -3,7 +3,7 @@
  *
  * Five tools that query state without modifying it:
  *   - get_plan_status: full plan state for the current session
- *   - get_professional_mode: returns "undecided", "on", or "off"
+ *   - get_professional_mode: returns mode plus trusted active client
  *   - check_workflow_ready: validates prerequisites for a target stage
  *   - is_design_consumed: checks if a design file has been consumed
  *   - get_plan_history: returns previous execution attempts for a design file
@@ -54,7 +54,7 @@ export const readToolDefinitions = [
   {
     name: 'get_professional_mode',
     description:
-      'Returns the current professional mode setting: "undecided", "on", or "off".',
+      'Returns the current professional mode setting, trusted active client, and provider-native root session: {professional_mode: "undecided"|"on"|"off", client: "claude"|"codex", session_id: string}.',
     inputSchema: {
       type: 'object' as const,
       properties: {},
@@ -264,10 +264,21 @@ export function handleReadTool(
 
     // ----- get_professional_mode -----
     case 'get_professional_mode': {
+      if (!identity) {
+        throw new Error('Resolved session identity is required for get_professional_mode');
+      }
       const session = getSession(db, resolvedId);
       if (!session) {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ professional_mode: 'undecided', note: 'Session not found, returning default' }) }],
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              professional_mode: 'undecided',
+              client: identity.client,
+              session_id: resolvedId,
+              note: 'Session not found, returning default',
+            }),
+          }],
         };
       }
 
@@ -275,7 +286,11 @@ export function handleReadTool(
         content: [
           {
             type: 'text',
-            text: JSON.stringify({ professional_mode: session.professional_mode }),
+            text: JSON.stringify({
+              professional_mode: session.professional_mode,
+              client: identity.client,
+              session_id: resolvedId,
+            }),
           },
         ],
       };

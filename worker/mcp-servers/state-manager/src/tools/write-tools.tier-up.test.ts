@@ -218,6 +218,52 @@ describe('start_execution — tier-up gate', () => {
     expect(r.error).toContain('tier-up review');
     expect(stage()).toBe('final_plan_prep');
   });
+
+  // ─── advisor-remediated: HAS-ISSUES is terminal when a tier-up advisor guided the fix ───
+  const PLAN2 = JSON.stringify({ name: 'P2', goal: 'g2', design_file: 'd-design.md', tasks: [] });
+  function setPlan(p: string): void {
+    db.prepare(`UPDATE sessions SET plan_json=? WHERE terminal_session=?`).run(p, SESSION_ID);
+  }
+
+  it('HAS-ISSUES at prior hash + advisor-remediated at current hash → advances', () => {
+    setPolicy('enforced');
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'HAS-ISSUES' }, db, SESSION_ID);
+    setPlan(PLAN2);
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'fable', verdict: 'advisor-remediated' }, db, SESSION_ID);
+    const r = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
+    expect(r.error).toBeUndefined();
+    expect(stage()).toBe('executing');
+  });
+
+  // All findings REJECTED by the advisor ⇒ no plan change ⇒ same hash carries both rows.
+  // Relies on getTierUpReviewByHash ordering `id DESC` so advisor-remediated wins. Load-bearing.
+  it('all-REJECTED: HAS-ISSUES then advisor-remediated at the SAME hash → advances', () => {
+    setPolicy('enforced');
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'HAS-ISSUES' }, db, SESSION_ID);
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'fable', verdict: 'advisor-remediated' }, db, SESSION_ID);
+    const r = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
+    expect(r.error).toBeUndefined();
+    expect(stage()).toBe('executing');
+  });
+
+  it('advisor-remediated with NO preceding HAS-ISSUES → BLOCKS', () => {
+    setPolicy('enforced');
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'fable', verdict: 'advisor-remediated' }, db, SESSION_ID);
+    const r = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
+    expect(r.error).toBeDefined();
+    expect(stage()).toBe('final_plan_prep');
+  });
+
+  it('advisor-remediated whose HAS-ISSUES has a HIGHER id → BLOCKS (ordering)', () => {
+    setPolicy('enforced');
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'fable', verdict: 'advisor-remediated' }, db, SESSION_ID);
+    setPlan(PLAN2);
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'HAS-ISSUES' }, db, SESSION_ID);
+    setPlan(PLAN);
+    const r = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
+    expect(r.error).toBeDefined();
+    expect(stage()).toBe('final_plan_prep');
+  });
 });
 
 describe('create_plan — reload after revise (from final_plan_prep)', () => {

@@ -43,18 +43,46 @@ function walkRollouts(dir: string): string[] {
   return out;
 }
 
-function readSessionMeta(file: string): { sessionId?: string; cwd?: string } {
+// Reads the first line only, accumulating chunks until the first newline rather than
+// a fixed buffer. A codex session_meta line embeds payload.base_instructions.text (the
+// whole system prompt) and now routinely approaches 64KB; a truncated read made
+// JSON.parse throw, which silently cost BOTH the project grouping (projectFor falls
+// back to codex-<uuid>) and summarization (the meta.sessionId guard in
+// syncCodexConversations). Chunks are concatenated and decoded ONCE so a multi-byte
+// UTF-8 character split across a chunk boundary cannot corrupt the JSON.
+export function readSessionMeta(file: string): { sessionId?: string; cwd?: string } {
+  let fd: number | undefined;
   try {
-    const fd = fs.openSync(file, 'r');
-    const buf = Buffer.alloc(65536);
-    const bytes = fs.readSync(fd, buf, 0, buf.length, 0);
-    fs.closeSync(fd);
-    const firstLine = buf.subarray(0, bytes).toString('utf-8').split('\n')[0];
+    fd = fs.openSync(file, 'r');
+    const CHUNK = 65536;
+    const chunks: Buffer[] = [];
+    const buf = Buffer.alloc(CHUNK);
+    let position = 0;
+    let newlineFound = false;
+
+    while (!newlineFound) {
+      const bytes = fs.readSync(fd, buf, 0, CHUNK, position);
+      if (bytes === 0) break; // EOF before any newline — whole file is one line
+      position += bytes;
+      const read = buf.subarray(0, bytes);
+      const nl = read.indexOf(0x0a);
+      if (nl === -1) {
+        chunks.push(Buffer.from(read));
+      } else {
+        chunks.push(Buffer.from(read.subarray(0, nl)));
+        newlineFound = true;
+      }
+    }
+
+    const firstLine = Buffer.concat(chunks).toString('utf-8');
     const rec = JSON.parse(firstLine);
     if (rec.type === 'session_meta' && rec.payload) {
       return { sessionId: rec.payload.session_id, cwd: rec.payload.cwd };
     }
   } catch { /* fall through */ }
+  finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* already closed */ } }
+  }
   return {};
 }
 

@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS workers (
     spawned_at TEXT NOT NULL DEFAULT (datetime('now')),
     finished_at TEXT,
     client TEXT,
-    model TEXT
+    model TEXT,
+    native_session_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -79,6 +80,23 @@ CREATE TABLE IF NOT EXISTS directives (
     planned_use_goal_reason TEXT,
     planned_prompt_reason TEXT,
     superseded_by INTEGER REFERENCES directives(id)
+);
+
+CREATE TABLE IF NOT EXISTS directive_capability_blocks (
+    directive_id INTEGER PRIMARY KEY REFERENCES directives(id),
+    capabilities_json TEXT NOT NULL,
+    denial_scope TEXT NOT NULL,
+    target TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('blocked', 'recovered')),
+    first_observed_at REAL NOT NULL,
+    last_observed_at REAL NOT NULL,
+    next_recheck_at REAL NOT NULL,
+    backoff_seconds REAL NOT NULL,
+    notification_state TEXT NOT NULL DEFAULT 'pending',
+    generation INTEGER NOT NULL DEFAULT 1,
+    recovery_dispatch_state TEXT NOT NULL DEFAULT 'none'
 );
 
 CREATE TABLE IF NOT EXISTS push_requests (
@@ -195,9 +213,9 @@ def init_db(db_path: str) -> sqlite3.Connection:
                 )
             else:
                 raise
-    # Migrate pre-existing `workers` tables that predate the client/model columns
-    # (the resolved provider client + model, persisted at spawn).
-    for _wcol in ("client", "model"):
+    # Migrate pre-existing `workers` tables that predate provider identity
+    # columns persisted at spawn.
+    for _wcol in ("client", "model", "native_session_id"):
         try:
             conn.execute(f"ALTER TABLE workers ADD COLUMN {_wcol} TEXT")
         except sqlite3.OperationalError as exc:

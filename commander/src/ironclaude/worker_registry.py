@@ -85,10 +85,18 @@ class WorkerRegistry:
         self, worker_id: str, worker_type: str, tmux_session: str,
         machine: str | None = None, repo: str | None = None, task_id: int | None = None,
         description: str = "",
+        client: str | None = None, model: str | None = None,
+        native_session_id: str | None = None,
     ) -> None:
         self._conn.execute(
-            "INSERT INTO workers (id, type, machine, repo, tmux_session, task_id, description) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (worker_id, worker_type, machine, repo, tmux_session, task_id, description),
+            "INSERT INTO workers "
+            "(id, type, machine, repo, tmux_session, task_id, description, "
+            "client, model, native_session_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                worker_id, worker_type, machine, repo, tmux_session, task_id,
+                description, client, model, native_session_id,
+            ),
         )
         self._conn.commit()
 

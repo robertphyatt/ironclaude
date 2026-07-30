@@ -72,6 +72,13 @@ class TestWorkers:
         assert w["type"] == "claude-max"
         assert w["status"] == "running"
 
+    def test_register_worker_legacy_identity_fields_default_null(self, registry):
+        registry.register_worker("worker-1", "claude-max", "worker-1")
+        w = registry.get_worker("worker-1")
+        assert w["client"] is None
+        assert w["model"] is None
+        assert w["native_session_id"] is None
+
     def test_update_worker_status(self, registry):
         registry.register_worker("worker-1", "claude-max", "worker-1")
         registry.update_worker_status("worker-1", "completed")

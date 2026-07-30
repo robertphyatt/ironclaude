@@ -207,3 +207,54 @@ def test_call_grader_codex_end_to_end(tmp_path, monkeypatch):
         out = tools._call_grader("sys", "user")
     assert out == {"grade": "B", "approved": True, "feedback": "looks fine"}
     assert run.call_args.args[0][0] == "codex"
+
+
+def _codex_cfg_with_effort(tmp_path, effort):
+    """Same config as _codex_enabled_cfg, but with a NON-DEFAULT effort level.
+
+    effort_level is an OrchestratorTools constructor kwarg, not a config key.
+    Asserting "high" would prove nothing — it is the default, so a hardcoded
+    value would pass. Only a non-default value proves _effort_level is read.
+    """
+    conn = init_db(str(tmp_path / "commander.db"))
+    cfg = {
+        "grader_model": "opus", "brain_model": "sonnet", "default_opus_model": "opus",
+        "advisor": {"advisor_model": "opus", "advisor_models": {}},
+        "providers": {
+            "clients": {
+                "claude": {"enabled": True, "path": "claude",
+                           "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "opus", "fable": "fable"}},
+                "codex": {"enabled": True, "path": "codex",
+                          "models": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol"}},
+            },
+            "roles": {
+                "brain": {"preferred": "claude", "clients": ["claude"]},
+                "worker": {"preferred": "claude", "clients": ["claude"]},
+                "grader": {"preferred": "codex", "clients": ["codex"]},
+                "advisor": {"preferred": "claude", "clients": ["claude"]},
+            },
+        },
+    }
+    return omcp.OrchestratorTools(registry=MagicMock(), tmux=MagicMock(), db_conn=conn,
+                                  config=cfg, effort_level=effort)
+
+
+def test_codex_grader_argv_pins_configured_reasoning_effort(tmp_path):
+    """IronClaude's effort_level must govern codex, not ~/.codex/config.toml."""
+    tools = _codex_cfg_with_effort(tmp_path, "low")
+    argv = tools._codex_grader_argv("/tmp/schema.json", "gpt-5.6-sol")
+    assert "-c" in argv
+    assert 'model_reasoning_effort="low"' in argv
+
+
+def test_codex_grader_env_adds_nothing(tmp_path):
+    """The codex grader env builder must be a pure pass-through.
+
+    Asserting `"CLAUDE_CODE_EFFORT_LEVEL" not in env` would test the ambient shell,
+    not the builder — and this shell exports that variable, while conftest.py scrubs
+    only IC_*. Equality against os.environ is environment-independent and still fails
+    the moment the builder re-adds any key.
+    """
+    import os
+    tools = _codex_cfg_with_effort(tmp_path, "low")
+    assert tools._codex_grader_env() == dict(os.environ)

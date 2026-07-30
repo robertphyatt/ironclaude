@@ -1,8 +1,10 @@
 # tests/test_orchestrator_mcp.py
 """Tests for the orchestrator MCP server business logic."""
 
+import copy
 import difflib
 import fcntl
+import inspect
 import itertools
 import json
 import logging
@@ -11,6 +13,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import tomllib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -20,11 +23,19 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 from ironclaude.db import init_db
 from ironclaude.worker_registry import WorkerRegistry
-from ironclaude.config import make_opus_command
+from ironclaude.config import DEFAULTS, make_opus_command
 from ironclaude.ollama_inventory import OllamaInventory
-from ironclaude.orchestrator_mcp import OrchestratorTools, WORKER_COMMANDS, _load_avatar_skill, _init_brain_session_background, _restart_watchdog
+from ironclaude.orchestrator_mcp import OrchestratorTools, WORKER_COMMANDS, _load_avatar_skill, _init_brain_session_background, _restart_watchdog, _CODEX_ADVISOR_INSTRUCTION
+from ironclaude.provider_state import ProviderState
+from ironclaude.provider_capabilities import ClientCapability, ProbeResult
+from ironclaude.ssh_manager import MachineConfig
 from ironclaude.slack_interface import SlackBot
 from ironclaude.ollama_client import OllamaError
+from ironclaude.provider_router import ProviderHandle, NoCapabilityAvailable
+
+_REAL_ENSURE_WORKER_INSTRUCTIONS = OrchestratorTools._ensure_worker_instructions
+_REAL_READ_PM_STATE = OrchestratorTools._read_pm_state_via_sqlite
+_VALID_NATIVE_UUID = "11111111-1111-4111-8111-111111111111"
 
 
 def _mock_grader_approve(tools):
@@ -35,6 +46,27 @@ def _mock_grader_approve(tools):
     tools._call_local_grader = MagicMock(return_value={
         "grade": "A", "approved": True, "feedback": "Test approval"
     })
+
+
+def _mock_batch_approve(tools):
+    """Approve in the high-confidence local batch pre-filter."""
+    tools._call_local_grader = MagicMock(return_value={
+        "grade": "A",
+        "approved": True,
+        "feedback": "Test approval",
+        "confidence": "high",
+    })
+
+
+def _provider_handle(client="codex", requested="sonnet", effective="sonnet",
+                     model="gpt-5.6-terra"):
+    return ProviderHandle(
+        client=client,
+        requested_tier=requested,
+        effective_tier=effective,
+        model=model,
+        host="local",
+    )
 
 
 def _submit_directive_default(tools_obj, source_ts, source_text, interpretation, **overrides):
@@ -77,6 +109,30 @@ def mock_tmux():
     tmux.read_log_tail.return_value = "ironclaude v1.0.33\n"
     tmux.list_pane_pid.return_value = None
     return tmux
+
+
+@pytest.fixture(autouse=True)
+def default_instruction_preflight(monkeypatch):
+    """Keep unrelated spawn tests filesystem-independent."""
+    monkeypatch.setattr(
+        OrchestratorTools,
+        "_ensure_worker_instructions",
+        lambda self, repo, client: None,
+    )
+
+
+@pytest.fixture(autouse=True)
+def default_pm_readback(monkeypatch):
+    """Keep existing spawn tests on their mocked PM-activation boundary."""
+    monkeypatch.setattr(
+        OrchestratorTools,
+        "_read_pm_state_via_sqlite",
+        lambda self, session_name, _claude_dir=None, client="claude": {
+            "professional_mode": "on",
+            "workflow_stage": "idle",
+            "session_uuid": _VALID_NATIVE_UUID,
+        },
+    )
 
 
 def test_ensure_ssh_manager_lazy_init(tmp_path, db_conn, registry, mock_tmux):
@@ -154,7 +210,885 @@ def tools(registry, mock_tmux, tmp_path, db_conn, monkeypatch):
     monkeypatch.setenv("IC_OLLAMA_CONFIG_PATH", str(empty_cfg))
     t = OrchestratorTools(registry, mock_tmux, ledger_path, db_conn=db_conn)
     t._get_ollama_vram = MagicMock(return_value=(0.0, []))
+    t._ensure_worker_instructions = MagicMock(return_value=None)
     return t
+
+
+class TestProviderAwareWorkerCommand:
+    def test_build_worker_launch_resolves_provider_once(self, tools):
+        handle = _provider_handle()
+        different = _provider_handle(
+            client="claude", model="sonnet",
+        )
+        tools._resolve_worker_client = MagicMock(side_effect=[handle, different])
+
+        cmd, returned = tools._build_worker_launch_cmd(
+            "claude-sonnet", "", "w1", None,
+        )
+
+        tools._resolve_worker_client.assert_called_once_with("claude-sonnet")
+        assert returned is handle
+        assert "exec codex --model gpt-5.6-terra" in cmd
+        assert "exec claude" not in cmd
+
+    def test_build_worker_launch_honors_resolved_claude_effective_tier_and_model(
+        self, tools,
+    ):
+        handle = _provider_handle(
+            client="claude",
+            requested="fable",
+            effective="opus",
+            model="claude-opus-4-6",
+        )
+        tools._resolve_worker_client = MagicMock(return_value=handle)
+
+        cmd, returned = tools._build_worker_launch_cmd(
+            "claude-fable", "", "w1", None,
+        )
+
+        assert returned is handle
+        assert "--model claude-opus-4-6" in cmd
+        assert "--model fable" not in cmd
+
+    def test_worker_templates_declared_as_package_data(self):
+        pyproject = Path(__file__).parents[1] / "pyproject.toml"
+        config = tomllib.loads(pyproject.read_text())
+        assert (
+            config["tool"]["setuptools"]["package-data"]["ironclaude"]
+            == ["templates/*.md"]
+        )
+
+    @pytest.mark.parametrize(
+        ("client", "model", "native_session_id"),
+        [
+            ("claude", "sonnet", "22222222-2222-4222-8222-222222222222"),
+            ("codex", "gpt-5.6-terra", "33333333-3333-4333-8333-333333333333"),
+        ],
+    )
+    def test_spawn_worker_provider_aware_persists_native_session_id(
+        self, tools, registry, client, model, native_session_id,
+    ):
+        handle = _provider_handle(client=client, model=model)
+        tools._resolve_worker_client = MagicMock(return_value=handle)
+        tools._ensure_ssh_manager = MagicMock()
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._wait_for_ready = MagicMock(return_value=True)
+        tools._read_pm_state_via_sqlite = MagicMock(return_value={
+            "professional_mode": "on",
+            "workflow_stage": "executing",
+            "session_uuid": native_session_id,
+        })
+        tools.ensure_worker_trusted = MagicMock()
+        _mock_grader_approve(tools)
+
+        result = tools.spawn_worker(
+            worker_id="w-native",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="Task",
+        )
+
+        assert "w-native" in result
+        tools._read_pm_state_via_sqlite.assert_called_once_with(
+            "ic-w-native", client=client,
+        )
+        worker = registry.get_worker("w-native")
+        assert worker["client"] == client
+        assert worker["model"] == model
+        assert worker["native_session_id"] == native_session_id
+
+    @pytest.mark.parametrize(
+        "pm_state",
+        [
+            {"professional_mode": "off", "workflow_stage": "idle",
+             "session_uuid": _VALID_NATIVE_UUID},
+            {"professional_mode": "on", "workflow_stage": "idle",
+             "session_uuid": None},
+            {"professional_mode": "on", "workflow_stage": "idle",
+             "session_uuid": "x" * 36},
+        ],
+        ids=["pm-off", "missing-uuid", "invalid-uuid"],
+    )
+    def test_spawn_worker_provider_aware_invalid_native_session_id_cleans_up(
+        self, tools, registry, mock_tmux, pm_state,
+    ):
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        tools._ensure_ssh_manager = MagicMock()
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._wait_for_ready = MagicMock(return_value=True)
+        tools._read_pm_state_via_sqlite = MagicMock(return_value=pm_state)
+        tools.ensure_worker_trusted = MagicMock()
+        _mock_grader_approve(tools)
+
+        result = tools.spawn_worker(
+            worker_id="w-native-bad",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="Task",
+        )
+
+        assert "error" in result
+        mock_tmux.kill_session.assert_called_once_with(
+            "ic-w-native-bad", ssh_host=None,
+        )
+        assert registry.get_worker("w-native-bad") is None
+        assert not registry.get_events_for_worker(
+            "w-native-bad", event_type="worker_spawned",
+        )
+
+
+class TestWorkerInstructionPreflight:
+    def test_ensure_worker_instructions_creates_codex_agents_only(
+        self, tools, tmp_path,
+    ):
+        result = _REAL_ENSURE_WORKER_INSTRUCTIONS(
+            tools, str(tmp_path), "codex",
+        )
+        assert result is None
+        assert (tmp_path / "AGENTS.md").read_text()
+        assert not (tmp_path / "CLAUDE.md").exists()
+
+    def test_ensure_worker_instructions_preserves_existing_codex_agents(
+        self, tools, tmp_path,
+    ):
+        path = tmp_path / "AGENTS.md"
+        original = b"operator-owned bytes\x00"
+        path.write_bytes(original)
+
+        result = _REAL_ENSURE_WORKER_INSTRUCTIONS(
+            tools, str(tmp_path), "codex",
+        )
+
+        assert result is None
+        assert path.read_bytes() == original
+
+    def test_spawn_worker_codex_uses_mandatory_instruction_preflight(
+        self, tools, mock_tmux,
+    ):
+        _mock_grader_approve(tools)
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        tools._ensure_worker_instructions = MagicMock(
+            return_value="Failed to ensure AGENTS.md",
+        )
+
+        result = tools.spawn_worker(
+            worker_id="w1",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="Task",
+        )
+
+        assert result == {"error": "Failed to ensure AGENTS.md"}
+        tools._ensure_worker_instructions.assert_called_once_with(
+            "/tmp/repo", "codex",
+        )
+        mock_tmux.spawn_session.assert_not_called()
+
+    def test_spawn_worker_claude_instruction_preflight_failure_blocks_spawn(
+        self, tools, mock_tmux,
+    ):
+        _mock_grader_approve(tools)
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle(
+            client="claude", model="sonnet",
+        ))
+        tools._ensure_worker_instructions = MagicMock(
+            return_value="Failed to ensure CLAUDE.md",
+        )
+
+        result = tools.spawn_worker(
+            worker_id="w1",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="Task",
+        )
+
+        assert result == {"error": "Failed to ensure CLAUDE.md"}
+        mock_tmux.spawn_session.assert_not_called()
+
+    def test_spawn_worker_provider_unavailable_fails_closed_without_claude_fallback(
+        self, tools, mock_tmux,
+    ):
+        _mock_grader_approve(tools)
+        error = NoCapabilityAvailable("worker", "sonnet", ["local"])
+        tools._resolve_worker_client = MagicMock(side_effect=error)
+
+        result = tools.spawn_worker(
+            worker_id="w1",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="Task",
+        )
+
+        assert result == {"error": str(error)}
+        mock_tmux.spawn_session.assert_not_called()
+
+    def test_local_worker_capability_recovery_probes_after_explicit_cutover(
+        self, tools,
+    ):
+        config = copy.deepcopy(DEFAULTS)
+        config["providers"]["clients"]["codex"]["enabled"] = True
+        config["providers"]["roles"]["worker"] = {
+            "preferred": "claude",
+            "clients": ["claude", "codex"],
+        }
+        tools._config = config
+        tools._grader_router_cache = None
+        state = ProviderState(tools._db)
+        state.mark_unavailable(
+            "local", "codex", "worker", "sonnet", "usage_limit", "old limit"
+        )
+        state.set_current_client("worker", "codex", reset_capabilities=True)
+        probed = []
+
+        def probe_local(_probe, _config, client, role, tier):
+            probed.append((client, role, tier))
+            return ClientCapability(
+                host="local", client=client, role=role, tier=tier,
+                configured=True, supported=True, installed=True,
+                authenticated=True, available=True,
+            )
+
+        with patch(
+            "ironclaude.orchestrator_mcp.CapabilityProbe.probe_local",
+            autospec=True,
+            side_effect=probe_local,
+        ):
+            handle = tools._resolve_worker_client("claude-sonnet")
+
+        assert handle.client == "codex"
+        assert ("codex", "worker", "sonnet") in probed
+
+
+def _run_ensure_role_capabilities(tools, *, codex_reason, codex_available):
+    """Seed BOTH clients, then run the local guard with probe_local recorded.
+
+    Both clients are seeded deliberately. `_ensure_role_capabilities` loops over every
+    client in `config.roles[role].clients`, so an unseeded client would be probed under
+    the old guard AND the new one, making any unqualified "was not probed" assertion
+    fail in both RED and GREEN. Seeding claude as available isolates the assertion to
+    codex.
+    """
+    config = copy.deepcopy(DEFAULTS)
+    config["providers"]["clients"]["codex"]["enabled"] = True
+    config["providers"]["roles"]["worker"] = {
+        "preferred": "claude",
+        "clients": ["claude", "codex"],
+    }
+    tools._config = config
+    tools._grader_router_cache = None
+    state = ProviderState(tools._db)
+    state.record_capability(
+        "local", "codex", "worker", "sonnet",
+        configured=True, supported=True, installed=True,
+        authenticated=None if codex_available else False,
+        reason=codex_reason, available=codex_available,
+    )
+    state.record_capability(
+        "local", "claude", "worker", "sonnet",
+        configured=True, supported=True, installed=True,
+        authenticated=True, reason=None, available=True,
+    )
+    probed = []
+
+    def probe_local(_probe, _config, client, role, tier):
+        probed.append((client, role, tier))
+        return ClientCapability(
+            host="local", client=client, role=role, tier=tier,
+            configured=True, supported=True, installed=True,
+            authenticated=True, available=True,
+        )
+
+    with patch(
+        "ironclaude.orchestrator_mcp.CapabilityProbe.probe_local",
+        autospec=True,
+        side_effect=probe_local,
+    ):
+        tools._ensure_role_capabilities("worker", "sonnet")
+    return state, probed
+
+
+class TestTransientCapabilityReprobe:
+    def test_transient_quarantine_triggers_local_reprobe(self, tools):
+        """A transient quarantine must be re-probed, or it can never self-heal."""
+        _state, probed = _run_ensure_role_capabilities(
+            tools, codex_reason="not_authenticated", codex_available=False,
+        )
+        assert ("codex", "worker", "sonnet") in probed
+
+    def test_hard_quarantine_does_not_trigger_local_reprobe(self, tools):
+        """Hard failures stay sticky - no auto-recovery, per the operator's rule."""
+        _state, probed = _run_ensure_role_capabilities(
+            tools, codex_reason="missing_executable", codex_available=False,
+        )
+        assert ("codex", "worker", "sonnet") not in probed
+
+    def test_available_row_does_not_trigger_local_reprobe(self, tools):
+        """Guards against probing on every resolve."""
+        _state, probed = _run_ensure_role_capabilities(
+            tools, codex_reason=None, codex_available=True,
+        )
+        assert ("codex", "worker", "sonnet") not in probed
+
+    def test_transient_quarantine_self_heals_end_to_end(self, tools):
+        """Acceptance criterion for parity defect #1."""
+        state, probed = _run_ensure_role_capabilities(
+            tools, codex_reason="probe_timeout", codex_available=False,
+        )
+        assert ("codex", "worker", "sonnet") in probed
+        assert state.is_available("local", "codex", "worker", "sonnet") is True
+
+
+class TestRemoteProviderLaunching:
+    REPO = "/home/user/projects/repo"
+
+    @staticmethod
+    def _machine(clients, env=None):
+        return MachineConfig(
+            name="remote-worker",
+            host="ssh-remote",
+            claude_path=(
+                clients.get("claude", {}).get("path")
+                if "claude" in clients
+                else None
+            ),
+            repos=[TestRemoteProviderLaunching.REPO],
+            env=env or {},
+            clients=clients,
+        )
+
+    @staticmethod
+    def _attach_remote(tools, machine):
+        ssh = MagicMock()
+        ssh.get_machine.return_value = machine
+        ssh.list_machine_names.return_value = [machine.name]
+        ssh.health_check.return_value = MagicMock(
+            ok=True, details="All checks passed",
+        )
+        tools._ssh_manager = ssh
+        return ssh
+
+    def _prepare_remote_success(self, tools, machine, handle):
+        self._attach_remote(tools, machine)
+        tools._resolve_remote_worker_client = MagicMock(return_value=handle)
+        tools._ensure_worker_instructions_remote = MagicMock(return_value=None)
+        tools._ensure_worker_trusted_remote = MagicMock()
+        tools._wait_for_ready = MagicMock(return_value=True)
+        tools._activate_pm_remote = MagicMock(return_value=_VALID_NATIVE_UUID)
+        _mock_grader_approve(tools)
+
+    def test_remote_provider_resolution_is_host_scoped(
+        self, registry, mock_tmux, tmp_path, db_conn,
+    ):
+        config = copy.deepcopy(DEFAULTS)
+        config["providers"]["clients"]["codex"]["enabled"] = True
+        config["providers"]["roles"]["worker"] = {
+            "preferred": "codex",
+            "clients": ["claude", "codex"],
+        }
+        tools = OrchestratorTools(
+            registry, mock_tmux, str(tmp_path / "ledger.json"),
+            db_conn=db_conn, config=config,
+        )
+        machine = self._machine({
+            "claude": {"enabled": True, "path": "/opt/claude"},
+            "codex": {"enabled": True, "path": "/opt/codex"},
+        })
+        ssh = self._attach_remote(tools, machine)
+
+        def run_argv(host, argv):
+            assert host == "ssh-remote"
+            if tuple(argv) == ("/opt/codex", "login", "status"):
+                return ProbeResult(0, "Logged in using ChatGPT\n", "")
+            return ProbeResult(0, "version\n", "")
+
+        ssh.run_argv.side_effect = run_argv
+        state = ProviderState(db_conn)
+        state.set_current_client("worker", "codex")
+
+        handle = tools._resolve_remote_worker_client(
+            "claude-sonnet", machine,
+        )
+
+        assert handle.client == "codex"
+        assert handle.model == "gpt-5.6-terra"
+        assert handle.host == "ssh-remote"
+        assert state.get_current_client("worker") == "codex"
+        assert all(call.args[0] == "ssh-remote" for call in ssh.run_argv.call_args_list)
+
+    def test_remote_worker_capability_recovery_probes_after_explicit_cutover(
+        self, registry, mock_tmux, tmp_path, db_conn,
+    ):
+        config = copy.deepcopy(DEFAULTS)
+        config["providers"]["clients"]["codex"]["enabled"] = True
+        config["providers"]["roles"]["worker"] = {
+            "preferred": "claude",
+            "clients": ["claude", "codex"],
+        }
+        tools = OrchestratorTools(
+            registry, mock_tmux, str(tmp_path / "ledger.json"),
+            db_conn=db_conn, config=config,
+        )
+        machine = self._machine({
+            "claude": {"enabled": True, "path": "/opt/claude"},
+            "codex": {"enabled": True, "path": "/opt/codex"},
+        })
+        ssh = self._attach_remote(tools, machine)
+
+        def run_argv(_host, argv):
+            if tuple(argv) == ("/opt/codex", "login", "status"):
+                return ProbeResult(0, "Logged in using ChatGPT\n", "")
+            return ProbeResult(0, "version\n", "")
+
+        ssh.run_argv.side_effect = run_argv
+        state = ProviderState(db_conn)
+        state.mark_unavailable(
+            "ssh-remote", "codex", "worker", "sonnet",
+            "usage_limit", "old limit",
+        )
+        state.set_current_client("worker", "codex", reset_capabilities=True)
+
+        handle = tools._resolve_remote_worker_client("claude-sonnet", machine)
+
+        assert handle.client == "codex"
+        assert ("/opt/codex", "login", "status") in [
+            tuple(call.args[1]) for call in ssh.run_argv.call_args_list
+        ]
+
+    def test_remote_unavailable_provider_fails_before_mutation(
+        self, tools, registry, mock_tmux, db_conn,
+    ):
+        machine = self._machine({
+            "codex": {"enabled": True, "path": "/opt/codex"},
+        })
+        self._attach_remote(tools, machine)
+        error = NoCapabilityAvailable("worker", "sonnet", ["ssh-remote"])
+        tools._resolve_remote_worker_client = MagicMock(side_effect=error)
+        tools._ensure_worker_instructions_remote = MagicMock()
+        tools._ensure_worker_trusted_remote = MagicMock()
+        _mock_grader_approve(tools)
+        state = ProviderState(db_conn)
+        state.set_current_client("worker", "codex")
+
+        result = tools.spawn_worker(
+            worker_id="w-remote-none",
+            worker_type="claude-sonnet",
+            repo=self.REPO,
+            objective="Task",
+            machine="remote-worker",
+        )
+
+        assert result == {"error": str(error)}
+        tools._ensure_worker_instructions_remote.assert_not_called()
+        tools._ensure_worker_trusted_remote.assert_not_called()
+        mock_tmux.spawn_session.assert_not_called()
+        assert registry.get_worker("w-remote-none") is None
+        assert state.get_current_client("worker") == "codex"
+
+    @pytest.mark.parametrize(
+        ("handle", "expected"),
+        [
+            (
+                _provider_handle(
+                    client="claude", model="sonnet",
+                ),
+                "export IC_ROLE=worker; export IC_WORKER_ID=w1; "
+                "export ENABLE_STOP_REVIEW=0; export SHARED=value; "
+                "export CLAUDE_CODE_EFFORT_LEVEL=high; "
+                "exec /opt/claude --model sonnet "
+                "--dangerously-skip-permissions",
+            ),
+            (
+                _provider_handle(),
+                "export IC_ROLE=worker; export IC_WORKER_ID=w1; "
+                "export ENABLE_STOP_REVIEW=0; export SHARED=value; "
+                "exec /opt/codex --model gpt-5.6-terra "
+                "--dangerously-bypass-approvals-and-sandbox",
+            ),
+        ],
+        ids=["claude", "codex"],
+    )
+    def test_remote_client_command_exact(self, tools, handle, expected):
+        machine = self._machine({
+            "claude": {"enabled": True, "path": "/opt/claude"},
+            "codex": {"enabled": True, "path": "/opt/codex"},
+        }, env={"SHARED": "value"})
+        tools._resolve_remote_worker_client = MagicMock(return_value=handle)
+
+        command, returned = tools._build_worker_launch_cmd(
+            "claude-sonnet", "", "w1", machine,
+        )
+
+        assert command == expected
+        assert returned is handle
+        if handle.client == "codex":
+            assert "CLAUDE_CODE" not in command
+            assert "skip-permissions" not in command
+
+    @pytest.mark.parametrize(
+        ("client", "filename"),
+        [("claude", "CLAUDE.md"), ("codex", "AGENTS.md")],
+    )
+    def test_remote_instruction_trust_preserves_existing_bytes(
+        self, tools, mock_tmux, client, filename,
+    ):
+        destination = f"{self.REPO}/{filename}"
+        original = b"operator-owned bytes\x00"
+        remote_files = {destination: original}
+        mock_tmux.file_exists.side_effect = (
+            lambda path, ssh_host=None: path in remote_files
+        )
+        mock_tmux.write_file.side_effect = (
+            lambda path, content, ssh_host=None:
+            remote_files.__setitem__(path, content.encode()) or True
+        )
+
+        result = tools._ensure_worker_instructions_remote(
+            self.REPO, "ssh-remote", client,
+        )
+
+        assert result is None
+        assert remote_files[destination] == original
+        mock_tmux.write_file.assert_not_called()
+
+    @pytest.mark.parametrize("client", ["claude", "codex"])
+    def test_remote_instruction_trust_selects_client_and_claude_trust_only(
+        self, tools, mock_tmux, client,
+    ):
+        machine = self._machine({
+            client: {
+                "enabled": True,
+                "path": f"/opt/{client}",
+            },
+        })
+        self._attach_remote(tools, machine)
+        model = "sonnet" if client == "claude" else "gpt-5.6-terra"
+        tools._resolve_remote_worker_client = MagicMock(
+            return_value=_provider_handle(client=client, model=model),
+        )
+        tools._ensure_worker_instructions_remote = MagicMock(return_value=None)
+        tools._ensure_worker_trusted_remote = MagicMock()
+        tools._activate_pm_remote = MagicMock(return_value=_VALID_NATIVE_UUID)
+        tools._wait_for_ready = MagicMock(return_value=True)
+        _mock_grader_approve(tools)
+
+        tools.spawn_worker(
+            worker_id=f"w-{client}",
+            worker_type="claude-sonnet",
+            repo=self.REPO,
+            objective="Task",
+            machine="remote-worker",
+        )
+
+        tools._ensure_worker_instructions_remote.assert_called_once_with(
+            self.REPO, "ssh-remote", client,
+        )
+        if client == "claude":
+            tools._ensure_worker_trusted_remote.assert_called_once_with(
+                self.REPO, "ssh-remote",
+            )
+        else:
+            tools._ensure_worker_trusted_remote.assert_not_called()
+
+    def test_remote_instruction_trust_missing_template_blocks_spawn(
+        self, tools, mock_tmux,
+    ):
+        machine = self._machine({
+            "codex": {"enabled": True, "path": "/opt/codex"},
+        })
+        self._attach_remote(tools, machine)
+        tools._resolve_remote_worker_client = MagicMock(
+            return_value=_provider_handle(),
+        )
+        mock_tmux.file_exists.return_value = False
+        _mock_grader_approve(tools)
+        real_read_text = Path.read_text
+
+        def read_text_or_missing(path, *args, **kwargs):
+            if path.name == "worker_agents.md":
+                raise FileNotFoundError("missing")
+            return real_read_text(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", new=read_text_or_missing):
+            result = tools.spawn_worker(
+                worker_id="w-missing-template",
+                worker_type="claude-sonnet",
+                repo=self.REPO,
+                objective="Task",
+                machine="remote-worker",
+            )
+
+        assert "Failed to ensure AGENTS.md" in result["error"]
+        mock_tmux.spawn_session.assert_not_called()
+
+    def test_remote_instruction_trust_failed_write_blocks_spawn(
+        self, tools, mock_tmux,
+    ):
+        machine = self._machine({
+            "codex": {"enabled": True, "path": "/opt/codex"},
+        })
+        self._attach_remote(tools, machine)
+        tools._resolve_remote_worker_client = MagicMock(
+            return_value=_provider_handle(),
+        )
+        mock_tmux.file_exists.return_value = False
+        mock_tmux.write_file.return_value = False
+        _mock_grader_approve(tools)
+
+        result = tools.spawn_worker(
+            worker_id="w-write-failed",
+            worker_type="claude-sonnet",
+            repo=self.REPO,
+            objective="Task",
+            machine="remote-worker",
+        )
+
+        assert "Failed to ensure AGENTS.md" in result["error"]
+        mock_tmux.spawn_session.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("client", "model"),
+        [("claude", "sonnet"), ("codex", "gpt-5.6-terra")],
+    )
+    def test_remote_registry_identity_is_atomic(
+        self, tools, registry, client, model,
+    ):
+        machine = self._machine({
+            client: {"enabled": True, "path": f"/opt/{client}"},
+        })
+        handle = _provider_handle(client=client, model=model)
+        self._prepare_remote_success(tools, machine, handle)
+
+        tools.spawn_worker(
+            worker_id=f"w-reg-{client}",
+            worker_type="claude-sonnet",
+            repo=self.REPO,
+            objective="Task",
+            machine="remote-worker",
+        )
+
+        worker = registry.get_worker(f"w-reg-{client}")
+        assert worker["machine"] == "remote-worker"
+        assert worker["client"] == client
+        assert worker["model"] == model
+        assert worker["native_session_id"] == _VALID_NATIVE_UUID
+
+    def test_remote_spawn_failure_preserves_exception_without_cleanup(
+        self, tools, registry, mock_tmux,
+    ):
+        machine = self._machine({
+            "codex": {"enabled": True, "path": "/opt/codex"},
+        })
+        self._prepare_remote_success(tools, machine, _provider_handle())
+        mock_tmux.spawn_session.return_value = False
+
+        with pytest.raises(RuntimeError, match="Failed to spawn tmux session"):
+            tools.spawn_worker(
+                worker_id="w-spawn-fail",
+                worker_type="claude-sonnet",
+                repo=self.REPO,
+                objective="Task",
+                machine="remote-worker",
+            )
+
+        mock_tmux.kill_session.assert_not_called()
+        assert registry.get_worker("w-spawn-fail") is None
+        assert not registry.get_events_for_worker(
+            "w-spawn-fail", event_type="worker_spawned",
+        )
+
+    @pytest.mark.parametrize(
+        ("failure", "pm_result"),
+        [
+            ("readiness", _VALID_NATIVE_UUID),
+            ("pm", "sqlite3 command failed on ssh-remote"),
+            ("missing-uuid", None),
+            ("invalid-uuid", "invalid session UUID format: 'bad'"),
+        ],
+    )
+    def test_remote_post_spawn_failure_cleanup(
+        self, tools, registry, mock_tmux, failure, pm_result,
+    ):
+        machine = self._machine({
+            "codex": {"enabled": True, "path": "/opt/codex"},
+        })
+        self._prepare_remote_success(tools, machine, _provider_handle())
+        mock_tmux.has_session.return_value = True
+        if failure == "readiness":
+            tools._wait_for_ready.return_value = False
+        else:
+            tools._activate_pm_remote.return_value = pm_result
+
+        result = tools.spawn_worker(
+            worker_id=f"w-post-{failure}",
+            worker_type="claude-sonnet",
+            repo=self.REPO,
+            objective="Task",
+            machine="remote-worker",
+        )
+
+        assert "error" in result
+        mock_tmux.kill_session.assert_called_once_with(
+            f"ic-w-post-{failure}", ssh_host="ssh-remote",
+        )
+        assert registry.get_worker(f"w-post-{failure}") is None
+        assert not registry.get_events_for_worker(
+            f"w-post-{failure}", event_type="worker_spawned",
+        )
+
+    def test_remote_registration_failure_cleanup_preserves_exception(
+        self, tools, registry, mock_tmux,
+    ):
+        machine = self._machine({
+            "codex": {"enabled": True, "path": "/opt/codex"},
+        })
+        self._prepare_remote_success(tools, machine, _provider_handle())
+        original = RuntimeError("registry write failed")
+        tools.registry.register_worker = MagicMock(side_effect=original)
+
+        with pytest.raises(RuntimeError, match="registry write failed"):
+            tools.spawn_worker(
+                worker_id="w-register-fail",
+                worker_type="claude-sonnet",
+                repo=self.REPO,
+                objective="Task",
+                machine="remote-worker",
+            )
+
+        mock_tmux.kill_session.assert_called_once_with(
+            "ic-w-register-fail", ssh_host="ssh-remote",
+        )
+        assert not registry.get_events_for_worker(
+            "w-register-fail", event_type="worker_spawned",
+        )
+
+    def test_remote_same_host_retry_carries_new_provider_handle(
+        self, tools, registry, mock_tmux,
+    ):
+        machine = self._machine({
+            "claude": {"enabled": True, "path": "/opt/claude"},
+            "codex": {"enabled": True, "path": "/opt/codex"},
+        })
+        self._attach_remote(tools, machine)
+        first = _provider_handle(
+            client="claude", requested="fable", effective="fable",
+            model="fable",
+        )
+        second = _provider_handle(
+            client="codex", requested="opus", effective="opus",
+            model="gpt-5.6-sol",
+        )
+        tools._resolve_remote_worker_client = MagicMock(
+            side_effect=[first, second],
+        )
+        tools._ensure_worker_instructions_remote = MagicMock(return_value=None)
+        tools._ensure_worker_trusted_remote = MagicMock()
+        tools._wait_for_ready = MagicMock(side_effect=[False, True])
+        tools._activate_pm_remote = MagicMock(return_value=_VALID_NATIVE_UUID)
+        mock_tmux.has_session.return_value = False
+        _mock_grader_approve(tools)
+
+        with patch(
+            "ironclaude.orchestrator_mcp._mark_fable_unavailable",
+            return_value="unchanged",
+        ):
+            result = tools.spawn_worker(
+                worker_id="w-retry",
+                worker_type="claude-fable",
+                repo=self.REPO,
+                objective="Task",
+                machine="remote-worker",
+            )
+
+        assert "w-retry" in result
+        assert [
+            call.args for call in tools._resolve_remote_worker_client.call_args_list
+        ] == [
+            ("claude-fable", machine),
+            ("claude-opus", machine),
+        ]
+        assert [call.kwargs["client"] for call in tools._wait_for_ready.call_args_list] == [
+            "claude", "codex",
+        ]
+        tools._activate_pm_remote.assert_called_once_with(
+            "ic-w-retry", "ssh-remote", client="codex",
+        )
+        worker = registry.get_worker("w-retry")
+        assert worker["client"] == "codex"
+        assert worker["model"] == "gpt-5.6-sol"
+        assert worker["native_session_id"] == _VALID_NATIVE_UUID
+
+    @pytest.mark.parametrize("client", ["claude", "codex"])
+    def test_remote_client_command_gate_preserves_claude_only_slash_commands(
+        self, registry, mock_tmux, tmp_path, db_conn, client,
+    ):
+        tools = OrchestratorTools(
+            registry,
+            mock_tmux,
+            str(tmp_path / "ledger.json"),
+            db_conn=db_conn,
+            advisor_cfg={
+                "enabled": True,
+                "advisor_model": "opus",
+                "advisor_models": {"claude-sonnet": "opus"},
+            },
+            dispatch_cfg={"use_goal": True},
+        )
+        machine = self._machine({
+            client: {"enabled": True, "path": f"/opt/{client}"},
+        })
+        model = "sonnet" if client == "claude" else "gpt-5.6-terra"
+        self._prepare_remote_success(
+            tools, machine, _provider_handle(client=client, model=model),
+        )
+
+        with patch("ironclaude.orchestrator_mcp.time.sleep"):
+            tools.spawn_worker(
+                worker_id=f"w-gate-{client}",
+                worker_type="claude-sonnet",
+                repo=self.REPO,
+                objective="Only objective",
+                machine="remote-worker",
+            )
+
+        sent = [call.args[1] for call in mock_tmux.send_keys.call_args_list]
+        if client == "claude":
+            assert sent == [
+                "/advisor opus",
+                "/goal the assigned objective is complete and code review has passed",
+                "Only objective",
+            ]
+        else:
+            assert sent == [_CODEX_ADVISOR_INSTRUCTION, "Only objective"]
+            # The property this test exists to guard: no Claude slash command
+            # reaches codex. The advisor text is not one.
+            assert not any(message.startswith("/") for message in sent)
+
+    def test_codex_receives_no_advisor_text_when_advisor_disabled(
+        self, registry, mock_tmux, tmp_path, db_conn,
+    ):
+        tools = OrchestratorTools(
+            registry,
+            mock_tmux,
+            str(tmp_path / "ledger.json"),
+            db_conn=db_conn,
+            advisor_cfg={"enabled": False},
+        )
+        machine = self._machine({"codex": {"enabled": True, "path": "/opt/codex"}})
+        self._prepare_remote_success(
+            tools, machine, _provider_handle(client="codex", model="gpt-5.6-terra"),
+        )
+
+        with patch("ironclaude.orchestrator_mcp.time.sleep"):
+            tools.spawn_worker(
+                worker_id="w-advisor-off",
+                worker_type="claude-sonnet",
+                repo=self.REPO,
+                objective="Only objective",
+                machine="remote-worker",
+            )
+
+        sent = [call.args[1] for call in mock_tmux.send_keys.call_args_list]
+        assert sent == ["Only objective"]
 
 
 class TestSpawnWorker:
@@ -222,13 +1156,17 @@ class TestSpawnWorker:
                 model_name="qwen3:8b",
             )
 
-    def test_spawn_calls_ensure_claude_md_before_tmux(self, tools, mock_tmux):
-        """spawn_worker calls _ensure_claude_md with repo before spawning tmux session."""
+    def test_spawn_calls_instruction_preflight_before_tmux(self, tools, mock_tmux):
+        """spawn_worker preflights active-client instructions before tmux."""
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
         _mock_grader_approve(tools)
         call_order = []
-        original_ensure = tools._ensure_claude_md
-        tools._ensure_claude_md = lambda repo: (call_order.append(("ensure_claude_md", repo)), original_ensure(repo))
+        tools._ensure_worker_instructions.side_effect = (
+            lambda repo, client: (
+                call_order.append(("ensure_worker_instructions", repo, client)),
+                None,
+            )[1]
+        )
         mock_tmux.spawn_session.side_effect = lambda *a, **kw: (call_order.append(("spawn_session",)), True)
         tools.spawn_worker(
             worker_id="w-test",
@@ -236,7 +1174,9 @@ class TestSpawnWorker:
             repo="/tmp/test-repo",
             objective="Test objective",
         )
-        assert call_order[0] == ("ensure_claude_md", "/tmp/test-repo")
+        assert call_order[0] == (
+            "ensure_worker_instructions", "/tmp/test-repo", "claude",
+        )
         assert call_order[1] == ("spawn_session",)
 
     def test_spawn_worker_sends_advisor_before_objective_when_enabled(self, registry, mock_tmux, tmp_path, db_conn):
@@ -436,7 +1376,7 @@ class TestSpawnWorker:
     ):
         """spawn_worker calls mkdir_p with remote log dir before spawn_session."""
         tools, _ = self._make_remote_tools(registry, mock_tmux, tmp_path, db_conn)
-        tools._activate_pm_remote = MagicMock(return_value=None)
+        tools._activate_pm_remote = MagicMock(return_value=_VALID_NATIVE_UUID)
         tools._ensure_claude_md_remote = MagicMock()
         tools._ensure_worker_trusted_remote = MagicMock()
         _mock_grader_approve(tools)
@@ -485,12 +1425,12 @@ class TestSpawnWorker:
         assert "died before ready" in result["error"]
         assert "claude binary not found" in result["error"]
 
-    def test_wait_for_ready_false_alive_session_proceeds(
+    def test_wait_for_ready_false_alive_remote_session_cleans_up(
         self, registry, mock_tmux, tmp_path, db_conn
     ):
-        """spawn_worker proceeds with warning when _wait_for_ready times out but session alive."""
+        """Remote readiness timeout fails closed even when session is alive."""
         tools, _ = self._make_remote_tools(registry, mock_tmux, tmp_path, db_conn)
-        tools._activate_pm_remote = MagicMock(return_value=None)
+        tools._activate_pm_remote = MagicMock(return_value=_VALID_NATIVE_UUID)
         tools._ensure_claude_md_remote = MagicMock()
         tools._ensure_worker_trusted_remote = MagicMock()
         _mock_grader_approve(tools)
@@ -507,8 +1447,12 @@ class TestSpawnWorker:
                 machine="remote-worker",
             )
 
-        assert "w-alive" in result
-        assert "error" not in result
+        assert "error" in result
+        assert "not ready" in result["error"]
+        mock_tmux.kill_session.assert_called_once_with(
+            "ic-w-alive", ssh_host="remote-worker",
+        )
+        assert registry.get_worker("w-alive") is None
 
 
 def _plant_directive(db_conn, planned_worker_type, planned_use_goal, planned_prompt):
@@ -1140,8 +2084,7 @@ class TestFableAvailabilityIntegration:
     def test_spawn_retry_idempotent_no_second_slack(
         self, tools, registry, mock_tmux, tmp_path, monkeypatch,
     ):
-        """Two consecutive fable-spawn deaths post the Fable-unavailable Slack
-        alert exactly once — the second death sees the flag already set."""
+        """First Fable death alerts once; next request starts degraded Opus."""
         from ironclaude import fable_availability
         state_path = tmp_path / "fable_state.json"
         monkeypatch.setattr(fable_availability, "_STATE_PATH", state_path)
@@ -1155,7 +2098,7 @@ class TestFableAvailabilityIntegration:
         mock_tmux.has_session.return_value = False
         mock_tmux.read_log_tail.return_value = "fable binary crashed\n"
 
-        with patch.object(tools, "_wait_for_ready", side_effect=[False, True, False, True]):
+        with patch.object(tools, "_wait_for_ready", side_effect=[False, True, True]):
             result1 = tools.spawn_worker(
                 worker_id="w-fable-death-1",
                 worker_type="claude-fable",
@@ -1264,6 +2207,8 @@ class TestFableAvailabilityIntegration:
         tools._call_local_grader = MagicMock(return_value={
             "grade": "A", "approved": True, "feedback": "ok", "confidence": "high",
         })
+        tools._wait_for_ready = MagicMock(return_value=True)
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
 
         # Force the batch PM-activation loop to succeed on its first iteration:
         # redirect HOME so claude_dir resolves under tmp_path, drop a valid
@@ -1371,7 +2316,7 @@ class TestFableAvailabilityIntegration:
         tools._ssh_manager = mock_ssh
         tools._get_ollama_vram = MagicMock(return_value=(0.0, []))
 
-        tools._activate_pm_remote = MagicMock(return_value=None)
+        tools._activate_pm_remote = MagicMock(return_value=_VALID_NATIVE_UUID)
         tools._ensure_claude_md_remote = MagicMock()
         tools._ensure_worker_trusted_remote = MagicMock()
         tools._call_local_grader = MagicMock(return_value={
@@ -1482,7 +2427,7 @@ class TestEnsureClaudeMd:
         """Writes boilerplate CLAUDE.md when repo has none."""
         repo = str(tmp_path / "empty-repo")
         os.makedirs(repo)
-        tools._ensure_claude_md(repo)
+        _REAL_ENSURE_WORKER_INSTRUCTIONS(tools, repo, "claude")
         claude_md = Path(repo) / "CLAUDE.md"
         assert claude_md.exists()
         content = claude_md.read_text()
@@ -1495,7 +2440,7 @@ class TestEnsureClaudeMd:
         os.makedirs(repo)
         claude_md = Path(repo) / "CLAUDE.md"
         claude_md.write_text("# My Custom CLAUDE.md\nKeep this content.")
-        tools._ensure_claude_md(repo)
+        _REAL_ENSURE_WORKER_INSTRUCTIONS(tools, repo, "claude")
         assert claude_md.read_text() == "# My Custom CLAUDE.md\nKeep this content."
 
 
@@ -3644,6 +4589,126 @@ def test_valid_directive_statuses_includes_awaiting_changes_and_superseded():
         assert existing in VALID_DIRECTIVE_STATUSES
 
 
+class TestDirectiveCapabilityBlock:
+    def _tools_and_directive(self, db_conn, registry, tmp_path):
+        tools = OrchestratorTools(
+            registry, MagicMock(), str(tmp_path / "ledger.json"), db_conn=db_conn,
+        )
+        db_conn.execute(
+            "INSERT INTO directives (source_ts, source_text, interpretation, status) "
+            "VALUES ('cap-1', 'blocked work', 'Blocked work', 'confirmed')"
+        )
+        db_conn.commit()
+        return tools, db_conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def test_blocked_directive_status_and_validation(self, db_conn, registry, tmp_path):
+        from ironclaude.orchestrator_mcp import VALID_DIRECTIVE_STATUSES
+        tools, directive_id = self._tools_and_directive(db_conn, registry, tmp_path)
+        assert "blocked" in VALID_DIRECTIVE_STATUSES
+        for bad_caps, scope, target, reason in (
+            ([], "codex_sandbox", "/repo", "denied"),
+            (["unknown"], "codex_sandbox", "/repo", "denied"),
+            (["workspace_write"], "unknown", "/repo", "denied"),
+            (["workspace_write"], "codex_sandbox", "", "denied"),
+            (["workspace_write"], "codex_sandbox", "/repo", ""),
+        ):
+            with pytest.raises(ValueError):
+                tools.report_directive_capability_block(
+                    directive_id, bad_caps, scope, target, reason
+                )
+
+    def test_directive_capability_block_dedup_generation_and_partial_recovery(
+        self, db_conn, registry, tmp_path
+    ):
+        tools, directive_id = self._tools_and_directive(db_conn, registry, tmp_path)
+        first = tools.report_directive_capability_block(
+            directive_id,
+            ["process_inspection", "workspace_write", "workspace_write"],
+            "codex_sandbox", "/repo", "denied",
+        )
+        assert first["capabilities"] == ["process_inspection", "workspace_write"]
+        assert first["generation"] == 1
+        db_conn.execute(
+            "UPDATE directive_capability_blocks SET notification_state='sent', "
+            "next_recheck_at=99, backoff_seconds=60 WHERE directive_id=?",
+            (directive_id,),
+        )
+        db_conn.commit()
+        same = tools.report_directive_capability_block(
+            directive_id,
+            ["workspace_write", "process_inspection"],
+            "codex_sandbox", "/repo", "new evidence",
+        )
+        assert (same["generation"], same["notification_state"],
+                same["next_recheck_at"], same["backoff_seconds"]) == (1, "sent", 99, 60)
+        partial = tools.report_directive_capability_recovery(
+            directive_id, ["workspace_write"]
+        )
+        assert partial["capabilities"] == ["process_inspection"]
+        remaining = tools.report_directive_capability_block(
+            directive_id, ["process_inspection"], "codex_sandbox", "/repo", "still denied"
+        )
+        assert (remaining["generation"], remaining["notification_state"],
+                remaining["next_recheck_at"]) == (1, "sent", 99)
+        changed = tools.report_directive_capability_block(
+            directive_id, ["ollama_loopback"], "host_runtime", "localhost", "down"
+        )
+        assert changed["generation"] == 2
+        assert changed["notification_state"] == "pending"
+
+    def test_directive_capability_block_full_recovery_and_generic_guard(
+        self, db_conn, registry, tmp_path
+    ):
+        tools, directive_id = self._tools_and_directive(db_conn, registry, tmp_path)
+        with pytest.raises(ValueError, match="structured"):
+            tools.update_directive_status(directive_id, "blocked")
+        tools.report_directive_capability_block(
+            directive_id, ["workspace_write"], "project_permission", "/repo", "readonly"
+        )
+        with pytest.raises(ValueError, match="structured"):
+            tools.update_directive_status(directive_id, "confirmed")
+        recovered = tools.report_directive_capability_recovery(
+            directive_id, ["workspace_write"]
+        )
+        assert recovered["state"] == "recovered"
+        assert recovered["recovery_dispatch_state"] == "pending"
+        assert db_conn.execute(
+            "SELECT status FROM directives WHERE id=?", (directive_id,)
+        ).fetchone()[0] == "blocked"
+
+    def test_directive_capability_block_atomic_rollback(
+        self, db_conn, registry, tmp_path
+    ):
+        tools, directive_id = self._tools_and_directive(db_conn, registry, tmp_path)
+        db_conn.execute(
+            "CREATE TRIGGER reject_block_status BEFORE UPDATE OF status ON directives "
+            "WHEN NEW.status='blocked' BEGIN SELECT RAISE(ABORT, 'reject block'); END"
+        )
+        db_conn.commit()
+        with pytest.raises(sqlite3.IntegrityError, match="reject block"):
+            tools.report_directive_capability_block(
+                directive_id, ["workspace_write"], "codex_sandbox", "/repo", "denied"
+            )
+        assert db_conn.execute(
+            "SELECT 1 FROM directive_capability_blocks WHERE directive_id=?",
+            (directive_id,),
+        ).fetchone() is None
+        assert db_conn.execute(
+            "SELECT status FROM directives WHERE id=?", (directive_id,)
+        ).fetchone()[0] == "confirmed"
+
+    def test_directive_capability_block_mcp_wrappers(self, db_conn, registry, tmp_path):
+        from ironclaude.orchestrator_mcp import _create_mcp_server
+        tools, directive_id = self._tools_and_directive(db_conn, registry, tmp_path)
+        server = _create_mcp_server(tools)
+        block = server._tool_manager.get_tool("report_directive_capability_block").fn
+        recover = server._tool_manager.get_tool("report_directive_capability_recovery").fn
+        assert json.loads(block(
+            directive_id, ["workspace_write"], "codex_sandbox", "/repo", "denied"
+        ))["state"] == "blocked"
+        assert json.loads(recover(directive_id, ["workspace_write"]))["state"] == "recovered"
+
+
 def test_submit_directive_stores_interpretation_ts(db_conn, registry, tmp_path):
     """Verify interpretation_ts is stored when Slack post succeeds."""
     mock_slack = MagicMock(spec=SlackBot)
@@ -4352,6 +5417,494 @@ class TestBatchSpawn:
         assert call_count[0] > 1
 
 
+class TestProviderAwareBatchLifecycle:
+    @pytest.fixture(autouse=True)
+    def _batch_defaults(self, tools):
+        _mock_batch_approve(tools)
+        tools._ensure_worker_instructions = MagicMock(return_value=None)
+        tools.ensure_worker_trusted = MagicMock()
+        tools._wait_for_ready = MagicMock(return_value=True)
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._read_pm_state_via_sqlite = MagicMock(return_value={
+            "professional_mode": "on",
+            "workflow_stage": "idle",
+            "session_uuid": _VALID_NATIVE_UUID,
+        })
+
+    @staticmethod
+    def _request(worker_id="w1", worker_type="claude-sonnet", **overrides):
+        request = {
+            "worker_id": worker_id,
+            "worker_type": worker_type,
+            "repo": "/tmp/repo",
+            "objective": f"Objective {worker_id}",
+        }
+        request.update(overrides)
+        return request
+
+    def test_batch_provider_unavailable_fails_closed_without_claude_fallback(
+        self, tools, mock_tmux,
+    ):
+        error = NoCapabilityAvailable("worker", "sonnet", ["local"])
+        tools._resolve_worker_client = MagicMock(side_effect=error)
+
+        result = tools.spawn_workers([self._request()])
+
+        assert result == [{"worker_id": "w1", "error": str(error)}]
+        mock_tmux.spawn_session.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("client", "message"),
+        [
+            ("codex", "Failed to ensure AGENTS.md"),
+            ("claude", "Failed to ensure CLAUDE.md"),
+        ],
+    )
+    def test_batch_instruction_preflight_failure_blocks_spawn(
+        self, tools, mock_tmux, client, message,
+    ):
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle(
+            client=client,
+            model="gpt-5.6-terra" if client == "codex" else "sonnet",
+        ))
+        tools._ensure_worker_instructions.return_value = message
+
+        result = tools.spawn_workers([self._request()])
+
+        assert result == [{"worker_id": "w1", "error": message}]
+        mock_tmux.spawn_session.assert_not_called()
+
+    def test_batch_codex_uses_provider_lifecycle_and_persists_provider(
+        self, tools, registry, mock_tmux,
+    ):
+        handle = _provider_handle()
+        tools._resolve_worker_client = MagicMock(return_value=handle)
+        tools._advisor_cfg["enabled"] = True
+        tools._dispatch_cfg["use_goal"] = True
+
+        result = tools.spawn_workers([self._request()])
+
+        command = mock_tmux.spawn_session.call_args.args[1]
+        assert "exec codex --model gpt-5.6-terra" in command
+        tools._wait_for_ready.assert_called_once_with(
+            "ic-w1", timeout=30, client="codex",
+        )
+        tools._activate_pm_via_sqlite.assert_called_once_with(
+            "ic-w1", timeout=300, max_retries=3, client="codex",
+        )
+        messages = [call.args[1] for call in mock_tmux.send_keys.call_args_list]
+        assert messages == ["Objective w1"]
+        worker = registry.get_worker("w1")
+        assert worker["type"] == "claude-sonnet"
+        assert worker["client"] == "codex"
+        assert worker["model"] == "gpt-5.6-terra"
+        assert worker["native_session_id"] == _VALID_NATIVE_UUID
+        assert result[0]["status"] == "spawned"
+        assert registry.get_events_for_worker(
+            "w1", event_type="worker_spawned",
+        )
+
+    def test_batch_claude_preserves_tiered_advisor_and_global_goal(
+        self, tools, registry, mock_tmux,
+    ):
+        handle = _provider_handle(client="claude", model="sonnet")
+        tools._resolve_worker_client = MagicMock(return_value=handle)
+        tools._advisor_cfg["enabled"] = True
+        tools._advisor_model_for = MagicMock(return_value="opus")
+        tools._dispatch_cfg["use_goal"] = True
+
+        result = tools.spawn_workers([self._request()])
+
+        messages = [call.args[1] for call in mock_tmux.send_keys.call_args_list]
+        assert messages == [
+            "/advisor opus",
+            "/goal the assigned objective is complete and code review has passed",
+            "Objective w1",
+        ]
+        tools._advisor_model_for.assert_called_once_with("claude-sonnet")
+        worker = registry.get_worker("w1")
+        assert worker["client"] == "claude"
+        assert worker["model"] == "sonnet"
+        assert worker["native_session_id"] == _VALID_NATIVE_UUID
+        assert result[0]["status"] == "spawned"
+
+    @pytest.mark.parametrize(
+        "pm_state",
+        [
+            {"professional_mode": "off", "workflow_stage": "idle",
+             "session_uuid": _VALID_NATIVE_UUID},
+            {"professional_mode": "on", "workflow_stage": "idle",
+             "session_uuid": None},
+            {"professional_mode": "on", "workflow_stage": "idle",
+             "session_uuid": "x" * 36},
+        ],
+        ids=["pm-off", "missing-uuid", "invalid-uuid"],
+    )
+    def test_batch_invalid_native_session_id_cleans_up(
+        self, tools, registry, mock_tmux, pm_state,
+    ):
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        tools._read_pm_state_via_sqlite.return_value = pm_state
+
+        result = tools.spawn_workers([self._request()])
+
+        assert "error" in result[0]
+        mock_tmux.kill_session.assert_called_once_with("ic-w1")
+        assert registry.get_worker("w1") is None
+        assert not registry.get_events_for_worker(
+            "w1", event_type="worker_spawned",
+        )
+
+    def test_batch_mixed_dispatches_fast_success_before_slow_peer(
+        self, tools, mock_tmux,
+    ):
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        slow_release = threading.Event()
+        fast_dispatched = threading.Event()
+
+        def wait_for_ready(session_name, **_kwargs):
+            if session_name == "ic-slow":
+                return slow_release.wait(timeout=5)
+            return True
+
+        def send_keys(session_name, message, **_kwargs):
+            if session_name == "ic-fast" and message == "Objective fast":
+                fast_dispatched.set()
+            return True
+
+        tools._wait_for_ready.side_effect = wait_for_ready
+        mock_tmux.send_keys.side_effect = send_keys
+        try:
+            timer = threading.Timer(2, slow_release.set)
+            timer.start()
+            result = tools.spawn_workers([
+                self._request("slow"),
+                self._request("fast"),
+            ])
+            assert fast_dispatched.is_set()
+        finally:
+            slow_release.set()
+            if "timer" in locals():
+                timer.cancel()
+
+        assert [item["worker_id"] for item in result] == ["slow", "fast"]
+        assert all(item["status"] == "spawned" for item in result)
+
+    def test_batch_future_exception_isolated_by_result_slot(
+        self, tools, registry, mock_tmux,
+    ):
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+
+        def wait_for_ready(session_name, **_kwargs):
+            if session_name == "ic-bad":
+                raise RuntimeError("readiness exploded")
+            return True
+
+        tools._wait_for_ready.side_effect = wait_for_ready
+        result = tools.spawn_workers([
+            self._request("bad"),
+            self._request("good"),
+        ])
+
+        assert result[0] == {
+            "worker_id": "bad",
+            "error": "Worker startup failed: readiness exploded",
+        }
+        assert result[1]["status"] == "spawned"
+        assert registry.get_worker("bad") is None
+        assert registry.get_worker("good") is not None
+        mock_tmux.kill_session.assert_any_call("ic-bad")
+
+    def test_batch_spawn_failure_isolated_by_result_slot(
+        self, tools, registry, mock_tmux,
+    ):
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        mock_tmux.spawn_session.side_effect = (
+            lambda session_name, *_args, **_kwargs: session_name != "ic-bad"
+        )
+
+        result = tools.spawn_workers([
+            self._request("bad"),
+            self._request("good"),
+        ])
+
+        assert result[0]["error"] == "Failed to spawn tmux session"
+        assert result[1]["status"] == "spawned"
+        assert registry.get_worker("bad") is None
+        assert registry.get_worker("good") is not None
+
+    def test_batch_all_pre_spawn_failures_return_ordered_errors(
+        self, tools, mock_tmux,
+    ):
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        tools._ensure_worker_instructions.side_effect = ["first", "second"]
+
+        result = tools.spawn_workers([
+            self._request("w1"),
+            self._request("w2"),
+        ])
+
+        assert result == [
+            {"worker_id": "w1", "error": "first"},
+            {"worker_id": "w2", "error": "second"},
+        ]
+        mock_tmux.spawn_session.assert_not_called()
+
+    def test_batch_alive_readiness_timeout_preserves_single_worker_behavior(
+        self, tools, registry, mock_tmux,
+    ):
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        tools._wait_for_ready.return_value = False
+        mock_tmux.has_session.return_value = True
+
+        result = tools.spawn_workers([self._request()])
+
+        assert result[0]["status"] == "spawned"
+        assert registry.get_worker("w1") is not None
+        tools._activate_pm_via_sqlite.assert_called_once()
+
+    def test_batch_dead_readiness_failure_isolated(
+        self, tools, registry, mock_tmux,
+    ):
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        tools._wait_for_ready.side_effect = (
+            lambda session_name, **_kwargs: session_name == "ic-good"
+        )
+        mock_tmux.has_session.side_effect = (
+            lambda session_name, **_kwargs: session_name == "ic-good"
+        )
+
+        result = tools.spawn_workers([
+            self._request("dead"),
+            self._request("good"),
+        ])
+
+        assert "died before ready" in result[0]["error"]
+        assert result[1]["status"] == "spawned"
+        assert registry.get_worker("dead") is None
+        assert registry.get_worker("good") is not None
+
+    def test_batch_pm_failure_isolated_and_unregistered(
+        self, tools, registry, mock_tmux,
+    ):
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        tools._activate_pm_via_sqlite.side_effect = ["database busy", None]
+
+        result = tools.spawn_workers([
+            self._request("bad"),
+            self._request("good"),
+        ])
+
+        assert result[0]["error"] == "PM activation failed: database busy"
+        assert result[1]["status"] == "spawned"
+        assert registry.get_worker("bad") is None
+        assert registry.get_worker("good") is not None
+
+    def test_batch_rejects_zero_pm_retries_before_spawn(
+        self, tools, mock_tmux,
+    ):
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+
+        result = tools.spawn_workers([
+            self._request(pm_max_retries=0),
+        ])
+
+        assert "pm_max_retries" in result[0]["error"]
+        mock_tmux.spawn_session.assert_not_called()
+
+    def test_batch_ollama_missing_model_preserves_error(
+        self, tools, mock_tmux,
+    ):
+        result = tools.spawn_workers([
+            self._request(worker_type="ollama"),
+        ])
+
+        assert result == [{
+            "worker_id": "w1",
+            "error": "Cannot spawn ollama worker — model_name is required",
+        }]
+        mock_tmux.spawn_session.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("client", "effective", "expected_type", "advisor"),
+        [
+            ("codex", "opus", "claude-opus", None),
+            ("claude", "opus", "claude-opus", "opus"),
+        ],
+    )
+    def test_batch_degraded_fable_uses_effective_provider_and_advisor(
+        self, tools, registry, mock_tmux, client, effective,
+        expected_type, advisor,
+    ):
+        handle = _provider_handle(
+            client=client,
+            requested="fable",
+            effective=effective,
+            model="gpt-5.6-sol" if client == "codex" else "claude-opus-4-6",
+        )
+        tools._resolve_worker_client = MagicMock(return_value=handle)
+        tools._advisor_cfg["enabled"] = True
+        tools._advisor_model_for = MagicMock(return_value="opus")
+
+        result = tools.spawn_workers([
+            self._request(worker_type="claude-fable"),
+        ])
+
+        worker = registry.get_worker("w1")
+        assert worker["type"] == expected_type
+        messages = [call.args[1] for call in mock_tmux.send_keys.call_args_list]
+        if advisor is None:
+            assert all(not message.startswith("/advisor") for message in messages)
+        else:
+            assert f"/advisor {advisor}" in messages
+            tools._advisor_model_for.assert_called_once_with(expected_type)
+        assert result[0]["worker_type"] == expected_type
+
+    @pytest.mark.parametrize("client", ["codex", "claude"])
+    def test_batch_routed_or_degraded_fable_death_does_not_mutate_fable_state(
+        self, tools, mock_tmux, client,
+    ):
+        handle = _provider_handle(
+            client=client,
+            requested="fable",
+            effective="opus",
+            model="gpt-5.6-sol" if client == "codex" else "claude-opus-4-6",
+        )
+        tools._resolve_worker_client = MagicMock(return_value=handle)
+        tools._wait_for_ready.return_value = False
+        mock_tmux.has_session.return_value = False
+
+        with patch(
+            "ironclaude.orchestrator_mcp._mark_fable_unavailable",
+        ) as mark:
+            result = tools.spawn_workers([
+                self._request(worker_type="claude-fable"),
+            ])
+
+        assert "died before ready" in result[0]["error"]
+        mark.assert_not_called()
+        assert mock_tmux.spawn_session.call_count == 1
+
+    def test_spawn_worker_codex_routed_fable_death_does_not_mutate_fable_state(
+        self, tools, mock_tmux,
+    ):
+        handle = _provider_handle(
+            client="codex",
+            requested="fable",
+            effective="opus",
+            model="gpt-5.6-sol",
+        )
+        tools._resolve_worker_client = MagicMock(return_value=handle)
+        tools._wait_for_ready.return_value = False
+        mock_tmux.has_session.return_value = False
+        _mock_grader_approve(tools)
+
+        with patch(
+            "ironclaude.orchestrator_mcp._mark_fable_unavailable",
+        ) as mark:
+            result = tools.spawn_worker(
+                worker_id="w1",
+                worker_type="claude-fable",
+                repo="/tmp/repo",
+                objective="Task",
+            )
+
+        assert "died before ready" in result["error"]
+        mark.assert_not_called()
+        assert mock_tmux.spawn_session.call_count == 1
+
+    def test_spawn_worker_claude_degraded_fable_uses_effective_opus_advisor(
+        self, tools, registry, mock_tmux,
+    ):
+        handle = _provider_handle(
+            client="claude",
+            requested="fable",
+            effective="opus",
+            model="claude-opus-4-6",
+        )
+        tools._resolve_worker_client = MagicMock(return_value=handle)
+        tools._advisor_cfg["enabled"] = True
+        tools._advisor_model_for = MagicMock(return_value="opus")
+        _mock_grader_approve(tools)
+
+        tools.spawn_worker(
+            worker_id="w1",
+            worker_type="claude-fable",
+            repo="/tmp/repo",
+            objective="Task",
+        )
+
+        tools._advisor_model_for.assert_called_once_with("claude-opus")
+        assert registry.get_worker("w1")["type"] == "claude-opus"
+
+    def test_batch_genuine_fable_recovery_clears_non_usage_flag(
+        self, tools, mock_tmux,
+    ):
+        handle = _provider_handle(
+            client="claude",
+            requested="fable",
+            effective="fable",
+            model="fable",
+        )
+        tools._resolve_worker_client = MagicMock(return_value=handle)
+
+        with patch(
+            "ironclaude.fable_availability.fable_block_category",
+            return_value="outage",
+        ), patch(
+            "ironclaude.orchestrator_mcp._clear_fable_unavailable",
+            return_value="removed",
+        ) as clear:
+            result = tools.spawn_workers([
+                self._request(worker_type="claude-fable"),
+            ])
+
+        assert result[0]["status"] == "spawned"
+        clear.assert_called_once_with()
+
+    def test_batch_fable_death_retries_opus_with_effective_provider(
+        self, tools, registry, mock_tmux,
+    ):
+        fable = _provider_handle(
+            client="claude",
+            requested="fable",
+            effective="fable",
+            model="fable",
+        )
+        opus = _provider_handle(
+            client="claude",
+            requested="opus",
+            effective="opus",
+            model="claude-opus-4-6",
+        )
+        tools._resolve_worker_client = MagicMock(side_effect=[fable, opus])
+        tools._wait_for_ready.side_effect = [False, True]
+        mock_tmux.has_session.return_value = False
+        tools._advisor_cfg["enabled"] = True
+        tools._advisor_model_for = MagicMock(return_value="opus")
+
+        with patch(
+            "ironclaude.orchestrator_mcp._mark_fable_unavailable",
+            return_value="transition",
+        ) as mark:
+            result = tools.spawn_workers([
+                self._request(worker_type="claude-fable"),
+            ])
+
+        mark.assert_called_once_with("spawn-died")
+        assert mock_tmux.spawn_session.call_count == 2
+        first_command = mock_tmux.spawn_session.call_args_list[0].args[1]
+        retry_command = mock_tmux.spawn_session.call_args_list[1].args[1]
+        assert "--model fable" in first_command
+        assert "--model claude-opus-4-6" in retry_command
+        worker = registry.get_worker("w1")
+        assert worker["type"] == "claude-opus"
+        assert worker["client"] == "claude"
+        assert worker["model"] == "claude-opus-4-6"
+        assert result[0]["worker_type"] == "claude-opus"
+        tools._advisor_model_for.assert_called_once_with("claude-opus")
+
+
 class TestSpawnWorkersBatchPmTimeout:
     """Tests for pm_timeout per-request deadline in spawn_workers."""
 
@@ -4370,46 +5923,26 @@ class TestSpawnWorkersBatchPmTimeout:
         assert "error" in results[0]
 
     def test_deadline_uses_max_pm_timeout(self, tools, mock_tmux):
-        """spawn_workers deadline equals max per-request pm_timeout, not hardcoded 300."""
-        import ironclaude.orchestrator_mcp as orc_mcp
-
+        """spawn_workers passes each request's PM timeout to shared activation."""
         tools._call_local_grader = MagicMock(return_value={"grade": "A", "approved": True, "feedback": "ok"})
-        # single request → graded individually → _call_grader returns a dict
         tools._call_grader = MagicMock(return_value={
             "grade": "A", "approved": True, "feedback": "Good", "recommended_model": "claude-sonnet"})
         mock_tmux.spawn_session.return_value = True
-
-        # Patch subprocess.run so tmux list-panes returns a valid PID,
-        # causing w1 to enter `pending` so the while-loop actually evaluates the deadline.
-        mock_run_result = MagicMock()
-        mock_run_result.stdout = "99999\n"
-
-        # Time sequence:
-        #   call 1 → 1000.0  (deadline = 1000 + max_pm_timeout)
-        #   call 2 → 1350.0  (loop condition: past hardcoded-300 deadline of 1300,
-        #                      but NOT past pm_timeout=600 deadline of 1600)
-        # With OLD code (hardcoded 300): deadline=1300, 1350>=1300 → exit → timeout error
-        # With NEW code (pm_timeout=600): deadline=1600, 1350<1600 → iterate → sleep
-        #   call 3 → 1700.0  (now past 1600 deadline → exit → timeout error)
-        time_calls = iter([1000.0, 1350.0, 1700.0])
-        sleep_calls = []
-
-        with patch("subprocess.run", return_value=mock_run_result):
-            with patch.object(orc_mcp, "time") as mock_time_mod:
-                mock_time_mod.time.side_effect = lambda: next(time_calls)
-                mock_time_mod.sleep.side_effect = lambda s: sleep_calls.append(s)
-                results = tools.spawn_workers([
-                    {"worker_id": "w1", "worker_type": "claude-sonnet", "repo": "/tmp/repo",
-                     "objective": "Task 1", "pm_timeout": 600},
-                ])
-
-        # With pm_timeout=600, loop ran at least one full iteration (slept once)
-        # before the deadline at t=1700 expired. With hardcoded 300, no sleep occurs.
-        assert len(sleep_calls) >= 1, (
-            "expected at least one sleep() — pm_timeout=600 deadline should not have "
-            "expired at t=1350; hardcoded 300s deadline would expire at t=1300"
+        tools._activate_pm_via_sqlite = MagicMock(
+            return_value="timed out after 600 seconds",
         )
-        assert results[0].get("error") == "PM activation timed out (batch)"
+
+        results = tools.spawn_workers([
+            {"worker_id": "w1", "worker_type": "claude-sonnet", "repo": "/tmp/repo",
+             "objective": "Task 1", "pm_timeout": 600},
+        ])
+
+        tools._activate_pm_via_sqlite.assert_called_once_with(
+            "ic-w1", timeout=600, max_retries=3, client="claude",
+        )
+        assert results[0].get("error") == (
+            "PM activation failed: timed out after 600 seconds"
+        )
 
 
 class TestRestartDaemon:
@@ -5824,26 +7357,64 @@ class TestCheckSpawnPreconditions:
 
 
 class TestActivatePmRemote:
-    def test_rejects_non_uuid_session_id(self, tools, mock_tmux):
+    def test_remote_claude_native_identity_rejects_non_uuid(
+        self, tools, mock_tmux,
+    ):
         """_activate_pm_remote returns error if session UUID fails UUID format check."""
         # 36-char string that passes the len==36 check but contains SQL injection characters
         malicious = "a' OR 'x'='x'; INSERT INTO evil;!xxx"
         assert len(malicious) == 36
         mock_tmux.list_pane_pid.return_value = "12345"
         mock_tmux.read_file.return_value = malicious
-        result = tools._activate_pm_remote("ic-w1", "remote-host")
+        result = tools._activate_pm_remote(
+            "ic-w1", "remote-host", client="claude",
+        )
         assert isinstance(result, str)
         assert "invalid" in result.lower()
         mock_tmux.run_sqlite_query.assert_not_called()
 
-    def test_accepts_valid_uuid(self, tools, mock_tmux):
-        """_activate_pm_remote succeeds when session UUID matches UUID format."""
+    def test_remote_claude_native_identity_uses_pane_pid(
+        self, tools, mock_tmux,
+    ):
+        """Claude reads and returns the pane-bound provider-native UUID."""
         mock_tmux.list_pane_pid.return_value = "12345"
         mock_tmux.read_file.return_value = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         mock_tmux.run_sqlite_query.return_value = ""
-        result = tools._activate_pm_remote("ic-w1", "remote-host")
-        assert result is None
+        result = tools._activate_pm_remote(
+            "ic-w1", "remote-host", client="claude",
+        )
+        assert result == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        mock_tmux.read_file.assert_called_with(
+            "~/.claude/ironclaude-session-12345.id",
+            ssh_host="remote-host",
+        )
         mock_tmux.run_sqlite_query.assert_called_once()
+
+    def test_remote_codex_native_identity_uses_descendant_pid(
+        self, tools, mock_tmux,
+    ):
+        mock_tmux.list_pane_pid.return_value = "12345"
+        native_uuid = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+        mock_tmux.read_file.side_effect = lambda path, ssh_host=None: (
+            native_uuid if path.endswith("-23456.id") else None
+        )
+        mock_tmux.run_sqlite_query.return_value = ""
+        ssh = MagicMock()
+        ssh.run_argv.side_effect = [
+            ProbeResult(0, "23456\n", ""),
+            ProbeResult(1, "", ""),
+        ]
+        tools._ssh_manager = ssh
+
+        result = tools._activate_pm_remote(
+            "ic-w1", "remote-host", client="codex",
+        )
+
+        assert result == native_uuid
+        assert [call.args for call in ssh.run_argv.call_args_list] == [
+            ("remote-host", ["pgrep", "-P", "12345"]),
+            ("remote-host", ["pgrep", "-P", "23456"]),
+        ]
 
     def test_pane_pid_none_includes_alive_status_and_log(self, tools, mock_tmux):
         """When list_pane_pid returns None, error includes session status and log tail."""
@@ -5851,7 +7422,9 @@ class TestActivatePmRemote:
         mock_tmux.has_session.return_value = False
         mock_tmux.read_log_tail.return_value = "/usr/local/bin/claude: not found\n"
 
-        result = tools._activate_pm_remote("ic-w1", "kandice")
+        result = tools._activate_pm_remote(
+            "ic-w1", "kandice", client="claude",
+        )
 
         assert isinstance(result, str)
         assert "DEAD" in result
@@ -6515,34 +8088,88 @@ class TestReadPmState:
         claude = tmp_path / ".claude"
         claude.mkdir()
         mock_tmux.list_pane_pid.return_value = "12345"
-        out = tools._read_pm_state_via_sqlite("ic-x", _claude_dir=claude)
+        out = _REAL_READ_PM_STATE(
+            tools, "ic-x", _claude_dir=claude, client="claude",
+        )
         assert out["professional_mode"] == "unknown"
         assert out["workflow_stage"] is None
 
-    def test_seeded_row_reported_and_unchanged(self, tools, mock_tmux, tmp_path):
+    def test_provider_aware_claude_native_session_id_reported_and_unchanged(
+        self, tools, mock_tmux, tmp_path,
+    ):
         claude = tmp_path / ".claude"
         claude.mkdir()
-        uuid = "a" * 36
+        uuid = "44444444-4444-4444-8444-444444444444"
         (claude / "ironclaude-session-12345.id").write_text(uuid)
         self._seed_sessions_db(claude, uuid, pm="on", stage="executing")
         mock_tmux.list_pane_pid.return_value = "12345"
-        out = tools._read_pm_state_via_sqlite("ic-x", _claude_dir=claude)
+        out = _REAL_READ_PM_STATE(
+            tools, "ic-x", _claude_dir=claude, client="claude",
+        )
         assert out["professional_mode"] == "on"
         assert out["workflow_stage"] == "executing"
+        assert out["session_uuid"] == uuid
         db = sqlite3.connect(str(claude / "ironclaude.db"))
         row = db.execute("SELECT professional_mode, workflow_stage FROM sessions"
                          " WHERE terminal_session=?", (uuid,)).fetchone()
         db.close()
         assert row == ("on", "executing")
 
+    def test_provider_aware_codex_descendant_native_session_id_reported(
+        self, tools, mock_tmux, tmp_path,
+    ):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        uuid = "55555555-5555-4555-8555-555555555555"
+        (claude / "ironclaude-session-22222.id").write_text(uuid)
+        self._seed_sessions_db(claude, uuid, pm="on", stage="executing")
+        mock_tmux.list_pane_pid.return_value = "12345"
+        tools._descendant_pids = MagicMock(return_value=[12345, 22222])
+
+        out = _REAL_READ_PM_STATE(
+            tools, "ic-x", _claude_dir=claude, client="codex",
+        )
+
+        assert out == {
+            "professional_mode": "on",
+            "workflow_stage": "executing",
+            "session_uuid": uuid,
+        }
+        tools._descendant_pids.assert_called_once_with(12345)
+
+    @pytest.mark.parametrize("client", ["claude", "codex"])
+    def test_provider_aware_non_uuid_native_session_id_rejected(
+        self, tools, mock_tmux, tmp_path, client,
+    ):
+        claude = tmp_path / f".claude-{client}"
+        claude.mkdir()
+        pid = 12345 if client == "claude" else 22222
+        (claude / f"ironclaude-session-{pid}.id").write_text("x" * 36)
+        mock_tmux.list_pane_pid.return_value = "12345"
+        tools._descendant_pids = MagicMock(return_value=[12345, 22222])
+
+        out = _REAL_READ_PM_STATE(
+            tools, "ic-x", _claude_dir=claude, client=client,
+        )
+
+        assert out == {
+            "professional_mode": "unknown",
+            "workflow_stage": None,
+            "session_uuid": None,
+        }
+
     def test_id_file_but_no_row_returns_off(self, tools, mock_tmux, tmp_path):
         claude = tmp_path / ".claude"
         claude.mkdir()
-        uuid = "b" * 36
+        uuid = "66666666-6666-4666-8666-666666666666"
         (claude / "ironclaude-session-12345.id").write_text(uuid)
-        self._seed_sessions_db(claude, "c" * 36)
+        self._seed_sessions_db(
+            claude, "77777777-7777-4777-8777-777777777777",
+        )
         mock_tmux.list_pane_pid.return_value = "12345"
-        out = tools._read_pm_state_via_sqlite("ic-x", _claude_dir=claude)
+        out = _REAL_READ_PM_STATE(
+            tools, "ic-x", _claude_dir=claude, client="claude",
+        )
         assert out["professional_mode"] == "off"
         assert out["workflow_stage"] is None
 
@@ -6732,60 +8359,316 @@ class TestAdoptSession:
 
 
 class TestResumeSession:
-    def test_rejects_existing_worker_id(self, tools, registry, mock_tmux):
-        registry.register_worker("d1", "claude-opus", "ic-d1", repo="/r", description="x")
-        out = tools.resume_session("aaaa-1111", "d1", repo="/r")
-        assert "error" in out
+    UUID = "e6d6a6fb-35ae-4ddf-ba2d-3f098c24b9ec"
 
-    def test_rejects_existing_target_session(self, tools, mock_tmux):
-        mock_tmux.has_session.side_effect = lambda n, **k: n == "ic-d2"
-        out = tools.resume_session("aaaa-2222", "d2", repo="/r")
-        assert "error" in out
-
-    def test_spawn_fails(self, tools, mock_tmux):
-        mock_tmux.has_session.return_value = False
-        mock_tmux.spawn_session.return_value = False
-        tools._ensure_claude_md = MagicMock()
-        tools.ensure_worker_trusted = MagicMock()
-        out = tools.resume_session("aaaa-3333", "d3", repo="/r")
-        assert "error" in out
-
-    def test_pm_failure_kills_session(self, tools, mock_tmux):
-        mock_tmux.has_session.return_value = False
-        mock_tmux.spawn_session.return_value = True
-        tools._ensure_claude_md = MagicMock()
-        tools.ensure_worker_trusted = MagicMock()
-        tools._wait_for_ready = MagicMock(return_value=True)
-        tools._activate_pm_via_sqlite = MagicMock(return_value="timeout waiting for session ID")
-        out = tools.resume_session("aaaa-4444", "d4", repo="/r")
-        assert "error" in out
-        mock_tmux.kill_session.assert_called_once_with("ic-d4")
-
-    def test_success_spawns_activates_registers(self, tools, registry, mock_tmux):
-        session_id = "e6d6a6fb-35ae-4ddf-ba2d-3f098c24b9ec"
+    def _prepare_success(self, tools, mock_tmux, client, observed_uuid=None):
         mock_tmux.has_session.return_value = False
         mock_tmux.spawn_session.return_value = True
         mock_tmux.capture_pane.return_value = "resumed context output"
-        tools._ensure_claude_md = MagicMock()
+        tools._ensure_worker_instructions = MagicMock(return_value=None)
         tools.ensure_worker_trusted = MagicMock()
         tools._wait_for_ready = MagicMock(return_value=True)
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
         tools._read_pm_state_via_sqlite = MagicMock(return_value={
-            "professional_mode": "on", "workflow_stage": "executing", "session_uuid": "z" * 36,
+            "professional_mode": "on",
+            "workflow_stage": "executing",
+            "session_uuid": observed_uuid or self.UUID,
         })
-        out = tools.resume_session(session_id, "d5", repo="/r", description="resuming auth work")
+        tools._provider_router = MagicMock()
+        state = ProviderState(tools._db)
+        state.set_current_client("worker", "codex")
+        return state
+
+    def test_client_is_required(self, tools):
+        with pytest.raises(TypeError):
+            tools.resume_session(self.UUID, "d0", repo="/r")
+
+    @pytest.mark.parametrize("client", ["", "ollama", "CLAUDE", None])
+    def test_rejects_invalid_client_before_side_effects(
+        self, tools, mock_tmux, client,
+    ):
+        state = ProviderState(tools._db)
+        state.set_current_client("worker", "codex")
+        tools._provider_router = MagicMock()
+        tools._ensure_worker_instructions = MagicMock()
+
+        out = tools.resume_session(self.UUID, client, "d0", repo="/r")
+
+        assert out == {"error": "client must be 'claude' or 'codex'"}
+        tools._ensure_worker_instructions.assert_not_called()
+        mock_tmux.spawn_session.assert_not_called()
+        tools._provider_router.assert_not_called()
+        assert state.get_current_client("worker") == "codex"
+
+    @pytest.mark.parametrize("session_id", ["", "aaaa-1111", "x" * 36])
+    def test_rejects_non_uuid_before_side_effects(
+        self, tools, mock_tmux, session_id,
+    ):
+        state = ProviderState(tools._db)
+        state.set_current_client("worker", "codex")
+        tools._provider_router = MagicMock()
+        tools._ensure_worker_instructions = MagicMock()
+
+        out = tools.resume_session(session_id, "codex", "d0", repo="/r")
+
+        assert out == {"error": "session_id must be a provider-native UUID"}
+        tools._ensure_worker_instructions.assert_not_called()
+        mock_tmux.spawn_session.assert_not_called()
+        tools._provider_router.assert_not_called()
+        assert state.get_current_client("worker") == "codex"
+
+    def test_rejects_existing_worker_id(self, tools, registry, mock_tmux):
+        registry.register_worker("d1", "claude-opus", "ic-d1", repo="/r", description="x")
+        out = tools.resume_session(self.UUID, "claude", "d1", repo="/r")
+        assert "error" in out
+
+    def test_rejects_existing_target_session(self, tools, mock_tmux):
+        mock_tmux.has_session.side_effect = lambda n, **k: n == "ic-d2"
+        out = tools.resume_session(self.UUID, "claude", "d2", repo="/r")
+        assert "error" in out
+
+    def test_spawn_fails(self, tools, mock_tmux):
+        state = ProviderState(tools._db)
+        state.set_current_client("worker", "codex")
+        mock_tmux.has_session.return_value = False
+        mock_tmux.spawn_session.return_value = False
+        tools._ensure_worker_instructions = MagicMock(return_value=None)
+        tools.ensure_worker_trusted = MagicMock()
+        tools._provider_router = MagicMock()
+
+        out = tools.resume_session(self.UUID, "claude", "d3", repo="/r")
+
+        assert "error" in out
+        tools._provider_router.assert_not_called()
+        assert state.get_current_client("worker") == "codex"
+
+    def test_instruction_failure_precedes_trust_and_spawn(
+        self, tools, mock_tmux,
+    ):
+        state = ProviderState(tools._db)
+        state.set_current_client("worker", "codex")
+        tools._ensure_worker_instructions = MagicMock(
+            return_value="Failed to ensure AGENTS.md",
+        )
+        tools.ensure_worker_trusted = MagicMock()
+        tools._provider_router = MagicMock()
+        mock_tmux.has_session.return_value = False
+
+        out = tools.resume_session(self.UUID, "codex", "d3", repo="/r")
+
+        assert out == {"error": "Failed to ensure AGENTS.md"}
+        tools._ensure_worker_instructions.assert_called_once_with("/r", "codex")
+        tools.ensure_worker_trusted.assert_not_called()
+        mock_tmux.spawn_session.assert_not_called()
+        tools._provider_router.assert_not_called()
+        assert state.get_current_client("worker") == "codex"
+
+    @pytest.mark.parametrize(
+        ("failure", "pm_state"),
+        [
+            ("readiness", None),
+            ("activation", None),
+            ("pm-off", {
+                "professional_mode": "off",
+                "workflow_stage": "idle",
+                "session_uuid": UUID,
+            }),
+            ("missing-uuid", {
+                "professional_mode": "on",
+                "workflow_stage": "idle",
+                "session_uuid": None,
+            }),
+            ("uuid-mismatch", {
+                "professional_mode": "on",
+                "workflow_stage": "idle",
+                "session_uuid": "88888888-8888-4888-8888-888888888888",
+            }),
+        ],
+    )
+    def test_lifecycle_failure_kills_without_registration_or_success_event(
+        self, tools, registry, mock_tmux, failure, pm_state,
+    ):
+        state = self._prepare_success(tools, mock_tmux, "codex")
+        if failure == "readiness":
+            tools._wait_for_ready.return_value = False
+        elif failure == "activation":
+            tools._activate_pm_via_sqlite.return_value = "database busy"
+        else:
+            tools._read_pm_state_via_sqlite.return_value = pm_state
+
+        out = tools.resume_session(self.UUID, "codex", "d4", repo="/r")
+
+        assert "error" in out
+        mock_tmux.kill_session.assert_called_once_with("ic-d4")
+        assert registry.get_worker("d4") is None
+        assert not registry.get_events_for_worker(
+            "d4", event_type="session_resumed",
+        )
+        tools._provider_router.assert_not_called()
+        assert state.get_current_client("worker") == "codex"
+
+    @pytest.mark.parametrize(
+        "failure_point",
+        ["readiness", "readiness-log", "activation", "readback"],
+    )
+    def test_post_spawn_exception_cleanup(
+        self, tools, registry, mock_tmux, failure_point,
+    ):
+        state = self._prepare_success(tools, mock_tmux, "codex")
+        error = RuntimeError(f"{failure_point} exploded")
+        if failure_point == "readiness":
+            tools._wait_for_ready.side_effect = error
+        elif failure_point == "readiness-log":
+            tools._wait_for_ready.return_value = False
+            mock_tmux.read_log_tail.side_effect = error
+        elif failure_point == "activation":
+            tools._activate_pm_via_sqlite.side_effect = error
+        else:
+            tools._read_pm_state_via_sqlite.side_effect = error
+
+        with pytest.raises(RuntimeError, match=f"{failure_point} exploded"):
+            tools.resume_session(self.UUID, "codex", "d4", repo="/r")
+
+        mock_tmux.kill_session.assert_called_once_with("ic-d4")
+        assert registry.get_worker("d4") is None
+        assert not registry.get_events_for_worker(
+            "d4", event_type="session_resumed",
+        )
+        tools._provider_router.assert_not_called()
+        assert state.get_current_client("worker") == "codex"
+
+    def test_registry_failure_kills_and_propagates_without_success_event(
+        self, tools, registry, mock_tmux,
+    ):
+        state = self._prepare_success(tools, mock_tmux, "codex")
+        tools.registry.register_worker = MagicMock(
+            side_effect=RuntimeError("insert failed"),
+        )
+
+        with pytest.raises(RuntimeError, match="insert failed"):
+            tools.resume_session(self.UUID, "codex", "d4", repo="/r")
+
+        mock_tmux.kill_session.assert_called_once_with("ic-d4")
+        assert not registry.get_events_for_worker(
+            "d4", event_type="session_resumed",
+        )
+        tools._provider_router.assert_not_called()
+        assert state.get_current_client("worker") == "codex"
+
+    @pytest.mark.parametrize(
+        ("client", "configured_path", "required", "forbidden"),
+        [
+            (
+                "claude",
+                None,
+                (
+                    "export CLAUDE_CODE_EFFORT_LEVEL=",
+                    f"exec claude --resume {UUID} --dangerously-skip-permissions",
+                ),
+                (" resume ", "--dangerously-bypass-approvals-and-sandbox"),
+            ),
+            (
+                "codex",
+                "/Applications/Codex App/codex",
+                (
+                    "exec '/Applications/Codex App/codex' "
+                    f"resume {UUID} --dangerously-bypass-approvals-and-sandbox",
+                ),
+                (
+                    "CLAUDE_CODE_EFFORT_LEVEL",
+                    "--resume",
+                    "--dangerously-skip-permissions",
+                    "--model",
+                ),
+            ),
+        ],
+    )
+    def test_success_uses_exact_client_and_persists_native_identity(
+        self, tools, registry, mock_tmux, client, configured_path,
+        required, forbidden,
+    ):
+        state = self._prepare_success(tools, mock_tmux, client)
+        if configured_path is not None:
+            tools._config = {
+                "providers": {
+                    "clients": {"codex": {"path": configured_path}},
+                },
+            }
+
+        out = tools.resume_session(
+            self.UUID, client, "d5", repo="/r",
+            description="resuming auth work",
+        )
+
         assert out["worker_id"] == "d5"
         assert out["tmux_session"] == "ic-d5"
         assert out["professional_mode"] == "on"
         assert out["workflow_stage"] == "executing"
         assert "resumed context output" in out["recent_output"]
-        spawn_call = mock_tmux.spawn_session.call_args
-        assert "--resume" in spawn_call.args[1]
-        assert session_id in spawn_call.args[1]
-        w = registry.get_worker("d5")
-        assert w is not None
-        assert w["tmux_session"] == "ic-d5"
-        assert w["status"] == "running"
+        command = mock_tmux.spawn_session.call_args.args[1]
+        for fragment in required:
+            assert fragment in command
+        for fragment in forbidden:
+            assert fragment not in command
+        tools._ensure_worker_instructions.assert_called_once_with("/r", client)
+        tools._wait_for_ready.assert_called_once_with(
+            "ic-d5", timeout=30, client=client,
+        )
+        tools._activate_pm_via_sqlite.assert_called_once_with(
+            "ic-d5", timeout=300, max_retries=3, client=client,
+        )
+        tools._read_pm_state_via_sqlite.assert_called_once_with(
+            "ic-d5", client=client,
+        )
+        if client == "claude":
+            tools.ensure_worker_trusted.assert_called_once_with("/r")
+        else:
+            tools.ensure_worker_trusted.assert_not_called()
+        worker = registry.get_worker("d5")
+        assert worker["tmux_session"] == "ic-d5"
+        assert worker["status"] == "running"
+        assert worker["client"] == client
+        assert worker["model"] is None
+        assert worker["native_session_id"] == self.UUID
+        events = registry.get_events_for_worker(
+            "d5", event_type="session_resumed",
+        )
+        assert len(events) == 1
+        assert json.loads(events[0]["details"]) == {
+            "client": client,
+            "session_id": self.UUID,
+        }
+        tools._provider_router.assert_not_called()
+        assert state.get_current_client("worker") == "codex"
+
+    def test_mcp_wrapper_requires_and_forwards_client(self, tools):
+        from ironclaude.orchestrator_mcp import _create_mcp_server
+
+        mcp_server = _create_mcp_server(tools)
+        wrapper_fn = mcp_server._tool_manager.get_tool("resume_session").fn
+        client_param = inspect.signature(wrapper_fn).parameters["client"]
+        assert client_param.default is inspect.Parameter.empty
+        tools.resume_session = MagicMock(return_value={"worker_id": "d6"})
+
+        result = json.loads(wrapper_fn(
+            self.UUID, "codex", "d6", "/r", "resume", "claude-opus",
+        ))
+
+        assert result == {"worker_id": "d6"}
+        tools.resume_session.assert_called_once_with(
+            self.UUID, "codex", "d6", "/r", "resume", "claude-opus",
+        )
+
+    def test_pm_failure_kills_session(self, tools, mock_tmux):
+        mock_tmux.has_session.return_value = False
+        mock_tmux.spawn_session.return_value = True
+        tools._ensure_worker_instructions = MagicMock(return_value=None)
+        tools.ensure_worker_trusted = MagicMock()
+        tools._wait_for_ready = MagicMock(return_value=True)
+        tools._activate_pm_via_sqlite = MagicMock(return_value="timeout waiting for session ID")
+        out = tools.resume_session(self.UUID, "claude", "d4", repo="/r")
+        assert "error" in out
+        mock_tmux.kill_session.assert_called_once_with("ic-d4")
 
 
 
@@ -7151,6 +9034,52 @@ class TestCallGraderSubprocess:
             r = tools._call_grader("sys", "usr")
         assert r["grade"] == "D" and r["approved"] is False and r["feedback"] == "no"
 
+    def test_grader_capability_recovery_probes_after_explicit_cutover(self, tools):
+        config = copy.deepcopy(DEFAULTS)
+        config["providers"]["clients"]["codex"]["enabled"] = True
+        config["providers"]["roles"]["grader"] = {
+            "preferred": "claude",
+            "clients": ["claude", "codex"],
+        }
+        tools._config = config
+        tools._grader_router_cache = None
+        state = ProviderState(tools._db)
+        state.mark_unavailable(
+            "local", "codex", "grader", "opus", "usage_limit", "old limit"
+        )
+        state.set_current_client("grader", "codex", reset_capabilities=True)
+        probed = []
+
+        def probe_local(_probe, _config, client, role, tier):
+            probed.append((client, role, tier))
+            return ClientCapability(
+                host="local", client=client, role=role, tier=tier,
+                configured=True, supported=True, installed=True,
+                authenticated=True, available=True,
+            )
+
+        verdict = {"grade": "A", "approved": True, "feedback": "recovered"}
+        event = json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": json.dumps(verdict),
+            },
+        })
+        with patch(
+            "ironclaude.orchestrator_mcp.CapabilityProbe.probe_local",
+            autospec=True,
+            side_effect=probe_local,
+        ), patch("ironclaude.main.ensure_brain_trusted"), patch(
+            "ironclaude.orchestrator_mcp.subprocess.run"
+        ) as run:
+            run.return_value = MagicMock(returncode=0, stdout=event, stderr="")
+            result = tools._call_grader("sys", "usr")
+
+        assert result == verdict
+        assert ("codex", "grader", "opus") in probed
+        assert run.call_args.args[0][0] == "codex"
+
     def test_timeout_returns_f_bounded(self, tools):
         import subprocess as _sp
         with patch("ironclaude.main.ensure_brain_trusted"), \
@@ -7365,3 +9294,22 @@ class TestGraderPromptsToolFree:
         src = pathlib.Path(__file__).resolve().parents[1] / "src" / "ironclaude" / "orchestrator_mcp.py"
         assert "Read and Bash" not in src.read_text(), \
             "a grader system prompt still tells the tool-free grader to use Read/Bash"
+
+
+class TestCodexAdvisorInstructionConstant:
+    """Guards on the delivered text. send_keys sends one argument then a single
+    Enter, and no test in this suite can observe pane state, so these properties
+    have to be asserted on the constant itself."""
+
+    def test_is_single_line(self):
+        # An embedded newline could submit the instruction in fragments.
+        assert "\n" not in _CODEX_ADVISOR_INSTRUCTION
+
+    def test_is_not_a_slash_command(self):
+        # The whole reason codex was skipped: it cannot parse Claude slash commands.
+        assert not _CODEX_ADVISOR_INSTRUCTION.startswith("/")
+
+    def test_names_the_advisor_mechanism_and_ladder(self):
+        # Asserting only "codex exec" would pass against an invented ladder.
+        assert "codex exec" in _CODEX_ADVISOR_INSTRUCTION
+        assert "luna -> terra -> sol" in _CODEX_ADVISOR_INSTRUCTION

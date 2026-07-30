@@ -14,6 +14,7 @@ from __future__ import annotations
 import collections
 import difflib
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -42,7 +44,7 @@ from ironclaude.fable_availability import (
 )
 from ironclaude.grader import LocalGrader
 from ironclaude.provider_config import provider_config_from_commander, _semantic_tier, ProviderConfigError
-from ironclaude.provider_state import ProviderState
+from ironclaude.provider_state import ProviderState, TRANSIENT_UNAVAILABLE_REASONS
 from ironclaude.provider_capabilities import CapabilityRegistry, CapabilityProbe
 from ironclaude.provider_router import ProviderRouter, NoCapabilityAvailable
 from ironclaude.notifications import format_directive_review, format_fable_unavailable, format_fable_recovered
@@ -130,9 +132,33 @@ WORKER_COMMANDS = {
 # existing ValueError for invalid worker types).
 _WORKER_TYPE_TIER = {"claude-opus": "opus", "claude-fable": "fable", "claude-sonnet": "sonnet"}
 
+# Codex's advisor channel. Claude workers are told their advisor with the
+# `/advisor <model>` slash command typed into their pane; codex cannot parse a
+# Claude slash command, so it gets the same directive as plain text over the same
+# send_keys channel. Wording tracks directive 9 of templates/worker_agents.md —
+# deliberately including its bare tier ladder and <one-tier-up-model> placeholder,
+# so the runtime path says exactly what the file path says and no more.
+# MUST stay a single line with no embedded newline: send_keys runs
+# `tmux send-keys -- <text>` without -l and then sends one Enter, so a newline
+# risks submitting the instruction in fragments.
+_CODEX_ADVISOR_INSTRUCTION = (
+    "Advisor directive: fire the advisor at natural discretionary points - before "
+    "substantive work, when stuck, and before declaring done. Invoke a one-tier-up "
+    "report-only reviewer with `codex exec -m <one-tier-up-model>` using "
+    "luna -> terra -> sol; at the sol ceiling, run a same-tier blind sol pass. "
+    "Reconcile the review with evidence; never proceed unreviewed because an "
+    "advisor command is unavailable."
+)
+
 VALID_DIRECTIVE_STATUSES = frozenset({
     "pending_confirmation", "awaiting_changes", "superseded",
-    "confirmed", "rejected", "in_progress", "completed",
+    "confirmed", "rejected", "in_progress", "completed", "blocked",
+})
+DIRECTIVE_BLOCK_CAPABILITIES = frozenset({
+    "workspace_write", "ollama_loopback", "process_inspection",
+})
+DIRECTIVE_BLOCK_SCOPES = frozenset({
+    "project_permission", "codex_sandbox", "host_runtime",
 })
 
 VALID_SUPABASE_TABLES = frozenset({"players", "sessions", "events", "feedback", "errors"})
@@ -512,9 +538,10 @@ class OrchestratorTools:
         """ProviderHandle for the worker, or None to use the legacy claude path.
 
         None for: ollama (unrouted), unknown worker_type (so the legacy body still raises
-        ValueError), a config with no provider block (ProviderConfigError), or no usable
-        client (NoCapabilityAvailable). Probes the requested tier AND, for a fable request,
-        the 'opus' degrade target (the router degrades fable->opus for non-claude clients)."""
+        ValueError), or a config with no provider block (ProviderConfigError).
+        Configured-provider exhaustion remains a hard NoCapabilityAvailable boundary.
+        Probes the requested tier AND, for a fable request, the 'opus' degrade target
+        (the router degrades fable->opus for non-claude clients)."""
         if worker_type == "ollama":
             return None
         tier = _WORKER_TYPE_TIER.get(_resolve_fable_worker_type(worker_type))
@@ -526,18 +553,60 @@ class OrchestratorTools:
                 self._ensure_role_capabilities("worker", "opus")
             router, _c, _s, _r = self._provider_router()
             return router.resolve("worker", tier, ["local"])
-        except NoCapabilityAvailable:
-            return None
         except ProviderConfigError:
             return None
 
-    def _get_worker_command(self, worker_type: str, model_name: str = "") -> str:
-        """Build worker command, using advisor config for model selection."""
+    def _resolve_remote_worker_client(self, worker_type: str, machine_cfg):
+        """Resolve one provider handle against the selected remote host."""
+        if worker_type == "ollama" or not machine_cfg.clients:
+            return None
+        tier = _WORKER_TYPE_TIER.get(_resolve_fable_worker_type(worker_type))
+        if tier is None:
+            return None
+        try:
+            router, config, _state, registry = self._provider_router()
+        except ProviderConfigError:
+            return None
+
+        probe = CapabilityProbe(executor=self._ssh_manager.run_argv)
+        probe_tiers = (tier, "opus") if tier == "fable" else (tier,)
+        for probe_tier in probe_tiers:
+            for client in config.roles["worker"].clients:
+                registry.record(probe.probe_remote(
+                    config,
+                    machine_cfg.clients,
+                    client,
+                    "worker",
+                    probe_tier,
+                    machine_cfg.host,
+                ))
+        return router.resolve(
+            "worker", tier, [machine_cfg.host],
+        )
+
+    def _get_worker_command_for_handle(
+        self, worker_type: str, model_name: str, worker_handle,
+    ) -> str:
+        """Build a worker command from one already-resolved provider handle."""
         worker_type = _resolve_fable_worker_type(worker_type)
-        _handle = self._resolve_worker_client(worker_type)
-        if _handle is not None and _handle.client == "codex":
-            return self._codex_worker_command(_handle.model)
-        # else: fall through to the existing byte-identical claude/ollama logic
+        if worker_handle is not None:
+            if worker_handle.client == "codex":
+                return self._codex_worker_command(worker_handle.model)
+            if worker_handle.client == "claude":
+                if worker_handle.effective_tier in ("opus", "fable"):
+                    return make_opus_command(
+                        worker_handle.model, self._effort_level,
+                    )
+                if worker_handle.effective_tier == "sonnet":
+                    if worker_handle.model == "sonnet":
+                        return WORKER_COMMANDS["claude-sonnet"]
+                    return (
+                        f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; "
+                        f"exec claude --model {shlex.quote(worker_handle.model)} "
+                        "--dangerously-skip-permissions"
+                    )
+
+        # Legacy configuration and Ollama retain the existing command shapes.
         advisor = self._advisor_cfg
         if worker_type == "ollama":
             self._get_ollama_client()  # populate _ollama_cfg_cache
@@ -554,17 +623,45 @@ class OrchestratorTools:
             return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model 'sonnet' --dangerously-skip-permissions"
         raise ValueError(f"Invalid worker type '{worker_type}'")
 
+    def _get_worker_command(self, worker_type: str, model_name: str = "") -> str:
+        """Build worker command, resolving the provider once for direct callers."""
+        worker_type = _resolve_fable_worker_type(worker_type)
+        handle = self._resolve_worker_client(worker_type)
+        return self._get_worker_command_for_handle(
+            worker_type, model_name, handle,
+        )
+
+    @staticmethod
+    def _effective_worker_type(worker_type: str, worker_handle) -> str:
+        """Return lifecycle worker type after provider-tier degradation."""
+        if worker_handle is not None:
+            return f"claude-{worker_handle.effective_tier}"
+        return _resolve_fable_worker_type(worker_type)
+
+    @staticmethod
+    def _launch_used_claude_fable(worker_type: str, worker_handle) -> bool:
+        """True only when the concrete launch is Claude at Fable tier."""
+        if worker_handle is not None:
+            return (
+                worker_handle.client == "claude"
+                and worker_handle.effective_tier == "fable"
+            )
+        return (
+            worker_type == "claude-fable"
+            and _resolve_fable_worker_type(worker_type) == "claude-fable"
+        )
+
     def _build_worker_launch_cmd(
         self, worker_type: str, model_name: str, worker_id: str, machine_cfg,
     ):
         """Build the full non-ollama worker launch command for a local or remote target.
 
-        Returns ``(cmd, handle)`` where ``handle`` is the resolved worker ProviderHandle
-        (or None). Remote (machine_cfg) is claude-only this slice, so its handle is None.
+        Returns ``(cmd, handle)`` where ``handle`` is the resolved worker
+        ProviderHandle (or None for legacy configuration).
 
-        For a remote machine: env prefix (IC_ROLE/IC_WORKER_ID) + machine_cfg.env
-        + machine_cfg.claude_path invocation — no local `_get_worker_command`
-        involved, since the remote binary path and env are machine-specific.
+        For a remote machine: resolve against that host, then combine common
+        worker identity/shared machine environment with the selected client's
+        executable, model, environment, and permission flags.
 
         For local: `_get_worker_command`'s resolved command (claude verbatim, or codex
         when the router selects it), with the IC_ROLE/IC_WORKER_ID/ENABLE_STOP_REVIEW
@@ -575,15 +672,60 @@ class OrchestratorTools:
         the initial remote spawn instead of silently falling back to a local
         `exec claude` command.
         """
-        handle = None if machine_cfg else self._resolve_worker_client(worker_type)
+        handle = (
+            self._resolve_remote_worker_client(worker_type, machine_cfg)
+            if machine_cfg
+            else self._resolve_worker_client(worker_type)
+        )
         if machine_cfg:
-            cmd_parts = ["export IC_ROLE=worker", f"export IC_WORKER_ID={shlex.quote(worker_id)}"]
+            client = handle.client if handle is not None else "claude"
+            executable = machine_cfg.client_path(client)
+            if executable is None and client == "claude":
+                executable = machine_cfg.claude_path
+            if executable is None:
+                raise NoCapabilityAvailable(
+                    "worker",
+                    _WORKER_TYPE_TIER.get(
+                        _resolve_fable_worker_type(worker_type), worker_type,
+                    ),
+                    [machine_cfg.host],
+                )
+            if executable == "~":
+                executable = "$HOME"
+            elif executable.startswith("~/"):
+                executable = "$HOME/" + shlex.quote(executable[2:])
+            else:
+                executable = shlex.quote(executable)
+
+            cmd_parts = [
+                "export IC_ROLE=worker",
+                f"export IC_WORKER_ID={shlex.quote(worker_id)}",
+                "export ENABLE_STOP_REVIEW=0",
+            ]
             for k, v in machine_cfg.env.items():
                 cmd_parts.append(f"export {k}={shlex.quote(v)}")
-            model = model_name or self._opus_model
-            cmd_parts.append(f"{machine_cfg.claude_path} --model {shlex.quote(model)} --dangerously-skip-permissions")
+            model = (
+                handle.model
+                if handle is not None
+                else model_name or self._opus_model
+            )
+            if client == "codex":
+                cmd_parts.append(
+                    f"exec {executable} --model {shlex.quote(model)} "
+                    "--dangerously-bypass-approvals-and-sandbox"
+                )
+            else:
+                cmd_parts.append(
+                    f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}"
+                )
+                cmd_parts.append(
+                    f"exec {executable} --model {shlex.quote(model)} "
+                    "--dangerously-skip-permissions"
+                )
             return "; ".join(cmd_parts), handle
-        cmd = self._get_worker_command(worker_type, model_name)
+        cmd = self._get_worker_command_for_handle(
+            worker_type, model_name, handle,
+        )
         return f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; export ENABLE_STOP_REVIEW=0; {cmd}", handle
 
     def _get_ollama_client(self) -> OllamaClient:
@@ -805,13 +947,13 @@ class OrchestratorTools:
         }
 
     def _codex_grader_env(self) -> dict:
-        """Env for the codex grader subprocess. Unlike the claude grader, codex
-        authenticates via its own ChatGPT-subscription login, so we do NOT strip
-        ANTHROPIC_*/Bedrock/Vertex (those are claude-only) — pass the process env
-        through, only pinning the reasoning-effort level for parity."""
-        env = dict(os.environ)
-        env["CLAUDE_CODE_EFFORT_LEVEL"] = self._effort_level
-        return env
+        """Env for the codex grader subprocess: the process env, unmodified.
+
+        Unlike the claude grader, codex authenticates via its own ChatGPT-subscription
+        login, so ANTHROPIC_*/Bedrock/Vertex are NOT stripped. Reasoning effort is not
+        set here — codex takes it from ``-c model_reasoning_effort`` in
+        _codex_grader_argv."""
+        return dict(os.environ)
 
     def _codex_grader_argv(self, schema_file: str, model: str) -> list:
         """``codex exec`` grader argv (validated by the codex-grader-exec live probe).
@@ -825,7 +967,9 @@ class OrchestratorTools:
             .get("codex", {}).get("path", "codex")
         )
         return [
-            codex_path, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
+            codex_path, "exec",
+            "-c", f'model_reasoning_effort="{self._effort_level}"',
+            "--json", "--ephemeral", "--skip-git-repo-check",
             "--output-schema", schema_file, "-s", "read-only", "-m", model, "-",
         ]
 
@@ -993,15 +1137,24 @@ class OrchestratorTools:
         return self._grader_router_cache
 
     def _ensure_role_capabilities(self, role: str, tier: str) -> None:
-        """Probe + cache local capability for each configured client of `role`, once.
+        """Probe + cache local capability for each configured client of `role`.
 
-        Lazy: only probes a (client, role, tier, local) tuple with no prior observation.
+        Lazy, with one exception: probes a (client, role, tier, local) tuple with no
+        prior observation, AND re-probes one holding a TRANSIENT quarantine. Without the
+        re-probe, `record_capability`'s reason-aware clearing can never fire locally —
+        a transient failure writes a row, the tuple is never probed again, and the
+        client stays quarantined forever. Hard quarantines are still skipped, preserving
+        the operator's no-auto-recovery rule for genuine configuration failures.
         Never raises — a probe error is logged and leaves the capability unobserved.
         """
         _router, config, state, registry = self._provider_router()
         probe = CapabilityProbe()
         for client in config.roles[role].clients:
-            if state.capability_observation("local", client, role, tier) is None:
+            observed = state.capability_observation("local", client, role, tier)
+            if observed is None or (
+                not observed["available"]
+                and observed["reason"] in TRANSIENT_UNAVAILABLE_REASONS
+            ):
                 try:
                     registry.record(probe.probe_local(config, client, role, tier))
                 except Exception as exc:  # noqa: BLE001 — probing must never crash grading
@@ -1669,6 +1822,11 @@ class OrchestratorTools:
         if row is None:
             raise ValueError(f"Directive {directive_id} not found")
         old_status = row[0]
+        if status == "blocked" or old_status == "blocked":
+            raise ValueError(
+                "Transitions into or out of blocked require the structured "
+                "directive capability block/recovery tools"
+            )
         self._db.execute(
             "UPDATE directives SET status=?, updated_at=datetime('now') WHERE id=?", (status, directive_id),
         )
@@ -1687,6 +1845,143 @@ class OrchestratorTools:
         columns = [desc[0] for desc in cursor.description]
         updated = cursor.fetchone()
         return dict(zip(columns, updated))
+
+    @staticmethod
+    def _directive_block_fingerprint(
+        capabilities: list[str], denial_scope: str, target: str
+    ) -> str:
+        payload = json.dumps(
+            {"capabilities": capabilities, "denial_scope": denial_scope, "target": target},
+            sort_keys=True, separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    @staticmethod
+    def _directive_block_result(row) -> dict:
+        result = dict(row)
+        result["capabilities"] = json.loads(result.pop("capabilities_json"))
+        return result
+
+    def report_directive_capability_block(
+        self,
+        directive_id: int,
+        capabilities: list[str],
+        denial_scope: str,
+        target: str,
+        reason: str,
+    ) -> dict:
+        """Atomically record a validated durable capability denial."""
+        if self._db is None:
+            raise RuntimeError("Database connection required for directive operations")
+        normalized = sorted(set(capabilities))
+        if not normalized or any(c not in DIRECTIVE_BLOCK_CAPABILITIES for c in normalized):
+            raise ValueError("Invalid or empty capability list")
+        if denial_scope not in DIRECTIVE_BLOCK_SCOPES:
+            raise ValueError("Invalid denial scope")
+        target = target.strip()
+        reason = reason.strip()
+        if not target or not reason:
+            raise ValueError("Target and reason are required")
+        now = time.time()
+        fingerprint = self._directive_block_fingerprint(
+            normalized, denial_scope, target
+        )
+        with self._db:
+            directive = self._db.execute(
+                "SELECT status FROM directives WHERE id=?", (directive_id,)
+            ).fetchone()
+            if directive is None:
+                raise ValueError(f"Directive {directive_id} not found")
+            existing = self._db.execute(
+                "SELECT * FROM directive_capability_blocks WHERE directive_id=?",
+                (directive_id,),
+            ).fetchone()
+            if (
+                existing is not None
+                and existing["state"] == "blocked"
+                and existing["fingerprint"] == fingerprint
+            ):
+                self._db.execute(
+                    "UPDATE directive_capability_blocks "
+                    "SET reason=?, last_observed_at=? WHERE directive_id=?",
+                    (reason, now, directive_id),
+                )
+            elif existing is None:
+                self._db.execute(
+                    "INSERT INTO directive_capability_blocks "
+                    "(directive_id, capabilities_json, denial_scope, target, reason, "
+                    "fingerprint, state, first_observed_at, last_observed_at, "
+                    "next_recheck_at, backoff_seconds, notification_state, generation, "
+                    "recovery_dispatch_state) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'blocked', ?, ?, ?, 60, 'pending', 1, 'none')",
+                    (
+                        directive_id, json.dumps(normalized), denial_scope, target,
+                        reason, fingerprint, now, now, now + 60,
+                    ),
+                )
+            else:
+                generation = existing["generation"] + 1
+                self._db.execute(
+                    "UPDATE directive_capability_blocks SET capabilities_json=?, "
+                    "denial_scope=?, target=?, reason=?, fingerprint=?, state='blocked', "
+                    "first_observed_at=?, last_observed_at=?, next_recheck_at=?, "
+                    "backoff_seconds=60, notification_state='pending', generation=?, "
+                    "recovery_dispatch_state='none' WHERE directive_id=?",
+                    (
+                        json.dumps(normalized), denial_scope, target, reason,
+                        fingerprint, now, now, now + 60, generation, directive_id,
+                    ),
+                )
+            self._db.execute(
+                "UPDATE directives SET status='blocked', updated_at=datetime('now') "
+                "WHERE id=?", (directive_id,),
+            )
+        row = self._db.execute(
+            "SELECT * FROM directive_capability_blocks WHERE directive_id=?",
+            (directive_id,),
+        ).fetchone()
+        return self._directive_block_result(row)
+
+    def report_directive_capability_recovery(
+        self, directive_id: int, recovered_capabilities: list[str]
+    ) -> dict:
+        """Atomically narrow or fully recover a durable capability denial."""
+        normalized = sorted(set(recovered_capabilities))
+        if not normalized or any(c not in DIRECTIVE_BLOCK_CAPABILITIES for c in normalized):
+            raise ValueError("Invalid or empty recovered capability list")
+        now = time.time()
+        with self._db:
+            row = self._db.execute(
+                "SELECT * FROM directive_capability_blocks WHERE directive_id=?",
+                (directive_id,),
+            ).fetchone()
+            if row is None or row["state"] != "blocked":
+                raise ValueError(f"Directive {directive_id} has no active capability block")
+            current = json.loads(row["capabilities_json"])
+            if any(c not in current for c in normalized):
+                raise ValueError("Recovered capability was not blocked")
+            remaining = sorted(set(current) - set(normalized))
+            if remaining:
+                fingerprint = self._directive_block_fingerprint(
+                    remaining, row["denial_scope"], row["target"]
+                )
+                self._db.execute(
+                    "UPDATE directive_capability_blocks SET capabilities_json=?, "
+                    "fingerprint=?, last_observed_at=? WHERE directive_id=?",
+                    (json.dumps(remaining), fingerprint, now, directive_id),
+                )
+            else:
+                self._db.execute(
+                    "UPDATE directive_capability_blocks SET capabilities_json='[]', "
+                    "state='recovered', last_observed_at=?, "
+                    "recovery_dispatch_state='pending' WHERE directive_id=?",
+                    (now, directive_id),
+                )
+        updated = self._db.execute(
+            "SELECT * FROM directive_capability_blocks WHERE directive_id=?",
+            (directive_id,),
+        ).fetchone()
+        return self._directive_block_result(updated)
 
     def debug_slack_connection(self) -> dict:
         """Diagnose Slack connectivity issues.
@@ -1736,31 +2031,43 @@ class OrchestratorTools:
         """Delegate to module-level ensure_worker_trusted."""
         ensure_worker_trusted(repo)
 
-    def _ensure_claude_md(self, repo: str) -> None:
-        """Ensure repo has a CLAUDE.md file for clean PM activation.
+    def _ensure_worker_instructions(
+        self, repo: str, client: str,
+    ) -> str | None:
+        """Create the active client's missing instruction file, fail closed."""
+        if client == "codex":
+            filename = "AGENTS.md"
+            template_name = "worker_agents.md"
+        else:
+            filename = "CLAUDE.md"
+            template_name = "worker_claude_md.md"
 
-        If repo lacks CLAUDE.md, writes the standard boilerplate template.
-        If repo already has one, does nothing. Failures are logged but
-        never block the spawn pipeline.
-        """
-        claude_md_path = os.path.join(repo, "CLAUDE.md")
-        if os.path.exists(claude_md_path):
-            logger.info(f"CLAUDE.md already exists in {repo}")
-            return
+        destination = os.path.join(repo, filename)
+        if os.path.exists(destination):
+            logger.info("%s already exists in %s", filename, repo)
+            return None
 
-        template_path = Path(__file__).parent / "templates" / "worker_claude_md.md"
+        template_path = Path(__file__).parent / "templates" / template_name
         try:
             content = template_path.read_text()
-        except FileNotFoundError:
-            logger.warning(f"Worker CLAUDE.md template not found at {template_path}")
-            return
+        except OSError as e:
+            reason = f"Failed to ensure {filename} in {repo}: {e}"
+            logger.warning(reason)
+            return reason
 
         try:
-            with open(claude_md_path, "w") as f:
-                f.write(content)
-            logger.info(f"Injected CLAUDE.md into {repo}")
+            with open(destination, "w") as stream:
+                stream.write(content)
         except OSError as e:
-            logger.warning(f"Failed to write CLAUDE.md to {repo}: {e}")
+            reason = f"Failed to ensure {filename} in {repo}: {e}"
+            logger.warning(reason)
+            return reason
+        logger.info("Injected %s into %s", filename, repo)
+        return None
+
+    def _ensure_claude_md(self, repo: str) -> str | None:
+        """Compatibility wrapper for callers that require Claude instructions."""
+        return self._ensure_worker_instructions(repo, "claude")
 
     def _wait_for_ready(self, session_name: str, timeout: int = 30,
                         ssh_host: str | None = None, client: str = "claude") -> bool:
@@ -1927,6 +2234,7 @@ class OrchestratorTools:
 
     def _read_pm_state_via_sqlite(
         self, session_name: str, _claude_dir: Path | None = None,
+        client: str = "claude",
     ) -> dict:
         """Read (without mutating) professional_mode + workflow_stage for a session.
 
@@ -1940,12 +2248,24 @@ class OrchestratorTools:
         pane_pid = self.tmux.list_pane_pid(session_name)
         if not pane_pid:
             return unknown
-        session_id_file = claude_dir / f"ironclaude-session-{pane_pid}.id"
-        if not session_id_file.exists():
-            return unknown
-        session_uuid = session_id_file.read_text().strip()
-        if len(session_uuid) != 36:
-            return unknown
+        if client == "codex":
+            candidates = []
+            for pid in self._descendant_pids(int(pane_pid)):
+                session_id_file = claude_dir / f"ironclaude-session-{pid}.id"
+                if session_id_file.exists():
+                    candidate = session_id_file.read_text().strip()
+                    if _UUID_RE.fullmatch(candidate):
+                        candidates.append((session_id_file.stat().st_mtime, candidate))
+            if not candidates:
+                return unknown
+            session_uuid = max(candidates)[1]
+        else:
+            session_id_file = claude_dir / f"ironclaude-session-{pane_pid}.id"
+            if not session_id_file.exists():
+                return unknown
+            session_uuid = session_id_file.read_text().strip()
+            if not _UUID_RE.fullmatch(session_uuid):
+                return unknown
 
         db_path = claude_dir / "ironclaude.db"
         conn = None
@@ -1996,21 +2316,46 @@ class OrchestratorTools:
                 time.sleep(1)
         return last_error
 
-    def _ensure_claude_md_remote(self, repo: str, ssh_host: str) -> None:
-        """Ensure remote repo has a CLAUDE.md for clean PM activation."""
-        if self.tmux.file_exists(os.path.join(repo, "CLAUDE.md"), ssh_host=ssh_host):
-            logger.info(f"CLAUDE.md already exists in {repo} on {ssh_host}")
-            return
-        template_path = Path(__file__).parent / "templates" / "worker_claude_md.md"
+    def _ensure_worker_instructions_remote(
+        self, repo: str, ssh_host: str, client: str,
+    ) -> str | None:
+        """Create the active client's missing remote instructions, fail closed."""
+        if client == "codex":
+            filename = "AGENTS.md"
+            template_name = "worker_agents.md"
+        else:
+            filename = "CLAUDE.md"
+            template_name = "worker_claude_md.md"
+
+        destination = os.path.join(repo, filename)
+        if self.tmux.file_exists(destination, ssh_host=ssh_host):
+            logger.info("%s already exists in %s on %s", filename, repo, ssh_host)
+            return None
+        template_path = Path(__file__).parent / "templates" / template_name
         try:
             content = template_path.read_text()
-        except FileNotFoundError:
-            logger.warning(f"Worker CLAUDE.md template not found at {template_path}")
-            return
-        if not self.tmux.write_file(os.path.join(repo, "CLAUDE.md"), content, ssh_host=ssh_host):
-            logger.warning(f"Failed to write CLAUDE.md to {repo} on {ssh_host}")
-        else:
-            logger.info(f"Injected CLAUDE.md into {repo} on {ssh_host}")
+        except OSError as exc:
+            reason = (
+                f"Failed to ensure {filename} in {repo} on {ssh_host}: {exc}"
+            )
+            logger.warning(reason)
+            return reason
+        if not self.tmux.write_file(
+            destination, content, ssh_host=ssh_host,
+        ):
+            reason = f"Failed to ensure {filename} in {repo} on {ssh_host}"
+            logger.warning(reason)
+            return reason
+        logger.info("Injected %s into %s on %s", filename, repo, ssh_host)
+        return None
+
+    def _ensure_claude_md_remote(
+        self, repo: str, ssh_host: str,
+    ) -> str | None:
+        """Compatibility wrapper for remote Claude instructions."""
+        return self._ensure_worker_instructions_remote(
+            repo, ssh_host, "claude",
+        )
 
     def _ensure_worker_trusted_remote(self, repo: str, ssh_host: str) -> None:
         """Ensure remote repo is trusted in ~/.claude.json on the remote host."""
@@ -2038,11 +2383,36 @@ class OrchestratorTools:
         else:
             logger.warning(f"Failed to write trust entry on {ssh_host}")
 
-    def _activate_pm_remote(self, session_name: str, ssh_host: str,
-                            timeout: int = 30) -> str | None:
+    def _remote_descendant_pids(
+        self, ssh_host: str, pane_pid: str,
+    ) -> list[str]:
+        """Return remote pane PID plus descendants using the SSH argv boundary."""
+        pids = [str(pane_pid)]
+        frontier = [str(pane_pid)]
+        while frontier:
+            parent = frontier.pop()
+            try:
+                result = self._ssh_manager.run_argv(
+                    ssh_host, ["pgrep", "-P", parent],
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode != 0:
+                continue
+            for child in result.stdout.split():
+                if child.isdigit() and child not in pids:
+                    pids.append(child)
+                    frontier.append(child)
+        return pids
+
+    def _activate_pm_remote(
+        self, session_name: str, ssh_host: str,
+        timeout: int = 30, client: str = "claude",
+    ) -> str | None:
         """Activate professional mode on a remote worker via sqlite3 over SSH.
 
-        Returns None on success, or a failure reason string.
+        Returns the validated provider-native UUID on success, or a failure
+        reason string.
         """
         pane_pid = self.tmux.list_pane_pid(session_name, ssh_host=ssh_host)
         if not pane_pid:
@@ -2055,13 +2425,25 @@ class OrchestratorTools:
             logger.warning(reason)
             return reason
 
-        session_id_file = f"~/.claude/ironclaude-session-{pane_pid}.id"
         deadline = time.time() + timeout
         session_uuid = None
         while time.time() < deadline:
-            content = self.tmux.read_file(session_id_file, ssh_host=ssh_host)
-            if content and len(content.strip()) == 36:
-                session_uuid = content.strip()
+            candidate_pids = (
+                self._remote_descendant_pids(ssh_host, str(pane_pid))
+                if client == "codex"
+                else [str(pane_pid)]
+            )
+            for candidate_pid in candidate_pids:
+                session_id_file = (
+                    f"~/.claude/ironclaude-session-{candidate_pid}.id"
+                )
+                content = self.tmux.read_file(
+                    session_id_file, ssh_host=ssh_host,
+                )
+                if content and len(content.strip()) == 36:
+                    session_uuid = content.strip()
+                    break
+            if session_uuid is not None:
                 break
             time.sleep(1)
 
@@ -2096,7 +2478,7 @@ class OrchestratorTools:
             return reason
 
         logger.info(f"PM activated via remote sqlite3 for {session_name} on {ssh_host}")
-        return None
+        return session_uuid
 
     def _check_spawn_preconditions(self, worker_type: str = "") -> dict | None:
         """Pre-spawn resource checks. Returns None if OK, error dict if rejected.
@@ -2479,25 +2861,6 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 return {"error": f"Machine '{machine}' unhealthy: {health.details}"}
             ssh_host = machine_cfg.host
 
-        # Captured before _get_worker_command can redirect claude-fable -> claude-opus
-        # (fable_availability flag). Used below to detect a fable spawn that died
-        # before ready, and to detect a fable spawn that came up successfully.
-        original_worker_type = worker_type
-
-        # True iff this spawn actually targets Fable — i.e. the request was
-        # claude-fable AND the fable_availability resolve step (the same one
-        # _get_worker_command applies internally) did NOT redirect it to
-        # claude-opus. Computed via direct resolution rather than re-reading
-        # `worker_type` after the fact: _get_worker_command's redirect is local
-        # to that call and never mutates this function's `worker_type`, so a
-        # naive post-hoc check would stay True even when the actual command
-        # targeted opus (e.g. under a lookalike default_opus_model like
-        # "fable-nano") — the OR-02 false-positive this flag exists to avoid.
-        spawn_used_fable = (
-            original_worker_type == "claude-fable"
-            and _resolve_fable_worker_type(original_worker_type) == "claude-fable"
-        )
-
         # Handle ollama dynamic command construction
         if worker_type == "ollama":
             if not model_name:
@@ -2535,20 +2898,40 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 cmd = f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; export ENABLE_STOP_REVIEW=0; {cmd}"
             worker_handle = None  # ollama runs the claude binary -> claude PM/ready path
         else:
-            cmd, worker_handle = self._build_worker_launch_cmd(worker_type, model_name, worker_id, machine_cfg)
+            try:
+                cmd, worker_handle = self._build_worker_launch_cmd(
+                    worker_type, model_name, worker_id, machine_cfg,
+                )
+            except NoCapabilityAvailable as exc:
+                return {"error": str(exc)}
         worker_client = worker_handle.client if worker_handle is not None else "claude"
+        effective_worker_type = self._effective_worker_type(
+            worker_type, worker_handle,
+        )
+        launch_used_claude_fable = self._launch_used_claude_fable(
+            worker_type, worker_handle,
+        )
 
         session_name = f"ic-{worker_id}"
 
-        # Stage 0: ensure CLAUDE.md exists for clean PM activation
+        # Stage 0: ensure active-client instructions exist before process spawn.
         if ssh_host:
-            self._ensure_claude_md_remote(repo, ssh_host)
+            instruction_error = self._ensure_worker_instructions_remote(
+                repo, ssh_host, worker_client,
+            )
+            if instruction_error is not None:
+                return {"error": instruction_error}
         else:
-            self._ensure_claude_md(repo)
+            instruction_error = self._ensure_worker_instructions(
+                repo, worker_client,
+            )
+            if instruction_error is not None:
+                return {"error": instruction_error}
 
         # Stage 1: ensure trust
         if ssh_host:
-            self._ensure_worker_trusted_remote(repo, ssh_host)
+            if worker_client == "claude":
+                self._ensure_worker_trusted_remote(repo, ssh_host)
         else:
             self.ensure_worker_trusted(repo)
 
@@ -2564,6 +2947,13 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             raise RuntimeError(
                 f"Failed to spawn tmux session for worker '{worker_id}'"
             )
+        remote_cleanup_armed = ssh_host is not None
+
+        def cleanup_remote_session() -> None:
+            nonlocal remote_cleanup_armed
+            if remote_cleanup_armed:
+                self.tmux.kill_session(session_name, ssh_host=ssh_host)
+                remote_cleanup_armed = False
 
         # Stage 3: wait for ready
         ready = self._wait_for_ready(session_name, timeout=30, ssh_host=ssh_host, client=worker_client)
@@ -2572,9 +2962,12 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 session_name, lines=30, ssh_host=ssh_host, remote_log_dir=remote_log_dir,
             )
             if not self.tmux.has_session(session_name, ssh_host=ssh_host):
-                self.tmux.kill_session(session_name, ssh_host=ssh_host)
+                if ssh_host:
+                    cleanup_remote_session()
+                else:
+                    self.tmux.kill_session(session_name, ssh_host=ssh_host)
 
-                if original_worker_type == "claude-fable":
+                if launch_used_claude_fable:
                     # Fable spawn died before ready. Mark it unavailable (Slack alert
                     # exactly once per detection episode) and retry once as claude-opus.
                     mark_result = _mark_fable_unavailable("spawn-died")
@@ -2591,11 +2984,32 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                         )
 
                     worker_type = "claude-opus"
-                    # This retry never targets Fable regardless of what the initial
-                    # resolve found — the recovery check below must not fire for it.
-                    spawn_used_fable = False
-                    cmd, worker_handle = self._build_worker_launch_cmd(worker_type, model_name, worker_id, machine_cfg)
+                    launch_used_claude_fable = False
+                    try:
+                        cmd, worker_handle = self._build_worker_launch_cmd(
+                            worker_type, model_name, worker_id, machine_cfg,
+                        )
+                    except NoCapabilityAvailable as exc:
+                        return {"error": str(exc)}
                     worker_client = worker_handle.client if worker_handle is not None else "claude"
+                    effective_worker_type = self._effective_worker_type(
+                        worker_type, worker_handle,
+                    )
+
+                    if ssh_host:
+                        instruction_error = self._ensure_worker_instructions_remote(
+                            repo, ssh_host, worker_client,
+                        )
+                        if instruction_error is not None:
+                            return {"error": instruction_error}
+                        if worker_client == "claude":
+                            self._ensure_worker_trusted_remote(repo, ssh_host)
+                    else:
+                        instruction_error = self._ensure_worker_instructions(
+                            repo, worker_client,
+                        )
+                        if instruction_error is not None:
+                            return {"error": instruction_error}
 
                     retry_success = self.tmux.spawn_session(
                         session_name, cmd, cwd=repo, ssh_host=ssh_host, remote_log_dir=remote_log_dir,
@@ -2604,6 +3018,7 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                         raise RuntimeError(
                             f"Failed to spawn tmux session for worker '{worker_id}' (opus retry)"
                         )
+                    remote_cleanup_armed = ssh_host is not None
 
                     ready = self._wait_for_ready(session_name, timeout=30, ssh_host=ssh_host, client=worker_client)
                     if not ready:
@@ -2611,11 +3026,24 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                             session_name, lines=30, ssh_host=ssh_host, remote_log_dir=remote_log_dir,
                         )
                         if not self.tmux.has_session(session_name, ssh_host=ssh_host):
-                            self.tmux.kill_session(session_name, ssh_host=ssh_host)
+                            if ssh_host:
+                                cleanup_remote_session()
+                            else:
+                                self.tmux.kill_session(
+                                    session_name, ssh_host=ssh_host,
+                                )
                             return {
                                 "error": (
                                     f"Worker '{worker_id}' session died before ready on "
                                     f"{machine or 'local'}.\nLast output:\n{retry_log_tail}"
+                                )
+                            }
+                        if ssh_host:
+                            cleanup_remote_session()
+                            return {
+                                "error": (
+                                    f"Worker '{worker_id}' not ready on "
+                                    f"{machine}.\nLast output:\n{retry_log_tail}"
                                 )
                             }
                         logger.warning(
@@ -2631,20 +3059,28 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                         )
                     }
             else:
+                if ssh_host:
+                    cleanup_remote_session()
+                    return {
+                        "error": (
+                            f"Worker '{worker_id}' not ready on "
+                            f"{machine}.\nLast output:\n{log_tail}"
+                        )
+                    }
                 logger.warning(
                     "Worker '%s' not ready after timeout on %s but session alive — "
                     "proceeding.\nLast output:\n%s",
                     worker_id, machine or "local", log_tail,
                 )
 
-        # Fable recovery: the spawn actually targeted Fable (no fable_availability
+        # Fable recovery: the spawn actually targeted Claude/Fable
         # redirect and no spawn-died-retry kicked in above) — if Fable had
         # previously been flagged unavailable, clear it and tell the operator
-        # it's back. Gated on `spawn_used_fable` rather than a "--model fable"
+        # it's back. Gated on the concrete resolved launch rather than command text.
         # substring check on `cmd`, since that substring also matches a
         # lookalike model name (e.g. a redirected opus command using an
         # operator-configured default_opus_model of "fable-nano") — OR-02.
-        if spawn_used_fable:
+        if launch_used_claude_fable:
             # Under an account-wide usage_limit, tmux readiness proves the CLI started (auth is
             # up) but NOT that the limit lifted — the throttle bites at inference, not startup.
             # Clearing here would re-open Fable into a still-throttled account (review M2). Only
@@ -2656,25 +3092,73 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 if clear_result == "removed":
                     self._post_slack_safe(format_fable_recovered())
 
-        # Stages 4-5: activate professional mode
+        # Stages 4-5: activate professional mode and retain native identity.
+        native_session_id = None
         if ssh_host:
-            pm_failure = self._activate_pm_remote(session_name, ssh_host)
+            remote_pm_result = self._activate_pm_remote(
+                session_name, ssh_host, client=worker_client,
+            )
+            if (
+                not isinstance(remote_pm_result, str)
+                or not _UUID_RE.fullmatch(remote_pm_result)
+            ):
+                cleanup_remote_session()
+                reason = (
+                    remote_pm_result
+                    if isinstance(remote_pm_result, str)
+                    else "missing provider-native UUID"
+                )
+                return {
+                    "error": (
+                        f"PM activation failed for worker "
+                        f"'{worker_id}': {reason}"
+                    ),
+                }
+            native_session_id = remote_pm_result
         else:
             pm_failure = self._activate_pm_via_sqlite(
                 session_name, timeout=pm_timeout, max_retries=pm_max_retries, client=worker_client
             )
-        if pm_failure is not None:
-            self.tmux.kill_session(session_name, ssh_host=ssh_host)
-            return {"error": f"PM activation failed for worker '{worker_id}': {pm_failure}"}
+            if pm_failure is not None:
+                self.tmux.kill_session(session_name, ssh_host=ssh_host)
+                return {
+                    "error": (
+                        f"PM activation failed for worker "
+                        f"'{worker_id}': {pm_failure}"
+                    ),
+                }
 
-        # Stage 5.5: enable advisor if configured (skip for claude-fable — top tier,
-        # no higher advisor available; and for codex — `/advisor` is a Claude slash
-        # command codex does not understand, so codex workers spawn advisor-less this slice).
-        if (worker_client != "codex" and self._advisor_cfg.get("enabled")
-                and worker_type != "claude-fable"):
-            advisor_model = self._advisor_model_for(worker_type)
-            advisor_model = _resolve_fable_advisor_model(advisor_model)
-            self.tmux.send_keys(session_name, f"/advisor {advisor_model}", ssh_host=ssh_host)
+        if not ssh_host:
+            pm_state = self._read_pm_state_via_sqlite(
+                session_name, client=worker_client,
+            )
+            native_session_id = pm_state.get("session_uuid")
+            if (
+                pm_state.get("professional_mode") != "on"
+                or not isinstance(native_session_id, str)
+                or not _UUID_RE.fullmatch(native_session_id)
+            ):
+                self.tmux.kill_session(session_name, ssh_host=ssh_host)
+                return {
+                    "error": (
+                        f"PM identity verification failed for worker "
+                        f"'{worker_id}'"
+                    ),
+                }
+
+        # Stage 5.5: enable advisor if configured (skip actual Claude/Fable — top tier,
+        # no higher advisor available). Codex cannot parse `/advisor`, a Claude slash
+        # command, so it receives the same directive as plain text over the same
+        # send_keys channel that already delivers the objective at Stage 6.
+        if self._advisor_cfg.get("enabled") and not launch_used_claude_fable:
+            if worker_client == "codex":
+                self.tmux.send_keys(
+                    session_name, _CODEX_ADVISOR_INSTRUCTION, ssh_host=ssh_host,
+                )
+            else:
+                advisor_model = self._advisor_model_for(effective_worker_type)
+                advisor_model = _resolve_fable_advisor_model(advisor_model)
+                self.tmux.send_keys(session_name, f"/advisor {advisor_model}", ssh_host=ssh_host)
             time.sleep(3)
 
         # Stage 5.6: dispatch by goal instead of raw objective, if configured.
@@ -2695,16 +3179,45 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             time.sleep(3)
 
         # Stage 6: send objective
-        self.registry.register_worker(worker_id, worker_type, session_name, repo=repo,
-                                       machine=machine, description=objective)
-        if worker_handle is not None:
-            self.registry.set_worker_provider(worker_id, worker_handle.client, worker_handle.model)
+        if ssh_host:
+            try:
+                self.registry.register_worker(
+                    worker_id,
+                    effective_worker_type,
+                    session_name,
+                    repo=repo,
+                    machine=machine,
+                    description=objective,
+                    client=worker_client,
+                    model=(
+                        worker_handle.model
+                        if worker_handle is not None
+                        else model_name or self._opus_model
+                    ),
+                    native_session_id=native_session_id,
+                )
+            except Exception:
+                cleanup_remote_session()
+                raise
+            remote_cleanup_armed = False
+        else:
+            self.registry.register_worker(
+                worker_id,
+                effective_worker_type,
+                session_name,
+                repo=repo,
+                machine=machine,
+                description=objective,
+                client=worker_client,
+                model=worker_handle.model if worker_handle is not None else None,
+                native_session_id=native_session_id,
+            )
         self.tmux.send_keys(session_name, objective, ssh_host=ssh_host)
         self.registry.log_event(
             "worker_spawned",
             worker_id=worker_id,
             details={
-                "type": worker_type,
+                "type": effective_worker_type,
                 "repo": repo,
                 "objective": objective,
                 "allowed_paths": allowed_paths,
@@ -2713,11 +3226,152 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             },
         )
 
-        recommended = grade_result.get('recommended_model', worker_type)
+        recommended = grade_result.get('recommended_model', effective_worker_type)
         loc = f" on {machine}" if machine else ""
-        result = f"Worker '{worker_id}' spawned ({worker_type}) in {repo}{loc}. Model recommendation: {recommended}"
+        result = f"Worker '{worker_id}' spawned ({effective_worker_type}) in {repo}{loc}. Model recommendation: {recommended}"
 
         return result
+
+    def _start_batch_item(self, item: dict) -> dict:
+        """Run readiness and PM activation for one already-spawned batch item."""
+        request = item["request"]
+        worker_id = request["worker_id"]
+        session_name = item["session_name"]
+
+        ready = self._wait_for_ready(
+            session_name, timeout=30, client=item["client"],
+        )
+        if not ready:
+            log_tail = self.tmux.read_log_tail(session_name, lines=30)
+            if not self.tmux.has_session(session_name):
+                if not item["launch_used_claude_fable"]:
+                    return {
+                        **item,
+                        "error": (
+                            f"Worker '{worker_id}' session died before ready on local."
+                            f"\nLast output:\n{log_tail}"
+                        ),
+                    }
+
+                self.tmux.kill_session(session_name)
+                mark_result = _mark_fable_unavailable("spawn-died")
+                if mark_result == "write_failed":
+                    logger.warning(
+                        "mark_fable_unavailable write failed; alerting Slack anyway "
+                        "(Fable is still down)"
+                    )
+                if mark_result in ("transition", "write_failed"):
+                    self._post_slack_safe(
+                        format_fable_unavailable(
+                            "spawn-died",
+                            redirected_to="opus",
+                            worker_id=worker_id,
+                        )
+                    )
+
+                retry_type = "claude-opus"
+                try:
+                    retry_cmd, retry_handle = self._build_worker_launch_cmd(
+                        retry_type,
+                        request.get("model_name", ""),
+                        worker_id,
+                        None,
+                    )
+                except NoCapabilityAvailable as exc:
+                    return {**item, "error": str(exc)}
+
+                retry_client = (
+                    retry_handle.client if retry_handle is not None else "claude"
+                )
+                instruction_error = self._ensure_worker_instructions(
+                    request["repo"], retry_client,
+                )
+                if instruction_error is not None:
+                    return {**item, "error": instruction_error}
+
+                retry_success = self.tmux.spawn_session(
+                    session_name, retry_cmd, cwd=request["repo"],
+                )
+                if not retry_success:
+                    return {
+                        **item,
+                        "error": (
+                            f"Failed to spawn tmux session for worker "
+                            f"'{worker_id}' (opus retry)"
+                        ),
+                    }
+
+                item = {
+                    **item,
+                    "worker_type": retry_type,
+                    "effective_worker_type": self._effective_worker_type(
+                        retry_type, retry_handle,
+                    ),
+                    "handle": retry_handle,
+                    "client": retry_client,
+                    "launch_used_claude_fable": False,
+                }
+                ready = self._wait_for_ready(
+                    session_name, timeout=30, client=retry_client,
+                )
+                if not ready:
+                    retry_log_tail = self.tmux.read_log_tail(
+                        session_name, lines=30,
+                    )
+                    if not self.tmux.has_session(session_name):
+                        return {
+                            **item,
+                            "error": (
+                                f"Worker '{worker_id}' session died before ready "
+                                f"on local.\nLast output:\n{retry_log_tail}"
+                            ),
+                        }
+                    logger.warning(
+                        "Worker '%s' (opus retry) not ready after timeout on local "
+                        "but session alive — proceeding.\nLast output:\n%s",
+                        worker_id,
+                        retry_log_tail,
+                    )
+            else:
+                logger.warning(
+                    "Worker '%s' not ready after timeout but session alive — "
+                    "proceeding.\nLast output:\n%s",
+                    worker_id,
+                    log_tail,
+                )
+
+        if item["launch_used_claude_fable"]:
+            from ironclaude.fable_availability import fable_block_category
+            if fable_block_category() != "usage_limit":
+                clear_result = _clear_fable_unavailable()
+                if clear_result == "removed":
+                    self._post_slack_safe(format_fable_recovered())
+
+        pm_failure = self._activate_pm_via_sqlite(
+            session_name,
+            timeout=request.get("pm_timeout", 300),
+            max_retries=request.get("pm_max_retries", 3),
+            client=item["client"],
+        )
+        if pm_failure is not None:
+            return {
+                **item,
+                "error": f"PM activation failed: {pm_failure}",
+            }
+        pm_state = self._read_pm_state_via_sqlite(
+            session_name, client=item["client"],
+        )
+        native_session_id = pm_state.get("session_uuid")
+        if (
+            pm_state.get("professional_mode") != "on"
+            or not isinstance(native_session_id, str)
+            or not _UUID_RE.fullmatch(native_session_id)
+        ):
+            return {
+                **item,
+                "error": "PM identity verification failed",
+            }
+        return {**item, "native_session_id": native_session_id}
 
     def spawn_workers(self, requests: list[dict]) -> list[dict]:
         """Spawn multiple workers with batch grading and parallel PM activation.
@@ -2925,7 +3579,7 @@ You are grading a spawn_worker decision. Your verdict is a JSON object:
                 approved.append((req, grade, len(results)))
                 results.append(None)  # placeholder — will be filled after spawn
 
-        # Spawn all approved tmux sessions
+        # Resolve, preflight, and spawn each approved item independently.
         spawned = []
         for req, grade, res_idx in approved:
             worker_type = req["worker_type"]
@@ -2933,116 +3587,210 @@ You are grading a spawn_worker decision. Your verdict is a JSON object:
             repo = req["repo"]
             model_name = req.get("model_name", "")
 
-            self._ensure_claude_md(repo)
-            self.ensure_worker_trusted(repo)
+            if req.get("pm_max_retries", 3) < 1:
+                results[res_idx] = {
+                    "worker_id": worker_id,
+                    "error": "pm_max_retries must be at least 1",
+                }
+                continue
 
-            if worker_type == "claude-opus":
-                cmd = make_opus_command(self._opus_model, self._effort_level)
-            elif worker_type == "claude-fable":
-                cmd = make_opus_command("fable", self._effort_level)
-            elif worker_type in WORKER_COMMANDS:
-                cmd = WORKER_COMMANDS[worker_type]
-            elif worker_type == "ollama" and model_name:
+            worker_handle = None
+            if worker_type == "ollama":
+                if not model_name:
+                    results[res_idx] = {
+                        "worker_id": worker_id,
+                        "error": (
+                            "Cannot spawn ollama worker — model_name is required"
+                        ),
+                    }
+                    continue
                 self._get_ollama_client()
-                _ollama_url = self._ollama_cfg_cache.get("url", "http://localhost:11434")
+                _ollama_url = self._ollama_cfg_cache.get(
+                    "url", "http://localhost:11434",
+                )
                 variant = self._ensure_ollama_ctx_variant(model_name)
-                _max_out = int(self._config.get("ollama_worker_max_output_tokens", 0))
-                _max_out_export = f"export CLAUDE_CODE_MAX_OUTPUT_TOKENS={_max_out}; " if _max_out else ""
-                cmd = (
+                _max_out = int(
+                    self._config.get("ollama_worker_max_output_tokens", 0)
+                )
+                _max_out_export = (
+                    f"export CLAUDE_CODE_MAX_OUTPUT_TOKENS={_max_out}; "
+                    if _max_out else ""
+                )
+                base_cmd = (
                     f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; "
                     f"export CLAUDE_CODE_ATTRIBUTION_HEADER=0; "
                     f"{_max_out_export}"
                     f"export ANTHROPIC_BASE_URL={shlex.quote(_ollama_url)}; "
-                    f"export ANTHROPIC_AUTH_TOKEN=ollama; export ANTHROPIC_API_KEY=; "
-                    f"exec claude --model {shlex.quote(variant)} --dangerously-skip-permissions "
-                    f"--append-system-prompt {shlex.quote(OLLAMA_WORKER_PLAYBOOK)}"
+                    f"export ANTHROPIC_AUTH_TOKEN=ollama; "
+                    f"export ANTHROPIC_API_KEY=; "
+                    f"exec claude --model {shlex.quote(variant)} "
+                    f"--dangerously-skip-permissions "
+                    f"--append-system-prompt "
+                    f"{shlex.quote(OLLAMA_WORKER_PLAYBOOK)}"
+                )
+                cmd = (
+                    f"export IC_ROLE=worker; "
+                    f"export IC_WORKER_ID={shlex.quote(worker_id)}; "
+                    f"export ENABLE_STOP_REVIEW=0; {base_cmd}"
                 )
             else:
-                results[res_idx] = {"worker_id": worker_id, "error": f"Unknown worker type: {worker_type}"}
-                continue
+                try:
+                    cmd, worker_handle = self._build_worker_launch_cmd(
+                        worker_type, model_name, worker_id, None,
+                    )
+                except NoCapabilityAvailable as exc:
+                    results[res_idx] = {
+                        "worker_id": worker_id,
+                        "error": str(exc),
+                    }
+                    continue
+                except ValueError:
+                    results[res_idx] = {
+                        "worker_id": worker_id,
+                        "error": f"Unknown worker type: {worker_type}",
+                    }
+                    continue
 
-            cmd = f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; export ENABLE_STOP_REVIEW=0; {cmd}"
-            session_name = f"ic-{worker_id}"
+            worker_client = (
+                worker_handle.client if worker_handle is not None else "claude"
+            )
+            effective_worker_type = self._effective_worker_type(
+                worker_type, worker_handle,
+            )
+            launch_used_claude_fable = self._launch_used_claude_fable(
+                worker_type, worker_handle,
+            )
 
-            success = self.tmux.spawn_session(session_name, cmd, cwd=repo)
-            if not success:
-                results[res_idx] = {"worker_id": worker_id, "error": "Failed to spawn tmux session"}
-                continue
-
-            spawned.append((req, grade, session_name, res_idx))
-
-        # Parallel PM activation: poll all PPID files in a single loop
-        # timeout raised from 120→300; now configurable via pm_timeout per request
-        # when ~/.claude/session-env/ has many files (find without -maxdepth)
-        claude_dir = Path("~/.claude").expanduser()
-        max_pm_timeout = max(
-            (req.get("pm_timeout", 300) for req, grade, res_idx in approved),
-            default=300,
-        )
-        deadline = time.time() + max_pm_timeout
-        pending = {}
-        for req, grade, session_name, res_idx in spawned:
-            try:
-                result = subprocess.run(
-                    ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_pid}"],
-                    capture_output=True, text=True,
-                )
-                pane_pid = result.stdout.strip()
-                if pane_pid.isdigit():
-                    pending[session_name] = (req, grade, pane_pid)
-            except Exception:
-                pass
-
-        activated = {}
-        while time.time() < deadline and pending:
-            for session_name, (req, grade, pane_pid) in list(pending.items()):
-                session_id_file = claude_dir / f"ironclaude-session-{pane_pid}.id"
-                if session_id_file.exists():
-                    candidate = session_id_file.read_text().strip()
-                    if len(candidate) == 36:
-                        # Write PM=on
-                        db_path = claude_dir / "ironclaude.db"
-                        try:
-                            conn = sqlite3.connect(str(db_path), timeout=5)
-                            conn.execute("PRAGMA journal_mode=WAL")
-                            conn.execute(
-                                "INSERT OR IGNORE INTO sessions (terminal_session, professional_mode)"
-                                " VALUES (?, 'on')", (candidate,))
-                            conn.execute(
-                                "UPDATE sessions SET professional_mode='on', updated_at=datetime('now')"
-                                " WHERE terminal_session=?", (candidate,))
-                            conn.commit()
-                            conn.close()
-                            activated[session_name] = (req, grade)
-                            del pending[session_name]
-                            logger.info(f"PM activated for {session_name} (batch)")
-                        except sqlite3.Error as e:
-                            logger.warning(f"SQLite error activating PM for {session_name}: {e}")
-            time.sleep(2)
-
-        # Send objectives to activated workers, clean up timed-out ones
-        for req, grade, session_name, res_idx in spawned:
-            worker_id = req["worker_id"]
-            if session_name in activated:
-                if self._advisor_cfg.get("enabled"):
-                    advisor_model = self._advisor_cfg.get("advisor_model", "opus")
-                    advisor_model = _resolve_fable_advisor_model(advisor_model)
-                    self.tmux.send_keys(session_name, f"/advisor {advisor_model}")
-                    time.sleep(3)
-                self.registry.register_worker(
-                    worker_id, req["worker_type"], session_name,
-                    repo=req["repo"], description=req["objective"])
-                self.tmux.send_keys(session_name, req["objective"])
-                recommended = grade.get("recommended_model", req["worker_type"])
+            instruction_error = self._ensure_worker_instructions(
+                repo, worker_client,
+            )
+            if instruction_error is not None:
                 results[res_idx] = {
                     "worker_id": worker_id,
+                    "error": instruction_error,
+                }
+                continue
+            self.ensure_worker_trusted(repo)
+
+            session_name = f"ic-{worker_id}"
+            success = self.tmux.spawn_session(
+                session_name, cmd, cwd=repo,
+            )
+            if not success:
+                results[res_idx] = {
+                    "worker_id": worker_id,
+                    "error": "Failed to spawn tmux session",
+                }
+                continue
+
+            spawned.append({
+                "request": req,
+                "grade": grade,
+                "res_idx": res_idx,
+                "session_name": session_name,
+                "worker_type": worker_type,
+                "effective_worker_type": effective_worker_type,
+                "handle": worker_handle,
+                "client": worker_client,
+                "launch_used_claude_fable": launch_used_claude_fable,
+            })
+
+        if not spawned:
+            return results
+
+        # Readiness and PM activation proceed independently; finalize each item
+        # as soon as its future completes while preserving positional slots.
+        with ThreadPoolExecutor(max_workers=len(spawned)) as executor:
+            future_items = {
+                executor.submit(self._start_batch_item, item): item
+                for item in spawned
+            }
+            for future in as_completed(future_items):
+                original = future_items[future]
+                try:
+                    outcome = future.result()
+                except Exception as exc:
+                    outcome = {
+                        **original,
+                        "error": f"Worker startup failed: {exc}",
+                    }
+
+                req = outcome["request"]
+                grade = outcome["grade"]
+                worker_id = req["worker_id"]
+                session_name = outcome["session_name"]
+                res_idx = outcome["res_idx"]
+
+                if outcome.get("error"):
+                    self.tmux.kill_session(session_name)
+                    results[res_idx] = {
+                        "worker_id": worker_id,
+                        "error": outcome["error"],
+                    }
+                    continue
+
+                effective_worker_type = outcome["effective_worker_type"]
+                if (
+                    outcome["client"] == "claude"
+                    and self._advisor_cfg.get("enabled")
+                    and not outcome["launch_used_claude_fable"]
+                ):
+                    advisor_model = self._advisor_model_for(
+                        effective_worker_type,
+                    )
+                    advisor_model = _resolve_fable_advisor_model(advisor_model)
+                    self.tmux.send_keys(
+                        session_name, f"/advisor {advisor_model}",
+                    )
+                    time.sleep(3)
+
+                if (
+                    self._dispatch_cfg.get("use_goal")
+                    and outcome["client"] == "claude"
+                ):
+                    self.tmux.send_keys(
+                        session_name,
+                        "/goal the assigned objective is complete and "
+                        "code review has passed",
+                    )
+                    time.sleep(3)
+
+                self.registry.register_worker(
+                    worker_id,
+                    effective_worker_type,
+                    session_name,
+                    repo=req["repo"],
+                    description=req["objective"],
+                    client=outcome["client"],
+                    model=(
+                        outcome["handle"].model
+                        if outcome["handle"] is not None else None
+                    ),
+                    native_session_id=outcome["native_session_id"],
+                )
+                self.tmux.send_keys(session_name, req["objective"])
+                self.registry.log_event(
+                    "worker_spawned",
+                    worker_id=worker_id,
+                    details={
+                        "type": effective_worker_type,
+                        "repo": req["repo"],
+                        "objective": req["objective"],
+                        "allowed_paths": req.get("allowed_paths"),
+                        "model_name": req.get("model_name", ""),
+                        "machine": None,
+                    },
+                )
+                recommended = grade.get(
+                    "recommended_model", effective_worker_type,
+                )
+                results[res_idx] = {
+                    "worker_id": worker_id,
+                    "worker_type": effective_worker_type,
                     "status": "spawned",
                     "grade": grade.get("grade", "?"),
                     "recommended_model": recommended,
                 }
-            else:
-                self.tmux.kill_session(session_name)
-                results[res_idx] = {"worker_id": worker_id, "error": "PM activation timed out (batch)"}
 
         return results
 
@@ -3591,64 +4339,122 @@ Grading criteria:
         }
 
     def resume_session(
-        self, session_id: str, worker_id: str,
+        self, session_id: str, client: str, worker_id: str,
         repo: str, description: str = "", worker_type: str = "claude-opus",
     ) -> str | dict:
-        """Resume a previous Claude Code conversation in a new tmux session.
+        """Resume a provider-native conversation in a new tmux session.
 
-        Creates a fresh tmux session running 'claude --resume {session_id}',
-        activates professional mode, and registers the session as an IronClaude
-        worker. Works with any past conversation, even if the original tmux
-        session is gone.
+        Uses the explicitly selected client, verifies the same native session
+        after professional-mode activation, then registers the worker.
         """
+        if client not in ("claude", "codex"):
+            return {"error": "client must be 'claude' or 'codex'"}
+        if not isinstance(session_id, str) or not _UUID_RE.fullmatch(session_id):
+            return {"error": "session_id must be a provider-native UUID"}
+
         target = f"ic-{worker_id}"
         if self.registry.get_worker(worker_id):
             return {"error": f"worker_id '{worker_id}' already exists"}
         if self.tmux.has_session(target):
             return {"error": f"target session '{target}' already exists"}
 
-        self._ensure_claude_md(repo)
-        self.ensure_worker_trusted(repo)
+        instruction_error = self._ensure_worker_instructions(repo, client)
+        if instruction_error is not None:
+            return {"error": instruction_error}
+        if client == "claude":
+            self.ensure_worker_trusted(repo)
 
-        cmd = (
+        env_prefix = (
             f"export IC_ROLE=worker; export IC_WORKER_ID={shlex.quote(worker_id)}; "
             f"export ENABLE_STOP_REVIEW=0; "
-            f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; "
-            f"exec claude --resume {shlex.quote(session_id)} --dangerously-skip-permissions"
         )
+        if client == "claude":
+            cmd = (
+                f"{env_prefix}"
+                f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; "
+                f"exec claude --resume {shlex.quote(session_id)} "
+                f"--dangerously-skip-permissions"
+            )
+        else:
+            codex_path = (
+                self._config.get("providers", {}).get("clients", {})
+                .get("codex", {}).get("path", "codex")
+            )
+            cmd = (
+                f"{env_prefix}exec {shlex.quote(codex_path)} "
+                f"resume {shlex.quote(session_id)} "
+                f"--dangerously-bypass-approvals-and-sandbox"
+            )
 
         success = self.tmux.spawn_session(target, cmd, cwd=repo)
         if not success:
             return {"error": f"Failed to spawn tmux session for worker '{worker_id}'"}
 
+        cleanup_required = True
         try:
-            self.tmux.setup_log_capture(target)
-        except Exception as e:
-            logger.warning(f"resume_session: log capture setup failed for {target}: {e}")
+            try:
+                self.tmux.setup_log_capture(target)
+            except Exception as e:
+                logger.warning(
+                    f"resume_session: log capture setup failed for {target}: {e}"
+                )
 
-        ready = self._wait_for_ready(target, timeout=30)
-        if not ready:
-            log_tail = self.tmux.read_log_tail(target, lines=30)
-            if not self.tmux.has_session(target):
-                return {"error": f"Worker '{worker_id}' died before ready.\nLast output:\n{log_tail}"}
-            logger.warning(
-                "Worker '%s' not ready after timeout but session alive — proceeding.", worker_id
+            ready = self._wait_for_ready(target, timeout=30, client=client)
+            if not ready:
+                log_tail = self.tmux.read_log_tail(target, lines=30)
+                return {
+                    "error": (
+                        f"Worker '{worker_id}' was not ready.\n"
+                        f"Last output:\n{log_tail}"
+                    ),
+                }
+
+            pm_failure = self._activate_pm_via_sqlite(
+                target, timeout=300, max_retries=3, client=client,
             )
+            if pm_failure is not None:
+                return {
+                    "error": (
+                        f"PM activation failed for worker '{worker_id}': "
+                        f"{pm_failure}"
+                    ),
+                }
 
-        pm_failure = self._activate_pm_via_sqlite(target, timeout=300, max_retries=3)
-        if pm_failure is not None:
-            self.tmux.kill_session(target)
-            return {"error": f"PM activation failed for worker '{worker_id}': {pm_failure}"}
+            pm = self._read_pm_state_via_sqlite(target, client=client)
+            if (
+                pm.get("professional_mode") != "on"
+                or pm.get("session_uuid") != session_id
+            ):
+                return {
+                    "error": (
+                        f"PM identity verification failed for worker '{worker_id}'"
+                    ),
+                }
 
-        self.registry.register_worker(worker_id, worker_type, target,
-                                      repo=repo, description=description)
-        pm = self._read_pm_state_via_sqlite(target)
+            self.registry.register_worker(
+                worker_id,
+                worker_type,
+                target,
+                repo=repo,
+                description=description,
+                client=client,
+                model=None,
+                native_session_id=session_id,
+            )
+            cleanup_required = False
+        finally:
+            if cleanup_required:
+                self.tmux.kill_session(target)
+
         try:
             recent_output = _strip_ansi(self.tmux.capture_pane(target, lines=200))
         except subprocess.CalledProcessError:
             recent_output = ""
-        self.registry.log_event("session_resumed", worker_id=worker_id,
-                                details={"session_id": session_id})
+        self.registry.log_event(
+            "session_resumed",
+            worker_id=worker_id,
+            details={"client": client, "session_id": session_id},
+        )
         return {
             "worker_id": worker_id,
             "tmux_session": target,
@@ -4660,6 +5466,28 @@ def _create_mcp_server(tools: OrchestratorTools):
         return json.dumps(tools.update_directive_status(directive_id, status))
 
     @mcp.tool()
+    def report_directive_capability_block(
+        directive_id: int,
+        capabilities: list[str],
+        denial_scope: str,
+        target: str,
+        reason: str,
+    ) -> str:
+        """Report a durable external capability denial for a directive."""
+        return json.dumps(tools.report_directive_capability_block(
+            directive_id, capabilities, denial_scope, target, reason
+        ))
+
+    @mcp.tool()
+    def report_directive_capability_recovery(
+        directive_id: int, recovered_capabilities: list[str]
+    ) -> str:
+        """Report partial or complete recovery of blocked capabilities."""
+        return json.dumps(tools.report_directive_capability_recovery(
+            directive_id, recovered_capabilities
+        ))
+
+    @mcp.tool()
     def debug_slack_connection() -> str:
         """Diagnose Slack connectivity issues.
 
@@ -4979,26 +5807,28 @@ def _create_mcp_server(tools: OrchestratorTools):
     @mcp.tool()
     def resume_session(
         session_id: str,
+        client: str,
         worker_id: str,
         repo: str,
         description: str = "",
         worker_type: str = "claude-opus",
     ) -> str:
-        """Resume a previous Claude Code conversation as an IronClaude worker.
+        """Resume a provider-native conversation as an IronClaude worker.
 
-        Creates a fresh tmux session running 'claude --resume {session_id}',
-        activates professional mode, and registers it for daemon monitoring.
-        Works with any past conversation — the original tmux session does not
-        need to be running.
+        Runs the native resume command for the required client, activates
+        professional mode, verifies the native UUID, and registers it.
 
         Args:
-            session_id: Claude Code conversation UUID to resume (e.g., "e6d6a6fb-35ae-4ddf-ba2d-3f098c24b9ec").
+            session_id: Provider-native conversation UUID to resume.
+            client: Native client that owns the conversation: claude or codex.
             worker_id: Identifier for the new worker; tmux session is named ic-{worker_id}.
             repo: Repository path; used as the working directory for the resumed session.
             description: Short description stored in worker registry metadata.
             worker_type: Registry metadata label only (default claude-opus); does not control model.
         """
-        result = tools.resume_session(session_id, worker_id, repo, description, worker_type)
+        result = tools.resume_session(
+            session_id, client, worker_id, repo, description, worker_type,
+        )
         if isinstance(result, dict):
             return json.dumps(result)
         return result

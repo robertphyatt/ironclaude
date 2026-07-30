@@ -7,42 +7,248 @@ description: Enable workflow discipline and behavioral expectations
 
 ## Purpose
 
-Enable workflow discipline that enforces human-in-the-loop practices. When professional mode is active, Claude operates in architect mode by default - planning and designing without making code changes unless executing an approved plan.
+Enable provider-aware workflow discipline. The active client operates in
+architect mode by default: planning and designing without code changes unless
+executing an approved plan.
 
-Professional mode starts in UNDECIDED state by default. In this state, only read-only tools (Read, Grep, Glob) and the activate/deactivate professional mode skills are allowed. Everything else is blocked until the human decides. The UNDECIDED state ensures Claude cannot take any meaningful action until the human has explicitly chosen whether to enable or disable professional mode.
+Professional mode begins `undecided`. Only read-only tools and the
+activate/deactivate skills are available until the operator chooses a mode.
+Activation must establish and verify the durable instruction surface consumed
+by the trusted active client before professional mode changes to `on`.
 
-To check the current professional mode state, use the `mcp__plugin_ironclaude_state-manager__get_professional_mode` MCP tool which returns 'undecided', 'on', or 'off'.
+## Provider-native state-manager calls
+
+- Claude Code:
+  `mcp__plugin_ironclaude_state-manager__get_professional_mode` and
+  `mcp__plugin_ironclaude_state-manager__set_professional_mode`.
+- Codex: Codex `state-manager` `get_professional_mode` and
+  Codex `state-manager` `set_professional_mode`.
+
+Both clients receive the same authenticated response contract:
+
+```json
+{"professional_mode": "undecided", "client": "codex", "session_id": "<provider-native-root-session>"}
+```
+
+or:
+
+```json
+{"professional_mode": "undecided", "client": "claude", "session_id": "<provider-native-root-session>"}
+```
+
+## Instruction-file operation bindings
+
+- When either token remains literal, the active client resolves it to its native file operation through the client subsection below.
+- If an instrumented skill replaces a token with a concrete tool name, that concrete replacement is authoritative; call it directly.
+- Every existence check, semantic read, creation, append or prepend, and read-back must use one of these exact tokens.
+- Natural-language file verbs are not an alternate execution path.
+
+### Codex
+
+Only when the exact tokens remain literal:
+
+- `<READ_INSTRUCTION_FILE>` means the marker-bounded `node_repl` `js` program below. Before calling it, replace `<ABSOLUTE_NORMALIZED_PATH>` exactly once with the JSON string literal for the target's absolute normalized path.
+<!-- CODEX_NATIVE_READ_PROGRAM_START -->
+```javascript
+var instructionFs = await import("node:fs/promises");
+var instructionResult;
+try {
+  instructionResult = {
+    exists: true,
+    text: await instructionFs.readFile(<ABSOLUTE_NORMALIZED_PATH>, "utf8"),
+  };
+} catch (error) {
+  if (error?.code !== "ENOENT") throw error;
+  instructionResult = { exists: false, text: null };
+}
+nodeRepl.write(JSON.stringify(instructionResult));
+```
+<!-- CODEX_NATIVE_READ_PROGRAM_END -->
+- `<WRITE_INSTRUCTION_FILE>` means the native `apply_patch` tool with the complete computed file content.
+- Do not use Bash, shell commands, Claude `Read`, or Claude `Write` as fallback operations.
+
+### Claude Code
+
+Only when the exact tokens remain literal:
+
+- `<READ_INSTRUCTION_FILE>` means the native `Read` tool.
+- `<WRITE_INSTRUCTION_FILE>` means the native `Write` tool.
+- Do not use Codex `node_repl` or `apply_patch` as fallback operations.
+
+## End provider bindings
 
 ## When to Use
 
-- At the start of any work session (recommended default)
-- After deactivating professional mode and wanting to restore discipline
-- When beginning a new project or feature
+- At the start of a work session
+- After deactivation when restoring workflow discipline
+- When beginning a project or feature
 
 ## Process
 
-### Step 1: Check current state
+### Step 1: Check current state and trusted client
 
-Call the `mcp__plugin_ironclaude_state-manager__get_professional_mode` MCP tool to check current state.
+Call the active client's provider-native `get_professional_mode`.
 
-- If it returns `on`: professional mode is already active. Skip to Step 4 to display confirmation.
-- If it returns `undecided` or `off`: continue with setup. Mode will be activated at Step 4 after CLAUDE.md is confirmed.
+The response must include `professional_mode`, `client`, and a nonempty `session_id`.
+Bind this activation to the exact `session_id` returned in Step 1.
+
+- Supported clients: `"codex"` and `"claude"`.
+- Missing or empty `session_id`: stop and report the exact response.
+- Missing or unsupported `client`: stop and report the exact response.
+- Do not infer the client from instruction-file presence, installed
+  executables, plugin paths, or availability of another client.
+- If it returns `on`: set setup mode to `verify-only` and continue to Step 3. Do not skip instruction verification.
+- If it returns `undecided` or `off`: set setup mode to `update` and continue
+  to Step 3. Preserve this exact prior value until setup succeeds.
+- Any other `professional_mode` value: stop and report the exact response.
 
 Display:
+
+```text
+Activating professional mode for <client>...
 ```
-Activating professional mode...
+
+### Step 3: Establish the active client's instruction surface
+
+In `verify-only` mode, do not write instruction files. If the active surface is incomplete, report the exact missing semantics and stop.
+
+Equivalent wording counts only when it affirmatively expresses the full
+required behavior. Only affirmative evidence of a concept's full required behavior counts as covered. Topical similarity, shared keywords, and uncertainty are uncovered.
+
+**Exact verify-only diagnostic contract**
+
+For an incomplete `verify-only` response, enumerate every uncovered concept by
+its exact name from this list:
+
+- Challenge Assumptions
+- Verify with Evidence
+- Refuse Impossible Requests
+- Persistent Questioning
+- No Premature Optimization
+- Search Before Guessing
+- Subagent Discipline
+- No Sycophantic Responses
+- Advisor Fallback
+- No Workflow Avoidance Under Stage/Context Restrictions
+- Boy Scout Rule
+
+The enumerated name set must equal the uncovered concept set exactly. Do not
+substitute a numeric range, a count, “concepts 1–11,” “behavioral concepts,” or
+another generic summary for the names. Do not list a covered concept.
+
+Preserve all unrelated project guidance and append only genuinely missing
+concepts. In `verify-only` mode, list every exact uncovered concept, write nothing, and do not call `set_professional_mode`.
+
+#### Codex: root `AGENTS.md`
+
+Codex owns only root `AGENTS.md`.
+
+Codex activation must not create or edit `CLAUDE.md` or anything under `.claude/rules`.
+
+Call `<READ_INSTRUCTION_FILE>` for root `AGENTS.md` to perform its existence check and complete semantic read.
+
+- In `update` mode, if it is absent, create it only through the exact write
+  operation below.
+- If it exists, semantically check the workflow requirement and all eleven
+  concepts across the whole file. Do not require matching headings or wording.
+- When classification is uncertain, treat the concept as uncovered.
+- In `update` mode, compute a full result that appends only missing canonical
+  concepts and prepends the workflow requirement only when its intent is
+  absent.
+- In `verify-only` mode, perform the same semantic check without writes.
+
+When root `AGENTS.md` is absent, create it with this canonical template:
+
+Call `<WRITE_INSTRUCTION_FILE>` for root `AGENTS.md` with the complete canonical template.
+
+```markdown
+> **WORKFLOW REQUIREMENT (when professional mode is active):** All code changes — regardless of size or perceived simplicity — MUST follow the brainstorm → write-plans → execute-plans workflow. Never suggest, attempt, or agree to circumvent this workflow. There are no "small" or "trivial" exceptions. If you think a change is too simple for the workflow, you are wrong — follow it anyway.
+
+# Behavioral Directives for Codex
+
+## Core Principles
+
+1. **Challenge Assumptions**
+   - Question stated requirements when they seem incomplete or contradictory
+   - Ask clarifying questions before accepting assumptions
+   - Verify understanding before proceeding
+
+2. **Verify with Evidence**
+   - Don't guess or use probabilistic language without proof
+   - Avoid "likely", "probably", "should work" without verification
+   - Test claims before stating them as fact
+
+3. **Refuse Impossible Requests**
+   - Clearly state when something cannot be done
+   - Explain why it's impossible
+   - Suggest alternatives when available
+
+4. **Persistent Questioning**
+   - Keep asking until understanding is complete
+   - Don't proceed with unclear requirements
+   - Confirm understanding before implementation
+
+5. **No Premature Optimization**
+   - Solve the stated problem, not hypothetical future problems
+   - Keep implementations simple and focused
+   - Don't add features that weren't requested
+
+6. **Search Before Guessing**
+   - If context feels incomplete (after compaction), search episodic memory
+   - Don't make up details - search for them
+   - Search with the `episodic-memory` MCP server's search capability
+
+7. **Subagent Discipline**
+   - Keep subagent prompts focused: one task, one clear deliverable, no open-ended exploration
+   - Use inline execution mode when tasks are complex enough to risk context exhaustion spirals
+   - Set max_turns on subagents so they fail fast rather than spiral (compaction loses critical detail, causing re-research loops)
+   - Never put orchestration in subagents — state management, code review invocation, flag management, and task sequencing belong in the main context
+
+8. **No Sycophantic Responses**
+   - Never use performative agreement ("Great point!", "You're absolutely right!", "That's a great catch")
+   - When corrected by a hook or review, respond with technical reasoning, not agreement
+   - If you disagree with review feedback, push back with evidence
+   - Before implementing a correction, verify the correction is actually correct
+   - Forbidden phrases: "Great point", "You're right", "Good catch", "Absolutely", "That's a great suggestion"
+
+9. **Advisor Fallback (advisor unavailable ≠ skip the advisor)**
+   - Fire the advisor at natural discretionary points: before substantive work, when stuck, and before declaring done
+   - Invoke a one-tier-up report-only reviewer with `codex exec -m <one-tier-up-model>` using `luna → terra → sol`; at the `sol` ceiling, run a same-tier blind `sol` pass
+   - Reconcile the review with evidence; never proceed unreviewed because an advisor command is unavailable
+
+10. **No Workflow Avoidance Under Stage/Context Restrictions**
+    - Do NOT propose to "checkpoint / bank progress / resume fresh / find a safe stopping point" mid-execution. Plan/task artifacts on disk ARE the checkpoint. Pauses are operator-initiated via `plan-interruption`.
+    - Do NOT ask the operator to run read-only queries (sqlite, grep, bash) because the current stage blocks Bash. The correct move is an investigation PM loop whose execute stage unblocks Bash — do it yourself.
+    - See `ironclaude:workflow-durability` for the decision table.
+
+11. **Boy Scout Rule — Leave It Better Than You Found It**
+    - Never dismiss an evidence-backed defect because it is pre-existing, adjacent, or outside the immediate change
+    - If cleanup is safe, relevant, and within the authorized task scope, fix it through the active workflow and verify the result
+    - If cleanup would materially expand scope, change behavior, require destructive action, affect external systems, or require new authority, describe the finding, evidence, proposed cleanup scope, and risk, then ask permission before proceeding
+    - If cleanup is blocked or unsafe, record the finding and explain the constraint instead of suppressing it
+    - Do not use this rule to justify speculative refactoring or unrequested features
 ```
 
-### Step 3: Check and upgrade CLAUDE.md
+For an existing file, use the same eleven-concept semantic meanings as the
+Claude table below, except Advisor Fallback is covered only by a Codex-native
+one-tier-up `codex exec` review. Append the corresponding complete body from
+the canonical Codex template above for any missing concept.
 
-Check if project has CLAUDE.md using the Read tool (attempt to read `CLAUDE.md`):
+Call `<WRITE_INSTRUCTION_FILE>` for root `AGENTS.md` with the full computed result after any append or prepend.
 
-- If Read succeeds: file exists. Proceed to directive upgrade check below.
-- If Read returns an error (file not found): file doesn't exist. Proceed to auto-create.
+Call `<READ_INSTRUCTION_FILE>` for root `AGENTS.md` as the read-back gate.
+Verify the workflow requirement and all eleven concepts from that returned
+content.
 
-**If CLAUDE.md doesn't exist:**
+#### Claude Code: `CLAUDE.md` and `.claude/rules/behavioral.md`
 
-Create CLAUDE.md with the compact template (using the Write tool):
+Claude activation must not create or edit `AGENTS.md`.
+
+Call `<READ_INSTRUCTION_FILE>` for root `CLAUDE.md` and `.claude/rules/behavioral.md` to perform their existence checks and complete semantic reads.
+
+If `CLAUDE.md` is absent in `update` mode, create this compact index:
+
+Call `<WRITE_INSTRUCTION_FILE>` for root `CLAUDE.md` with the complete compact index.
 
 ```markdown
 > **WORKFLOW REQUIREMENT (when professional mode is active):** All code changes — regardless of size or perceived simplicity — MUST follow the brainstorm → write-plans → execute-plans workflow. Never suggest, attempt, or agree to circumvent this workflow. There are no "small" or "trivial" exceptions. If you think a change is too simple for the workflow, you are wrong — follow it anyway.
@@ -66,7 +272,14 @@ Create CLAUDE.md with the compact template (using the Write tool):
 Full behavioral rules: [`.claude/rules/behavioral.md`](.claude/rules/behavioral.md)
 ```
 
-Then create `.claude/rules/behavioral.md` with the full canonical principles (using the Write tool):
+First semantically evaluate the existing `CLAUDE.md` together with
+`.claude/rules/behavioral.md` when the rules file exists. Do not create `.claude/rules/behavioral.md` solely because it is absent. If `CLAUDE.md` alone covers the workflow requirement and all eleven concepts, leave the rules file absent.
+
+Only if that evaluation finds missing concepts and
+`.claude/rules/behavioral.md` is absent in `update` mode, create it with the
+full canonical template:
+
+Call `<WRITE_INSTRUCTION_FILE>` for `.claude/rules/behavioral.md` with the complete canonical template.
 
 ```markdown
 # Behavioral Directives
@@ -135,115 +348,39 @@ Then create `.claude/rules/behavioral.md` with the full canonical principles (us
     - Do not use this rule to justify speculative refactoring or unrequested features
 ```
 
-Display:
-```
-Created CLAUDE.md (compact index) + .claude/rules/behavioral.md (11 principles)
-```
+For existing Claude files, semantically check both files together:
 
-Continue to Step 3.5.
-
-**If CLAUDE.md exists:**
-
-Perform semantic concept analysis. Use the Read tool to check `.claude/rules/behavioral.md` directly (this is the only rules file written by the activation skill). For each of the 11 concepts below, check the entire CLAUDE.md AND `.claude/rules/behavioral.md` (if it exists) and determine whether it's already covered — regardless of heading text, section structure, or wording. A concept is "covered" if CLAUDE.md or `.claude/rules/behavioral.md` contains instructions, rules, or guidance that address the same intent, even if expressed differently. When uncertain, err on the side of "covered" (don't add) rather than "missing" (add redundant content).
-
-| # | Concept | Covered if the file contains... |
+| # | Concept | Covered if the files contain... |
 |---|---------|----------------------------------|
-| 1 | Challenge Assumptions | Instructions to question, challenge, push back on, or disagree with the user's requirements or thinking |
-| 2 | Verify with Evidence | Instructions to verify claims before acting, avoid guessing, test assertions, or demand proof |
+| 1 | Challenge Assumptions | Instructions to question, challenge, push back on, or disagree with requirements or thinking |
+| 2 | Verify with Evidence | Instructions to verify claims, avoid guessing, test assertions, or demand proof |
 | 3 | Refuse Impossible Requests | Instructions to refuse, hard-stop, or block dangerous, impossible, or destructive actions |
-| 4 | Persistent Questioning | Instructions to keep asking questions, clarify ambiguity, or not proceed when requirements are unclear |
-| 5 | No Premature Optimization | Instructions about YAGNI, simplicity, solving only the stated problem, or not adding unrequested features |
-| 6 | Search Before Guessing | Instructions to search episodic memory or conversation history before making assumptions after compaction |
-| 7 | Subagent Discipline | Instructions about keeping subagent prompts focused, setting max_turns, or avoiding orchestration in subagents |
-| 8 | No Sycophantic Responses | Instructions to avoid performative agreement, push back with evidence when disagreeing, or verify corrections before implementing them |
-| 9 | Advisor Fallback | Instructions to substitute a subagent (Fable if available, else Opus) for the advisor's review when the `advisor` tool is unavailable, rather than skipping the review |
-| 10 | No Workflow Avoidance Under Stage/Context Restrictions | Instructions to not self-checkpoint / bank progress / hand read-only work back to the operator when a stage restricts Bash; instructions to open an investigation PM loop instead. See `ironclaude:workflow-durability`. |
+| 4 | Persistent Questioning | Instructions to keep asking, clarify ambiguity, or stop when requirements are unclear |
+| 5 | No Premature Optimization | YAGNI, simplicity, stated-problem-only, or no-unrequested-feature instructions |
+| 6 | Search Before Guessing | Instructions to search episodic memory or conversation history after compaction |
+| 7 | Subagent Discipline | Focused prompts, max_turns, or no orchestration in subagents |
+| 8 | No Sycophantic Responses | Avoid performative agreement, push back with evidence, or verify corrections |
+| 9 | Advisor Fallback | Instructions to use the `Agent` tool with Fable if available else Opus instead of skipping advisor review |
+| 10 | No Workflow Avoidance Under Stage/Context Restrictions | Instructions not to self-checkpoint or hand stage-blocked read-only work to the operator; open an investigation PM loop |
 | 11 | Boy Scout Rule | Instructions not to ignore evidence-backed pre-existing or adjacent defects; clean them up when within authorized task scope, ask permission before scope expansion, destructive action, or external-system effects after presenting finding/evidence/scope/risk, and record blocked or unsafe findings instead of suppressing them |
 
-Also check whether the workflow requirement concept (all changes must follow brainstorm → write-plans → execute-plans, no exceptions) is expressed anywhere in CLAUDE.md or `.claude/rules/behavioral.md`.
+Also semantically check the workflow requirement across both files. If all
+eleven concepts and the workflow requirement are covered, make no changes.
+When classification is uncertain, treat the concept as uncovered.
 
-**If all concepts and workflow requirement are covered:** No changes needed. Continue to Step 3.5.
+In `update` mode, if a concept is missing, append its corresponding complete
+body from the full canonical template above to
+`.claude/rules/behavioral.md`. If the workflow requirement is missing, prepend
+the exact block from the compact index. Do not append numbered directives to
+`CLAUDE.md`.
 
-**If concepts are missing:**
+Call `<WRITE_INSTRUCTION_FILE>` for the affected Claude-owned file with the full computed result after any append or prepend.
 
-Write missing concepts to `.claude/rules/behavioral.md`:
-
-- If `.claude/rules/behavioral.md` does not exist: create it with the full 11-principle template (same template as in the "CLAUDE.md doesn't exist" path above — use the Write tool).
-- If `.claude/rules/behavioral.md` exists: append the missing concept(s) to the end of the file using the Edit tool.
-
-Do NOT append numbered directives to CLAUDE.md.
-
-Use these canonical texts for missing concepts (for appending to an existing behavioral.md):
-
-Concept 1 (Challenge Assumptions):
-```
-N. **Challenge Assumptions**
-   - Question stated requirements when they seem incomplete or contradictory
-   - Ask clarifying questions before accepting assumptions
-   - Verify understanding before proceeding
-```
-
-Concept 2 (Verify with Evidence):
-```
-N. **Verify with Evidence**
-   - Don't guess or use probabilistic language without proof
-   - Avoid "likely", "probably", "should work" without verification
-   - Test claims before stating them as fact
-```
-
-Concept 3 (Refuse Impossible Requests):
-```
-N. **Refuse Impossible Requests**
-   - Clearly state when something cannot be done
-   - Explain why it's impossible
-   - Suggest alternatives when available
-```
-
-Concept 4 (Persistent Questioning):
-```
-N. **Persistent Questioning**
-   - Keep asking until understanding is complete
-   - Don't proceed with unclear requirements
-   - Confirm understanding before implementation
-```
-
-Concept 5 (No Premature Optimization):
-```
-N. **No Premature Optimization**
-   - Solve the stated problem, not hypothetical future problems
-   - Keep implementations simple and focused
-   - Don't add features that weren't requested
-```
-
-Concept 6 (Search Before Guessing):
-```
-N. **Search Before Guessing**
-   - If context feels incomplete (after compaction), search episodic memory
-   - Don't make up details - search for them
-   - Use the ironclaude:search-conversations agent, not raw MCP tools
-```
-
-Concept 7 (Subagent Discipline):
-```
-N. **Subagent Discipline**
-   - Keep subagent prompts focused: one task, one clear deliverable, no open-ended exploration
-   - Use inline execution mode when tasks are complex enough to risk context exhaustion spirals
-   - Set max_turns on subagents so they fail fast rather than spiral (compaction loses critical detail, causing re-research loops)
-   - Never put orchestration in subagents — state management, code review invocation, flag management, and task sequencing belong in the main context
-```
-
-Concept 8 (No Sycophantic Responses):
-```
-N. **No Sycophantic Responses**
-   - Never use performative agreement ("Great point!", "You're absolutely right!", "That's a great catch")
-   - When corrected by a hook or review, respond with technical reasoning, not agreement
-   - If you disagree with review feedback, push back with evidence
-   - Before implementing a correction, verify the correction is actually correct
-   - Forbidden phrases: "Great point", "You're right", "Good catch", "Absolutely", "That's a great suggestion"
-```
+The following append bodies remain explicit provider-native pins:
 
 Concept 9 (Advisor Fallback):
-```
+
+```markdown
 N. **Advisor Fallback**
    - When the `advisor` tool returns unavailable, do NOT skip the advisor step or just reason it through yourself
    - Spawn a top-tier subagent via the `Agent` tool (`model=fable` if Fable is available, else `model=opus`) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
@@ -252,15 +389,17 @@ N. **Advisor Fallback**
 ```
 
 Concept 10 (No Workflow Avoidance Under Stage/Context Restrictions):
-```
+
+```markdown
 N. **No Workflow Avoidance Under Stage/Context Restrictions**
-   - Do NOT propose to "checkpoint / bank progress / resume fresh / find a safe stopping point" mid-execution. Plan/task artifacts on disk ARE the checkpoint. Pauses are operator-initiated via `plan-interruption`.
-   - Do NOT ask the operator to run read-only queries (sqlite, grep, bash) because the current stage blocks Bash. The correct move is an investigation PM loop whose execute stage unblocks Bash — do it yourself.
-   - See `ironclaude:workflow-durability` for the decision table.
+    - Do NOT propose to "checkpoint / bank progress / resume fresh / find a safe stopping point" mid-execution. Plan/task artifacts on disk ARE the checkpoint. Pauses are operator-initiated via `plan-interruption`.
+    - Do NOT ask the operator to run read-only queries (sqlite, grep, bash) because the current stage blocks Bash. The correct move is an investigation PM loop whose execute stage unblocks Bash — do it yourself.
+    - See `ironclaude:workflow-durability` for the decision table.
 ```
 
 Concept 11 (Boy Scout Rule):
-```
+
+```markdown
 N. **Boy Scout Rule — Leave It Better Than You Found It**
     - Never dismiss an evidence-backed defect because it is pre-existing, adjacent, or outside the immediate change
     - If cleanup is safe, relevant, and within the authorized task scope, fix it through the active workflow and verify the result
@@ -269,61 +408,66 @@ N. **Boy Scout Rule — Leave It Better Than You Found It**
     - Do not use this rule to justify speculative refactoring or unrequested features
 ```
 
-Display: `Added missing directive(s) to .claude/rules/behavioral.md: [list of concept names]`
+The full rule set has 11 concepts. New projects receive the compact index plus
+full rules `(11 principles)`. Existing projects use the same 11-principle template as the canonical source.
 
-**If workflow requirement is missing:**
+Call `<READ_INSTRUCTION_FILE>` for each existing Claude-owned instruction file as the read-back gate.
+Verify the workflow requirement and all eleven concepts from the returned
+content.
 
-Prepend at the top of the file (before any existing content):
-```
-> **WORKFLOW REQUIREMENT (when professional mode is active):** All code changes — regardless of size or perceived simplicity — MUST follow the brainstorm → write-plans → execute-plans workflow. Never suggest, attempt, or agree to circumvent this workflow. There are no "small" or "trivial" exceptions. If you think a change is too simple for the workflow, you are wrong — follow it anyway.
-```
+**Read-back verification gate**
 
-Display: `Added workflow requirement directive`
+Use the active branch's exact `<READ_INSTRUCTION_FILE>` read-back operation
+after all setup edits.
+Confirm the workflow requirement and all eleven concepts are semantically
+covered. Confirm no inactive-client surface was written during this activation.
 
-**Edge case:** If CLAUDE.md exists but has no numbered directives at all, create `.claude/rules/behavioral.md` with the full 11-principle template (do not modify CLAUDE.md).
-
-**Error handling:** If Write/Edit to CLAUDE.md fails (permissions, etc.), display the error and continue with activation. CLAUDE.md upgrade is best-effort, not a blocker for professional mode.
-
-Continue to Step 3.5.
+Do not continue after a required-surface write or verification failure. Report
+the exact target, operation, and missing concept or tool error. Leave professional mode in its prior state. Do not call `set_professional_mode` after any setup failure.
 
 ### Step 3.5: Check validation backend
 
-Read `~/.claude/ironclaude-hooks-config.json` to detect the current validation backend and display its status:
-
-- If file exists and `validation_backend` is `"ollama"`: read `ollama.model` and `ollama.url` from the config
-- If file exists with a different backend: note what backend is configured
-- If file doesn't exist: note that no validation backend is configured
-
-Display the appropriate message:
-
-**Ollama active:**
-```
-Validation backend: Ollama (<model> at <url>)
-```
-
-**Other backend:**
-```
-Validation backend: <backend> (consider /setup-ollama-validation for faster validation)
-```
-
-**No config:**
-```
-Validation backend: not configured (using slow Haiku default)
-Run /setup-ollama-validation for faster validation (~1s vs ~12-15s)
-```
+Use the trusted client's concrete `<READ_INSTRUCTION_FILE>` binding to read
+`~/.claude/ironclaude-hooks-config.json` by its absolute normalized path and
+display the configured validation backend. For Ollama, include model and URL.
+For another backend, name it. If the read envelope or native read reports that
+the file does not exist, report that validation is not configured and suggest
+`ironclaude:setup-ollama-validation`. Treat every non-absence read error as a
+setup failure.
 
 ### Step 4: Activate and confirm
 
-⚠️ ORDERING REQUIREMENT: Steps 3 and 3.5 must be fully complete before calling `set_professional_mode`. Once professional mode flips to "on", the undecided-state write exceptions disappear — file writes then require the executing workflow stage.
+The instruction-surface gate and validation-backend check must finish before
+this step.
 
-**First:** Call `mcp__plugin_ironclaude_state-manager__set_professional_mode` MCP tool with `value: "on"` to activate professional mode.
+#### Verify-only activation
 
-- If the call fails: report the error to the user and stop. Do not display activation confirmation. Session stays `undecided` — user can retry.
-- If the call succeeds: continue to display confirmation.
+Do not call `set_professional_mode`. Call `get_professional_mode` again using
+the same provider-native form. Require `professional_mode: "on"`, the same trusted `client` and the same bound `session_id`.
+If any differs or the call fails, report the exact response and stop without
+confirmation.
+
+#### Updating activation
+
+Call `set_professional_mode` with `value: "on"` using the active client's
+provider-native form.
+
+- A returned rejection reports the exact error and stops without confirmation;
+  prior mode is unchanged.
+- A missing or untrustworthy response reports
+  `ACTIVATION STATUS UNKNOWN` and stops without a success claim. Do not claim that prior state was restored.
+- A trustworthy success response must contain `success: true`,
+  `professional_mode: "on"`, `previous` equal to the Step 1 prior mode, and
+  `session_id` equal to the bound Step 1 `session_id`.
+
+Do not call `get_professional_mode` again after a successful set. The
+transactional success response is updating-mode confirmation and avoids a
+post-mutation failure window with no valid rollback to `undecided`.
 
 Display:
-```
-Professional mode ACTIVATED.
+
+```text
+Professional mode ACTIVATED for <client>.
 
 Workflow enforcement:
 ✓ Code changes blocked (architect mode)
@@ -335,15 +479,16 @@ Behavioral expectations:
 ✓ Engineer review required (manual commits only)
 ✓ Professional mode stays ACTIVE throughout work
 
-Validation backend: [result from Step 3.5]
+Validation backend: <observed status>
 
-To disable (rarely needed): /deactivate-professional-mode
+To disable (rarely needed): use ironclaude:deactivate-professional-mode
 ```
 
 ## Key Principles
 
-- **Idempotent**: Safe to run when already active
-- **Session-scoped execution**: Uses $CLAUDE_SESSION_ID for concurrent sessions
-- **Human-in-the-loop**: Engineers always commit manually
-- **Never force-disable**: Don't suggest deactivation unless explicitly requested
-- **CLAUDE.md auto-upgrade**: Creates compact index CLAUDE.md + `.claude/rules/behavioral.md` for new projects; redirects missing concepts to `.claude/rules/behavioral.md` for existing projects
+- **Provider-owned**: update only the active client's durable instruction files
+- **Semantically idempotent**: equivalent wording is covered; do not duplicate
+- **Fail-closed**: instruction failure never changes professional mode
+- **Session-scoped**: state-manager identity selects the active session/client
+- **Human-in-the-loop**: engineers commit manually
+- **Never force-disable**: do not suggest deactivation unless requested

@@ -35,6 +35,15 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/codex-brain-gated-actions.sh"
+          }
+        ],
+        "matcher": "mcp__(plugin_ironclaude_)?episodic[-_]memory__.*|mcp__plugin_ironclaude_orchestrator__(wiki_query|get_operator_messages|update_ledger|spawn_worker|spawn_workers|approve_plan|reject_plan|send_to_worker|kill_worker|game_(launch|screenshot|click|type|key|kill))|mcp__orchestrator__(wiki_query|get_operator_messages|update_ledger|spawn_worker|spawn_workers|approve_plan|reject_plan|send_to_worker|kill_worker|game_(launch|screenshot|click|type|key|kill))|mcp__plugin_ironclaude_ollama__(pull_model|remove_model|create_model)|mcp__ollama__(pull_model|remove_model|create_model)"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "bash $HOME/.claude/ironclaude-hooks/skill-state-bridge.sh"
           }
         ],
@@ -121,7 +130,7 @@
             "command": "bash $HOME/.claude/ironclaude-hooks/mcp-state-logger.sh"
           }
         ],
-        "matcher": "mcp__plugin_ironclaude_state-manager__mark_design_ready|mcp__plugin_ironclaude_state-manager__mark_plan_ready|mcp__plugin_ironclaude_state-manager__mark_brainstorming|mcp__plugin_ironclaude_state-manager__mark_executing|mcp__plugin_ironclaude_state-manager__mark_debugging|mcp__plugin_ironclaude_state-manager__create_plan|mcp__plugin_ironclaude_state-manager__start_execution|mcp__plugin_ironclaude_state-manager__retreat"
+        "matcher": "mcp__(plugin_ironclaude_)?state[-_]manager__(mark_design_ready|mark_plan_ready|mark_brainstorming|mark_executing|mark_debugging|create_plan|start_execution|retreat)"
       },
       {
         "hooks": [

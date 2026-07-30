@@ -11,11 +11,54 @@ function payload(result: { content: Array<{ text: string }> }): Record<string, u
   return JSON.parse(result.content[0].text) as Record<string, unknown>;
 }
 
-function identity(sessionId: string): SessionIdentity {
-  return { client: 'codex', sessionId, invocationThreadId: sessionId, source: 'codex_meta' };
+function identity(
+  sessionId: string,
+  client: SessionIdentity['client'] = 'codex',
+): SessionIdentity {
+  if (client === 'claude') {
+    return {
+      client,
+      sessionId,
+      invocationThreadId: null,
+      source: 'ppid_file',
+    };
+  }
+  return {
+    client,
+    sessionId,
+    invocationThreadId: sessionId,
+    source: 'codex_meta',
+  };
 }
 
 describe('dispatchTool', () => {
+  it('returns trusted client identity with existing and default professional mode', () => {
+    const db = initDb(':memory:');
+    upsertSession(db, {
+      terminal_session: ROOT_A,
+      professional_mode: 'on',
+    });
+    upsertSession(db, {
+      terminal_session: ROOT_B,
+      professional_mode: 'off',
+    });
+
+    expect(
+      payload(dispatchTool('get_professional_mode', {}, db, identity(ROOT_A, 'codex'))),
+    ).toEqual({ professional_mode: 'on', client: 'codex', session_id: ROOT_A });
+    expect(
+      payload(dispatchTool('get_professional_mode', {}, db, identity(ROOT_B, 'claude'))),
+    ).toEqual({ professional_mode: 'off', client: 'claude', session_id: ROOT_B });
+    expect(
+      payload(dispatchTool('get_professional_mode', {}, db, identity('missing-root', 'codex'))),
+    ).toEqual({
+      professional_mode: 'undecided',
+      client: 'codex',
+      session_id: 'missing-root',
+      note: 'Session not found, returning default',
+    });
+  });
+
   it('isolates interleaved reads and writes by explicit root session', () => {
     const db = initDb(':memory:');
     upsertSession(db, {

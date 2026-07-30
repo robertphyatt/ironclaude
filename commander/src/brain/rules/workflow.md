@@ -94,6 +94,26 @@ For each running worker from the inventory:
 
 Do NOT stop after reviewing one worker. Review ALL of them before taking action.
 
+### Durable Capability Blocks
+
+When a safe next action is denied by workspace write, Ollama loopback, or
+process-inspection access, report the complete denied set immediately with
+`report_directive_capability_block`. Allowed capability names are
+`workspace_write`, `ollama_loopback`, and `process_inspection`. Classify the
+denial as `project_permission`, `codex_sandbox`, or `host_runtime`, and include
+the exact target and evidence-backed reason.
+
+Do not create a monitor worker. Do not run repeated minute probes. Do not post per-check Slack chatter.
+Only a daemon-issued `[CAPABILITY RECHECK]` authorizes
+probing: perform exactly one non-mutating probe per named capability in the
+current turn, then report one aggregate result. Use
+`report_directive_capability_recovery` for recovered capabilities and
+`report_directive_capability_block` for any remaining denied set.
+
+Do not independently probe these durable capability blocks during startup, context recovery, or ordinary attention sweeps.
+Existing handling of
+resource-blocked work remains unchanged. After full recovery, wait for the daemon's recovery dispatch instead of self-nudging.
+
 **Step 2.5 — Resource inventory (EVERY sweep):**
 
 Call `get_system_memory()` on EVERY sweep to get `{total_gb, available_gb}`. Then:
@@ -472,13 +492,20 @@ loop — no single worker runs the whole thing.
 
 **Core principles:**
 
-1. **Always blind** — The reviewer gets ONLY the artifact under review + evaluation
-   criteria. No history, no prior findings, no context about what was fixed. Tainting
-   the reviewer with prior-round context is counterproductive — it anchors them on
-   known issues instead of finding new ones.
+1. **Always blind to prior review and fix history** — Generic code and artifact
+   review gets only the current artifact plus evaluation criteria. No prior
+   findings, verdicts, reviewer identity, repair coaching, or context about what was
+   fixed.
 
-2. **Always opus** — Both reviewer and fixer workers use `claude-opus`. Adversarial
-   review requires the strongest model for rigor.
+   **Plan-review exception:** a plan reviewer MUST receive operator intent and the
+   full scoped brainstorming that produced the plan. Plan review is blind to prior
+   review/fix history; it is not blind to operator intent, rationale, alternatives,
+   clarifications, approvals, or preserved distinctions. Derived requirements,
+   design, and plan files never replace that authority.
+
+2. **Always strongest on the trusted active client** — Both reviewer and fixer use
+   the active client's strongest available review model: Opus/Fable for Claude Code,
+   or Sol for Codex. Never cross clients merely to obtain a nominally higher tier.
 
 3. **Fresh workers every round** — Each reviewer is a NEW worker. Each fixer is a NEW
    worker. Never reuse a reviewer to fix its own findings. Never reuse a fixer to
@@ -486,13 +513,22 @@ loop — no single worker runs the whole thing.
 
 **The loop:**
 
-1. **Spawn blind reviewer** — Construct an objective containing ONLY:
+1. **Spawn blind reviewer** — For generic code/artifact review, construct an
+   objective containing only:
    - The artifact paths (files to review)
    - {OPERATOR_NAME}'s evaluation criteria (what to evaluate against)
    - Instruction: "Report every issue with specific file paths, line numbers, and
      evidence. Structured as PASS/FAIL sections. Do NOT suggest improvements — only
      identify problems."
    - Standard PM workflow instructions (start with /brainstorming --scope=hold)
+
+   For a plan review, use the plan-review exception instead. Include the complete
+   scoped operator/brainstorming provenance plus roadmap/design, requirements,
+   human plan, and machine plan. Do not omit or summarize brainstorming to save
+   tokens. If active context is compacted, invoke
+   `ironclaude:remembering-conversations` and recover complete relevant turns. If
+   completeness cannot be established, fail closed rather than substituting a
+   derived artifact.
    
    The objective MUST NOT contain:
    - Any mention of prior review rounds
@@ -564,6 +600,26 @@ fewer issues as core problems are fixed (e.g., 8 → 6 → 3 → 0).
 | 5+ iterations without convergence | Escalate to {OPERATOR_NAME}: "Adversarial review loop has not converged after N iterations. Trajectory: [history]. Recommend: [assessment]." |
 | {OPERATOR_NAME} says "stop" or "proceed" mid-loop | Loop terminates immediately. Mark directive completed with note about early termination. |
 
+### Plan Review Checklist
+
+Before approving or dispatching review of any worker plan:
+
+1. **Recover authority** — Build the complete chain in order:
+   operator directives → full scoped brainstorming → roadmap/design →
+   requirements → human plan → machine plan. Requirements and design are derived
+   evidence, not presumed authority.
+2. **Challenge the frame** — Before optimizing within a derived document, hunt
+   semantic merges, semantic collapses, substitutions, lost independence, and
+   authority inversion against operator/brainstorming evidence.
+3. **Scope match** — Plan addresses the objective, nothing more, nothing less.
+4. **Mechanical steps** — Each step has exact file paths, commands, and expected
+   output.
+5. **TDD compliance** — Tests precede implementation (RED → GREEN).
+6. **File restrictions** — Only exact allowed files are modified.
+
+The reviewer remains blind to earlier review rounds and repairs, not to the plan's
+original operator context. If full provenance is unavailable, fail closed.
+
 ## Context Recovery Priority
 
 When resuming after a session break, search for recent context in this order:
@@ -573,7 +629,10 @@ When resuming after a session break, search for recent context in this order:
    a. Call `get_directives()` for ALL statuses (not just `confirmed` or `in_progress`)
    b. For each Slack message that looks like a directive but has NO matching directive record → call `submit_directive()` to recover the lost directive
    c. For each `in_progress` directive with NO active worker → check `git log --oneline -20` for a matching commit. If committed → mark `completed`. If NOT committed → flag for immediate respawning in the next sweep
-   d. For each `blocked` directive → re-evaluate: has the blocking condition resolved? If so, unblock and queue for spawning
+   d. For each `blocked` directive → if it has a durable capability-block row,
+      do not probe or unblock it here; wait for a daemon-issued
+      `[CAPABILITY RECHECK]`. Otherwise re-evaluate existing resource/task
+      blocks as before: if resolved, unblock and queue for spawning.
 3. **Episodic memory** — Search for decisions, patterns, and preferences that predate the current session. Useful for how {OPERATOR_NAME} typically approaches architectural choices, not for what he asked today.
 4. **Task ledger** — Check in-progress and pending tasks to understand what work was already planned or underway.
 5. **Git log** — Review recent commits to understand what was completed before the session break.

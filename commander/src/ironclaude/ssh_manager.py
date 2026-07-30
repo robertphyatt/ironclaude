@@ -7,6 +7,9 @@ import os
 import shlex
 import subprocess
 from dataclasses import dataclass, field
+from typing import Sequence
+
+from ironclaude.provider_config import normalize_machine_clients
 
 logger = logging.getLogger("ironclaude.ssh_manager")
 
@@ -34,13 +37,22 @@ def _quote_remote_path(path: str) -> str:
 class MachineConfig:
     name: str
     host: str
-    claude_path: str
+    claude_path: str | None
     repos: list[str]
     purpose: str = ""
     log_dir: str = "/tmp/ic-logs"
     max_workers: int | None = None
     env: dict[str, str] = field(default_factory=dict)
     role: str = "worker"
+    clients: dict[str, dict] = field(default_factory=dict)
+
+    def client_path(self, client: str) -> str | None:
+        config = self.clients.get(client)
+        if config is not None:
+            return str(config["path"]) if config.get("enabled") is True else None
+        if not self.clients and client == "claude":
+            return self.claude_path
+        return None
 
 
 @dataclass
@@ -60,16 +72,22 @@ class SSHConnectionManager:
 
     def register_machines(self, machines: list[dict]) -> None:
         for m in machines:
+            clients = normalize_machine_clients(m)
             cfg = MachineConfig(
                 name=m["name"],
                 host=m["host"],
-                claude_path=m["claude_path"],
+                claude_path=(
+                    str(clients["claude"]["path"])
+                    if "claude" in clients
+                    else None
+                ),
                 repos=m.get("repos", []),
                 purpose=m.get("purpose", ""),
                 log_dir=m.get("log_dir", "/tmp/ic-logs"),
                 max_workers=m.get("max_workers"),
                 env=m.get("env", {}),
                 role=m.get("role", "worker"),
+                clients=clients,
             )
             self._machines[cfg.name] = cfg
 
@@ -91,6 +109,24 @@ class SSHConnectionManager:
             host,
         ]
 
+    def run_argv(
+        self, host: str, argv: Sequence[str],
+    ) -> subprocess.CompletedProcess[str]:
+        if not argv:
+            raise ValueError("remote argv must not be empty")
+        executable = _quote_remote_path(str(argv[0]))
+        arguments = shlex.join([str(value) for value in argv[1:]])
+        remote_command = (
+            f"{executable} {arguments}" if arguments else executable
+        )
+        return subprocess.run(
+            self.get_ssh_args(host) + [remote_command],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
     def health_check(self, name: str) -> HealthResult:
         machine = self._machines.get(name)
         if not machine:
@@ -98,7 +134,6 @@ class SSHConnectionManager:
 
         checks = [
             (["true"], "SSH connectivity"),
-            (["which", _quote_remote_path(machine.claude_path)], "Claude binary"),
         ]
         if machine.role == "worker":
             checks.append((["tmux", "-V"], "tmux available"))

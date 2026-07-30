@@ -341,6 +341,48 @@ db_read_or_fail() {
   echo "$result"
 }
 
+# db_read_allow_missing_session HOOK_NAME QUERY
+# Reads a query for which zero rows is valid without weakening db_read_or_fail's
+# strict session-existence contract. Validates sqlite, DB, WAL, query status,
+# and stderr; prints an empty result successfully when no row matches.
+db_read_allow_missing_session() {
+  local hook="$1"
+  local query="$2"
+
+  if ! command -v sqlite3 &>/dev/null; then
+    hard_fail "$hook" "sqlite3 binary not found in PATH"
+  fi
+  if [ ! -f "$DB_PATH" ]; then
+    hard_fail "$hook" "DB file does not exist: $DB_PATH"
+  fi
+
+  local journal journal_status
+  journal=$(sqlite3 "$DB_PATH" ".timeout 10000" "PRAGMA journal_mode;" 2>&1)
+  journal_status=$?
+  if [ "$journal_status" -ne 0 ]; then
+    hard_fail "$hook" "Journal-mode query failed (exit $journal_status): $journal"
+  fi
+  if [ "$journal" != "wal" ]; then
+    hard_fail "$hook" "Journal mode is '$journal', expected 'wal'. DB: $DB_PATH"
+  fi
+
+  local stderr_file result query_status stderr_content
+  stderr_file=$(mktemp /tmp/.claude-db-err-XXXXXX)
+  result=$(sqlite3 "$DB_PATH" ".timeout 10000" "$query" 2>"$stderr_file")
+  query_status=$?
+  stderr_content=$(cat "$stderr_file" 2>/dev/null)
+  rm -f "$stderr_file"
+
+  if [ "$query_status" -ne 0 ]; then
+    hard_fail "$hook" "SQLite query failed (exit $query_status): ${stderr_content:-no stderr}"
+  fi
+  if [ -n "$stderr_content" ]; then
+    hard_fail "$hook" "SQLite query wrote stderr: $stderr_content"
+  fi
+
+  printf '%s\n' "$result"
+}
+
 # db_read HOOK_NAME QUERY [DEFAULT]
 # Like db_read_or_fail but returns DEFAULT (empty string) when query returns no rows.
 # Use for queries where empty is a valid state (e.g., "is design consumed?").

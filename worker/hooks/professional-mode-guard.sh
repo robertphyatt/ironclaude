@@ -28,8 +28,154 @@ init_session_id
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null || true)
 FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.notebook_path // .tool_input.command // empty' 2>/dev/null || true)
 FILE_PATH=$(normalize_path "$FILE_PATH")
+RAW_PROJECT_ROOT=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)
+if [ -n "$RAW_PROJECT_ROOT" ]; then
+  PROJECT_ROOT=$(cd -- "$RAW_PROJECT_ROOT" 2>/dev/null && pwd -P) || \
+    PROJECT_ROOT=$(pwd -P)
+else
+  PROJECT_ROOT=$(pwd -P)
+fi
+PROJECT_ROOT=$(normalize_path "$PROJECT_ROOT")
+if [ "$PROJECT_ROOT" != "/" ]; then
+  PROJECT_ROOT="${PROJECT_ROOT%/}"
+fi
 
 SAFE_SESSION=$(echo "$SESSION_TAG" | sed "s/'/''/g")
+
+is_root_setup_file() {
+  local candidate="$1"
+  local filename="$2"
+  if ! [[ "$candidate" == "$filename" \
+    || "$candidate" == "./$filename" \
+    || "$candidate" == "$PROJECT_ROOT/$filename" ]]; then
+    return 1
+  fi
+  is_safe_setup_file_target "$PROJECT_ROOT/$filename" "$PROJECT_ROOT"
+}
+
+is_behavioral_rules_file() {
+  local candidate="$1"
+  if ! [[ "$candidate" == ".claude/rules/behavioral.md" \
+    || "$candidate" == "./.claude/rules/behavioral.md" \
+    || "$candidate" == "$PROJECT_ROOT/.claude/rules/behavioral.md" ]]; then
+    return 1
+  fi
+  is_safe_setup_file_target \
+    "$PROJECT_ROOT/.claude/rules/behavioral.md" \
+    "$PROJECT_ROOT/.claude/rules"
+}
+
+is_physically_owned_ancestor() {
+  local requested="$1"
+  local ancestor="$requested"
+  local physical
+
+  while [ ! -e "$ancestor" ] && [ ! -L "$ancestor" ] \
+      && [ "$ancestor" != "$PROJECT_ROOT" ]; do
+    ancestor=$(dirname "$ancestor")
+  done
+
+  [ -d "$ancestor" ] || return 1
+  [ ! -L "$ancestor" ] || return 1
+  physical=$(cd -- "$ancestor" 2>/dev/null && pwd -P) || return 1
+  [ "$physical" = "$ancestor" ]
+}
+
+is_safe_setup_file_target() {
+  local target="$1"
+  local expected_parent="$2"
+  local physical_parent
+  [ ! -L "$target" ] || return 1
+  [ -d "$expected_parent" ] || return 1
+  [ ! -L "$expected_parent" ] || return 1
+  physical_parent=$(cd -- "$expected_parent" 2>/dev/null && pwd -P) || return 1
+  [ "$physical_parent" = "$expected_parent" ]
+}
+
+is_safe_rules_directory_target() {
+  local target="$PROJECT_ROOT/.claude/rules"
+  [ ! -L "$target" ] || return 1
+  is_physically_owned_ancestor "$target"
+}
+
+has_command_input_key() {
+  printf '%s' "$INPUT" | jq -e \
+    '(.tool_input | type) == "object" and (.tool_input | has("command"))' \
+    >/dev/null 2>&1
+}
+
+is_safe_codex_agents_patch() {
+  local patch_command counts begin_count end_count operation_count move_count
+  local operation_line operation target
+
+  # Native Codex ApplyPatchHandler emits exact tool_name=apply_patch with one
+  # command field. Reject hybrid or invented input shapes.
+  printf '%s' "$INPUT" | jq -e '
+    .tool_name == "apply_patch"
+    and (.tool_input | type) == "object"
+    and ((.tool_input | keys) == ["command"])
+    and (.tool_input.command | type) == "string"
+    and (.tool_input.command
+      | explode
+      | all(. == 10 or (. >= 32 and . != 127)))
+    and (
+      (.tool_input.command | startswith("*** Begin Patch\n"))
+      and (
+        (.tool_input.command | endswith("\n*** End Patch"))
+        or (.tool_input.command | endswith("\n*** End Patch\n"))
+      )
+    )
+  ' >/dev/null 2>&1 || return 1
+
+  patch_command=$(printf '%s' "$INPUT" \
+    | jq -r '.tool_input.command' 2>/dev/null) || return 1
+
+  counts=$(printf '%s\n' "$patch_command" | awk '
+    $0 == "*** Begin Patch" { begin_count++ }
+    $0 == "*** End Patch" { end_count++ }
+    $0 ~ /^\*\*\* (Add|Update|Delete) File: / { operation_count++ }
+    $0 ~ /^\*\*\* Move to: / { move_count++ }
+    END {
+      printf "%d %d %d %d", begin_count, end_count, operation_count, move_count
+    }
+  ') || return 1
+  read -r begin_count end_count operation_count move_count <<< "$counts"
+  [ "$begin_count" -eq 1 ] || return 1
+  [ "$end_count" -eq 1 ] || return 1
+  [ "$operation_count" -eq 1 ] || return 1
+  [ "$move_count" -eq 0 ] || return 1
+
+  operation_line=$(printf '%s\n' "$patch_command" \
+    | awk '/^\*\*\* (Add|Update|Delete) File: / { print; exit }') || return 1
+  case "$operation_line" in
+    "*** Add File: "*)
+      operation="Add"
+      target="${operation_line#*** Add File: }"
+      ;;
+    "*** Update File: "*)
+      operation="Update"
+      target="${operation_line#*** Update File: }"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  is_root_setup_file "$target" "AGENTS.md" || return 1
+  case "$operation" in
+    Add)
+      [ ! -e "$PROJECT_ROOT/AGENTS.md" ] \
+        && [ ! -L "$PROJECT_ROOT/AGENTS.md" ]
+      ;;
+    Update)
+      [ -f "$PROJECT_ROOT/AGENTS.md" ] \
+        && [ ! -L "$PROJECT_ROOT/AGENTS.md" ]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 
 # ─── Human-only: never let the agent write the hooks-config file ───
 # tier_up_review_policy and other guardrail settings live here. The agent must
@@ -71,7 +217,7 @@ get_plan_json_path() {
 }
 
 # ─── Read professional_mode from sqlite3 ───
-prof_mode=$(db_read_or_fail "professional-mode-guard" \
+prof_mode=$(db_read_allow_missing_session "professional-mode-guard" \
   "SELECT professional_mode FROM sessions WHERE terminal_session='${SAFE_SESSION}';") || {
   block_pretooluse "professional-mode-guard" "BLOCKED — DATABASE ERROR
 
@@ -79,6 +225,9 @@ Cannot read professional_mode from the database. This is a temporary error.
 
 Try your action again. If this persists, report the error to the user."
 }
+if [ -z "$prof_mode" ]; then
+  prof_mode="undecided"
+fi
 
 # ─── UNDECIDED: block everything except Read/Grep/Glob and mode-toggle Skills ───
 if [ "$prof_mode" = "undecided" ]; then
@@ -87,26 +236,37 @@ if [ "$prof_mode" = "undecided" ]; then
     log_hook "professional-mode-guard" "Allowed" "AskUserQuestion in undecided"
     exit 0
   fi
-  # CLAUDE.md: allow Write/Edit during undecided setup window (prerequisites before restrictions)
-  if [[ "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "Edit" ]]; then
-    if [[ "$FILE_PATH" == "CLAUDE.md" || "$FILE_PATH" == */CLAUDE.md ]]; then
-      log_hook "professional-mode-guard" "Allowed" "CLAUDE.md write during undecided setup"
+  # Native Codex apply_patch: allow one exact root AGENTS.md Add/Update patch.
+  # Only the exact native apply_patch event can enter this strict command route.
+  # Synthetic Write events carrying command stay out of legacy file-path setup.
+  if [ "$TOOL_NAME" = "apply_patch" ] && has_command_input_key; then
+    if is_safe_codex_agents_patch; then
+      log_hook "professional-mode-guard" "Allowed" \
+        "native Codex root AGENTS patch during undecided setup"
       exit 0
     fi
   fi
-  # .claude/rules/: allow Write/Edit during undecided setup (activation skill writes behavioral.md)
-  if [[ "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "Edit" ]]; then
-    if [[ "$FILE_PATH" == *"/.claude/rules/"* ]] || [[ "$FILE_PATH" == ".claude/rules/"* ]]; then
-      log_hook "professional-mode-guard" "Allowed" ".claude/rules/ write during undecided setup"
+  # Provider-owned root setup files: allow only exact project-root targets.
+  if [[ "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "Edit" ]] \
+      && ! has_command_input_key; then
+    if is_root_setup_file "$FILE_PATH" "AGENTS.md" \
+        || is_root_setup_file "$FILE_PATH" "CLAUDE.md"; then
+      log_hook "professional-mode-guard" "Allowed" "root instruction write during undecided setup"
       exit 0
     fi
   fi
-  # Bash mkdir .claude/rules/: allow during undecided setup (activation skill creates directory)
-  # Anchored to the command start + metachar-blocked so chained payloads cannot ride the exception.
+  # Claude behavioral rules: allow only the exact owned file at project root.
+  if [[ "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "Edit" ]]; then
+    if is_behavioral_rules_file "$FILE_PATH"; then
+      log_hook "professional-mode-guard" "Allowed" "behavioral rules write during undecided setup"
+      exit 0
+    fi
+  fi
+  # Bash mkdir: allow only the literal project-relative behavioral-rules directory.
   if [[ "$TOOL_NAME" == "Bash" ]]; then
     if ! _has_blocked_metachars "$FILE_PATH" \
-        && [[ "$FILE_PATH" =~ ^[[:space:]]*mkdir[[:space:]] ]] \
-        && [[ "$FILE_PATH" == *".claude/rules"* ]]; then
+        && [[ "$FILE_PATH" =~ ^[[:space:]]*mkdir[[:space:]]+(-p[[:space:]]+)?(\./)?\.claude/rules/?[[:space:]]*$ ]] \
+        && is_safe_rules_directory_target; then
       log_hook "professional-mode-guard" "Allowed" "mkdir .claude/rules during undecided setup"
       exit 0
     fi
