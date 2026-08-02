@@ -50,12 +50,14 @@ def test_mark_transition_semantics():
     assert fa.mark_fable_unavailable("r") == "already_flagged"
 
 
-def test_mark_model_unavailable_uses_24h_ttl():
-    # Repointed: the blanket 24h window is now scoped to model_unavailable only
-    # (usage/unknown get shorter re-probe windows). A model-outage reason keeps 24h.
+def test_mark_model_unavailable_reprobes_within_1h():
+    # No provider reset time, so the operator rule applies: re-probe after an hour.
+    # Real clock (no _now patch) — this is the only real-clock coverage of the mark
+    # path. Bounds are literals: reading _MODEL_TTL back would stay green at any value.
     fa.mark_fable_unavailable("Claude Fable 5 is currently unavailable")
     payload = json.loads(fa._STATE_PATH.read_text())
-    assert payload["unavailable_until"] - time.time() > 86000
+    delta = payload["unavailable_until"] - time.time()
+    assert 3500 < delta <= 3600
     assert payload["category"] == "model_unavailable"
 
 
@@ -283,12 +285,16 @@ class TestMarkWindows:
         fa.mark_fable_unavailable("usage limit", reset_at=1000.0 + 20 * 3600)
         assert self._read()["unavailable_until"] == 1000.0 + fa._USAGE_MAX
 
-    def test_model_unavailable_24h(self, monkeypatch):
+    def test_model_unavailable_reprobes_in_1h(self, monkeypatch):
+        """model_unavailable is a failure with NO provider reset time, so the operator
+        rule applies: retry after an hour. The 3600 is a LITERAL on purpose — the old
+        assertion read the constant back and stayed green whatever its value.
+        """
         monkeypatch.setattr(fa, "_now", lambda: 1000.0)
         fa.mark_fable_unavailable("Claude Fable 5 is currently unavailable")
         p = self._read()
         assert p["category"] == "model_unavailable"
-        assert p["unavailable_until"] == 1000.0 + fa._MODEL_TTL
+        assert p["unavailable_until"] == 1000.0 + 3600
 
     def test_unknown_reprobe(self, monkeypatch):
         monkeypatch.setattr(fa, "_now", lambda: 1000.0)
@@ -306,7 +312,7 @@ class TestMarkWindows:
         assert fa.mark_fable_unavailable("issue with the selected model (fable[1m])") == "transition"
         p = self._read()
         assert p["category"] == "model_unavailable"
-        assert p["unavailable_until"] == 1000.0 + fa._MODEL_TTL
+        assert p["unavailable_until"] == 1000.0 + 3600     # literal on purpose
 
     def test_usage_limit_not_re_marked_by_another_usage_limit(self, monkeypatch):
         monkeypatch.setattr(fa, "_now", lambda: 1000.0)

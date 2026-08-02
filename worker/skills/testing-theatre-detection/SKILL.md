@@ -11,7 +11,7 @@ Enforce zero tolerance for testing theatre across all test types.
 
 ## MANDATORY: Structured User Input
 
-Whenever soliciting user input — choices, confirmations, or selections — ALWAYS use the `AskUserQuestion` tool. NEVER ask via prose. Follow the format in `.claude/rules/ask-user-question-format.md`: Re-ground context, Predict, Options.
+Whenever soliciting user input — choices, confirmations, or selections — ALWAYS use the `AskUserQuestion` tool. NEVER ask via prose. Follow the format in `../../rules/ask-user-question-format.md`: Re-ground context, Predict, Options.
 
 ## When to Use
 

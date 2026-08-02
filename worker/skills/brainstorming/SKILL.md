@@ -25,7 +25,7 @@ DESIGN, not IMPLEMENT.
 
 ## MANDATORY: Structured User Input
 
-Whenever soliciting user input — choices, confirmations, or selections — ALWAYS use the `AskUserQuestion` tool. NEVER ask via prose. Follow the format in `.claude/rules/ask-user-question-format.md`: Re-ground context, Predict, Options. This produces structured UI and enforces one-question-at-a-time discipline.
+Whenever soliciting user input — choices, confirmations, or selections — ALWAYS use the `AskUserQuestion` tool. NEVER ask via prose. Follow the format in `../../rules/ask-user-question-format.md`: Re-ground context, Predict, Options. This produces structured UI and enforces one-question-at-a-time discipline.
 
 ## Mandatory Direct Transition Preflight
 

@@ -18,7 +18,7 @@ Review completed work against the original plan, checking for code quality, bugs
 
 ## MANDATORY: Structured User Input
 
-Whenever soliciting user input — choices, confirmations, or selections — ALWAYS use the `AskUserQuestion` tool. NEVER ask via prose. Follow the format in `.claude/rules/ask-user-question-format.md`: Re-ground context, Predict, Options.
+Whenever soliciting user input — choices, confirmations, or selections — ALWAYS use the `AskUserQuestion` tool. NEVER ask via prose. Follow the format in `../../rules/ask-user-question-format.md`: Re-ground context, Predict, Options.
 
 ## Common Rationalizations (all wrong)
 
@@ -105,7 +105,7 @@ If Stage 1 FAILS:
 
 **Step 4.5: Load review checklist**
 
-Read `.claude/rules/review-checklist.md` (if it exists). Apply each check procedure against the diff, following the specific detection steps and respecting the "DO NOT flag" suppressions. If the file doesn't exist, fall back to the generic checks below.
+Read `../../rules/review-checklist.md` (if it exists). Apply each check procedure against the diff, following the specific detection steps and respecting the "DO NOT flag" suppressions. If the file doesn't exist, fall back to the generic checks below.
 
 **Step 5: Check for common issues**
 

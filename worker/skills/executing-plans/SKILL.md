@@ -39,7 +39,7 @@ not see one, call mcp__plugin_ironclaude_state-manager__get_resume_state before 
 
 ## MANDATORY: Structured User Input
 
-Whenever soliciting user input — choices, confirmations, or selections — ALWAYS use the `AskUserQuestion` tool. NEVER ask via prose. Follow the format in `.claude/rules/ask-user-question-format.md`: Re-ground context, Predict, Options.
+Whenever soliciting user input — choices, confirmations, or selections — ALWAYS use the `AskUserQuestion` tool. NEVER ask via prose. Follow the format in `../../rules/ask-user-question-format.md`: Re-ground context, Predict, Options.
 
 ## Mandatory Direct Transition Preflight
 
@@ -302,7 +302,11 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    - an `expected:` value that was predicted rather than measured — run the
      command yourself and compare it against what the plan claims;
    - a guard whose expected value the change itself moves (a count or grep over
-     text the same step edits).
+     text the same step edits);
+   - a guard defused by a later step of the same plan — evaluate every check
+     against the state after ALL tasks land, not the state where it is introduced;
+   - a factual claim (a count, a line number, a symbol) whose
+     provenance is an agent summary rather than a file the author opened.
 
    Classify every candidate finding with this decision test. A finding is
    MATERIAL only if executing the plan exactly as written would:
@@ -467,6 +471,18 @@ When dispatching tasks via the Task tool, follow these rules to prevent context 
   - Simple file edits: 10-15 turns
   - Multi-file changes with builds: 20-30 turns
   - Never omit — unlimited turns enable death spirals
+
+**Subagent model tier:**
+- `model`: pick the LEAST capable tier that will reliably succeed —
+  - `haiku`: mechanical or lookup work (locate a symbol, list files, apply a rote edit)
+  - `sonnet`: routine implementation — **the default for plan-task execution**
+  - `opus`: hard multi-step reasoning, unclear root cause, cross-cutting judgment
+  - `fable`: only when a lower tier has genuinely failed this same task
+- Apply that default according to who is driving. Run `echo "${IC_ROLE:-}"`:
+  - **`worker` (autonomous PM loop):** make the call yourself, set `model=` on the dispatch, proceed.
+  - **anything else (operator interacting directly):** recommend the tier, let the operator pick.
+- This is INFORM-only: it sets the recommended default and nothing else. Tier choice alone never
+  blocks a dispatch or lowers a review grade.
 
 **Anti-patterns (never do these):**
 - Dumping the full plan JSON or design doc into the subagent prompt

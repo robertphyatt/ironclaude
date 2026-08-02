@@ -11,11 +11,11 @@ import logging
 import os
 import re
 
+from ironclaude import paths
 from ironclaude.ollama_client import OllamaClient, OllamaError
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_CONFIG_PATH = os.path.expanduser("~/.claude/ironclaude-hooks-config.json")
 _DEFAULT_MODEL = "gemma4:12b-it-qat"
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 # Strip leaked chat-template control tokens (e.g. <|tool_response>, <|im_end|>)
@@ -35,7 +35,7 @@ class LocalGrader:
 
     def __init__(self, config_path: str | None = None, timeout: int | None = None,
                  keep_alive: str | None = None) -> None:
-        self._config_path = config_path or _DEFAULT_CONFIG_PATH
+        self._config_path = config_path or paths.hooks_config()
         self._client: OllamaClient | None = None
         self._cfg: dict = {}
         self._timeout_override = timeout

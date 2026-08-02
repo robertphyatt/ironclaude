@@ -42,6 +42,7 @@ from ironclaude.fable_availability import (
     mark_fable_unavailable as _mark_fable_unavailable,
     clear_fable_unavailable as _clear_fable_unavailable,
 )
+from ironclaude import paths
 from ironclaude.grader import LocalGrader
 from ironclaude.provider_config import provider_config_from_commander, _semantic_tier, ProviderConfigError
 from ironclaude.provider_state import ProviderState, TRANSIENT_UNAVAILABLE_REASONS
@@ -103,9 +104,6 @@ def _validate_keys(keys: list[str]) -> None:
         )
 
 
-_ALLOWED_LOG_PREFIXES = ("/tmp/", "/var/log/", str(Path.home()) + "/")
-
-
 def _validate_log_path(path: str) -> None:
     """Validate a log file path against traversal and allowlist policy.
 
@@ -113,8 +111,9 @@ def _validate_log_path(path: str) -> None:
     """
     if ".." in path:
         raise ValueError("path traversal not allowed")
-    if not any(path.startswith(prefix) for prefix in _ALLOWED_LOG_PREFIXES):
-        allowed = ", ".join(_ALLOWED_LOG_PREFIXES)
+    prefixes = paths.allowed_log_prefixes()
+    if not any(path.startswith(prefix) for prefix in prefixes):
+        allowed = ", ".join(prefixes)
         raise ValueError(f"path not in allowed directories ({allowed})")
 
 
@@ -483,9 +482,7 @@ class OrchestratorTools:
         )
         self._wiki_dir = os.path.join(os.path.expanduser(brain_cwd), "wiki")
         self._wiki = WikiTools(self._wiki_dir)
-        self._ollama_config_path = os.path.expanduser(
-            os.environ.get("IC_OLLAMA_CONFIG_PATH", "~/.claude/ironclaude-hooks-config.json")
-        )
+        self._ollama_config_path = paths.hooks_config()
         self._ollama_client: OllamaClient | None = None
         self._ollama_cfg_cache: dict = {}
         self._local_grader = LocalGrader(config_path=self._ollama_config_path)
@@ -2752,15 +2749,17 @@ Automatic F-grade triggers (objective contains PM deactivation language):
 - These are ALWAYS grade F, approved=false — no exceptions
 
 Model recommendation (include "recommended_model" in your JSON response):
-- claude-sonnet: single-file changes, config updates, bug fixes with clear root cause,
-  adding tests, documentation, straightforward features
-- claude-opus: multi-file refactors (5+ files), architectural changes requiring broad
+- claude-sonnet — THE DEFAULT. single-file changes, config updates, bug fixes with clear root cause,
+  adding tests, documentation, straightforward features. Recommend this unless the objective shows a
+  concrete reason it would fail.
+- claude-opus — escalation: multi-file refactors (5+ files), architectural changes requiring broad
   codebase understanding, complex debugging with unclear root cause, greenfield design
-- claude-fable: highest capability — architectural decisions requiring maximum reasoning,
+- claude-fable — rare escalation: architectural decisions requiring maximum reasoning,
   cross-codebase changes where correctness is critical
 - ollama (local 12B model): single-file edits only, concrete action verb (not "refactor"/"improve"),
   explicit success condition present, no architectural decisions required
-  Contraindicated: multi-file scope, ambiguous outcome, architectural judgment"""
+  Contraindicated: multi-file scope, ambiguous outcome, architectural judgment
+Tier choice alone never lowers the grade or affects approval — recommend, do not gate."""
 
         # Hard-enforce brain-notes: append repo constraints before grader sees objective
         notes_path = os.path.join(repo, ".ironclaude", "brain-notes.md")
@@ -3437,10 +3436,11 @@ Grading criteria:
 - F: Fundamentally wrong — violates {self._operator_name}'s principles. approved=false
 
 Model recommendation (include "recommended_model" in your JSON response):
-- claude-sonnet: single-file changes, config updates, bug fixes with clear root cause
-- claude-opus: multi-file refactors (5+ files), architectural changes, complex debugging
-- claude-fable: highest capability — architectural decisions requiring maximum reasoning
-- ollama (local 12B model): single-file edits only, concrete action verb, explicit success condition — no architectural decisions"""
+- claude-sonnet — THE DEFAULT. single-file changes, config updates, bug fixes with clear root cause. Recommend this unless the objective shows a concrete reason it would fail.
+- claude-opus — escalation: multi-file refactors (5+ files), architectural changes, complex debugging
+- claude-fable — rare escalation: architectural decisions requiring maximum reasoning
+- ollama (local 12B model): single-file edits only, concrete action verb, explicit success condition — no architectural decisions
+Tier choice alone never lowers the grade or affects approval — recommend, do not gate."""
 
         confidence_schema = {
             "type": "object",
@@ -3498,10 +3498,11 @@ Model recommendation (include "recommended_model" in your JSON response):
 - F: Fundamentally wrong — violates {self._operator_name}'s principles. approved=false
 
 Model recommendation (include "recommended_model"):
-- claude-sonnet: single-file changes, config updates, bug fixes with clear root cause
-- claude-opus: multi-file refactors (5+ files), architectural changes, complex debugging
-- claude-fable: highest capability — architectural decisions requiring maximum reasoning
-- ollama: single-file edits only, concrete action verb, explicit success condition"""
+- claude-sonnet — THE DEFAULT. single-file changes, config updates, bug fixes with clear root cause. Recommend this unless the objective shows a concrete reason it would fail.
+- claude-opus — escalation: multi-file refactors (5+ files), architectural changes, complex debugging
+- claude-fable — rare escalation: architectural decisions requiring maximum reasoning
+- ollama: single-file edits only, concrete action verb, explicit success condition
+Tier choice alone never lowers the grade or affects approval — recommend, do not gate."""
 
             # NOTE: the verdict schema is strict (additionalProperties: false), so the
             # prompt must NOT ask for keys the schema forbids (e.g. worker_id). Batch

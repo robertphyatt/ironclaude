@@ -13,6 +13,194 @@
 
 _Nothing yet._
 
+## 1.1.2: suite isolation, a home-resolution seam, and the sonnet spawn default
+
+A maintenance release with one behavioural change. The bulk of it closes a class of defect the
+test suite had been carrying for months: tests that read and wrote the operator's real state
+under `~/.claude` and `~/.ironclaude`. Fixing that surfaced a second problem — import-time frozen
+path constants that no `HOME` redirect can reach — which is what the new `paths.py` seam exists
+for. The behavioural change is that the Brain no longer carries an instruction steering it away
+from `claude-sonnet` workers.
+
+### Added
+
+- **A `sys.addaudithook` tripwire that fails any test touching real operator state.** Occurrence
+  five of "tests mutate the operator's live files" prompted a conftest-scope guard over
+  `~/.claude`, `~/.ironclaude` and `~/.claude.json`. It audits the `open`, `os.remove`,
+  `os.rename`, `os.mkdir`, `os.rmdir`, `os.symlink`, `os.link`, `shutil.copyfile` and
+  `sqlite3.connect` events — so it catches reads that go through `open`, but being an in-process
+  audit hook it does **not** see `os.stat`, `os.listdir`, `glob`, or anything a subprocess does.
+  The containment is real for the paths that caused the five recorded incidents; it is not a total
+  seal. Its exception
+  derives from `BaseException`, not `Exception`, for a specific reason: the handlers that hid this
+  bug through four prior occurrences are `except Exception`, so a `RuntimeError` tripwire would
+  abort the operation and then die silently inside them. A trip ledger backs it for handlers that
+  would swallow even that, capturing the offending production `file:line` machine-side rather than
+  from scrolled terminal output. It deliberately carries **no exit-status backstop** for a trip
+  occurring after final teardown: such a trip is recorded but does not fail the run. No late trip was
+  ever observed, and an exit-status signal is the one this repo's convention discards ("grade the
+  summary line, never the exit status").
+- **`commander/src/ironclaude/paths.py`, the single home-resolution seam.** Four public accessors
+  (`home`, `hooks_config`, `brain_sessions_dir`, `allowed_log_prefixes`) and two private helpers,
+  function-only with **zero module-level path constants** — a constant is precisely what froze each
+  site it replaces, so the module replacing them must not contain one. It imports only `os` and
+  `pathlib`, making it a leaf any importer can take without a cycle. A broader set was sketched and
+  deliberately not shipped, because some of the candidates were the wrong shape: `brain_cwd` and
+  `grader_home` apply `expanduser` to a config-supplied *value*, so a zero-arg accessor cannot
+  replace them, and shipping one would have frozen a signature the next migration must break.
+- **A review checklist that code review actually loads.** `worker/rules/review-checklist.md` now
+  carries three checks with numbered detection steps and explicit "DO NOT flag" suppressions:
+  falsifiability evaluated at the plan's *end state*, provenance for factual claims, and
+  widened-guard scope. Each exists because that defect shipped into a real diff here and was caught
+  by a reviewer rather than the author. Two matching archetypes were added to the blind plan-review
+  contract in `executing-plans`: a guard defused by a later step of the same plan, and a factual
+  claim whose provenance is an agent summary rather than a file the author opened.
+- **`test_rules_references_resolve.py`.** For every skill, each `rules/` reference must resolve to a
+  file that exists when joined to that skill's own directory. A companion test asserts the scanner
+  finds at least five references, so a broken extraction regex cannot make the resolution test pass
+  by examining the empty set.
+- **A guard proving the transitional review checklist can be deleted losslessly.** Two files are
+  named `review-checklist.md` — a project-local `.claude/rules/` copy carrying 3 checks, and the
+  canonical `worker/rules/` file carrying 11. The existing tests asserted three known names in each
+  file independently, which says nothing about whether deleting the transitional copy would drop a
+  check. The new guard asserts the transitional file's check set is a *subset* of canonical's — set
+  equality would be wrong, since canonical carries more — with a non-vacuity assertion so a
+  heading-format change cannot make the comparison silently true.
+- **A model-tier step in the Subagent Prompt Construction Guide.** `executing-plans` specified
+  `subagent_type` and `max_turns` and said nothing about model tier, so even correctly-delegated
+  work picked its tier blind. The new step carries a tier table, is conditioned on `IC_ROLE=worker`
+  (exported on all six spawn paths), and is explicitly INFORM-only.
+
+### Fixed
+
+- **The guard treated write-capable git subcommands as read-only.** `professional-mode-guard.sh`
+  exempts "read-only git commands" at any non-executing stage, exiting 0 with the log line
+  "read-only git command". The alternation admitted whole *subcommands*, so `git stash`,
+  `git stash drop`, `git branch -D`, `git tag`, `git remote add` and `git reflog expire` all took
+  that exemption. `git stash drop` discards stashed work permanently and `git reflog expire
+  --expire=now` destroys the recovery log — both reachable through a branch that logs them as
+  read-only. `is_readonly_git` now uses two greps: one keeping the always-read-only subcommands
+  byte-exact (trailing `\b` included, so `git diff-index` and `git show-ref` still pass), and a
+  second admitting only pinned read-only *forms* — `stash list`, `branch` with read-only flags,
+  `remote`/`remote -v`, `tag`/`tag -l`, `reflog`/`reflog show` — each anchored so no argument can
+  follow. Separating them leaves the proven expression untouched and isolates all new risk in the
+  new one. Whitelist-only throughout: nothing enumerates destructive flags, so an unrecognised form
+  falls through to blocked — a blocklist of `-d|-D|-m` would leave `--delete` as the loophole.
+  Twenty assertions in both directions; the ten negatives were each observed failing beforehand,
+  including `git -C /repo stash drop`, proving `-C` cannot reopen what the narrowing closed.
+- **Both reviewing-stage block messages listed the pre-widening allowlist**, omitting `diff`, the
+  `git -C` forms and env-prefixed pytest — so a reader could not distinguish "Bash is blocked here"
+  from "this command is not on the list". Both now match `is_review_allowed`, guarded by a test that
+  checks each single-word member by comma-token *equality*: `"diff" in text` is satisfied by
+  "git diff/…" and `"ls"` by "ls-files", so a substring check on those could never fail.
+- **`IC_OLLAMA_CONFIG_PATH` resolved two different ways.** `orchestrator_mcp.py` expanded a leading
+  `~`; `paths.hooks_config()` returned the override verbatim. A single-quoted `~/custom.json`
+  therefore worked through one consumer and stayed literal through the other. The accessor now
+  expands, and the orchestrator resolves through it — so there is one resolver rather than two that
+  merely agree. This also means the orchestrator now honours `IRONCLAUDE_HOME`, which is what the
+  seam exists for.
+
+- **The test suite planted a real 24-hour Fable blackout.** `test_brain_client.py:211` injects a
+  mocked model-unavailable error, and `BrainClient`'s real error path ran unisolated — writing the
+  operator's actual `~/.ironclaude/state/fable_unavailable.json`. `classify_reason` mapped it to
+  `model_unavailable` with a 24h TTL, which then silently downgraded tier-up plan reviews from Fable
+  to Opus *while Fable was working*. Observed 2026-07-17, 07-21 and 07-30; every occurrence was a
+  test run, never an outage. Fixed with an autouse conftest fixture using `setattr` rather than
+  `setenv`, because `_STATE_PATH` is read from the environment once at import time and a
+  fixture-time `setenv` would run too late and silently do nothing.
+- **The suite deleted rows from the operator's live database.** Four `TestRunMaintenance` tests ran
+  `DELETE FROM audit_log` against the real `~/.claude/ironclaude.db` and unlinked real `~/.claude`
+  session-id files, with exceptions swallowed either side so they passed regardless. Eight more read
+  the operator's real hooks config, making their assertions depend on personal config values.
+  Harvesting with the tripwire but no containment found **92 failures across 8 production sites**;
+  static enumeration had found two of them.
+- **Fable was quarantined for 24 hours when the rule says one.** The operator's rule has two
+  clauses: honour an explicit "unavailable until \<time\>" when the provider supplies one, otherwise
+  retry after an hour. Clause 2 was built for `unknown` but never for `model_unavailable`, which
+  kept a flat 24h. `model_unavailable` is by definition a failure with no provider reset time, so
+  clause 2 governs it. Four documented false positives sat in that gap; no case was found where the
+  24h window was vindicated by a real outage. Two of the three tests guarding the window
+  **could never have failed** — they asserted the computed window against the very constant that
+  produces it, so they stayed green at 86400 and would have stayed green at 3600. The third encoded
+  the window as a bare literal `86000`, invisible to the constant-name grep the first audit used.
+  `usage_limit` is untouched: it still honours the parsed reset and still keeps Fable, because an
+  account-wide limit throttles Opus equally.
+- **Five skill references pointed at files that never existed.** Skills named
+  `.claude/rules/<file>` for two files that ship at `<plugin_root>/rules/`. `code-review` Step 4.5
+  named `.claude/rules/review-checklist.md` from the initial commit onward while
+  `worker/rules/review-checklist.md` sat unread — so **every code review in this repo silently took
+  Step 4.5's fallback branch**, because nothing checked. References are now anchored to each skill's
+  own directory, the one location a skill is always given at load time; `../../rules/<file>`
+  resolves in all three installs (repo, Claude cache, Codex cache), each confirmed.
+- **The Brain was instructed away from sonnet workers.** `system_prompt.md:217` told the Brain to
+  follow the grader's recommendation "when it recommends opus or fable" — placing a *sonnet*
+  recommendation outside what must be followed — and then argued that context-compaction cost
+  exceeds the sonnet/opus price difference. Both halves pushed upward, contradicting
+  `workflow.md:692`, which already calls `claude-sonnet` the default choice for most implementation
+  work. Recommendation-following is now symmetric in either direction. The auto-escalate-on-retry
+  sentence stays, because that describes real behaviour rather than a bias.
+
+### Changed
+
+- **Guard matchers became testable predicates, and four allowlists widened.** `git -C <path> <sub>`
+  was rejected while `writing-plans`' own execution invariants *require* it (the Bash cwd is
+  `commander/`), so a subagent could not run its staging command and silently dropped `-C` — a plan
+  instruction that did not execute as written. The review allowlist permitted bare `pytest` but this
+  repo needs `.venv/bin/python -m pytest`; `diff` was on no allowlist despite being the documented
+  way to verify a hook deploy; and the block message named the stage but not the permitted set, so a
+  reader could not distinguish "Bash is blocked here" from "this command is not on the list". The
+  matchers previously lived inline with no real coverage — only mirror functions that replicate the
+  logic rather than exercise it, 39 assertions that could not fail against actual behaviour.
+  Extraction landed first and **byte-exact**, keeping a trailing `\b`: `\b` matches before any
+  non-word character where `([[:space:]]|$)` does not, so substituting would have silently blocked
+  `make test-unit`, `git diff-index` and `git show-ref` while the mirror suite kept passing.
+  `is_review_allowed` deliberately uses two greps — a single grep with the env-prefix group in front
+  of the whole alternation would admit `FOO=1 sqlite3 db "UPDATE x"` and `FOO=1 find . -delete`,
+  both of which then bypass the raw-anchored write checks.
+- **Four frozen path constants now resolve through the seam.** `grader.py`, `shadow_grader.py`,
+  `brain_client.py` and `orchestrator_mcp.py` each froze a home-derived path at import. Three bare
+  `LocalGrader()` constructions therefore change behaviour, since `hooks_config()` now honours
+  `IC_OLLAMA_CONFIG_PATH` for all callers — an override `orchestrator_mcp` had and the graders did
+  not. Nothing in the repo sets that variable, and conftest deletes it autouse.
+- **The grader recommends sonnet by default, and says so without gating.** All three grader menus
+  now mark `claude-sonnet` the default. Each also carries an explicit line that tier choice alone
+  never lowers the grade or affects approval — load-bearing, because the same grader holds
+  approve/reject power and grades worker-type correctness, so a biased menu without that carve-out
+  would have quietly become an enforcement gate.
+
+### Known gaps
+
+Recorded rather than fixed, so they are not mistaken for covered ground:
+
+- **`notifications.py:318` still says "for the next 24h".** Its only callers pass `spawn-died`,
+  which maps to `unknown` and was already on a 1h window, so that text was wrong before the Fable
+  change and is untouched by it.
+- **`.claude/rules/review-checklist.md` deliberately survives as a duplicate.** Deleting it takes
+  effect immediately while the repointed skill text waits for the next skill load, and the gap
+  between is a window where no checklist resolves at all. It goes once a relaunched session is
+  observed loading the canonical file.
+- **`code-review` Step 4.5 names the checklist by a relative path** while the workflow's Bash cwd is
+  `commander/`, so a reviewer resolving it against its cwd may find nothing and fall back silently.
+  Only the checklist's *content* effect is demonstrated; the path-resolution half is unproven.
+- **`git stash show` is read-only and is nonetheless refused** by the narrowed allowlist below. It
+  sits outside the approved admitted set, and fail-closed is the correct default for a guard whose
+  failure mode is data loss. Admitting it is a one-line change if it proves to be friction.
+- **The deployed guard remains revertible.** Hooks execute from `~/.claude/ironclaude-hooks/`, and a
+  session running an older plugin version copies its own hooks over that shared directory — so a
+  stale build can undo the fix below. Unfixed; it is the single thing standing between this
+  narrowing and permanence.
+- **The quoted-pipe false positive** — a `|` inside a quoted regex read as a shell pipe — remains,
+  as do six mirror functions in the security suite and the guard's session-scoped stage sensitivity,
+  which lets one task's review gate block a sibling's commands under parallel execution.
+- **The sonnet spawn default is not yet demonstrated in behaviour.** No test here shows the Brain
+  spawning more sonnet workers; that needs live dispatch. The prompt and grader changes require a
+  **daemon restart** to take effect, and the `executing-plans` change is inert until the next skill
+  load.
+- **Editing all three grader prompts resets the `get_shadow_concordance_stats` baseline**, which
+  `workflow.md:698` asks to be reviewed before such changes.
+- **Every "Known gap" listed under 1.1.1 remains open**, including Codex's native `apply_patch`
+  receiving no professional-mode enforcement and no CI running any shell hook suite.
+
 ## 1.1.1: Codex Brain tool gating, provider capability quarantine, and one plan review per lineage
 
 Closes the parity defects that a blind full-tree recertification found in the 1.1.0 Codex

@@ -22,6 +22,7 @@ import time
 from glob import glob
 from pathlib import Path
 from typing import Callable, Optional
+from ironclaude import paths
 from ironclaude.grader import LocalGrader
 from ironclaude.signal_forensics import _logged_kill
 from ironclaude.fable_availability import mark_fable_unavailable as _mark_fable_unavailable
@@ -141,7 +142,7 @@ class BrainClient:
 
     ALLOWED_TOOLS = ["Read", "Grep", "Glob", "Bash"]
     MAX_BUFFER_SIZE = 50 * 1024 * 1024  # 50MB — prevent SDK transport buffer overflow
-    SESSION_LOG_DIR = str(Path.home() / ".ironclaude" / "brain-sessions")
+    SESSION_LOG_DIR: str | None = None
     SESSION_LOG_KEEP = 10
 
     # Orchestrator action tools that require episodic memory search first
@@ -473,7 +474,7 @@ class BrainClient:
     def _init_session_log(self) -> None:
         """Create a new session log file and run retention cleanup."""
         try:
-            log_dir = Path(self.SESSION_LOG_DIR)
+            log_dir = Path(self.SESSION_LOG_DIR or paths.brain_sessions_dir())
             log_dir.mkdir(parents=True, exist_ok=True)
             existing = sorted(log_dir.glob("*.log"))
             to_delete = existing[:max(0, len(existing) - (self.SESSION_LOG_KEEP - 1))]

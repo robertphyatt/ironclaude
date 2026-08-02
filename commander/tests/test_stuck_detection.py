@@ -43,6 +43,7 @@ def daemon(tmp_path, db_conn):
         registry=registry, tmux_manager=tmux, brain=brain,
         db_conn=db_conn,
     )
+    d._state_manager_db_path = str(tmp_path / "state-manager.db")
     return d
 
 
@@ -384,3 +385,10 @@ class TestPromptWaitingCacheBounded:
 
         # Cap (<=512) plus TTL pruning keeps the cache bounded.
         assert len(daemon._prompt_waiting_cache) <= 512
+
+
+def test_daemon_fixture_isolates_state_manager_db_path(daemon, tmp_path):
+    """The daemon fixture must never point at the operator's real state DB
+    (main.py:995 DELETEs from audit_log against it). Equality, not startswith:
+    the fake home lives under tmp_path, so startswith passes without the override."""
+    assert daemon._state_manager_db_path == str(tmp_path / "state-manager.db")

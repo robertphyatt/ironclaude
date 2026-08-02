@@ -40,7 +40,7 @@ _STATE_PATH = Path(
 )
 
 # Per-category recheck windows. The recheck follows WHY Fable was blocked:
-_MODEL_TTL = 86400        # 24h — Fable-specific outage; Opus is a genuine fallback.
+_MODEL_TTL = 3600         # 1h — no provider reset time, so re-probe like `unknown`.
 _USAGE_REPROBE = 1800     # 30m — usage limit with no extractable reset; re-probe (never a flat 5h).
 _UNKNOWN_REPROBE = 3600   # 1h  — unclassified/transient overload; downgrade but re-probe soon.
 _USAGE_MAX = 6 * 3600     # hard upper bound on any usage_limit window (guards a bad parse/skew).
@@ -197,7 +197,7 @@ def mark_fable_unavailable(
       - usage_limit: the real reset — reset_at, else the message's parsed
         `resets <time>`, else now+retry_after_seconds, else a 30-min re-probe;
         clamped to [now+60s, now+_USAGE_MAX] so a bad parse can't over-blackout.
-      - model_unavailable: now + _MODEL_TTL (24h — Opus is a genuine fallback).
+      - model_unavailable: now + _MODEL_TTL (1h — no reset time; re-probe soon).
       - unknown: now + _UNKNOWN_REPROBE (1h re-probe, never a stuck 24h blackout).
 
     Returns:

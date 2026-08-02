@@ -102,7 +102,7 @@ def brain():
 
 
 @pytest.fixture
-def daemon(db_conn, brain):
+def daemon(db_conn, brain, tmp_path):
     config = {"operator_name": "TestOp"}
     slack = MagicMock()
     slack._operator_user_id = "U_OPERATOR"
@@ -115,6 +115,7 @@ def daemon(db_conn, brain):
         brain=brain,
         db_conn=db_conn,
     )
+    d._state_manager_db_path = str(tmp_path / "state-manager.db")
     return d
 
 
@@ -201,3 +202,10 @@ class TestIdleEnforcement:
         daemon.check_idle_enforcement()
 
         daemon.brain.send_message.assert_not_called()
+
+
+def test_daemon_fixture_isolates_state_manager_db_path(daemon, tmp_path):
+    """The daemon fixture must never point at the operator's real state DB
+    (main.py:995 DELETEs from audit_log against it). Equality, not startswith:
+    the fake home lives under tmp_path, so startswith passes without the override."""
+    assert daemon._state_manager_db_path == str(tmp_path / "state-manager.db")

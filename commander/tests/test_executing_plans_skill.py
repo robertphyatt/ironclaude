@@ -244,8 +244,15 @@ def test_reviewer_archetypes_cover_verification_quality():
     An author-side invariant only warns; a reviewer archetype detects, and the reviewer
     has source access. Neither an unmeasured `expected:` nor a guard the change itself
     moves was covered by the original five archetypes.
+
+    The last two markers were added 2026-07-31 for the same reason, from six defects in
+    four loops that a blind reviewer caught and the author did not: a guard evaluated at
+    writing time rather than against the state after every task lands, and a count taken
+    from an agent's prose summary rather than from a file the author opened.
     """
     text = _read()
     for marker in ("predicted rather than measured",
-                   "the change itself moves"):
+                   "the change itself moves",
+                   "defused by a later step of the same plan",
+                   "provenance is an agent summary"):
         assert marker in text, marker

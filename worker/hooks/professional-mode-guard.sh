@@ -456,25 +456,21 @@ Do NOT run git commit, git push, git merge, or git rebase outside of plan execut
       fi
     fi
     # Exception: allow read-only git commands at any workflow stage (no chaining — mirrors git-add guard above)
-    if [ "$TOOL_NAME" = "Bash" ] && ! _has_blocked_metachars "$FILE_PATH" && echo "$FILE_PATH" | grep -qE '^\s*git\s+(diff|status|log|show|blame|branch|rev-list|ls-files|ls-tree|check-ignore|tag|remote|reflog|stash)\b'; then
+    if [ "$TOOL_NAME" = "Bash" ] && ! _has_blocked_metachars "$FILE_PATH" && is_readonly_git "$FILE_PATH"; then
       log_hook "professional-mode-guard" "Allowed" "read-only git command"
       exit 0
     fi
     # Exception: allow specific read-only commands during code review
     if [ "$TOOL_NAME" = "Bash" ] && [ "$WORKFLOW" = "reviewing" ]; then
-      # Locally-scoped -C normalization for the make-test member of the allowlist
-      # below only. A no-op for any non-make command, so it cannot affect the
-      # sqlite3/git/pytest/cat/etc. members of the same alternation.
-      MAKE_NORMALIZED_REVIEW=$(echo "$FILE_PATH" | sed -E 's/^([[:space:]]*make)[[:space:]]+-C[[:space:]]+[^[:space:]]+[[:space:]]+/\1 /')
       if _has_blocked_metachars "$FILE_PATH"; then
         block_pretooluse "professional-mode-guard" "BLOCKED — COMMAND CHAINING/REDIRECTION NOT ALLOWED DURING REVIEW
 
 Shell chaining/redirection operators (; && || | backtick \$() > <) are not permitted during code review.
 
-Allowed commands: sqlite3, git diff/status/log/show/blame/ls-files/check-ignore, pytest, make test, cat, head, tail, wc, grep, rg, find, ls
+Allowed commands: sqlite3, git diff/status/log/show/blame/ls-files/check-ignore, git -C <path> forms, pytest, make test, cat, head, tail, wc, grep, rg, find, ls, diff
 
 Do NOT run commands with shell operators during the reviewing stage."
-      elif echo "$MAKE_NORMALIZED_REVIEW" | grep -qE '^\s*(sqlite3|git\s+(diff|status|log|show|blame|ls-files|check-ignore)|pytest|make\s+test|cat|head|tail|wc|grep|rg|find|ls)\b'; then
+      elif is_review_allowed "$FILE_PATH"; then
         if echo "$FILE_PATH" | grep -qE '^\s*sqlite3\b' && echo "$FILE_PATH" | grep -qiE '\b(UPDATE|INSERT|DELETE|DROP|ALTER|CREATE|REPLACE)\b'; then
           block_pretooluse "professional-mode-guard" "BLOCKED — SQLITE WRITE OPERATIONS NOT ALLOWED DURING REVIEW
 
@@ -495,8 +491,9 @@ Use find for searching only."
         block_pretooluse "professional-mode-guard" "BLOCKED — COMMAND NOT ALLOWED DURING REVIEW
 
 Only the following commands are allowed during code review:
-  sqlite3, git diff/status/log/show/blame/ls-files/check-ignore, pytest, make test,
-  cat, head, tail, wc, grep, rg, find, ls
+  sqlite3, git diff/status/log/show/blame/ls-files/check-ignore, git -C <path> forms,
+  pytest, make test, cat, head, tail, wc, grep, rg, find, ls, diff
+  (pytest also accepts VAR=x prefixes and <path>/python -m pytest)
 
 Do NOT run destructive or write commands during the reviewing stage."
       fi
@@ -589,6 +586,11 @@ Do NOT run destructive or write commands during the reviewing stage."
 The current workflow stage is '${WORKFLOW}'. Write tools (Edit, Write, Bash) are only allowed during plan execution.
 
 Professional mode enforces a brainstorm → plan → execute workflow. Write tools are restricted to the execution phase to ensure all changes are planned and reviewed.
+
+Read-only research commands ARE permitted at this stage:
+  cat, head, tail, wc, grep, rg, find, ls, diff
+They must contain no shell metacharacters (; & | \` \$( < >) — note that a pipe
+inside a quoted regex is currently treated as a shell pipe and rejected.
 
 To reach execution, follow the workflow:
 1. Call Skill tool with skill: \"ironclaude:brainstorming\" to design

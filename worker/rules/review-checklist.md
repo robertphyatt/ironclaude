@@ -37,6 +37,27 @@ DO NOT flag: LLM output displayed as plain text to the requesting user, LLM outp
 
 DO NOT flag: Hardcoded commands with no external input, argument arrays (safe by construction).
 
+### Falsifiability at the end state
+
+- [ ] **Guard that cannot fail** — For every added assertion, guard, or `expected:` value, name the deletion that would make it fail. Re-evaluate that expression against the state where **every change in this branch has landed**, not the state at the line where it appears. If it still holds, the check verifies nothing.
+- [ ] **Guard defused by a sibling change** — A check whose subject is relocated or rewritten by another change in the same diff: a path moved under a redirected root, a count the diff itself alters, a marker whose text another step edits.
+
+DO NOT flag: checks weaker than ideal that still fail on a real regression, deliberate assertions of a current limitation where the diff or plan says it is removed later, documentation, comments, logging.
+
+### Provenance for factual claims
+
+- [ ] **Unsupported count, line number, or symbol** — List every numeric or positional claim in the diff and its commit/plan text; for each, find the command output or file read that establishes it.
+- [ ] **Agent summary as evidence** — A claim whose only support is a summary — an agent report, a prior document, a recollection — is unverified provenance. A count derived from a line range rather than traced through the code is unverified.
+
+DO NOT flag: claims the diff itself demonstrates (a test asserting the value), approximations explicitly marked as such, values whose supporting command appears in the same change.
+
+### Widened-guard scope
+
+- [ ] **Loosened allowlist, matcher, or validation without negative cases** — Identify any pattern or predicate the diff makes more permissive. Compare the scope the requirement states against the scope the code actually admits — read the regex or condition, do not trust its description.
+- [ ] **Widening tested only with positive cases** — Passing examples prove nothing about what the guard still refuses. Require negative cases bounding the newly-admitted set.
+
+DO NOT flag: widenings whose negative cases exist elsewhere in the same suite (say where), pure refactors that preserve the admitted set.
+
 ---
 
 ## INFORMATIONAL CHECKS (report, don't block)

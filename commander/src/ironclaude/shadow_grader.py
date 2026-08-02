@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 
+from ironclaude import paths
 from ironclaude.ollama_client import OllamaClient, OllamaError
 
 logger = logging.getLogger(__name__)
@@ -21,7 +22,6 @@ _GREP_CMD = (
     else ["grep", "-r", "-m", "20", "-e"]
 )
 
-_DEFAULT_CONFIG_PATH = os.path.expanduser("~/.claude/ironclaude-hooks-config.json")
 _DEFAULT_SHADOW_MODEL = "gemma4:12b-it-qat"
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _SPECIAL_TOKEN_RE = re.compile(r"<\|[^>]*>")
@@ -106,7 +106,7 @@ class ShadowGrader:
     """
 
     def __init__(self, config_path: str | None = None) -> None:
-        self._config_path = config_path or _DEFAULT_CONFIG_PATH
+        self._config_path = config_path or paths.hooks_config()
         self._client: OllamaClient | None = None
         self._model: str = _DEFAULT_SHADOW_MODEL
         self._num_ctx: int = 32768

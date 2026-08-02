@@ -4,12 +4,137 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import traceback
 import types
 from pathlib import Path
 
 import pytest
 
 collect_ignore = ["test_signal_handler_destructive.py"]
+
+# ── Real-path tripwire ────────────────────────────────────────────────────────
+# Occurrence #5 of "tests mutate real operator state". Per-site fixes recurred
+# four times; the one conftest-scoped DENY (_guard_os_kill) held.
+
+
+class RealHomeAccess(BaseException):
+    """A test touched one of the operator's real IronClaude paths.
+
+    BaseException, NOT Exception: main.py:1000-1001 and :1020-1021 are
+    `except Exception as e: logger.warning(...)` — the exact handlers that kept
+    this bug invisible for five occurrences. A RuntimeError tripwire would abort
+    the operation and then die silently in them.
+    """
+
+
+_AUDITED_EVENTS = frozenset(
+    {
+        "open",
+        "os.remove",
+        "os.rename",
+        "os.mkdir",
+        "shutil.copyfile",
+        "sqlite3.connect",
+        "os.rmdir",
+        "os.symlink",
+        "os.link",
+    }
+)
+
+_REAL_HOME = ""
+_DENIED_REAL_PREFIXES: tuple = ()
+_TRIP_LEDGER: list = []
+
+
+def _real_path_tripwire(event, args):
+    if event not in _AUDITED_EVENTS:
+        return
+    for arg in args:
+        if not isinstance(arg, (str, bytes, os.PathLike)):
+            continue
+        try:
+            text = os.fsdecode(arg)
+        except (TypeError, ValueError):
+            continue
+        for prefix in _DENIED_REAL_PREFIXES:
+            if text == prefix or text.startswith(prefix + os.sep):
+                _TRIP_LEDGER.append(
+                    (event, text, "".join(traceback.format_stack()))
+                )
+                raise RealHomeAccess(
+                    f"Test touched the operator's real IronClaude path "
+                    f"via {event!r}: {text}\n"
+                    f"Production code resolved a path under the real home. Fix "
+                    f"the resolver (step 3 of "
+                    f"docs/plans/2026-07-31-home-redirect-test-isolation-design.md). "
+                    f"Do NOT add an exemption."
+                )
+
+
+def _report_and_clear_trips(when):
+    """Raise if anything tripped, then clear so the next test starts clean.
+
+    Never blind-clear: a clear() without a check silently discards trips that
+    occurred during collection or session-scoped setup, and harvest fidelity is
+    this loop's entire product.
+    """
+    if not _TRIP_LEDGER:
+        return
+    trips = list(_TRIP_LEDGER)
+    _TRIP_LEDGER.clear()
+    entries = "\n".join(f"  {ev} -> {p}" for ev, p, _ in trips)
+    raise AssertionError(
+        f"Real IronClaude path(s) touched {when}:\n{entries}\n"
+        f"Stack of first trip:\n{trips[0][2]}"
+    )
+
+
+def pytest_configure(config):
+    """Freeze the real-home deny-set BEFORE any redirect fixture can run.
+
+    Computed after redirection it would guard the fake home and protect nothing.
+    """
+    global _REAL_HOME, _DENIED_REAL_PREFIXES
+    real_home = Path.home()
+    _REAL_HOME = str(real_home)
+    _DENIED_REAL_PREFIXES = (
+        str(real_home / ".claude"),
+        str(real_home / ".ironclaude"),
+        str(real_home / ".claude.json"),
+    )
+    sys.addaudithook(_real_path_tripwire)
+
+
+@pytest.fixture(scope="session")
+def real_home():
+    """The operator's actual home, captured before any redirect."""
+    return _REAL_HOME
+
+
+@pytest.fixture(scope="session")
+def tripwire_error():
+    """The tripwire exception class, for pytest.raises in the controls."""
+    return RealHomeAccess
+
+
+@pytest.fixture
+def trip_ledger():
+    """The live ledger — canary control only. Do NOT use it to clear a trip your
+    test caused; fix the resolver instead."""
+    return _TRIP_LEDGER
+
+
+@pytest.fixture(autouse=True)
+def _assert_no_real_path_trips():
+    """Backstop for handlers that swallow even a BaseException.
+
+    A bare `except:` or contextlib.suppress would absorb RealHomeAccess. The
+    ledger records the trip regardless, so the test still fails here.
+    """
+    _report_and_clear_trips("before this test (collection or session setup)")
+    yield
+    _report_and_clear_trips("during this test")
+
 
 # ── Fix ironclaude.plugins namespace shadowing ────────────────────────────────
 # src/ironclaude/plugins.py (a module) shadows src/ironclaude/plugins/ (a package).
@@ -103,6 +228,47 @@ def _reset_ollama_breakers():
     _BREAKERS.reset()
     yield
     _BREAKERS.reset()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_fable_state(tmp_path, monkeypatch):
+    """Never let the suite write the operator's real Fable-unavailability flag.
+
+    BrainClient's real error path writes ~/.ironclaude/state/fable_unavailable.json
+    on any 'fable' model failure, so a test injecting a model-unavailable error
+    plants a real 24h blackout that silently downgrades tier-up plan reviews.
+    Per-test patching missed TestBrainModelFallback (test_brain_client.py:211);
+    this makes opting out impossible by default.
+
+    setattr, not setenv: fable_availability._STATE_PATH is evaluated from
+    IRONCLAUDE_FABLE_STATE_PATH once at import time, so setting the env var here
+    would be too late and would silently do nothing.
+    """
+    from ironclaude import fable_availability
+
+    monkeypatch.setattr(
+        fable_availability, "_STATE_PATH", tmp_path / "fable_unavailable.json"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _redirect_home(tmp_path, monkeypatch):
+    """Point $HOME at a per-test fake home.
+
+    Seeded with a .gitconfig because the wiki tests run real `git commit`, and a
+    bare redirect strips git identity.
+
+    IRONCLAUDE_HOME is deliberately NOT set: nothing reads it until paths.py
+    exists (step 3), and paths.home() will fall back to Path.home(), which
+    honors HOME.
+    """
+    fake_home = tmp_path / "home"
+    fake_home.mkdir(exist_ok=True)
+    (fake_home / ".gitconfig").write_text(
+        "[user]\n\tname = IronClaude Tests\n\temail = tests@ironclaude.invalid\n"
+    )
+    monkeypatch.setenv("HOME", str(fake_home))
+    return fake_home
 
 
 @pytest.fixture
