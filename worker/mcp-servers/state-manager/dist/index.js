@@ -12654,6 +12654,7 @@ import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 import os from "os";
+var PLAN_LINEAGE_BLIND_REVIEW_TRIGGER_MESSAGE = "plan lineage already has a blind review";
 function getDbPath() {
   if (process.env.STATE_MANAGER_DB_PATH) {
     return process.env.STATE_MANAGER_DB_PATH;
@@ -12752,7 +12753,8 @@ function migrateSchema(db) {
     const expectedColumns = [
       { name: "memory_search_required", type: "INTEGER NOT NULL", dflt: "0" },
       { name: "testing_theatre_checked", type: "INTEGER NOT NULL", dflt: "0" },
-      { name: "review_block_count", type: "INTEGER NOT NULL", dflt: "0" }
+      { name: "review_block_count", type: "INTEGER NOT NULL", dflt: "0" },
+      { name: "plan_lineage", type: "INTEGER NOT NULL", dflt: "0" }
     ];
     const currentColumns = db.prepare(`PRAGMA table_info(sessions)`).all();
     const columnNames = new Set(currentColumns.map((c) => c.name));
@@ -12763,6 +12765,33 @@ function migrateSchema(db) {
       }
     }
   }
+  const tierUpReviewsExists = db.prepare(
+    `SELECT name FROM sqlite_master WHERE type='table' AND name='tier_up_reviews'`
+  ).get();
+  if (tierUpReviewsExists) {
+    const tierUpReviewColumns = db.prepare(`PRAGMA table_info(tier_up_reviews)`).all();
+    if (!tierUpReviewColumns.some((column) => column.name === "plan_lineage")) {
+      db.exec(`ALTER TABLE tier_up_reviews ADD COLUMN plan_lineage INTEGER NOT NULL DEFAULT 0`);
+      console.error("Migration: added plan_lineage column to tier_up_reviews table.");
+    }
+    installTierUpReviewLineageTrigger(db);
+  }
+}
+function installTierUpReviewLineageTrigger(db) {
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS prevent_duplicate_blind_tier_up_review
+    BEFORE INSERT ON tier_up_reviews
+    WHEN NEW.verdict IN ('SOLID', 'HAS-ISSUES', 'top-tier-self')
+      AND EXISTS (
+        SELECT 1 FROM tier_up_reviews
+        WHERE terminal_session = NEW.terminal_session
+          AND plan_lineage = NEW.plan_lineage
+          AND verdict IN ('SOLID', 'HAS-ISSUES', 'top-tier-self')
+      )
+    BEGIN
+      SELECT RAISE(ABORT, '${PLAN_LINEAGE_BLIND_REVIEW_TRIGGER_MESSAGE}');
+    END;
+  `);
 }
 var _db = null;
 function initDb(dbPath) {
@@ -12787,6 +12816,7 @@ function initDb(dbPath) {
       current_wave INTEGER NOT NULL DEFAULT 0,
       review_pending INTEGER NOT NULL DEFAULT 0,
       review_block_count INTEGER NOT NULL DEFAULT 0,
+      plan_lineage INTEGER NOT NULL DEFAULT 0,
       circuit_breaker INTEGER NOT NULL DEFAULT 0,
       memory_search_required INTEGER NOT NULL DEFAULT 0,
       testing_theatre_checked INTEGER NOT NULL DEFAULT 0,
@@ -12863,6 +12893,7 @@ function initDb(dbPath) {
     CREATE TABLE IF NOT EXISTS tier_up_reviews (
       id               INTEGER PRIMARY KEY AUTOINCREMENT,
       terminal_session TEXT NOT NULL,
+      plan_lineage    INTEGER NOT NULL DEFAULT 0,
       plan_hash        TEXT NOT NULL,
       reviewer_model   TEXT NOT NULL,
       verdict          TEXT NOT NULL,
@@ -12879,6 +12910,7 @@ function initDb(dbPath) {
       PRIMARY KEY (terminal_session, tool_name, input_hash)
     );
   `);
+  installTierUpReviewLineageTrigger(db);
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_wave_tasks_session
       ON wave_tasks(terminal_session);
@@ -13091,33 +13123,43 @@ function clearReviewGrades(db, sessionId) {
   db.prepare(`DELETE FROM review_grades WHERE terminal_session = ?`).run(sessionId);
   walCheckpoint(db);
 }
-function insertTierUpReview(db, sessionId, planHash, reviewerModel, verdict) {
+function insertTierUpReview(db, sessionId, planLineage, planHash, reviewerModel, verdict) {
   db.prepare(`
-    INSERT INTO tier_up_reviews (terminal_session, plan_hash, reviewer_model, verdict)
-    VALUES (?, ?, ?, ?)
-  `).run(sessionId, planHash, reviewerModel, verdict);
+    INSERT INTO tier_up_reviews (terminal_session, plan_lineage, plan_hash, reviewer_model, verdict)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(sessionId, planLineage, planHash, reviewerModel, verdict);
   walCheckpoint(db);
 }
-function getTierUpReviewByHash(db, sessionId, planHash) {
+function hasAdvisorRemediatedAtHash(db, sessionId, planLineage, planHash) {
+  const row = db.prepare(`
+    SELECT 1 AS found FROM tier_up_reviews AS remediation
+    WHERE remediation.terminal_session = ? AND remediation.plan_lineage = ? AND remediation.plan_hash = ?
+      AND remediation.verdict = 'advisor-remediated'
+      AND EXISTS (
+        SELECT 1 FROM tier_up_reviews AS failed_review
+        WHERE failed_review.terminal_session = remediation.terminal_session
+          AND failed_review.plan_lineage = remediation.plan_lineage
+          AND failed_review.verdict = 'HAS-ISSUES'
+          AND failed_review.id < remediation.id
+      )
+    LIMIT 1
+  `).get(sessionId, planLineage, planHash);
+  return row !== void 0;
+}
+function getBlindTierUpReviewForLineage(db, sessionId, planLineage) {
   return db.prepare(`
     SELECT * FROM tier_up_reviews
-    WHERE terminal_session = ? AND plan_hash = ?
-    ORDER BY id DESC LIMIT 1
-  `).get(sessionId, planHash);
+    WHERE terminal_session = ? AND plan_lineage = ?
+      AND verdict IN ('SOLID', 'HAS-ISSUES', 'top-tier-self')
+    ORDER BY id ASC LIMIT 1
+  `).get(sessionId, planLineage);
 }
-function getLatestTierUpReview(db, sessionId) {
-  return db.prepare(`
-    SELECT * FROM tier_up_reviews
-    WHERE terminal_session = ?
-    ORDER BY id DESC LIMIT 1
-  `).get(sessionId);
-}
-function hasEarlierTierUpVerdict(db, sessionId, verdict, beforeId) {
+function hasEarlierTierUpVerdict(db, sessionId, planLineage, verdict, beforeId) {
   const row = db.prepare(`
     SELECT 1 AS found FROM tier_up_reviews
-    WHERE terminal_session = ? AND verdict = ? AND id < ?
+    WHERE terminal_session = ? AND plan_lineage = ? AND verdict = ? AND id < ?
     LIMIT 1
-  `).get(sessionId, verdict, beforeId);
+  `).get(sessionId, planLineage, verdict, beforeId);
   return row !== void 0;
 }
 
@@ -13133,6 +13175,9 @@ function text(value, label) {
     throw new Error(`Missing or invalid ${label}`);
   }
   return value;
+}
+function hasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value, key);
 }
 function parseIronClaudeClient(value) {
   if (value === "claude" || value === "codex") return value;
@@ -13156,18 +13201,36 @@ function resolveSessionIdentity(client2, requestMeta, claudePpidSession) {
   const turn = record(meta["x-codex-turn-metadata"], "x-codex-turn-metadata");
   const sessionId = text(turn.session_id, "Codex root session_id");
   const nestedThreadId = text(turn.thread_id, "Codex thread_id");
-  const threadSource = text(turn.thread_source, "Codex thread_source");
   if (invocationThreadId !== nestedThreadId) {
     throw new Error("Codex top-level threadId disagrees with nested thread_id");
   }
-  if (threadSource === "subagent") {
+  const hasParent = hasOwn(turn, "parent_thread_id");
+  const hasFork = hasOwn(turn, "forked_from_thread_id");
+  if (!hasOwn(turn, "thread_source")) {
+    if (hasParent || hasFork) {
+      throw new Error("Source-less Codex root metadata cannot contain ancestry fields");
+    }
+    if (sessionId !== invocationThreadId) {
+      throw new Error("Codex root session_id disagrees with root threadId");
+    }
+  } else if (turn.thread_source === "user") {
+    if (hasParent || hasFork) {
+      throw new Error("Codex user root metadata cannot contain ancestry fields");
+    }
+    if (sessionId !== invocationThreadId) {
+      throw new Error("Codex root session_id disagrees with root threadId");
+    }
+  } else if (turn.thread_source === "subagent") {
     const parentThreadId = text(turn.parent_thread_id, "Codex parent_thread_id");
     const forkedFromThreadId = text(turn.forked_from_thread_id, "Codex forked_from_thread_id");
+    if (sessionId === invocationThreadId) {
+      throw new Error("Codex subagent thread_id must differ from root session_id");
+    }
     if (sessionId !== parentThreadId || sessionId !== forkedFromThreadId) {
       throw new Error("Codex subagent root session fields disagree");
     }
-  } else if (sessionId !== invocationThreadId) {
-    throw new Error("Codex root session_id disagrees with root threadId");
+  } else {
+    throw new Error("Missing or invalid Codex thread_source");
   }
   return { client: client2, sessionId, invocationThreadId, source: "codex_meta" };
 }
@@ -13629,6 +13692,7 @@ function prepareRetreatArtifacts(db, sessionId, session, from, reason) {
 import path3 from "path";
 import os2 from "os";
 import fs2 from "fs";
+import { createHash as createHash2 } from "crypto";
 function requireSessionId(sessionId) {
   if (!sessionId) {
     throw new Error("Resolved session ID is required before read tool handling");
@@ -14231,6 +14295,19 @@ ${JSON.stringify({
           plan_goal = null;
         }
       }
+      const currentPlanHash = session.plan_json ? createHash2("sha256").update(session.plan_json).digest("hex") : null;
+      const canonicalReview = getBlindTierUpReviewForLineage(
+        db,
+        resolvedId,
+        session.plan_lineage
+      );
+      const review_summary = {
+        plan_lineage: session.plan_lineage,
+        canonical_blind_verdict: canonicalReview?.verdict ?? null,
+        canonical_blind_plan_hash: canonicalReview?.plan_hash ?? null,
+        canonical_hash_matches_current: canonicalReview ? canonicalReview.plan_hash === currentPlanHash : null,
+        current_hash_advisor_remediated: currentPlanHash ? hasAdvisorRemediatedAtHash(db, resolvedId, session.plan_lineage, currentPlanHash) : false
+      };
       const result = {
         workflow_stage: session.workflow_stage,
         professional_mode: session.professional_mode,
@@ -14244,6 +14321,7 @@ ${JSON.stringify({
           wave: t.wave_number,
           status: t.status
         })),
+        review_summary,
         session_id: resolvedId
       };
       return {
@@ -14279,7 +14357,7 @@ ${JSON.stringify({
 import path4 from "path";
 import fs3 from "fs";
 import os3 from "os";
-import { createHash as createHash2 } from "crypto";
+import { createHash as createHash3 } from "crypto";
 function requireSessionId2(sessionId) {
   if (!sessionId) {
     throw new Error("Resolved session ID is required before write tool handling");
@@ -14334,14 +14412,18 @@ function getTierUpPolicy() {
   }
 }
 function hashPlan(planJson) {
-  return createHash2("sha256").update(planJson).digest("hex");
+  return createHash3("sha256").update(planJson).digest("hex");
 }
 var TIER_UP_VERDICTS = ["SOLID", "HAS-ISSUES", "top-tier-self", "advisor-remediated"];
+var BLIND_TIER_UP_VERDICTS = ["SOLID", "HAS-ISSUES", "top-tier-self"];
 function isTierUpVerdict(value) {
   return TIER_UP_VERDICTS.includes(value);
 }
 function isPassingTierUpVerdict(value) {
   return value === "SOLID" || value === "top-tier-self";
+}
+function isBlindTierUpVerdict(value) {
+  return BLIND_TIER_UP_VERDICTS.includes(value);
 }
 var writeToolDefinitions = [
   {
@@ -14746,42 +14828,48 @@ function handleWriteTool(name, args, db, sessionId) {
       if (!file || typeof file !== "string" || file.trim() === "") {
         return err("Missing or empty required parameter: file");
       }
-      const session = getSession(db, resolvedId);
-      if (!session) {
-        return err("Session not found", { session_id: resolvedId });
-      }
-      const design = getDesign(db, file);
-      if (!design) {
-        return err(`Design not found: ${file}`);
-      }
-      if (design.consumed === 1) {
-        return err(`Design already consumed: ${file}`);
-      }
-      const validConsumeStages = ["brainstorming", "design_ready", "design_marked_for_use"];
-      if (!validConsumeStages.includes(session.workflow_stage)) {
-        return err(
-          `Cannot consume design: workflow must be brainstorming, design_ready, or design_marked_for_use, currently ${session.workflow_stage}`
-        );
-      }
-      consumeDesign(db, file);
-      if (session.workflow_stage === "brainstorming") {
-        updateSession(db, resolvedId, { workflow_stage: "design_ready" });
-      }
-      const newStage = session.workflow_stage === "brainstorming" ? "design_ready" : session.workflow_stage;
-      insertAuditLog(db, {
-        terminal_session: resolvedId,
-        actor: "claude",
-        action: "consume_design",
-        old_value: session.workflow_stage,
-        new_value: newStage,
-        context: `Consumed design file: ${file}`
+      const consumeDesign2 = db.transaction(() => {
+        const session = getSession(db, resolvedId);
+        if (!session) {
+          return err("Session not found", { session_id: resolvedId });
+        }
+        const design = getDesign(db, file);
+        if (!design) {
+          return err(`Design not found: ${file}`);
+        }
+        if (design.consumed === 1) {
+          return err(`Design already consumed: ${file}`);
+        }
+        const validConsumeStages = ["brainstorming", "design_ready", "design_marked_for_use"];
+        if (!validConsumeStages.includes(session.workflow_stage)) {
+          return err(
+            `Cannot consume design: workflow must be brainstorming, design_ready, or design_marked_for_use, currently ${session.workflow_stage}`
+          );
+        }
+        const newStage = session.workflow_stage === "brainstorming" ? "design_ready" : session.workflow_stage;
+        consumeDesign(db, file);
+        if (session.workflow_stage === "brainstorming") {
+          updateSession(db, resolvedId, {
+            workflow_stage: "design_ready",
+            plan_lineage: session.plan_lineage + 1
+          });
+        }
+        insertAuditLog(db, {
+          terminal_session: resolvedId,
+          actor: "claude",
+          action: "consume_design",
+          old_value: session.workflow_stage,
+          new_value: newStage,
+          context: `Consumed design file: ${file}`
+        });
+        return ok({
+          success: true,
+          file,
+          workflow_stage: newStage,
+          session_id: resolvedId
+        });
       });
-      return ok({
-        success: true,
-        file,
-        workflow_stage: newStage,
-        session_id: resolvedId
-      });
+      return consumeDesign2();
     }
     // ----- create_plan -----
     case "create_plan": {
@@ -14869,20 +14957,24 @@ function handleWriteTool(name, args, db, sessionId) {
             return "BLOCKED \u2014 tier-up review gate: no plan loaded. Call create_plan first.";
           }
           const planHash = hashPlan(session.plan_json);
-          const review = getTierUpReviewByHash(db, resolvedId, planHash);
-          const latestReview = getLatestTierUpReview(db, resolvedId);
-          const passRequired = tierUpPolicy === "enforced" || latestReview?.verdict === "HAS-ISSUES";
-          if (passRequired && !review) {
-            return `BLOCKED \u2014 passing tier-up review required (tier_up_review_policy=${tierUpPolicy}). ` + (latestReview?.verdict === "HAS-ISSUES" ? "The latest review was HAS-ISSUES; perform the holistic requirements/design/plan audit, revise coherently, and obtain a fresh SOLID review. " : "") + "Dispatch a blind higher-tier reviewer for THIS plan and call submit_tier_up_review, then retry start_execution. If the plan changed after a prior review, re-review is required (the hash no longer matches). To change this requirement, a human must edit tier_up_review_policy in ~/.claude/ironclaude-hooks-config.json (the commander cannot change it).";
-          }
-          if (passRequired && review && review.verdict === "advisor-remediated") {
-            if (hasEarlierTierUpVerdict(db, resolvedId, "HAS-ISSUES", review.id)) {
-              return null;
+          const canonicalReview = getBlindTierUpReviewForLineage(
+            db,
+            resolvedId,
+            session.plan_lineage
+          );
+          if (!canonicalReview) {
+            if (tierUpPolicy === "enforced") {
+              return `BLOCKED \u2014 passing tier-up review required (tier_up_review_policy=${tierUpPolicy}). Dispatch one blind higher-tier reviewer for THIS plan and call submit_tier_up_review, then retry start_execution. To change this requirement, a human must edit tier_up_review_policy in ~/.claude/ironclaude-hooks-config.json (the commander cannot change it).`;
             }
-            return "BLOCKED \u2014 advisor-remediated requires a prior HAS-ISSUES review. This verdict records that a tier-up advisor guided the response to a failed review; with no earlier HAS-ISSUES row in this session it is not a valid execution gate. Obtain a blind review first.";
+            return null;
           }
-          if (passRequired && review && !isPassingTierUpVerdict(review.verdict)) {
-            return `BLOCKED \u2014 current plan tier-up verdict is ${review.verdict}. Execution requires SOLID (or top-tier-self at the highest model tier). Verify findings, perform the holistic requirements/design/plan audit, revise coherently, and obtain a fresh blind review.`;
+          if (isPassingTierUpVerdict(canonicalReview.verdict)) {
+            if (canonicalReview.plan_hash === planHash) return null;
+            return `BLOCKED \u2014 plan lineage ${session.plan_lineage} already has a passing ${canonicalReview.verdict} review for a different plan hash. Restore the exact reviewed plan or retreat to brainstorming after verifying a design-premise change. Do not dispatch another plan review.`;
+          }
+          if (canonicalReview.verdict === "HAS-ISSUES") {
+            if (hasAdvisorRemediatedAtHash(db, resolvedId, session.plan_lineage, planHash)) return null;
+            return `BLOCKED \u2014 plan lineage ${session.plan_lineage} has HAS-ISSUES. Use the non-blind fix advisor and record advisor-remediated for the current plan after remediation. Do not dispatch another plan review.`;
           }
           return null;
         },
@@ -15121,11 +15213,12 @@ function handleWriteTool(name, args, db, sessionId) {
           valid: false,
           reason: `Cannot mark design ready: workflow_stage must be 'brainstorming', got '${from}'`
         },
-        applyArtifacts: () => {
+        applyArtifacts: ({ session }) => {
           if (file) {
             registerDesign(db, file, resolvedId);
             consumeDesign(db, file);
           }
+          return { plan_lineage: session.plan_lineage + 1 };
         }
       });
       return workflowTransitionResult(outcome, { workflow_stage: "design_ready" });
@@ -15399,16 +15492,43 @@ function handleWriteTool(name, args, db, sessionId) {
         );
       }
       const planHash = hashPlan(session.plan_json);
-      insertTierUpReview(db, resolvedId, planHash, reviewerModel, verdict);
+      if (isBlindTierUpVerdict(verdict)) {
+        const existing = getBlindTierUpReviewForLineage(db, resolvedId, session.plan_lineage);
+        if (existing) {
+          return err(
+            `BLOCKED \u2014 plan lineage ${session.plan_lineage} already consumed its one blind review (${existing.verdict}). Do not dispatch another plan review. Use the fix advisor and advisor-remediated path after HAS-ISSUES, or retreat to brainstorming when a verified design premise is invalid.`
+          );
+        }
+      } else if (!hasEarlierTierUpVerdict(
+        db,
+        resolvedId,
+        session.plan_lineage,
+        "HAS-ISSUES",
+        Number.MAX_SAFE_INTEGER
+      )) {
+        return err(
+          `BLOCKED \u2014 advisor-remediated requires a prior HAS-ISSUES review in plan lineage ${session.plan_lineage}.`
+        );
+      }
+      try {
+        insertTierUpReview(db, resolvedId, session.plan_lineage, planHash, reviewerModel, verdict);
+      } catch (error) {
+        if (error instanceof Error && error.message === PLAN_LINEAGE_BLIND_REVIEW_TRIGGER_MESSAGE) {
+          return err(
+            `BLOCKED \u2014 plan lineage ${session.plan_lineage} already consumed its one blind review. Do not dispatch another plan review.`
+          );
+        }
+        throw error;
+      }
       insertAuditLog(db, {
         terminal_session: resolvedId,
         actor: "claude",
         action: "submit_tier_up_review",
         old_value: null,
         new_value: verdict,
-        context: `Tier-up review recorded (model=${reviewerModel}, plan_hash=${planHash.slice(0, 12)}\u2026)`
+        context: `Tier-up review recorded (model=${reviewerModel}, plan_lineage=${session.plan_lineage}, plan_hash=${planHash.slice(0, 12)}\u2026)`
       });
-      return ok({ success: true, plan_hash: planHash, reviewer_model: reviewerModel, verdict, session_id: resolvedId });
+      return ok({ success: true, plan_lineage: session.plan_lineage, plan_hash: planHash, reviewer_model: reviewerModel, verdict, session_id: resolvedId });
     }
     default:
       throw new Error(`Unknown write tool: ${name}`);

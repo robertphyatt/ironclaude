@@ -19,9 +19,9 @@ from pathlib import Path
 
 import pytest
 import psutil
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch, PropertyMock, call
 
-from ironclaude.db import init_db
+from ironclaude.db import DIRECT_REPLY_FALLBACK_REASON, init_db
 from ironclaude.worker_registry import WorkerRegistry
 from ironclaude.config import DEFAULTS, make_opus_command
 from ironclaude.ollama_inventory import OllamaInventory
@@ -3007,6 +3007,99 @@ class TestSendToWorkerGrader:
 class TestPostMessageGrader:
     """Tests for post_message proactiveness grading."""
 
+    def test_post_message_marked_reply_grades_clean_body_posts_thread_and_reacts(self, tools):
+        """A valid reply marker is stripped, threaded, then acknowledged after delivery."""
+        source_ts = "1700000000.123456"
+        body = "Task 2 is complete."
+        tools._slack = MagicMock()
+        tools._slack.post_message.return_value = "1700000010.654321"
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "Action reported"
+        })
+
+        result = tools.post_message(f"[reply-to:{source_ts}] {body}")
+
+        assert result == "1700000010.654321"
+        assert body in tools._call_local_grader.call_args.args[1]
+        assert f"[reply-to:{source_ts}]" not in tools._call_local_grader.call_args.args[1]
+        tools._slack.post_message.assert_called_once_with(body, thread_ts=source_ts)
+        tools._slack.add_reaction.assert_called_once_with("white_check_mark", source_ts)
+        assert tools._slack.method_calls == [
+            call.post_message(body, thread_ts=source_ts),
+            call.add_reaction("white_check_mark", source_ts),
+        ]
+
+    def test_post_message_marked_reply_without_delivery_does_not_react(self, tools):
+        """A reply marker is not acknowledged when Slack returns no delivery timestamp."""
+        source_ts = "1700000000.123456"
+        tools._slack = MagicMock()
+        tools._slack.post_message.return_value = None
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "Approved"
+        })
+
+        result = tools.post_message(f"[reply-to:{source_ts}] Delivered body")
+
+        assert result is None
+        tools._slack.post_message.assert_called_once_with("Delivered body", thread_ts=source_ts)
+        tools._slack.add_reaction.assert_not_called()
+
+    def test_post_message_marked_reply_rejected_does_not_post_or_react(self, tools):
+        """A grader rejection stops both threaded delivery and acknowledgement."""
+        tools._slack = MagicMock()
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "D", "approved": False, "feedback": "Passive report"
+        })
+
+        result = tools.post_message("[reply-to:1700000000.123456] Service failed.")
+
+        assert isinstance(result, dict)
+        tools._slack.post_message.assert_not_called()
+        tools._slack.add_reaction.assert_not_called()
+
+    def test_post_message_marker_only_rejected_before_grading_or_slack(self, tools):
+        """A marker with no body is rejected without grading or Slack calls."""
+        tools._slack = MagicMock()
+        tools._call_local_grader = MagicMock()
+
+        result = tools.post_message("[reply-to:1700000000.123456]   ")
+
+        assert result == {"error": "Message is empty after reply marker"}
+        tools._call_local_grader.assert_not_called()
+        tools._slack.post_message.assert_not_called()
+        tools._slack.add_reaction.assert_not_called()
+
+    @pytest.mark.parametrize("content", [
+        "[reply-to:not-a-ts] body",
+        "[reply-to:1.2.3] body",
+    ])
+    def test_post_message_malformed_marker_rejected_before_grading_or_slack(self, tools, content):
+        """Malformed leading reply markers are never posted as ordinary messages."""
+        tools._slack = MagicMock()
+        tools._call_local_grader = MagicMock()
+
+        result = tools.post_message(content)
+
+        assert result == {"error": "Malformed reply marker"}
+        tools._call_local_grader.assert_not_called()
+        tools._slack.post_message.assert_not_called()
+        tools._slack.add_reaction.assert_not_called()
+
+    def test_post_message_unmarked_content_uses_positional_top_level_post(self, tools):
+        """Unmarked content preserves positional top-level Slack posting."""
+        content = "Normal status update."
+        tools._slack = MagicMock()
+        tools._slack.post_message.return_value = "1700000010.654321"
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "Not a problem report"
+        })
+
+        result = tools.post_message(content)
+
+        assert result == "1700000010.654321"
+        tools._slack.post_message.assert_called_once_with(content)
+        tools._slack.add_reaction.assert_not_called()
+
     def test_post_message_approved_non_problem(self, tools):
         """Non-problem messages are approved and posted to Slack."""
         tools._slack = MagicMock()
@@ -3064,6 +3157,106 @@ class TestPostMessageGrader:
         tools._slack = None
         result = tools.post_message("Any message")
         assert result == "Error: Slack not configured"
+
+
+class TestPostMessageTransportAcknowledgement:
+    """Marked MCP replies must acknowledge before their first Slack write."""
+
+    def _approved(self, tools):
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "Approved"
+        })
+
+    def _ack(self, db_conn, source_ts):
+        return db_conn.execute(
+            "SELECT reason FROM operator_message_acknowledgements WHERE source_ts=?", (source_ts,)
+        ).fetchone()
+
+    def test_transport_acknowledgement_commits_before_post_with_fallback(self, tools, db_conn):
+        source_ts = "1700000000.123456"
+        db_path = db_conn.execute("PRAGMA database_list").fetchone()[2]
+        tools._slack = MagicMock()
+        self._approved(tools)
+
+        def post(*_args, **_kwargs):
+            reader = sqlite3.connect(db_path)
+            try:
+                assert self._ack(reader, source_ts)[0] == DIRECT_REPLY_FALLBACK_REASON
+            finally:
+                reader.close()
+            return "1700000010.654321"
+
+        tools._slack.post_message.side_effect = post
+        assert tools.post_message(f"[reply-to:{source_ts}] reply body") == "1700000010.654321"
+        tools._slack.add_reaction.assert_called_once_with("white_check_mark", source_ts)
+
+    def test_transport_acknowledgement_preserves_existing_explicit_reason(self, tools, db_conn):
+        source_ts = "1700000000.123456"
+        db_conn.execute(
+            "INSERT INTO operator_message_acknowledgements (source_ts, reason) VALUES (?, ?)",
+            (source_ts, "explicit no-action reason"),
+        )
+        db_conn.commit()
+        tools._slack = MagicMock()
+        tools._slack.post_message.return_value = "1700000010.654321"
+        self._approved(tools)
+
+        tools.post_message(f"[reply-to:{source_ts}] reply body")
+
+        assert self._ack(db_conn, source_ts)[0] == "explicit no-action reason"
+
+    @pytest.mark.parametrize("content,approved", [
+        ("ordinary response", True),
+        ("[reply-to:1700000000.123456]   ", True),
+        ("[reply-to:not-a-ts] reply body", True),
+        ("[reply-to:1700000000.123456] passive problem", False),
+    ])
+    def test_transport_acknowledgement_never_persists_unmarked_or_rejected_forms(self, tools, db_conn, content, approved):
+        tools._slack = MagicMock()
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A" if approved else "D", "approved": approved, "feedback": "verdict"
+        })
+
+        tools.post_message(content)
+
+        assert db_conn.execute("SELECT COUNT(*) FROM operator_message_acknowledgements").fetchone()[0] == 0
+
+    def test_transport_acknowledgement_missing_db_returns_error_without_post_or_reaction(self, registry, mock_tmux):
+        tools = OrchestratorTools(registry, mock_tmux, db_conn=None)
+        tools._slack = MagicMock()
+        self._approved(tools)
+
+        result = tools.post_message("[reply-to:1700000000.123456] reply body")
+
+        assert isinstance(result, dict)
+        assert "error" in result
+        tools._slack.post_message.assert_not_called()
+        tools._slack.add_reaction.assert_not_called()
+
+    def test_transport_acknowledgement_directive_conflict_returns_error_without_post_or_reaction(self, tools, db_conn):
+        source_ts = "1700000000.123456"
+        _submit_directive_default(tools, source_ts, "operator text", "directive")
+        tools._slack = MagicMock()
+        self._approved(tools)
+
+        result = tools.post_message(f"[reply-to:{source_ts}] reply body")
+
+        assert isinstance(result, dict)
+        assert "error" in result
+        tools._slack.post_message.assert_not_called()
+        tools._slack.add_reaction.assert_not_called()
+
+    def test_transport_acknowledgement_persistence_failure_returns_error_without_post_or_reaction(self, tools, db_conn):
+        db_conn.close()
+        tools._slack = MagicMock()
+        self._approved(tools)
+
+        result = tools.post_message("[reply-to:1700000000.123456] reply body")
+
+        assert isinstance(result, dict)
+        assert "error" in result
+        tools._slack.post_message.assert_not_called()
+        tools._slack.add_reaction.assert_not_called()
 
 
 class TestSendToWorkerMenuDetection:
@@ -9313,3 +9506,67 @@ class TestCodexAdvisorInstructionConstant:
         # Asserting only "codex exec" would pass against an invented ladder.
         assert "codex exec" in _CODEX_ADVISOR_INSTRUCTION
         assert "luna -> terra -> sol" in _CODEX_ADVISOR_INSTRUCTION
+
+
+class TestAcknowledgeOperatorMessage:
+    SOURCE_TS = "1785731067.460039"
+
+    def _tools(self, db_conn, registry, mock_tmux):
+        return OrchestratorTools(registry, mock_tmux, db_conn=db_conn)
+
+    def test_acknowledge_operator_message_validation(self, db_conn, registry, mock_tmux):
+        tools = self._tools(db_conn, registry, mock_tmux)
+        for source_ts, reason in (("bad", "reason"), (1785731067.460039, "reason"), (self.SOURCE_TS, ""), (self.SOURCE_TS, "   ")):
+            with pytest.raises(ValueError):
+                tools.acknowledge_operator_message(source_ts, reason)
+        assert db_conn.execute(
+            "SELECT COUNT(*) FROM operator_message_acknowledgements"
+        ).fetchone()[0] == 0
+
+    def test_acknowledge_operator_message_immutable_and_idempotent(self, db_conn, registry, mock_tmux):
+        tools = self._tools(db_conn, registry, mock_tmux)
+        first = tools.acknowledge_operator_message(self.SOURCE_TS, "no action requested")
+        again = tools.acknowledge_operator_message(self.SOURCE_TS, "different reason")
+        assert again == first
+        assert db_conn.execute(
+            "SELECT reason FROM operator_message_acknowledgements WHERE source_ts=?",
+            (self.SOURCE_TS,),
+        ).fetchone()[0] == "no action requested"
+
+    def test_acknowledge_operator_message_rejects_existing_directive(self, db_conn, registry, mock_tmux):
+        tools = self._tools(db_conn, registry, mock_tmux)
+        _submit_directive_default(tools, self.SOURCE_TS, "x", "x")
+        with pytest.raises(sqlite3.IntegrityError):
+            tools.acknowledge_operator_message(self.SOURCE_TS, "no")
+
+    def test_submit_directive_rejects_acknowledged(self, db_conn, registry, mock_tmux):
+        tools = self._tools(db_conn, registry, mock_tmux)
+        tools.acknowledge_operator_message(self.SOURCE_TS, "no")
+        with pytest.raises(sqlite3.IntegrityError):
+            _submit_directive_default(tools, self.SOURCE_TS, "x", "x")
+
+    def test_acknowledge_operator_message_mcp_wrapper(self, db_conn, registry, mock_tmux):
+        from ironclaude.orchestrator_mcp import _create_mcp_server
+        tools = self._tools(db_conn, registry, mock_tmux)
+        server = _create_mcp_server(tools)
+        acknowledge = server._tool_manager.get_tool("acknowledge_operator_message").fn
+        result = json.loads(acknowledge(self.SOURCE_TS, "no action requested"))
+        assert result["source_ts"] == self.SOURCE_TS
+        assert result["reason"] == "no action requested"
+
+    def test_acknowledge_operator_message_delegates_to_shared_persistence(
+        self, db_conn, registry, mock_tmux, monkeypatch
+    ):
+        import ironclaude.orchestrator_mcp as orchestrator_mcp
+
+        tools = self._tools(db_conn, registry, mock_tmux)
+        expected = {"source_ts": self.SOURCE_TS, "reason": "no action", "created_at": "now"}
+        calls = []
+
+        def persist(conn, source_ts, reason):
+            calls.append((conn, source_ts, reason))
+            return expected
+
+        monkeypatch.setattr(orchestrator_mcp, "persist_operator_message_acknowledgement", persist)
+        assert tools.acknowledge_operator_message(self.SOURCE_TS, "no action") == expected
+        assert calls == [(db_conn, self.SOURCE_TS, "no action")]

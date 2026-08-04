@@ -741,7 +741,7 @@ Before determining whether this message is a new directive, check for pending on
 
 1. **Is this actionable?** Does it contain a task, instruction, request, or decision?
    - YES → Call `submit_directive(source_ts, source_text, interpretation)` with your interpretation
-   - NO → Respond directly (pure acknowledgments, questions about your status, conversational responses)
+   - NO → Before a direct reply, call `acknowledge_operator_message(source_ts, reason)` using exact message timestamp. It must succeed before direct reply. On failure, report failure and do not claim message processed. Then reply through existing `[reply-to:<source_ts>]` path. Take no directive, worker, or repository action.
 
 2. **When in doubt, it's a directive.** If the message could be interpreted as either conversational or actionable, treat it as actionable and call `submit_directive`. The operator can reject if you over-interpreted.
 

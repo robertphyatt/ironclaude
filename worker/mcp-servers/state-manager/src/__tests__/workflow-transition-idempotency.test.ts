@@ -65,6 +65,7 @@ function createTestDb(): Database.Database {
       current_wave INTEGER NOT NULL DEFAULT 0,
       review_pending INTEGER NOT NULL DEFAULT 0,
       review_block_count INTEGER NOT NULL DEFAULT 0,
+      plan_lineage INTEGER NOT NULL DEFAULT 0,
       circuit_breaker INTEGER NOT NULL DEFAULT 0,
       memory_search_required INTEGER NOT NULL DEFAULT 0,
       testing_theatre_checked INTEGER NOT NULL DEFAULT 0,
@@ -101,6 +102,7 @@ function createTestDb(): Database.Database {
     CREATE TABLE tier_up_reviews (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       terminal_session TEXT NOT NULL,
+      plan_lineage INTEGER NOT NULL DEFAULT 0,
       plan_hash TEXT NOT NULL,
       reviewer_model TEXT NOT NULL,
       verdict TEXT NOT NULL,
@@ -152,9 +154,9 @@ function seedSession(db: Database.Database, stage: WorkflowStage): void {
     INSERT INTO sessions (
       terminal_session, professional_mode, workflow_stage, active_skill,
       brainstorming_active, plan_name, plan_json, current_wave,
-      review_pending, review_block_count, circuit_breaker,
+      review_pending, review_block_count, plan_lineage, circuit_breaker,
       memory_search_required, testing_theatre_checked, project_hash, updated_at
-    ) VALUES (?, 'on', ?, 'seed-skill', 1, ?, ?, 3, 1, 2, 1, 1, 1, 'project', '2001-02-03 04:05:06')
+    ) VALUES (?, 'on', ?, 'seed-skill', 1, ?, ?, 3, 1, 2, 0, 1, 1, 1, 'project', '2001-02-03 04:05:06')
   `).run(SESSION_ID, stage, PLAN.name, planJson);
   db.prepare(`
     INSERT INTO registered_designs (design_file, registered_at, terminal_session, consumed)
@@ -174,8 +176,8 @@ function seedSession(db: Database.Database, stage: WorkflowStage): void {
   `).run(SESSION_ID);
   db.prepare(`
     INSERT INTO tier_up_reviews (
-      terminal_session, plan_hash, reviewer_model, verdict, created_at
-    ) VALUES (?, ?, 'gpt-5.6-sol', 'SOLID', '2001-02-03 04:05:06')
+      terminal_session, plan_lineage, plan_hash, reviewer_model, verdict, created_at
+    ) VALUES (?, 0, ?, 'gpt-5.6-sol', 'SOLID', '2001-02-03 04:05:06')
   `).run(SESSION_ID, hashPlan(planJson));
   db.prepare(`
     INSERT INTO plan_history (
@@ -289,6 +291,42 @@ describe('explicit workflow-transition idempotency', () => {
     expect((after.audit as unknown[]).length).toBe(beforeAuditCount + 1);
   });
 
+  it('advances plan lineage exactly once when mark_design_ready changes brainstorming', () => {
+    seedSession(db, 'brainstorming');
+
+    const result = parseResult(handleWriteTool('mark_design_ready', {}, db, SESSION_ID));
+
+    expect(result).toMatchObject({ success: true, changed: true, to: 'design_ready' });
+    expect((snapshot(db, SESSION_ID).session as { plan_lineage: number }).plan_lineage).toBe(1);
+  });
+
+  it('consume_design advances plan lineage only when it changes brainstorming', () => {
+    seedSession(db, 'brainstorming');
+    db.prepare(`
+      INSERT INTO registered_designs (design_file, terminal_session, consumed)
+      VALUES ('docs/plans/consume-increment.md', ?, 0)
+    `).run(SESSION_ID);
+
+    const result = parseResult(handleWriteTool('consume_design', { file: 'docs/plans/consume-increment.md' }, db, SESSION_ID));
+
+    expect(result).toMatchObject({ success: true, workflow_stage: 'design_ready' });
+    expect((snapshot(db, SESSION_ID).session as { plan_lineage: number }).plan_lineage).toBe(1);
+  });
+
+  it('consume_design preserves lineage when consuming at a later stage', () => {
+    seedSession(db, 'design_ready');
+    db.prepare(`
+      INSERT INTO registered_designs (design_file, terminal_session, consumed)
+      VALUES ('docs/plans/consume-later.md', ?, 0)
+    `).run(SESSION_ID);
+    db.prepare('UPDATE sessions SET plan_lineage = 7 WHERE terminal_session = ?').run(SESSION_ID);
+
+    const result = parseResult(handleWriteTool('consume_design', { file: 'docs/plans/consume-later.md' }, db, SESSION_ID));
+
+    expect(result).toMatchObject({ success: true, workflow_stage: 'design_ready' });
+    expect((snapshot(db, SESSION_ID).session as { plan_lineage: number }).plan_lineage).toBe(7);
+  });
+
   it.each([
     { tool: 'mark_design_ready', args: {}, stage: 'idle' as WorkflowStage },
     { tool: 'mark_plan_ready', args: {}, stage: 'idle' as WorkflowStage },
@@ -323,6 +361,59 @@ describe('explicit workflow-transition idempotency', () => {
       .toThrow(/forced transition audit failure/);
 
     expect(snapshot(db, SESSION_ID)).toEqual(before);
+  });
+
+  it('rolls back design consumption, stage, lineage, and audit when consume_design audit insertion fails', () => {
+    seedSession(db, 'brainstorming');
+    db.prepare(`
+      INSERT INTO registered_designs (design_file, terminal_session, consumed)
+      VALUES ('docs/plans/consume-rollback.md', ?, 0)
+    `).run(SESSION_ID);
+    db.exec(`
+      CREATE TRIGGER force_consume_audit_failure
+      BEFORE INSERT ON audit_log
+      WHEN NEW.action = 'consume_design'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced consume audit failure');
+      END;
+    `);
+    const before = snapshot(db, SESSION_ID);
+
+    expect(() => handleWriteTool('consume_design', { file: 'docs/plans/consume-rollback.md' }, db, SESSION_ID))
+      .toThrow(/forced consume audit failure/);
+
+    expect(snapshot(db, SESSION_ID)).toEqual(before);
+  });
+
+  it('derives consume_design lineage and audit fields from transaction-current state', () => {
+    seedSession(db, 'brainstorming');
+    db.prepare(`
+      INSERT INTO registered_designs (design_file, terminal_session, consumed)
+      VALUES ('docs/plans/consume-interleaved.md', ?, 0)
+    `).run(SESSION_ID);
+    const realTransaction = db.transaction.bind(db);
+    Object.defineProperty(db, 'transaction', {
+      configurable: true,
+      value: (operation: () => unknown) => realTransaction(() => {
+        db.prepare(`
+          UPDATE sessions
+          SET workflow_stage = 'design_ready', plan_lineage = 41
+          WHERE terminal_session = ?
+        `).run(SESSION_ID);
+        return operation();
+      }),
+    });
+
+    const result = parseResult(handleWriteTool('consume_design', { file: 'docs/plans/consume-interleaved.md' }, db, SESSION_ID));
+
+    expect(result).toMatchObject({ success: true, workflow_stage: 'design_ready' });
+    const after = snapshot(db, SESSION_ID);
+    expect((after.session as { plan_lineage: number }).plan_lineage).toBe(41);
+    expect((after.audit as Array<{ action: string; old_value: string; new_value: string }>).at(-1)).toMatchObject({
+      action: 'consume_design',
+      old_value: 'design_ready',
+      new_value: 'design_ready',
+    });
   });
 
   it('reloads revised create_plan domain state while remaining final_plan_prep', () => {

@@ -5,9 +5,13 @@ from __future__ import annotations
 
 import sqlite3
 import logging
+import re
 from pathlib import Path
 
 logger = logging.getLogger("ironclaude.db")
+
+DIRECT_REPLY_FALLBACK_REASON = "Marked direct reply classified operator message as non-actionable."
+_SLACK_TIMESTAMP_RE = re.compile(r"^[0-9]+\.[0-9]+$")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS objectives (
@@ -81,6 +85,28 @@ CREATE TABLE IF NOT EXISTS directives (
     planned_prompt_reason TEXT,
     superseded_by INTEGER REFERENCES directives(id)
 );
+
+CREATE TABLE IF NOT EXISTS operator_message_acknowledgements (
+    source_ts TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TRIGGER IF NOT EXISTS reject_acknowledgement_for_directive
+BEFORE INSERT ON operator_message_acknowledgements
+WHEN EXISTS (SELECT 1 FROM directives WHERE source_ts = NEW.source_ts)
+BEGIN
+    SELECT RAISE(ABORT, 'operator message already has a directive');
+END;
+
+CREATE TRIGGER IF NOT EXISTS reject_directive_for_acknowledgement
+BEFORE INSERT ON directives
+WHEN EXISTS (
+    SELECT 1 FROM operator_message_acknowledgements WHERE source_ts = NEW.source_ts
+)
+BEGIN
+    SELECT RAISE(ABORT, 'operator message already acknowledged');
+END;
 
 CREATE TABLE IF NOT EXISTS directive_capability_blocks (
     directive_id INTEGER PRIMARY KEY REFERENCES directives(id),
@@ -183,6 +209,61 @@ _DIRECTIVES_MIGRATION_COLUMNS = [
     ("planned_prompt_reason", "TEXT"),
     ("superseded_by", "INTEGER REFERENCES directives(id)"),
 ]
+
+
+def persist_operator_message_acknowledgement(
+    conn: sqlite3.Connection, source_ts: str, reason: str
+) -> dict:
+    """Persist, or return, an immutable no-action disposition for one message."""
+    if conn is None:
+        raise RuntimeError("Database connection required for operator message acknowledgement")
+    if not isinstance(source_ts, str) or not _SLACK_TIMESTAMP_RE.fullmatch(source_ts):
+        raise ValueError("source_ts must be an exact Slack timestamp string")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("reason must be a non-blank string")
+    if conn.in_transaction:
+        raise RuntimeError(
+            "Database connection already has an active transaction; operator message "
+            "acknowledgement requires an idle connection."
+        )
+
+    def result_from(row) -> dict:
+        return {"source_ts": row[0], "reason": row[1], "created_at": row[2]}
+
+    existing = conn.execute(
+        "SELECT source_ts, reason, created_at FROM operator_message_acknowledgements "
+        "WHERE source_ts=?",
+        (source_ts,),
+    ).fetchone()
+    if existing is not None:
+        return result_from(existing)
+
+    try:
+        conn.execute(
+            "INSERT INTO operator_message_acknowledgements (source_ts, reason) VALUES (?, ?)",
+            (source_ts, reason),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        concurrent = conn.execute(
+            "SELECT source_ts, reason, created_at FROM operator_message_acknowledgements "
+            "WHERE source_ts=?",
+            (source_ts,),
+        ).fetchone()
+        if concurrent is not None:
+            return result_from(concurrent)
+        raise
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+
+    persisted = conn.execute(
+        "SELECT source_ts, reason, created_at FROM operator_message_acknowledgements "
+        "WHERE source_ts=?",
+        (source_ts,),
+    ).fetchone()
+    return result_from(persisted)
 
 
 def init_db(db_path: str) -> sqlite3.Connection:

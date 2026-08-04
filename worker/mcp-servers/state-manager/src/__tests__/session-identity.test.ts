@@ -14,6 +14,15 @@ const rootMeta = {
   },
 };
 
+const sourceLessRootMeta = {
+  threadId: ROOT,
+  'x-codex-turn-metadata': {
+    session_id: ROOT,
+    thread_id: ROOT,
+    turn_id: 'turn-root',
+  },
+};
+
 const subagentMeta = {
   threadId: CHILD,
   'x-codex-turn-metadata': {
@@ -35,9 +44,93 @@ describe('resolveSessionIdentity', () => {
 
   it('uses Codex root session metadata for root and subagent calls', () => {
     expect(resolveSessionIdentity('codex', rootMeta).sessionId).toBe(ROOT);
+    expect(resolveSessionIdentity('codex', sourceLessRootMeta).sessionId).toBe(ROOT);
     const child = resolveSessionIdentity('codex', subagentMeta);
     expect(child.sessionId).toBe(ROOT);
     expect(child.invocationThreadId).toBe(CHILD);
+  });
+
+  it.each([
+    ['parent only', { parent_thread_id: ROOT }],
+    ['fork only', { forked_from_thread_id: ROOT }],
+    ['both', { parent_thread_id: ROOT, forked_from_thread_id: ROOT }],
+    ['null ancestry', { parent_thread_id: null }],
+    ['empty ancestry', { forked_from_thread_id: '' }],
+    ['undefined ancestry', { parent_thread_id: undefined }],
+  ])('rejects source-less root metadata with own ancestry field: %s', (_label, ancestry) => {
+    expect(() => resolveSessionIdentity('codex', {
+      threadId: ROOT,
+      'x-codex-turn-metadata': {
+        session_id: ROOT,
+        thread_id: ROOT,
+        ...ancestry,
+      },
+    })).toThrow();
+  });
+
+  it('rejects source-less metadata whose root session differs from the invocation thread', () => {
+    expect(() => resolveSessionIdentity('codex', {
+      threadId: CHILD,
+      'x-codex-turn-metadata': {
+        session_id: ROOT,
+        thread_id: CHILD,
+      },
+    })).toThrow('Codex root session_id disagrees with root threadId');
+  });
+
+  it.each([
+    ['parent only', { parent_thread_id: ROOT }],
+    ['fork only', { forked_from_thread_id: ROOT }],
+    ['both', { parent_thread_id: ROOT, forked_from_thread_id: ROOT }],
+  ])('rejects explicit user metadata with ancestry: %s', (_label, ancestry) => {
+    expect(() => resolveSessionIdentity('codex', {
+      threadId: CHILD,
+      'x-codex-turn-metadata': {
+        session_id: CHILD,
+        thread_id: CHILD,
+        thread_source: 'user',
+        ...ancestry,
+      },
+    })).toThrow();
+  });
+
+  it('rejects a self-parenting subagent identity', () => {
+    expect(() => resolveSessionIdentity('codex', {
+      threadId: CHILD,
+      'x-codex-turn-metadata': {
+        session_id: CHILD,
+        thread_id: CHILD,
+        thread_source: 'subagent',
+        parent_thread_id: CHILD,
+        forked_from_thread_id: CHILD,
+      },
+    })).toThrow();
+  });
+
+  it.each([
+    ['top-level', { threadId: '', 'x-codex-turn-metadata': { session_id: ROOT, thread_id: ROOT } }],
+    ['root session', { threadId: ROOT, 'x-codex-turn-metadata': { session_id: '', thread_id: ROOT } }],
+    ['nested thread', { threadId: ROOT, 'x-codex-turn-metadata': { session_id: ROOT, thread_id: '' } }],
+  ])('rejects an empty Codex identity field: %s', (_label, meta) => {
+    expect(() => resolveSessionIdentity('codex', meta)).toThrow();
+  });
+
+  it.each([
+    ['empty', ''],
+    ['whitespace', ' user '],
+    ['wrong case', 'USER'],
+    ['null', null],
+    ['array', ['user']],
+    ['object', { value: 'user' }],
+  ])('rejects unsupported explicit Codex thread_source: %s', (_label, threadSource) => {
+    expect(() => resolveSessionIdentity('codex', {
+      threadId: ROOT,
+      'x-codex-turn-metadata': {
+        session_id: ROOT,
+        thread_id: ROOT,
+        thread_source: threadSource,
+      },
+    })).toThrow();
   });
 
   it.each([
@@ -45,6 +138,8 @@ describe('resolveSessionIdentity', () => {
     ['missing root session', { threadId: ROOT, 'x-codex-turn-metadata': { thread_id: ROOT, thread_source: 'user' } }],
     ['root mismatch', { threadId: CHILD, 'x-codex-turn-metadata': { session_id: ROOT, thread_id: CHILD, thread_source: 'user' } }],
     ['child mismatch', { threadId: ROOT, 'x-codex-turn-metadata': { session_id: ROOT, thread_id: CHILD, thread_source: 'subagent', parent_thread_id: ROOT, forked_from_thread_id: ROOT } }],
+    ['missing parent', { threadId: CHILD, 'x-codex-turn-metadata': { session_id: ROOT, thread_id: CHILD, thread_source: 'subagent', forked_from_thread_id: ROOT } }],
+    ['missing fork', { threadId: CHILD, 'x-codex-turn-metadata': { session_id: ROOT, thread_id: CHILD, thread_source: 'subagent', parent_thread_id: ROOT } }],
     ['parent mismatch', { threadId: CHILD, 'x-codex-turn-metadata': { session_id: ROOT, thread_id: CHILD, thread_source: 'subagent', parent_thread_id: 'other', forked_from_thread_id: ROOT } }],
     ['fork mismatch', { threadId: CHILD, 'x-codex-turn-metadata': { session_id: ROOT, thread_id: CHILD, thread_source: 'subagent', parent_thread_id: ROOT, forked_from_thread_id: 'other' } }],
   ])('rejects invalid Codex identity: %s', (_label, meta) => {

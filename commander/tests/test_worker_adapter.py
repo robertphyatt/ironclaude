@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock
 import ironclaude.orchestrator_mcp as omcp
 from ironclaude.db import init_db
+from ironclaude.tmux_manager import _strip_ansi
 
 CLAUDE_MODELS = {"haiku": "haiku", "sonnet": "sonnet", "opus": "opus", "fable": "fable"}
 CODEX_MODELS = {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol"}
@@ -84,13 +85,21 @@ def test_legacy_config_worker_is_claude(tmp_path):
 
 class _FakeTmux:
     """Minimal tmux double: read_log_tail returns scripted outputs in sequence."""
-    def __init__(self, outputs):
+    def __init__(self, outputs, sanitize=False):
         self._outputs = list(outputs)
+        self._sanitize = sanitize
+        self.read_count = 0
         self.sent = []
+        self.raw_sent = []
     def read_log_tail(self, name, lines=50, ssh_host=None, remote_log_dir=None):
-        return self._outputs.pop(0) if self._outputs else ""
+        self.read_count += 1
+        output = self._outputs.pop(0) if self._outputs else ""
+        return _strip_ansi(output) if self._sanitize else output
     def send_keys(self, name, text, ssh_host=None):
         self.sent.append(text)
+        return True
+    def send_raw_keys(self, name, keys, ssh_host=None):
+        self.raw_sent.append(keys)
         return True
 
 
@@ -99,14 +108,105 @@ def _tools_with_tmux(tmp_path, tmux):
     return omcp.OrchestratorTools(registry=MagicMock(), tmux=tmux, db_conn=conn, config=_legacy_cfg())
 
 
-def test_wait_for_ready_codex_trust_and_marker(tmp_path):
-    tmux = _FakeTmux([
-        "  Do you trust the contents of this directory?\n  1. Yes, continue",
-        ">_ OpenAI Codex (v0.145.0)\n  model: gpt-5.6-sol high",
-    ])
+def test_wait_for_ready_codex_trust_hooks_and_marker(tmp_path):
+    trust_screen = (
+        "\x1b[2J\x1b[1;1HDo\x1b[1;4Hyou\x1b[1;8Htrust"
+        "\x1b[1;14Hthe\x1b[1;18Hcontents\x1b[1;27Hof\x1b[1;30Hthis"
+        "\x1b[1;35Hdirectory?\n\x1b[2;1H1.\x1b[2;4HYes,\x1b[2;9Hcontinue"
+    )
+    hooks_screen = (
+        trust_screen
+        + "\n\x1b[2;3HHooks\x1b[2;9Hneed\x1b[2;14Hreview"
+        "\n\x1b[6;1H1.\x1b[6;4HReview\x1b[6;11Hhooks"
+        "\n\x1b[7;1H2.\x1b[7;4HTrust\x1b[7;10Hall\x1b[7;14Hand"
+        "\x1b[7;18Hcontinue"
+        "\n\x1b[8;1H3.\x1b[8;4HContinue\x1b[8;13Hwithout"
+        "\x1b[8;21Htrusting"
+    )
+    welcome_marker = (
+        "\n\x1b[20;1H>_\x1b[20;4HOpenAI\x1b[20;11HCodex"
+        "\x1b[20;17H(v0.146.0)\n\x1b[21;1Hmodel:\x1b[21;8Hgpt-5.6-sol"
+    )
+    reopened_hooks_screen = (
+        hooks_screen
+        + welcome_marker
+        + "\n\x1b[22;1HHooks\x1b[22;7H7\x1b[22;9Hhooks\x1b[22;15Hneed"
+        "\x1b[22;20Hreview\n\x1b[23;1HPress\x1b[23;7Ht\x1b[23;9Hto"
+        "\x1b[23;12Htrust\x1b[23;18Hall"
+    )
+    fresh_ready_screen = reopened_hooks_screen + welcome_marker
+    hooks_with_stale_welcome = hooks_screen + welcome_marker
+    tmux = _FakeTmux(
+        [
+            trust_screen,
+            trust_screen,
+            hooks_with_stale_welcome,
+            reopened_hooks_screen,
+            fresh_ready_screen,
+        ],
+        sanitize=True,
+    )
     tools = _tools_with_tmux(tmp_path, tmux)
     assert tools._wait_for_ready("ic-w", timeout=5, client="codex") is True
-    assert tmux.sent == [""]   # dismissed trust exactly ONCE (Enter)
+    assert tmux.sent == [""]
+    assert tmux.raw_sent == [["2"]]
+    assert tmux.read_count == 5
+    assert tmux._outputs == []
+
+
+def test_wait_for_ready_codex_does_not_match_unrelated_hooks_fragments(tmp_path):
+    trust_screen = "Do you trust the contents of this directory?"
+    unrelated_hooks = (
+        "Hooks need review"
+        + ("x" * 501)
+        + "2. Trust all and continue"
+    )
+    tmux = _FakeTmux(
+        [trust_screen, unrelated_hooks, ">_ OpenAI Codex"],
+        sanitize=True,
+    )
+    tools = _tools_with_tmux(tmp_path, tmux)
+
+    assert tools._wait_for_ready("ic-w", timeout=5, client="codex") is True
+    assert tmux.sent == [""]
+    assert tmux.raw_sent == []
+
+
+def test_wait_for_ready_codex_requires_directory_trust_before_hooks(tmp_path):
+    hooks_screen = "Hooks need review\n2. Trust all and continue"
+    tmux = _FakeTmux([hooks_screen, ">_ OpenAI Codex"], sanitize=True)
+    tools = _tools_with_tmux(tmp_path, tmux)
+
+    assert tools._wait_for_ready("ic-w", timeout=5, client="codex") is True
+    assert tmux.sent == []
+    assert tmux.raw_sent == []
+
+
+def test_wait_for_ready_codex_requires_exact_hooks_option_two(tmp_path):
+    trust_screen = "Do you trust the contents of this directory?"
+    wrong_option = "Hooks need review\n12. Trust all and continue"
+    tmux = _FakeTmux(
+        [trust_screen, wrong_option, ">_ OpenAI Codex"],
+        sanitize=True,
+    )
+    tools = _tools_with_tmux(tmp_path, tmux)
+
+    assert tools._wait_for_ready("ic-w", timeout=5, client="codex") is True
+    assert tmux.sent == [""]
+    assert tmux.raw_sent == []
+
+
+def test_wait_for_ready_codex_does_not_match_unrelated_fragments(tmp_path):
+    unrelated = (
+        "\x1b[1;1HUndo\x1b[1;6Hyou\x1b[1;10Htrustworthy"
+        "\x1b[1;22Hchanges\x1b[1;30Hin\x1b[1;33Hthis\x1b[1;38Hdirectory"
+    )
+    ready = ">_ OpenAI Codex"
+    tmux = _FakeTmux([unrelated, ready], sanitize=True)
+    tools = _tools_with_tmux(tmp_path, tmux)
+
+    assert tools._wait_for_ready("ic-w", timeout=5, client="codex") is True
+    assert tmux.sent == []
 
 
 def test_wait_for_ready_claude_unchanged(tmp_path):

@@ -292,6 +292,8 @@ The Commander orchestrates multiple Claude Code worker sessions via Slack. A Bra
    - `im:history` -- receive direct messages
    - `reactions:read` -- read emoji reactions (for directive approval)
    - `reactions:write` -- add/remove emoji reactions (status indicators)
+   - `pins:read` -- inventory pinned items before adding a directive review
+   - `pins:write` -- add directive-review pins and remove the oldest pin at channel capacity
 4. **OAuth & Permissions > User Token Scopes** (optional, for operator message search):
    - `files:write` -- upload files on your behalf
    - `search:read` -- search workspace messages

@@ -24,9 +24,13 @@ from pathlib import Path
 
 from ironclaude.config import load_config, load_machines_config, DEFAULTS, make_opus_command
 from ironclaude.auth_relay import AuthRelay
-from ironclaude.slack_interface import SlackBot, DIRECTIVE_STATUS_EMOJI
+from ironclaude.slack_interface import SlackBot, DIRECTIVE_STATUS_EMOJI, parse_reply_to_marker
 from ironclaude.slack_commands import SlackSocketHandler, format_help_text
-from ironclaude.db import init_db
+from ironclaude.db import (
+    DIRECT_REPLY_FALLBACK_REASON,
+    init_db,
+    persist_operator_message_acknowledgement,
+)
 from ironclaude.tmux_manager import TmuxManager, _strip_ansi
 from ironclaude.brain_client import BrainClient, _NARRATION_PREFIX
 from ironclaude.worker_registry import WorkerRegistry
@@ -66,7 +70,6 @@ _BRAIN_MSG_SCHEMA = {
 }
 _DIRECTIVE_REF_RE = re.compile(r'(?:#\d+|d\d+|directive\s+\d+)', re.IGNORECASE)
 _BLOCKED_NO_DIRECTIVE = "no_directive_ref"
-_REPLY_TO_RE = re.compile(r'^\s*\[reply-to:([0-9.]+)\]\s*')   # brain-echoed operator msg ts -> threaded reply
 _BRAIN_POST_CHUNK = 39000   # keep each *Brain:* post under Slack's ~40000-char message limit
 
 # --- Awaiting-operator surfacing ---------------------------------------------
@@ -844,8 +847,20 @@ class IroncladeDaemon:
     def shutdown(self):
         self._running = False
 
+    def _get_operator_message_dispositions(self) -> dict[str, str]:
+        """Return durable operator-message dispositions from the authoritative ledger."""
+        if self._db is None:
+            return {}
+        rows = self._db.execute(
+            "SELECT source_ts, 'directive' AS disposition FROM directives "
+            "UNION "
+            "SELECT source_ts, 'acknowledged' AS disposition "
+            "FROM operator_message_acknowledgements"
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
+
     def _get_unprocessed_messages(self, max_age_seconds: int = 1800) -> list[dict]:
-        """Find operator messages older than max_age with no matching directive source_ts."""
+        """Find operator messages older than max_age with no durable disposition."""
         operator_user_id = self.config.get("slack_operator_user_id", "")
         if not operator_user_id or self._db is None:
             return []
@@ -856,8 +871,7 @@ class IroncladeDaemon:
             return []
         now = time.time()
         try:
-            directive_ts_rows = self._db.execute("SELECT source_ts FROM directives").fetchall()
-            directive_ts_set = {row[0] for row in directive_ts_rows}
+            dispositions = self._get_operator_message_dispositions()
         except Exception:
             return []
         result = []
@@ -867,7 +881,7 @@ class IroncladeDaemon:
             msg_age = now - float(msg["ts"])
             if msg_age < max_age_seconds:
                 continue
-            if msg["ts"] in directive_ts_set:
+            if msg["ts"] in dispositions:
                 continue
             result.append(msg)
         return result
@@ -939,11 +953,8 @@ class IroncladeDaemon:
 
         if self._message_aging_alerted and self._db is not None:
             try:
-                directive_ts_rows = self._db.execute(
-                    "SELECT source_ts FROM directives"
-                ).fetchall()
-                directive_ts_set = {row[0] for row in directive_ts_rows}
-                self._message_aging_alerted -= directive_ts_set
+                dispositions = self._get_operator_message_dispositions()
+                self._message_aging_alerted -= set(dispositions)
             except Exception:
                 pass
 
@@ -1101,10 +1112,18 @@ class IroncladeDaemon:
                 self.registry.log_event("objective_received", details={"text": text, "id": obj_id})
             elif cmd_type == "approve":
                 worker_id = parsed.get("target", "")
+                worker, reason = self._validate_worker_plan_target(worker_id)
+                if not worker:
+                    self.slack.post_message(f"Approval not queued for `{worker_id}`: {reason}")
+                    continue
                 write_decision(self._decisions_dir, {"action": "approve_plan", "worker_id": worker_id})
                 self.slack.post_message(f"Approval queued for `{worker_id}`.")
             elif cmd_type == "reject":
                 worker_id = parsed.get("target", "")
+                worker, reason = self._validate_worker_plan_target(worker_id)
+                if not worker:
+                    self.slack.post_message(f"Rejection not queued for `{worker_id}`: {reason}")
+                    continue
                 write_decision(self._decisions_dir, {"action": "reject_plan", "worker_id": worker_id, "reason": "User rejected via Slack"})
                 self.slack.post_message(f"Rejection queued for `{worker_id}`.")
             elif cmd_type == "summary":
@@ -1796,21 +1815,37 @@ class IroncladeDaemon:
                 if last is None or now - last > _LIMIT_COOLDOWN_S:
                     self._limit_alerted[limit] = now
                     self.slack.post_message(f"⚠️ Usage limit hit ({limit}). Send `login` to switch accounts.")
-            # Awaiting-operator capture runs FIRST, for every message (whether or not it
-            # would pass the directive-ref gate), converting a "holding" message into
-            # structured heartbeat state instead of posting or silently dropping it.
-            if self._maybe_capture_operator_wait(text):
-                continue
             # Solicited reply: the Brain echoes the operator ts as [reply-to:<ts>].
             # Thread the answer under the operator's message and mark it answered (✅).
-            m = _REPLY_TO_RE.match(text)
-            if m:
-                reply_ts = m.group(1)
-                cleaned = _REPLY_TO_RE.sub("", text, count=1).strip()
+            # Malformed leading markers are dropped instead of being treated as chatter.
+            parsed_reply = parse_reply_to_marker(text)
+            if parsed_reply is None:
+                logger.warning("Brain message dropped: malformed reply-to marker | text=%s", text[:200])
+                continue
+            cleaned, reply_ts = parsed_reply
+            if reply_ts is not None:
+                if not cleaned:
+                    logger.info("Brain reply not delivered for reply_ts=%s (empty body)", reply_ts)
+                    continue
+                try:
+                    persist_operator_message_acknowledgement(
+                        self._db, reply_ts, DIRECT_REPLY_FALLBACK_REASON,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Brain reply acknowledgement failed; skipping delivery | reply_ts=%s",
+                        reply_ts,
+                        exc_info=True,
+                    )
+                    continue
                 if self._post_brain_message(cleaned, thread_ts=reply_ts):
                     self.slack.add_reaction("white_check_mark", reply_ts)
                 else:
                     logger.info("Brain reply not delivered for reply_ts=%s (empty or chunk failure)", reply_ts)
+                continue
+            # Awaiting-operator capture applies only to unmarked messages. A marked reply
+            # belongs in the operator's Slack thread even when its wording says "waiting".
+            if self._maybe_capture_operator_wait(text):
                 continue
             if text.startswith(_NARRATION_PREFIX):
                 # Brain narration: thread-only under the last heartbeat, and NEVER through
@@ -1924,24 +1959,33 @@ class IroncladeDaemon:
         except RuntimeError as e:
             self.slack.post_message(f"Audit unavailable: {e}")
             return
-        rows = self._db.execute(
-            "SELECT id, source_ts, interpretation, status FROM directives ORDER BY created_at DESC"
-        ).fetchall()
+        try:
+            dispositions = self._get_operator_message_dispositions()
+            rows = self._db.execute(
+                "SELECT id, source_ts, interpretation, status FROM directives ORDER BY created_at DESC"
+            ).fetchall()
+        except Exception as e:
+            self.slack.post_message(f"Audit unavailable: {e}")
+            return
         directive_by_ts = {row[1]: row for row in rows}
         mapped = []
-        unmapped = []
+        acknowledged = []
+        unresolved = []
         for msg in messages:
             ts = msg["ts"]
-            if ts in directive_by_ts:
+            if dispositions.get(ts) == "directive":
                 row = directive_by_ts[ts]
                 mapped.append((ts, row[0], row[2], row[3]))
+            elif dispositions.get(ts) == "acknowledged":
+                acknowledged.append(msg)
             else:
-                unmapped.append(msg)
+                unresolved.append(msg)
         lines = ["*Slack Audit Report (72h)*", ""]
         lines.append("📊 *Summary*")
         lines.append(f"• Messages scanned: {len(messages)}")
-        lines.append(f"• Mapped to directives: {len(mapped)}")
-        lines.append(f"• Unmapped: {len(unmapped)}")
+        lines.append(f"• Directives: {len(mapped)}")
+        lines.append(f"• Acknowledged: {len(acknowledged)}")
+        lines.append(f"• Unresolved: {len(unresolved)}")
         lines.append("")
         lines.append("✅ *Mapped Messages*")
         if mapped:
@@ -1950,9 +1994,17 @@ class IroncladeDaemon:
         else:
             lines.append("(none)")
         lines.append("")
-        lines.append("⚠️ *Unmapped Messages*")
-        if unmapped:
-            for msg in unmapped:
+        lines.append("💬 *Acknowledged Messages*")
+        if acknowledged:
+            for msg in acknowledged:
+                snippet = msg["text"][:50]
+                lines.append(f'• "{snippet}" (ts:{msg["ts"]})')
+        else:
+            lines.append("(none)")
+        lines.append("")
+        lines.append("⚠️ *Unresolved Messages*")
+        if unresolved:
+            for msg in unresolved:
                 snippet = msg["text"][:50]
                 lines.append(f'• "{snippet}" (ts:{msg["ts"]})')
         else:
@@ -2012,13 +2064,27 @@ class IroncladeDaemon:
                 self._handle_spawn_worker(decision)
             elif action == "approve_plan":
                 worker_id = decision.get("worker_id", "")
-                self.tmux.send_keys(f"ic-{worker_id}", "yes")
-                self.slack.post_message(f"Approved plan for `{worker_id}`.")
+                worker, reason = self._validate_worker_plan_target(worker_id)
+                if not worker:
+                    self.slack.post_message(f"Approval not delivered for `{worker_id}`: {reason}")
+                    continue
+                ssh_host, _ = self._resolve_worker_ssh(worker)
+                if self.tmux.send_keys(worker["tmux_session"], "yes", ssh_host=ssh_host):
+                    self.slack.post_message(f"Approved plan for `{worker_id}`.")
+                else:
+                    self.slack.post_message(f"Approval for `{worker_id}` could not be delivered.")
             elif action == "reject_plan":
                 worker_id = decision.get("worker_id", "")
                 reason = decision.get("reason", "No reason given")
-                self.tmux.send_keys(f"ic-{worker_id}", f"no: {reason}")
-                self.slack.post_message(f"Rejected plan for `{worker_id}`: {reason}")
+                worker, validation_reason = self._validate_worker_plan_target(worker_id)
+                if not worker:
+                    self.slack.post_message(f"Rejection not delivered for `{worker_id}`: {validation_reason}")
+                    continue
+                ssh_host, _ = self._resolve_worker_ssh(worker)
+                if self.tmux.send_keys(worker["tmux_session"], f"no: {reason}", ssh_host=ssh_host):
+                    self.slack.post_message(f"Rejected plan for `{worker_id}`: {reason}")
+                else:
+                    self.slack.post_message(f"Rejection for `{worker_id}` could not be delivered.")
             elif action == "send_to_worker":
                 worker_id = decision.get("worker_id", "")
                 message = decision.get("message", "")
@@ -2163,6 +2229,23 @@ class IroncladeDaemon:
         if not machine_cfg:
             return None, None
         return machine_cfg.host, machine_cfg.log_dir
+
+    def _validate_worker_plan_target(self, worker_id: str) -> tuple[dict | None, str | None]:
+        """Return a live registered worker suitable for plan approval delivery."""
+        worker = self.registry.get_worker(worker_id)
+        if not worker:
+            return None, "worker is not registered"
+        if worker.get("status") != "running":
+            return None, f"worker is not running (status: {worker.get('status')})"
+        session_name = worker.get("tmux_session")
+        if not session_name:
+            return None, "worker has no registered tmux session"
+        ssh_host, _ = self._resolve_worker_ssh(worker)
+        if worker.get("machine") and not ssh_host:
+            return None, f"worker machine `{worker['machine']}` is unavailable"
+        if not self.tmux.has_session(session_name, ssh_host=ssh_host):
+            return None, "registered tmux session is not active"
+        return worker, None
 
     def _get_worker_workflow_stage(
         self, session_name: str, _claude_dir: Path | None = None,

@@ -49,6 +49,18 @@ DIRECTIVE_STATUS_EMOJI = {
 }
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_REPLY_TO_PREFIX_RE = re.compile(r"^\s*\[reply-to:")
+_REPLY_TO_VALID_RE = re.compile(r"^\s*\[reply-to:([0-9]+\.[0-9]+)\]\s*")
+
+
+def parse_reply_to_marker(text: str) -> tuple[str, str | None] | None:
+    """Parse a leading Brain reply marker without altering ordinary message text."""
+    if not _REPLY_TO_PREFIX_RE.match(text):
+        return text, None
+    match = _REPLY_TO_VALID_RE.match(text)
+    if not match:
+        return None
+    return text[match.end():].strip(), match.group(1)
 
 
 
@@ -252,6 +264,79 @@ class SlackBot:
 
     def pin_message(self, timestamp: str) -> bool:
         """Pin a message in the channel. Returns True on success or if already pinned."""
+        try:
+            inventory = self._client.pins_list(channel=self._channel_id)
+        except Exception as e:
+            response_data = getattr(getattr(e, "response", None), "data", None)
+            error = response_data.get("error", "unknown") if isinstance(response_data, dict) else "unknown"
+            logger.warning("Slack pin inventory failed: %s (%s)", type(e).__name__, error)
+            return False
+
+        inventory_get = getattr(inventory, "get", None)
+        items = inventory_get("items") if callable(inventory_get) else None
+        if not isinstance(items, list):
+            logger.warning("Slack pin inventory failed: invalid items shape")
+            return False
+
+        for item in items:
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "message"
+                and isinstance(item.get("message"), dict)
+                and item["message"].get("ts") == timestamp
+            ):
+                return True
+
+        if len(items) > 100:
+            logger.warning("Slack pin capacity check failed: inventory exceeds 100 items")
+            return False
+
+        if len(items) == 100:
+            candidates = []
+            for item in items:
+                if not isinstance(item, dict):
+                    logger.warning("Slack pin capacity check failed: malformed item")
+                    return False
+                try:
+                    created = float(item["created"])
+                except (KeyError, TypeError, ValueError):
+                    logger.warning("Slack pin capacity check failed: invalid created value")
+                    return False
+                if not math.isfinite(created):
+                    logger.warning("Slack pin capacity check failed: invalid created value")
+                    return False
+
+                item_type = item.get("type")
+                if item_type == "message":
+                    locator_name = "timestamp"
+                    payload = item.get("message")
+                    locator = payload.get("ts") if isinstance(payload, dict) else None
+                elif item_type == "file":
+                    locator_name = "file"
+                    payload = item.get("file")
+                    locator = payload.get("id") if isinstance(payload, dict) else None
+                elif item_type == "file_comment":
+                    locator_name = "file_comment"
+                    payload = item.get("comment")
+                    locator = payload.get("id") if isinstance(payload, dict) else None
+                else:
+                    logger.warning("Slack pin capacity check failed: unsupported item type")
+                    return False
+
+                if not isinstance(locator, str) or not locator:
+                    logger.warning("Slack pin capacity check failed: missing item locator")
+                    return False
+                candidates.append((created, item_type, locator, {locator_name: locator}))
+
+            _, _, _, removal_kwargs = min(candidates, key=lambda candidate: candidate[:3])
+            try:
+                self._client.pins_remove(channel=self._channel_id, **removal_kwargs)
+            except Exception as e:
+                response_data = getattr(getattr(e, "response", None), "data", None)
+                error = response_data.get("error", "unknown") if isinstance(response_data, dict) else "unknown"
+                logger.warning("Slack oldest-pin removal failed: %s (%s)", type(e).__name__, error)
+                return False
+
         try:
             self._client.pins_add(channel=self._channel_id, timestamp=timestamp)
             return True

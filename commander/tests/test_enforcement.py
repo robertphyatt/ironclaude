@@ -74,6 +74,20 @@ class TestGetUnprocessedMessages:
         result = daemon._get_unprocessed_messages()
         assert len(result) == 0
 
+    def test_excludes_messages_with_acknowledgement(self, daemon, db_conn):
+        """Acknowledged operator messages are no longer unprocessed work."""
+        old_ts = str(time.time() - 2400)
+        daemon.slack.get_recent_messages.return_value = [
+            {"text": "Thanks", "ts": old_ts, "user": "U_OPERATOR"},
+        ]
+        db_conn.execute(
+            "INSERT INTO operator_message_acknowledgements (source_ts, reason) VALUES (?, ?)",
+            (old_ts, "non-actionable acknowledgement"),
+        )
+        db_conn.commit()
+
+        assert daemon._get_unprocessed_messages() == []
+
     def test_excludes_non_operator_messages(self, daemon):
         """Messages from non-operator users are excluded."""
         old_ts = str(time.time() - 2400)
@@ -275,6 +289,28 @@ class TestIdleEnforcement:
         assert daemon._idle_escalation_tier == 3
         daemon.slack.post_message.assert_called()  # operator notification
 
+    def test_acknowledged_message_keeps_all_idle_tiers_quiet(self, daemon, db_conn):
+        """Acknowledgement clears daemon work accounting at every real idle tier."""
+        old_ts = str(time.time() - 2400)
+        daemon.registry.get_recent_workers.return_value = []
+        daemon.slack.get_recent_messages.return_value = [
+            {"text": "No action needed", "ts": old_ts, "user": "U_OPERATOR"},
+        ]
+        db_conn.execute(
+            "INSERT INTO operator_message_acknowledgements (source_ts, reason) VALUES (?, ?)",
+            (old_ts, "non-actionable acknowledgement"),
+        )
+        db_conn.commit()
+
+        for elapsed in (0, 120, 400):
+            daemon._last_idle_check = 0.0
+            daemon._idle_enforcement_start = time.time() - elapsed
+            daemon._idle_escalation_tier = 0
+            daemon._operator_notified_idle = False
+            daemon.check_idle_enforcement()
+            daemon.brain.send_message.assert_not_called()
+            daemon.slack.post_message.assert_not_called()
+
 
 class TestCheckMessageAging:
     def test_alerts_on_old_unprocessed(self, daemon):
@@ -344,6 +380,58 @@ class TestCheckMessageAging:
         daemon._last_message_aging_check = 0.0
         daemon.check_message_aging()
         assert old_ts not in daemon._message_aging_alerted
+
+    def test_acknowledgement_clears_stale_alerts(self, daemon, db_conn):
+        """Alerted timestamps are cleared when a message is acknowledged."""
+        old_ts = str(time.time() - 2400)
+        daemon._message_aging_alerted.add(old_ts)
+        daemon.slack.get_recent_messages.return_value = [
+            {"text": "Thanks", "ts": old_ts, "user": "U_OPERATOR"},
+        ]
+        db_conn.execute(
+            "INSERT INTO operator_message_acknowledgements (source_ts, reason) VALUES (?, ?)",
+            (old_ts, "non-actionable acknowledgement"),
+        )
+        db_conn.commit()
+        daemon._last_message_aging_check = 0.0
+        daemon.check_message_aging()
+        assert old_ts not in daemon._message_aging_alerted
+
+
+class TestAuditDispositions:
+    def test_audit_classifies_directive_acknowledged_and_unresolved(self, daemon, db_conn):
+        """Audit uses daemon dispositions for all operator-message outcomes."""
+        directive_ts = "1.0"
+        acknowledged_ts = "2.0"
+        unresolved_ts = "3.0"
+        db_conn.execute(
+            "INSERT INTO directives (source_ts, source_text, interpretation, status) VALUES (?, ?, ?, ?)",
+            (directive_ts, "fix auth", "Fix auth", "completed"),
+        )
+        db_conn.execute(
+            "INSERT INTO operator_message_acknowledgements (source_ts, reason) VALUES (?, ?)",
+            (acknowledged_ts, "non-actionable acknowledgement"),
+        )
+        db_conn.commit()
+        daemon.slack.search_operator_messages.return_value = [
+            {"ts": directive_ts, "text": "fix auth"},
+            {"ts": acknowledged_ts, "text": "thanks"},
+            {"ts": unresolved_ts, "text": "what next?"},
+        ]
+
+        daemon._handle_audit()
+
+        report = daemon.slack.post_message.call_args[0][0]
+        assert "Directives: 1" in report
+        assert "Acknowledged: 1" in report
+        assert "Unresolved: 1" in report
+        assert "*Unmapped Messages*" not in report
+        assert report.count("✅ *Mapped Messages*") == 1
+        assert report.count("💬 *Acknowledged Messages*") == 1
+        assert report.count("⚠️ *Unresolved Messages*") == 1
+        assert "ts:1.0" in report
+        assert "ts:2.0" in report
+        assert "ts:3.0" in report
 
     def test_throttle_300s(self, daemon):
         """Check only runs once per 300 seconds."""

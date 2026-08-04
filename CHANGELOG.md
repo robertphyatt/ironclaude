@@ -9,9 +9,80 @@
 > `vX.Y.Z`. Land changes under `## [Unreleased]` as you go, then rename that
 > heading to the new version at release time so the entry matches what shipped.
 
-## [Unreleased]
+## 1.1.3: Codex Commander parity, convergent Slack control, and deterministic reviews
 
-_Nothing yet._
+This release closes the remaining behavioral gaps between Codex and Claude in Commander while
+hardening the state transitions around directives, professional mode, and plan review. The focus is
+operational correctness: provider-specific transport is isolated behind adapters, operator messages
+receive one durable disposition, and workflow gates now reject ambiguous or duplicate state instead
+of relying on prompt discipline.
+
+### Fixed
+
+- **Codex Brain now uses the same Commander control plane as Claude.** The Codex app-server adapter
+  receives the orchestrator environment, exposes the required MCP tools, handles directory and hook
+  trust prompts during startup, and preserves threaded Brain replies. Provider-specific details stay
+  at the adapter boundary rather than leaking into directive or Slack logic.
+- **Directive approval cards are posted and correlated reliably.** Slack message timestamps are
+  persisted with directives, reactions are applied only after successful delivery, and approval or
+  rejection is sent only to a registered, running worker with a live local or remote tmux session.
+  Delivery failures remain visible instead of being reported as success.
+- **Every operator message converges to one durable disposition.** Messages are either represented by
+  a directive or by an immutable acknowledgement, enforced in both directions with SQLite triggers.
+  Aging alerts and `/audit` consume that ledger, so acknowledged replies stop resurfacing as stale
+  work and the audit output reports non-overlapping directive, acknowledged, and unresolved totals.
+- **Acknowledgement persistence no longer commits a caller-owned transaction.** The helper now fails
+  closed when its injected SQLite connection already has an active transaction, preventing unrelated
+  writes from being committed or rolled back as a side effect.
+- **Threaded Brain replies share one strict parser across daemon and MCP transports.** Valid
+  `[reply-to:<Slack timestamp>]` markers are removed before delivery, malformed or marker-only inputs
+  are dropped, and the acknowledgement is persisted before the Slack post and reaction. This keeps
+  retries idempotent and prevents malformed control text from becoming visible chatter.
+- **Codex token usage no longer renders as zero.** Commander reads the cumulative
+  `tokenUsage.total` breakdown emitted by current Codex app-server events while retaining support for
+  the older flat payload shape.
+- **Professional-mode activation and deactivation verify the correct Codex session.** Source-less
+  desktop roots are accepted only when all trusted identifiers agree and no subagent ancestry is
+  present; malformed child identities remain fail-closed. Deactivation reports confirmed off,
+  confirmed not-off, or unknown rather than treating an identity error as proof that the hook failed.
+- **The Codex Desktop deactivation skill chip now works like the slash command.** The human-only hook
+  recognizes Codex's exact standalone Markdown skill-link envelope and normalizes it to the existing
+  command. Anchored negative cases continue to reject prose mentions, code spans, URLs, relative
+  paths, wrong skills, case changes, and suffixes.
+- **A plan lineage can receive at most one blind review.** Lineage identity is stored on sessions and
+  review rows, duplicate blind reviews are rejected before audit mutation and by a database trigger,
+  and migrations preserve historical review rows while selecting one canonical review. A
+  `HAS-ISSUES` verdict now converges through a non-blind fix advisor and `advisor-remediated` record
+  instead of launching another blind review.
+- **Hook bootstrap and workflow transitions preserve review-lineage state.** Idempotent transitions do
+  not advance lineage counters, while a real new design transition does. The bundled state-manager
+  implementation and source tests cover fresh databases, migrations, reopen behavior, and raw-SQL
+  constraint enforcement.
+- **Slack pin saturation is handled deterministically.** Before pinning a new directive review at the
+  channel limit, Commander removes the oldest pin and then adds the new one; it does not silently
+  drop the requested pin.
+
+### Changed
+
+- **The shipped Commander configuration enables Codex and prefers it for worker and grader roles.**
+  Claude remains an explicitly configured alternative; provider selection is data-driven rather
+  than hard-coded into orchestration logic.
+- **Workflow guidance now treats on-disk plans and state-manager records as the durable checkpoint.**
+  Agents are directed to use an investigation loop when stage restrictions block required evidence,
+  rather than handing read-only shell work back to the operator or inventing an extra checkpoint.
+- **Review and execution guidance explicitly favors bounded sequential delegation for routine work.**
+  The main context retains state transitions, review invocation, task sequencing, and runtime
+  activation boundaries.
+
+### Verification
+
+- Added protocol-shaped regression coverage for Codex startup, token-usage events, Slack threading,
+  directive acknowledgement, approval delivery, professional-mode identity, and skill-link
+  normalization.
+- Added state-manager migration and reopen tests for review-lineage uniqueness and transition
+  idempotency, with source-to-bundle parity checks for the shipped JavaScript artifact.
+- Exercised the deployed stable hook against the exact Codex Desktop payload in an isolated SQLite
+  harness while proving the live professional-mode session was not mutated by agent-run tests.
 
 ## 1.1.2: suite isolation, a home-resolution seam, and the sonnet spawn default
 

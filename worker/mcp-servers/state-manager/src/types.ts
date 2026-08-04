@@ -36,6 +36,7 @@ export interface ReviewGradeEntry {
 export interface TierUpReviewEntry {
   id: number;
   terminal_session: string;
+  plan_lineage: number;
   plan_hash: string;        // sha256 of session.plan_json at submit time
   reviewer_model: string;   // e.g. "opus", "fable"
   verdict: string;          // reviewer's summary verdict/label (free text)
@@ -55,6 +56,7 @@ export interface Session {
   current_wave: number;
   review_pending: number;
   review_block_count: number;
+  plan_lineage: number;
   circuit_breaker: number;
   memory_search_required: number;
   testing_theatre_checked: number;

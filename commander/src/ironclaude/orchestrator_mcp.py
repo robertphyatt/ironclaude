@@ -35,6 +35,10 @@ import requests
 import shlex
 
 from ironclaude.config import make_opus_command
+from ironclaude.db import (
+    DIRECT_REPLY_FALLBACK_REASON,
+    persist_operator_message_acknowledgement,
+)
 from ironclaude.brain_client import _model_needs_1m_beta
 from ironclaude.fable_availability import (
     resolve_worker_type as _resolve_fable_worker_type,
@@ -53,6 +57,7 @@ from ironclaude.shadow_grader import ShadowGrader
 from ironclaude.ollama_client import OllamaClient, OllamaError
 from ironclaude.ollama_playbook import OLLAMA_WORKER_PLAYBOOK
 from ironclaude.signal_forensics import _logged_kill
+from ironclaude.slack_interface import parse_reply_to_marker
 from ironclaude.tmux_manager import _strip_ansi, detect_ask_user_menu
 from ironclaude.wiki_tools import WikiTools
 
@@ -1546,6 +1551,12 @@ class OrchestratorTools:
             self._slack.add_reaction("hourglass_flowing_sand", source_ts)
         return {"id": directive_id, "status": "pending_confirmation"}
 
+    def acknowledge_operator_message(self, source_ts: str, reason: str) -> dict:
+        """Persist an immutable no-action disposition for one Slack message."""
+        if self._db is None:
+            raise RuntimeError("Database connection required for directive operations")
+        return persist_operator_message_acknowledgement(self._db, source_ts, reason)
+
     def push_repo(self, repo: str, remote: str = "origin", branch: str = "") -> dict | str:
         """Submit a git push request for operator confirmation via Slack.
 
@@ -2073,19 +2084,40 @@ class OrchestratorTools:
         Returns True if the client's ready indicator is found (claude: "ironclaude v";
         codex: the ">_ OpenAI Codex" welcome box), False on timeout. Dismisses the
         client's trust dialog by sending Enter (codex: only once — its prompt text
-        persists in the tail after acceptance).
+        persists in the tail after acceptance). Codex's subsequent hooks-review
+        prompt selects "Trust all and continue" once with its raw numeric shortcut.
         """
         deadline = time.time() + timeout
         codex_trust_dismissed = False
+        codex_hooks_trust_dismissed = False
         while time.time() < deadline:
             output = self.tmux.read_log_tail(session_name, lines=50, ssh_host=ssh_host)
             if output:
                 lower = output.lower()
                 if client == "codex":
-                    if not codex_trust_dismissed and "do you trust" in lower:
+                    compact = re.sub(r"\s+", "", lower)
+                    if (
+                        not codex_trust_dismissed
+                        and "doyoutrustthecontentsofthisdirectory" in compact
+                    ):
                         self.tmux.send_keys(session_name, "", ssh_host=ssh_host)  # Enter accepts default "Yes"
                         codex_trust_dismissed = True
-                    if ">_ openai codex" in lower:
+                    if (
+                        codex_trust_dismissed
+                        and not codex_hooks_trust_dismissed
+                        and re.search(
+                            r"hooksneedreview.{0,500}(?<!\d)2\.trustallandcontinue",
+                            compact,
+                        )
+                    ):
+                        self.tmux.send_raw_keys(
+                            session_name, ["2"], ssh_host=ssh_host,
+                        )
+                        codex_hooks_trust_dismissed = True
+                        continue
+                    ready_index = compact.rfind(">_openaicodex")
+                    hooks_index = compact.rfind("hooksneedreview")
+                    if ready_index > hooks_index:
                         return True
                 else:
                     if "trust this folder" in lower:
@@ -5055,6 +5087,13 @@ Has the worker genuinely completed its objective based on the evidence?
         if self._slack is None:
             return "Error: Slack not configured"
 
+        parsed_reply = parse_reply_to_marker(content)
+        if parsed_reply is None:
+            return {"error": "Malformed reply marker"}
+        message_content, reply_ts = parsed_reply
+        if reply_ts is not None and not message_content:
+            return {"error": "Message is empty after reply marker"}
+
         avatar_skill = _load_avatar_skill()
         system_prompt = f"""{avatar_skill}
 
@@ -5070,7 +5109,7 @@ Grading criteria:
 
         user_prompt = f"""Evaluate this Brain-to-operator Slack message for proactiveness:
 
-{content}
+{message_content}
 
 Does this message report a problem? If so, does it include an action already taken or a pinned escalation?"""
 
@@ -5092,7 +5131,23 @@ Does this message report a problem? If so, does it include an action already tak
                 "action": "revise message to include action taken or pin an escalation, then try again",
             }
         logger.info("Grader approved post_message (grade %s)", grade_result["grade"])
-        return self._slack.post_message(content)
+        if reply_ts is None:
+            return self._slack.post_message(message_content)
+        try:
+            persist_operator_message_acknowledgement(
+                self._db, reply_ts, DIRECT_REPLY_FALLBACK_REASON,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Marked reply acknowledgement failed; skipping Slack delivery | reply_ts=%s",
+                reply_ts,
+                exc_info=True,
+            )
+            return {"error": f"Unable to acknowledge operator message: {exc}"}
+        posted_ts = self._slack.post_message(message_content, thread_ts=reply_ts)
+        if posted_ts is not None:
+            self._slack.add_reaction("white_check_mark", reply_ts)
+        return posted_ts
 
 
 def _create_mcp_server(tools: OrchestratorTools):
@@ -5385,6 +5440,19 @@ def _create_mcp_server(tools: OrchestratorTools):
             planned_worker_type_reason, planned_use_goal_reason, planned_prompt_reason,
             supersedes=supersedes,
         ))
+
+    @mcp.tool()
+    def acknowledge_operator_message(source_ts: str, reason: str) -> str:
+        """Record an immutable no-action disposition for one Slack message.
+
+        Args:
+            source_ts: Exact Slack timestamp string for the operator message.
+            reason: Non-blank reason the message needs no directive.
+
+        Returns JSON with the stored acknowledgement. Repeated calls return the
+        original acknowledgement unchanged.
+        """
+        return json.dumps(tools.acknowledge_operator_message(source_ts, reason))
 
     @mcp.tool()
     def push_repo(repo: str, remote: str = "origin", branch: str = "") -> str:

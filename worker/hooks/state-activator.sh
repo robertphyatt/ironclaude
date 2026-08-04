@@ -48,7 +48,24 @@ SAFE_SESSION=$(echo "$SESSION_TAG" | sed "s/'/''/g")
 # Claude-only restrictions.
 # Debug: surface what user_prompt contains (gated by verbose logging)
 log_hook "state-activator" "Debug" "user_prompt prefix: $(echo "$USER_PROMPT" | head -c 200)"
+DEACTIVATE_REQUEST="false"
 if echo "$USER_PROMPT" | grep -qiE '^[[:space:]]*/(ironclaude:)?deactivate-professional-mode([[:space:]]|$)'; then
+  DEACTIVATE_REQUEST="true"
+else
+  # Codex invokes plugin skills with a dollar-prefixed name. Keep this route
+  # case-sensitive and exact (apart from outer whitespace) so prose, code spans,
+  # escaped dollars, and prefix/suffix variants cannot deactivate the session.
+  TRIMMED_PROMPT=$(printf '%s' "$USER_PROMPT" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+  CODEX_DEACTIVATE_LINK_RE='^\[\$ironclaude:deactivate-professional-mode\]\(/[^)[:cntrl:]]*/skills/deactivate-professional-mode/SKILL\.md\)$'
+  if [[ "$TRIMMED_PROMPT" =~ $CODEX_DEACTIVATE_LINK_RE ]]; then
+    TRIMMED_PROMPT='$ironclaude:deactivate-professional-mode'
+  fi
+  if [ "$TRIMMED_PROMPT" = '$ironclaude:deactivate-professional-mode' ]; then
+    DEACTIVATE_REQUEST="true"
+  fi
+fi
+
+if [ "$DEACTIVATE_REQUEST" = "true" ]; then
   # Check for active wave_tasks before resetting workflow_stage
   ACTIVE_TASKS=$(sqlite3 "$DB_PATH" ".timeout 10000" \
     "SELECT COUNT(*) FROM wave_tasks WHERE terminal_session='${SAFE_SESSION}' AND status IN ('pending', 'in_progress', 'review_pending');" 2>/dev/null) || ACTIVE_TASKS="0"
@@ -61,7 +78,7 @@ if echo "$USER_PROMPT" | grep -qiE '^[[:space:]]*/(ironclaude:)?deactivate-profe
       db_audit_log "hook:state-activator" "professional_mode_off" "on" "off" "Active wave_tasks detected (${ACTIVE_TASKS}) — workflow_stage preserved"
       log_hook "state-activator" "Set" "professional-mode-off (workflow_stage preserved: ${ACTIVE_TASKS} active tasks)"
     else
-      log_warning "state-activator" "Deactivation UPDATE affected 0 rows (session=${SESSION_TAG}). Skill will provide sqlite fallback."
+      log_warning "state-activator" "Deactivation UPDATE affected 0 rows (session=${SESSION_TAG}); verification required."
     fi
   else
     # No active execution: safe to reset both PM and workflow_stage
@@ -71,7 +88,7 @@ if echo "$USER_PROMPT" | grep -qiE '^[[:space:]]*/(ironclaude:)?deactivate-profe
       db_audit_log "hook:state-activator" "professional_mode_off" "on" "off" ""
       log_hook "state-activator" "Set" "professional-mode-off"
     else
-      log_warning "state-activator" "Deactivation UPDATE affected 0 rows (session=${SESSION_TAG}). Skill will provide sqlite fallback."
+      log_warning "state-activator" "Deactivation UPDATE affected 0 rows (session=${SESSION_TAG}); verification required."
     fi
   fi
 fi

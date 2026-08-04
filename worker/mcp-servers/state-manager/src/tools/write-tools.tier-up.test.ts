@@ -4,6 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { handleWriteTool, getTierUpPolicy, hashPlan } from './write-tools.js';
+import { handleReadTool } from './read-tools.js';
 
 const SESSION_ID = 'test-tier-up';
 const PLAN = JSON.stringify({ name: 'P', goal: 'g', design_file: 'd-design.md', tasks: [] });
@@ -24,6 +25,7 @@ function createDb(dbPath = ':memory:'): Database.Database {
       active_skill TEXT, brainstorming_active INTEGER NOT NULL DEFAULT 0,
       plan_name TEXT, plan_json TEXT, current_wave INTEGER NOT NULL DEFAULT 0,
       review_pending INTEGER NOT NULL DEFAULT 0, review_block_count INTEGER NOT NULL DEFAULT 0,
+      plan_lineage INTEGER NOT NULL DEFAULT 0,
       circuit_breaker INTEGER NOT NULL DEFAULT 0, memory_search_required INTEGER NOT NULL DEFAULT 0,
       testing_theatre_checked INTEGER NOT NULL DEFAULT 0, project_hash TEXT,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -35,6 +37,7 @@ function createDb(dbPath = ':memory:'): Database.Database {
     );
     CREATE TABLE tier_up_reviews (
       id INTEGER PRIMARY KEY AUTOINCREMENT, terminal_session TEXT NOT NULL,
+      plan_lineage INTEGER NOT NULL DEFAULT 0,
       plan_hash TEXT NOT NULL, reviewer_model TEXT NOT NULL, verdict TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -98,6 +101,7 @@ describe('submit_tier_up_review', () => {
     expect(r.plan_hash).toBe(hashPlan(PLAN));
     const row = db.prepare(`SELECT * FROM tier_up_reviews WHERE terminal_session=?`).get(SESSION_ID) as any;
     expect(row.plan_hash).toBe(hashPlan(PLAN));
+    expect(row.plan_lineage).toBe(0);
     expect(row.reviewer_model).toBe('opus');
     expect(row.verdict).toBe('SOLID');
   });
@@ -122,6 +126,62 @@ describe('submit_tier_up_review', () => {
     const r = parse(handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus' } as any, db, SESSION_ID));
     expect(r.error).toBeDefined();
   });
+
+  it.each(['SOLID', 'HAS-ISSUES', 'top-tier-self'])(
+    'rejects a second %s blind review before review or audit mutation',
+    (verdict) => {
+      seed(db, 'final_plan_prep');
+      expect(parse(handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict }, db, SESSION_ID)).error)
+        .toBeUndefined();
+      const beforeReviews = db.prepare('SELECT * FROM tier_up_reviews ORDER BY id').all();
+      const beforeAudit = db.prepare('SELECT * FROM audit_log ORDER BY id').all();
+      const result = parse(handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'SOLID' }, db, SESSION_ID));
+      expect(result.error).toContain('one blind review');
+      expect(db.prepare('SELECT * FROM tier_up_reviews ORDER BY id').all()).toEqual(beforeReviews);
+      expect(db.prepare('SELECT * FROM audit_log ORDER BY id').all()).toEqual(beforeAudit);
+    },
+  );
+
+  it('rejects a formatting-only plan JSON change in the consumed lineage', () => {
+    seed(db, 'final_plan_prep');
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'HAS-ISSUES' }, db, SESSION_ID);
+    const formattingOnly = JSON.stringify(JSON.parse(PLAN), null, 2);
+    expect(formattingOnly).not.toBe(PLAN);
+    db.prepare('UPDATE sessions SET plan_json=? WHERE terminal_session=?')
+      .run(formattingOnly, SESSION_ID);
+    const beforeReviews = db.prepare('SELECT * FROM tier_up_reviews ORDER BY id').all();
+    const beforeAudit = db.prepare('SELECT * FROM audit_log ORDER BY id').all();
+    const result = parse(handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'SOLID' }, db, SESSION_ID));
+    expect(result.error).toContain('one blind review');
+    expect(db.prepare('SELECT * FROM tier_up_reviews ORDER BY id').all()).toEqual(beforeReviews);
+    expect(db.prepare('SELECT * FROM audit_log ORDER BY id').all()).toEqual(beforeAudit);
+  });
+
+  it('accepts advisor-remediated only after same-lineage HAS-ISSUES', () => {
+    seed(db, 'final_plan_prep');
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'HAS-ISSUES' }, db, SESSION_ID);
+    db.prepare('UPDATE sessions SET plan_json=? WHERE terminal_session=?')
+      .run(JSON.stringify({ name: 'P2', goal: 'g', design_file: 'd-design.md', tasks: [] }), SESSION_ID);
+    const result = parse(handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'advisor-remediated' }, db, SESSION_ID));
+    expect(result.error).toBeUndefined();
+
+    db.prepare('UPDATE sessions SET plan_lineage=1 WHERE terminal_session=?').run(SESSION_ID);
+    const beforeReviews = db.prepare('SELECT * FROM tier_up_reviews ORDER BY id').all();
+    const beforeAudit = db.prepare('SELECT * FROM audit_log ORDER BY id').all();
+    const crossLineage = parse(handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'advisor-remediated' }, db, SESSION_ID));
+    expect(crossLineage.error).toContain('prior HAS-ISSUES');
+    expect(db.prepare('SELECT * FROM tier_up_reviews ORDER BY id').all()).toEqual(beforeReviews);
+    expect(db.prepare('SELECT * FROM audit_log ORDER BY id').all()).toEqual(beforeAudit);
+  });
+
+  it('allows one new blind review after a new design lineage', () => {
+    seed(db, 'final_plan_prep');
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'SOLID' }, db, SESSION_ID);
+    db.prepare('UPDATE sessions SET plan_lineage=1 WHERE terminal_session=?').run(SESSION_ID);
+    const result = parse(handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'HAS-ISSUES' }, db, SESSION_ID));
+    expect(result.error).toBeUndefined();
+    expect(result.plan_lineage).toBe(1);
+  });
 });
 
 describe('start_execution — tier-up gate', () => {
@@ -133,11 +193,25 @@ describe('start_execution — tier-up gate', () => {
     return (db.prepare(`SELECT workflow_stage FROM sessions WHERE terminal_session=?`).get(SESSION_ID) as any).workflow_stage;
   }
 
+  function reviewAndAuditSnapshot(): { reviews: unknown[]; audit: unknown[] } {
+    return {
+      reviews: db.prepare('SELECT * FROM tier_up_reviews ORDER BY id').all(),
+      audit: db.prepare('SELECT * FROM audit_log ORDER BY id').all(),
+    };
+  }
+
+  function expectReviewAndAuditUnchanged(before: { reviews: unknown[]; audit: unknown[] }): void {
+    expect(db.prepare('SELECT * FROM tier_up_reviews ORDER BY id').all()).toEqual(before.reviews);
+    expect(db.prepare('SELECT * FROM audit_log ORDER BY id').all()).toEqual(before.audit);
+  }
+
   it('enforced + no review row → BLOCKS, stays final_plan_prep', () => {
     setPolicy('enforced');
+    const before = reviewAndAuditSnapshot();
     const r = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
     expect(r.error).toContain('tier-up review');
     expect(stage()).toBe('final_plan_prep');
+    expectReviewAndAuditUnchanged(before);
   });
 
   it('enforced + matching review row → advances to executing', () => {
@@ -151,9 +225,11 @@ describe('start_execution — tier-up gate', () => {
   it('enforced + matching HAS-ISSUES review → BLOCKS', () => {
     setPolicy('enforced');
     handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'HAS-ISSUES' }, db, SESSION_ID);
+    const before = reviewAndAuditSnapshot();
     const r = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
     expect(r.error).toContain('HAS-ISSUES');
     expect(stage()).toBe('final_plan_prep');
+    expectReviewAndAuditUnchanged(before);
   });
 
   it('enforced + matching top-tier-self review → advances', () => {
@@ -169,10 +245,55 @@ describe('start_execution — tier-up gate', () => {
     handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'SOLID' }, db, SESSION_ID);
     db.prepare(`UPDATE sessions SET plan_json=? WHERE terminal_session=?`)
       .run(JSON.stringify({ name: 'P2', goal: 'g2', design_file: 'd-design.md', tasks: [] }), SESSION_ID);
+    const before = reviewAndAuditSnapshot();
     const r = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
-    expect(r.error).toContain('tier-up review');
+    expect(r.error).toContain('different plan hash');
+    expect(r.error).toContain('Do not dispatch another plan review');
     expect(stage()).toBe('final_plan_prep');
+    expectReviewAndAuditUnchanged(before);
   });
+
+  it.each(['SOLID', 'top-tier-self'])(
+    'a changed current plan after canonical %s fails closed without state mutation',
+    (verdict) => {
+      setPolicy('enforced');
+      handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict }, db, SESSION_ID);
+      db.prepare('UPDATE sessions SET plan_json=? WHERE terminal_session=?')
+        .run(JSON.stringify({ name: 'changed', goal: 'g', design_file: 'd-design.md', tasks: [] }), SESSION_ID);
+      const beforeSession = db.prepare('SELECT * FROM sessions WHERE terminal_session=?').get(SESSION_ID);
+      const before = reviewAndAuditSnapshot();
+      const result = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
+      expect(result.error).toContain('different plan hash');
+      expect(result.error).toContain('Do not dispatch another plan review');
+      expect(db.prepare('SELECT * FROM sessions WHERE terminal_session=?').get(SESSION_ID)).toEqual(beforeSession);
+      expectReviewAndAuditUnchanged(before);
+    },
+  );
+
+  it.each([
+    ['HAS-ISSUES', 'SOLID', 'HAS-ISSUES'],
+    ['SOLID', 'HAS-ISSUES', undefined],
+  ] as const)(
+    'uses earliest migrated blind row (%s before %s) as canonical',
+    (firstVerdict, secondVerdict, expectedBlock) => {
+      setPolicy('enforced');
+      const planHash = hashPlan(PLAN);
+      db.prepare(`
+        INSERT INTO tier_up_reviews (terminal_session, plan_lineage, plan_hash, reviewer_model, verdict)
+        VALUES (?, 0, ?, 'legacy', ?), (?, 0, ?, 'legacy', ?)
+      `).run(SESSION_ID, planHash, firstVerdict, SESSION_ID, planHash, secondVerdict);
+      const before = reviewAndAuditSnapshot();
+      const result = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
+      if (expectedBlock) {
+        expect(result.error).toContain(expectedBlock);
+        expect(stage()).toBe('final_plan_prep');
+        expectReviewAndAuditUnchanged(before);
+      } else {
+        expect(result.error).toBeUndefined();
+        expect(stage()).toBe('executing');
+      }
+    },
+  );
 
   it('commander-choice + no row → advances (no gate)', () => {
     setPolicy('commander-choice');
@@ -181,17 +302,21 @@ describe('start_execution — tier-up gate', () => {
     expect(stage()).toBe('executing');
   });
 
-  it('commander-choice + latest review HAS-ISSUES requires a current-plan pass', () => {
+  it('commander-choice + HAS-ISSUES requires advisor-remediated, not a second blind review', () => {
     setPolicy('commander-choice');
     handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'HAS-ISSUES' }, db, SESSION_ID);
     const revised = JSON.stringify({ name: 'P2', goal: 'g2', design_file: 'd-design.md', tasks: [] });
     db.prepare(`UPDATE sessions SET plan_json=? WHERE terminal_session=?`).run(revised, SESSION_ID);
 
+    const before = reviewAndAuditSnapshot();
     const blocked = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
     expect(blocked.error).toContain('HAS-ISSUES');
     expect(stage()).toBe('final_plan_prep');
+    expectReviewAndAuditUnchanged(before);
 
-    handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'SOLID' }, db, SESSION_ID);
+    const secondBlind = parse(handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'SOLID' }, db, SESSION_ID));
+    expect(secondBlind.error).toContain('one blind review');
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'fable', verdict: 'advisor-remediated' }, db, SESSION_ID);
     const passed = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
     expect(passed.error).toBeUndefined();
     expect(stage()).toBe('executing');
@@ -214,9 +339,11 @@ describe('start_execution — tier-up gate', () => {
 
   it('fail-secure: absent config → enforced → BLOCKS', () => {
     setPolicy(null);
+    const before = reviewAndAuditSnapshot();
     const r = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
     expect(r.error).toContain('tier-up review');
     expect(stage()).toBe('final_plan_prep');
+    expectReviewAndAuditUnchanged(before);
   });
 
   // ─── advisor-remediated: HAS-ISSUES is terminal when a tier-up advisor guided the fix ───
@@ -236,7 +363,6 @@ describe('start_execution — tier-up gate', () => {
   });
 
   // All findings REJECTED by the advisor ⇒ no plan change ⇒ same hash carries both rows.
-  // Relies on getTierUpReviewByHash ordering `id DESC` so advisor-remediated wins. Load-bearing.
   it('all-REJECTED: HAS-ISSUES then advisor-remediated at the SAME hash → advances', () => {
     setPolicy('enforced');
     handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'HAS-ISSUES' }, db, SESSION_ID);
@@ -246,23 +372,57 @@ describe('start_execution — tier-up gate', () => {
     expect(stage()).toBe('executing');
   });
 
-  it('advisor-remediated with NO preceding HAS-ISSUES → BLOCKS', () => {
+  it('recognizes historical remediation despite a later duplicate blind row at the same hash', () => {
     setPolicy('enforced');
-    handleWriteTool('submit_tier_up_review', { reviewer_model: 'fable', verdict: 'advisor-remediated' }, db, SESSION_ID);
+    const planHash = hashPlan(PLAN);
+    db.prepare(`
+      INSERT INTO tier_up_reviews (terminal_session, plan_lineage, plan_hash, reviewer_model, verdict)
+      VALUES
+        (?, 0, ?, 'legacy', 'HAS-ISSUES'),
+        (?, 0, ?, 'legacy', 'advisor-remediated'),
+        (?, 0, ?, 'legacy', 'SOLID')
+    `).run(SESSION_ID, planHash, SESSION_ID, planHash, SESSION_ID, planHash);
+
+    const resumed = parse(handleReadTool('get_resume_state', {}, db, SESSION_ID));
+    expect(resumed.review_summary).toMatchObject({
+      canonical_blind_verdict: 'HAS-ISSUES',
+      canonical_hash_matches_current: true,
+      current_hash_advisor_remediated: true,
+    });
+    const result = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
+    expect(result.error).toBeUndefined();
+    expect(stage()).toBe('executing');
+  });
+
+  it('advisor-remediated with NO preceding HAS-ISSUES is rejected before mutation', () => {
+    setPolicy('enforced');
+    const beforeReviews = db.prepare('SELECT * FROM tier_up_reviews ORDER BY id').all();
+    const beforeAudit = db.prepare('SELECT * FROM audit_log ORDER BY id').all();
+    const submitted = parse(handleWriteTool('submit_tier_up_review', { reviewer_model: 'fable', verdict: 'advisor-remediated' }, db, SESSION_ID));
+    expect(submitted.error).toContain('prior HAS-ISSUES');
+    expect(db.prepare('SELECT * FROM tier_up_reviews ORDER BY id').all()).toEqual(beforeReviews);
+    expect(db.prepare('SELECT * FROM audit_log ORDER BY id').all()).toEqual(beforeAudit);
+    const before = reviewAndAuditSnapshot();
     const r = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
     expect(r.error).toBeDefined();
     expect(stage()).toBe('final_plan_prep');
+    expectReviewAndAuditUnchanged(before);
   });
 
   it('advisor-remediated whose HAS-ISSUES has a HIGHER id → BLOCKS (ordering)', () => {
     setPolicy('enforced');
-    handleWriteTool('submit_tier_up_review', { reviewer_model: 'fable', verdict: 'advisor-remediated' }, db, SESSION_ID);
-    setPlan(PLAN2);
-    handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'HAS-ISSUES' }, db, SESSION_ID);
-    setPlan(PLAN);
+    const planHash = hashPlan(PLAN);
+    db.prepare(`
+      INSERT INTO tier_up_reviews (terminal_session, plan_lineage, plan_hash, reviewer_model, verdict)
+      VALUES
+        (?, 0, ?, 'legacy', 'advisor-remediated'),
+        (?, 0, ?, 'legacy', 'HAS-ISSUES')
+    `).run(SESSION_ID, planHash, SESSION_ID, planHash);
+    const before = reviewAndAuditSnapshot();
     const r = parse(handleWriteTool('start_execution', {}, db, SESSION_ID));
     expect(r.error).toBeDefined();
     expect(stage()).toBe('final_plan_prep');
+    expectReviewAndAuditUnchanged(before);
   });
 });
 

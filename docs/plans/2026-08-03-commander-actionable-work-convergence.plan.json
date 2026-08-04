@@ -1,0 +1,156 @@
+{
+  "name": "Commander Direct-Reply Acknowledgment Enforcement Continuation",
+  "goal": "Enforce durable non-actionable disposition at both marked direct-reply transports so model omission cannot produce a false successful reply.",
+  "requirements_file": "docs/plans/2026-08-03-commander-actionable-work-convergence-requirements.md",
+  "design_file": "docs/plans/2026-08-03-commander-actionable-work-convergence-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Centralize acknowledgment persistence",
+      "description": "One sequential gpt-5.6-terra worker adds an authoritative-connection-only shared persistence helper and delegates the existing MCP acknowledgment method; main context owns state and review.",
+      "allowed_files": [
+        "commander/src/ironclaude/db.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_db.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add RED direct helper and MCP delegation tests for validation/no-open, immutable repeat, concurrent acknowledgment convergence, real helper use in the directive/ack race, and unchanged wrapper behavior.",
+          "expected": "Tests exercise the actual shared persistence seam without helper mocks."
+        },
+        {
+          "description": "Run Task 1 RED.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_db.py tests/test_orchestrator_mcp.py -k 'persist_operator_message_acknowledgement or disposition_exclusivity_two_connections_race or TestAcknowledgeOperatorMessage'",
+          "expected": "FAIL because the shared helper/constant do not exist and MCP persistence remains inline."
+        },
+        {
+          "description": "Implement DIRECT_REPLY_FALLBACK_REASON and persist_operator_message_acknowledgement in db.py using only the injected connection, immutable return, commit, rollback/re-query for concurrent duplicate, and fail-closed directive conflict; delegate the existing MCP method without changing its wrapper.",
+          "expected": "One persistence implementation owns validation and idempotency; no DB path/open, schema, trigger, or unrelated tool change."
+        },
+        {
+          "description": "Run Task 1 focused GREEN.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_db.py tests/test_orchestrator_mcp.py -k 'persist_operator_message_acknowledgement or disposition_exclusivity_two_connections_race or TestAcknowledgeOperatorMessage'",
+          "expected": "PASS, exit 0."
+        },
+        {
+          "description": "Run full Task 1 modules.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_db.py tests/test_orchestrator_mcp.py",
+          "expected": "PASS, exit 0."
+        },
+        {
+          "description": "Stage Task 1 files only.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -- commander/src/ironclaude/db.py commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_db.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "Task 1 files staged; protected files unstaged."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Enforce acknowledgment at both marked-reply transports",
+      "description": "A second sequential gpt-5.6-terra worker enforces shared persistence at daemon and MCP marked-reply entries while main context retains orchestration and review.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_daemon.py",
+        "commander/tests/test_main_validate.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Add RED real-helper transport tests for commit-before-post, preserved explicit reason, fallback reason, rejected/unmarked non-persistence, missing DB, directive conflict, persistence failure, continued polling, and real SlackBot queued delivery after WebClient failure.",
+          "expected": "Tests enter actual daemon/MCP transport paths and actual DB helper; no persistence-helper mocks."
+        },
+        {
+          "description": "Run Task 2 RED.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_daemon.py tests/test_main_validate.py tests/test_orchestrator_mcp.py -k 'SolicitedReply or reply_marker or reply_reaction or TestPostMessageGrader or transport_acknowledgement'",
+          "expected": "FAIL because valid marked replies still post without persistence."
+        },
+        {
+          "description": "In main.py, persist valid non-empty marked reply timestamps immediately before _post_brain_message; on DB absence/conflict/error log and skip post/reaction while preserving all unrelated routing.",
+          "expected": "Daemon marked replies always have committed classification before Slack; failures are fail-closed."
+        },
+        {
+          "description": "In orchestrator_mcp.py, persist approved valid marked replies after grading and before Slack; return structured error on DB absence/conflict/error; never persist rejected, malformed, marker-only, or unmarked content.",
+          "expected": "MCP marked replies enforce the same classification and preserve grading/top-level behavior."
+        },
+        {
+          "description": "Run Task 2 focused GREEN.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_daemon.py tests/test_main_validate.py tests/test_orchestrator_mcp.py -k 'SolicitedReply or reply_marker or reply_reaction or TestPostMessageGrader or transport_acknowledgement'",
+          "expected": "PASS, exit 0."
+        },
+        {
+          "description": "Run full Task 2 modules.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_daemon.py tests/test_main_validate.py tests/test_orchestrator_mcp.py",
+          "expected": "PASS, exit 0."
+        },
+        {
+          "description": "Stage Task 2 files only.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -- commander/src/ironclaude/main.py commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_daemon.py commander/tests/test_main_validate.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "Task 2 files staged; protected files unstaged."
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Regression restart fresh live acceptance and findings",
+      "description": "Main context owns protected-scope checks, combined/full regressions, daemon restarts, fresh operator Slack gate, durability recheck, findings, and final staging.",
+      "allowed_files": [
+        "docs/plans/2026-08-03-commander-actionable-work-convergence-requirements.md",
+        "docs/plans/2026-08-03-commander-actionable-work-convergence-design.md",
+        "docs/plans/2026-08-03-commander-actionable-work-convergence.md",
+        "docs/plans/2026-08-03-commander-actionable-work-convergence.plan.json",
+        "docs/plans/2026-08-03-commander-actionable-work-convergence-findings.md"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "Recheck protected hashes and staged scope.",
+          "command": "shasum -a 256 /Users/roberthyatt/Code/ironclaude/AGENTS.md /Users/roberthyatt/Code/ironclaude/commander/config/ironclaude.json && git -C /Users/roberthyatt/Code/ironclaude status --short",
+          "expected": "Protected hashes match execution invariants; both files remain unstaged."
+        },
+        {
+          "description": "Run combined focused regression.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_db.py tests/test_orchestrator_mcp.py tests/test_enforcement.py tests/test_main_validate.py tests/test_slack_interface.py tests/test_codex_brain_client.py tests/test_daemon.py",
+          "expected": "PASS, exit 0; record measured count."
+        },
+        {
+          "description": "Run full Commander suite once.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q tests/",
+          "expected": "PASS, exit 0; record measured pass/skip counts."
+        },
+        {
+          "description": "Restart the verified sole Commander through its identity-checking CLI outside any sandbox that blocks internal ps.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/ironclaude restart",
+          "expected": "SIGHUP reaches the sole daemon; no duplicate starts."
+        },
+        {
+          "description": "Verify exactly one Commander, one attached Codex Brain app-server, fresh Slack/Brain startup, and no missing-tool error.",
+          "command": "ps -axo pid,ppid,lstart,command | rg 'ironclaude\\.main|codex app-server' && tail -n 300 /tmp/ironclaude-daemon.log | rg 'Brain SDK client started|Brain Codex client started|IronClaude Commander daemon starting|Bolt app is running' && ! tail -n 300 /tmp/ironclaude-daemon.log | rg 'orchestrator MCP inventory missing tools'",
+          "expected": "Exactly one daemon and one Codex Brain app-server; fresh startup; no missing-tool error."
+        },
+        {
+          "description": "In main context, use one fresh operator-authored non-actionable Slack question after restart; do not reuse 1785801581.255109 or synthesize a substitute. Verify #1457 closure, one immutable acknowledgment/reason, no directive/worker/event, one cleaned containing-thread reply, post-delivery reactions, and threshold quiescence.",
+          "expected": "Fresh message satisfies every disposition and delivery invariant."
+        },
+        {
+          "description": "Restart after accepted message, then re-query exact source for unchanged acknowledgment, no duplicate reply/nudge, and repeat healthy topology.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/ironclaude restart",
+          "expected": "Disposition and Slack outcome remain durable across restart."
+        },
+        {
+          "description": "Update findings with all evidence and both successor PM loops; force-stage five workflow artifacts.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f -- docs/plans/2026-08-03-commander-actionable-work-convergence-requirements.md docs/plans/2026-08-03-commander-actionable-work-convergence-design.md docs/plans/2026-08-03-commander-actionable-work-convergence.md docs/plans/2026-08-03-commander-actionable-work-convergence.plan.json docs/plans/2026-08-03-commander-actionable-work-convergence-findings.md",
+          "expected": "Previously implemented source, planned tests, and workflow artifacts staged; no commit or push."
+        },
+        {
+          "description": "Recheck protected hashes and final staged scope.",
+          "command": "shasum -a 256 /Users/roberthyatt/Code/ironclaude/AGENTS.md /Users/roberthyatt/Code/ironclaude/commander/config/ironclaude.json && git -C /Users/roberthyatt/Code/ironclaude status --short",
+          "expected": "Protected hashes unchanged; protected files unstaged; only authorized implementation, tests, and workflow artifacts staged."
+        }
+      ]
+    }
+  ]
+}

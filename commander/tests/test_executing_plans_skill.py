@@ -36,6 +36,24 @@ def test_executing_plans_tier_up_is_blind_and_policy_aware():
         "tier-up review lost the on-disk Fable-availability check"
 
 
+def test_executing_plans_checks_persisted_lineage_before_reviewer_dispatch():
+    text = _read().lower()
+    normalized = " ".join(text.split())
+    review_step = text.index("tier-up plan review (policy-gated)")
+    resume = text.index("get_resume_state", review_step)
+    dispatch = text.index("run the review", review_step)
+    assert resume < dispatch, "lineage resume state must be checked before reviewer dispatch"
+    for required in (
+        "review_summary",
+        "canonical_blind_verdict",
+        "current_hash_advisor_remediated",
+        "do not dispatch a replacement blind review",
+        "do not dispatch another plan review",
+        "fail closed",
+    ):
+        assert required in normalized, f"lineage resume branch lost '{required}'"
+
+
 def test_plan_review_receives_derived_artifacts_and_no_revision_context():
     text = _read()
     lower = text.lower()

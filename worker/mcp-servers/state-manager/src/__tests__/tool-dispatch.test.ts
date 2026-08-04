@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { getSession, initDb, upsertSession } from '../db.js';
 import { resolveSessionIdentity, type SessionIdentity } from '../session-identity.js';
 import { dispatchTool } from '../tool-dispatch.js';
+import { createHash } from 'node:crypto';
 
 const ROOT_A = 'root-a';
 const ROOT_B = 'root-b';
@@ -95,6 +96,38 @@ describe('dispatchTool', () => {
     const db = initDb(':memory:');
     const result = payload(dispatchTool('get_plan_status', {}, db, identity('missing-root')));
     expect(result).toEqual({ error: 'Session not found', session_id: 'missing-root' });
+  });
+
+  it('exposes bounded current-lineage plan-review evidence through get_resume_state', () => {
+    const db = initDb(':memory:');
+    const firstPlan = JSON.stringify({ name: 'first' });
+    const currentPlan = JSON.stringify({ name: 'current' });
+    const firstHash = createHash('sha256').update(firstPlan).digest('hex');
+    const currentHash = createHash('sha256').update(currentPlan).digest('hex');
+    upsertSession(db, {
+      terminal_session: 'review-summary-root',
+      professional_mode: 'on',
+      workflow_stage: 'final_plan_prep',
+      plan_json: currentPlan,
+      plan_lineage: 4,
+    });
+    db.prepare(`
+      INSERT INTO tier_up_reviews (terminal_session, plan_lineage, plan_hash, reviewer_model, verdict)
+      VALUES (?, 4, ?, 'gpt-5.6-sol', 'HAS-ISSUES')
+    `).run('review-summary-root', firstHash);
+    db.prepare(`
+      INSERT INTO tier_up_reviews (terminal_session, plan_lineage, plan_hash, reviewer_model, verdict)
+      VALUES (?, 4, ?, 'gpt-5.6-sol', 'advisor-remediated')
+    `).run('review-summary-root', currentHash);
+
+    const result = payload(dispatchTool('get_resume_state', {}, db, identity('review-summary-root')));
+    expect(result.review_summary).toEqual({
+      plan_lineage: 4,
+      canonical_blind_verdict: 'HAS-ISSUES',
+      canonical_blind_plan_hash: firstHash,
+      canonical_hash_matches_current: false,
+      current_hash_advisor_remediated: true,
+    });
   });
 
   it('routes root and subagent Codex calls to the same root row', () => {

@@ -13,5 +13,16 @@
     "enabled": true,
     "executor_model": "sonnet",
     "advisor_model": "opus"
+  },
+  "providers": {
+    "clients": {
+      "codex": {
+        "enabled": true
+      }
+    },
+    "roles": {
+      "worker": {"preferred": "codex", "clients": ["codex", "claude"]},
+      "grader": {"preferred": "codex", "clients": ["codex", "claude"]}
+    }
   }
 }

@@ -34,9 +34,10 @@ import {
   updateWaveTaskStatus,
   insertReviewGrade,
   clearReviewGrades,
+  PLAN_LINEAGE_BLIND_REVIEW_TRIGGER_MESSAGE,
   insertTierUpReview,
-  getTierUpReviewByHash,
-  getLatestTierUpReview,
+  getBlindTierUpReviewForLineage,
+  hasAdvisorRemediatedAtHash,
   hasEarlierTierUpVerdict,
 } from '../db.js';
 import {
@@ -136,6 +137,7 @@ export function hashPlan(planJson: string): string {
 
 const TIER_UP_VERDICTS = ['SOLID', 'HAS-ISSUES', 'top-tier-self', 'advisor-remediated'] as const;
 type TierUpVerdict = typeof TIER_UP_VERDICTS[number];
+const BLIND_TIER_UP_VERDICTS = ['SOLID', 'HAS-ISSUES', 'top-tier-self'] as const;
 
 function isTierUpVerdict(value: string): value is TierUpVerdict {
   return (TIER_UP_VERDICTS as readonly string[]).includes(value);
@@ -143,6 +145,10 @@ function isTierUpVerdict(value: string): value is TierUpVerdict {
 
 function isPassingTierUpVerdict(value: string): boolean {
   return value === 'SOLID' || value === 'top-tier-self';
+}
+
+function isBlindTierUpVerdict(value: string): boolean {
+  return (BLIND_TIER_UP_VERDICTS as readonly string[]).includes(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -602,53 +608,54 @@ export function handleWriteTool(
         return err('Missing or empty required parameter: file');
       }
 
-      const session = getSession(db, resolvedId);
-      if (!session) {
-        return err('Session not found', { session_id: resolvedId });
-      }
+      const consumeDesign = db.transaction((): ToolResult => {
+        const session = getSession(db, resolvedId);
+        if (!session) {
+          return err('Session not found', { session_id: resolvedId });
+        }
 
-      // Check design exists and is not consumed
-      const design = getDesign(db, file);
-      if (!design) {
-        return err(`Design not found: ${file}`);
-      }
-      if (design.consumed === 1) {
-        return err(`Design already consumed: ${file}`);
-      }
+        const design = getDesign(db, file);
+        if (!design) {
+          return err(`Design not found: ${file}`);
+        }
+        if (design.consumed === 1) {
+          return err(`Design already consumed: ${file}`);
+        }
 
-      // Only transition to design_ready if moving forward; don't regress state
-      const validConsumeStages: WorkflowStage[] = ['brainstorming', 'design_ready', 'design_marked_for_use'];
-      if (!validConsumeStages.includes(session.workflow_stage)) {
-        return err(
-          `Cannot consume design: workflow must be brainstorming, design_ready, or design_marked_for_use, currently ${session.workflow_stage}`,
-        );
-      }
+        const validConsumeStages: WorkflowStage[] = ['brainstorming', 'design_ready', 'design_marked_for_use'];
+        if (!validConsumeStages.includes(session.workflow_stage)) {
+          return err(
+            `Cannot consume design: workflow must be brainstorming, design_ready, or design_marked_for_use, currently ${session.workflow_stage}`,
+          );
+        }
 
-      // Consume design
-      dbConsumeDesign(db, file);
+        const newStage = session.workflow_stage === 'brainstorming' ? 'design_ready' : session.workflow_stage;
+        dbConsumeDesign(db, file);
 
-      // Only transition to design_ready if coming from brainstorming; preserve later stages
-      if (session.workflow_stage === 'brainstorming') {
-        updateSession(db, resolvedId, { workflow_stage: 'design_ready' });
-      }
+        if (session.workflow_stage === 'brainstorming') {
+          updateSession(db, resolvedId, {
+            workflow_stage: 'design_ready',
+            plan_lineage: session.plan_lineage + 1,
+          });
+        }
 
-      const newStage = session.workflow_stage === 'brainstorming' ? 'design_ready' : session.workflow_stage;
+        insertAuditLog(db, {
+          terminal_session: resolvedId,
+          actor: 'claude',
+          action: 'consume_design',
+          old_value: session.workflow_stage,
+          new_value: newStage,
+          context: `Consumed design file: ${file}`,
+        });
 
-      insertAuditLog(db, {
-        terminal_session: resolvedId,
-        actor: 'claude',
-        action: 'consume_design',
-        old_value: session.workflow_stage,
-        new_value: newStage,
-        context: `Consumed design file: ${file}`,
+        return ok({
+          success: true,
+          file,
+          workflow_stage: newStage,
+          session_id: resolvedId,
+        });
       });
-
-      return ok({
-        success: true,
-        file,
-        workflow_stage: newStage,
-        session_id: resolvedId,
-      });
+      return consumeDesign();
     }
 
     // ----- create_plan -----
@@ -766,41 +773,34 @@ export function handleWriteTool(
             return 'BLOCKED — tier-up review gate: no plan loaded. Call create_plan first.';
           }
           const planHash = hashPlan(session.plan_json);
-          const review = getTierUpReviewByHash(db, resolvedId, planHash);
-          const latestReview = getLatestTierUpReview(db, resolvedId);
-          const passRequired = tierUpPolicy === 'enforced'
-            || latestReview?.verdict === 'HAS-ISSUES';
+          const canonicalReview = getBlindTierUpReviewForLineage(
+            db, resolvedId, session.plan_lineage,
+          );
 
-          if (passRequired && !review) {
-            return `BLOCKED — passing tier-up review required (tier_up_review_policy=${tierUpPolicy}). ` +
-              (latestReview?.verdict === 'HAS-ISSUES'
-                ? 'The latest review was HAS-ISSUES; perform the holistic requirements/design/plan audit, revise coherently, and obtain a fresh SOLID review. '
-                : '') +
-              'Dispatch a blind higher-tier reviewer for THIS plan and call ' +
-              'submit_tier_up_review, then retry start_execution. If the plan changed ' +
-              'after a prior review, re-review is required (the hash no longer matches). ' +
-              'To change this requirement, a human must edit tier_up_review_policy in ' +
-              '~/.claude/ironclaude-hooks-config.json (the commander cannot change it).';
-          }
-          // advisor-remediated: HAS-ISSUES is terminal when a tier-up advisor guided the
-          // response. Not expressible via isPassingTierUpVerdict — that is a pure
-          // verdict-string predicate, and this condition depends on a SECOND row existing.
-          // The paired HAS-ISSUES belongs to the pre-revision plan (different hash), so the
-          // lookup is session-scoped and ordered by id.
-          if (passRequired && review && review.verdict === 'advisor-remediated') {
-            if (hasEarlierTierUpVerdict(db, resolvedId, 'HAS-ISSUES', review.id)) {
-              return null;
+          if (!canonicalReview) {
+            if (tierUpPolicy === 'enforced') {
+              return `BLOCKED — passing tier-up review required (tier_up_review_policy=${tierUpPolicy}). ` +
+                'Dispatch one blind higher-tier reviewer for THIS plan and call ' +
+                'submit_tier_up_review, then retry start_execution. To change this ' +
+                'requirement, a human must edit tier_up_review_policy in ' +
+                '~/.claude/ironclaude-hooks-config.json (the commander cannot change it).';
             }
-            return 'BLOCKED — advisor-remediated requires a prior HAS-ISSUES review. ' +
-              'This verdict records that a tier-up advisor guided the response to a failed ' +
-              'review; with no earlier HAS-ISSUES row in this session it is not a valid ' +
-              'execution gate. Obtain a blind review first.';
+            return null;
           }
-          if (passRequired && review && !isPassingTierUpVerdict(review.verdict)) {
-            return `BLOCKED — current plan tier-up verdict is ${review.verdict}. ` +
-              'Execution requires SOLID (or top-tier-self at the highest model tier). ' +
-              'Verify findings, perform the holistic requirements/design/plan audit, ' +
-              'revise coherently, and obtain a fresh blind review.';
+
+          if (isPassingTierUpVerdict(canonicalReview.verdict)) {
+            if (canonicalReview.plan_hash === planHash) return null;
+            return `BLOCKED — plan lineage ${session.plan_lineage} already has a passing ` +
+              `${canonicalReview.verdict} review for a different plan hash. Restore the exact ` +
+              'reviewed plan or retreat to brainstorming after verifying a design-premise change. ' +
+              'Do not dispatch another plan review.';
+          }
+
+          if (canonicalReview.verdict === 'HAS-ISSUES') {
+            if (hasAdvisorRemediatedAtHash(db, resolvedId, session.plan_lineage, planHash)) return null;
+            return `BLOCKED — plan lineage ${session.plan_lineage} has HAS-ISSUES. ` +
+              'Use the non-blind fix advisor and record advisor-remediated for the current ' +
+              'plan after remediation. Do not dispatch another plan review.';
           }
           return null;
         },
@@ -1102,11 +1102,12 @@ export function handleWriteTool(
               valid: false,
               reason: `Cannot mark design ready: workflow_stage must be 'brainstorming', got '${from}'`,
             },
-        applyArtifacts: () => {
+        applyArtifacts: ({ session }) => {
           if (file) {
             dbRegisterDesign(db, file, resolvedId);
             dbConsumeDesign(db, file);
           }
+          return { plan_lineage: session.plan_lineage + 1 };
         },
       });
 
@@ -1443,7 +1444,36 @@ export function handleWriteTool(
       }
 
       const planHash = hashPlan(session.plan_json);
-      insertTierUpReview(db, resolvedId, planHash, reviewerModel, verdict);
+      if (isBlindTierUpVerdict(verdict)) {
+        const existing = getBlindTierUpReviewForLineage(db, resolvedId, session.plan_lineage);
+        if (existing) {
+          return err(
+            `BLOCKED — plan lineage ${session.plan_lineage} already consumed its one blind review ` +
+            `(${existing.verdict}). Do not dispatch another plan review. Use the fix advisor ` +
+            'and advisor-remediated path after HAS-ISSUES, or retreat to brainstorming when ' +
+            'a verified design premise is invalid.',
+          );
+        }
+      } else if (!hasEarlierTierUpVerdict(
+        db, resolvedId, session.plan_lineage, 'HAS-ISSUES', Number.MAX_SAFE_INTEGER,
+      )) {
+        return err(
+          `BLOCKED — advisor-remediated requires a prior HAS-ISSUES review in plan lineage ` +
+          `${session.plan_lineage}.`,
+        );
+      }
+
+      try {
+        insertTierUpReview(db, resolvedId, session.plan_lineage, planHash, reviewerModel, verdict);
+      } catch (error) {
+        if (error instanceof Error && error.message === PLAN_LINEAGE_BLIND_REVIEW_TRIGGER_MESSAGE) {
+          return err(
+            `BLOCKED — plan lineage ${session.plan_lineage} already consumed its one blind review. ` +
+            'Do not dispatch another plan review.',
+          );
+        }
+        throw error;
+      }
 
       insertAuditLog(db, {
         terminal_session: resolvedId,
@@ -1451,10 +1481,10 @@ export function handleWriteTool(
         action: 'submit_tier_up_review',
         old_value: null,
         new_value: verdict,
-        context: `Tier-up review recorded (model=${reviewerModel}, plan_hash=${planHash.slice(0, 12)}…)`,
+        context: `Tier-up review recorded (model=${reviewerModel}, plan_lineage=${session.plan_lineage}, plan_hash=${planHash.slice(0, 12)}…)`,
       });
 
-      return ok({ success: true, plan_hash: planHash, reviewer_model: reviewerModel, verdict, session_id: resolvedId });
+      return ok({ success: true, plan_lineage: session.plan_lineage, plan_hash: planHash, reviewer_model: reviewerModel, verdict, session_id: resolvedId });
     }
 
     default:

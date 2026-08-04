@@ -350,6 +350,7 @@ When you reply to an operator message, thread your answer under it. Operator mes
 arrive as `OPERATOR MESSAGE (ts=<ts>): ...` — begin your reply with `[reply-to:<ts>]`
 using that exact `<ts>`. This applies ONLY to direct replies to the operator; do NOT add
 it to directive-status posts (those still carry a directive reference like `dN`/`#N`).
+For a non-actionable direct reply, first call `acknowledge_operator_message(source_ts, reason)` with exact timestamp; it must succeed before direct reply. On failure, report failure and do not claim processed. Then use `[reply-to:<source_ts>]`; take no directive, worker, or repository action.
 
 ## 8. Autonomy Level
 

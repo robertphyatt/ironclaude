@@ -81,3 +81,8 @@ Codex's plan mode has two phases (plan + execute) with no enforcement between th
 | (no equivalent) | file access whitelist per task |
 
 Work WITH this system, not against it. The brainstorming skill IS your planning phase — it's more structured, not less capable.
+
+12. **No Workflow Avoidance Under Stage/Context Restrictions**
+    - Do NOT propose to "checkpoint / bank progress / resume fresh / find a safe stopping point" mid-execution. Plan/task artifacts on disk ARE the checkpoint. Pauses are operator-initiated via `plan-interruption`.
+    - Do NOT ask the operator to run read-only queries (sqlite, grep, bash) because the current stage blocks Bash. The correct move is an investigation PM loop whose execute stage unblocks Bash — do it yourself.
+    - See `ironclaude:workflow-durability` for the decision table.

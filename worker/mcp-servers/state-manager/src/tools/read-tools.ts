@@ -18,10 +18,12 @@ import {
   type RuntimeFingerprintExpectation,
 } from '../runtime-fingerprint.js';
 import { getSession, getWaveTasks, getPlanHistory, isDesignConsumed } from '../db.js';
+import { getBlindTierUpReviewForLineage, hasAdvisorRemediatedAtHash } from '../db.js';
 import { canTransitionTo } from '../state-machine.js';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
+import { createHash } from 'crypto';
 
 function requireSessionId(sessionId: string): string {
   if (!sessionId) {
@@ -721,6 +723,24 @@ export function handleReadTool(
         }
       }
 
+      const currentPlanHash = session.plan_json
+        ? createHash('sha256').update(session.plan_json).digest('hex')
+        : null;
+      const canonicalReview = getBlindTierUpReviewForLineage(
+        db, resolvedId, session.plan_lineage,
+      );
+      const review_summary = {
+        plan_lineage: session.plan_lineage,
+        canonical_blind_verdict: canonicalReview?.verdict ?? null,
+        canonical_blind_plan_hash: canonicalReview?.plan_hash ?? null,
+        canonical_hash_matches_current: canonicalReview
+          ? canonicalReview.plan_hash === currentPlanHash
+          : null,
+        current_hash_advisor_remediated: currentPlanHash
+          ? hasAdvisorRemediatedAtHash(db, resolvedId, session.plan_lineage, currentPlanHash)
+          : false,
+      };
+
       const result = {
         workflow_stage: session.workflow_stage,
         professional_mode: session.professional_mode,
@@ -734,6 +754,7 @@ export function handleReadTool(
           wave: t.wave_number,
           status: t.status,
         })),
+        review_summary,
         session_id: resolvedId,
       };
 

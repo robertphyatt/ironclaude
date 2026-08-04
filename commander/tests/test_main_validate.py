@@ -5,6 +5,8 @@ import time
 import pytest
 from unittest.mock import MagicMock, patch
 
+from ironclaude.db import init_db
+
 from ironclaude import fable_availability as fa
 from ironclaude.main import IroncladeDaemon, PROMPT_WAITING_CACHE_TTL
 
@@ -407,6 +409,7 @@ def _make_poll_daemon():
     d._heartbeat_stuck_notified = set()
     d._last_heartbeat_ts = None
     d._last_brain_context = None
+    d._db = init_db(":memory:")
     from ironclaude.auth_relay import AuthRelay
     d._auth_relay = AuthRelay()   # __new__ bypasses __init__; the new tick() needs this
     return d
@@ -487,16 +490,15 @@ class TestOperatorWaits:
         d.slack.post_message.assert_not_called()
         d.brain.send_message.assert_not_called()
 
-    def test_malformed_reply_marker_treated_as_chatter(self):
+    def test_malformed_reply_marker_is_suppressed(self):
         d = _make_poll_daemon()
         d._last_heartbeat_ts = "1700.1"
         d.brain.get_pending_responses.return_value = ["[reply-to:abc] not a real ts"]
         d.poll_brain_responses()
-        # _REPLY_TO_RE only matches [0-9.]+, so a non-numeric marker falls through to chatter
-        d.slack.post_message.assert_called_once()
-        _, kwargs = d.slack.post_message.call_args
-        assert kwargs.get("thread_ts") == "1700.1"
+        d.slack.post_message.assert_not_called()
         d.slack.add_reaction.assert_not_called()
+        d.brain.send_message.assert_not_called()
+        d._grader.grade.assert_not_called()
 
     def test_reply_reaction_skipped_when_post_fails(self):
         d = _make_poll_daemon()
@@ -792,6 +794,97 @@ def test_operator_wait_infra_error_returns_false():
     daemon = _make_daemon()
     daemon._grader.grade.return_value = {"infrastructure_error": True, "error_detail": "down"}
     assert not daemon._maybe_capture_operator_wait("holding for your reply on d1")
+
+
+class TestWorkerPlanSlackDecisionValidation:
+    def _daemon(self, tmp_path, worker, *, session=True, send=True, ssh_host=None):
+        d = _make_poll_daemon()
+        d.socket_handler = MagicMock()
+        d._handle_directive_confirmation = MagicMock(return_value=False)
+        d.plugin_registry = MagicMock()
+        d._decisions_dir = str(tmp_path / "decisions")
+        d.registry = MagicMock()
+        d.registry.get_worker.return_value = worker
+        d.tmux = MagicMock()
+        d.tmux.has_session.return_value = session
+        d.tmux.send_keys.return_value = send
+        d._resolve_worker_ssh = MagicMock(return_value=(ssh_host, None))
+        return d
+
+    @staticmethod
+    def _worker(**overrides):
+        worker = {
+            "id": "w1", "status": "running", "tmux_session": "registered-w1",
+            "machine": None,
+        }
+        worker.update(overrides)
+        return worker
+
+    def _poll(self, daemon, command_type="approve"):
+        daemon.socket_handler.drain.return_value = [{
+            "parsed": {"type": command_type, "target": "w1"},
+            "original_text": f"{command_type} w1",
+        }]
+        daemon.poll_slack_commands()
+
+    def test_missing_worker_rejected_before_queue(self, tmp_path):
+        d = self._daemon(tmp_path, None)
+        self._poll(d)
+        assert not list((tmp_path / "decisions").glob("*.json"))
+        d.tmux.send_keys.assert_not_called()
+        assert "not registered" in _posts(d)
+
+    def test_completed_worker_rejected_before_queue(self, tmp_path):
+        d = self._daemon(tmp_path, self._worker(status="completed"))
+        self._poll(d, "reject")
+        assert not list((tmp_path / "decisions").glob("*.json"))
+        d.tmux.send_keys.assert_not_called()
+        assert "not running" in _posts(d)
+
+    def test_missing_registered_tmux_session_rejected_before_queue(self, tmp_path):
+        d = self._daemon(tmp_path, self._worker(), session=False)
+        self._poll(d)
+        assert not list((tmp_path / "decisions").glob("*.json"))
+        d.tmux.send_keys.assert_not_called()
+        assert "not active" in _posts(d)
+
+    def test_worker_disappearing_after_queue_rejected_at_consumption(self, tmp_path):
+        d = self._daemon(tmp_path, self._worker())
+        self._poll(d)
+        assert len(list((tmp_path / "decisions").glob("*.json"))) == 1
+        d.registry.get_worker.return_value = None
+        d.process_brain_decisions()
+        d.tmux.send_keys.assert_not_called()
+        assert "not registered" in _posts(d)
+
+    def test_remote_worker_uses_stored_session_and_resolved_ssh_host(self, tmp_path):
+        d = self._daemon(tmp_path, self._worker(machine="remote"), ssh_host="host.example")
+        self._poll(d)
+        d.process_brain_decisions()
+        d.tmux.has_session.assert_called_with("registered-w1", ssh_host="host.example")
+        d.tmux.send_keys.assert_called_once_with("registered-w1", "yes", ssh_host="host.example")
+        assert "Approved plan" in _posts(d)
+
+    def test_send_failure_never_reports_success(self, tmp_path):
+        d = self._daemon(tmp_path, self._worker(), send=False)
+        self._poll(d)
+        d.process_brain_decisions()
+        assert "Approved plan" not in _posts(d)
+        assert "could not be delivered" in _posts(d)
+
+    @pytest.mark.parametrize(("command_type", "expected_keys", "success"), [
+        ("approve", "yes", "Approved plan"),
+        ("reject", "no: User rejected via Slack", "Rejected plan"),
+    ])
+    def test_valid_local_approval_and_rejection_remain_unchanged(
+        self, tmp_path, command_type, expected_keys, success,
+    ):
+        d = self._daemon(tmp_path, self._worker())
+        self._poll(d, command_type)
+        assert len(list((tmp_path / "decisions").glob("*.json"))) == 1
+        d.process_brain_decisions()
+        d.tmux.send_keys.assert_called_once_with("registered-w1", expected_keys, ssh_host=None)
+        assert success in _posts(d)
 
 
 # --- /login relay wiring (Task 4) ---

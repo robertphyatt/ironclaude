@@ -23,6 +23,8 @@ import type {
   TierUpReviewEntry,
 } from './types.js';
 
+export const PLAN_LINEAGE_BLIND_REVIEW_TRIGGER_MESSAGE = 'plan lineage already has a blind review';
+
 // --- Database path ---
 
 function getDbPath(): string {
@@ -160,6 +162,7 @@ export function migrateSchema(db: Database.Database): void {
       { name: 'memory_search_required', type: 'INTEGER NOT NULL', dflt: '0' },
       { name: 'testing_theatre_checked', type: 'INTEGER NOT NULL', dflt: '0' },
       { name: 'review_block_count', type: 'INTEGER NOT NULL', dflt: '0' },
+      { name: 'plan_lineage', type: 'INTEGER NOT NULL', dflt: '0' },
     ];
 
     const currentColumns = db.prepare(`PRAGMA table_info(sessions)`).all() as Array<{name: string}>;
@@ -172,6 +175,41 @@ export function migrateSchema(db: Database.Database): void {
       }
     }
   }
+
+  const tierUpReviewsExists = db.prepare(
+    `SELECT name FROM sqlite_master WHERE type='table' AND name='tier_up_reviews'`,
+  ).get();
+  if (tierUpReviewsExists) {
+    const tierUpReviewColumns = db.prepare(`PRAGMA table_info(tier_up_reviews)`).all() as Array<{name: string}>;
+    if (!tierUpReviewColumns.some((column) => column.name === 'plan_lineage')) {
+      db.exec(`ALTER TABLE tier_up_reviews ADD COLUMN plan_lineage INTEGER NOT NULL DEFAULT 0`);
+      console.error('Migration: added plan_lineage column to tier_up_reviews table.');
+    }
+    installTierUpReviewLineageTrigger(db);
+  }
+}
+
+/**
+ * SQLite is the final concurrency backstop for plan-review cardinality.  The
+ * application checks first so it can return a useful MCP error without any
+ * mutation; this trigger covers concurrent writers that race that check.
+ * Existing historical duplicates are intentionally retained by migration.
+ */
+function installTierUpReviewLineageTrigger(db: Database.Database): void {
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS prevent_duplicate_blind_tier_up_review
+    BEFORE INSERT ON tier_up_reviews
+    WHEN NEW.verdict IN ('SOLID', 'HAS-ISSUES', 'top-tier-self')
+      AND EXISTS (
+        SELECT 1 FROM tier_up_reviews
+        WHERE terminal_session = NEW.terminal_session
+          AND plan_lineage = NEW.plan_lineage
+          AND verdict IN ('SOLID', 'HAS-ISSUES', 'top-tier-self')
+      )
+    BEGIN
+      SELECT RAISE(ABORT, '${PLAN_LINEAGE_BLIND_REVIEW_TRIGGER_MESSAGE}');
+    END;
+  `);
 }
 
 // --- Database initialization ---
@@ -212,6 +250,7 @@ export function initDb(dbPath?: string): Database.Database {
       current_wave INTEGER NOT NULL DEFAULT 0,
       review_pending INTEGER NOT NULL DEFAULT 0,
       review_block_count INTEGER NOT NULL DEFAULT 0,
+      plan_lineage INTEGER NOT NULL DEFAULT 0,
       circuit_breaker INTEGER NOT NULL DEFAULT 0,
       memory_search_required INTEGER NOT NULL DEFAULT 0,
       testing_theatre_checked INTEGER NOT NULL DEFAULT 0,
@@ -288,6 +327,7 @@ export function initDb(dbPath?: string): Database.Database {
     CREATE TABLE IF NOT EXISTS tier_up_reviews (
       id               INTEGER PRIMARY KEY AUTOINCREMENT,
       terminal_session TEXT NOT NULL,
+      plan_lineage    INTEGER NOT NULL DEFAULT 0,
       plan_hash        TEXT NOT NULL,
       reviewer_model   TEXT NOT NULL,
       verdict          TEXT NOT NULL,
@@ -304,6 +344,8 @@ export function initDb(dbPath?: string): Database.Database {
       PRIMARY KEY (terminal_session, tool_name, input_hash)
     );
   `);
+
+  installTierUpReviewLineageTrigger(db);
 
   // Create indexes for common queries
   db.exec(`
@@ -671,44 +713,76 @@ export function clearReviewGrades(db: Database.Database, sessionId: string): voi
 export function insertTierUpReview(
   db: Database.Database,
   sessionId: string,
+  planLineage: number,
   planHash: string,
   reviewerModel: string,
   verdict: string,
 ): void {
   db.prepare(`
-    INSERT INTO tier_up_reviews (terminal_session, plan_hash, reviewer_model, verdict)
-    VALUES (?, ?, ?, ?)
-  `).run(sessionId, planHash, reviewerModel, verdict);
+    INSERT INTO tier_up_reviews (terminal_session, plan_lineage, plan_hash, reviewer_model, verdict)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(sessionId, planLineage, planHash, reviewerModel, verdict);
   walCheckpoint(db);
 }
 
 export function getTierUpReviewByHash(
   db: Database.Database,
   sessionId: string,
+  planLineage: number,
   planHash: string,
 ): TierUpReviewEntry | undefined {
   return db.prepare(`
     SELECT * FROM tier_up_reviews
-    WHERE terminal_session = ? AND plan_hash = ?
+    WHERE terminal_session = ? AND plan_lineage = ? AND plan_hash = ?
     ORDER BY id DESC LIMIT 1
-  `).get(sessionId, planHash) as TierUpReviewEntry | undefined;
+  `).get(sessionId, planLineage, planHash) as TierUpReviewEntry | undefined;
 }
 
-export function getLatestTierUpReview(
+/**
+ * Advisor remediation is an existence condition, not a latest-row condition:
+ * migrated historical rows can contain a later blind duplicate at the same
+ * hash. Such a row must not erase valid remediation evidence. The matching
+ * HAS-ISSUES row must precede the remediation row.
+ */
+export function hasAdvisorRemediatedAtHash(
   db: Database.Database,
   sessionId: string,
+  planLineage: number,
+  planHash: string,
+): boolean {
+  const row = db.prepare(`
+    SELECT 1 AS found FROM tier_up_reviews AS remediation
+    WHERE remediation.terminal_session = ? AND remediation.plan_lineage = ? AND remediation.plan_hash = ?
+      AND remediation.verdict = 'advisor-remediated'
+      AND EXISTS (
+        SELECT 1 FROM tier_up_reviews AS failed_review
+        WHERE failed_review.terminal_session = remediation.terminal_session
+          AND failed_review.plan_lineage = remediation.plan_lineage
+          AND failed_review.verdict = 'HAS-ISSUES'
+          AND failed_review.id < remediation.id
+      )
+    LIMIT 1
+  `).get(sessionId, planLineage, planHash) as { found: number } | undefined;
+  return row !== undefined;
+}
+
+export function getBlindTierUpReviewForLineage(
+  db: Database.Database,
+  sessionId: string,
+  planLineage: number,
 ): TierUpReviewEntry | undefined {
   return db.prepare(`
     SELECT * FROM tier_up_reviews
-    WHERE terminal_session = ?
-    ORDER BY id DESC LIMIT 1
-  `).get(sessionId) as TierUpReviewEntry | undefined;
+    WHERE terminal_session = ? AND plan_lineage = ?
+      AND verdict IN ('SOLID', 'HAS-ISSUES', 'top-tier-self')
+    ORDER BY id ASC LIMIT 1
+  `).get(sessionId, planLineage) as TierUpReviewEntry | undefined;
 }
 
 /**
  * Existence check: did a review with `verdict` land in this session BEFORE row `beforeId`?
  *
- * Deliberately NOT scoped by plan_hash. The advisor-remediated gate pairs a HAS-ISSUES
+ * Deliberately not scoped by plan_hash, but always scoped by plan_lineage. The advisor-remediated gate pairs a HAS-ISSUES
  * review of plan vN with an advisor-remediated review of the revised plan vN+1, and those
  * bind different hashes — filtering by the current hash would never find the HAS-ISSUES row.
  *
@@ -719,13 +793,14 @@ export function getLatestTierUpReview(
 export function hasEarlierTierUpVerdict(
   db: Database.Database,
   sessionId: string,
+  planLineage: number,
   verdict: string,
   beforeId: number,
 ): boolean {
   const row = db.prepare(`
     SELECT 1 AS found FROM tier_up_reviews
-    WHERE terminal_session = ? AND verdict = ? AND id < ?
+    WHERE terminal_session = ? AND plan_lineage = ? AND verdict = ? AND id < ?
     LIMIT 1
-  `).get(sessionId, verdict, beforeId) as { found: number } | undefined;
+  `).get(sessionId, planLineage, verdict, beforeId) as { found: number } | undefined;
   return row !== undefined;
 }

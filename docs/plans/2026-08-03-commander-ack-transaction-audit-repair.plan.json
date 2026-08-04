@@ -1,0 +1,97 @@
+{
+  "name": "Commander Acknowledgment Transaction and Audit Repair",
+  "goal": "Prevent acknowledgment persistence from owning an existing caller transaction and remove duplicate audit disposition totals without changing normal Commander behavior.",
+  "requirements_file": "docs/plans/2026-08-03-commander-actionable-work-convergence-requirements.md",
+  "design_file": "docs/plans/2026-08-03-commander-ack-transaction-audit-repair-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Enforce transaction ownership and canonical audit totals",
+      "description": "A sequential Terra worker adds RED tests, the idle-transaction guard, and deletion-only audit cleanup, then runs focused regressions and stages only its four files.",
+      "allowed_files": [
+        "commander/src/ironclaude/db.py",
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_db.py",
+        "commander/tests/test_daemon.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add one real-SQLite active-transaction RED test that verifies through the caller connection that its pending objective remains and no acknowledgement exists before rollback, while an independent reader sees neither write; expose in_transaction on the existing failure test double; update two audit tests to require only Directives, Acknowledged, and Unresolved totals."
+        },
+        {
+          "description": "Run the three exact RED tests.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_db.py::test_persist_operator_message_acknowledgement_rejects_active_transaction tests/test_daemon.py::TestHandleAudit::test_audit_all_mapped tests/test_daemon.py::TestHandleAudit::test_audit_all_unmapped",
+          "expected": "FAIL because the helper does not raise and both duplicate audit labels remain."
+        },
+        {
+          "description": "Add the idle-transaction RuntimeError before any helper SQL and delete only the two duplicate audit summary lines."
+        },
+        {
+          "description": "Run the exact three tests GREEN.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_db.py::test_persist_operator_message_acknowledgement_rejects_active_transaction tests/test_daemon.py::TestHandleAudit::test_audit_all_mapped tests/test_daemon.py::TestHandleAudit::test_audit_all_unmapped",
+          "expected": "PASS, exit 0."
+        },
+        {
+          "description": "Run focused helper, audit, MCP, and transport regression.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_db.py tests/test_daemon.py tests/test_orchestrator_mcp.py -k 'operator_message_acknowledgement or audit or transport_acknowledgement or TestAcknowledgeOperatorMessage'",
+          "expected": "PASS, exit 0; record measured count."
+        },
+        {
+          "description": "Stage only Task 1 files and run staged diff check.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -- commander/src/ironclaude/db.py commander/src/ironclaude/main.py commander/tests/test_db.py commander/tests/test_daemon.py && git -C /Users/roberthyatt/Code/ironclaude diff --staged --check",
+          "expected": "Four Task 1 files staged; exit 0; no commit or push."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Full regression restart and bounded findings",
+      "description": "Main context verifies protected scope, runs combined and full Commander regressions, restarts the sole daemon, checks topology and retained disposition evidence, writes findings, and stages workflow artifacts without commit or push.",
+      "allowed_files": [
+        "docs/plans/2026-08-03-commander-ack-transaction-audit-repair-findings.md"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Verify protected hashes and unstaged status.",
+          "command": "shasum -a 256 /Users/roberthyatt/Code/ironclaude/AGENTS.md /Users/roberthyatt/Code/ironclaude/commander/config/ironclaude.json && git -C /Users/roberthyatt/Code/ironclaude status --short",
+          "expected": "Protected hashes match plan invariants; protected files remain unstaged."
+        },
+        {
+          "description": "Run combined focused regression.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_db.py tests/test_orchestrator_mcp.py tests/test_enforcement.py tests/test_main_validate.py tests/test_slack_interface.py tests/test_codex_brain_client.py tests/test_daemon.py",
+          "expected": "PASS, exit 0; record measured count."
+        },
+        {
+          "description": "Run full Commander suite.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q tests/",
+          "expected": "PASS, exit 0; record measured pass and skip counts."
+        },
+        {
+          "description": "Restart the identity-checked sole Commander.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/ironclaude restart",
+          "expected": "Sole daemon restarts without duplicate start."
+        },
+        {
+          "description": "Verify one daemon, one Codex Brain app-server, fresh startup, two retained acknowledgments, and the operator-confirmed actionable source directive.",
+          "command": "ps -axo pid,ppid,lstart,command | rg 'ironclaude\\.main|codex app-server' && tail -n 300 /tmp/ironclaude-daemon.log | rg 'Brain SDK client started|Brain Codex client started|IronClaude Commander daemon starting|Bolt app is running' && sqlite3 /Users/roberthyatt/Code/ironclaude/commander/data/db/ironclaude.db \"SELECT source_ts,reason,created_at FROM operator_message_acknowledgements WHERE source_ts IN ('1785805709.575399','1785807711.015959') ORDER BY source_ts;\" && sqlite3 /Users/roberthyatt/Code/ironclaude/commander/data/db/ironclaude.db \"SELECT id,source_ts,status,interpretation_ts FROM directives WHERE source_ts='1785808112.894889' ORDER BY id;\"",
+          "expected": "Healthy sole topology; both acknowledgments and actionable directive row remain; no new Slack work created."
+        },
+        {
+          "description": "Write bounded findings containing root cause, RED and GREEN output, measured regression counts, restart topology, retained database evidence, protected hashes, and no-commit/no-push statement."
+        },
+        {
+          "description": "Force-stage four repair workflow artifacts and run staged diff check.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f -- docs/plans/2026-08-03-commander-ack-transaction-audit-repair-design.md docs/plans/2026-08-03-commander-ack-transaction-audit-repair.md docs/plans/2026-08-03-commander-ack-transaction-audit-repair.plan.json docs/plans/2026-08-03-commander-ack-transaction-audit-repair-findings.md && git -C /Users/roberthyatt/Code/ironclaude diff --staged --check",
+          "expected": "Repair changes and four repair workflow artifacts staged; diff check passes; no commit or push."
+        },
+        {
+          "description": "Verify final protected hashes and status.",
+          "command": "shasum -a 256 /Users/roberthyatt/Code/ironclaude/AGENTS.md /Users/roberthyatt/Code/ironclaude/commander/config/ironclaude.json && git -C /Users/roberthyatt/Code/ironclaude status --short",
+          "expected": "Protected files unchanged and unstaged; no files beyond existing convergence work and this repair loop are staged; no commit or push."
+        }
+      ]
+    }
+  ]
+}

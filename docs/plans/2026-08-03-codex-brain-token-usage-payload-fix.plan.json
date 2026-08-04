@@ -1,0 +1,91 @@
+{
+  "name": "Codex Brain Token-Usage Payload Parity Fix",
+  "goal": "Restore existing Commander heartbeat token accounting for Codex Brain by reading the cumulative breakdown in the installed app-server payload.",
+  "requirements_file": "docs/plans/2026-08-03-codex-brain-token-usage-payload-fix-requirements.md",
+  "design_file": "docs/plans/2026-08-03-codex-brain-token-usage-payload-fix-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Normalize cumulative Codex token usage with protocol-shaped TDD",
+      "description": "Preserve flat fallback coverage, add the installed nested payload, prove RED, select tokenUsage.total in the provider adapter, prove GREEN, and stage only the two bounded files.",
+      "allowed_files": [
+        "commander/tests/test_codex_brain_client.py",
+        "commander/src/ironclaude/codex_brain_client.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Keep the existing flat fallback test and add a schema-shaped event whose last and total values differ and whose explicit totalTokens is 191 rather than the derived sum 180."
+        },
+        {
+          "description": "Run the single protocol-shaped test and prove it fails because the current parser returns zero.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest /Users/roberthyatt/Code/ironclaude/commander/tests/test_codex_brain_client.py::TestTokenUsageEventName::test_real_token_usage_event_populates_cumulative_usage -q",
+          "expected": "Exit 1 with assertion 0 == 110; after GREEN, the explicit 191 assertion also rejects a parser that always derives 180. Any other RED result stops execution."
+        },
+        {
+          "description": "Update CodexBrainClient.get_token_usage to select dictionary-valued usage.total and otherwise retain flat parsing."
+        },
+        {
+          "description": "Run the focused Codex Brain client suite.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest /Users/roberthyatt/Code/ironclaude/commander/tests/test_codex_brain_client.py -q",
+          "expected": "Exit 0; all Codex Brain client tests pass."
+        },
+        {
+          "description": "Run notification tests to prove presentation behavior remains unchanged.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest /Users/roberthyatt/Code/ironclaude/commander/tests/test_notifications.py -q",
+          "expected": "Exit 0; all notification tests pass."
+        },
+        {
+          "description": "Stage only the two Task 1 source and test paths.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -- commander/src/ironclaude/codex_brain_client.py commander/tests/test_codex_brain_client.py",
+          "expected": "Exit 0; the two bounded Task 1 paths are staged."
+        },
+        {
+          "description": "Enumerate staged paths and reject any unrelated source path.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached --name-only | /usr/bin/python3 -c 'import sys; paths=[line.strip() for line in sys.stdin if line.strip()]; required={\"commander/src/ironclaude/codex_brain_client.py\",\"commander/tests/test_codex_brain_client.py\"}; workflow={\"docs/plans/2026-08-03-codex-brain-token-usage-payload-fix-design.md\",\"docs/plans/2026-08-03-codex-brain-token-usage-payload-fix-requirements.md\",\"docs/plans/2026-08-03-codex-brain-token-usage-payload-fix.md\",\"docs/plans/2026-08-03-codex-brain-token-usage-payload-fix.plan.json\"}; unexpected=set(paths)-(required|workflow); missing=required-set(paths); print(\"STAGED_PATHS\"); print(\"\\n\".join(paths)); print(\"MISSING_TASK_PATHS=\"+(\"none\" if not missing else \",\".join(sorted(missing)))); print(\"UNEXPECTED_PATHS=\"+(\"none\" if not unexpected else \",\".join(sorted(unexpected)))); raise SystemExit(0 if not missing and not unexpected else 1)'",
+          "expected": "Exit 0 with all four workflow artifacts and both Task 1 paths listed, MISSING_TASK_PATHS=none, and UNEXPECTED_PATHS=none."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Run full verification and activate the repaired Commander",
+      "description": "Make no file edits; run the full Commander suite, verify a single live runtime, use the existing SIGHUP restart path, and inspect bounded startup evidence.",
+      "allowed_files": [
+        "commander/src/ironclaude/codex_brain_client.py",
+        "commander/tests/test_codex_brain_client.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Run the full Commander test suite.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest /Users/roberthyatt/Code/ironclaude/commander/tests -q",
+          "expected": "Exit 0; complete Commander suite passes."
+        },
+        {
+          "description": "Enumerate pre-restart Commander and Codex app-server processes and require exactly one of each.",
+          "command": "ps -axo pid=,ppid=,command= | /usr/bin/python3 -c 'import sys; rows=[]; [rows.append((int(parts[0]),int(parts[1]),parts[2])) for line in sys.stdin for parts in [line.strip().split(None,2)] if len(parts)==3]; daemons=[row for row in rows if \"/commander/.venv/bin/python -m ironclaude.main\" in row[2] and \"python3 -c\" not in row[2]]; parents={pid:ppid for pid,ppid,_ in rows}; descends=lambda pid,ancestor: any(parent==ancestor for parent in iter(lambda p=[pid]: (p.__setitem__(0,parents.get(p[0],-1)) or p[0]),-1)); owned=[] if len(daemons)!=1 else [row for row in rows if row[2].startswith(\"codex app-server\") and descends(row[0],daemons[0][0])]; print(f\"COMMANDER_DAEMONS={len(daemons)}\"); print(f\"COMMANDER_OWNED_CODEX_APP_SERVERS={len(owned)}\"); print(\"\\n\".join(str(row) for row in daemons+owned)); raise SystemExit(0 if len(daemons)==1 and len(owned)==1 else 1)'",
+          "expected": "Exit 0 with COMMANDER_DAEMONS=1 and COMMANDER_OWNED_CODEX_APP_SERVERS=1 plus enumerated owned processes."
+        },
+        {
+          "description": "Send the existing Commander restart signal.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/ironclaude restart",
+          "expected": "Exit 0 with Restart signal sent to daemon PID followed by the enumerated PID."
+        },
+        {
+          "description": "In a later invocation, enumerate post-restart processes and require exactly one Commander and one Codex app-server.",
+          "command": "ps -axo pid=,ppid=,command= | /usr/bin/python3 -c 'import sys; rows=[]; [rows.append((int(parts[0]),int(parts[1]),parts[2])) for line in sys.stdin for parts in [line.strip().split(None,2)] if len(parts)==3]; daemons=[row for row in rows if \"/commander/.venv/bin/python -m ironclaude.main\" in row[2] and \"python3 -c\" not in row[2]]; parents={pid:ppid for pid,ppid,_ in rows}; descends=lambda pid,ancestor: any(parent==ancestor for parent in iter(lambda p=[pid]: (p.__setitem__(0,parents.get(p[0],-1)) or p[0]),-1)); owned=[] if len(daemons)!=1 else [row for row in rows if row[2].startswith(\"codex app-server\") and descends(row[0],daemons[0][0])]; print(f\"COMMANDER_DAEMONS={len(daemons)}\"); print(f\"COMMANDER_OWNED_CODEX_APP_SERVERS={len(owned)}\"); print(\"\\n\".join(str(row) for row in daemons+owned)); raise SystemExit(0 if len(daemons)==1 and len(owned)==1 else 1)'",
+          "expected": "Exit 0 with COMMANDER_DAEMONS=1 and COMMANDER_OWNED_CODEX_APP_SERVERS=1 plus enumerated owned processes."
+        },
+        {
+          "description": "Inspect the last 160 daemon-log lines for bounded restart evidence.",
+          "command": "/usr/bin/tail -n 160 /tmp/ironclaude-daemon.log",
+          "expected": "Recent output contains the SIGHUP restart request and fresh Brain and Commander startup markers without a later startup traceback or duplicate-daemon exit."
+        },
+        {
+          "description": "Perform one post-verification read of a naturally available post-turn heartbeat; otherwise report live token-counter acceptance pending without polling, synthetic work, another restart, or scope changes."
+        }
+      ]
+    }
+  ]
+}

@@ -88,6 +88,40 @@ class TestTokenUsageEventName:
         assert usage["input_tokens"] == 11
         assert usage["output_tokens"] == 7
 
+    def test_real_token_usage_event_populates_cumulative_usage(self):
+        client = CodexBrainClient()
+        client._handle_event({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "tokenUsage": {
+                    "last": {
+                        "inputTokens": 11,
+                        "cachedInputTokens": 0,
+                        "outputTokens": 7,
+                        "reasoningOutputTokens": 0,
+                        "totalTokens": 18,
+                    },
+                    "total": {
+                        "inputTokens": 110,
+                        "cachedInputTokens": 0,
+                        "outputTokens": 70,
+                        "reasoningOutputTokens": 0,
+                        "totalTokens": 191,
+                    },
+                },
+                "modelContextWindow": 258400,
+            },
+        })
+        usage = client.get_token_usage()
+        assert usage is not None
+        assert usage["input_tokens"] == 110
+        assert usage["output_tokens"] == 70
+        assert usage["total_tokens"] == 191
+        assert usage["cost_usd"] == 0.0
+        assert usage["seconds_since_last_activity"] is not None
+
 
 class TestFailClosedApprovals:
     # Confirmed from the generated schema (2026-07-23): ServerRequest.json method
@@ -651,7 +685,9 @@ class TestOrchestratorMcpWiring:
         assert "mcp_servers.orchestrator.startup_timeout_sec=120" in joined
         assert "mcp_servers.orchestrator.cwd=" in joined
         assert (
-            'mcp_servers.orchestrator.env_vars=["SUPABASE_URL","SUPABASE_ANON_KEY"]'
+            'mcp_servers.orchestrator.env_vars=["SUPABASE_URL","SUPABASE_ANON_KEY",'
+            '"SLACK_BOT_TOKEN","SLACK_CHANNEL_ID","SLACK_USER_TOKEN",'
+            '"SLACK_OPERATOR_USER_ID","OPERATOR_NAME"]'
             in joined
         )
         assert (
@@ -662,10 +698,21 @@ class TestOrchestratorMcpWiring:
         assert argv[-1] == "--stdio"
 
     def test_secret_stays_in_spawn_env_and_out_of_argv(self, monkeypatch):
-        monkeypatch.setenv("SUPABASE_ANON_KEY", "secret-sentinel")
+        sentinels = {
+            "SUPABASE_ANON_KEY": "supabase-secret-sentinel",
+            "SLACK_BOT_TOKEN": "slack-bot-secret-sentinel",
+            "SLACK_USER_TOKEN": "slack-user-secret-sentinel",
+        }
+        for name, value in sentinels.items():
+            monkeypatch.setenv(name, value)
+
         client = CodexBrainClient()
-        assert client._spawn_env()["SUPABASE_ANON_KEY"] == "secret-sentinel"
-        assert "secret-sentinel" not in "\n".join(client._app_server_argv())
+        spawn_env = client._spawn_env()
+        argv_text = "\n".join(client._app_server_argv())
+
+        for name, value in sentinels.items():
+            assert spawn_env[name] == value
+            assert value not in argv_text
 
     def test_preflight_uses_same_interpreter_cwd_and_environment(self, monkeypatch):
         import ironclaude.codex_brain_client as module
@@ -747,6 +794,7 @@ class TestOrchestratorStartupReadiness:
         "reject_plan",
         "send_to_worker",
         "kill_worker",
+        "acknowledge_operator_message",
     }
 
     @staticmethod
@@ -929,6 +977,22 @@ class TestOrchestratorStartupReadiness:
             lambda: (inventory, None),
         )
         assert fragment in client._verify_orchestrator_mcp()
+
+    def test_verify_rejects_stale_acknowledgement_inventory(self, monkeypatch):
+        client = CodexBrainClient()
+        stale_tools = self.REQUIRED - {"acknowledge_operator_message"}
+        inventory = {
+            "orchestrator": {
+                "tools": {name: {"name": name} for name in stale_tools},
+            },
+            "episodic-memory": {"tools": {}},
+        }
+        monkeypatch.setattr(client, "_await_orchestrator_ready", lambda timeout: None)
+        monkeypatch.setattr(client, "_list_mcp_server_inventory", lambda: (inventory, None))
+
+        assert client._verify_orchestrator_mcp() == (
+            "orchestrator MCP inventory missing tools: acknowledge_operator_message"
+        )
 
     def test_verify_requires_ready_before_inventory(self, monkeypatch):
         client = CodexBrainClient()

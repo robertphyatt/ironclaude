@@ -144,6 +144,24 @@ If validation fails, the MCP returns an error with specific issues. Fix the plan
 
 **Step 1.5: Tier-up plan review (policy-gated)**
 
+Immediately after `create_plan`, before selecting or dispatching any reviewer, call
+`mcp__plugin_ironclaude_state-manager__get_resume_state`. Inspect only its bounded
+`review_summary` for the current plan lineage:
+
+- No `canonical_blind_verdict`: continue to the policy branch below; this lineage
+  has not consumed its one blind review.
+- Matching `SOLID` or `top-tier-self`: skip reviewer dispatch and continue to Step 2.
+- `HAS-ISSUES` without `current_hash_advisor_remediated`: resume the existing
+  non-blind fix-advisor/remediation path below. Do not dispatch a replacement blind
+  review. If its findings are unavailable after compaction, recover them with
+  `ironclaude:remembering-conversations`; if they still cannot be recovered, fail
+  closed rather than manufacturing a new review.
+- `HAS-ISSUES` with `current_hash_advisor_remediated`: skip reviewer dispatch and
+  continue to Step 2.
+- A passing canonical verdict whose hash does not match the current plan: fail
+  closed. Restore the exact reviewed plan or make a verified retreat to
+  brainstorming; do not dispatch another plan review.
+
 Read `tier_up_review_policy` from `~/.claude/ironclaude-hooks-config.json` (if the
 `IRONCLAUDE_HOOKS_CONFIG_PATH` env var is set, read that path instead — this mirrors
 the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`

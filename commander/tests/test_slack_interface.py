@@ -2,9 +2,34 @@
 import logging
 import pytest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
-from ironclaude.slack_interface import SlackBot, parse_inbound_command
+from ironclaude.slack_interface import SlackBot, parse_inbound_command, parse_reply_to_marker
+
+
+class TestParseReplyToMarker:
+    def test_parse_reply_to_marker_cleans_strict_valid_marker(self):
+        assert parse_reply_to_marker("  [reply-to:1700000000.123456]  reply body") == (
+            "reply body", "1700000000.123456",
+        )
+
+    def test_parse_reply_to_marker_preserves_unmarked_text(self):
+        text = "Waiting for your decision on #12"
+        assert parse_reply_to_marker(text) == (text, None)
+
+    def test_parse_reply_to_marker_preserves_nonleading_marker_text(self):
+        text = "Update [reply-to:1700000000.123456] remains ordinary text"
+        assert parse_reply_to_marker(text) == (text, None)
+
+    @pytest.mark.parametrize("text", [
+        "[reply-to:not-a-ts] body",
+        "[reply-to:1.2.3] body",
+    ])
+    def test_parse_reply_to_marker_suppresses_malformed_leading_marker(self, text):
+        assert parse_reply_to_marker(text) is None
+
+    def test_parse_reply_to_marker_accepts_marker_only_body(self):
+        assert parse_reply_to_marker("[reply-to:1.2]   ") == ("", "1.2")
 
 
 class TestSlackBot:
@@ -341,6 +366,17 @@ class TestParseInboundCommand:
 
 
 class TestSlackBotReactions:
+    @staticmethod
+    def _pin_item(item_type, created, locator):
+        item = {"type": item_type, "created": created}
+        if item_type == "message":
+            item["message"] = {"ts": locator}
+        elif item_type == "file":
+            item["file"] = {"id": locator}
+        elif item_type == "file_comment":
+            item["comment"] = {"id": locator}
+        return item
+
     @patch("ironclaude.slack_interface.WebClient")
     def test_add_reaction_calls_api(self, mock_client_cls):
         mock_client = MagicMock()
@@ -420,13 +456,15 @@ class TestSlackBotReactions:
     @patch("ironclaude.slack_interface.WebClient")
     def test_pin_message_calls_api(self, mock_client_cls):
         mock_client = MagicMock()
+        mock_client.pins_list.return_value = {"items": []}
         mock_client_cls.return_value = mock_client
         bot = SlackBot(token="xoxb-test", channel_id="C123")
         result = bot.pin_message("123.456")
         assert result is True
-        mock_client.pins_add.assert_called_once_with(
-            channel="C123", timestamp="123.456",
-        )
+        assert mock_client.method_calls == [
+            call.pins_list(channel="C123"),
+            call.pins_add(channel="C123", timestamp="123.456"),
+        ]
 
     @patch("ironclaude.slack_interface.WebClient")
     def test_pin_message_ignores_already_pinned(self, mock_client_cls):
@@ -437,6 +475,7 @@ class TestSlackBotReactions:
         mock_client.pins_add.side_effect = SlackApiError(
             message="already_pinned", response=mock_response,
         )
+        mock_client.pins_list.return_value = {"items": []}
         mock_client_cls.return_value = mock_client
         bot = SlackBot(token="xoxb-test", channel_id="C123")
         result = bot.pin_message("123.456")
@@ -445,12 +484,172 @@ class TestSlackBotReactions:
     @patch("ironclaude.slack_interface.WebClient")
     def test_pin_message_returns_false_on_failure(self, mock_client_cls, caplog):
         mock_client = MagicMock()
+        mock_client.pins_list.return_value = {"items": []}
         mock_client.pins_add.side_effect = Exception("api error")
         mock_client_cls.return_value = mock_client
         bot = SlackBot(token="xoxb-test", channel_id="C123")
         with caplog.at_level(logging.WARNING, logger="ironclaude.slack"):
             result = bot.pin_message("123.456")
         assert result is False
+
+    @pytest.mark.parametrize(
+        "response", [None, [], {}, {"items": None}, {"items": {}}],
+    )
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_pin_message_fails_closed_on_invalid_inventory_shape(
+        self, mock_client_cls, response,
+    ):
+        mock_client = MagicMock()
+        mock_client.pins_list.return_value = response
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+
+        assert bot.pin_message("new.001") is False
+        mock_client.pins_remove.assert_not_called()
+        mock_client.pins_add.assert_not_called()
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_pin_message_fails_closed_when_inventory_raises(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.pins_list.side_effect = Exception("inventory unavailable")
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+
+        assert bot.pin_message("new.001") is False
+        mock_client.pins_remove.assert_not_called()
+        mock_client.pins_add.assert_not_called()
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_pin_message_below_capacity_does_not_validate_unselected_items(
+        self, mock_client_cls,
+    ):
+        mock_client = MagicMock()
+        mock_client.pins_list.return_value = {"items": [None]}
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+
+        assert bot.pin_message("target.001") is True
+        assert mock_client.method_calls == [
+            call.pins_list(channel="C123"),
+            call.pins_add(channel="C123", timestamp="target.001"),
+        ]
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_pin_message_fails_closed_above_capacity(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.pins_list.return_value = {
+            "items": [
+                self._pin_item("message", index, f"pin.{index:03d}")
+                for index in range(101)
+            ]
+        }
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+
+        assert bot.pin_message("target.001") is False
+        assert mock_client.method_calls == [call.pins_list(channel="C123")]
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_pin_message_over_capacity_keeps_already_pinned_target_idempotent(
+        self, mock_client_cls,
+    ):
+        mock_client = MagicMock()
+        items = [
+            self._pin_item("message", index, f"pin.{index:03d}")
+            for index in range(100)
+        ]
+        items.append(self._pin_item("message", 200, "target.001"))
+        mock_client.pins_list.return_value = {"items": items}
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+
+        assert bot.pin_message("target.001") is True
+        assert mock_client.method_calls == [call.pins_list(channel="C123")]
+
+    @pytest.mark.parametrize(
+        ("item_type", "locator", "remove_kwargs"),
+        [
+            ("message", "old.001", {"timestamp": "old.001"}),
+            ("file", "FOLD", {"file": "FOLD"}),
+            ("file_comment", "FCOLD", {"file_comment": "FCOLD"}),
+        ],
+    )
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_pin_message_at_capacity_removes_oldest_type_before_add(
+        self, mock_client_cls, item_type, locator, remove_kwargs,
+    ):
+        mock_client = MagicMock()
+        newer = [
+            self._pin_item("message", 1000 + index, f"newer.{index:03d}")
+            for index in range(99)
+        ]
+        oldest = self._pin_item(item_type, 1, locator)
+        mock_client.pins_list.return_value = {"items": newer[:50] + [oldest] + newer[50:]}
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+
+        assert bot.pin_message("target.001") is True
+        assert mock_client.method_calls == [
+            call.pins_list(channel="C123"),
+            call.pins_remove(channel="C123", **remove_kwargs),
+            call.pins_add(channel="C123", timestamp="target.001"),
+        ]
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_pin_message_at_capacity_does_not_evict_already_pinned_target(
+        self, mock_client_cls,
+    ):
+        mock_client = MagicMock()
+        items = [
+            self._pin_item("message", index, f"pin.{index:03d}")
+            for index in range(99)
+        ]
+        items.append(self._pin_item("message", 200, "target.001"))
+        mock_client.pins_list.return_value = {"items": items}
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+
+        assert bot.pin_message("target.001") is True
+        assert mock_client.method_calls == [call.pins_list(channel="C123")]
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_pin_message_at_capacity_fails_closed_on_malformed_item(
+        self, mock_client_cls,
+    ):
+        mock_client = MagicMock()
+        items = [
+            self._pin_item("message", 1000 + index, f"pin.{index:03d}")
+            for index in range(99)
+        ]
+        items.append({"type": "file", "created": 2000, "file": {}})
+        mock_client.pins_list.return_value = {"items": items}
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+
+        assert bot.pin_message("target.001") is False
+        mock_client.pins_remove.assert_not_called()
+        mock_client.pins_add.assert_not_called()
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_pin_message_at_capacity_fails_closed_when_remove_fails(
+        self, mock_client_cls,
+    ):
+        mock_client = MagicMock()
+        mock_client.pins_list.return_value = {
+            "items": [
+                self._pin_item("message", index, f"pin.{index:03d}")
+                for index in range(100)
+            ]
+        }
+        mock_client.pins_remove.side_effect = Exception("remove failed")
+        mock_client_cls.return_value = mock_client
+        bot = SlackBot(token="xoxb-test", channel_id="C123")
+
+        assert bot.pin_message("target.001") is False
+        mock_client.pins_remove.assert_called_once_with(
+            channel="C123", timestamp="pin.000",
+        )
+        mock_client.pins_add.assert_not_called()
 
     @patch("ironclaude.slack_interface.WebClient")
     def test_unpin_message_calls_api(self, mock_client_cls):

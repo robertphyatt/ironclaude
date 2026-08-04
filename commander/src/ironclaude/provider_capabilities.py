@@ -110,7 +110,8 @@ class CapabilityProbe:
                 host, client, role, tier, True, True, False, None,
                 available=False, reason="executable_error",
             )
-        if result.returncode == 0 and "chatgpt" in result.stdout.casefold():
+        auth_status = f"{result.stdout}\n{result.stderr}".casefold()
+        if result.returncode == 0 and "chatgpt" in auth_status:
             return self._capability(
                 host, client, role, tier, True, True, True, True, available=True
             )

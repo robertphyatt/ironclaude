@@ -1,7 +1,8 @@
 # tests/test_db.py
 import sqlite3
+import threading
 import pytest
-from ironclaude.db import init_db
+from ironclaude.db import init_db, persist_operator_message_acknowledgement
 
 
 class TestInitDb:
@@ -247,3 +248,259 @@ def test_init_db_migrates_index_after_column_add(tmp_path):
     ).fetchall()
     idx_names = [r[0] for r in idx_rows]
     assert "idx_directives_superseded_by" in idx_names, f"index missing: {idx_names}"
+
+
+def test_operator_message_acknowledgement_table_and_persistence(tmp_path):
+    db_path = str(tmp_path / "ack.db")
+    conn = init_db(db_path)
+    assert conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='operator_message_acknowledgements'"
+    ).fetchone() is not None
+    conn.execute(
+        "INSERT INTO operator_message_acknowledgements (source_ts, reason) VALUES (?, ?)",
+        ("1785731067.460039", "no action requested"),
+    )
+    conn.commit()
+    conn.close()
+
+    reopened = init_db(db_path)
+    row = reopened.execute(
+        "SELECT source_ts, reason FROM operator_message_acknowledgements WHERE source_ts=?",
+        ("1785731067.460039",),
+    ).fetchone()
+    assert tuple(row) == ("1785731067.460039", "no action requested")
+    reopened.close()
+
+
+def test_persist_operator_message_acknowledgement_validation_does_not_touch_connection(tmp_path):
+    conn = init_db(str(tmp_path / "validation.db"))
+    for source_ts, reason in (("bad", "reason"), (1785731067.460039, "reason"),
+                              ("1785731067.460039", ""), ("1785731067.460039", "   ")):
+        with pytest.raises(ValueError):
+            persist_operator_message_acknowledgement(conn, source_ts, reason)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM operator_message_acknowledgements"
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+def test_persist_operator_message_acknowledgement_rejects_none_connection_without_opening_path(tmp_path):
+    db_path = tmp_path / "must-not-be-created.db"
+    assert not db_path.exists()
+    with pytest.raises(
+        RuntimeError,
+        match="^Database connection required for operator message acknowledgement$",
+    ):
+        persist_operator_message_acknowledgement(None, "1785731067.460039", "no action")
+    assert not db_path.exists()
+
+
+def test_persist_operator_message_acknowledgement_rejects_active_transaction(tmp_path):
+    db_path = str(tmp_path / "active-transaction.db")
+    conn = init_db(db_path)
+    reader = sqlite3.connect(db_path)
+    try:
+        conn.execute("INSERT INTO objectives (text, status) VALUES ('pending', 'active')")
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "^Database connection already has an active transaction; operator message "
+                "acknowledgement requires an idle connection\\.$"
+            ),
+        ):
+            persist_operator_message_acknowledgement(
+                conn, "1785731067.460039", "no action",
+            )
+
+        assert conn.in_transaction
+        assert conn.execute("SELECT COUNT(*) FROM objectives").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM operator_message_acknowledgements"
+        ).fetchone()[0] == 0
+        assert reader.execute("SELECT COUNT(*) FROM objectives").fetchone()[0] == 0
+        assert reader.execute(
+            "SELECT COUNT(*) FROM operator_message_acknowledgements"
+        ).fetchone()[0] == 0
+
+        conn.rollback()
+        persist_operator_message_acknowledgement(
+            conn, "1785731067.460039", "no action",
+        )
+        assert reader.execute(
+            "SELECT COUNT(*) FROM operator_message_acknowledgements"
+        ).fetchone()[0] == 1
+    finally:
+        reader.close()
+        conn.close()
+
+
+def test_persist_operator_message_acknowledgement_rolls_back_persistence_errors(tmp_path):
+    class CommitFailingConnection:
+        def __init__(self, inner):
+            self.inner = inner
+            self.rollbacks = 0
+
+        def execute(self, *args):
+            return self.inner.execute(*args)
+
+        @property
+        def in_transaction(self):
+            return self.inner.in_transaction
+
+        def commit(self):
+            raise sqlite3.OperationalError("commit failure")
+
+        def rollback(self):
+            self.rollbacks += 1
+            self.inner.rollback()
+
+    inner = init_db(str(tmp_path / "rollback.db"))
+    conn = CommitFailingConnection(inner)
+    with pytest.raises(sqlite3.OperationalError, match="commit failure"):
+        persist_operator_message_acknowledgement(conn, "1785731067.460039", "no action")
+    assert conn.rollbacks == 1
+    assert inner.execute(
+        "SELECT COUNT(*) FROM operator_message_acknowledgements"
+    ).fetchone()[0] == 0
+    inner.close()
+
+
+def test_persist_operator_message_acknowledgement_is_immutable_with_plain_rows(tmp_path):
+    conn = init_db(str(tmp_path / "immutable.db"))
+    conn.row_factory = None
+    source_ts = "1785731067.460039"
+    first = persist_operator_message_acknowledgement(conn, source_ts, "first reason")
+    repeated = persist_operator_message_acknowledgement(conn, source_ts, "second reason")
+    assert repeated == first
+    assert first["source_ts"] == source_ts
+    assert first["reason"] == "first reason"
+    assert conn.execute(
+        "SELECT reason FROM operator_message_acknowledgements WHERE source_ts=?", (source_ts,)
+    ).fetchone()[0] == "first reason"
+    conn.close()
+
+
+def test_persist_operator_message_acknowledgement_concurrent_calls_converge(tmp_path):
+    db_path = str(tmp_path / "ack-race.db")
+    init_db(db_path).close()
+    source_ts = "1785731067.460039"
+    barrier = threading.Barrier(2)
+    outcomes = []
+    errors = []
+
+    def acknowledge(reason):
+        conn = init_db(db_path)
+        try:
+            barrier.wait()
+            outcomes.append(persist_operator_message_acknowledgement(conn, source_ts, reason))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=acknowledge, args=(reason,)) for reason in ("first", "second")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert len(outcomes) == 2
+    assert outcomes[0] == outcomes[1]
+    conn = init_db(db_path)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM operator_message_acknowledgements WHERE source_ts=?", (source_ts,)
+    ).fetchone()[0] == 1
+    conn.close()
+
+
+def test_operator_message_disposition_exclusivity_both_insert_orders(tmp_path):
+    conn = init_db(str(tmp_path / "exclusive.db"))
+    source_ts = "1785731067.460039"
+    conn.execute(
+        "INSERT INTO directives (source_ts, source_text, interpretation) VALUES (?, 'x', 'x')",
+        (source_ts,),
+    )
+    conn.commit()
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO operator_message_acknowledgements (source_ts, reason) VALUES (?, 'no')",
+            (source_ts,),
+        )
+    conn.rollback()
+    conn.execute(
+        "INSERT INTO operator_message_acknowledgements (source_ts, reason) VALUES (?, 'no')",
+        ("1785731067.460040",),
+    )
+    conn.commit()
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO directives (source_ts, source_text, interpretation) VALUES (?, 'x', 'x')",
+            ("1785731067.460040",),
+        )
+    conn.close()
+
+
+def test_operator_message_disposition_exclusivity_two_connections_race(tmp_path):
+    db_path = str(tmp_path / "race.db")
+    init_db(db_path).close()
+    source_ts = "1785731067.460039"
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def insert_disposition(kind):
+        conn = init_db(db_path)
+        try:
+            barrier.wait()
+            if kind == "ack":
+                persist_operator_message_acknowledgement(conn, source_ts, "no")
+            else:
+                conn.execute(
+                    "INSERT INTO directives (source_ts, source_text, interpretation) VALUES (?, 'x', 'x')",
+                    (source_ts,),
+                )
+            conn.commit()
+            outcomes.append("inserted")
+        except sqlite3.IntegrityError:
+            outcomes.append("rejected")
+        except sqlite3.Error:
+            outcomes.append("error")
+        finally:
+            conn.close()
+
+    threads = [
+        threading.Thread(target=insert_disposition, args=(kind,))
+        for kind in ("ack", "directive")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(outcomes) == ["inserted", "rejected"]
+    conn = init_db(db_path)
+    directive_count = conn.execute(
+        "SELECT COUNT(*) FROM directives WHERE source_ts=?", (source_ts,)
+    ).fetchone()[0]
+    acknowledgement_count = conn.execute(
+        "SELECT COUNT(*) FROM operator_message_acknowledgements WHERE source_ts=?",
+        (source_ts,),
+    ).fetchone()[0]
+    assert directive_count in (0, 1)
+    assert acknowledgement_count in (0, 1)
+    assert directive_count + acknowledgement_count == 1
+    conn.close()
+
+
+def test_multiple_directives_can_still_share_unacknowledged_source_ts(tmp_path):
+    conn = init_db(str(tmp_path / "shared.db"))
+    source_ts = "1785731067.460039"
+    for interpretation in ("first", "second"):
+        conn.execute(
+            "INSERT INTO directives (source_ts, source_text, interpretation) VALUES (?, 'x', ?)",
+            (source_ts, interpretation),
+        )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM directives WHERE source_ts=?", (source_ts,)
+    ).fetchone()[0] == 2
+    conn.close()

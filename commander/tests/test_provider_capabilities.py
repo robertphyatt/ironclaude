@@ -66,6 +66,16 @@ def test_codex_login_status_proves_chatgpt_authentication(base_config):
     assert result.usable is True
 
 
+def test_codex_login_status_stderr_proves_chatgpt_authentication(base_config):
+    executor = FakeExecutor([ProbeResult(0, "", "Logged in using ChatGPT")])
+    probe = CapabilityProbe(executor=executor, executable_lookup=lambda _: "/bin/codex")
+    result = probe.probe_local(dual_config(base_config), "codex", "worker", "sonnet")
+    assert executor.calls == [("local", ("/bin/codex", "login", "status"))]
+    assert result.authenticated is True
+    assert result.available is True
+    assert result.usable is True
+
+
 def test_other_successful_codex_auth_mode_is_rejected(base_config):
     executor = FakeExecutor([ProbeResult(0, "Logged in using API key", "")])
     probe = CapabilityProbe(executor=executor, executable_lookup=lambda _: "/bin/codex")

@@ -61,6 +61,7 @@ if command -v sqlite3 &>/dev/null; then
       current_wave INTEGER NOT NULL DEFAULT 0,
       review_pending INTEGER NOT NULL DEFAULT 0,
       review_block_count INTEGER NOT NULL DEFAULT 0,
+      plan_lineage INTEGER NOT NULL DEFAULT 0,
       circuit_breaker INTEGER NOT NULL DEFAULT 0,
       memory_search_required INTEGER NOT NULL DEFAULT 0,
       testing_theatre_checked INTEGER NOT NULL DEFAULT 0,
@@ -137,6 +138,7 @@ if command -v sqlite3 &>/dev/null; then
     CREATE TABLE IF NOT EXISTS tier_up_reviews (
       id               INTEGER PRIMARY KEY AUTOINCREMENT,
       terminal_session TEXT NOT NULL,
+      plan_lineage    INTEGER NOT NULL DEFAULT 0,
       plan_hash        TEXT NOT NULL,
       reviewer_model   TEXT NOT NULL,
       verdict          TEXT NOT NULL,

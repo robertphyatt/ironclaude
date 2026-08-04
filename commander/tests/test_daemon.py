@@ -5,7 +5,7 @@ import os
 import shlex
 import sqlite3
 import subprocess
-from ironclaude.db import init_db
+from ironclaude.db import DIRECT_REPLY_FALLBACK_REASON, init_db
 import time
 import json
 from pathlib import Path
@@ -52,6 +52,14 @@ def test_brain_blocked_capability_contract_startup_exemption_preserves_resources
         assert "daemon-issued `[CAPABILITY RECHECK]`" in text
         assert "startup, context recovery, or ordinary attention sweeps" in text
         assert "resource-blocked work remains unchanged" in text
+
+
+def test_brain_direct_reply_requires_acknowledgement_before_threaded_reply():
+    for text in _brain_instruction_surfaces():
+        assert "acknowledge_operator_message(source_ts, reason)" in text
+        assert "must succeed before direct reply" in text
+        assert "no directive, worker, or repository action" in text
+        assert "[reply-to:<source_ts>]" in text
 
 
 @pytest.fixture
@@ -799,6 +807,10 @@ class TestHandleAudit:
             "status TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')), "
             "updated_at TEXT DEFAULT (datetime('now')))"
         )
+        conn.execute(
+            "CREATE TABLE operator_message_acknowledgements ("
+            "source_ts TEXT PRIMARY KEY, reason TEXT NOT NULL)"
+        )
         for row in rows:
             conn.execute(
                 "INSERT INTO directives (source_ts, source_text, interpretation, status) "
@@ -856,9 +868,11 @@ class TestHandleAudit:
         ]
         daemon._handle_audit()
         msg = daemon.slack.post_message.call_args[0][0]
-        assert "Messages scanned: 1" in msg
-        assert "Mapped to directives: 1" in msg
-        assert "Unmapped: 0" in msg
+        assert "Directives: 1" in msg
+        assert "Acknowledged: 0" in msg
+        assert "Unresolved: 0" in msg
+        assert "Mapped to directives:" not in msg
+        assert "Unmapped:" not in msg
         assert "(none)" in msg
         conn.close()
 
@@ -871,9 +885,11 @@ class TestHandleAudit:
         ]
         daemon._handle_audit()
         msg = daemon.slack.post_message.call_args[0][0]
-        assert "Messages scanned: 1" in msg
-        assert "Mapped to directives: 0" in msg
-        assert "Unmapped: 1" in msg
+        assert "Directives: 0" in msg
+        assert "Acknowledged: 0" in msg
+        assert "Unresolved: 1" in msg
+        assert "Mapped to directives:" not in msg
+        assert "Unmapped:" not in msg
         assert "random chat" in msg
         conn.close()
 
@@ -2836,6 +2852,215 @@ class TestPollBrainResponsesFilter:
         daemon.slack.post_message.assert_called_once()
         msg = daemon.slack.post_message.call_args[0][0]
         assert "#1134" in msg
+
+
+class TestSolicitedReply:
+    def test_solicited_reply_uses_shared_marker_helper(self, daemon):
+        daemon.brain.get_pending_responses.return_value = ["ordinary response"]
+        with patch("ironclaude.main.parse_reply_to_marker", return_value=("ordinary response", None)) as parser:
+            daemon.poll_brain_responses()
+        parser.assert_called_once_with("ordinary response")
+
+    def test_solicited_reply_threads_and_reacts_only_after_delivery(self, daemon, tmp_path):
+        daemon._db = init_db(str(tmp_path / "reply-ack.db"))
+        daemon.brain.get_pending_responses.return_value = [
+            "[reply-to:1700000000.123456] #12 completed requested work"
+        ]
+        daemon.slack.post_message.return_value = "1700000001.000001"
+
+        daemon.poll_brain_responses()
+
+        daemon.slack.post_message.assert_called_once_with(
+            "*Brain:* #12 completed requested work", thread_ts="1700000000.123456"
+        )
+        daemon.slack.add_reaction.assert_called_once_with("white_check_mark", "1700000000.123456")
+
+    def test_solicited_reply_does_not_react_when_delivery_is_incomplete(self, daemon):
+        daemon.brain.get_pending_responses.return_value = [
+            "[reply-to:1700000000.123456] #12 completed requested work"
+        ]
+        daemon._post_brain_message = MagicMock(return_value=None)
+
+        daemon.poll_brain_responses()
+
+        daemon.slack.add_reaction.assert_not_called()
+
+    def test_solicited_reply_marker_only_posts_nothing_and_does_not_react(self, daemon):
+        daemon.brain.get_pending_responses.return_value = ["[reply-to:1700000000.123456]   "]
+
+        daemon.poll_brain_responses()
+
+        daemon.slack.post_message.assert_not_called()
+        daemon.slack.add_reaction.assert_not_called()
+
+    def test_solicited_reply_marked_waiting_language_bypasses_operator_wait_capture(self, daemon, tmp_path):
+        daemon._db = init_db(str(tmp_path / "reply-ack.db"))
+        daemon.brain.get_pending_responses.return_value = [
+            "[reply-to:1700000000.123456] Waiting for your decision on #12"
+        ]
+        daemon._maybe_capture_operator_wait = MagicMock(return_value=True)
+        daemon._post_brain_message = MagicMock(return_value="1700000001.000001")
+
+        daemon.poll_brain_responses()
+
+        daemon._maybe_capture_operator_wait.assert_not_called()
+        daemon._post_brain_message.assert_called_once_with(
+            "Waiting for your decision on #12", thread_ts="1700000000.123456"
+        )
+
+    def test_solicited_reply_unmarked_waiting_message_uses_operator_wait_capture(self, daemon):
+        text = "Waiting for your decision on #12"
+        daemon.brain.get_pending_responses.return_value = [text]
+        daemon._maybe_capture_operator_wait = MagicMock(return_value=True)
+
+        daemon.poll_brain_responses()
+
+        daemon._maybe_capture_operator_wait.assert_called_once_with(text)
+        daemon.slack.post_message.assert_not_called()
+
+    @pytest.mark.parametrize("text", [
+        "[reply-to:not-a-ts] #12 body",
+        "[reply-to:1.2.3] #12 body",
+    ])
+    def test_solicited_reply_suppresses_malformed_leading_marker(self, daemon, text):
+        daemon.brain.get_pending_responses.return_value = [text]
+
+        daemon.poll_brain_responses()
+
+        daemon.slack.post_message.assert_not_called()
+        daemon.slack.add_reaction.assert_not_called()
+        daemon.brain.send_message.assert_not_called()
+
+
+class TestSolicitedReplyTransportAcknowledgement:
+    """Marked daemon replies must durably classify their source before delivery."""
+
+    def _with_db(self, daemon, tmp_path):
+        daemon._db = init_db(str(tmp_path / "reply-ack.db"))
+        return daemon._db
+
+    def _ack(self, conn, source_ts):
+        return conn.execute(
+            "SELECT reason FROM operator_message_acknowledgements WHERE source_ts=?",
+            (source_ts,),
+        ).fetchone()
+
+    def test_transport_acknowledgement_commits_before_first_post_and_uses_fallback(self, daemon, tmp_path):
+        source_ts = "1700000000.123456"
+        conn = self._with_db(daemon, tmp_path)
+        db_path = str(tmp_path / "reply-ack.db")
+        daemon.brain.get_pending_responses.return_value = [f"[reply-to:{source_ts}] reply body"]
+
+        def post(*_args, **_kwargs):
+            reader = sqlite3.connect(db_path)
+            try:
+                assert self._ack(reader, source_ts)[0] == DIRECT_REPLY_FALLBACK_REASON
+            finally:
+                reader.close()
+            return "1700000001.000001"
+
+        daemon.slack.post_message.side_effect = post
+        daemon.poll_brain_responses()
+
+        daemon.slack.add_reaction.assert_called_once_with("white_check_mark", source_ts)
+
+    def test_transport_acknowledgement_preserves_existing_reason(self, daemon, tmp_path):
+        source_ts = "1700000000.123456"
+        conn = self._with_db(daemon, tmp_path)
+        conn.execute(
+            "INSERT INTO operator_message_acknowledgements (source_ts, reason) VALUES (?, ?)",
+            (source_ts, "operator supplied reason"),
+        )
+        conn.commit()
+        daemon.brain.get_pending_responses.return_value = [f"[reply-to:{source_ts}] reply body"]
+        daemon.slack.post_message.return_value = "1700000001.000001"
+
+        daemon.poll_brain_responses()
+
+        assert self._ack(conn, source_ts)[0] == "operator supplied reason"
+        daemon.slack.post_message.assert_called_once()
+
+    @pytest.mark.parametrize("text", [
+        "ordinary response",
+        "[reply-to:not-a-ts] reply body",
+        "[reply-to:1700000000.123456]   ",
+    ])
+    def test_transport_acknowledgement_skips_unmarked_or_invalid_reply_forms(self, daemon, tmp_path, text):
+        conn = self._with_db(daemon, tmp_path)
+        daemon.brain.get_pending_responses.return_value = [text]
+
+        daemon.poll_brain_responses()
+
+        assert conn.execute("SELECT COUNT(*) FROM operator_message_acknowledgements").fetchone()[0] == 0
+
+    def test_transport_acknowledgement_missing_db_skips_reply_and_continues_polling(self, daemon):
+        first_ts = "1700000000.123456"
+        second_ts = "1700000000.123457"
+        daemon.brain.get_pending_responses.return_value = [
+            f"[reply-to:{first_ts}] first reply",
+            f"[reply-to:{second_ts}] second reply",
+        ]
+
+        daemon.poll_brain_responses()
+
+        daemon.slack.post_message.assert_not_called()
+        daemon.slack.add_reaction.assert_not_called()
+
+    def test_transport_acknowledgement_directive_conflict_skips_failed_reply_and_continues(self, daemon, tmp_path):
+        blocked_ts = "1700000000.123456"
+        delivered_ts = "1700000000.123457"
+        conn = self._with_db(daemon, tmp_path)
+        conn.execute(
+            "INSERT INTO directives (source_ts, source_text, interpretation) VALUES (?, ?, ?)",
+            (blocked_ts, "operator text", "directive"),
+        )
+        conn.commit()
+        daemon.brain.get_pending_responses.return_value = [
+            f"[reply-to:{blocked_ts}] blocked reply",
+            f"[reply-to:{delivered_ts}] delivered reply",
+        ]
+        daemon.slack.post_message.return_value = "1700000001.000001"
+
+        daemon.poll_brain_responses()
+
+        daemon.slack.post_message.assert_called_once_with(
+            "*Brain:* delivered reply", thread_ts=delivered_ts
+        )
+        daemon.slack.add_reaction.assert_called_once_with("white_check_mark", delivered_ts)
+
+    def test_transport_acknowledgement_persistence_failure_skips_post_and_reaction(self, daemon, tmp_path):
+        source_ts = "1700000000.123456"
+        conn = self._with_db(daemon, tmp_path)
+        conn.close()
+        daemon.brain.get_pending_responses.return_value = [f"[reply-to:{source_ts}] reply body"]
+
+        daemon.poll_brain_responses()
+
+        daemon.slack.post_message.assert_not_called()
+        daemon.slack.add_reaction.assert_not_called()
+
+    @patch("ironclaude.slack_interface.WebClient")
+    def test_transport_acknowledgement_real_slack_queue_preserves_thread_without_reaction(self, web_client, tmp_path):
+        from ironclaude.slack_interface import SlackBot
+
+        source_ts = "1700000000.123456"
+        client = web_client.return_value
+        client.chat_postMessage.side_effect = Exception("network down")
+        slack = SlackBot(token="xoxb-test", channel_id="C123")
+        registry, tmux, brain = MagicMock(), MagicMock(), MagicMock()
+        tmux.log_dir = str(tmp_path / "logs")
+        os.makedirs(tmux.log_dir, exist_ok=True)
+        daemon = IroncladeDaemon({"tmp_dir": str(tmp_path)}, slack, None, registry, tmux, brain,
+                                 db_conn=init_db(str(tmp_path / "reply-ack.db")))
+        daemon.brain.get_pending_responses.return_value = [f"[reply-to:{source_ts}] reply body"]
+
+        daemon.poll_brain_responses()
+
+        assert daemon._db.execute(
+            "SELECT reason FROM operator_message_acknowledgements WHERE source_ts=?", (source_ts,)
+        ).fetchone()[0] == DIRECT_REPLY_FALLBACK_REASON
+        assert slack._notification_queue == [("[IRONCLAUDE] *Brain:* reply body", source_ts)]
+        client.reactions_add.assert_not_called()
 
 
 class TestHeartbeatStateHistory:

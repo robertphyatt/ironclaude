@@ -1,0 +1,43 @@
+{
+  "name": "Codex Commander Runtime Parity Fix - Already-Pinned Overcapacity Clarification",
+  "goal": "Lock the operator's new-pin contract: already-pinned targets remain idempotent at any inventory count, while unpinned targets above 100 fail closed, without changing production behavior or touching Slack.",
+  "requirements_file": "docs/plans/2026-08-02-codex-commander-runtime-parity-fix-requirements.md",
+  "design_file": "docs/plans/2026-08-02-codex-commander-runtime-parity-fix-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Prove already-pinned overcapacity idempotence",
+      "description": "Add the missing intersection regression, run focused and full verification, and update findings without production or live Slack changes.",
+      "allowed_files": [
+        "commander/tests/test_slack_interface.py",
+        "docs/plans/2026-08-03-codex-commander-runtime-parity-fix-findings.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add a 101-item inventory containing the target timestamp and assert pin_message returns true after pins.list with no pins.remove or pins.add call.",
+          "expected": "Regression passes against current production behavior and proves the operator's rule applies only when adding a new pin. No production file changes."
+        },
+        {
+          "description": "Run the new exact node.",
+          "command": "commander/.venv/bin/python -m pytest -p no:cacheprovider commander/tests/test_slack_interface.py::TestSlackBotReactions::test_pin_message_over_capacity_keeps_already_pinned_target_idempotent -q",
+          "expected": "Exact node passes."
+        },
+        {
+          "description": "Run the complete Slack reaction class.",
+          "command": "commander/.venv/bin/python -m pytest -p no:cacheprovider commander/tests/test_slack_interface.py::TestSlackBotReactions -q",
+          "expected": "Full reaction class passes."
+        },
+        {
+          "description": "Run the full Commander suite with pytest cache disabled.",
+          "command": "commander/.venv/bin/python -m pytest -p no:cacheprovider commander/tests -q",
+          "expected": "Full suite passes with one additional test."
+        },
+        {
+          "description": "Update findings with clarified pinned-versus-unpinned overcapacity semantics, test totals, and final blind review; reassert exact 14-path staging, protected hashes, no live Slack call, no worker spawn, no commit, and no push.",
+          "expected": "Evidence is internally consistent and staged scope remains exact."
+        }
+      ]
+    }
+  ]
+}

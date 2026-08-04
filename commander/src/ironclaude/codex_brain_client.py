@@ -84,6 +84,7 @@ _ORCHESTRATOR_REQUIRED_TOOLS = frozenset({
     "reject_plan",
     "send_to_worker",
     "kill_worker",
+    "acknowledge_operator_message",
 })
 _ORCHESTRATOR_STARTUP_TIMEOUT = 120.0
 
@@ -227,7 +228,9 @@ class CodexBrainClient:
             "mcp_servers.orchestrator.enabled=true",
             'mcp_servers.orchestrator.default_tools_approval_mode="approve"',
             "mcp_servers.orchestrator.startup_timeout_sec=120",
-            'mcp_servers.orchestrator.env_vars=["SUPABASE_URL","SUPABASE_ANON_KEY"]',
+            'mcp_servers.orchestrator.env_vars=["SUPABASE_URL","SUPABASE_ANON_KEY",'
+            '"SLACK_BOT_TOKEN","SLACK_CHANNEL_ID","SLACK_USER_TOKEN",'
+            '"SLACK_OPERATOR_USER_ID","OPERATOR_NAME"]',
             "mcp_servers.orchestrator.env.IC_BRAIN_CWD="
             + json.dumps(self._cwd or ""),
             "mcp_servers.orchestrator.env.IC_MACHINES_CONFIG="
@@ -918,9 +921,12 @@ class CodexBrainClient:
         usage = self._token_usage
         if not usage:
             return None
-        input_tokens = usage.get("inputTokens", usage.get("input_tokens", 0)) or 0
-        output_tokens = usage.get("outputTokens", usage.get("output_tokens", 0)) or 0
-        total = usage.get("totalTokens", usage.get("total_tokens")) or (input_tokens + output_tokens)
+        breakdown = usage.get("total")
+        if not isinstance(breakdown, dict):
+            breakdown = usage
+        input_tokens = breakdown.get("inputTokens", breakdown.get("input_tokens", 0)) or 0
+        output_tokens = breakdown.get("outputTokens", breakdown.get("output_tokens", 0)) or 0
+        total = breakdown.get("totalTokens", breakdown.get("total_tokens")) or (input_tokens + output_tokens)
         age = time.time() - self._last_activity if self._last_activity > 0 else None
         return {
             "input_tokens": input_tokens,
