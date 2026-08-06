@@ -73,6 +73,17 @@ Preferred over multiple `spawn_worker` calls when spawning 2+ workers. Grades al
 | `original_objective` | string | no | The objective the worker was given (enables grader evaluation) |
 | `evidence` | string | no | Concrete evidence of completion (git diff output, test results, etc.) |
 
+**`commit_worker`** — Commit one reviewed worker assignment locally without pushing
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `worker_id` | string | yes | Worker whose isolated assignment is ready |
+| `message` | string | yes | Commit message for reviewed staged work |
+
+This tool derives authority from worker registry metadata, the worker's persisted
+`execution_complete` state, zero unfinished plan tasks, the latest task-boundary A/B
+review, and fresh Git branch/ref/tree/HEAD evidence. It accepts no caller-supplied
+grade, role, owner, ref, tree, or completion claim and never pushes.
+
 **`push_repo`** — Submit a git push request for operator confirmation via Slack
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

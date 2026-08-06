@@ -4,10 +4,51 @@
 > features and fixes increment the patch number (`1.0.N`), and a minor bump
 > (`1.1.0`) marks a release significant enough to warrant one. The version is declared in
 > `commander/pyproject.toml`, `worker/.claude-plugin/plugin.json`,
-> `worker/.codex-plugin/plugin.json`, and `.claude-plugin/marketplace.json`, kept in lockstep by
+> `worker/.codex-plugin/plugin.json`, `worker/mcp-servers/workspace-manager/package.json`, and
+> `.claude-plugin/marketplace.json`, kept in lockstep by
 > `commander/tests/test_version_consistency.py`. Each release commit is tagged
 > `vX.Y.Z`. Land changes under `## [Unreleased]` as you go, then rename that
 > heading to the new version at release time so the entry matches what shipped.
+
+## 1.1.4: opt-in managed worktrees, human-only Git authority, Codex guard parity
+
+- Managed Git worktrees, opt-in per session. `/use-managed-worktree` assigns a worktree named from
+  the session GUID and transparently redirects that session's writes into it, so concurrent Claude
+  Code and Codex sessions stop sharing one checkout and one index. Activation itself changes
+  nothing: professional mode works in the primary checkout by default, because redirecting where an
+  operator's files land is their decision rather than a side effect of enabling workflow
+  discipline. `/use-primary-checkout` returns an isolated session to the real checkout, and
+  allocation failures leave the session in the primary checkout rather than half-entering
+  isolation.
+- Commander workers always allocate a worktree — isolation is the reason to run several at once,
+  and they are not an interactive operator who can be surprised by it. They use the same lifecycle.
+  Commander may create a reviewed local commit through its control plane, but cannot push;
+  direct-session commit and push operations remain operator-only commands.
+- Git mutations became human-only commands. `/commit`, `/commit-and-push`, `/push`,
+  `/use-primary-checkout`, and `/return-to-managed-worktree` are recognized by the
+  `UserPromptSubmit` hook, which mints a single-use, evidence-bound intent held server-side. The
+  consuming skill re-observes the exact staged tree, parent OID, and local ref before acting, so
+  the model issues the call but cannot supply the authority that makes it succeed. Prose, quoting,
+  model-generated text, and programmatic invocation are not authority.
+- Runtime diagnostics identify the installed state-manager bundle, workspace-manager bundle,
+  workspace-manager CLI, and hook-intent helper so activation cannot silently validate a mixed
+  source/cache installation.
+- Codex parity for the guard surface: the PreToolUse matcher now covers Codex's native
+  `apply_patch` and `exec_command`, which previously never reached the guard at all, and both are
+  normalized to their Claude-native equivalents before the human-only config gate and the
+  Commander-only transport gate — closing a route by which a Codex patch could rewrite
+  `~/.claude/ironclaude-hooks-config.json`.
+- Known limitation — subagent fencing is not yet at parity. Codex reports `thread_source`, so a
+  Codex subagent is genuinely refused when it tries to consume human Git authority. A Claude
+  subagent shares its root session's PPID file, so the provider-root check reads whichever subagent
+  marker the transport supplies and fails closed if one appears; no such marker is known to be sent
+  today. The practical ceiling is narrow, because an intent binds the exact tree and parent OID — a
+  subagent could at most reproduce the commit the human just authorized — but this is a prepared
+  seam, not proven isolation, and it is documented as such in `session-identity.ts`.
+- Portability: replaced the GNU-only `realpath -m` (which silently returned the raw, unresolved
+  path on BSD/macOS, leaving path-identity guards inert) with a portable canonicalizer, and fixed
+  a `bash` 4-only parameter expansion that made the worktree escape check fail open on macOS's
+  stock bash 3.2. `make test` now runs every hook suite, and CI exercises them on both shells.
 
 ## 1.1.3: Codex Commander parity, convergent Slack control, and deterministic reviews
 

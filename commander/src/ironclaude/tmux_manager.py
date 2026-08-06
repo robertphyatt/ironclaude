@@ -140,7 +140,7 @@ class TmuxManager:
         else:
             log_path = os.path.join(self.log_dir, f"{name}.log")
         self._run(
-            ["tmux", "pipe-pane", "-t", name, f"cat >> {shlex.quote(log_path)}"],
+            ["tmux", "pipe-pane", "-t", name, f"cat > {shlex.quote(log_path)}"],
             ssh_host=ssh_host, capture_output=True,
         )
         logger.info(f"Spawned tmux session: {name}, logging to {log_path}")

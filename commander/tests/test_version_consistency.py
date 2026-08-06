@@ -37,6 +37,11 @@ def _codex_plugin_json_version() -> str:
     return _release_version_from_codex_cachebuster(data["version"])
 
 
+def _workspace_manager_package_version() -> str:
+    data = json.loads((REPO_ROOT / "worker" / "mcp-servers" / "workspace-manager" / "package.json").read_text())
+    return data["version"]
+
+
 def _marketplace_version() -> str:
     data = json.loads((REPO_ROOT / ".claude-plugin" / "marketplace.json").read_text())
     return data["plugins"][0]["version"]
@@ -84,6 +89,7 @@ def test_version_sources_match():
         "commander/pyproject.toml": _pyproject_version(),
         "worker/.claude-plugin/plugin.json": _claude_plugin_json_version(),
         "worker/.codex-plugin/plugin.json": _codex_plugin_json_version(),
+        "worker/mcp-servers/workspace-manager/package.json": _workspace_manager_package_version(),
         ".claude-plugin/marketplace.json": _marketplace_version(),
     }
     makefile_version = _makefile_pinned_version()

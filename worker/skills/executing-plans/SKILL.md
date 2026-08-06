@@ -550,13 +550,11 @@ When dispatching tasks via the Task tool, follow these rules to prevent context 
    ```
    - The code-review skill runs and displays its full report (files reviewed, findings, PASS/FAIL)
    - The user sees all review findings with file:line references
-   - If critical issues are found, fix them before proceeding
-   - The task-completion-validator hook validates that completed work matches the task description. The code-review skill calls `mcp__plugin_ironclaude_state-manager__record_review_verdict` to record the grade, and GBTW advances tasks on passing grades.
-   - Once review passes, the MCP clears review_pending
-   - After code-review returns, run Mandatory Direct Transition Preflight for
-     target `executing`; only after a different-target result, call MCP
-     `mcp__plugin_ironclaude_state-manager__mark_executing` once to transition
-     back from `reviewing` to `executing`
+   - Code review is report-only: it records the verdict but does not repair task code.
+   - **A/B:** after successful verdict response, run Mandatory Direct Transition Preflight for target `executing`. Only after a different-target result, call `mcp__plugin_ironclaude_state-manager__mark_executing` once and require `changed:true`; retain the existing pass/advance path.
+   - **C/D/F:** require the successful verdict response and repair only its returned reopened `task_ids` in `executing`. Confirm `reopened_count` and `workflow_stage: "executing"`, run planned verification, resubmit those tasks, and invoke task-boundary code review again.
+   - Never call `mark_executing` after C/D/F: the verdict transaction already returned the workflow to `executing`.
+   - Task code re-review is required after repair; never dispatch another blind plan review for task repair.
 
 7. **After task completes (MUST be the last output for each task):**
    ```

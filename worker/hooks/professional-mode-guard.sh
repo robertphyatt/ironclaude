@@ -6,6 +6,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/hook-logger.sh"
 source "$SCRIPT_DIR/bash-readonly-guard.sh"
+source "$SCRIPT_DIR/workspace-path-adapter.sh"
 source "$SCRIPT_DIR/config-guard.sh" 2>/dev/null || true
 # FAIL CLOSED: if config-guard.sh failed to load, block ALL config-file operations
 # (revert to v1.0.19 hard-block) rather than silently allowing them.
@@ -26,7 +27,7 @@ INPUT=$(cat)
 init_session_id
 
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null || true)
-FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.notebook_path // .tool_input.command // empty' 2>/dev/null || true)
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.notebook_path // .tool_input.command // .tool_input.cmd // empty' 2>/dev/null || true)
 FILE_PATH=$(normalize_path "$FILE_PATH")
 RAW_PROJECT_ROOT=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)
 if [ -n "$RAW_PROJECT_ROOT" ]; then
@@ -199,8 +200,89 @@ Do NOT change guardrail keys."
 # guardrail/unknown blocked, case-insensitive), Edit/MultiEdit are hard-blocked (partial
 # fragments), Bash is BEST-EFFORT (NOT provable — interpreter/split-filename/aliasing
 # writes evade it). Runs before the prof_mode branches, so it holds when PM is off.
-if [ "$(config_guard_decision "$TOOL_NAME" "$FILE_PATH" "$INPUT")" = "block" ]; then
+# Codex's native exec_command is the same capability as Bash, but both gates
+# below (and config_guard_decision's tool gate) were keyed to the Claude-native
+# name. The adapter only renames exec_command to Bash later, so until then a
+# Codex worker reached the private transport and the hooks-config file through
+# gates that never inspected it.
+_PRE_ADAPTER_TOOL="$TOOL_NAME"
+case "$_PRE_ADAPTER_TOOL" in
+  exec_command) _PRE_ADAPTER_TOOL="Bash" ;;
+  # apply_patch is Codex's native file-write tool; the adapter later normalizes
+  # it to MultiEdit, which config_guard_decision hard-blocks. Mapping only
+  # exec_command left native patches able to rewrite the guardrail config file
+  # while professional mode was off.
+  apply_patch) _PRE_ADAPTER_TOOL="MultiEdit" ;;
+esac
+
+if [ "$(config_guard_decision "$_PRE_ADAPTER_TOOL" "$FILE_PATH" "$INPUT")" = "block" ]; then
   block_pretooluse "professional-mode-guard" "$_HOOKS_CFG_BLOCK"
+fi
+
+# Private workspace finalization is callable only by Commander Python. AI Bash
+# traverses this hook, so deny the internal CLI command before mode/stage or
+# workspace routing can accidentally allow it. IC_ROLE is not authority.
+# Quotes are stripped before matching because `node '<path>/cli.js' finalize`
+# puts a quote exactly where a path-anchored pattern expects whitespace, and
+# `cd <dir> && node cli.js finalize` drops the directory from the token
+# entirely. Both forms reached the transport while the earlier path-anchored
+# regex matched neither. Requiring a workspace-manager reference AND an internal
+# subcommand keeps an unrelated project's `cli.js` out of scope.
+#
+# LIMIT: this is string matching against a shell command, so it cannot be
+# complete — copying the bundle elsewhere first still evades it. Bash is the
+# only boundary here (an AI shell runs as the same user, against the same DB and
+# binaries, so no server-side secret can fence it), which is why the matcher is
+# deliberately broad rather than precise.
+_WM_PRIVATE_CMD="${FILE_PATH//\'/}"
+_WM_PRIVATE_CMD="${_WM_PRIVATE_CMD//\"/}"
+# EXECUTION CONTEXT IS REQUIRED. Matching a mere mention refused ordinary
+# inspection of this repo's own source — diffing two copies of a bundle,
+# checksumming them, or any compound command naming one — because the
+# read-only-research carve-out does not cover a command with metacharacters. A
+# guard that blocks reading your own source is a defect, not a trade-off.
+#
+# These bundles are not executable (`-rw-r--r--`; esbuild does not set the bit),
+# so the ONLY way to run one is a Node-family launcher. Requiring that token
+# separates invocation from inspection exactly, with no false positives on
+# diff/grep/shasum/cat/find.
+#
+# `node` must be a standalone word: `node_modules` inside a path is not a
+# launcher, and `NODE_OPTIONS=` is followed by `=` rather than whitespace.
+# LIMIT: chmod +x on a relocated copy still evades this — the same class as
+# relocating the bundle. Bash is a best-effort boundary here, not a sandbox.
+#
+# The directory name is NOT part of the test. Requiring the literal substring
+# `workspace-manager` was defeated by one glob character (`.../works*/dist/
+# hook-intent.js` relocates nothing yet matches no conjunct), so the match keys
+# on the distinctive BASENAME and, for cli.js, its private subcommand. An
+# unrelated project's `cli.js` is only caught if it also takes one of those five
+# subcommands — acceptable, and the block message explains it.
+#
+# The export names cover `node -e "import('<any path>').then(m => m.runCli(...))"`,
+# which reaches the same transport without naming a subcommand on the argv.
+_WM_EXEC_LAUNCHER=0
+if [[ "$_WM_PRIVATE_CMD" =~ (^|[[:space:]\;\|\&\(])(node|nodejs|npx|bun|deno)([[:space:]]|$) ]]; then
+  _WM_EXEC_LAUNCHER=1
+fi
+if [ "$_PRE_ADAPTER_TOOL" = "Bash" ] \
+    && [ "$_WM_EXEC_LAUNCHER" = "1" ] \
+    && { [[ "$_WM_PRIVATE_CMD" =~ (^|[^[:alnum:]_.-])cli\.js[[:space:]]+(allocate|bind|finalize|abandon|reconcile)([[:space:]]|$) ]] \
+      || [[ "$_WM_PRIVATE_CMD" =~ (^|[^[:alnum:]_.-])hook-intent\.js([^[:alnum:]_.-]|$) ]] \
+      || [[ "$_WM_PRIVATE_CMD" == *runCli* ]] \
+      || [[ "$_WM_PRIVATE_CMD" == *dispatchInternalCommand* ]] \
+      || [[ "$_WM_PRIVATE_CMD" == *createInternalCommandDependencies* ]] \
+      || [[ "$_WM_PRIVATE_CMD" == *createPublicToolDependencies* ]] \
+      || [[ "$_WM_PRIVATE_CMD" == *runHookIntent* ]]; }; then
+  block_pretooluse "professional-mode-guard" "BLOCKED — COMMANDER-ONLY WORKSPACE TRANSPORT
+
+The private workspace-manager internal commands (allocate, bind, finalize,
+abandon, reconcile) cannot be invoked through AI Bash. Commander derives worker
+completion, task-boundary review, owner, ref, tree, and HEAD evidence from
+persisted state and live Git before calling this transport.
+
+Do not forge a payload, quote the path, cd into the bundle directory, or retry
+with IC_ROLE overrides."
 fi
 
 # ─── Helper: query design/plan paths for SUGGESTED_NEXT_ACTION ───
@@ -234,7 +316,7 @@ if [ "$prof_mode" = "undecided" ]; then
   # AskUserQuestion: always allow in UNDECIDED (activation skill needs to prompt user)
   if [ "$TOOL_NAME" = "AskUserQuestion" ]; then
     log_hook "professional-mode-guard" "Allowed" "AskUserQuestion in undecided"
-    exit 0
+    workspace_allow
   fi
   # Native Codex apply_patch: allow one exact root AGENTS.md Add/Update patch.
   # Only the exact native apply_patch event can enter this strict command route.
@@ -243,7 +325,7 @@ if [ "$prof_mode" = "undecided" ]; then
     if is_safe_codex_agents_patch; then
       log_hook "professional-mode-guard" "Allowed" \
         "native Codex root AGENTS patch during undecided setup"
-      exit 0
+      workspace_allow
     fi
   fi
   # Provider-owned root setup files: allow only exact project-root targets.
@@ -252,14 +334,14 @@ if [ "$prof_mode" = "undecided" ]; then
     if is_root_setup_file "$FILE_PATH" "AGENTS.md" \
         || is_root_setup_file "$FILE_PATH" "CLAUDE.md"; then
       log_hook "professional-mode-guard" "Allowed" "root instruction write during undecided setup"
-      exit 0
+      workspace_allow
     fi
   fi
   # Claude behavioral rules: allow only the exact owned file at project root.
   if [[ "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "Edit" ]]; then
     if is_behavioral_rules_file "$FILE_PATH"; then
       log_hook "professional-mode-guard" "Allowed" "behavioral rules write during undecided setup"
-      exit 0
+      workspace_allow
     fi
   fi
   # Bash mkdir: allow only the literal project-relative behavioral-rules directory.
@@ -268,19 +350,19 @@ if [ "$prof_mode" = "undecided" ]; then
         && [[ "$FILE_PATH" =~ ^[[:space:]]*mkdir[[:space:]]+(-p[[:space:]]+)?(\./)?\.claude/rules/?[[:space:]]*$ ]] \
         && is_safe_rules_directory_target; then
       log_hook "professional-mode-guard" "Allowed" "mkdir .claude/rules during undecided setup"
-      exit 0
+      workspace_allow
     fi
   fi
   case "$TOOL_NAME" in
     Read|Grep|Glob)
       log_hook "professional-mode-guard" "Allowed" "read-only tool (undecided)"
-      exit 0
+      workspace_allow
       ;;
     Skill)
       skill_name=$(echo "$INPUT" | jq -r '.tool_input.skill // empty' 2>/dev/null || true)
       if [ "$skill_name" = "activate-professional-mode" ] || [ "$skill_name" = "deactivate-professional-mode" ]; then
         log_hook "professional-mode-guard" "Allowed" "mode toggle skill (undecided)"
-        exit 0
+        workspace_allow
       fi
       block_pretooluse "professional-mode-guard" "BLOCKED — PROFESSIONAL MODE NOT SET
 
@@ -311,16 +393,41 @@ fi
 # ─── OFF: no enforcement ───
 if [ "$prof_mode" = "off" ]; then
   log_hook "professional-mode-guard" "Allowed" "professional mode off"
-  exit 0
+  workspace_allow
 fi
 
 # ─── ON: enforce restrictions ───
+
+if ! workspace_prepare_input; then
+  block_pretooluse "professional-mode-guard" "BLOCKED — MANAGED WORKTREE ENFORCEMENT FAILED
+
+${WORKSPACE_ADAPTER_ERROR}
+
+The requested tool input was not executed. A read that stays inside the managed
+worktree is never blocked for lack of an assignment, so you can still inspect
+state before repairing. (A read that explicitly names a parent, the primary
+checkout, or another assignment IS still refused.)
+
+To repair, in order:
+  1. Inspect the assignment with the workspace-manager MCP tool
+     get_workspace_status (Claude: mcp__plugin_ironclaude_workspace-manager__get_workspace_status).
+  2. If that server is not registered in this session, run /reload-plugins —
+     the guard deploys to the shared hooks directory immediately, but the
+     workspace-manager server only registers per session.
+  3. If it is still unavailable, /deactivate-professional-mode always works;
+     it is a UserPromptSubmit command and does not traverse this hook."
+fi
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null || true)
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.notebook_path // .tool_input.command // .tool_input.cmd // empty' 2>/dev/null || true)
+if [ -n "$WORKSPACE_GUARD_TOOL_NAME" ]; then TOOL_NAME="$WORKSPACE_GUARD_TOOL_NAME"; fi
+if [ -n "$WORKSPACE_GUARD_FILE_PATH" ]; then FILE_PATH="$WORKSPACE_GUARD_FILE_PATH"; fi
+FILE_PATH=$(normalize_path "$FILE_PATH")
 
 # Read-only tools: always allow
 case "$TOOL_NAME" in
   Read|Grep|Glob)
     log_hook "professional-mode-guard" "Allowed" "read-only tool"
-    exit 0
+    workspace_allow
     ;;
   Skill)
     skill_name=$(echo "$INPUT" | jq -r '.tool_input.skill // empty' 2>/dev/null || true)
@@ -342,7 +449,7 @@ Do NOT invoke executing-plans without estimated_memory_gb in the plan."
       fi
     fi
     log_hook "professional-mode-guard" "Allowed" "skill tool"
-    exit 0
+    workspace_allow
     ;;
 esac
 
@@ -354,10 +461,10 @@ if [[ "$TOOL_NAME" == "Edit" || "$TOOL_NAME" == "Write" ]]; then
     DEBUG_WRITES=$(jq -r '.debug_allow_config_writes // false' "$CONFIG_FILE" 2>/dev/null || echo "false")
   fi
   if [ "$DEBUG_WRITES" = "true" ]; then
-    CANONICAL_PATH=$(realpath -m "$FILE_PATH" 2>/dev/null || echo "$FILE_PATH")
+    CANONICAL_PATH=$(canonicalize_path_portable "$FILE_PATH" 2>/dev/null || echo "$FILE_PATH")
     if [[ "$CANONICAL_PATH" == "$HOME/.claude/"* ]]; then
       log_warning "professional-mode-guard" "DEBUG BYPASS — config write allowed: ${FILE_PATH}"
-      exit 0
+      workspace_allow
     fi
   fi
 fi
@@ -390,10 +497,33 @@ fi
 
 # docs/ path whitelist (design + plan gate)
 if [[ "$TOOL_NAME" == "Edit" || "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "MultiEdit" || "$TOOL_NAME" == "NotebookEdit" ]]; then
-  if [[ "$FILE_PATH" == *"/docs/"* ]] || [[ "$FILE_PATH" == "docs/"* ]]; then
-    # Design documents require active brainstorming
-    if [[ "$FILE_PATH" == *-design.md ]]; then
-      if [ "$WORKFLOW" != "brainstorming" ] && [ "$WORKFLOW" != "design_ready" ] && ! ([ "$WORKFLOW" = "executing" ] && [ -f "$FILE_PATH" ]); then
+  DOCS_TARGET_FILES="${WORKSPACE_TARGET_FILES:-$FILE_PATH}"
+  DOCS_ALL="true"
+  DOCS_HAS_DESIGN="false"
+  DOCS_HAS_PLAN="false"
+  while IFS= read -r DOCS_TARGET; do
+    [ -n "$DOCS_TARGET" ] || { DOCS_ALL="false"; break; }
+    if [ -n "$WORKSPACE_EFFECTIVE_ROOT" ] && [[ "$DOCS_TARGET" == "$WORKSPACE_EFFECTIVE_ROOT/"* ]]; then
+      DOCS_RELATIVE="${DOCS_TARGET#${WORKSPACE_EFFECTIVE_ROOT}/}"
+    elif [[ "$DOCS_TARGET" == "$PROJECT_ROOT/"* ]]; then
+      DOCS_RELATIVE="${DOCS_TARGET#${PROJECT_ROOT}/}"
+    else
+      DOCS_RELATIVE="${DOCS_TARGET#./}"
+    fi
+    case "$DOCS_RELATIVE" in
+      docs/*) ;;
+      *) DOCS_ALL="false"; break ;;
+    esac
+    if [[ "$DOCS_RELATIVE" == *-design.md ]]; then
+      DOCS_HAS_DESIGN="true"
+    elif [[ "$DOCS_RELATIVE" == docs/plans/*.md || "$DOCS_RELATIVE" == docs/plans/*.plan.json ]]; then
+      DOCS_HAS_PLAN="true"
+    fi
+  done <<< "$DOCS_TARGET_FILES"
+
+  if [ "$DOCS_ALL" = "true" ] && [ "$WORKFLOW" != "executing" ]; then
+    if [ "$DOCS_HAS_DESIGN" = "true" ]; then
+      if [ "$WORKFLOW" != "brainstorming" ] && [ "$WORKFLOW" != "design_ready" ]; then
         block_pretooluse "professional-mode-guard" "BLOCKED — BRAINSTORMING REQUIRED FIRST
 
 Design documents can only be created during the brainstorming skill.
@@ -403,11 +533,8 @@ Call the Skill tool with:
 
 Do NOT create design documents outside of brainstorming."
       fi
-      log_hook "professional-mode-guard" "Allowed" "design write during brainstorming"
-      exit 0
     fi
-    # Plan files require a consumed design
-    if [[ "$FILE_PATH" == */docs/plans/*.md ]] || [[ "$FILE_PATH" == docs/plans/*.md ]]; then
+    if [ "$DOCS_HAS_PLAN" = "true" ]; then
       consumed=$(db_read "professional-mode-guard" \
         "SELECT 1 FROM registered_designs WHERE consumed=1 AND terminal_session='${SAFE_SESSION}' LIMIT 1;")
       if [ "$consumed" != "1" ]; then
@@ -422,17 +549,17 @@ Follow this workflow:
 Do NOT create plan files without completing brainstorming first."
       fi
     fi
-    log_hook "professional-mode-guard" "Allowed" "docs/ path"
-    exit 0
+    log_hook "professional-mode-guard" "Allowed" "validated all-target docs path"
+    workspace_allow
   fi
 fi
 
 # Allow writes to auto-memory files regardless of workflow stage
 if [[ "$TOOL_NAME" == "Edit" || "$TOOL_NAME" == "Write" ]]; then
-  CANONICAL_PATH=$(realpath -m "$FILE_PATH" 2>/dev/null || echo "$FILE_PATH")
+  CANONICAL_PATH=$(canonicalize_path_portable "$FILE_PATH" 2>/dev/null || echo "$FILE_PATH")
   if [[ "$CANONICAL_PATH" != *".."* ]] && [[ "$CANONICAL_PATH" == "$HOME/.claude/projects/"*"/memory/"* ]]; then
     log_hook "professional-mode-guard" "Allowed" "memory file"
-    exit 0
+    workspace_allow
   fi
 fi
 
@@ -452,13 +579,13 @@ Do NOT run git commit, git push, git merge, or git rebase outside of plan execut
     if [ "$TOOL_NAME" = "Bash" ]; then
       if ! _has_blocked_metachars "$FILE_PATH" && echo "$FILE_PATH" | grep -qE '^\s*git\s+add\b'; then
         log_hook "professional-mode-guard" "Allowed" "git staging"
-        exit 0
+        workspace_allow
       fi
     fi
     # Exception: allow read-only git commands at any workflow stage (no chaining — mirrors git-add guard above)
     if [ "$TOOL_NAME" = "Bash" ] && ! _has_blocked_metachars "$FILE_PATH" && is_readonly_git "$FILE_PATH"; then
       log_hook "professional-mode-guard" "Allowed" "read-only git command"
-      exit 0
+      workspace_allow
     fi
     # Exception: allow specific read-only commands during code review
     if [ "$TOOL_NAME" = "Bash" ] && [ "$WORKFLOW" = "reviewing" ]; then
@@ -486,7 +613,7 @@ find -exec/-execdir/-delete/-fls/-fprint*/-ok* can modify the filesystem and are
 Use find for searching only."
         fi
         log_hook "professional-mode-guard" "Allowed" "safe bash during code review"
-        exit 0
+        workspace_allow
       else
         block_pretooluse "professional-mode-guard" "BLOCKED — COMMAND NOT ALLOWED DURING REVIEW
 
@@ -506,7 +633,7 @@ Do NOT run destructive or write commands during the reviewing stage."
     # `WORKFLOW != executing` branch, so executing is unaffected.
     if [ "$TOOL_NAME" = "Bash" ] && is_readonly_research_bash "$FILE_PATH"; then
       log_hook "professional-mode-guard" "Allowed" "read-only research bash"
-      exit 0
+      workspace_allow
     fi
     # Exception: allow make test* commands at any workflow stage — anchored, no chaining
     if [ "$TOOL_NAME" = "Bash" ]; then
@@ -515,50 +642,7 @@ Do NOT run destructive or write commands during the reviewing stage."
       MAKE_NORMALIZED=$(echo "$FILE_PATH" | sed -E 's/^([[:space:]]*make)[[:space:]]+-C[[:space:]]+[^[:space:]]+[[:space:]]+/\1 /')
       if ! _has_blocked_metachars "$FILE_PATH" && echo "$MAKE_NORMALIZED" | grep -qE '^\s*make\s+test'; then
         log_hook "professional-mode-guard" "Allowed" "make test* command"
-        exit 0
-      fi
-    fi
-    # Exception: allow Edit/Write/MultiEdit to allowed_files DURING code review.
-    # code-review Step 7.1 (Fix-First Pass) makes mechanical edits while
-    # workflow_stage='reviewing'; without this they deadlock. FAIL-CLOSED: exit 0
-    # ONLY on a positive allowed-file match. Any state where membership cannot be
-    # determined (no wave, empty allowed_files, missing jq, query failure) does NOT
-    # exit — it falls through to the write-tools block below. Distinct REVIEW_*
-    # vars avoid clobbering the executing-stage check's vars.
-    if [ "$WORKFLOW" = "reviewing" ] \
-       && { [ "$TOOL_NAME" = "Edit" ] || [ "$TOOL_NAME" = "Write" ] || [ "$TOOL_NAME" = "MultiEdit" ] || [ "$TOOL_NAME" = "NotebookEdit" ]; } \
-       && [ -n "$FILE_PATH" ]; then
-      REVIEW_WAVE=$(sqlite3 "$DB_PATH" ".timeout 10000" \
-        "SELECT current_wave FROM sessions WHERE terminal_session='${SAFE_SESSION}';" 2>/dev/null || echo "0")
-      SAFE_REVIEW_WAVE=$(echo "$REVIEW_WAVE" | sed "s/'/''/g")
-      if [ -n "$REVIEW_WAVE" ] && [ "$REVIEW_WAVE" != "0" ]; then
-        REVIEW_ALLOWED_FILES=$(sqlite3 "$DB_PATH" ".timeout 10000" \
-          "SELECT allowed_files FROM wave_tasks WHERE terminal_session='${SAFE_SESSION}' AND wave_number='${SAFE_REVIEW_WAVE}';" 2>/dev/null || true)
-        if [ -n "$REVIEW_ALLOWED_FILES" ] && command -v jq &>/dev/null; then
-          REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
-          if [ -n "$REPO_ROOT" ]; then
-            REVIEW_NORMALIZED_FILE="${FILE_PATH#${REPO_ROOT}/}"
-          else
-            REVIEW_NORMALIZED_FILE="$FILE_PATH"
-          fi
-          REVIEW_FILE_ALLOWED="false"
-          while IFS= read -r allowed_json; do
-            if echo "$allowed_json" | jq -e 'type == "array"' &>/dev/null; then
-              if echo "$allowed_json" | jq -r '.[]' 2>/dev/null | grep -qxF "$FILE_PATH"; then
-                REVIEW_FILE_ALLOWED="true"
-                break
-              fi
-              if echo "$allowed_json" | jq -r '.[]' 2>/dev/null | grep -qxF "$REVIEW_NORMALIZED_FILE"; then
-                REVIEW_FILE_ALLOWED="true"
-                break
-              fi
-            fi
-          done <<< "$REVIEW_ALLOWED_FILES"
-          if [ "$REVIEW_FILE_ALLOWED" = "true" ]; then
-            log_hook "professional-mode-guard" "Allowed" "reviewing-stage edit to allowed_file"
-            exit 0
-          fi
-        fi
+        workspace_allow
       fi
     fi
     # Build SUGGESTED_NEXT_ACTION based on current workflow stage
@@ -613,32 +697,42 @@ ${NEXT_ACTION}"
         "SELECT allowed_files FROM wave_tasks WHERE terminal_session='${SAFE_SESSION}' AND wave_number='${SAFE_WAVE_NUM}';" 2>/dev/null || true)
 
       if [ -n "$ALLOWED_FILES" ] && command -v jq &>/dev/null; then
-        # Normalize FILE_PATH: strip git repo root to get relative path
-        REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
-        if [ -n "$REPO_ROOT" ]; then
-          NORMALIZED_FILE="${FILE_PATH#${REPO_ROOT}/}"
-        else
-          NORMALIZED_FILE="$FILE_PATH"
-        fi
-
-        # Collect all allowed files from all wave tasks
-        FILE_ALLOWED="false"
-        while IFS= read -r allowed_json; do
-          if echo "$allowed_json" | jq -e 'type == "array"' &>/dev/null; then
-            # Check absolute path (handles case where allowed_files has absolute paths)
-            if echo "$allowed_json" | jq -r '.[]' 2>/dev/null | grep -qxF "$FILE_PATH"; then
-              FILE_ALLOWED="true"
-              break
-            fi
-            # Check normalized (relative) path
-            if echo "$allowed_json" | jq -r '.[]' 2>/dev/null | grep -qxF "$NORMALIZED_FILE"; then
-              FILE_ALLOWED="true"
-              break
+        TARGET_FILES="${WORKSPACE_TARGET_FILES:-$FILE_PATH}"
+        ALL_FILES_ALLOWED="true"
+        while IFS= read -r TARGET_FILE; do
+          [ -n "$TARGET_FILE" ] || continue
+          if [ -n "$WORKSPACE_EFFECTIVE_ROOT" ] && [[ "$TARGET_FILE" == "$WORKSPACE_EFFECTIVE_ROOT/"* ]]; then
+            NORMALIZED_FILE="${TARGET_FILE#${WORKSPACE_EFFECTIVE_ROOT}/}"
+          else
+            REPO_ROOT=$(git -C "$PROJECT_ROOT" rev-parse --show-toplevel 2>/dev/null || true)
+            if [ -n "$REPO_ROOT" ]; then
+              NORMALIZED_FILE="${TARGET_FILE#${REPO_ROOT}/}"
+            else
+              NORMALIZED_FILE="$TARGET_FILE"
             fi
           fi
-        done <<< "$ALLOWED_FILES"
 
-        if [ "$FILE_ALLOWED" = "false" ]; then
+          FILE_ALLOWED="false"
+          while IFS= read -r allowed_json; do
+            if echo "$allowed_json" | jq -e 'type == "array"' &>/dev/null; then
+              if echo "$allowed_json" | jq -r '.[]' 2>/dev/null | grep -qxF "$TARGET_FILE"; then
+                FILE_ALLOWED="true"
+                break
+              fi
+              if echo "$allowed_json" | jq -r '.[]' 2>/dev/null | grep -qxF "$NORMALIZED_FILE"; then
+                FILE_ALLOWED="true"
+                break
+              fi
+            fi
+          done <<< "$ALLOWED_FILES"
+          if [ "$FILE_ALLOWED" = "false" ]; then
+            ALL_FILES_ALLOWED="false"
+            FILE_PATH="$TARGET_FILE"
+            break
+          fi
+        done <<< "$TARGET_FILES"
+
+        if [ "$ALL_FILES_ALLOWED" = "false" ]; then
           block_pretooluse "professional-mode-guard" "BLOCKED — FILE NOT IN PLAN
 
 The file '${FILE_PATH}' is not in the allowed_files list for the current wave's tasks.
@@ -666,7 +760,7 @@ Do NOT run git commit, git push, git merge, or git rebase."
     fi
     if ! _has_blocked_metachars "$FILE_PATH" && echo "$FILE_PATH" | grep -qE '^\s*git\s+add\b'; then
       log_hook "professional-mode-guard" "Allowed" "git staging"
-      exit 0
+      workspace_allow
     fi
   fi
 
@@ -686,7 +780,7 @@ Do NOT run git commit, git push, git merge, or git rebase."
         sqlite3 "$DB_PATH" ".timeout 5000" \
           "UPDATE sessions SET review_pending=0, review_block_count=0 WHERE terminal_session='${SAFE_SESSION}';" 2>/dev/null || true
         log_hook "professional-mode-guard" "Auto-cleared" "stale review_pending — 0 submitted tasks in wave ${CURRENT_WAVE}"
-        exit 0
+        workspace_allow
       fi
       sqlite3 "$DB_PATH" ".timeout 5000" \
         "UPDATE sessions SET review_block_count = review_block_count + 1 WHERE terminal_session='${SAFE_SESSION}';" 2>/dev/null || true
@@ -715,11 +809,11 @@ Do NOT use Edit, Write, MultiEdit, or Bash until code review completes."
   fi
 
   log_hook "professional-mode-guard" "Allowed" "access check passed"
-  exit 0
+  workspace_allow
 fi
 
 # Tool not handled by this hook — allow.
 # MCP tools (mcp__plugin_ironclaude_*) intentionally fall through here.
 # They are not matched by hooks.json and are governed by their own MCP-layer validation.
 log_hook "professional-mode-guard" "Allowed" "tool not handled"
-exit 0
+workspace_allow

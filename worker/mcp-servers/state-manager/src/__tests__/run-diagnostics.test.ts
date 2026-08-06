@@ -42,16 +42,40 @@ const runtimeCapture: RuntimeFingerprintCapture = {
     plugin_root: '/tmp/ironclaude/1.1.0+codex.test',
     manifest_path: '/tmp/ironclaude/1.1.0+codex.test/.codex-plugin/plugin.json',
     manifest_sha256: 'a'.repeat(64),
-    bundle_path: '/tmp/ironclaude/1.1.0+codex.test/mcp-servers/state-manager/dist/index.js',
-    bundle_sha256: 'b'.repeat(64),
+    state_manager_bundle_path: '/tmp/ironclaude/1.1.0+codex.test/mcp-servers/state-manager/dist/index.js',
+    state_manager_bundle_sha256: 'b'.repeat(64),
+    workspace_manager_bundle_path: '/tmp/ironclaude/1.1.0+codex.test/mcp-servers/workspace-manager/dist/index.js',
+    workspace_manager_bundle_sha256: 'c'.repeat(64),
+    workspace_manager_cli_path: '/tmp/ironclaude/1.1.0+codex.test/mcp-servers/workspace-manager/dist/cli.js',
+    workspace_manager_cli_sha256: 'd'.repeat(64),
+    workspace_manager_hook_intent_path: '/tmp/ironclaude/1.1.0+codex.test/mcp-servers/workspace-manager/dist/hook-intent.js',
+    workspace_manager_hook_intent_sha256: 'e'.repeat(64),
     client: 'codex',
   },
 };
 
 function expectedRuntime(): RuntimeFingerprintExpectation {
   if (!runtimeCapture.ok) throw new Error(runtimeCapture.error);
-  const { plugin_version, plugin_root, manifest_sha256, bundle_sha256, client } = runtimeCapture.runtime;
-  return { plugin_version, plugin_root, manifest_sha256, bundle_sha256, client };
+  const {
+    plugin_version,
+    plugin_root,
+    manifest_sha256,
+    state_manager_bundle_sha256,
+    workspace_manager_bundle_sha256,
+    workspace_manager_cli_sha256,
+    workspace_manager_hook_intent_sha256,
+    client,
+  } = runtimeCapture.runtime;
+  return {
+    plugin_version,
+    plugin_root,
+    manifest_sha256,
+    state_manager_bundle_sha256,
+    workspace_manager_bundle_sha256,
+    workspace_manager_cli_sha256,
+    workspace_manager_hook_intent_sha256,
+    client,
+  };
 }
 
 function structuredPayload(text: string) {
@@ -82,6 +106,34 @@ describe('run_diagnostics', () => {
   it('is advertised as read-only now that its probe rolls back', () => {
     const definition = readToolDefinitions.find((tool) => tool.name === 'run_diagnostics');
     expect(definition?.annotations.readOnlyHint).toBe(true);
+  });
+
+  it('advertises the exact four-artifact runtime expectation schema', () => {
+    const definition = readToolDefinitions.find((tool) => tool.name === 'run_diagnostics');
+    const expectedRuntimeSchema = definition?.inputSchema.properties.expected_runtime;
+    expect(expectedRuntimeSchema).toEqual(expect.objectContaining({
+      required: [
+        'plugin_version',
+        'plugin_root',
+        'manifest_sha256',
+        'state_manager_bundle_sha256',
+        'workspace_manager_bundle_sha256',
+        'workspace_manager_cli_sha256',
+        'workspace_manager_hook_intent_sha256',
+        'client',
+      ],
+      additionalProperties: false,
+    }));
+    expect(Object.keys(expectedRuntimeSchema?.properties ?? {})).toEqual([
+      'plugin_version',
+      'plugin_root',
+      'manifest_sha256',
+      'state_manager_bundle_sha256',
+      'workspace_manager_bundle_sha256',
+      'workspace_manager_cli_sha256',
+      'workspace_manager_hook_intent_sha256',
+      'client',
+    ]);
   });
 
   it('reports explicit Codex context without changing session or audit state', () => {
@@ -201,7 +253,10 @@ describe('run_diagnostics', () => {
     ['plugin_version', 'stale'],
     ['plugin_root', '/stale'],
     ['manifest_sha256', '0'.repeat(64)],
-    ['bundle_sha256', '1'.repeat(64)],
+    ['state_manager_bundle_sha256', '1'.repeat(64)],
+    ['workspace_manager_bundle_sha256', '2'.repeat(64)],
+    ['workspace_manager_cli_sha256', '3'.repeat(64)],
+    ['workspace_manager_hook_intent_sha256', '4'.repeat(64)],
     ['client', 'claude'],
   ] as const)('rejects expected_runtime mismatch for %s without mutation', (field, value) => {
     const db = seededDb();

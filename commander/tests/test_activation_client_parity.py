@@ -438,3 +438,14 @@ def test_codex_surfaces_never_reference_an_unavailable_agent():
     assert "ironclaude:search-conversations" not in codex
     template = (ROOT / "commander/src/ironclaude/templates/worker_agents.md").read_text()
     assert "ironclaude:search-conversations" not in template
+
+
+def test_activation_uses_provider_native_workspace_manager_names():
+    text = SKILL.read_text(encoding="utf-8")
+    flat = " ".join(text.split())
+    assert "mcp__plugin_ironclaude_workspace-manager__activate_session_workspace" in text
+    assert "mcp__plugin_ironclaude_workspace-manager__get_workspace_status" in text
+    assert "Claude Code:" in text
+    assert "Codex `workspace-manager` `activate_session_workspace`" in text
+    assert "Codex `workspace-manager` `get_workspace_status`" in text
+    assert "Do not infer or switch clients from tool availability" in flat

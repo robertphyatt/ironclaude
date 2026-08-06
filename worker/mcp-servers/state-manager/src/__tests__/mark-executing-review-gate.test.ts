@@ -167,7 +167,7 @@ describe('review_block_count resets', () => {
     expect(row.review_block_count).toBe(0);
   });
 
-  it('record_review_verdict with failing grade does not reset review_block_count', () => {
+  it('record_review_verdict with failing grade reopens and resets review gate', () => {
     db.prepare(
       `INSERT INTO sessions (terminal_session, workflow_stage, review_block_count, current_wave, review_pending)
        VALUES ('test-rbc', 'reviewing', 4, 1, 1)`,
@@ -185,11 +185,57 @@ describe('review_block_count resets', () => {
     );
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.error).toBeUndefined();
+    expect(parsed.reopened_count).toBe(1);
+    expect(parsed.task_ids).toEqual([1]);
+    expect(parsed.workflow_stage).toBe('executing');
 
     const row = db.prepare(
-      'SELECT review_block_count FROM sessions WHERE terminal_session = ?',
-    ).get('test-rbc') as { review_block_count: number };
-    expect(row.review_block_count).toBe(4);
+      'SELECT workflow_stage, review_pending, review_block_count FROM sessions WHERE terminal_session = ?',
+    ).get('test-rbc');
+    const task = db.prepare(
+      'SELECT status FROM wave_tasks WHERE terminal_session = ? AND task_id = 1',
+    ).get('test-rbc') as { status: string };
+    expect(row).toMatchObject({ workflow_stage: 'executing', review_pending: 0, review_block_count: 0 });
+    expect(task.status).toBe('in_progress');
+  });
+
+  it('rolls back grade, audit, task, and session changes when audit insert fails', () => {
+    db.prepare(
+      `INSERT INTO sessions (terminal_session, workflow_stage, review_block_count, current_wave, review_pending)
+       VALUES ('test-rollback', 'reviewing', 4, 1, 1)`,
+    ).run();
+    db.prepare(
+      `INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status)
+       VALUES ('test-rollback', 1, 1, 'Test Task', 'submitted')`,
+    ).run();
+    db.exec(`
+      CREATE TRIGGER fail_record_review_audit
+      BEFORE INSERT ON audit_log
+      WHEN NEW.action = 'record_review_verdict'
+      BEGIN
+        SELECT RAISE(ABORT, 'audit trigger failure');
+      END;
+    `);
+
+    expect(() => handleWriteTool(
+      'record_review_verdict',
+      { grade: 'F', task_boundary: true },
+      db,
+      'test-rollback',
+    )).toThrow('audit trigger failure');
+
+    expect(db.prepare('SELECT * FROM review_grades WHERE terminal_session = ?').all('test-rollback')).toEqual([]);
+    expect(db.prepare('SELECT * FROM audit_log WHERE terminal_session = ?').all('test-rollback')).toEqual([]);
+    expect(db.prepare(
+      'SELECT workflow_stage, review_pending, review_block_count FROM sessions WHERE terminal_session = ?',
+    ).get('test-rollback')).toMatchObject({
+      workflow_stage: 'reviewing',
+      review_pending: 1,
+      review_block_count: 4,
+    });
+    expect(db.prepare(
+      'SELECT status FROM wave_tasks WHERE terminal_session = ? AND task_id = 1',
+    ).get('test-rollback')).toMatchObject({ status: 'submitted' });
   });
 
   it('mark_executing resets review_block_count to 0', () => {

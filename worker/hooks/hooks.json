@@ -65,7 +65,7 @@
             "command": "bash $HOME/.claude/ironclaude-hooks/professional-mode-guard.sh"
           }
         ],
-        "matcher": "Edit|Write|NotebookEdit|MultiEdit|Bash|Read|Grep|Glob"
+        "matcher": "Edit|Write|NotebookEdit|MultiEdit|Bash|Read|Grep|Glob|apply_patch|exec_command"
       },
       {
         "hooks": [

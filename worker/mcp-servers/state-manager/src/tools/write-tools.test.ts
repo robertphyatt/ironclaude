@@ -109,16 +109,31 @@ describe('record_review_verdict — review_pending flag clearing', () => {
     expect(getReviewPending(db)).toBe(0);
   });
 
-  it('does NOT clear review_pending when grade=D (failing grade)', () => {
+  it.each(['C', 'D', 'F'])('reopens the submitted task for failing grade=%s at a task boundary', (grade) => {
     const result = handleWriteTool(
       'record_review_verdict',
-      { grade: 'D', task_boundary: true },
+      { grade, task_boundary: true },
       db,
       SESSION_ID,
     );
     const parsed = JSON.parse(result.content[0].text);
+    const session = db.prepare(
+      `SELECT workflow_stage, review_pending, review_block_count FROM sessions WHERE terminal_session = ?`,
+    ).get(SESSION_ID);
+    const task = db.prepare(
+      `SELECT status FROM wave_tasks WHERE terminal_session = ? AND task_id = 1`,
+    ).get(SESSION_ID) as { status: string };
+
     expect(parsed.error).toBeUndefined();
-    expect(getReviewPending(db)).toBe(1);
+    expect(parsed.reopened_count).toBe(1);
+    expect(parsed.task_ids).toEqual([1]);
+    expect(parsed.workflow_stage).toBe('executing');
+    expect(session).toMatchObject({
+      workflow_stage: 'executing',
+      review_pending: 0,
+      review_block_count: 0,
+    });
+    expect(task.status).toBe('in_progress');
   });
 
   it('does NOT clear review_pending when task_boundary=false (partial wave)', () => {
@@ -129,7 +144,22 @@ describe('record_review_verdict — review_pending flag clearing', () => {
       SESSION_ID,
     );
     const parsed = JSON.parse(result.content[0].text);
+    const session = db.prepare(
+      `SELECT workflow_stage, review_pending, review_block_count FROM sessions WHERE terminal_session = ?`,
+    ).get(SESSION_ID);
+    const task = db.prepare(
+      `SELECT status FROM wave_tasks WHERE terminal_session = ? AND task_id = 1`,
+    ).get(SESSION_ID) as { status: string };
     expect(parsed.error).toBeUndefined();
+    expect(parsed.reopened_count).toBe(0);
+    expect(parsed.workflow_stage).toBe('executing');
+    expect(parsed.task_ids).toEqual([1]);
+    expect(session).toMatchObject({
+      workflow_stage: 'executing',
+      review_pending: 1,
+      review_block_count: 0,
+    });
+    expect(task.status).toBe('submitted');
     expect(getReviewPending(db)).toBe(1);
   });
 });

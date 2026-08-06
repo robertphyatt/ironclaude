@@ -39,6 +39,92 @@ if [ -z "$USER_PROMPT" ]; then
   exit 0
 fi
 
+# Exact direct-human Git/workspace commands create a server-held intent through
+# the internal workspace-manager CLI. The prompt hook returns no nonce, expiry,
+# or evidence to conversation; public MCP consumers re-observe and atomically
+# match those fields later.
+TRIMMED_PROMPT=$(printf '%s' "$USER_PROMPT" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+HOOK_EVENT_NAME=$(printf '%s' "$INPUT" | jq -r '.hook_event_name // empty' 2>/dev/null || true)
+THREAD_SOURCE=$(printf '%s' "$INPUT" | jq -r '.thread_source // empty' 2>/dev/null || true)
+EVENT_CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)
+HUMAN_OPERATION=""
+HUMAN_CHANNEL=""
+
+if [ "$HOOK_EVENT_NAME" = "UserPromptSubmit" ] && [ "$THREAD_SOURCE" != "subagent" ]; then
+  for operation in commit commit-and-push push use-primary-checkout return-to-managed-worktree; do
+    if [ "$TRIMMED_PROMPT" = "/$operation" ] || [ "$TRIMMED_PROMPT" = "/ironclaude:$operation" ]; then
+      HUMAN_OPERATION="$operation"
+      HUMAN_CHANNEL="claude-user-prompt"
+      break
+    fi
+    if [ "$TRIMMED_PROMPT" = "\$ironclaude:$operation" ]; then
+      HUMAN_OPERATION="$operation"
+      HUMAN_CHANNEL="codex-user-prompt"
+      break
+    fi
+    CODEX_COMMAND_LINK_RE='^\[\$ironclaude:'"$operation"'\]\(/[^)[:cntrl:]]*/skills/'"$operation"'/SKILL\.md\)$'
+    if [[ "$TRIMMED_PROMPT" =~ $CODEX_COMMAND_LINK_RE ]]; then
+      HUMAN_OPERATION="$operation"
+      HUMAN_CHANNEL="codex-user-prompt"
+      break
+    fi
+  done
+fi
+
+if [ -n "$HUMAN_OPERATION" ]; then
+  INTENT_SAFE_SESSION=$(printf '%s' "$SESSION_TAG" | sed "s/'/''/g")
+  INTENT_PROFESSIONAL_MODE=$(sqlite3 "$DB_PATH" ".timeout 10000" \
+    "SELECT professional_mode FROM sessions WHERE terminal_session='${INTENT_SAFE_SESSION}';" 2>/dev/null || true)
+  WORKSPACE_HOOK_INTENT="${IRONCLAUDE_WORKSPACE_HOOK_INTENT:-}"
+  if [ -z "$WORKSPACE_HOOK_INTENT" ] && [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+    candidate="$CLAUDE_PLUGIN_ROOT/mcp-servers/workspace-manager/dist/hook-intent.js"
+    [ -f "$candidate" ] && WORKSPACE_HOOK_INTENT="$candidate"
+  fi
+  if [ -z "$WORKSPACE_HOOK_INTENT" ]; then
+    # Deterministic selection: the active client's plugin cache first, then the
+    # highest installed version within it, stopping at the first hit. The
+    # previous loop assigned on EVERY match with no break, so the last glob
+    # expansion won — with several versions installed a Claude session could
+    # execute the Codex-installed bundle, and a stale version could beat the
+    # running one. Nothing here validated either.
+    intent_roots=()
+    case "${IRONCLAUDE_CLIENT:-claude}" in
+      codex) intent_roots=(
+               "$HOME/.codex/plugins/cache/ironclaude/ironclaude"
+               "$HOME/.claude/plugins/cache/ironclaude/ironclaude") ;;
+      *)     intent_roots=(
+               "$HOME/.claude/plugins/cache/ironclaude/ironclaude"
+               "$HOME/.codex/plugins/cache/ironclaude/ironclaude") ;;
+    esac
+    for intent_root in "${intent_roots[@]}"; do
+      [ -d "$intent_root" ] || continue
+      while IFS= read -r intent_version; do
+        [ -n "$intent_version" ] || continue
+        candidate="$intent_root/$intent_version/mcp-servers/workspace-manager/dist/hook-intent.js"
+        if [ -f "$candidate" ]; then WORKSPACE_HOOK_INTENT="$candidate"; break; fi
+      done < <(ls -1 "$intent_root" 2>/dev/null | sort -Vr)
+      [ -n "$WORKSPACE_HOOK_INTENT" ] && break
+    done
+  fi
+  if [ "$INTENT_PROFESSIONAL_MODE" != "on" ]; then
+    log_error "state-activator" "Human intent issuance requires professional mode on for this provider root"
+  elif [ -z "$EVENT_CWD" ] || [ -z "$WORKSPACE_HOOK_INTENT" ] || [ ! -f "$WORKSPACE_HOOK_INTENT" ]; then
+    log_error "state-activator" "Human intent issuance runtime is unavailable"
+  else
+    ISSUE_PAYLOAD=$(jq -cn \
+      --arg operation "$HUMAN_OPERATION" \
+      --arg human_channel "$HUMAN_CHANNEL" \
+      --arg owner_session_id "$SESSION_TAG" \
+      --arg repository_path "$EVENT_CWD" \
+      '{operation:$operation,human_channel:$human_channel,owner_session_id:$owner_session_id,repository_path:$repository_path,hook_event_name:"UserPromptSubmit",invocation_source:"human"}')
+    if ISSUE_RESULT=$(node "$WORKSPACE_HOOK_INTENT" "$ISSUE_PAYLOAD" 2>&1); then
+      log_hook "state-activator" "Allowed" "server-held human intent issued for $HUMAN_OPERATION"
+    else
+      log_error "state-activator" "Human intent issuance failed: $ISSUE_RESULT"
+    fi
+  fi
+fi
+
 # Detect professional mode toggles
 SAFE_SESSION=$(echo "$SESSION_TAG" | sed "s/'/''/g")
 
@@ -55,7 +141,6 @@ else
   # Codex invokes plugin skills with a dollar-prefixed name. Keep this route
   # case-sensitive and exact (apart from outer whitespace) so prose, code spans,
   # escaped dollars, and prefix/suffix variants cannot deactivate the session.
-  TRIMMED_PROMPT=$(printf '%s' "$USER_PROMPT" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
   CODEX_DEACTIVATE_LINK_RE='^\[\$ironclaude:deactivate-professional-mode\]\(/[^)[:cntrl:]]*/skills/deactivate-professional-mode/SKILL\.md\)$'
   if [[ "$TRIMMED_PROMPT" =~ $CODEX_DEACTIVATE_LINK_RE ]]; then
     TRIMMED_PROMPT='$ironclaude:deactivate-professional-mode'

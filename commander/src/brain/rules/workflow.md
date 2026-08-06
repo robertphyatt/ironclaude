@@ -398,7 +398,9 @@ Worker has finished all tasks, staged changes, and suggests a commit message.
    - Is 1-2 sentences, concise
    - Matches the existing commit message conventions
 
-6. **Commit** — `git commit -m "<message>"`
+6. **Commit reviewed worker work locally** — call `commit_worker(worker_id, message)`.
+   Commander derives completion/review authority and exact Git evidence itself; do
+   not supply or infer grade, role, owner, ref, tree, or completion fields.
 
 7. **Kill the worker** — `kill_worker` with evidence (the commit hash and a summary
    of what was verified).
@@ -410,7 +412,9 @@ Worker has finished all tasks, staged changes, and suggests a commit message.
 
 **Do NOT:**
 - Commit without reading the diff (rubber-stamping)
-- Let the worker commit (workers stage only, Brain commits)
+- Let the worker commit (workers stage only; Brain calls `commit_worker`)
+- Run `git commit` via Bash for worker work or invoke workspace-manager's private
+  `finalize` CLI directly
 - Run `git push` via Bash (blocked) — use `push_repo` MCP tool instead (see section 6a)
 - Amend previous commits (git commit --amend is blocked)
 

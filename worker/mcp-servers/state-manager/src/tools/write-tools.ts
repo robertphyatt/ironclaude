@@ -1050,33 +1050,54 @@ export function handleWriteTool(
         );
       }
 
-      // Auto-determine submitted task_ids from current wave (filtered by wave_number)
-      const submittedRows = db.prepare(
-        `SELECT task_id FROM wave_tasks WHERE terminal_session = ? AND wave_number = ? AND status = 'submitted' ORDER BY task_id`,
-      ).all(resolvedId, session.current_wave) as { task_id: number }[];
-      const taskIds = submittedRows.map((r) => r.task_id);
+      const recordVerdict = db.transaction(() => {
+        const submittedRows = db.prepare(
+          `SELECT task_id FROM wave_tasks
+           WHERE terminal_session = ? AND wave_number = ? AND status = 'submitted'
+           ORDER BY task_id`,
+        ).all(resolvedId, session.current_wave) as { task_id: number }[];
+        const taskIds = submittedRows.map((row) => row.task_id);
 
-      insertReviewGrade(db, resolvedId, session.current_wave, taskIds, grade, taskBoundary);
+        insertReviewGrade(db, resolvedId, session.current_wave, taskIds, grade, taskBoundary);
 
-      // Advance submitted tasks on passing grade (A/B) with task_boundary
-      let advancedCount = 0;
-      if (taskBoundary && ['A', 'B'].includes(grade)) {
-        const result = db.prepare(
-          `UPDATE wave_tasks SET status = 'review_passed', updated_at = datetime('now')
-           WHERE terminal_session = ? AND wave_number = ? AND status = 'submitted'`,
-        ).run(resolvedId, session.current_wave);
-        advancedCount = result.changes;
-        updateSession(db, resolvedId, { review_pending: 0, review_block_count: 0 });
-      }
+        let advancedCount = 0;
+        let reopenedCount = 0;
+        let workflowStage = session.workflow_stage;
 
-      insertAuditLog(db, {
-        terminal_session: resolvedId,
-        actor: 'claude',
-        action: 'record_review_verdict',
-        old_value: null,
-        new_value: grade,
-        context: `wave=${session.current_wave}, task_boundary=${taskBoundary}, task_ids=${JSON.stringify(taskIds)}`,
+        if (taskBoundary && ['A', 'B'].includes(grade)) {
+          advancedCount = db.prepare(
+            `UPDATE wave_tasks SET status = 'review_passed', updated_at = datetime('now')
+             WHERE terminal_session = ? AND wave_number = ? AND status = 'submitted'`,
+          ).run(resolvedId, session.current_wave).changes;
+          updateSession(db, resolvedId, { review_pending: 0, review_block_count: 0 });
+        } else if (taskBoundary) {
+          if (taskIds.length === 0) {
+            throw new Error('Cannot record a failing task-boundary verdict without submitted tasks');
+          }
+          reopenedCount = db.prepare(
+            `UPDATE wave_tasks SET status = 'in_progress', updated_at = datetime('now')
+             WHERE terminal_session = ? AND wave_number = ? AND status = 'submitted'`,
+          ).run(resolvedId, session.current_wave).changes;
+          updateSession(db, resolvedId, {
+            workflow_stage: 'executing',
+            review_pending: 0,
+            review_block_count: 0,
+          });
+          workflowStage = 'executing';
+        }
+
+        insertAuditLog(db, {
+          terminal_session: resolvedId,
+          actor: 'claude',
+          action: 'record_review_verdict',
+          old_value: null,
+          new_value: grade,
+          context: `wave=${session.current_wave}, task_boundary=${taskBoundary}, task_ids=${JSON.stringify(taskIds)}`,
+        });
+
+        return { taskIds, advancedCount, reopenedCount, workflowStage };
       });
+      const { taskIds, advancedCount, reopenedCount, workflowStage } = recordVerdict();
 
       return ok({
         success: true,
@@ -1085,6 +1106,8 @@ export function handleWriteTool(
         wave_number: session.current_wave,
         task_ids: taskIds,
         advanced_count: advancedCount,
+        reopened_count: reopenedCount,
+        workflow_stage: workflowStage,
       });
     }
 

@@ -155,21 +155,37 @@ describe('review_pending Flavor B — record_review_verdict clears flag', () => 
     expect(session.review_pending).toBe(0);
   });
 
-  it('does NOT clear review_pending on failing grade', () => {
+  it('reopens only submitted current-wave tasks on failing grade', () => {
     const db = createTestDb();
     db.prepare(
-      `INSERT INTO sessions (terminal_session, workflow_stage, review_pending, current_wave, professional_mode) VALUES (?, 'executing', 1, 1, 'on')`
+      `INSERT INTO sessions (terminal_session, workflow_stage, review_pending, review_block_count, current_wave, professional_mode) VALUES (?, 'reviewing', 1, 4, 1, 'on')`
     ).run(SESSION_ID);
     db.prepare(
-      `INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status) VALUES (?, 1, 1, 'test task', 'submitted')`
-    ).run(SESSION_ID);
+      `INSERT INTO wave_tasks (terminal_session, task_id, wave_number, task_name, status) VALUES
+       (?, 1, 1, 'submitted first', 'submitted'),
+       (?, 2, 1, 'submitted second', 'submitted'),
+       (?, 3, 1, 'unrelated current-wave task', 'in_progress'),
+       (?, 4, 2, 'submitted other-wave task', 'submitted')`
+    ).run(SESSION_ID, SESSION_ID, SESSION_ID, SESSION_ID);
 
     const result = handleWriteTool('record_review_verdict', { grade: 'D', task_boundary: true }, db, SESSION_ID);
     const parsed = JSON.parse(result.content[0].text);
 
     expect(parsed.success).toBe(true);
+    expect(parsed.reopened_count).toBe(2);
+    expect(parsed.task_ids).toEqual([1, 2]);
+    expect(parsed.workflow_stage).toBe('executing');
 
-    const session = db.prepare(`SELECT review_pending FROM sessions WHERE terminal_session = ?`).get(SESSION_ID) as { review_pending: number };
-    expect(session.review_pending).toBe(1);
+    const session = db.prepare(`SELECT workflow_stage, review_pending, review_block_count FROM sessions WHERE terminal_session = ?`).get(SESSION_ID);
+    const tasks = db.prepare(
+      `SELECT task_id, status FROM wave_tasks WHERE terminal_session = ? ORDER BY task_id`,
+    ).all(SESSION_ID);
+    expect(session).toMatchObject({ workflow_stage: 'executing', review_pending: 0, review_block_count: 0 });
+    expect(tasks).toEqual([
+      { task_id: 1, status: 'in_progress' },
+      { task_id: 2, status: 'in_progress' },
+      { task_id: 3, status: 'in_progress' },
+      { task_id: 4, status: 'submitted' },
+    ]);
   });
 });

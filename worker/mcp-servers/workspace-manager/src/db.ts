@@ -1,0 +1,434 @@
+import Database from 'better-sqlite3';
+import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import type {
+  AcquireIntegrationLockInput,
+  AcquirePrimaryCheckoutOwnershipInput,
+  Assignment,
+  AssignmentLifecycle,
+  CreateAssignmentInput,
+  CreateHumanIntentInput,
+  ConsumeHumanIntentInput,
+  ConsumeMatchingHumanIntentInput,
+  HumanIntent,
+  HumanIntentReceipt,
+  IssueHumanIntentInput,
+  IntegrationLock,
+  IntegrationRecord,
+  PrimaryCheckoutOwnership,
+  RecordIntegrationInput,
+} from './types.js';
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const TRANSITIONS: Readonly<Record<AssignmentLifecycle, readonly AssignmentLifecycle[]>> = {
+  reserved: ['materialized', 'abandoned'],
+  materialized: ['active', 'abandoned'],
+  active: ['ready_for_integration', 'abandoned'],
+  ready_for_integration: ['active', 'integrated', 'abandoned'],
+  integrated: ['cleaned'],
+  abandoned: ['cleaned'],
+  cleaned: [],
+};
+
+function getDbPath(): string {
+  if (process.env.WORKSPACE_MANAGER_DB_PATH) return process.env.WORKSPACE_MANAGER_DB_PATH;
+  return path.join(os.homedir(), '.claude', 'ironclaude-workspaces.db');
+}
+
+function requiredText(value: string, label: string): string {
+  if (value.length === 0) throw new Error(`${label} must not be empty`);
+  return value;
+}
+
+function requiredUuid(value: string, label: string): string {
+  if (!UUID_PATTERN.test(value)) throw new Error(`${label} must be a UUID`);
+  return value;
+}
+
+function canonicalIsoTimestamp(value: string, label: string): string {
+  if (value.length === 0 || Number.isNaN(Date.parse(value))) {
+    throw new Error(`${label} must be an ISO timestamp`);
+  }
+  return new Date(value).toISOString();
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('expectedEvidence must be JSON serializable');
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(',')}}`;
+  }
+  throw new Error('expectedEvidence must be JSON serializable');
+}
+
+/** Re-runnable, transactional schema bootstrap for durable workspace state. */
+export function migrateSchema(db: Database.Database): void {
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS assignments (
+        workspace_guid TEXT PRIMARY KEY,
+        repository_identity TEXT NOT NULL,
+        worktree_path TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        base_commit TEXT NOT NULL,
+        current_head TEXT NOT NULL,
+        owner_session_id TEXT,
+        worker_id TEXT,
+        lifecycle_status TEXT NOT NULL DEFAULT 'reserved'
+          CHECK (lifecycle_status IN ('reserved', 'materialized', 'active', 'ready_for_integration', 'integrated', 'abandoned', 'cleaned')),
+        integration_target TEXT NOT NULL,
+        integrated_commit TEXT,
+        recovery_ref TEXT,
+        disposition TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS primary_checkout_owners (
+        repository_identity TEXT PRIMARY KEY,
+        workspace_guid TEXT NOT NULL REFERENCES assignments(workspace_guid),
+        owner_session_id TEXT NOT NULL,
+        acquired_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS integration_locks (
+        repository_identity TEXT PRIMARY KEY,
+        workspace_guid TEXT NOT NULL REFERENCES assignments(workspace_guid),
+        target_ref TEXT NOT NULL,
+        expected_target TEXT NOT NULL,
+        acquired_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS integration_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        workspace_guid TEXT NOT NULL UNIQUE REFERENCES assignments(workspace_guid),
+        repository_identity TEXT NOT NULL,
+        target_ref TEXT NOT NULL,
+        integrated_commit TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS human_intents (
+        intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation TEXT NOT NULL CHECK (operation IN ('use-primary-checkout', 'return-to-managed-worktree', 'commit', 'commit-and-push', 'push')),
+        human_channel TEXT NOT NULL,
+        provider_root_session_id TEXT NOT NULL,
+        repository_identity TEXT NOT NULL,
+        workspace_guid TEXT NOT NULL REFERENCES assignments(workspace_guid),
+        expected_evidence TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        nonce TEXT NOT NULL UNIQUE,
+        issued_at TEXT NOT NULL DEFAULT (datetime('now')),
+        consumed_at TEXT
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS active_assignment_owner_repository
+        ON assignments(owner_session_id, repository_identity)
+        WHERE owner_session_id IS NOT NULL
+          AND lifecycle_status NOT IN ('integrated', 'abandoned', 'cleaned');
+      CREATE INDEX IF NOT EXISTS assignments_repository_idx ON assignments(repository_identity);
+      CREATE INDEX IF NOT EXISTS human_intents_lookup_idx
+        ON human_intents(operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, nonce);
+
+      CREATE TRIGGER IF NOT EXISTS prevent_workspace_guid_mutation
+      BEFORE UPDATE OF workspace_guid ON assignments
+      WHEN NEW.workspace_guid <> OLD.workspace_guid
+      BEGIN
+        SELECT RAISE(ABORT, 'workspace GUID is immutable');
+      END;
+
+      INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
+    `);
+  })();
+}
+
+export function initDb(dbPath?: string): Database.Database {
+  const resolvedPath = dbPath || getDbPath();
+  if (resolvedPath !== ':memory:') fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
+  const db = new Database(resolvedPath, { timeout: 10000 });
+  db.pragma('foreign_keys = ON');
+  db.pragma('journal_mode = WAL');
+  migrateSchema(db);
+  return db;
+}
+
+export function getAssignment(db: Database.Database, workspaceGuid: string): Assignment | undefined {
+  return db.prepare('SELECT * FROM assignments WHERE workspace_guid = ?').get(workspaceGuid) as Assignment | undefined;
+}
+
+export function createAssignment(db: Database.Database, input: CreateAssignmentInput): Assignment {
+  const workspaceGuid = requiredUuid(input.workspaceGuid, 'workspaceGuid');
+  const ownerSessionId = input.ownerSessionId == null ? null : requiredText(input.ownerSessionId, 'ownerSessionId');
+  db.prepare(`
+    INSERT INTO assignments (
+      workspace_guid, repository_identity, worktree_path, branch, base_commit, current_head,
+      owner_session_id, worker_id, integration_target
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    workspaceGuid,
+    requiredText(input.repositoryIdentity, 'repositoryIdentity'),
+    requiredText(input.worktreePath, 'worktreePath'),
+    requiredText(input.branch, 'branch'),
+    requiredText(input.baseCommit, 'baseCommit'),
+    requiredText(input.currentHead, 'currentHead'),
+    ownerSessionId,
+    input.workerId == null ? null : requiredText(input.workerId, 'workerId'),
+    requiredText(input.integrationTarget, 'integrationTarget'),
+  );
+  return getAssignment(db, workspaceGuid)!;
+}
+
+export function bindAssignmentOwner(db: Database.Database, workspaceGuid: string, ownerSessionId: string): Assignment {
+  const existing = getAssignment(db, workspaceGuid);
+  if (!existing) throw new Error('Assignment not found');
+  const owner = requiredText(ownerSessionId, 'ownerSessionId');
+  if (existing.owner_session_id === owner) return existing;
+  if (existing.owner_session_id !== null) throw new Error('Assignment owner is already bound');
+  const result = db.prepare(`
+    UPDATE assignments SET owner_session_id = ?, updated_at = datetime('now')
+    WHERE workspace_guid = ? AND owner_session_id IS NULL
+  `).run(owner, workspaceGuid);
+  if (result.changes !== 1) throw new Error('Assignment owner binding changed concurrently');
+  return getAssignment(db, workspaceGuid)!;
+}
+
+export function transitionAssignment(
+  db: Database.Database,
+  workspaceGuid: string,
+  expectedStatus: AssignmentLifecycle,
+  nextStatus: AssignmentLifecycle,
+): Assignment {
+  if (!TRANSITIONS[expectedStatus].includes(nextStatus)) {
+    throw new Error(`Invalid lifecycle transition: ${expectedStatus} -> ${nextStatus}`);
+  }
+  const result = db.prepare(`
+    UPDATE assignments SET lifecycle_status = ?, updated_at = datetime('now')
+    WHERE workspace_guid = ? AND lifecycle_status = ?
+  `).run(nextStatus, workspaceGuid, expectedStatus);
+  if (result.changes !== 1) throw new Error('Assignment lifecycle state changed concurrently or assignment was not found');
+  return getAssignment(db, workspaceGuid)!;
+}
+
+export function acquirePrimaryCheckoutOwnership(
+  db: Database.Database,
+  input: AcquirePrimaryCheckoutOwnershipInput,
+): PrimaryCheckoutOwnership {
+  const assignment = getAssignment(db, input.workspaceGuid);
+  if (!assignment || assignment.repository_identity !== input.repositoryIdentity || assignment.owner_session_id !== input.ownerSessionId) {
+    throw new Error('Primary checkout ownership does not match assignment binding');
+  }
+  try {
+    db.prepare(`
+      INSERT INTO primary_checkout_owners (repository_identity, workspace_guid, owner_session_id)
+      VALUES (?, ?, ?)
+    `).run(input.repositoryIdentity, input.workspaceGuid, input.ownerSessionId);
+  } catch (error) {
+    const owner = db.prepare('SELECT * FROM primary_checkout_owners WHERE repository_identity = ?')
+      .get(input.repositoryIdentity) as PrimaryCheckoutOwnership | undefined;
+    if (owner?.workspace_guid === input.workspaceGuid && owner.owner_session_id === input.ownerSessionId) return owner;
+    throw new Error('Primary checkout is already owned');
+  }
+  return db.prepare('SELECT * FROM primary_checkout_owners WHERE repository_identity = ?')
+    .get(input.repositoryIdentity) as PrimaryCheckoutOwnership;
+}
+
+export function releasePrimaryCheckoutOwnership(
+  db: Database.Database,
+  repositoryIdentity: string,
+  workspaceGuid: string,
+  ownerSessionId: string,
+): void {
+  const result = db.prepare(`
+    DELETE FROM primary_checkout_owners
+    WHERE repository_identity = ? AND workspace_guid = ? AND owner_session_id = ?
+  `).run(repositoryIdentity, workspaceGuid, ownerSessionId);
+  if (result.changes !== 1) throw new Error('Primary checkout ownership was not held by this assignment');
+}
+
+export function acquireIntegrationLock(db: Database.Database, input: AcquireIntegrationLockInput): IntegrationLock {
+  const assignment = getAssignment(db, input.workspaceGuid);
+  if (!assignment || assignment.repository_identity !== input.repositoryIdentity) {
+    throw new Error('Integration lock does not match assignment repository');
+  }
+  try {
+    db.prepare(`
+      INSERT INTO integration_locks (repository_identity, workspace_guid, target_ref, expected_target)
+      VALUES (?, ?, ?, ?)
+    `).run(input.repositoryIdentity, input.workspaceGuid, requiredText(input.targetRef, 'targetRef'), requiredText(input.expectedTarget, 'expectedTarget'));
+  } catch {
+    throw new Error('Integration lock is already held');
+  }
+  return db.prepare('SELECT * FROM integration_locks WHERE repository_identity = ?')
+    .get(input.repositoryIdentity) as IntegrationLock;
+}
+
+export function releaseIntegrationLock(db: Database.Database, repositoryIdentity: string, workspaceGuid: string): void {
+  const result = db.prepare(`
+    DELETE FROM integration_locks WHERE repository_identity = ? AND workspace_guid = ?
+  `).run(repositoryIdentity, workspaceGuid);
+  if (result.changes !== 1) throw new Error('Integration lock was not held by this assignment');
+}
+
+export function recordIntegration(db: Database.Database, input: RecordIntegrationInput): IntegrationRecord {
+  const assignment = getAssignment(db, input.workspaceGuid);
+  if (!assignment || assignment.repository_identity !== input.repositoryIdentity) {
+    throw new Error('Integration record does not match assignment repository');
+  }
+  const result = db.prepare(`
+    INSERT INTO integration_records (workspace_guid, repository_identity, target_ref, integrated_commit)
+    VALUES (?, ?, ?, ?)
+  `).run(input.workspaceGuid, input.repositoryIdentity, requiredText(input.targetRef, 'targetRef'), requiredText(input.integratedCommit, 'integratedCommit'));
+  return db.prepare('SELECT * FROM integration_records WHERE id = ?').get(result.lastInsertRowid) as IntegrationRecord;
+}
+
+export function createHumanIntent(db: Database.Database, input: CreateHumanIntentInput): HumanIntent {
+  const expiresAt = canonicalIsoTimestamp(input.expiresAt, 'expiresAt');
+  const result = db.prepare(`
+    INSERT INTO human_intents (
+      operation, human_channel, provider_root_session_id, repository_identity,
+      workspace_guid, expected_evidence, expires_at, nonce
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    input.operation,
+    requiredText(input.humanChannel, 'humanChannel'),
+    requiredText(input.providerRootSessionId, 'providerRootSessionId'),
+    requiredText(input.repositoryIdentity, 'repositoryIdentity'),
+    requiredUuid(input.workspaceGuid, 'workspaceGuid'),
+    canonicalJson(input.expectedEvidence),
+    expiresAt,
+    requiredText(input.nonce, 'nonce'),
+  );
+  return db.prepare('SELECT * FROM human_intents WHERE intent_id = ?').get(result.lastInsertRowid) as HumanIntent;
+}
+
+/**
+ * Trusted UserPromptSubmit issuance boundary. Nonce, expiry, and evidence stay
+ * in the server-owned database; the caller receives only a non-authorizing
+ * receipt. A repeated exact command supersedes any still-pending equivalent
+ * intent so public consumers never face an ambiguous replay set.
+ */
+export function issueHumanIntent(
+  db: Database.Database,
+  input: IssueHumanIntentInput,
+  clock: () => Date = () => new Date(),
+  nonceFactory: () => string = randomUUID,
+): HumanIntentReceipt {
+  const issuedAt = canonicalIsoTimestamp(clock().toISOString(), 'server clock');
+  const expiresAt = canonicalIsoTimestamp(new Date(Date.parse(issuedAt) + 5 * 60 * 1000).toISOString(), 'expiresAt');
+  return db.transaction(() => {
+    db.prepare(`
+      UPDATE human_intents SET consumed_at = ?
+      WHERE operation = ?
+        AND human_channel = ?
+        AND provider_root_session_id = ?
+        AND repository_identity = ?
+        AND workspace_guid = ?
+        AND consumed_at IS NULL
+    `).run(
+      issuedAt,
+      input.operation,
+      input.humanChannel,
+      input.providerRootSessionId,
+      input.repositoryIdentity,
+      input.workspaceGuid,
+    );
+    createHumanIntent(db, {
+      ...input,
+      expiresAt,
+      nonce: requiredText(nonceFactory(), 'nonce'),
+    });
+    return { issued: true as const, operation: input.operation };
+  })();
+}
+
+/**
+ * Atomically matches every authorization binding and marks an intent consumed.
+ * The optional clock is an internal test seam; callers cannot supply a time.
+ */
+export function consumeHumanIntent(
+  db: Database.Database,
+  input: ConsumeHumanIntentInput,
+  clock: () => Date = () => new Date(),
+): HumanIntent | undefined {
+  const evidence = canonicalJson(input.expectedEvidence);
+  const now = canonicalIsoTimestamp(clock().toISOString(), 'server clock');
+  return db.transaction(() => {
+    const result = db.prepare(`
+      UPDATE human_intents SET consumed_at = ?
+      WHERE operation = ?
+        AND human_channel = ?
+        AND provider_root_session_id = ?
+        AND repository_identity = ?
+        AND workspace_guid = ?
+        AND expected_evidence = ?
+        AND nonce = ?
+        AND consumed_at IS NULL
+        AND expires_at > ?
+    `).run(
+      now,
+      input.operation,
+      input.humanChannel,
+      input.providerRootSessionId,
+      input.repositoryIdentity,
+      input.workspaceGuid,
+      evidence,
+      input.nonce,
+      now,
+    );
+    if (result.changes !== 1) return undefined;
+    return db.prepare('SELECT * FROM human_intents WHERE nonce = ?').get(input.nonce) as HumanIntent;
+  })();
+}
+
+/** Atomically consumes the newest exact pending intent without exposing nonce. */
+export function consumeMatchingHumanIntent(
+  db: Database.Database,
+  input: ConsumeMatchingHumanIntentInput,
+  clock: () => Date = () => new Date(),
+): HumanIntent | undefined {
+  const evidence = canonicalJson(input.expectedEvidence);
+  const now = canonicalIsoTimestamp(clock().toISOString(), 'server clock');
+  return db.transaction(() => {
+    const candidate = db.prepare(`
+      SELECT intent_id FROM human_intents
+      WHERE operation = ?
+        AND human_channel = ?
+        AND provider_root_session_id = ?
+        AND repository_identity = ?
+        AND workspace_guid = ?
+        AND expected_evidence = ?
+        AND consumed_at IS NULL
+        AND expires_at > ?
+      ORDER BY intent_id DESC
+      LIMIT 1
+    `).get(
+      input.operation,
+      input.humanChannel,
+      input.providerRootSessionId,
+      input.repositoryIdentity,
+      input.workspaceGuid,
+      evidence,
+      now,
+    ) as { intent_id: number } | undefined;
+    if (!candidate) return undefined;
+    const result = db.prepare(`
+      UPDATE human_intents SET consumed_at = ?
+      WHERE intent_id = ? AND consumed_at IS NULL AND expires_at > ?
+    `).run(now, candidate.intent_id, now);
+    if (result.changes !== 1) return undefined;
+    return db.prepare('SELECT * FROM human_intents WHERE intent_id = ?').get(candidate.intent_id) as HumanIntent;
+  })();
+}

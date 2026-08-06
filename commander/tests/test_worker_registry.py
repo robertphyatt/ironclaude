@@ -110,6 +110,37 @@ class TestWorkers:
         assert len(running) == 1
         assert running[0]["description"] == "Deploy service"
 
+    def test_workspace_assignment_round_trips_atomically(self, registry):
+        registry.register_worker("w-1", "claude-max", "ic-w-1", repo="/repo")
+        assignment = {
+            "workspace_guid": "019fc5e5-fc72-7493-b785-bee8cda62b1b",
+            "repository_identity": "/repo/.git",
+            "worktree_path": "/repo/.ironclaude/worktrees/019fc5e5-fc72-7493-b785-bee8cda62b1b",
+            "branch": "ironclaude/019fc5e5-fc72-7493-b785-bee8cda62b1b",
+            "base_commit": "a" * 40,
+            "integration_target": "refs/heads/main",
+        }
+
+        registry.set_worker_workspace("w-1", assignment)
+        worker = registry.get_worker("w-1")
+        assert worker["workspace_guid"] == assignment["workspace_guid"]
+        assert worker["workspace_repository_identity"] == assignment["repository_identity"]
+        assert worker["workspace_path"] == assignment["worktree_path"]
+        assert worker["workspace_branch"] == assignment["branch"]
+        assert worker["workspace_base_commit"] == assignment["base_commit"]
+        assert worker["workspace_integration_target"] == assignment["integration_target"]
+
+    def test_workspace_assignment_rejects_missing_worker(self, registry):
+        with pytest.raises(KeyError, match="missing"):
+            registry.set_worker_workspace("missing", {
+                "workspace_guid": "guid",
+                "repository_identity": "repo",
+                "worktree_path": "path",
+                "branch": "branch",
+                "base_commit": "base",
+                "integration_target": "target",
+            })
+
 
 class TestWorkersByType:
     def test_get_running_workers_by_type_returns_matching(self, registry):

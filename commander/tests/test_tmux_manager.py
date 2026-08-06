@@ -50,6 +50,8 @@ class TestTmuxManager:
         calls = mock_run.call_args_list
         assert len(calls) == 2  # new-session + pipe-pane
         assert "worker-1" in calls[0].args[0]
+        assert "cat >>" not in calls[1].args[0][-1]
+        assert "cat >" in calls[1].args[0][-1]
 
     @patch("ironclaude.tmux_manager.subprocess.run")
     def test_kill_session(self, mock_run):
@@ -696,3 +698,4 @@ class TestAdoptionHelpers:
         path = tm.setup_log_capture("ic-d1209a")
         assert path == "/tmp/ic-logs/ic-d1209a.log"
         assert "pipe-pane" in mock_run.call_args.args[0]
+        assert "cat >>" in mock_run.call_args.args[0][-1]

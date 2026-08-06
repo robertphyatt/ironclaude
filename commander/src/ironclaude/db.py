@@ -46,7 +46,13 @@ CREATE TABLE IF NOT EXISTS workers (
     finished_at TEXT,
     client TEXT,
     model TEXT,
-    native_session_id TEXT
+    native_session_id TEXT,
+    workspace_guid TEXT,
+    workspace_repository_identity TEXT,
+    workspace_path TEXT,
+    workspace_branch TEXT,
+    workspace_base_commit TEXT,
+    workspace_integration_target TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -296,7 +302,17 @@ def init_db(db_path: str) -> sqlite3.Connection:
                 raise
     # Migrate pre-existing `workers` tables that predate provider identity
     # columns persisted at spawn.
-    for _wcol in ("client", "model", "native_session_id"):
+    for _wcol in (
+        "client",
+        "model",
+        "native_session_id",
+        "workspace_guid",
+        "workspace_repository_identity",
+        "workspace_path",
+        "workspace_branch",
+        "workspace_base_commit",
+        "workspace_integration_target",
+    ):
         try:
             conn.execute(f"ALTER TABLE workers ADD COLUMN {_wcol} TEXT")
         except sqlite3.OperationalError as exc:

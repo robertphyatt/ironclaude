@@ -108,6 +108,38 @@ class WorkerRegistry:
         )
         self._conn.commit()
 
+    def set_worker_workspace(self, worker_id: str, assignment: dict) -> None:
+        """Persist the exact durable workspace assignment returned by workspace-manager."""
+        fields = (
+            "workspace_guid",
+            "repository_identity",
+            "worktree_path",
+            "branch",
+            "base_commit",
+            "integration_target",
+        )
+        missing = [field for field in fields if not isinstance(assignment.get(field), str) or not assignment[field]]
+        if missing:
+            raise ValueError(f"workspace assignment missing required fields: {', '.join(missing)}")
+        cursor = self._conn.execute(
+            "UPDATE workers SET workspace_guid = ?, workspace_repository_identity = ?, "
+            "workspace_path = ?, workspace_branch = ?, workspace_base_commit = ?, "
+            "workspace_integration_target = ? WHERE id = ?",
+            (
+                assignment["workspace_guid"],
+                assignment["repository_identity"],
+                assignment["worktree_path"],
+                assignment["branch"],
+                assignment["base_commit"],
+                assignment["integration_target"],
+                worker_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            self._conn.rollback()
+            raise KeyError(f"worker not found: {worker_id}")
+        self._conn.commit()
+
     def get_worker(self, worker_id: str) -> dict | None:
         row = self._conn.execute(
             "SELECT * FROM workers WHERE id = ?", (worker_id,)

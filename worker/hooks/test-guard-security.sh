@@ -12,6 +12,9 @@ FAIL=0
 # the same _has_blocked_metachars the guards now use (covers ; & | ` $( < > and newline).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/bash-readonly-guard.sh"
+# Needed for canonicalize_path_portable, which the M2 mirror below uses. Without
+# it the mirror falls back to the raw path and stops modelling production.
+source "$SCRIPT_DIR/hook-logger.sh"
 
 assert_eq() {
   local desc="$1" expected="$2" actual="$3"
@@ -88,11 +91,13 @@ is_safe_make_test() {
 # M1: reviewing stage allowlist — adapter onto the real predicate from bash-readonly-guard.sh
 is_review_allowed_verdict() { if is_review_allowed "$1"; then echo allowed; else echo blocked; fi; }
 
-# M2: safe memory path check (fixed version — realpath -m + .. rejection)
+# M2: safe memory path check. Mirrors production, which uses the portable
+# canonicalizer: `realpath -m` is GNU-only and silently returns the RAW path on
+# BSD/macOS, so a mirror using it stops modelling production on half the hosts.
 is_safe_memory_path() {
   local path="$1"
   local canonical
-  canonical=$(realpath -m "$path" 2>/dev/null || echo "$path")
+  canonical=$(canonicalize_path_portable "$path" 2>/dev/null || echo "$path")
   if [[ "$canonical" != *".."* ]] && [[ "$canonical" == "$HOME/.claude/projects/"*"/memory/"* ]]; then
     echo "allowed"
   else
@@ -303,6 +308,100 @@ do
   assert_real_blocked "real hook $stage process-substitution" "$stage" \
     "git check-ignore <(touch /tmp/x)"
 done
+
+echo "=== WF: Private Workspace Finalizer Is Commander-Only ==="
+FORGED_FINALIZE_COMMAND="node /installed/ironclaude/mcp-servers/workspace-manager/dist/cli.js finalize '{\"command\":{\"repositoryPath\":\"/repo\",\"workspaceGuid\":\"22222222-2222-4222-8222-222222222222\",\"providerRootSessionId\":\"11111111-1111-4111-8111-111111111111\",\"message\":\"forged\",\"canonicalBranch\":\"ironclaude/2222\",\"localRef\":\"refs/heads/ironclaude/2222\",\"stagedTree\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"parentOid\":\"cccccccccccccccccccccccccccccccccccccccc\"}}'"
+
+run_private_finalize_guard() {
+  local role="$1" command="$2"
+  jq -nc --arg command "$command" \
+    '{tool_name:"Bash",tool_input:{command:$command},session_id:"check-ignore-test"}' \
+    | HOME="$TEST_HOME" IC_ROLE="$role" bash "$REAL_GUARD" 2>&1
+}
+
+set_real_stage "executing"
+for role in direct worker brain; do
+  PRIVATE_FINALIZE_OUT=$(run_private_finalize_guard "$role" "$FORGED_FINALIZE_COMMAND")
+  assert_real_blocked "private finalize denied for IC_ROLE=$role" "executing" \
+    "$FORGED_FINALIZE_COMMAND"
+  if printf '%s' "$PRIVATE_FINALIZE_OUT" | grep -q 'COMMANDER-ONLY WORKSPACE TRANSPORT'; then
+    assert_eq "private finalize reason for IC_ROLE=$role" "commander-only" "commander-only"
+  else
+    assert_eq "private finalize reason for IC_ROLE=$role" "commander-only" "$PRIVATE_FINALIZE_OUT"
+  fi
+done
+
+# Each form below reached the transport under the previous path-anchored regex.
+echo "=== WF: Private Transport Evasion Forms ==="
+FORGED_PAYLOAD="'{\"command\":{}}'"
+assert_real_blocked "single-quoted bundle path" "executing" \
+  "node '/installed/ironclaude/mcp-servers/workspace-manager/dist/cli.js' finalize $FORGED_PAYLOAD"
+assert_real_blocked "double-quoted bundle path" "executing" \
+  "node \"/installed/ironclaude/mcp-servers/workspace-manager/dist/cli.js\" finalize $FORGED_PAYLOAD"
+assert_real_blocked "cd into bundle dir then relative invoke" "executing" \
+  "cd /installed/ironclaude/mcp-servers/workspace-manager/dist && node cli.js finalize $FORGED_PAYLOAD"
+assert_real_blocked "src bundle without dist segment" "executing" \
+  "node /installed/ironclaude/mcp-servers/workspace-manager/src/cli.js finalize $FORGED_PAYLOAD"
+# The other four internal commands are equally private.
+for private_cmd in allocate bind abandon reconcile; do
+  assert_real_blocked "private $private_cmd denied" "executing" \
+    "node /installed/ironclaude/mcp-servers/workspace-manager/dist/cli.js $private_cmd $FORGED_PAYLOAD"
+done
+# Negative cases: the broadened matcher must not CLAIM unrelated commands. These
+# assert the absence of the commander-only verdict rather than a bare allow,
+# because an unrelated mutation can still be refused for other reasons (no
+# workspace database in this harness) — which would mask over-matching.
+set_real_stage "executing"
+# The directory is deliberately NOT part of the match: requiring the literal
+# `workspace-manager` substring was defeated by `.../works*/dist/cli.js`, which
+# relocates nothing. The bound is the PRIVATE SUBCOMMAND — an unrelated cli.js
+# using a different subcommand is not claimed.
+UNRELATED_OUT=$(run_real_guard "node /some/other/project/dist/cli.js serve --port 8080")
+if printf '%s' "$UNRELATED_OUT" | grep -q 'COMMANDER-ONLY'; then
+  assert_eq "unrelated cli.js subcommand not claimed as commander-only" "not-claimed" "$UNRELATED_OUT"
+else
+  assert_eq "unrelated cli.js subcommand not claimed as commander-only" "not-claimed" "not-claimed"
+fi
+# INSPECTION IS NOT INVOCATION. Each of these names a private bundle in a
+# compound command, which disqualifies it from the read-only-research carve-out.
+# Blocking them meant the guard refused to let anyone read this repo's own
+# source. None can execute anything: the bundles are not executable, so without
+# a Node-family launcher there is no invocation to prevent.
+WM_INTENT_BUNDLE="hook-""intent.js"
+for inspect_form in \
+  "diff -q /a/workspace-manager/dist/$WM_INTENT_BUNDLE /b/workspace-manager/dist/$WM_INTENT_BUNDLE && echo same" \
+  "shasum -a 256 /installed/mcp-servers/workspace-manager/dist/$WM_INTENT_BUNDLE; true" \
+  "cat /installed/mcp-servers/workspace-manager/dist/$WM_INTENT_BUNDLE | wc -l" \
+  "grep -n runCli /installed/mcp-servers/workspace-manager/dist/cli.js && echo found" \
+  "ls -l /installed/mcp-servers/workspace-manager/dist/$WM_INTENT_BUNDLE; echo done"
+do
+  INSPECT_OUT=$(run_real_guard "$inspect_form")
+  if printf '%s' "$INSPECT_OUT" | grep -q 'COMMANDER-ONLY'; then
+    assert_eq "inspection is not claimed as invocation" "not-claimed" "$INSPECT_OUT"
+  else
+    assert_eq "inspection is not claimed as invocation" "not-claimed" "not-claimed"
+  fi
+done
+# A launcher inside an otherwise-inspecting compound command is still invocation.
+assert_real_blocked "launcher hidden in a compound command denied" "executing" \
+  "ls -l /tmp && node /installed/ironclaude/mcp-servers/workspace-manager/dist/cli.js finalize {}"
+
+# Glob-relocated paths must still be claimed — this is the defect the directory
+# conjunct allowed through.
+for glob_form in \
+  "node /installed/ironclaude/mcp-servers/works*/dist/hook-intent.js {}" \
+  "node /installed/ironclaude/mcp-servers/works*/dist/cli.js finalize {}" \
+  "node -e import('/x/dist/cli.js').then(m=>m.runCli(['finalize']))" \
+  "node -e import('/x/dist/index.js').then(m=>m.createPublicToolDependencies())"
+do
+  assert_real_blocked "glob/eval transport form denied" "executing" "$glob_form"
+done
+WM_MENTION_OUT=$(run_real_guard "cat /installed/ironclaude/mcp-servers/workspace-manager/package.json")
+if printf '%s' "$WM_MENTION_OUT" | grep -q 'COMMANDER-ONLY'; then
+  assert_eq "workspace-manager mention without subcommand not claimed" "not-claimed" "$WM_MENTION_OUT"
+else
+  assert_eq "workspace-manager mention without subcommand not claimed" "not-claimed" "not-claimed"
+fi
 
 # ─── PA TESTS: Provider-Aware Undecided Bootstrap Paths ───
 echo "=== PA: Provider-Aware Undecided Bootstrap Paths ==="
@@ -818,8 +917,8 @@ assert_bootstrap_blocked "on mode rejects root CLAUDE bootstrap Edit" "Edit" \
 assert_bootstrap_blocked "on mode rejects behavioral bootstrap Write" "Write" \
   ".claude/rules/behavioral.md"
 
-# ─── WG TESTS: Reviewing-Stage Write-Guard allowed_files Exception ───
-echo "=== WG: Reviewing-Stage Write-Guard (allowed_files exception) ==="
+# ─── WG TESTS: Reviewing-Stage Write-Guard ───
+echo "=== WG: Reviewing-Stage Write-Guard ==="
 WG_SESSION="wg-review-test"
 TEST_HOME_WG=$(mktemp -d)
 # Re-set EXIT trap to clean BOTH temp dirs (CR-4's TEST_HOME + ours).
@@ -852,7 +951,9 @@ printf '{"verbose_hook_logs":false}\n' > "$TEST_HOME_WG/.claude/ironclaude-hooks
 
 run_wg_guard() {
   local tool_name="$1" file_path="$2"
-  printf '%s' "{\"tool_name\":\"$tool_name\",\"tool_input\":{\"file_path\":\"$file_path\"},\"session_id\":\"$WG_SESSION\"}" \
+  local input_key="file_path"
+  [ "$tool_name" = "NotebookEdit" ] && input_key="notebook_path"
+  printf '%s' "{\"tool_name\":\"$tool_name\",\"tool_input\":{\"$input_key\":\"$file_path\"},\"session_id\":\"$WG_SESSION\"}" \
     | HOME="$TEST_HOME_WG" bash "$REAL_GUARD" 2>&1
 }
 
@@ -867,12 +968,12 @@ assert_wg_blocked() {
   fi
 }
 
-# Allowed file during reviewing → permitted (exit 0, empty output).
-# RED anchor: on the PRE-FIX hook this is BLOCKED at the write-tools gate, so both
-# assertions fail — proving the deadlock exists and the seed reaches gate #1.
-WG_OUT=$(run_wg_guard "Edit" "$WG_ALLOWED_FILE"); WG_STATUS=$?
-assert_eq "WG allowed file during reviewing: exit 0" "0" "$WG_STATUS"
-assert_eq "WG allowed file during reviewing: empty output" "" "$WG_OUT"
+# All reviewing-stage writes are blocked, even when the path is allowed for
+# execution. RED anchor: the pre-fix reviewing exception permits each tool.
+for tool_name in Edit Write MultiEdit NotebookEdit; do
+  WG_OUT=$(run_wg_guard "$tool_name" "$WG_ALLOWED_FILE")
+  assert_wg_blocked "WG allowed file during reviewing ($tool_name): blocked" "$WG_OUT"
+done
 
 # Not-allowed file during reviewing → still blocked (file guard preserved).
 WG_OUT=$(run_wg_guard "Edit" "$WG_BLOCKED_FILE")
@@ -895,7 +996,7 @@ sqlite3 "$TEST_HOME_WG/.claude/ironclaude.db" \
 
 run_nb_guard() {
   local notebook_path="$1"
-  printf '%s' "{\"tool_name\":\"NotebookEdit\",\"tool_input\":{\"notebook_path\":\"$notebook_path\"},\"session_id\":\"$WG_SESSION\"}" \
+  printf '%s' "{\"tool_name\":\"NotebookEdit\",\"tool_input\":{\"notebook_path\":\"$notebook_path\"},\"cwd\":\"$TEST_HOME_WG\",\"session_id\":\"$WG_SESSION\"}" \
     | HOME="$TEST_HOME_WG" bash "$REAL_GUARD" 2>&1
 }
 

@@ -1,6 +1,6 @@
 ---
 name: activate-professional-mode
-description: Enable workflow discipline and behavioral expectations
+description: Enable workflow discipline across Claude Code and Codex; reports workspace mode without changing where files are written
 ---
 
 # Activate Professional Mode
@@ -15,6 +15,9 @@ Professional mode begins `undecided`. Only read-only tools and the
 activate/deactivate skills are available until the operator chooses a mode.
 Activation must establish and verify the durable instruction surface consumed
 by the trusted active client before professional mode changes to `on`.
+Activation works in the operator's primary checkout. Managed worktree isolation
+is opt-in via `/use-managed-worktree`; where a session already has one,
+activation verifies and reports it before professional mode changes to `on`.
 
 ## Provider-native state-manager calls
 
@@ -35,6 +38,18 @@ or:
 ```json
 {"professional_mode": "undecided", "client": "claude", "session_id": "<provider-native-root-session>"}
 ```
+
+## Provider-native workspace-manager calls
+
+- Claude Code:
+  `mcp__plugin_ironclaude_workspace-manager__list_active_assignments`,
+  `mcp__plugin_ironclaude_workspace-manager__activate_session_workspace`, and
+  `mcp__plugin_ironclaude_workspace-manager__get_workspace_status`.
+- Codex: Codex `workspace-manager` `list_active_assignments`, Codex `workspace-manager` `activate_session_workspace`, and Codex `workspace-manager` `get_workspace_status`.
+
+Use only the names for the trusted Step 1 client. Do not infer or switch clients
+from tool availability. Workspace-manager binds every call to the same
+provider-native root session, so never supply or invent a session identity.
 
 ## Instruction-file operation bindings
 
@@ -107,6 +122,79 @@ Display:
 ```text
 Activating professional mode for <client>...
 ```
+
+### Step 2: Report workspace mode
+
+Managed worktree isolation is OPT-IN. Activation works in the operator's primary
+checkout — the behaviour they already have — and never allocates a worktree.
+Isolation is requested explicitly with `/use-managed-worktree`, which matters
+when multiple sessions work the same codebase at once without pollution between
+efforts.
+
+Never call `activate_session_workspace` from this skill. Redirecting where an
+operator's files land is their decision, not an activation side effect.
+
+Use read-only Git inspection and read-only workspace-manager calls only.
+
+- If the project root is not inside a Git worktree, record workspace mode as
+  `not-applicable` and continue. Do not call workspace-manager for that project.
+- Otherwise, bind every workspace call to the canonical project root and the
+  same bound Step 1 `session_id`.
+
+Call the trusted client's `list_active_assignments` for the repository. This is
+a read: a session may already be isolated from an earlier `/use-managed-worktree`
+in the same provider root, and activation must report that truthfully rather
+than assume primary mode.
+
+- No assignment is the normal case. Record workspace mode as `primary-checkout`
+  and continue.
+- More than one assignment for the bound provider root is ambiguous. Enter
+  AI-assisted worktree recovery below; do not select one.
+- For one assignment, call `get_workspace_status` with its `workspace_guid`.
+  Verify the same `workspace_guid`, repository identity, owner session, managed
+  path, branch, base commit, and active lifecycle. A dirty managed worktree is
+  valid existing work and must be preserved.
+A dirty primary checkout is not a problem here, because activation no longer
+moves anything. Never stash, commit, copy, reset, clean, or move an operator's
+uncommitted work.
+
+Where an assignment already exists, its read-back must agree on
+`workspace_guid`, `repository_identity`, `worktree_path`, `branch`,
+`base_commit`, `owner_session_id`, `integration_target`, and active lifecycle.
+The owner must equal the same bound Step 1 `session_id`. Do not continue on
+partial, mismatched, or unregistered evidence.
+
+Record the verified assignment for the final activation display:
+
+```text
+Workspace assignment: <workspace_guid>
+Managed worktree: <worktree_path>
+Managed branch: <branch>
+Base commit: <base_commit>
+```
+
+#### AI-assisted worktree recovery
+
+If listing, allocation, or read-back fails, professional mode remains at the exact Step 1 prior value.
+Never silently fall back to the primary checkout.
+Preserve every existing checkout, branch, index, assignment, and file.
+
+Display a Bounded recovery diagnostic containing only:
+
+```text
+Failed operation: <list|allocate|read-back>
+Repository: <canonical repository root>
+Workspace assignment: <workspace_guid or not-yet-assigned>
+Observed error: <exact bounded error>
+Next safe action: <read-only diagnosis or exact retry>
+```
+
+The active assistant must help diagnose the failure with workspace-manager
+status/list evidence and read-only Git worktree/status evidence. After the
+cause is corrected, retry only the same assignment and repository binding.
+When exact reconciliation cannot be proved, preserve the assignment and
+explain the exact blocker. Never create a replacement assignment to make the
+error disappear.
 
 ### Step 3: Establish the active client's instruction surface
 
@@ -469,9 +557,28 @@ Display:
 ```text
 Professional mode ACTIVATED for <client>.
 
+Git workspace:
+<for primary-checkout mode: Working in your primary checkout. Nothing is redirected.>
+<for an existing assignment: the four-line verified assignment recorded in Step 2>
+<for non-Git: Professional mode active; Git worktree isolation not applicable (non-Git project).>
+
+Git worktrees are helpful when you want multiple sessions working on the same codebase at the same time without pollution between efforts.
+
+<for primary-checkout mode:>
+Your files are written where you expect them. If more than one session will work
+this repository at once, run /use-managed-worktree to move THIS session into an
+isolated worktree; that is the only thing that changes where writes land.
+
+<for an existing assignment:>
+This session is already isolated. File writes and Bash commands go to the managed
+worktree above — NOT your primary checkout, where `git status` will not show
+them. Uncommitted work in the primary checkout is untouched.
+To go back: /use-primary-checkout
+
 Workflow enforcement:
 ✓ Code changes blocked (architect mode)
 ✓ Git write operations blocked (staging allowed)
+✓ Commit and push are human-only: /commit, /commit-and-push, /push
 ✓ Changes only during plan execution via executing-plans skill
 
 Behavioral expectations:
@@ -484,11 +591,17 @@ Validation backend: <observed status>
 To disable (rarely needed): use ironclaude:deactivate-professional-mode
 ```
 
+Do not claim activation success before this disclosure. The effective workspace
+root is the primary checkout unless this session already holds a verified managed
+assignment; where it does, that worktree is the effective root even if provider
+UI still displays the primary checkout.
+
 ## Key Principles
 
 - **Provider-owned**: update only the active client's durable instruction files
 - **Semantically idempotent**: equivalent wording is covered; do not duplicate
 - **Fail-closed**: instruction failure never changes professional mode
+- **Primary checkout by default**: activation never allocates a worktree; isolation is opt-in via `/use-managed-worktree`
 - **Session-scoped**: state-manager identity selects the active session/client
 - **Human-in-the-loop**: engineers commit manually
 - **Never force-disable**: do not suggest deactivation unless requested

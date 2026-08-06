@@ -15,6 +15,16 @@ You can use the Worker alone for single-session discipline, or add the Commander
 
 ---
 
+## What's New in v1.1.4
+
+- **Managed worktrees, opt-in per session.** Two sessions sharing one checkout and one index overwrite each other silently. Run `/use-managed-worktree` and that session gets its own Git worktree, with file and command paths transparently rewritten into it — so a second session, or a Commander worker, can work the same repository without collision. **Nothing changes unless you ask for it:** professional mode works in your primary checkout by default, exactly as before. `/use-primary-checkout` returns an isolated session to the real checkout. Commander workers always get worktrees, since concurrency is the whole point of running them.
+- **Commit and push became human-only commands.** Committing, pushing, and switching checkouts are minted as single-use authority by the `UserPromptSubmit` hook from *your* typed `/commit`, `/push`, `/commit-and-push`, `/use-primary-checkout`, or `/return-to-managed-worktree`. The model issues the call; it cannot supply the authority that makes the call succeed. Commander can create a reviewed local commit through its own control plane, but it cannot push.
+- **Codex parity for the guard surface.** Codex's native `apply_patch` and `exec_command` previously never reached the PreToolUse guard at all. They now do, and are normalized to their Claude-native equivalents before the human-only config gate and the Commander-only transport gate.
+- **Portability fixes that mattered on macOS.** `realpath -m` is a GNU extension — on BSD/macOS it failed and the fallback returned the raw, unresolved path, leaving path-identity guards inert. A separate `bash` 4-only parameter expansion made the worktree escape check fail *open* on macOS's stock bash 3.2. Both are fixed, `make test` runs every hook suite, and CI exercises them on bash 3.2 and 5.
+- See [CHANGELOG.md](CHANGELOG.md) for full details.
+
+---
+
 ## What's New in v1.1.0
 
 - **Codex↔Claude parity for workers and grader.** A provider router lets those roles run on OpenAI Codex (`gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-5.6-sol`), selected per role in `config/ironclaude.json`. See [CODEX_SETUP.md](CODEX_SETUP.md).
@@ -135,6 +145,30 @@ In Codex, invoke the `ironclaude:activate-professional-mode` skill from the comp
 
 When active, Claude operates in architect mode -- planning and designing without making code changes unless executing an approved plan. Every write action is validated by hooks that check whether it's permitted in the current workflow phase.
 
+**Activation does not change where your files are written.** You work in your primary checkout, exactly as before. Activation reports the mode it's in and, if this session was already isolated, the worktree it's using.
+
+To isolate a session — worth doing when a second session or a Commander worker will touch the same repository at the same time:
+
+```
+/ironclaude:use-managed-worktree
+```
+
+That session then behaves like this:
+
+| What | Where it goes |
+|------|---------------|
+| Files the agent writes | `<repo>/.ironclaude/worktrees/<session-guid>/` on branch `ironclaude/<session-guid>` |
+| Relative paths (`src/app.py`) | Resolved against the managed worktree |
+| Bash commands | Prefixed with a `cd` into the managed worktree |
+| Reads | Never redirected away from you |
+| Your existing uncommitted work | Untouched in the primary checkout |
+
+`git status` in the primary checkout will not show work done inside the worktree — that is the point of the isolation, and the command says so when it runs. `/use-primary-checkout` returns the session to the real checkout; `/return-to-managed-worktree` sends it back.
+
+If allocation fails, the session stays in the primary checkout and reports the error rather than half-entering isolation.
+
+Commander workers always get their own worktree. Isolation is the reason to run several at once, and they aren't a human who can be surprised by it.
+
 ### Set Up Statusline (Recommended)
 
 ```
@@ -252,6 +286,17 @@ Advisor pairing is configured under `advisor.advisor_models` (per worker type) w
 | `testing-theatre-detection` | Detect tests that can't prevent regressions |
 | `elements-of-style` | Apply Strunk & White principles to technical writing |
 | `setup-ollama-validation` | Configure local LLM for hook validation |
+| `use-managed-worktree` | Isolate this session in its own Git worktree (opt-in) |
+
+**Human-only Git commands.** These consume single-use authority minted by the `UserPromptSubmit` hook from your own typed command. The model can invoke the skill, but authority comes from your keystrokes, not from its request — so an agent cannot commit or push on its own initiative.
+
+| Command | Purpose |
+|---------|---------|
+| `/commit` | Commit the reviewed staged tree and integrate locally; never pushes |
+| `/commit-and-push` | Commit, integrate, and push the reviewed tree |
+| `/push` | Push the verified local ref without creating a commit |
+| `/use-primary-checkout` | Work in the real checkout instead of the managed worktree |
+| `/return-to-managed-worktree` | Hand the primary checkout back and resume in the worktree |
 
 ### Uninstall
 
@@ -553,6 +598,15 @@ Commander workers run with `--dangerously-skip-permissions`. This is intentional
 Professional mode hooks are the security model. By the time a Commander worker is executing, the work has already passed through brainstorming, a written implementation plan, your approval, and code review gates. Asking for per-action permission at execution time is redundant friction on work that was already authorized — the discipline is enforced upstream, not at the action level.
 
 Users who prefer Claude Code's built-in permission prompts can use [Anthropic's auto mode](https://www.anthropic.com/engineering/claude-code-auto-mode) as an alternative to Commander's worker spawning.
+
+### Git authority (v1.1.4)
+
+Committing and pushing are minted as single-use authority by the `UserPromptSubmit` hook from a command *you* type. The intent is held server-side, bound to the exact staged tree, parent OID, and local ref, and re-verified when consumed. The model issues the call; it cannot supply the authority that makes the call succeed. Prose, quoting, model-generated text, and programmatic invocation are not authority.
+
+Two honest boundaries on that claim:
+
+- **The AI runs as your OS user.** This is a hook and tool-policy boundary, not cryptographic isolation. A process already running as you, willing to relocate a bundle, is outside what a PreToolUse guard can prevent — the guard refuses every invocation form we could construct, including glob-relocated paths and `node -e import(...)`, but it is string matching over a shell command and is best-effort by nature.
+- **Subagent fencing is not at parity.** Codex reports `thread_source`, so a Codex subagent is genuinely refused. A Claude subagent shares its root session's PPID file; the check reads whichever subagent marker the transport supplies and fails closed if one appears, but no such marker is known to be sent today. Because an intent binds the exact tree and parent OID, a subagent could at most reproduce the commit you just authorized.
 
 **Use at your own risk.** IronClaude is open-source software provided under the MIT License with no warranty. You are responsible for everything IronClaude does on your systems. Review the [LICENSE](LICENSE) before use.
 

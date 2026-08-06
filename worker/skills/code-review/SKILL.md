@@ -186,22 +186,11 @@ Organize findings into:
 - **Important**: Code quality issues, standards violations, architecture concerns
 - **Minor**: Style issues, documentation gaps
 
-**Step 7.1: Fix-First Pass (task-boundary reviews only)**
+**Step 7.1: Report-only classification**
 
-If invoked with `--task-boundary` AND workflow_stage is `executing` or `reviewing`:
+Code review is report-only for both task-boundary and standalone reviews. Do not edit files, apply fixes, or otherwise mutate the implementation during review. Classify every finding, report its file and line, and assign the grade from the reviewed state.
 
-1. Classify each finding as AUTO-FIX or ASK:
-   - **AUTO-FIX** (mechanical, unambiguous, low risk): missing imports, obvious typos, formatting violations, unused imports/variables in diff, console.log/print left in, missing semicolons
-   - **ASK** (requires judgment): security vulnerabilities, architecture concerns, logic errors, missing error handling, anything where two developers might disagree on the fix
-
-2. Apply AUTO-FIX items directly:
-   - For each: make the edit, output: `[AUTO-FIXED] [file:line] Problem → what was done`
-
-3. ASK items follow the current process (report, recommend, AskUserQuestion if important+).
-
-4. Grade reflects the post-AUTO-FIX state. Successfully auto-fixed items don't count against the grade.
-
-If NOT invoked with `--task-boundary` (standalone review): skip this step. Standalone reviews are report-only.
+For task-boundary C/D/F findings, return the complete findings to `executing-plans`; repair belongs to execution after the failing verdict reopens the submitted tasks. Task code re-review after repair is required, but it is not another blind plan review.
 
 **Step 7.5: Assign letter grade**
 
@@ -266,19 +255,20 @@ Use MCP tool: mcp__plugin_ironclaude_state-manager__record_review_verdict with:
   task_boundary: true
 ```
 
-The tool auto-determines submitted task_ids and wave_number from the DB.
+The tool auto-determines submitted task_ids and wave_number from the DB. A tool error is blocking: report it and stop; narrative output is not a substitute for a recorded verdict.
 
-If the MCP call fails (tool unavailable, or error), display a warning and continue — do NOT block skill completion:
-```
-⚠️ Warning: mcp__plugin_ironclaude_state-manager__record_review_verdict failed — GBTW will block on next stop.
-Grade is captured in the narrative above.
-```
+For task-boundary C/D/F, require a successful result, verify the returned `task_ids`, `reopened_count`, and `workflow_stage: "executing"`, then return the findings and those reopened task IDs to `executing-plans`. Do not repair code during this report-only review. A/B retain the existing pass/advance path.
 
 If invoked WITHOUT `--task-boundary` (standalone review): skip this step entirely.
 
 **Step 9: Recommend action**
 
-Based on findings:
+For task-boundary reviews:
+
+- **A/B:** retain the existing pass/advance path.
+- **C/D/F:** return the findings and verified reopened task IDs to `executing-plans` without an AskUserQuestion. Execution owns the automatic repair, planned verification, resubmission, and task code re-review.
+
+For standalone reviews, recommend action based on findings:
 
 - **Critical issues found:**
   ```

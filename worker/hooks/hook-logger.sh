@@ -558,3 +558,28 @@ read_config_flag() {
   fi
   echo "$default_val"
 }
+
+# canonicalize_path_portable <path> -> absolute path with the PARENT resolved
+# physically (symlinks followed), the final component left as-is so a
+# not-yet-created file still canonicalizes.
+#
+# Replaces `realpath -m`, which is a GNU extension: BSD/macOS realpath rejects
+# `-m`, so every `realpath -m ... || echo "$path"` fallback silently returned the
+# RAW path and no symlink was ever resolved on macOS. Guards that relied on it
+# for identity were inert on half the platforms this ships to.
+canonicalize_path_portable() {
+  local candidate="$1" parent base resolved
+  [ -n "$candidate" ] || return 1
+  case "$candidate" in /*) ;; *) candidate="$PWD/$candidate" ;; esac
+  parent=$(dirname -- "$candidate")
+  base=$(basename -- "$candidate")
+  if resolved=$(cd -- "$parent" 2>/dev/null && pwd -P); then
+    case "$base" in
+      .)  printf '%s' "$resolved" ;;
+      ..) printf '%s' "$(dirname -- "$resolved")" ;;
+      *)  printf '%s/%s' "${resolved%/}" "$base" ;;
+    esac
+  else
+    printf '%s' "$candidate"
+  fi
+}

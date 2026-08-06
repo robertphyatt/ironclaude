@@ -94,6 +94,25 @@ class TestInitDb:
         assert row[1] == 0  # session_active = 0
         conn.close()
 
+    def test_migrates_legacy_workers_with_workspace_columns(self, tmp_path):
+        db_path = str(tmp_path / "legacy.db")
+        legacy = sqlite3.connect(db_path)
+        legacy.execute("CREATE TABLE workers (id TEXT PRIMARY KEY)")
+        legacy.commit()
+        legacy.close()
+
+        conn = init_db(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(workers)")}
+        assert {
+            "workspace_guid",
+            "workspace_repository_identity",
+            "workspace_path",
+            "workspace_branch",
+            "workspace_base_commit",
+            "workspace_integration_target",
+        } <= columns
+        conn.close()
+
 
 def test_init_db_creates_shadow_concordance_table(tmp_path):
     conn = init_db(str(tmp_path / "test.db"))

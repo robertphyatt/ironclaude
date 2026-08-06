@@ -34,6 +34,7 @@ from ironclaude.ollama_client import OllamaError
 from ironclaude.provider_router import ProviderHandle, NoCapabilityAvailable
 
 _REAL_ENSURE_WORKER_INSTRUCTIONS = OrchestratorTools._ensure_worker_instructions
+_REAL_SET_PM = OrchestratorTools._set_pm_via_sqlite
 _REAL_READ_PM_STATE = OrchestratorTools._read_pm_state_via_sqlite
 _VALID_NATIVE_UUID = "11111111-1111-4111-8111-111111111111"
 
@@ -133,6 +134,48 @@ def default_pm_readback(monkeypatch):
             "session_uuid": _VALID_NATIVE_UUID,
         },
     )
+
+
+@pytest.fixture(autouse=True)
+def default_workspace_client(monkeypatch):
+    """Keep existing spawn tests compatible while production defaults to isolation."""
+    client = MagicMock()
+    client.discover_installed_plugin_root.side_effect = (
+        lambda provider, ssh_host=None: f"/installed/{provider}"
+    )
+
+    def allocate(payload, **transport):
+        guid = payload["workspace_guid"]
+        repo = payload["repository_path"]
+        return {
+            "workspace_guid": guid,
+            "repository_identity": f"identity:{repo}",
+            "worktree_path": repo,
+            "branch": f"ironclaude/{guid}",
+            "base_commit": "a" * 40,
+            "current_head": "a" * 40,
+            "owner_session_id": None,
+            "lifecycle_status": "active",
+            # Mirrors workspace-manager: an omitted integration_target is
+            # resolved server-side from the primary checkout's current branch.
+            # Commander deliberately no longer sends a hardcoded "main".
+            "integration_target": payload.get("integration_target", "main"),
+        }
+
+    client.allocate.side_effect = allocate
+    client.bind.side_effect = lambda payload, **transport: {
+        **allocate({
+            "workspace_guid": payload["workspace_guid"],
+            "repository_path": payload["repository_path"],
+            "integration_target": "main",
+        }),
+        "owner_session_id": payload["owner_session_id"],
+    }
+    monkeypatch.setattr(
+        "ironclaude.orchestrator_mcp.WorkspaceClient",
+        MagicMock(return_value=client),
+    )
+    return client
 
 
 def test_ensure_ssh_manager_lazy_init(tmp_path, db_conn, registry, mock_tmux):
@@ -289,9 +332,17 @@ class TestProviderAwareWorkerCommand:
         )
 
         assert "w-native" in result
-        tools._read_pm_state_via_sqlite.assert_called_once_with(
-            "ic-w-native", client=client,
-        )
+        if client == "codex":
+            tools._read_pm_state_via_sqlite.assert_called_once()
+            assert tools._read_pm_state_via_sqlite.call_args.args == ("ic-w-native",)
+            assert tools._read_pm_state_via_sqlite.call_args.kwargs["client"] == client
+            assert isinstance(
+                tools._read_pm_state_via_sqlite.call_args.kwargs["not_before"], float,
+            )
+        else:
+            tools._read_pm_state_via_sqlite.assert_called_once_with(
+                "ic-w-native", client=client,
+            )
         worker = registry.get_worker("w-native")
         assert worker["client"] == client
         assert worker["model"] == model
@@ -336,6 +387,225 @@ class TestProviderAwareWorkerCommand:
             "w-native-bad", event_type="worker_spawned",
         )
 
+    def test_codex_interrupted_spawn_cleans_up_without_pm_activation(
+        self, tools, registry, mock_tmux,
+    ):
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        tools._ensure_ssh_manager = MagicMock()
+        tools._wait_for_ready = MagicMock(return_value=False)
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        mock_tmux.read_log_tail.return_value = "MCP startup interrupted"
+        mock_tmux.has_session.return_value = True
+        _mock_grader_approve(tools)
+
+        result = tools.spawn_worker(
+            worker_id="w-interrupted",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="Task",
+        )
+
+        assert "MCP startup interrupted" in result["error"]
+        mock_tmux.kill_session.assert_called_once_with(
+            "ic-w-interrupted", ssh_host=None,
+        )
+        tools._activate_pm_via_sqlite.assert_not_called()
+        assert registry.get_worker("w-interrupted") is None
+
+
+class TestSingleWorkerManagedWorktree:
+    @staticmethod
+    def _assignment(payload):
+        guid = payload["workspace_guid"]
+        return {
+            "workspace_guid": guid,
+            "repository_identity": "machine:repo.git",
+            "worktree_path": f"/tmp/repo/.ironclaude/worktrees/{guid}",
+            "branch": f"ironclaude/{guid}",
+            "base_commit": "1" * 40,
+            "current_head": "1" * 40,
+            "owner_session_id": None,
+            "lifecycle_status": "active",
+            "integration_target": "main",
+        }
+
+    def test_allocation_omits_integration_target_for_server_derivation(
+        self, tools, registry, mock_tmux, default_workspace_client,
+    ):
+        """Commander must not pin the target; the server derives it per repo.
+
+        Hardcoding "main" produced assignments aimed at a ref that does not
+        exist on any master/trunk repository, and the failure only surfaced at
+        finalization after the whole worker run.
+        """
+        workspace = default_workspace_client
+        self._prepare(tools, workspace, mock_tmux)
+        tools.spawn_worker(
+            worker_id="w-target",
+            worker_type="claude-sonnet",
+            repo="/tmp/repo",
+            objective="Task",
+        )
+
+        workspace.allocate.assert_called()
+        payload = workspace.allocate.call_args[0][0]
+        assert "integration_target" not in payload
+
+    def _prepare(self, tools, workspace, mock_tmux):
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        tools._ensure_ssh_manager = MagicMock()
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._wait_for_ready = MagicMock(return_value=True)
+        tools._read_pm_state_via_sqlite = MagicMock(return_value={
+            "professional_mode": "on",
+            "workflow_stage": "executing",
+            "session_uuid": _VALID_NATIVE_UUID,
+        })
+        tools.ensure_worker_trusted = MagicMock()
+        workspace.allocate.side_effect = (
+            lambda payload, **transport: self._assignment(payload)
+        )
+        workspace.bind.side_effect = lambda payload, **transport: {
+            **self._assignment(payload),
+            "owner_session_id": payload["owner_session_id"],
+        }
+        mock_tmux.spawn_session.return_value = True
+        mock_tmux.send_keys.return_value = True
+        _mock_grader_approve(tools)
+
+    def test_reserves_before_launch_uses_worktree_cwd_then_binds_and_persists(
+        self, tools, registry, mock_tmux, default_workspace_client,
+    ):
+        workspace = default_workspace_client
+        self._prepare(tools, workspace, mock_tmux)
+        order = []
+        workspace.allocate.side_effect = lambda payload, **transport: (
+            order.append("allocate") or self._assignment(payload)
+        )
+        mock_tmux.spawn_session.side_effect = lambda *args, **kwargs: (
+            order.append("spawn") or True
+        )
+        tools._read_pm_state_via_sqlite.side_effect = lambda *args, **kwargs: (
+            order.append("identity") or {
+                "professional_mode": "on", "workflow_stage": "executing",
+                "session_uuid": _VALID_NATIVE_UUID,
+            }
+        )
+        workspace.bind.side_effect = lambda payload, **transport: (
+            order.append("bind") or {
+                **self._assignment(payload), "owner_session_id": payload["owner_session_id"],
+            }
+        )
+        mock_tmux.send_keys.side_effect = lambda *args, **kwargs: (
+            order.append("dispatch") or True
+        )
+
+        result = tools.spawn_worker(
+            worker_id="w-worktree", worker_type="claude-sonnet",
+            repo="/tmp/repo", objective="Task",
+        )
+
+        assert isinstance(result, str)
+        assert order == ["allocate", "spawn", "identity", "bind", "dispatch"]
+        assignment = workspace.allocate.return_value
+        spawned = mock_tmux.spawn_session.call_args
+        assert spawned.kwargs["cwd"].startswith("/tmp/repo/.ironclaude/worktrees/")
+        bind_payload = workspace.bind.call_args.args[0]
+        assert bind_payload["owner_session_id"] == _VALID_NATIVE_UUID
+        assert bind_payload["expected_worktree_path"] == spawned.kwargs["cwd"]
+        worker = registry.get_worker("w-worktree")
+        assert worker["repo"] == "/tmp/repo"
+        assert worker["workspace_guid"] == bind_payload["workspace_guid"]
+        assert worker["workspace_path"] == spawned.kwargs["cwd"]
+        workspace.discover_installed_plugin_root.assert_called_once_with("codex", ssh_host=None)
+
+    @pytest.mark.parametrize("phase", ["launch", "readiness", "activation", "bind", "dispatch"])
+    def test_post_reservation_failures_preserve_assignment_with_one_recovery_payload(
+        self, tools, registry, mock_tmux, default_workspace_client, phase,
+    ):
+        workspace = default_workspace_client
+        self._prepare(tools, workspace, mock_tmux)
+        if phase == "launch":
+            mock_tmux.spawn_session.return_value = False
+        elif phase == "readiness":
+            tools._wait_for_ready.return_value = False
+            mock_tmux.has_session.return_value = False
+        elif phase == "activation":
+            tools._activate_pm_via_sqlite.return_value = "activation failed"
+        elif phase == "bind":
+            workspace.bind.side_effect = RuntimeError("bind failed")
+        else:
+            mock_tmux.send_keys.return_value = False
+
+        result = tools.spawn_worker(
+            worker_id=f"w-{phase}", worker_type="claude-sonnet",
+            repo="/tmp/repo", objective="Task",
+        )
+
+        assert result["failure_phase"] == phase
+        assert result["assignment_preserved"] is True
+        assert result["workspace"]["workspace_guid"]
+        assert result["workspace"]["repository"] == "/tmp/repo"
+        assert result["workspace"]["worktree_path"].startswith(
+            "/tmp/repo/.ironclaude/worktrees/",
+        )
+        assert result["workspace"]["branch"].startswith("ironclaude/")
+        assert result["workspace"]["lifecycle"] == "active"
+        assert len(result["recovery"]) == 1
+        assert set(result["recovery"]) <= {"retry_bind", "reconcile", "abandon"}
+        workspace.abandon.assert_not_called()
+        if phase == "dispatch":
+            worker = registry.get_worker("w-dispatch")
+            assert worker["workspace_guid"] == result["workspace"]["workspace_guid"]
+
+    def test_allocation_failure_recovers_preserved_assignment_without_launch(
+        self, tools, mock_tmux, default_workspace_client,
+    ):
+        workspace = default_workspace_client
+        self._prepare(tools, workspace, mock_tmux)
+        captured = {}
+
+        def fail_allocate(payload, **transport):
+            captured.update(self._assignment(payload))
+            raise RuntimeError("materialization interrupted")
+
+        workspace.allocate.side_effect = fail_allocate
+        workspace.reconcile.return_value = {"assignments": [captured]}
+
+        result = tools.spawn_worker(
+            worker_id="w-allocation", worker_type="claude-sonnet",
+            repo="/tmp/repo", objective="Task",
+        )
+
+        assert result["failure_phase"] == "allocation"
+        assert result["assignment_preserved"] is True
+        assert result["workspace"]["workspace_guid"] == captured["workspace_guid"]
+        assert set(result["recovery"]) == {"reconcile"}
+        mock_tmux.spawn_session.assert_not_called()
+
+    def test_bind_rejects_response_owned_by_different_native_session(
+        self, tools, mock_tmux, default_workspace_client,
+    ):
+        workspace = default_workspace_client
+        self._prepare(tools, workspace, mock_tmux)
+        workspace.bind.side_effect = lambda payload, **transport: {
+            **self._assignment(payload),
+            "owner_session_id": "22222222-2222-4222-8222-222222222222",
+        }
+
+        result = tools.spawn_worker(
+            worker_id="w-bind-owner", worker_type="claude-sonnet",
+            repo="/tmp/repo", objective="Task",
+        )
+
+        assert result["failure_phase"] == "bind"
+        assert result["assignment_preserved"] is True
+        assert set(result["recovery"]) == {"retry_bind"}
+        assert result["recovery"]["retry_bind"]["owner_session_id"] == _VALID_NATIVE_UUID
+        failure_workspace = result["workspace"]
+        assert failure_workspace["owner"] == _VALID_NATIVE_UUID
+        mock_tmux.kill_session.assert_called_once()
+
 
 class TestWorkerInstructionPreflight:
     def test_ensure_worker_instructions_creates_codex_agents_only(
@@ -378,7 +648,9 @@ class TestWorkerInstructionPreflight:
             objective="Task",
         )
 
-        assert result == {"error": "Failed to ensure AGENTS.md"}
+        assert result["error"] == "Failed to ensure AGENTS.md"
+        assert result["failure_phase"] == "launch"
+        assert result["assignment_preserved"] is True
         tools._ensure_worker_instructions.assert_called_once_with(
             "/tmp/repo", "codex",
         )
@@ -402,7 +674,9 @@ class TestWorkerInstructionPreflight:
             objective="Task",
         )
 
-        assert result == {"error": "Failed to ensure CLAUDE.md"}
+        assert result["error"] == "Failed to ensure CLAUDE.md"
+        assert result["failure_phase"] == "launch"
+        assert result["assignment_preserved"] is True
         mock_tmux.spawn_session.assert_not_called()
 
     def test_spawn_worker_provider_unavailable_fails_closed_without_claude_fallback(
@@ -881,15 +1155,17 @@ class TestRemoteProviderLaunching:
         self._prepare_remote_success(tools, machine, _provider_handle())
         mock_tmux.spawn_session.return_value = False
 
-        with pytest.raises(RuntimeError, match="Failed to spawn tmux session"):
-            tools.spawn_worker(
-                worker_id="w-spawn-fail",
-                worker_type="claude-sonnet",
-                repo=self.REPO,
-                objective="Task",
-                machine="remote-worker",
-            )
+        result = tools.spawn_worker(
+            worker_id="w-spawn-fail",
+            worker_type="claude-sonnet",
+            repo=self.REPO,
+            objective="Task",
+            machine="remote-worker",
+        )
 
+        assert "Failed to spawn tmux session" in result["error"]
+        assert result["failure_phase"] == "launch"
+        assert result["assignment_preserved"] is True
         mock_tmux.kill_session.assert_not_called()
         assert registry.get_worker("w-spawn-fail") is None
         assert not registry.get_events_for_worker(
@@ -945,15 +1221,17 @@ class TestRemoteProviderLaunching:
         original = RuntimeError("registry write failed")
         tools.registry.register_worker = MagicMock(side_effect=original)
 
-        with pytest.raises(RuntimeError, match="registry write failed"):
-            tools.spawn_worker(
-                worker_id="w-register-fail",
-                worker_type="claude-sonnet",
-                repo=self.REPO,
-                objective="Task",
-                machine="remote-worker",
-            )
+        result = tools.spawn_worker(
+            worker_id="w-register-fail",
+            worker_type="claude-sonnet",
+            repo=self.REPO,
+            objective="Task",
+            machine="remote-worker",
+        )
 
+        assert result["error"] == "registry write failed"
+        assert result["failure_phase"] == "dispatch"
+        assert result["assignment_preserved"] is True
         mock_tmux.kill_session.assert_called_once_with(
             "ic-w-register-fail", ssh_host="ssh-remote",
         )
@@ -2421,6 +2699,19 @@ class TestWaitForReady:
         result = tools._wait_for_ready("ic-test", timeout=2)
         assert result is False
 
+    def test_codex_mcp_startup_interrupted_returns_false_without_sleep(
+        self, tools, mock_tmux,
+    ):
+        mock_tmux.read_log_tail.return_value = "MCP startup interrupted"
+        with patch(
+            "ironclaude.orchestrator_mcp.time.time",
+            side_effect=[0, 0, 31],
+        ), patch("ironclaude.orchestrator_mcp.time.sleep") as sleep:
+            result = tools._wait_for_ready("ic-test", timeout=30, client="codex")
+
+        assert result is False
+        sleep.assert_not_called()
+
 
 class TestEnsureClaudeMd:
     def test_injects_template_when_missing(self, tools, tmp_path):
@@ -3474,6 +3765,49 @@ class TestActivatePmViaSqlite:
         ).fetchone()
         conn.close()
         assert row[0] == "on"
+
+    def test_codex_session_identity_freshness_activates_and_reads_newer_descendant(
+        self, tools, tmp_path,
+    ):
+        pid = "12345"
+        brain_id = "11111111-1111-4111-8111-111111111111"
+        worker_id = "22222222-2222-4222-8222-222222222222"
+        boundary = 200.0
+        claude_dir = self._setup_claude_dir(tmp_path, "111", brain_id)
+        brain_file = claude_dir / "ironclaude-session-111.id"
+        worker_file = claude_dir / "ironclaude-session-222.id"
+        worker_file.write_text(worker_id)
+        os.utime(brain_file, (100.0, 100.0))
+        os.utime(worker_file, (201.0, 201.0))
+        tools._descendant_pids = MagicMock(return_value=[111, 222])
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = self._mock_tmux_run(pid)
+            assert _REAL_SET_PM(
+                tools,
+                "ic-x",
+                "on",
+                _claude_dir=claude_dir,
+                client="codex",
+                not_before=boundary,
+            ) is None
+
+        mock_tmux = tools.tmux
+        mock_tmux.list_pane_pid.return_value = pid
+        out = _REAL_READ_PM_STATE(
+            tools,
+            "ic-x",
+            _claude_dir=claude_dir,
+            client="codex",
+            not_before=boundary,
+        )
+        assert out["session_uuid"] == worker_id
+        db = sqlite3.connect(str(claude_dir / "ironclaude.db"))
+        rows = db.execute(
+            "SELECT terminal_session, professional_mode FROM sessions ORDER BY terminal_session",
+        ).fetchall()
+        db.close()
+        assert rows == [(worker_id, "on")]
 
     def test_update_overwrites_existing_row(self, tools, tmp_path):
         """Updates existing 'undecided' row to 'on'."""
@@ -5610,6 +5944,156 @@ class TestBatchSpawn:
         assert call_count[0] > 1
 
 
+class TestBatchManagedWorktree:
+    @staticmethod
+    def _assignment(payload):
+        guid = payload["workspace_guid"]
+        return {
+            "workspace_guid": guid,
+            "repository_identity": "machine:repo.git",
+            "worktree_path": f"/tmp/repo/.ironclaude/worktrees/{guid}",
+            "branch": f"ironclaude/{guid}",
+            "base_commit": "1" * 40,
+            "current_head": "1" * 40,
+            "owner_session_id": None,
+            "lifecycle_status": "active",
+            "integration_target": "main",
+        }
+
+    @staticmethod
+    def _requests():
+        return [
+            {"worker_id": "batch-a", "worker_type": "claude-sonnet",
+             "repo": "/tmp/repo", "objective": "Objective a"},
+            {"worker_id": "batch-b", "worker_type": "claude-sonnet",
+             "repo": "/tmp/repo", "objective": "Objective b"},
+        ]
+
+    def _prepare(self, tools, workspace):
+        _mock_batch_approve(tools)
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        tools._ensure_worker_instructions = MagicMock(return_value=None)
+        tools.ensure_worker_trusted = MagicMock()
+        tools._wait_for_ready = MagicMock(return_value=True)
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        native_ids = {
+            "ic-batch-a": "11111111-1111-4111-8111-111111111111",
+            "ic-batch-b": "22222222-2222-4222-8222-222222222222",
+        }
+        tools._read_pm_state_via_sqlite = MagicMock(side_effect=(
+            lambda session_name, **kwargs: {
+                "professional_mode": "on",
+                "workflow_stage": "idle",
+                "session_uuid": native_ids[session_name],
+            }
+        ))
+        workspace.allocate.side_effect = (
+            lambda payload, **transport: self._assignment(payload)
+        )
+        workspace.bind.side_effect = lambda payload, **transport: {
+            **self._assignment(payload),
+            "owner_session_id": payload["owner_session_id"],
+        }
+
+    def test_batch_worktree_assigns_unique_cwds_binds_and_persists(
+        self, tools, registry, mock_tmux, default_workspace_client,
+    ):
+        workspace = default_workspace_client
+        self._prepare(tools, workspace)
+
+        result = tools.spawn_workers(self._requests())
+
+        assert [item["status"] for item in result] == ["spawned", "spawned"]
+        cwd_by_session = {
+            call.args[0]: call.kwargs["cwd"]
+            for call in mock_tmux.spawn_session.call_args_list
+        }
+        assert set(cwd_by_session) == {"ic-batch-a", "ic-batch-b"}
+        assert len(set(cwd_by_session.values())) == 2
+        assert all(path != "/tmp/repo" for path in cwd_by_session.values())
+        allocation_guids = {
+            call.args[0]["workspace_guid"]
+            for call in workspace.allocate.call_args_list
+        }
+        assert len(allocation_guids) == 2
+        assert workspace.bind.call_count == 2
+        assert {
+            call.args[0]["owner_session_id"]
+            for call in workspace.bind.call_args_list
+        } == {
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        }
+        for worker_id in ("batch-a", "batch-b"):
+            worker = registry.get_worker(worker_id)
+            assert worker["workspace_guid"] in allocation_guids
+            assert worker["workspace_path"] == cwd_by_session[f"ic-{worker_id}"]
+
+    def test_batch_worktree_failed_sibling_preserves_only_its_assignment(
+        self, tools, registry, mock_tmux, default_workspace_client,
+    ):
+        workspace = default_workspace_client
+        self._prepare(tools, workspace)
+        tools._wait_for_ready.side_effect = (
+            lambda session_name, **kwargs: session_name == "ic-batch-b"
+        )
+        mock_tmux.has_session.side_effect = (
+            lambda session_name, **kwargs: session_name == "ic-batch-b"
+        )
+
+        result = tools.spawn_workers(self._requests())
+
+        failed, succeeded = result
+        assert failed["worker_id"] == "batch-a"
+        assert failed["failure_phase"] == "readiness"
+        assert failed["assignment_preserved"] is True
+        assert len(failed["recovery"]) == 1
+        assert set(failed["recovery"]) <= {"retry_bind", "reconcile", "abandon"}
+        assert succeeded["worker_id"] == "batch-b"
+        assert succeeded["status"] == "spawned"
+        assert registry.get_worker("batch-a") is None
+        assert registry.get_worker("batch-b")["workspace_guid"] != failed["workspace"]["workspace_guid"]
+        workspace.abandon.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "workspace_guid",
+            "repository_identity",
+            "worktree_path",
+            "branch",
+            "base_commit",
+            "current_head",
+            "lifecycle_status",
+            "integration_target",
+        ],
+    )
+    def test_batch_worktree_rejects_bind_response_with_changed_assignment_evidence(
+        self, tools, registry, mock_tmux, default_workspace_client, field,
+    ):
+        workspace = default_workspace_client
+        self._prepare(tools, workspace)
+
+        def changed_bind(payload, **transport):
+            response = {
+                **self._assignment(payload),
+                "owner_session_id": payload["owner_session_id"],
+            }
+            response[field] = f"changed-{field}"
+            return response
+
+        workspace.bind.side_effect = changed_bind
+
+        result = tools.spawn_workers(self._requests()[:1])[0]
+
+        assert result["failure_phase"] == "bind"
+        assert result["assignment_preserved"] is True
+        assert set(result["recovery"]) == {"retry_bind"}
+        assert field in result["error"]
+        assert registry.get_worker("batch-a") is None
+        mock_tmux.kill_session.assert_called_once_with("ic-batch-a")
+
+
 class TestProviderAwareBatchLifecycle:
     @pytest.fixture(autouse=True)
     def _batch_defaults(self, tools):
@@ -5664,7 +6148,10 @@ class TestProviderAwareBatchLifecycle:
 
         result = tools.spawn_workers([self._request()])
 
-        assert result == [{"worker_id": "w1", "error": message}]
+        assert result[0]["worker_id"] == "w1"
+        assert result[0]["error"] == message
+        assert result[0]["failure_phase"] == "launch"
+        assert result[0]["assignment_preserved"] is True
         mock_tmux.spawn_session.assert_not_called()
 
     def test_batch_codex_uses_provider_lifecycle_and_persists_provider(
@@ -5682,9 +6169,12 @@ class TestProviderAwareBatchLifecycle:
         tools._wait_for_ready.assert_called_once_with(
             "ic-w1", timeout=30, client="codex",
         )
-        tools._activate_pm_via_sqlite.assert_called_once_with(
-            "ic-w1", timeout=300, max_retries=3, client="codex",
-        )
+        tools._activate_pm_via_sqlite.assert_called_once()
+        assert tools._activate_pm_via_sqlite.call_args.args == ("ic-w1",)
+        assert tools._activate_pm_via_sqlite.call_args.kwargs["timeout"] == 300
+        assert tools._activate_pm_via_sqlite.call_args.kwargs["max_retries"] == 3
+        assert tools._activate_pm_via_sqlite.call_args.kwargs["client"] == "codex"
+        assert isinstance(tools._activate_pm_via_sqlite.call_args.kwargs["not_before"], float)
         messages = [call.args[1] for call in mock_tmux.send_keys.call_args_list]
         assert messages == ["Objective w1"]
         worker = registry.get_worker("w1")
@@ -5799,10 +6289,10 @@ class TestProviderAwareBatchLifecycle:
             self._request("good"),
         ])
 
-        assert result[0] == {
-            "worker_id": "bad",
-            "error": "Worker startup failed: readiness exploded",
-        }
+        assert result[0]["worker_id"] == "bad"
+        assert result[0]["error"] == "Worker startup failed: readiness exploded"
+        assert result[0]["failure_phase"] == "readiness"
+        assert result[0]["assignment_preserved"] is True
         assert result[1]["status"] == "spawned"
         assert registry.get_worker("bad") is None
         assert registry.get_worker("good") is not None
@@ -5837,10 +6327,12 @@ class TestProviderAwareBatchLifecycle:
             self._request("w2"),
         ])
 
-        assert result == [
-            {"worker_id": "w1", "error": "first"},
-            {"worker_id": "w2", "error": "second"},
+        assert [(item["worker_id"], item["error"]) for item in result] == [
+            ("w1", "first"),
+            ("w2", "second"),
         ]
+        assert all(item["failure_phase"] == "launch" for item in result)
+        assert all(item["assignment_preserved"] is True for item in result)
         mock_tmux.spawn_session.assert_not_called()
 
     def test_batch_alive_readiness_timeout_preserves_single_worker_behavior(
@@ -5855,6 +6347,21 @@ class TestProviderAwareBatchLifecycle:
         assert result[0]["status"] == "spawned"
         assert registry.get_worker("w1") is not None
         tools._activate_pm_via_sqlite.assert_called_once()
+
+    def test_codex_interrupted_spawn_returns_error_and_skips_pm_activation(
+        self, tools, registry, mock_tmux,
+    ):
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        tools._wait_for_ready.return_value = False
+        mock_tmux.read_log_tail.return_value = "MCP startup interrupted"
+        mock_tmux.has_session.return_value = True
+
+        result = tools.spawn_workers([self._request("interrupted")])
+
+        assert "MCP startup interrupted" in result[0]["error"]
+        mock_tmux.kill_session.assert_called_once_with("ic-interrupted")
+        tools._activate_pm_via_sqlite.assert_not_called()
+        assert registry.get_worker("interrupted") is None
 
     def test_batch_dead_readiness_failure_isolated(
         self, tools, registry, mock_tmux,
@@ -6421,6 +6928,24 @@ class TestRestartWatchdog:
 
 
 class TestRestartMcp:
+    def test_restart_mcp_codex_refuses_before_side_effects(self, tools, monkeypatch):
+        monkeypatch.setenv("IRONCLAUDE_CLIENT", "codex")
+        mock_db = MagicMock()
+        with patch.object(tools, "_db", mock_db), \
+             patch.object(tools, "_cleanup_zombie_mcp_processes") as cleanup, \
+             patch("os.execvp") as execvp, \
+             patch("sys.stdout.flush") as stdout_flush, \
+             patch("sys.stderr.flush") as stderr_flush:
+            result = tools.restart_mcp()
+
+        assert "unsupported for a Codex Brain" in result
+        assert "restart_daemon" in result
+        mock_db.close.assert_not_called()
+        cleanup.assert_not_called()
+        execvp.assert_not_called()
+        stdout_flush.assert_not_called()
+        stderr_flush.assert_not_called()
+
     def test_restart_mcp_closes_db_and_execs(self, tools):
         """restart_mcp closes the DB connection and calls os.execvp with current argv."""
         import sys as _sys
@@ -8048,6 +8573,12 @@ class TestParseToolCallsFromDelta:
 
 
 class TestComputeConcordance:
+    def test_grader_infrastructure_error_from_primary_returns_f(self, db_conn, registry, mock_tmux):
+        tools = OrchestratorTools(registry, mock_tmux)
+        opus = {"infrastructure_error": True, "error_detail": "primary unavailable"}
+        shadow = {"grade": "A", "approved": True, "tool_calls": []}
+        assert tools._compute_concordance(opus, shadow) == "F"
+
     def test_exact_match_grade_and_pass_fail(self, db_conn, registry, mock_tmux):
         tools = OrchestratorTools(registry, mock_tmux)
         opus = {"grade": "B", "approved": True}
@@ -8074,6 +8605,20 @@ class TestComputeConcordance:
 
 
 class TestFormatShadowSlackMessage:
+    def test_grader_infrastructure_error_from_primary_has_no_semantic_verdict(
+        self, db_conn, registry, mock_tmux,
+    ):
+        tools = OrchestratorTools(registry, mock_tmux)
+        opus_result = {"infrastructure_error": True, "error_detail": "primary usage exhausted"}
+        shadow_result = {"grade": "A", "approved": True, "feedback": "fine", "tool_calls": []}
+        msg = tools._format_shadow_slack_message(
+            "spawn_worker", "w-primary", opus_result, [], shadow_result, "F",
+        )
+        assert "primary usage exhausted" in msg
+        assert "F — grader infrastructure failure" in msg
+        assert "Opus:    F" not in msg
+        assert "Opus:    ✗ rejected" not in msg
+
     def test_contains_tool_calls_before_verdicts(self, db_conn, registry, mock_tmux):
         tools = OrchestratorTools(registry, mock_tmux)
         opus_result = {"grade": "B", "approved": True, "feedback": "looks good"}
@@ -8329,6 +8874,114 @@ class TestReadPmState:
             "session_uuid": uuid,
         }
         tools._descendant_pids.assert_called_once_with(12345)
+
+    def test_codex_session_identity_freshness_stale_only_returns_unknown(
+        self, tools, mock_tmux, tmp_path,
+    ):
+        claude = tmp_path / ".claude"
+        claude.mkdir()
+        brain_id = "11111111-1111-4111-8111-111111111111"
+        brain_file = claude / "ironclaude-session-22222.id"
+        brain_file.write_text(brain_id)
+        os.utime(brain_file, (100.0, 100.0))
+        mock_tmux.list_pane_pid.return_value = "12345"
+        tools._descendant_pids = MagicMock(return_value=[12345, 22222])
+
+        out = _REAL_READ_PM_STATE(
+            tools,
+            "ic-x",
+            _claude_dir=claude,
+            client="codex",
+            not_before=200.0,
+        )
+
+        assert out == {
+            "professional_mode": "unknown",
+            "workflow_stage": None,
+            "session_uuid": None,
+        }
+
+
+class TestCodexLaunchBoundary(TestReadPmState):
+    def test_single_launch_boundary_is_shared_by_activation_and_readback(
+        self, tools, registry, mock_tmux,
+    ):
+        boundary = 200.0
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        tools._ensure_ssh_manager = MagicMock()
+        tools._wait_for_ready = MagicMock(return_value=True)
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._read_pm_state_via_sqlite = MagicMock(return_value={
+            "professional_mode": "on",
+            "workflow_stage": "executing",
+            "session_uuid": _VALID_NATIVE_UUID,
+        })
+        _mock_grader_approve(tools)
+
+        with patch("ironclaude.orchestrator_mcp.time.time", return_value=boundary):
+            tools.spawn_worker("w-boundary", "claude-sonnet", "/tmp/repo", "Task")
+
+        tools._activate_pm_via_sqlite.assert_called_once_with(
+            "ic-w-boundary", timeout=300, max_retries=3, client="codex",
+            not_before=boundary,
+        )
+        tools._read_pm_state_via_sqlite.assert_called_once_with(
+            "ic-w-boundary", client="codex", not_before=boundary,
+        )
+
+    def test_batch_launch_boundary_is_shared_by_activation_and_readback(
+        self, tools,
+    ):
+        boundary = 200.0
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        tools._wait_for_ready = MagicMock(return_value=True)
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._read_pm_state_via_sqlite = MagicMock(return_value={
+            "professional_mode": "on",
+            "workflow_stage": "executing",
+            "session_uuid": _VALID_NATIVE_UUID,
+        })
+        _mock_batch_approve(tools)
+
+        with patch("ironclaude.orchestrator_mcp.time.time", return_value=boundary):
+            tools.spawn_workers([{
+                "worker_id": "w-boundary", "worker_type": "claude-sonnet",
+                "repo": "/tmp/repo", "objective": "Task",
+            }])
+
+        tools._activate_pm_via_sqlite.assert_called_once_with(
+            "ic-w-boundary", timeout=300, max_retries=3, client="codex",
+            not_before=boundary,
+        )
+        tools._read_pm_state_via_sqlite.assert_called_once_with(
+            "ic-w-boundary", client="codex", not_before=boundary,
+        )
+
+    def test_resume_launch_boundary_is_shared_by_activation_and_readback(
+        self, tools, mock_tmux,
+    ):
+        boundary = 200.0
+        session_id = "33333333-3333-4333-8333-333333333333"
+        mock_tmux.has_session.return_value = False
+        tools._ensure_worker_instructions = MagicMock(return_value=None)
+        tools._wait_for_ready = MagicMock(return_value=True)
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._read_pm_state_via_sqlite = MagicMock(return_value={
+            "professional_mode": "on",
+            "workflow_stage": "executing",
+            "session_uuid": session_id,
+        })
+
+        with patch("ironclaude.orchestrator_mcp.time.time", return_value=boundary):
+            tools.resume_session(session_id, "codex", "d-boundary", repo="/tmp/repo")
+
+        tools._activate_pm_via_sqlite.assert_called_once_with(
+            "ic-d-boundary", timeout=300, max_retries=3, client="codex",
+            not_before=boundary,
+        )
+        tools._read_pm_state_via_sqlite.assert_called_once_with(
+            "ic-d-boundary", client="codex", not_before=boundary,
+        )
 
     @pytest.mark.parametrize("client", ["claude", "codex"])
     def test_provider_aware_non_uuid_native_session_id_rejected(
@@ -8700,6 +9353,20 @@ class TestResumeSession:
         tools._provider_router.assert_not_called()
         assert state.get_current_client("worker") == "codex"
 
+    def test_codex_interrupted_spawn_returns_error_and_skips_pm_activation(
+        self, tools, registry, mock_tmux,
+    ):
+        self._prepare_success(tools, mock_tmux, "codex")
+        tools._wait_for_ready.return_value = False
+        mock_tmux.read_log_tail.return_value = "MCP startup interrupted"
+
+        out = tools.resume_session(self.UUID, "codex", "d-interrupted", repo="/r")
+
+        assert "Codex MCP startup interrupted" in out["error"]
+        mock_tmux.kill_session.assert_called_once_with("ic-d-interrupted")
+        tools._activate_pm_via_sqlite.assert_not_called()
+        assert registry.get_worker("d-interrupted") is None
+
     @pytest.mark.parametrize(
         "failure_point",
         ["readiness", "readiness-log", "activation", "readback"],
@@ -8807,12 +9474,19 @@ class TestResumeSession:
         tools._wait_for_ready.assert_called_once_with(
             "ic-d5", timeout=30, client=client,
         )
-        tools._activate_pm_via_sqlite.assert_called_once_with(
-            "ic-d5", timeout=300, max_retries=3, client=client,
-        )
-        tools._read_pm_state_via_sqlite.assert_called_once_with(
-            "ic-d5", client=client,
-        )
+        activation_kwargs = tools._activate_pm_via_sqlite.call_args.kwargs
+        readback_kwargs = tools._read_pm_state_via_sqlite.call_args.kwargs
+        assert activation_kwargs == {
+            "timeout": 300, "max_retries": 3, "client": client,
+            **({"not_before": activation_kwargs["not_before"]} if client == "codex" else {}),
+        }
+        assert readback_kwargs == {
+            "client": client,
+            **({"not_before": readback_kwargs["not_before"]} if client == "codex" else {}),
+        }
+        if client == "codex":
+            assert isinstance(activation_kwargs["not_before"], float)
+            assert isinstance(readback_kwargs["not_before"], float)
         if client == "claude":
             tools.ensure_worker_trusted.assert_called_once_with("/r")
         else:
@@ -9218,6 +9892,63 @@ class TestCallGraderSubprocess:
             {"type": "system", "subtype": "init"},
             {"type": "result", "subtype": "success", "is_error": False, "structured_output": verdict},
         ])
+
+    def _configure_codex_grader(self, tools):
+        router = MagicMock()
+        router.resolve.return_value = _provider_handle(
+            client="codex", requested="opus", effective="opus", model="gpt-5.6-sol",
+        )
+        tools._ensure_role_capabilities = MagicMock()
+        tools._provider_router = MagicMock(return_value=(router, None, None, None))
+
+    def test_codex_grader_nonzero_stdout_diagnostic_is_infrastructure_failure(self, tools):
+        self._configure_codex_grader(tools)
+        with patch("ironclaude.main.ensure_brain_trusted"), \
+             patch("ironclaude.orchestrator_mcp.subprocess.run") as run:
+            run.return_value = MagicMock(returncode=7, stdout='{"error":"usage exhausted"}', stderr="")
+            result = tools._call_grader("sys", "usr")
+        assert result["infrastructure_error"] is True
+        assert "usage exhausted" in result["error_detail"]
+        assert len(result["error_detail"]) <= 300
+        assert result["approved"] is False
+
+    def test_codex_grader_nonzero_stderr_diagnostic_is_infrastructure_failure(self, tools):
+        self._configure_codex_grader(tools)
+        with patch("ironclaude.main.ensure_brain_trusted"), \
+             patch("ironclaude.orchestrator_mcp.subprocess.run") as run:
+            run.return_value = MagicMock(returncode=7, stdout="ignored stdout", stderr="credential denied")
+            result = tools._call_grader("sys", "usr")
+        assert result["infrastructure_error"] is True
+        assert "credential denied" in result["error_detail"]
+        assert "ignored stdout" not in result["error_detail"]
+
+    def test_codex_grader_malformed_success_is_infrastructure_failure(self, tools):
+        self._configure_codex_grader(tools)
+        with patch("ironclaude.main.ensure_brain_trusted"), \
+             patch("ironclaude.orchestrator_mcp.subprocess.run") as run:
+            run.return_value = MagicMock(returncode=0, stdout="not json", stderr="")
+            result = tools._call_grader("sys", "usr")
+        assert result["infrastructure_error"] is True
+
+    def test_codex_grader_successful_structured_verdict_is_unchanged(self, tools):
+        self._configure_codex_grader(tools)
+        verdict = {"grade": "A", "approved": True, "feedback": "approved"}
+        event = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(verdict)}})
+        with patch("ironclaude.main.ensure_brain_trusted"), \
+             patch("ironclaude.orchestrator_mcp.subprocess.run") as run:
+            run.return_value = MagicMock(returncode=0, stdout=event, stderr="")
+            result = tools._call_grader("sys", "usr")
+        assert result == verdict
+
+    def test_grader_infrastructure_failure_kill_worker_is_not_semantic_f(self, tools, registry):
+        registry.register_worker("infra-kill", "claude-sonnet", "ic-infra-kill", repo="/tmp/repo", description="task")
+        tools._call_grader = MagicMock(return_value={
+            "grade": "F", "approved": False, "feedback": "Grader infrastructure failure: unavailable",
+            "infrastructure_error": True, "error_detail": "unavailable",
+        })
+        result = tools.kill_worker("infra-kill", original_objective="Task", evidence="Evidence")
+        assert "grader infrastructure failure" in result["error"].lower()
+        assert "grade F" not in result["error"]
 
     def test_returns_verdict_from_structured_output(self, tools):
         verdict = {"grade": "D", "approved": False, "feedback": "no"}

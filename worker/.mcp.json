@@ -10,5 +10,12 @@
     "env": {
       "IRONCLAUDE_CLIENT": "claude"
     }
+  },
+  "workspace-manager": {
+    "command": "node",
+    "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-servers/workspace-manager/cli/mcp-server-wrapper.js"],
+    "env": {
+      "IRONCLAUDE_CLIENT": "claude"
+    }
   }
 }

@@ -1,4 +1,4 @@
-.PHONY: tailscale-serve-setup deploy-hooks
+.PHONY: tailscale-serve-setup deploy-hooks test test-hooks test-commander test-workspace-manager
 
 PLUGIN_CACHE_BASE := $(HOME)/.claude/plugins/cache/ironclaude/ironclaude
 # Derive the latest installed plugin-cache version dir at runtime instead of
@@ -8,6 +8,33 @@ PLUGIN_CACHE_BASE := $(HOME)/.claude/plugins/cache/ironclaude/ironclaude
 PLUGIN_CACHE_VERSION := $(shell ls -1 "$(PLUGIN_CACHE_BASE)" 2>/dev/null | sort -V | tail -1)
 PLUGIN_CACHE_HOOK_DIR := $(PLUGIN_CACHE_BASE)/$(PLUGIN_CACHE_VERSION)/hooks
 STABLE_HOOK_DIR := $(HOME)/.claude/ironclaude-hooks
+
+
+# ─── Tests ───
+# Every suite below was previously reachable only by typing its path by hand:
+# nothing in this Makefile, and no CI workflow, invoked the shell guards at all.
+# `make test` is the single entry point for contributors and CI.
+test: test-hooks test-workspace-manager test-commander
+
+# Runs EVERY hook suite. An earlier version wired only four, which is how a
+# guard could regress with `make test-hooks` still green. Each suite exits
+# non-zero on failure, so `set -e` semantics come free from make.
+test-hooks:
+	@for suite in worker/hooks/test-*.sh worker/hooks/tests/test-*.sh; do \
+	  printf '\n--- %s ---\n' "$$suite"; \
+	  bash "$$suite" || exit 1; \
+	done
+
+test-workspace-manager:
+	cd worker/mcp-servers/workspace-manager && npm test
+
+# commander/.venv is gitignored, so a fresh clone has no interpreter there.
+# Prefer it when present, otherwise fall back to whatever python3 is on PATH so
+# `make test` works for a contributor who just cloned the repo.
+test-commander:
+	cd commander && PYTHONUNBUFFERED=1 \
+	  $$( [ -x .venv/bin/python ] && echo .venv/bin/python || echo python3 ) \
+	  -m pytest tests/ -q
 
 # Deploys ALL worker hooks to the runtime locations (stable dir + plugin cache).
 # Run after editing any file in worker/hooks/.

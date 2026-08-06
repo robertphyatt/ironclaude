@@ -47,11 +47,32 @@ config_tool_write_verdict() {
 # IRONCLAUDE-HOOKS-CONFIG.JSON names the same file — it must still match.)
 is_config_path() {
   local fp="$1" canon lc_canon lc_fp lc_target
-  canon=$(realpath -m "$fp" 2>/dev/null || echo "$fp")
+  canon=$(canonicalize_path_portable "$fp" 2>/dev/null || echo "$fp")
   lc_canon=$(printf '%s' "$canon" | tr '[:upper:]' '[:lower:]')
   lc_fp=$(printf '%s' "$fp" | tr '[:upper:]' '[:lower:]')
   lc_target=$(printf '%s' "$HOME/.claude/ironclaude-hooks-config.json" | tr '[:upper:]' '[:lower:]')
-  if [[ "$lc_canon" == "$lc_target" || "$lc_fp" == *"ironclaude-hooks-config.json" ]]; then
+  # The second arm must be a CONTAINS match, not a suffix match. For Codex's
+  # native apply_patch the inspected string is the whole patch body, which ends
+  # with "*** End Patch" — so a suffix test never matched and a patch could
+  # rewrite the guardrail file while professional mode was off.
+  # The second arm is scoped to a PATH-COMPONENT occurrence: the filename must
+  # end the string or be followed by a path/argument boundary. A bare
+  # `*name*` contains-match blocked writing `<cfg>.bak`, a docs file merely
+  # MENTIONING the filename, and any patch body quoting it — the project could
+  # not document its own config. A patch body still matches, because the target
+  # line ends at a newline.
+  local _cfg_name="ironclaude-hooks-config.json" _cfg_boundary="no"
+  case "$lc_fp" in
+    *"$_cfg_name") _cfg_boundary="yes" ;;
+    # NEWLINE only, not all whitespace. `FILE_PATH` is the whole string for a
+    # Codex patch body and for Bash, where the real target line ends at a
+    # newline — but a space after the name is ordinary PROSE ("the file
+    # <name> holds keys"), and admitting it blocked the project from
+    # documenting its own config file.
+    *"$_cfg_name"$'\n'*|*"$_cfg_name"$'\r'*) _cfg_boundary="yes" ;;
+    *"$_cfg_name"'"'*|*"$_cfg_name"\'*|*"$_cfg_name"\)*) _cfg_boundary="yes" ;;
+  esac
+  if [[ "$lc_canon" == "$lc_target" || "$_cfg_boundary" == "yes" ]]; then
     echo "yes"
   else
     echo "no"

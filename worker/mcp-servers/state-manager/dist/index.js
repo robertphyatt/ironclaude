@@ -13250,13 +13250,49 @@ function sha256(bytes) {
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
+function assertPathUnderPluginRoot(pluginRoot, artifactPath) {
+  const relative = path2.relative(pluginRoot, artifactPath);
+  if (relative === "" || relative === ".." || relative.startsWith(`..${path2.sep}`) || path2.isAbsolute(relative)) {
+    throw new Error(`Runtime artifact ${artifactPath} is not under plugin root ${pluginRoot}`);
+  }
+}
+function readRuntimeArtifact(label, artifactPath) {
+  try {
+    return readFileSync(artifactPath);
+  } catch (error) {
+    throw new Error(`Could not read runtime ${label} ${artifactPath}: ${errorMessage(error)}`);
+  }
+}
 function captureRuntimeFingerprintFromPaths(pluginRoot, bundlePath, client2) {
   const resolvedRoot = path2.resolve(pluginRoot);
-  const resolvedBundle = path2.resolve(bundlePath);
+  const stateManagerBundlePath = path2.resolve(bundlePath);
   const manifestPath = path2.join(resolvedRoot, MANIFEST_BY_CLIENT[client2]);
+  const workspaceManagerBundlePath = path2.join(resolvedRoot, "mcp-servers", "workspace-manager", "dist", "index.js");
+  const workspaceManagerCliPath = path2.join(resolvedRoot, "mcp-servers", "workspace-manager", "dist", "cli.js");
+  const workspaceManagerHookIntentPath = path2.join(
+    resolvedRoot,
+    "mcp-servers",
+    "workspace-manager",
+    "dist",
+    "hook-intent.js"
+  );
   try {
-    const manifestBytes = readFileSync(manifestPath);
-    const bundleBytes = readFileSync(resolvedBundle);
+    const artifactPaths = [
+      manifestPath,
+      stateManagerBundlePath,
+      workspaceManagerBundlePath,
+      workspaceManagerCliPath,
+      workspaceManagerHookIntentPath
+    ];
+    for (const artifactPath of artifactPaths) assertPathUnderPluginRoot(resolvedRoot, artifactPath);
+    const manifestBytes = readRuntimeArtifact("manifest", manifestPath);
+    const stateManagerBundleBytes = readRuntimeArtifact("state-manager bundle", stateManagerBundlePath);
+    const workspaceManagerBundleBytes = readRuntimeArtifact("workspace-manager bundle", workspaceManagerBundlePath);
+    const workspaceManagerCliBytes = readRuntimeArtifact("workspace-manager CLI", workspaceManagerCliPath);
+    const workspaceManagerHookIntentBytes = readRuntimeArtifact(
+      "workspace-manager hook intent",
+      workspaceManagerHookIntentPath
+    );
     let manifest;
     try {
       manifest = JSON.parse(manifestBytes.toString("utf8"));
@@ -13281,15 +13317,21 @@ function captureRuntimeFingerprintFromPaths(pluginRoot, bundlePath, client2) {
         plugin_root: resolvedRoot,
         manifest_path: manifestPath,
         manifest_sha256: sha256(manifestBytes),
-        bundle_path: resolvedBundle,
-        bundle_sha256: sha256(bundleBytes),
+        state_manager_bundle_path: stateManagerBundlePath,
+        state_manager_bundle_sha256: sha256(stateManagerBundleBytes),
+        workspace_manager_bundle_path: workspaceManagerBundlePath,
+        workspace_manager_bundle_sha256: sha256(workspaceManagerBundleBytes),
+        workspace_manager_cli_path: workspaceManagerCliPath,
+        workspace_manager_cli_sha256: sha256(workspaceManagerCliBytes),
+        workspace_manager_hook_intent_path: workspaceManagerHookIntentPath,
+        workspace_manager_hook_intent_sha256: sha256(workspaceManagerHookIntentBytes),
         client: client2
       })
     };
   } catch (error) {
     return {
       ok: false,
-      error: `Runtime fingerprint capture failed for manifest ${manifestPath} and bundle ${resolvedBundle}: ${errorMessage(error)}`
+      error: `Runtime fingerprint capture failed under plugin root ${resolvedRoot}: ${errorMessage(error)}`
     };
   }
 }
@@ -13313,7 +13355,10 @@ function verifyRuntimeActivation(capture, expected) {
     "plugin_version",
     "plugin_root",
     "manifest_sha256",
-    "bundle_sha256",
+    "state_manager_bundle_sha256",
+    "workspace_manager_bundle_sha256",
+    "workspace_manager_cli_sha256",
+    "workspace_manager_hook_intent_sha256",
     "client"
   ];
   const errors = fields.flatMap((field) => {
@@ -13803,10 +13848,22 @@ var readToolDefinitions = [
             plugin_version: { type: "string" },
             plugin_root: { type: "string" },
             manifest_sha256: { type: "string" },
-            bundle_sha256: { type: "string" },
+            state_manager_bundle_sha256: { type: "string" },
+            workspace_manager_bundle_sha256: { type: "string" },
+            workspace_manager_cli_sha256: { type: "string" },
+            workspace_manager_hook_intent_sha256: { type: "string" },
             client: { type: "string", enum: ["claude", "codex"] }
           },
-          required: ["plugin_version", "plugin_root", "manifest_sha256", "bundle_sha256", "client"],
+          required: [
+            "plugin_version",
+            "plugin_root",
+            "manifest_sha256",
+            "state_manager_bundle_sha256",
+            "workspace_manager_bundle_sha256",
+            "workspace_manager_cli_sha256",
+            "workspace_manager_hook_intent_sha256",
+            "client"
+          ],
           additionalProperties: false
         }
       },
@@ -15172,35 +15229,58 @@ function handleWriteTool(name, args, db, sessionId) {
           `Cannot record review: workflow must be executing or reviewing, currently ${session.workflow_stage}`
         );
       }
-      const submittedRows = db.prepare(
-        `SELECT task_id FROM wave_tasks WHERE terminal_session = ? AND wave_number = ? AND status = 'submitted' ORDER BY task_id`
-      ).all(resolvedId, session.current_wave);
-      const taskIds = submittedRows.map((r) => r.task_id);
-      insertReviewGrade(db, resolvedId, session.current_wave, taskIds, grade, taskBoundary);
-      let advancedCount = 0;
-      if (taskBoundary && ["A", "B"].includes(grade)) {
-        const result = db.prepare(
-          `UPDATE wave_tasks SET status = 'review_passed', updated_at = datetime('now')
-           WHERE terminal_session = ? AND wave_number = ? AND status = 'submitted'`
-        ).run(resolvedId, session.current_wave);
-        advancedCount = result.changes;
-        updateSession(db, resolvedId, { review_pending: 0, review_block_count: 0 });
-      }
-      insertAuditLog(db, {
-        terminal_session: resolvedId,
-        actor: "claude",
-        action: "record_review_verdict",
-        old_value: null,
-        new_value: grade,
-        context: `wave=${session.current_wave}, task_boundary=${taskBoundary}, task_ids=${JSON.stringify(taskIds)}`
+      const recordVerdict = db.transaction(() => {
+        const submittedRows = db.prepare(
+          `SELECT task_id FROM wave_tasks
+           WHERE terminal_session = ? AND wave_number = ? AND status = 'submitted'
+           ORDER BY task_id`
+        ).all(resolvedId, session.current_wave);
+        const taskIds2 = submittedRows.map((row) => row.task_id);
+        insertReviewGrade(db, resolvedId, session.current_wave, taskIds2, grade, taskBoundary);
+        let advancedCount2 = 0;
+        let reopenedCount2 = 0;
+        let workflowStage2 = session.workflow_stage;
+        if (taskBoundary && ["A", "B"].includes(grade)) {
+          advancedCount2 = db.prepare(
+            `UPDATE wave_tasks SET status = 'review_passed', updated_at = datetime('now')
+             WHERE terminal_session = ? AND wave_number = ? AND status = 'submitted'`
+          ).run(resolvedId, session.current_wave).changes;
+          updateSession(db, resolvedId, { review_pending: 0, review_block_count: 0 });
+        } else if (taskBoundary) {
+          if (taskIds2.length === 0) {
+            throw new Error("Cannot record a failing task-boundary verdict without submitted tasks");
+          }
+          reopenedCount2 = db.prepare(
+            `UPDATE wave_tasks SET status = 'in_progress', updated_at = datetime('now')
+             WHERE terminal_session = ? AND wave_number = ? AND status = 'submitted'`
+          ).run(resolvedId, session.current_wave).changes;
+          updateSession(db, resolvedId, {
+            workflow_stage: "executing",
+            review_pending: 0,
+            review_block_count: 0
+          });
+          workflowStage2 = "executing";
+        }
+        insertAuditLog(db, {
+          terminal_session: resolvedId,
+          actor: "claude",
+          action: "record_review_verdict",
+          old_value: null,
+          new_value: grade,
+          context: `wave=${session.current_wave}, task_boundary=${taskBoundary}, task_ids=${JSON.stringify(taskIds2)}`
+        });
+        return { taskIds: taskIds2, advancedCount: advancedCount2, reopenedCount: reopenedCount2, workflowStage: workflowStage2 };
       });
+      const { taskIds, advancedCount, reopenedCount, workflowStage } = recordVerdict();
       return ok({
         success: true,
         grade,
         task_boundary: taskBoundary,
         wave_number: session.current_wave,
         task_ids: taskIds,
-        advanced_count: advancedCount
+        advanced_count: advancedCount,
+        reopened_count: reopenedCount,
+        workflow_stage: workflowStage
       });
     }
     // ----- mark_design_ready -----

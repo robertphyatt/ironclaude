@@ -1,0 +1,298 @@
+import { afterEach, describe, expect, it } from 'vitest';
+import Database from 'better-sqlite3';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  acquireIntegrationLock,
+  acquirePrimaryCheckoutOwnership,
+  bindAssignmentOwner,
+  consumeMatchingHumanIntent,
+  consumeHumanIntent,
+  createAssignment,
+  createHumanIntent,
+  getAssignment,
+  initDb,
+  issueHumanIntent,
+  migrateSchema,
+  recordIntegration,
+  releaseIntegrationLock,
+  releasePrimaryCheckoutOwnership,
+  transitionAssignment,
+} from '../db.js';
+import { resolveSessionIdentity } from '../session-identity.js';
+import type { HumanIntentOperation } from '../types.js';
+
+const REPOSITORY = 'local:/repos/ironclaude/.git';
+const OWNER = '019f7742-abd8-7c62-af7b-fe07189f1ffd';
+const OTHER_OWNER = '019f7cdf-023c-74e0-9ead-9c155636885d';
+const GUID_ONE = '11111111-1111-4111-8111-111111111111';
+const GUID_TWO = '22222222-2222-4222-8222-222222222222';
+
+describe('workspace assignment store', () => {
+  const directories: string[] = [];
+  const databases: Database.Database[] = [];
+
+  afterEach(() => {
+    for (const db of databases.splice(0)) db.close();
+    for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+  });
+
+  function db(): Database.Database {
+    const directory = mkdtempSync(join(tmpdir(), 'ironclaude-workspace-manager-'));
+    directories.push(directory);
+    const database = initDb(join(directory, 'workspace.db'));
+    databases.push(database);
+    return database;
+  }
+
+  function assignment(database: Database.Database, workspaceGuid = GUID_ONE) {
+    return createAssignment(database, {
+      workspaceGuid,
+      repositoryIdentity: REPOSITORY,
+      worktreePath: `/repos/ironclaude/.ironclaude/worktrees/${workspaceGuid}`,
+      branch: `ironclaude/${workspaceGuid}`,
+      baseCommit: 'a'.repeat(40),
+      currentHead: 'a'.repeat(40),
+      integrationTarget: 'main',
+    });
+  }
+
+  it('enables WAL and applies schema migrations safely on replay', () => {
+    const database = db();
+    expect(database.pragma('journal_mode', { simple: true })).toBe('wal');
+    assignment(database);
+    migrateSchema(database);
+    migrateSchema(database);
+    expect(getAssignment(database, GUID_ONE)).toMatchObject({ workspace_guid: GUID_ONE });
+    expect(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'human_intents'").get()).toBeTruthy();
+  });
+
+  it('keeps workspace GUID identity immutable and validates GUIDs', () => {
+    const database = db();
+    expect(() => assignment(database, 'not-a-guid')).toThrow('workspaceGuid must be a UUID');
+    assignment(database);
+    expect(() => database.prepare('UPDATE assignments SET workspace_guid = ? WHERE workspace_guid = ?')
+      .run(GUID_TWO, GUID_ONE)).toThrow('workspace GUID is immutable');
+    expect(getAssignment(database, GUID_ONE)?.workspace_guid).toBe(GUID_ONE);
+  });
+
+  it('permits one active assignment per provider root and repository', () => {
+    const database = db();
+    assignment(database, GUID_ONE);
+    assignment(database, GUID_TWO);
+    bindAssignmentOwner(database, GUID_ONE, OWNER);
+    expect(() => bindAssignmentOwner(database, GUID_TWO, OWNER)).toThrow('UNIQUE constraint failed');
+    bindAssignmentOwner(database, GUID_TWO, OTHER_OWNER);
+    expect(getAssignment(database, GUID_TWO)?.owner_session_id).toBe(OTHER_OWNER);
+  });
+
+  it('allows only durable lifecycle transitions', () => {
+    const database = db();
+    assignment(database);
+    expect(() => transitionAssignment(database, GUID_ONE, 'reserved', 'active')).toThrow('Invalid lifecycle transition');
+    expect(transitionAssignment(database, GUID_ONE, 'reserved', 'materialized').lifecycle_status).toBe('materialized');
+    transitionAssignment(database, GUID_ONE, 'materialized', 'active');
+    transitionAssignment(database, GUID_ONE, 'active', 'ready_for_integration');
+    expect(transitionAssignment(database, GUID_ONE, 'ready_for_integration', 'active').lifecycle_status).toBe('active');
+    transitionAssignment(database, GUID_ONE, 'active', 'ready_for_integration');
+    transitionAssignment(database, GUID_ONE, 'ready_for_integration', 'integrated');
+    expect(transitionAssignment(database, GUID_ONE, 'integrated', 'cleaned').lifecycle_status).toBe('cleaned');
+    expect(() => transitionAssignment(database, GUID_ONE, 'cleaned', 'active')).toThrow('Invalid lifecycle transition');
+  });
+
+  it('serializes primary checkout and integration ownership and records integration', () => {
+    const database = db();
+    assignment(database);
+    bindAssignmentOwner(database, GUID_ONE, OWNER);
+    expect(acquirePrimaryCheckoutOwnership(database, {
+      repositoryIdentity: REPOSITORY, workspaceGuid: GUID_ONE, ownerSessionId: OWNER,
+    }).workspace_guid).toBe(GUID_ONE);
+    assignment(database, GUID_TWO);
+    bindAssignmentOwner(database, GUID_TWO, OTHER_OWNER);
+    expect(() => acquirePrimaryCheckoutOwnership(database, {
+      repositoryIdentity: REPOSITORY, workspaceGuid: GUID_TWO, ownerSessionId: OTHER_OWNER,
+    })).toThrow('Primary checkout is already owned');
+    releasePrimaryCheckoutOwnership(database, REPOSITORY, GUID_ONE, OWNER);
+
+    expect(acquireIntegrationLock(database, {
+      repositoryIdentity: REPOSITORY, workspaceGuid: GUID_ONE, targetRef: 'refs/heads/main', expectedTarget: 'a'.repeat(40),
+    }).workspace_guid).toBe(GUID_ONE);
+    expect(() => acquireIntegrationLock(database, {
+      repositoryIdentity: REPOSITORY, workspaceGuid: GUID_ONE, targetRef: 'refs/heads/main', expectedTarget: 'a'.repeat(40),
+    })).toThrow('Integration lock is already held');
+    releaseIntegrationLock(database, REPOSITORY, GUID_ONE);
+    expect(recordIntegration(database, {
+      workspaceGuid: GUID_ONE, repositoryIdentity: REPOSITORY, targetRef: 'refs/heads/main', integratedCommit: 'b'.repeat(40),
+    }).integrated_commit).toBe('b'.repeat(40));
+  });
+
+  it.each<HumanIntentOperation>([
+    'use-primary-checkout',
+    'return-to-managed-worktree',
+    'commit',
+    'commit-and-push',
+    'push',
+  ])('consumes matching %s human intent exactly once', (operation) => {
+    const database = db();
+    assignment(database);
+    const evidence = { expectedHead: 'a'.repeat(40), targetRef: 'refs/heads/main' };
+    const intent = createHumanIntent(database, {
+      operation,
+      humanChannel: 'codex-user-prompt',
+      providerRootSessionId: OWNER,
+      repositoryIdentity: REPOSITORY,
+      workspaceGuid: GUID_ONE,
+      expectedEvidence: evidence,
+      expiresAt: '2030-01-01T00:00:00.000Z',
+      nonce: `nonce-${operation}`,
+    });
+    const request = {
+      operation,
+      humanChannel: 'codex-user-prompt',
+      providerRootSessionId: OWNER,
+      repositoryIdentity: REPOSITORY,
+      workspaceGuid: GUID_ONE,
+      expectedEvidence: evidence,
+      nonce: intent.nonce,
+    };
+    const clock = () => new Date('2029-01-01T00:00:00.000Z');
+    expect(consumeHumanIntent(database, request, clock)?.intent_id).toBe(intent.intent_id);
+    expect(consumeHumanIntent(database, request, clock)).toBeUndefined();
+  });
+
+  it('issues nonce and expiry server-side, supersedes replay, and consumes without caller nonce', () => {
+    const database = db();
+    assignment(database);
+    const input = {
+      operation: 'commit' as const,
+      humanChannel: 'codex-user-prompt',
+      providerRootSessionId: OWNER,
+      repositoryIdentity: REPOSITORY,
+      workspaceGuid: GUID_ONE,
+      expectedEvidence: { stagedTree: 'a'.repeat(40) },
+    };
+    const clock = () => new Date('2029-01-01T00:00:00.000Z');
+    const first = issueHumanIntent(database, input, clock, () => 'server-nonce-one');
+    const second = issueHumanIntent(database, input, clock, () => 'server-nonce-two');
+
+    expect(first).toEqual({ issued: true, operation: 'commit' });
+    expect(second).toEqual(first);
+    expect(first).not.toHaveProperty('nonce');
+    expect(first).not.toHaveProperty('expectedEvidence');
+    expect(database.prepare('SELECT COUNT(*) AS count FROM human_intents WHERE consumed_at IS NULL')
+      .get()).toEqual({ count: 1 });
+    expect(database.prepare('SELECT nonce FROM human_intents WHERE consumed_at IS NULL').get())
+      .toEqual({ nonce: 'server-nonce-two' });
+    expect(consumeMatchingHumanIntent(database, { ...input, humanChannel: 'claude-user-prompt' }, clock)).toBeUndefined();
+    expect(consumeMatchingHumanIntent(database, { ...input, expectedEvidence: { stagedTree: 'b'.repeat(40) } }, clock)).toBeUndefined();
+    expect(consumeMatchingHumanIntent(database, input, clock)?.nonce).toBe('server-nonce-two');
+    expect(consumeMatchingHumanIntent(database, input, clock)).toBeUndefined();
+  });
+
+  it('does not consume an expired server-held intent', () => {
+    const database = db();
+    assignment(database);
+    const input = {
+      operation: 'push' as const,
+      humanChannel: 'codex-user-prompt',
+      providerRootSessionId: OWNER,
+      repositoryIdentity: REPOSITORY,
+      workspaceGuid: GUID_ONE,
+      expectedEvidence: { localOid: 'a'.repeat(40) },
+    };
+    issueHumanIntent(database, input, () => new Date('2029-01-01T00:00:00.000Z'), () => 'expiring-server-nonce');
+    expect(consumeMatchingHumanIntent(database, input, () => new Date('2029-01-01T00:05:00.001Z'))).toBeUndefined();
+  });
+
+  it('rejects human-intent replay across channel, root session, evidence, expiry, and request-supplied time', () => {
+    const database = db();
+    assignment(database);
+    const input = {
+      operation: 'commit' as const,
+      humanChannel: 'claude-user-prompt',
+      providerRootSessionId: OWNER,
+      repositoryIdentity: REPOSITORY,
+      workspaceGuid: GUID_ONE,
+      expectedEvidence: { stagedTree: 'a'.repeat(40) },
+      expiresAt: '2030-01-01T00:00:00.000Z',
+      nonce: 'cross-binding-nonce',
+    };
+    createHumanIntent(database, input);
+    expect(consumeHumanIntent(database, {
+      ...input, humanChannel: 'codex-user-prompt',
+    }, () => new Date('2029-01-01T00:00:00.000Z'))).toBeUndefined();
+    expect(consumeHumanIntent(database, {
+      ...input,
+      now: '2029-01-01T00:00:00.000Z',
+    } as typeof input & { now: string }, () => new Date('2031-01-01T00:00:00.000Z'))).toBeUndefined();
+    expect(consumeHumanIntent(database, {
+      ...input, expectedEvidence: { stagedTree: 'b'.repeat(40) },
+    }, () => new Date('2029-01-01T00:00:00.000Z'))).toBeUndefined();
+    expect(consumeHumanIntent(database, {
+      ...input,
+    }, () => new Date('2029-01-01T00:00:00.000Z'))?.nonce).toBe(input.nonce);
+  });
+
+  it('normalizes intent expiry timestamps before durable comparison', () => {
+    const database = db();
+    assignment(database);
+    expect(createHumanIntent(database, {
+      operation: 'push',
+      humanChannel: 'codex-user-prompt',
+      providerRootSessionId: OWNER,
+      repositoryIdentity: REPOSITORY,
+      workspaceGuid: GUID_ONE,
+      expectedEvidence: { localCommit: 'a'.repeat(40) },
+      expiresAt: '2030-01-01T01:00:00+01:00',
+      nonce: 'normalized-expiry-nonce',
+    }).expires_at).toBe('2030-01-01T00:00:00.000Z');
+  });
+
+  it('separates a Claude subagent from its root so authority consumption can be fenced', () => {
+    // Parity with the Codex thread_source fence. A Claude subagent SHARES the
+    // root's PPID file, so identity by PPID alone cannot tell them apart and
+    // requireProviderRoot() could never fire on the Claude path.
+    const root = resolveSessionIdentity('claude', undefined, 'claude-ppid-root');
+    expect(root.invocationThreadId).toBeNull();
+
+    for (const meta of [
+      { thread_source: 'subagent', agent_id: 'a1' },
+      { threadSource: 'subagent' },
+      { agent_id: 'a2' },
+      { subagentId: 'a3' },
+    ]) {
+      const sub = resolveSessionIdentity('claude', meta, 'claude-ppid-root');
+      expect(sub.sessionId).toBe('claude-ppid-root');
+      expect(sub.invocationThreadId).not.toBeNull();
+      expect(sub.invocationThreadId).not.toBe(sub.sessionId);
+    }
+
+    // A root turn carrying unrelated metadata must stay root.
+    expect(resolveSessionIdentity('claude', { progressToken: 7 }, 'claude-ppid-root')
+      .invocationThreadId).toBeNull();
+  });
+
+  it('uses the same trusted provider-root identity rules as state-manager', () => {
+    const codexRoot = resolveSessionIdentity('codex', {
+      threadId: OWNER,
+      'x-codex-turn-metadata': {
+        session_id: OWNER,
+        thread_id: OWNER,
+        thread_source: 'user',
+      },
+    });
+    expect(codexRoot).toMatchObject({ sessionId: OWNER, source: 'codex_meta' });
+    expect(resolveSessionIdentity('claude', undefined, 'claude-ppid-root')).toMatchObject({
+      sessionId: 'claude-ppid-root', source: 'ppid_file',
+    });
+    expect(() => resolveSessionIdentity('codex', {
+      threadId: OTHER_OWNER,
+      'x-codex-turn-metadata': {
+        session_id: OWNER,
+        thread_id: OTHER_OWNER,
+        thread_source: 'user',
+      },
+    })).toThrow('Codex root session_id disagrees with root threadId');
+  });
+});

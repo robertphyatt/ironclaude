@@ -60,6 +60,7 @@ from ironclaude.signal_forensics import _logged_kill
 from ironclaude.slack_interface import parse_reply_to_marker
 from ironclaude.tmux_manager import _strip_ansi, detect_ask_user_menu
 from ironclaude.wiki_tools import WikiTools
+from ironclaude.workspace_client import WorkspaceClient, WorkspaceClientError
 
 logger = logging.getLogger("ironclaude.orchestrator_mcp")
 
@@ -83,6 +84,44 @@ _ALLOWED_NAMED_KEYS = frozenset({
 # interpreted by tmux as Ctrl-/Meta- chords, letting the navigation-only
 # send_keys tool kill/suspend/EOF a worker. Deny them regardless of case.
 _CONTROL_KEY_RE = re.compile(r'^[CM]-.', re.IGNORECASE)
+
+# Commands whose ONLY legitimate source is a human typing into their own
+# session. The UserPromptSubmit hook mints single-use Git/workspace authority
+# from the exact prompt text, so text typed into a worker's TTY must never carry
+# one: that would let Commander manufacture direct-human commit and push
+# authority inside a worker, which the managed-worktree design forbids outright.
+# These are refused rather than graded — the grader only ran on text longer than
+# 20 characters, and every one of these is shorter than that.
+_HUMAN_AUTHORITY_OPERATIONS = (
+    "commit-and-push",
+    "commit",
+    "push",
+    "use-primary-checkout",
+    "return-to-managed-worktree",
+    "deactivate-professional-mode",
+)
+_HUMAN_AUTHORITY_ALTERNATION = "|".join(_HUMAN_AUTHORITY_OPERATIONS)
+# Two accepted shapes, because state-activator.sh mints authority from both:
+#   1. the bare command, e.g. /commit, /ironclaude:commit, $ironclaude:commit
+#   2. the Codex Markdown skill link, e.g.
+#      [$ironclaude:commit](/abs/path/skills/commit/SKILL.md)
+# The link form begins with `[`, so a leading (?:^|\s) anchor on `/` or `$`
+# missed it entirely while the hook accepted it.
+_HUMAN_AUTHORITY_COMMAND_RE = re.compile(
+    r'(?:^|\s|\[)(?:/|\$)(?:ironclaude:)?(' + _HUMAN_AUTHORITY_ALTERNATION + r')(?:\s|\]|$)',
+    re.IGNORECASE,
+)
+
+
+def _reject_human_authority_text(text: str, tool: str) -> None:
+    """Refuse text that would mint direct-human authority in a worker session."""
+    match = _HUMAN_AUTHORITY_COMMAND_RE.search(text)
+    if match:
+        raise ValueError(
+            f"{tool} refused: text contains the human-authority command "
+            f"'{match.group(1)}'. Git and workspace authority is minted only from "
+            f"a human's own prompt; Commander cannot type it into a worker."
+        )
 
 
 def _validate_keys(keys: list[str]) -> None:
@@ -480,6 +519,16 @@ class OrchestratorTools:
         self._ssh_lock = threading.Lock()
         self._config = config or {}
         self._ollama_inventory = ollama_inventory
+        source_plugin_root = Path(__file__).resolve().parents[3] / "worker"
+        workspace_plugin_root = (
+            os.environ.get("IRONCLAUDE_PLUGIN_ROOT")
+            or self._config.get("plugin_root")
+            or source_plugin_root
+        )
+        self._workspace_client = WorkspaceClient(
+            workspace_plugin_root,
+            ssh_manager=ssh_manager,
+        )
         brain_cwd = (
             os.environ.get("IC_BRAIN_CWD")
             or self._config.get("brain_cwd")
@@ -817,6 +866,7 @@ class OrchestratorTools:
                 level = logging.INFO if health.ok else logging.WARNING
                 logger.log(level, f"Machine {name}: {health.details}")
             self._ssh_manager = mgr
+            self._workspace_client.set_ssh_manager(mgr)
 
     def list_machines(self) -> dict:
         """List configured remote machines with health status and active worker counts."""
@@ -877,8 +927,28 @@ class OrchestratorTools:
 
     @staticmethod
     def _grader_failure(batch: bool, feedback: str):
-        f = {"grade": "F", "approved": False, "feedback": feedback}
+        detail = re.sub(r"\s+", " ", feedback).strip()[:300]
+        f = {
+            "grade": "F",
+            "approved": False,
+            "feedback": f"Grader infrastructure failure: {detail}",
+            "infrastructure_error": True,
+            "error_detail": detail,
+        }
         return [f] if batch else f
+
+    @staticmethod
+    def _grader_rejection(subject: str, grade_result: dict) -> str:
+        """Present grader outages distinctly from semantic rejection."""
+        if grade_result.get("infrastructure_error"):
+            return (
+                f"{subject} blocked by grader infrastructure failure. "
+                f"{grade_result.get('error_detail', grade_result.get('feedback', 'Unknown'))}"
+            )
+        return (
+            f"{subject} rejected by grader (grade {grade_result['grade']}). "
+            f"{grade_result['feedback']}"
+        )
 
     def _claude_grader_argv(self, schema: dict, sysfile: str, model: str) -> list:
         """The exact ``claude -p`` grader argv. Kept byte-identical to the historical
@@ -1092,8 +1162,13 @@ class OrchestratorTools:
                             except OSError:
                                 pass
                     if codex_proc.returncode != 0:
+                        diagnostic = (
+                            codex_proc.stderr.strip()
+                            or codex_proc.stdout.strip()
+                            or "no diagnostic output"
+                        )
                         return self._grader_failure(
-                            batch, f"Codex grader exited {codex_proc.returncode}: {codex_proc.stderr[:300]}")
+                            batch, f"Codex grader exited {codex_proc.returncode}: {diagnostic}")
                     return self._parse_codex_grader_output(codex_proc, batch)
                 cmd = self._claude_grader_argv(schema, sysfile, grader_model)
                 proc = subprocess.run(
@@ -1181,7 +1256,7 @@ class OrchestratorTools:
 
     def _compute_concordance(self, opus: dict, shadow: dict) -> str:
         """Compute A/B/C/F concordance between Opus and shadow grade results."""
-        if shadow.get("infrastructure_error"):
+        if opus.get("infrastructure_error") or shadow.get("infrastructure_error"):
             return "F"
         if opus.get("grade") == shadow.get("grade") and opus.get("approved") == shadow.get("approved"):
             return "A"
@@ -1223,10 +1298,14 @@ class OrchestratorTools:
 
         lines.append("")
         lines.append("Verdicts:")
-        opus_mark = "✓" if opus_result.get("approved") else "✗"
-        opus_status = "approved" if opus_result.get("approved") else "rejected"
-        lines.append(f"  Opus:    {opus_result.get('grade', '?')} {opus_mark} {opus_status}")
-        lines.append(f"  \"{opus_result.get('feedback', '')}\"")
+        if opus_result.get("infrastructure_error"):
+            lines.append("  Opus:    (infrastructure error)")
+            lines.append(f"  \"{opus_result.get('error_detail', '')}\"")
+        else:
+            opus_mark = "✓" if opus_result.get("approved") else "✗"
+            opus_status = "approved" if opus_result.get("approved") else "rejected"
+            lines.append(f"  Opus:    {opus_result.get('grade', '?')} {opus_mark} {opus_status}")
+            lines.append(f"  \"{opus_result.get('feedback', '')}\"")
 
         if shadow_result.get("infrastructure_error"):
             lines.append("  gemma4:  (infrastructure error)")
@@ -1242,11 +1321,15 @@ class OrchestratorTools:
             "A": "A — exact match",
             "B": "B — same pass/fail, different grade",
             "C": "C — DIVERGE on pass/fail",
-            "F": "F — gemma4 failed",
+            "F": "F — grader infrastructure failure",
         }
         lines.append(f"Concordance: {concordance_labels.get(concordance, concordance)}")
-        if concordance == "F" and shadow_result.get("error_detail"):
-            lines.append(f"  Detail: {shadow_result['error_detail']}")
+        if concordance == "F":
+            infrastructure_result = (
+                opus_result if opus_result.get("infrastructure_error") else shadow_result
+            )
+            if infrastructure_result.get("error_detail"):
+                lines.append(f"  Detail: {infrastructure_result['error_detail']}")
 
         return "\n".join(lines)
 
@@ -2093,6 +2176,8 @@ class OrchestratorTools:
         while time.time() < deadline:
             output = self.tmux.read_log_tail(session_name, lines=50, ssh_host=ssh_host)
             if output:
+                if client == "codex" and "MCP startup interrupted" in output:
+                    return False
                 lower = output.lower()
                 if client == "codex":
                     compact = re.sub(r"\s+", "", lower)
@@ -2149,6 +2234,7 @@ class OrchestratorTools:
     def _set_pm_via_sqlite(
         self, session_name: str, value: str,
         timeout: int = 30, _claude_dir: Path | None = None, client: str = "claude",
+        not_before: float | None = None,
     ) -> str | None:
         """Shared implementation for activate/deactivate PM via direct SQLite write.
 
@@ -2197,8 +2283,11 @@ class OrchestratorTools:
                     f = claude_dir / f"ironclaude-session-{p}.id"
                     if f.exists():
                         txt = f.read_text().strip()
-                        if len(txt) == 36:
-                            candidates.append((f.stat().st_mtime, txt))
+                        mtime = f.stat().st_mtime
+                        if _UUID_RE.fullmatch(txt) and (
+                            not_before is None or mtime >= not_before
+                        ):
+                            candidates.append((mtime, txt))
                 if candidates:
                     session_uuid = max(candidates)[1]  # newest by mtime
                     break
@@ -2263,7 +2352,7 @@ class OrchestratorTools:
 
     def _read_pm_state_via_sqlite(
         self, session_name: str, _claude_dir: Path | None = None,
-        client: str = "claude",
+        client: str = "claude", not_before: float | None = None,
     ) -> dict:
         """Read (without mutating) professional_mode + workflow_stage for a session.
 
@@ -2283,8 +2372,11 @@ class OrchestratorTools:
                 session_id_file = claude_dir / f"ironclaude-session-{pid}.id"
                 if session_id_file.exists():
                     candidate = session_id_file.read_text().strip()
-                    if _UUID_RE.fullmatch(candidate):
-                        candidates.append((session_id_file.stat().st_mtime, candidate))
+                    mtime = session_id_file.stat().st_mtime
+                    if _UUID_RE.fullmatch(candidate) and (
+                        not_before is None or mtime >= not_before
+                    ):
+                        candidates.append((mtime, candidate))
             if not candidates:
                 return unknown
             session_uuid = max(candidates)[1]
@@ -2321,7 +2413,8 @@ class OrchestratorTools:
 
     def _activate_pm_via_sqlite(
         self, session_name: str, timeout: int = 30,
-        max_retries: int = 3, _claude_dir: Path | None = None, client: str = "claude"
+        max_retries: int = 3, _claude_dir: Path | None = None, client: str = "claude",
+        not_before: float | None = None,
     ) -> str | None:
         """Activate professional mode by writing directly to ironclaude.db.
 
@@ -2331,7 +2424,12 @@ class OrchestratorTools:
         """
         last_error: str | None = None
         for attempt in range(max_retries):
-            result = self._set_pm_via_sqlite(session_name, "on", timeout, _claude_dir, client=client)
+            kwargs = {"client": client}
+            if not_before is not None:
+                kwargs["not_before"] = not_before
+            result = self._set_pm_via_sqlite(
+                session_name, "on", timeout, _claude_dir, **kwargs,
+            )
             if result is None:
                 return None
             last_error = result
@@ -2628,6 +2726,380 @@ class OrchestratorTools:
             )
         return True, ""
 
+    @staticmethod
+    def _workspace_transport(plugin_root: str, ssh_host: str | None) -> dict:
+        if ssh_host is None:
+            return {"plugin_root": plugin_root}
+        return {"ssh_host": ssh_host, "remote_plugin_root": plugin_root}
+
+    @staticmethod
+    def _require_workspace_assignment(assignment: object) -> dict:
+        required = (
+            "workspace_guid", "repository_identity", "worktree_path", "branch",
+            "base_commit", "current_head", "lifecycle_status", "integration_target",
+        )
+        if not isinstance(assignment, dict):
+            raise WorkspaceClientError("workspace allocation response must be an object")
+        missing = [
+            field for field in required
+            if not isinstance(assignment.get(field), str) or not assignment[field]
+        ]
+        if missing:
+            raise WorkspaceClientError(
+                f"workspace allocation response missing required fields: {', '.join(missing)}"
+            )
+        return assignment
+
+    @staticmethod
+    def _validate_bound_workspace(
+        reserved: dict,
+        bound: dict,
+        owner_session_id: str,
+    ) -> None:
+        expected = {
+            field: reserved[field]
+            for field in (
+                "workspace_guid",
+                "repository_identity",
+                "worktree_path",
+                "branch",
+                "base_commit",
+                "current_head",
+                "lifecycle_status",
+                "integration_target",
+            )
+        }
+        expected["owner_session_id"] = owner_session_id
+        mismatched = [
+            field for field, value in expected.items()
+            if bound.get(field) != value
+        ]
+        if mismatched:
+            raise WorkspaceClientError(
+                "workspace bind response changed reserved evidence: "
+                + ", ".join(mismatched)
+            )
+
+    @staticmethod
+    def _workspace_failure(
+        phase: str,
+        repository: str,
+        assignment: dict,
+        error: object,
+        *,
+        recovery_name: str = "reconcile",
+        recovery_payload: dict | None = None,
+    ) -> dict:
+        owner = assignment.get("owner_session_id")
+        payload = recovery_payload or {"repository_path": repository}
+        return {
+            "error": str(error),
+            "failure_phase": phase,
+            "workspace": {
+                "workspace_guid": assignment.get("workspace_guid"),
+                "repository": repository,
+                "repository_identity": assignment.get("repository_identity"),
+                "worktree_path": assignment.get("worktree_path"),
+                "branch": assignment.get("branch"),
+                "lifecycle": assignment.get("lifecycle_status"),
+                "owner": owner,
+            },
+            "assignment_preserved": True,
+            "recovery": {recovery_name: payload},
+        }
+
+    def _reserve_worker_workspace(
+        self,
+        repository: str,
+        worker_id: str,
+        client: str,
+        *,
+        ssh_host: str | None = None,
+    ) -> dict:
+        """Discover installed runtime and reserve one isolated worker checkout."""
+        try:
+            installed_plugin_root = self._workspace_client.discover_installed_plugin_root(
+                client, ssh_host=ssh_host,
+            )
+        except Exception as exc:
+            return {
+                "failure": {
+                    "error": str(exc),
+                    "failure_phase": "runtime_discovery",
+                    "assignment_preserved": False,
+                }
+            }
+
+        transport = self._workspace_transport(installed_plugin_root, ssh_host)
+        workspace_guid = str(uuid.uuid4())
+        # integration_target is deliberately omitted: workspace-manager resolves
+        # it from the primary checkout's current branch on the host that owns the
+        # repository. Hardcoding "main" here targeted a nonexistent ref on any
+        # master/trunk repository and only failed at finalization.
+        allocation_payload = {
+            "repository_path": repository,
+            "workspace_guid": workspace_guid,
+            "worker_id": worker_id,
+        }
+        try:
+            assignment = self._require_workspace_assignment(
+                self._workspace_client.allocate(allocation_payload, **transport)
+            )
+        except Exception as exc:
+            try:
+                reconciliation = self._workspace_client.reconcile(
+                    {"repository_path": repository}, **transport,
+                )
+                reconciled = next(
+                    (
+                        item for item in reconciliation.get("assignments", [])
+                        if isinstance(item, dict)
+                        and item.get("workspace_guid") == workspace_guid
+                    ),
+                    None,
+                )
+                assignment = self._require_workspace_assignment(reconciled)
+            except Exception:
+                return {
+                    "failure": {
+                        "error": str(exc),
+                        "failure_phase": "allocation",
+                        "workspace_guid": workspace_guid,
+                        "repository": repository,
+                        "assignment_preserved": False,
+                        "recovery": {
+                            "reconcile": {"repository_path": repository},
+                        },
+                    }
+                }
+            return {
+                "failure": self._workspace_failure(
+                    "allocation", repository, assignment, exc,
+                    recovery_payload={"repository_path": repository},
+                )
+            }
+        return {"assignment": assignment, "transport": transport}
+
+    @staticmethod
+    def _registry_workspace_assignment(worker: dict) -> dict:
+        mapping = {
+            "workspace_guid": "workspace_guid",
+            "repository_identity": "workspace_repository_identity",
+            "worktree_path": "workspace_path",
+            "branch": "workspace_branch",
+            "base_commit": "workspace_base_commit",
+            "integration_target": "workspace_integration_target",
+        }
+        assignment = {
+            target: worker.get(source) for target, source in mapping.items()
+        }
+        missing = [
+            field for field, value in assignment.items()
+            if not isinstance(value, str) or not value
+        ]
+        owner = worker.get("native_session_id")
+        if not isinstance(owner, str) or not _UUID_RE.fullmatch(owner):
+            missing.append("native_session_id")
+        if missing:
+            raise WorkspaceClientError(
+                "worker registry lacks workspace authority fields: "
+                + ", ".join(missing)
+            )
+        return {
+            **assignment,
+            "owner_session_id": owner,
+            "lifecycle_status": "active",
+        }
+
+    def _read_worker_finalization_state(
+        self,
+        native_session_id: str,
+        *,
+        ssh_host: str | None = None,
+        _claude_dir: Path | None = None,
+    ) -> dict:
+        if not _UUID_RE.fullmatch(native_session_id):
+            raise WorkspaceClientError("worker native session identity is invalid")
+        query = (
+            "SELECT json_object("
+            "'workflow_stage', workflow_stage, "
+            "'unfinished_tasks', (SELECT COUNT(*) FROM wave_tasks "
+            "WHERE terminal_session = sessions.terminal_session "
+            "AND status != 'review_passed'), "
+            "'latest_task_boundary_grade', (SELECT grade FROM review_grades "
+            "WHERE terminal_session = sessions.terminal_session AND task_boundary = 1 "
+            "ORDER BY id DESC LIMIT 1)) "
+            "FROM sessions WHERE terminal_session = "
+            f"'{native_session_id}'"
+        )
+        if ssh_host is not None:
+            value = self.tmux.run_sqlite_query(
+                "~/.claude/ironclaude.db", query, ssh_host=ssh_host,
+            )
+            if not isinstance(value, str) or not value.strip():
+                raise WorkspaceClientError(
+                    "worker review state is missing or unreadable on remote host"
+                )
+            raw = value.strip().splitlines()[-1]
+        else:
+            claude_dir = (
+                _claude_dir
+                if _claude_dir is not None
+                else Path("~/.claude").expanduser()
+            )
+            db_path = claude_dir / "ironclaude.db"
+            try:
+                connection = sqlite3.connect(str(db_path), timeout=5)
+                row = connection.execute(query).fetchone()
+            except sqlite3.Error as exc:
+                raise WorkspaceClientError(
+                    f"worker review state query failed: {exc}"
+                ) from exc
+            finally:
+                if "connection" in locals():
+                    connection.close()
+            if row is None or not isinstance(row[0], str):
+                raise WorkspaceClientError("worker review state is missing")
+            raw = row[0]
+        try:
+            state = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise WorkspaceClientError(
+                "worker review state returned invalid JSON"
+            ) from exc
+        if not isinstance(state, dict):
+            raise WorkspaceClientError("worker review state must be an object")
+        return state
+
+    def _derive_workspace_commit_evidence(
+        self,
+        worktree_path: str,
+        expected_branch: str,
+        *,
+        ssh_host: str | None = None,
+    ) -> dict:
+        def git(*args: str) -> str:
+            argv = ["git", "-C", worktree_path, *args]
+            if ssh_host is None:
+                result = subprocess.run(
+                    argv, capture_output=True, text=True, check=False,
+                )
+            else:
+                if self._ssh_manager is None:
+                    raise WorkspaceClientError(
+                        "remote Git evidence requires an SSH manager"
+                    )
+                result = self._ssh_manager.run_argv(ssh_host, argv)
+            if result.returncode != 0:
+                detail = (
+                    result.stderr.strip()
+                    if isinstance(result.stderr, str) and result.stderr.strip()
+                    else "no diagnostic"
+                )
+                raise WorkspaceClientError(
+                    f"live Git evidence command failed: {' '.join(args)}: {detail}"
+                )
+            return result.stdout.strip() if isinstance(result.stdout, str) else ""
+
+        branch = git("symbolic-ref", "--quiet", "--short", "HEAD")
+        if branch != expected_branch:
+            raise WorkspaceClientError(
+                "worker checkout branch differs from registry assignment"
+            )
+        local_ref = f"refs/heads/{expected_branch}"
+        parent_oid = git("rev-parse", "--verify", "HEAD^{commit}")
+        if git("rev-parse", "--verify", f"{local_ref}^{{commit}}") != parent_oid:
+            raise WorkspaceClientError(
+                "worker checkout HEAD differs from its assigned local ref"
+            )
+        return {
+            "canonicalBranch": branch,
+            "localRef": local_ref,
+            "stagedTree": git("write-tree"),
+            "parentOid": parent_oid,
+        }
+
+    def commit_worker(self, worker_id: str, message: str) -> dict:
+        """Commit reviewed worker work locally; never authorize or execute push."""
+        if not isinstance(message, str) or not message.strip():
+            return {"error": "commit message must be non-empty"}
+        worker = self.registry.get_worker(worker_id)
+        if not worker:
+            return {"error": f"worker not found: {worker_id}"}
+        try:
+            assignment = self._registry_workspace_assignment(worker)
+        except Exception as exc:
+            return {
+                "error": str(exc),
+                "failure_phase": "authority",
+                "assignment_preserved": True,
+            }
+        repository = worker.get("repo")
+        client = worker.get("client")
+        if not isinstance(repository, str) or not repository:
+            return self._workspace_failure(
+                "authority", "", assignment,
+                "worker registry lacks repository path",
+            )
+        if client not in {"claude", "codex"}:
+            return self._workspace_failure(
+                "authority", repository, assignment,
+                "worker registry lacks supported provider client",
+            )
+
+        if worker.get("machine"):
+            self._ensure_ssh_manager()
+        ssh_host = self._resolve_ssh_host(worker_id)
+        try:
+            review_state = self._read_worker_finalization_state(
+                assignment["owner_session_id"], ssh_host=ssh_host,
+            )
+            if review_state.get("workflow_stage") != "execution_complete":
+                raise WorkspaceClientError(
+                    "worker workflow is not execution_complete"
+                )
+            if review_state.get("unfinished_tasks") != 0:
+                raise WorkspaceClientError("worker has unfinished plan tasks")
+            if review_state.get("latest_task_boundary_grade") not in {"A", "B"}:
+                raise WorkspaceClientError(
+                    "worker lacks latest passing task-boundary review"
+                )
+            evidence = self._derive_workspace_commit_evidence(
+                assignment["worktree_path"], assignment["branch"],
+                ssh_host=ssh_host,
+            )
+            installed_root = self._workspace_client.discover_installed_plugin_root(
+                client, ssh_host=ssh_host,
+            )
+        except Exception as exc:
+            return self._workspace_failure(
+                "authority", repository, assignment, exc,
+            )
+
+        command = {
+            "repositoryPath": repository,
+            "workspaceGuid": assignment["workspace_guid"],
+            "providerRootSessionId": assignment["owner_session_id"],
+            "message": message.strip(),
+            **evidence,
+        }
+        try:
+            result = self._workspace_client.finalize(
+                {"command": command},
+                **self._workspace_transport(installed_root, ssh_host),
+            )
+        except Exception as exc:
+            return self._workspace_failure(
+                "finalization", repository, assignment, exc,
+                recovery_payload={
+                    "repository_path": repository,
+                    "workspace_guid": assignment["workspace_guid"],
+                    "owner_session_id": assignment["owner_session_id"],
+                },
+            )
+        self.registry.update_worker_status(worker_id, "completed")
+        return result
+
     def spawn_worker(
         self,
         worker_id: str,
@@ -2644,6 +3116,10 @@ class OrchestratorTools:
         """Spawn a new worker with the given objective. Set machine to target a remote host."""
         if pm_max_retries < 1:
             raise ValueError("pm_max_retries must be >= 1")
+        # Validated at ENTRY. Refusing after provisioning leaked a live tmux
+        # session, a registered worker, and a bound workspace, because this
+        # raises rather than returning a _workspace_failure the caller unwinds.
+        _reject_human_authority_text(objective, "spawn_worker objective")
 
         # ORCH-01: the daemon honors the directive's planned_use_goal at spawn
         # time (see the /goal dispatch decision below) rather than treating it
@@ -2850,7 +3326,7 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
 
         if not grade_result["approved"]:
             return {
-                "error": f"Spawn rejected by grader (grade {grade_result['grade']}). {grade_result['feedback']}",
+                "error": self._grader_rejection("Spawn", grade_result),
                 "action": "revise objective and try again",
             }
         logger.info(f"Grader approved spawn for '{worker_id}' (grade {grade_result['grade']})")
@@ -2873,7 +3349,8 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             logger.warning(drift_msg)
             self._post_slack_safe(drift_msg)
 
-        self._ensure_ssh_manager()
+        if machine:
+            self._ensure_ssh_manager()
         # Resolve remote machine if specified
         ssh_host = None
         machine_cfg = None
@@ -2945,26 +3422,38 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
 
         session_name = f"ic-{worker_id}"
 
+        # Reserve one durable workspace before any worker process starts. The
+        # provider-native session UUID is intentionally unknown until startup;
+        # workspace-manager binds it after PM identity read-back.
+        reservation = self._reserve_worker_workspace(
+            repo, worker_id, worker_client, ssh_host=ssh_host,
+        )
+        if reservation.get("failure"):
+            return reservation["failure"]
+        assignment = reservation["assignment"]
+        workspace_transport = reservation["transport"]
+        workspace_cwd = assignment["worktree_path"]
+
         # Stage 0: ensure active-client instructions exist before process spawn.
         if ssh_host:
             instruction_error = self._ensure_worker_instructions_remote(
-                repo, ssh_host, worker_client,
+                workspace_cwd, ssh_host, worker_client,
             )
             if instruction_error is not None:
-                return {"error": instruction_error}
+                return self._workspace_failure("launch", repo, assignment, instruction_error)
         else:
             instruction_error = self._ensure_worker_instructions(
-                repo, worker_client,
+                workspace_cwd, worker_client,
             )
             if instruction_error is not None:
-                return {"error": instruction_error}
+                return self._workspace_failure("launch", repo, assignment, instruction_error)
 
         # Stage 1: ensure trust
         if ssh_host:
             if worker_client == "claude":
-                self._ensure_worker_trusted_remote(repo, ssh_host)
+                self._ensure_worker_trusted_remote(workspace_cwd, ssh_host)
         else:
-            self.ensure_worker_trusted(repo)
+            self.ensure_worker_trusted(workspace_cwd)
 
         # Stage 1.5: ensure remote log dir exists before spawning
         remote_log_dir = machine_cfg.log_dir if machine_cfg else None
@@ -2972,11 +3461,13 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             self.tmux.mkdir_p(remote_log_dir, ssh_host=ssh_host)
 
         # Stage 2: spawn tmux session
-        success = self.tmux.spawn_session(session_name, cmd, cwd=repo,
+        launch_started_at = time.time() if not ssh_host else None
+        success = self.tmux.spawn_session(session_name, cmd, cwd=workspace_cwd,
                                           ssh_host=ssh_host, remote_log_dir=remote_log_dir)
         if not success:
-            raise RuntimeError(
-                f"Failed to spawn tmux session for worker '{worker_id}'"
+            return self._workspace_failure(
+                "launch", repo, assignment,
+                f"Failed to spawn tmux session for worker '{worker_id}'",
             )
         remote_cleanup_armed = ssh_host is not None
 
@@ -2992,6 +3483,15 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             log_tail = self.tmux.read_log_tail(
                 session_name, lines=30, ssh_host=ssh_host, remote_log_dir=remote_log_dir,
             )
+            if worker_client == "codex" and "MCP startup interrupted" in log_tail:
+                if ssh_host:
+                    cleanup_remote_session()
+                else:
+                    self.tmux.kill_session(session_name, ssh_host=ssh_host)
+                return self._workspace_failure(
+                    "readiness", repo, assignment,
+                    f"Codex MCP startup interrupted for worker '{worker_id}'.\nLast output:\n{log_tail}",
+                )
             if not self.tmux.has_session(session_name, ssh_host=ssh_host):
                 if ssh_host:
                     cleanup_remote_session()
@@ -3029,25 +3529,31 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
 
                     if ssh_host:
                         instruction_error = self._ensure_worker_instructions_remote(
-                            repo, ssh_host, worker_client,
+                            workspace_cwd, ssh_host, worker_client,
                         )
                         if instruction_error is not None:
-                            return {"error": instruction_error}
+                            return self._workspace_failure(
+                                "readiness", repo, assignment, instruction_error,
+                            )
                         if worker_client == "claude":
-                            self._ensure_worker_trusted_remote(repo, ssh_host)
+                            self._ensure_worker_trusted_remote(workspace_cwd, ssh_host)
                     else:
                         instruction_error = self._ensure_worker_instructions(
-                            repo, worker_client,
+                            workspace_cwd, worker_client,
                         )
                         if instruction_error is not None:
-                            return {"error": instruction_error}
+                            return self._workspace_failure(
+                                "readiness", repo, assignment, instruction_error,
+                            )
 
+                    launch_started_at = time.time() if not ssh_host else None
                     retry_success = self.tmux.spawn_session(
-                        session_name, cmd, cwd=repo, ssh_host=ssh_host, remote_log_dir=remote_log_dir,
+                        session_name, cmd, cwd=workspace_cwd, ssh_host=ssh_host, remote_log_dir=remote_log_dir,
                     )
                     if not retry_success:
-                        raise RuntimeError(
-                            f"Failed to spawn tmux session for worker '{worker_id}' (opus retry)"
+                        return self._workspace_failure(
+                            "readiness", repo, assignment,
+                            f"Failed to spawn tmux session for worker '{worker_id}' (opus retry)",
                         )
                     remote_cleanup_armed = ssh_host is not None
 
@@ -3063,41 +3569,35 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                                 self.tmux.kill_session(
                                     session_name, ssh_host=ssh_host,
                                 )
-                            return {
-                                "error": (
-                                    f"Worker '{worker_id}' session died before ready on "
-                                    f"{machine or 'local'}.\nLast output:\n{retry_log_tail}"
-                                )
-                            }
+                            return self._workspace_failure(
+                                "readiness", repo, assignment,
+                                f"Worker '{worker_id}' session died before ready on "
+                                f"{machine or 'local'}.\nLast output:\n{retry_log_tail}",
+                            )
                         if ssh_host:
                             cleanup_remote_session()
-                            return {
-                                "error": (
-                                    f"Worker '{worker_id}' not ready on "
-                                    f"{machine}.\nLast output:\n{retry_log_tail}"
-                                )
-                            }
+                            return self._workspace_failure(
+                                "readiness", repo, assignment,
+                                f"Worker '{worker_id}' not ready on {machine}.\nLast output:\n{retry_log_tail}",
+                            )
                         logger.warning(
                             "Worker '%s' (opus retry) not ready after timeout on %s but "
                             "session alive — proceeding.\nLast output:\n%s",
                             worker_id, machine or "local", retry_log_tail,
                         )
                 else:
-                    return {
-                        "error": (
-                            f"Worker '{worker_id}' session died before ready on "
-                            f"{machine or 'local'}.\nLast output:\n{log_tail}"
-                        )
-                    }
+                    return self._workspace_failure(
+                        "readiness", repo, assignment,
+                        f"Worker '{worker_id}' session died before ready on "
+                        f"{machine or 'local'}.\nLast output:\n{log_tail}",
+                    )
             else:
                 if ssh_host:
                     cleanup_remote_session()
-                    return {
-                        "error": (
-                            f"Worker '{worker_id}' not ready on "
-                            f"{machine}.\nLast output:\n{log_tail}"
-                        )
-                    }
+                    return self._workspace_failure(
+                        "readiness", repo, assignment,
+                        f"Worker '{worker_id}' not ready on {machine}.\nLast output:\n{log_tail}",
+                    )
                 logger.warning(
                     "Worker '%s' not ready after timeout on %s but session alive — "
                     "proceeding.\nLast output:\n%s",
@@ -3139,29 +3639,32 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                     if isinstance(remote_pm_result, str)
                     else "missing provider-native UUID"
                 )
-                return {
-                    "error": (
-                        f"PM activation failed for worker "
-                        f"'{worker_id}': {reason}"
-                    ),
-                }
+                return self._workspace_failure(
+                    "activation", repo, assignment,
+                    f"PM activation failed for worker '{worker_id}': {reason}",
+                )
             native_session_id = remote_pm_result
         else:
+            pm_identity_kwargs = (
+                {"not_before": launch_started_at}
+                if worker_client == "codex" else {}
+            )
             pm_failure = self._activate_pm_via_sqlite(
-                session_name, timeout=pm_timeout, max_retries=pm_max_retries, client=worker_client
+                session_name, timeout=pm_timeout, max_retries=pm_max_retries,
+                client=worker_client,
+                **pm_identity_kwargs,
             )
             if pm_failure is not None:
                 self.tmux.kill_session(session_name, ssh_host=ssh_host)
-                return {
-                    "error": (
-                        f"PM activation failed for worker "
-                        f"'{worker_id}': {pm_failure}"
-                    ),
-                }
+                return self._workspace_failure(
+                    "activation", repo, assignment,
+                    f"PM activation failed for worker '{worker_id}': {pm_failure}",
+                )
 
         if not ssh_host:
             pm_state = self._read_pm_state_via_sqlite(
                 session_name, client=worker_client,
+                **pm_identity_kwargs,
             )
             native_session_id = pm_state.get("session_uuid")
             if (
@@ -3170,12 +3673,42 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 or not _UUID_RE.fullmatch(native_session_id)
             ):
                 self.tmux.kill_session(session_name, ssh_host=ssh_host)
-                return {
-                    "error": (
-                        f"PM identity verification failed for worker "
-                        f"'{worker_id}'"
-                    ),
-                }
+                return self._workspace_failure(
+                    "activation", repo, assignment,
+                    f"PM identity verification failed for worker '{worker_id}'",
+                )
+
+        bind_payload = {
+            "repository_path": repo,
+            "repository_identity": assignment["repository_identity"],
+            "workspace_guid": assignment["workspace_guid"],
+            "worker_id": worker_id,
+            "owner_session_id": native_session_id,
+            "expected_lifecycle": assignment["lifecycle_status"],
+            "expected_worktree_path": assignment["worktree_path"],
+            "expected_branch": assignment["branch"],
+            "expected_base_commit": assignment["base_commit"],
+            "expected_current_head": assignment["current_head"],
+        }
+        try:
+            bound_assignment = self._require_workspace_assignment(
+                self._workspace_client.bind(bind_payload, **workspace_transport)
+            )
+            self._validate_bound_workspace(
+                assignment, bound_assignment, native_session_id,
+            )
+            assignment = bound_assignment
+        except Exception as exc:
+            if ssh_host:
+                cleanup_remote_session()
+            else:
+                self.tmux.kill_session(session_name, ssh_host=ssh_host)
+            pending_assignment = {**assignment, "owner_session_id": native_session_id}
+            return self._workspace_failure(
+                "bind", repo, pending_assignment, exc,
+                recovery_name="retry_bind",
+                recovery_payload=bind_payload,
+            )
 
         # Stage 5.5: enable advisor if configured (skip actual Claude/Fable — top tier,
         # no higher advisor available). Codex cannot parse `/advisor`, a Claude slash
@@ -3210,8 +3743,8 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             time.sleep(3)
 
         # Stage 6: send objective
-        if ssh_host:
-            try:
+        try:
+            if ssh_host:
                 self.registry.register_worker(
                     worker_id,
                     effective_worker_type,
@@ -3227,23 +3760,35 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                     ),
                     native_session_id=native_session_id,
                 )
-            except Exception:
+            else:
+                self.registry.register_worker(
+                    worker_id,
+                    effective_worker_type,
+                    session_name,
+                    repo=repo,
+                    machine=machine,
+                    description=objective,
+                    client=worker_client,
+                    model=worker_handle.model if worker_handle is not None else None,
+                    native_session_id=native_session_id,
+                )
+            self.registry.set_worker_workspace(worker_id, assignment)
+        except Exception as exc:
+            if ssh_host:
                 cleanup_remote_session()
-                raise
-            remote_cleanup_armed = False
-        else:
-            self.registry.register_worker(
-                worker_id,
-                effective_worker_type,
-                session_name,
-                repo=repo,
-                machine=machine,
-                description=objective,
-                client=worker_client,
-                model=worker_handle.model if worker_handle is not None else None,
-                native_session_id=native_session_id,
+            else:
+                self.tmux.kill_session(session_name, ssh_host=ssh_host)
+            return self._workspace_failure("dispatch", repo, assignment, exc)
+        remote_cleanup_armed = False
+        if not self.tmux.send_keys(session_name, objective, ssh_host=ssh_host):
+            if ssh_host:
+                self.tmux.kill_session(session_name, ssh_host=ssh_host)
+            else:
+                self.tmux.kill_session(session_name, ssh_host=ssh_host)
+            return self._workspace_failure(
+                "dispatch", repo, assignment,
+                f"Failed to dispatch objective to worker '{worker_id}'",
             )
-        self.tmux.send_keys(session_name, objective, ssh_host=ssh_host)
         self.registry.log_event(
             "worker_spawned",
             worker_id=worker_id,
@@ -3268,21 +3813,43 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
         request = item["request"]
         worker_id = request["worker_id"]
         session_name = item["session_name"]
+        assignment = item["assignment"]
+        workspace_cwd = assignment["worktree_path"]
+
+        def failed(
+            phase: str,
+            error: object,
+            *,
+            recovery_name: str = "reconcile",
+            recovery_payload: dict | None = None,
+        ) -> dict:
+            return {
+                **item,
+                "failure": self._workspace_failure(
+                    phase, request["repo"], assignment, error,
+                    recovery_name=recovery_name,
+                    recovery_payload=recovery_payload,
+                ),
+            }
 
         ready = self._wait_for_ready(
             session_name, timeout=30, client=item["client"],
         )
         if not ready:
             log_tail = self.tmux.read_log_tail(session_name, lines=30)
+            if item["client"] == "codex" and "MCP startup interrupted" in log_tail:
+                return failed(
+                    "readiness",
+                    f"Codex MCP startup interrupted for worker '{worker_id}'.\n"
+                    f"Last output:\n{log_tail}",
+                )
             if not self.tmux.has_session(session_name):
                 if not item["launch_used_claude_fable"]:
-                    return {
-                        **item,
-                        "error": (
-                            f"Worker '{worker_id}' session died before ready on local."
-                            f"\nLast output:\n{log_tail}"
-                        ),
-                    }
+                    return failed(
+                        "readiness",
+                        f"Worker '{worker_id}' session died before ready on local."
+                        f"\nLast output:\n{log_tail}",
+                    )
 
                 self.tmux.kill_session(session_name)
                 mark_result = _mark_fable_unavailable("spawn-died")
@@ -3309,28 +3876,27 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                         None,
                     )
                 except NoCapabilityAvailable as exc:
-                    return {**item, "error": str(exc)}
+                    return failed("readiness", exc)
 
                 retry_client = (
                     retry_handle.client if retry_handle is not None else "claude"
                 )
                 instruction_error = self._ensure_worker_instructions(
-                    request["repo"], retry_client,
+                    workspace_cwd, retry_client,
                 )
                 if instruction_error is not None:
-                    return {**item, "error": instruction_error}
+                    return failed("readiness", instruction_error)
 
+                launch_started_at = time.time()
                 retry_success = self.tmux.spawn_session(
-                    session_name, retry_cmd, cwd=request["repo"],
+                    session_name, retry_cmd, cwd=workspace_cwd,
                 )
                 if not retry_success:
-                    return {
-                        **item,
-                        "error": (
-                            f"Failed to spawn tmux session for worker "
-                            f"'{worker_id}' (opus retry)"
-                        ),
-                    }
+                    return failed(
+                        "readiness",
+                        f"Failed to spawn tmux session for worker "
+                        f"'{worker_id}' (opus retry)",
+                    )
 
                 item = {
                     **item,
@@ -3341,6 +3907,7 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                     "handle": retry_handle,
                     "client": retry_client,
                     "launch_used_claude_fable": False,
+                    "launch_started_at": launch_started_at,
                 }
                 ready = self._wait_for_ready(
                     session_name, timeout=30, client=retry_client,
@@ -3350,13 +3917,11 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                         session_name, lines=30,
                     )
                     if not self.tmux.has_session(session_name):
-                        return {
-                            **item,
-                            "error": (
-                                f"Worker '{worker_id}' session died before ready "
-                                f"on local.\nLast output:\n{retry_log_tail}"
-                            ),
-                        }
+                        return failed(
+                            "readiness",
+                            f"Worker '{worker_id}' session died before ready "
+                            f"on local.\nLast output:\n{retry_log_tail}",
+                        )
                     logger.warning(
                         "Worker '%s' (opus retry) not ready after timeout on local "
                         "but session alive — proceeding.\nLast output:\n%s",
@@ -3378,19 +3943,22 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 if clear_result == "removed":
                     self._post_slack_safe(format_fable_recovered())
 
+        pm_identity_kwargs = (
+            {"not_before": item["launch_started_at"]}
+            if item["client"] == "codex" else {}
+        )
         pm_failure = self._activate_pm_via_sqlite(
             session_name,
             timeout=request.get("pm_timeout", 300),
             max_retries=request.get("pm_max_retries", 3),
             client=item["client"],
+            **pm_identity_kwargs,
         )
         if pm_failure is not None:
-            return {
-                **item,
-                "error": f"PM activation failed: {pm_failure}",
-            }
+            return failed("activation", f"PM activation failed: {pm_failure}")
         pm_state = self._read_pm_state_via_sqlite(
             session_name, client=item["client"],
+            **pm_identity_kwargs,
         )
         native_session_id = pm_state.get("session_uuid")
         if (
@@ -3398,11 +3966,46 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             or not isinstance(native_session_id, str)
             or not _UUID_RE.fullmatch(native_session_id)
         ):
+            return failed("activation", "PM identity verification failed")
+
+        bind_payload = {
+            "repository_path": request["repo"],
+            "repository_identity": assignment["repository_identity"],
+            "workspace_guid": assignment["workspace_guid"],
+            "worker_id": worker_id,
+            "owner_session_id": native_session_id,
+            "expected_lifecycle": assignment["lifecycle_status"],
+            "expected_worktree_path": assignment["worktree_path"],
+            "expected_branch": assignment["branch"],
+            "expected_base_commit": assignment["base_commit"],
+            "expected_current_head": assignment["current_head"],
+        }
+        try:
+            bound_assignment = self._require_workspace_assignment(
+                self._workspace_client.bind(
+                    bind_payload, **item["workspace_transport"],
+                )
+            )
+            self._validate_bound_workspace(
+                assignment, bound_assignment, native_session_id,
+            )
+        except Exception as exc:
+            pending_assignment = {
+                **assignment, "owner_session_id": native_session_id,
+            }
             return {
                 **item,
-                "error": "PM identity verification failed",
+                "failure": self._workspace_failure(
+                    "bind", request["repo"], pending_assignment, exc,
+                    recovery_name="retry_bind",
+                    recovery_payload=bind_payload,
+                ),
             }
-        return {**item, "native_session_id": native_session_id}
+        return {
+            **item,
+            "assignment": bound_assignment,
+            "native_session_id": native_session_id,
+        }
 
     def spawn_workers(self, requests: list[dict]) -> list[dict]:
         """Spawn multiple workers with batch grading and parallel PM activation.
@@ -3606,7 +4209,12 @@ You are grading a spawn_worker decision. Your verdict is a JSON object:
             if not isinstance(grade, dict) or not grade.get("approved"):
                 feedback = grade.get("feedback", "Unknown") if isinstance(grade, dict) else "Invalid grade"
                 g = grade.get("grade", "F") if isinstance(grade, dict) else "F"
-                results.append({"worker_id": req["worker_id"], "error": f"Rejected (grade {g}): {feedback}"})
+                error = (
+                    self._grader_rejection("Spawn", grade)
+                    if isinstance(grade, dict)
+                    else f"Rejected (grade {g}): {feedback}"
+                )
+                results.append({"worker_id": req["worker_id"], "error": error})
             else:
                 # Remember this request's slot so results stay positionally correct
                 approved.append((req, grade, len(results)))
@@ -3694,25 +4302,43 @@ You are grading a spawn_worker decision. Your verdict is a JSON object:
                 worker_type, worker_handle,
             )
 
+            reservation = self._reserve_worker_workspace(
+                repo, worker_id, worker_client,
+            )
+            if reservation.get("failure"):
+                results[res_idx] = {
+                    "worker_id": worker_id,
+                    **reservation["failure"],
+                }
+                continue
+            assignment = reservation["assignment"]
+            workspace_cwd = assignment["worktree_path"]
+
             instruction_error = self._ensure_worker_instructions(
-                repo, worker_client,
+                workspace_cwd, worker_client,
             )
             if instruction_error is not None:
                 results[res_idx] = {
                     "worker_id": worker_id,
-                    "error": instruction_error,
+                    **self._workspace_failure(
+                        "launch", repo, assignment, instruction_error,
+                    ),
                 }
                 continue
-            self.ensure_worker_trusted(repo)
+            self.ensure_worker_trusted(workspace_cwd)
 
             session_name = f"ic-{worker_id}"
+            launch_started_at = time.time()
             success = self.tmux.spawn_session(
-                session_name, cmd, cwd=repo,
+                session_name, cmd, cwd=workspace_cwd,
             )
             if not success:
                 results[res_idx] = {
                     "worker_id": worker_id,
-                    "error": "Failed to spawn tmux session",
+                    **self._workspace_failure(
+                        "launch", repo, assignment,
+                        "Failed to spawn tmux session",
+                    ),
                 }
                 continue
 
@@ -3726,6 +4352,9 @@ You are grading a spawn_worker decision. Your verdict is a JSON object:
                 "handle": worker_handle,
                 "client": worker_client,
                 "launch_used_claude_fable": launch_used_claude_fable,
+                "launch_started_at": launch_started_at,
+                "assignment": assignment,
+                "workspace_transport": reservation["transport"],
             })
 
         if not spawned:
@@ -3745,7 +4374,12 @@ You are grading a spawn_worker decision. Your verdict is a JSON object:
                 except Exception as exc:
                     outcome = {
                         **original,
-                        "error": f"Worker startup failed: {exc}",
+                        "failure": self._workspace_failure(
+                            "readiness",
+                            original["request"]["repo"],
+                            original["assignment"],
+                            f"Worker startup failed: {exc}",
+                        ),
                     }
 
                 req = outcome["request"]
@@ -3754,11 +4388,11 @@ You are grading a spawn_worker decision. Your verdict is a JSON object:
                 session_name = outcome["session_name"]
                 res_idx = outcome["res_idx"]
 
-                if outcome.get("error"):
+                if outcome.get("failure"):
                     self.tmux.kill_session(session_name)
                     results[res_idx] = {
                         "worker_id": worker_id,
-                        "error": outcome["error"],
+                        **outcome["failure"],
                     }
                     continue
 
@@ -3788,20 +4422,44 @@ You are grading a spawn_worker decision. Your verdict is a JSON object:
                     )
                     time.sleep(3)
 
-                self.registry.register_worker(
-                    worker_id,
-                    effective_worker_type,
-                    session_name,
-                    repo=req["repo"],
-                    description=req["objective"],
-                    client=outcome["client"],
-                    model=(
-                        outcome["handle"].model
-                        if outcome["handle"] is not None else None
-                    ),
-                    native_session_id=outcome["native_session_id"],
-                )
-                self.tmux.send_keys(session_name, req["objective"])
+                try:
+                    self.registry.register_worker(
+                        worker_id,
+                        effective_worker_type,
+                        session_name,
+                        repo=req["repo"],
+                        description=req["objective"],
+                        client=outcome["client"],
+                        model=(
+                            outcome["handle"].model
+                            if outcome["handle"] is not None else None
+                        ),
+                        native_session_id=outcome["native_session_id"],
+                    )
+                    self.registry.set_worker_workspace(
+                        worker_id, outcome["assignment"],
+                    )
+                    # Same TTY as send_to_worker, so the same refusal applies.
+                    _reject_human_authority_text(
+                        req["objective"], "spawn_workers_batch objective",
+                    )
+                    dispatched = self.tmux.send_keys(
+                        session_name, req["objective"],
+                    )
+                    if not dispatched:
+                        raise RuntimeError(
+                            f"Failed to dispatch objective to worker '{worker_id}'"
+                        )
+                except Exception as exc:
+                    self.tmux.kill_session(session_name)
+                    results[res_idx] = {
+                        "worker_id": worker_id,
+                        **self._workspace_failure(
+                            "dispatch", req["repo"],
+                            outcome["assignment"], exc,
+                        ),
+                    }
+                    continue
                 self.registry.log_event(
                     "worker_spawned",
                     worker_id=worker_id,
@@ -3891,7 +4549,7 @@ Did the Brain act as {self._operator_name}'s avatar during brainstorming? Did it
         self._fire_shadow_thread("approve_plan", worker_id, worker.get("repo"), grade_result, _opus_tool_calls, system_prompt, user_prompt)
         if not grade_result["approved"]:
             return {
-                "error": f"Plan approval rejected by grader (grade {grade_result['grade']}). {grade_result['feedback']}",
+                "error": self._grader_rejection("Plan approval", grade_result),
                 "action": "deepen brainstorming engagement with the worker and try again",
             }
         logger.info(f"Grader approved plan for '{worker_id}' (grade {grade_result['grade']})")
@@ -3938,6 +4596,10 @@ Did the Brain act as {self._operator_name}'s avatar during brainstorming? Did it
             self.registry.update_worker_status(worker_id, "failed")
             raise RuntimeError(f"Worker '{worker_id}' tmux session is dead")
 
+        # Deterministic refusal before the grader. The grader is an LLM and is
+        # not a reliable gate for an authority-minting string.
+        _reject_human_authority_text(message, "send_to_worker")
+
         # Inline grader enforcement — MCP grades automatically
         avatar_skill = _load_avatar_skill()
         system_prompt = f"""{avatar_skill}
@@ -3981,7 +4643,7 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
             grade_result = self._call_grader(system_prompt, user_prompt)
         if not grade_result["approved"]:
             return {
-                "error": f"Message rejected by grader (grade {grade_result['grade']}). {grade_result['feedback']}",
+                "error": self._grader_rejection("Message", grade_result),
                 "action": "revise message and try again",
             }
         logger.info(f"Grader approved message to '{worker_id}' (grade {grade_result['grade']})")
@@ -4104,6 +4766,9 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
         _validate_keys(keys)
 
         text_content = "".join(k for k in keys if k not in _ALLOWED_NAMED_KEYS)
+        # Checked before the length threshold: every human-authority command is
+        # shorter than 20 characters and so never reached the grader at all.
+        _reject_human_authority_text(text_content, "send_keys_to_worker")
         if len(text_content) > 20:
             logger.info(f"send_keys_to_worker '{worker_id}': {len(text_content)} chars of text, routing through grader")
             avatar_skill = _load_avatar_skill()
@@ -4135,7 +4800,7 @@ Grading criteria:
                 grade_result = self._call_grader(system_prompt, user_prompt)
             if not grade_result["approved"]:
                 return {
-                    "error": f"send_keys text rejected by grader (grade {grade_result['grade']}). {grade_result['feedback']}",
+                    "error": self._grader_rejection("send_keys text", grade_result),
                     "action": "revise text and try again",
                 }
 
@@ -4419,6 +5084,7 @@ Grading criteria:
                 f"--dangerously-bypass-approvals-and-sandbox"
             )
 
+        launch_started_at = time.time()
         success = self.tmux.spawn_session(target, cmd, cwd=repo)
         if not success:
             return {"error": f"Failed to spawn tmux session for worker '{worker_id}'"}
@@ -4435,6 +5101,13 @@ Grading criteria:
             ready = self._wait_for_ready(target, timeout=30, client=client)
             if not ready:
                 log_tail = self.tmux.read_log_tail(target, lines=30)
+                if client == "codex" and "MCP startup interrupted" in log_tail:
+                    return {
+                        "error": (
+                            f"Codex MCP startup interrupted for worker '{worker_id}'.\n"
+                            f"Last output:\n{log_tail}"
+                        ),
+                    }
                 return {
                     "error": (
                         f"Worker '{worker_id}' was not ready.\n"
@@ -4442,8 +5115,12 @@ Grading criteria:
                     ),
                 }
 
+            pm_identity_kwargs = (
+                {"not_before": launch_started_at} if client == "codex" else {}
+            )
             pm_failure = self._activate_pm_via_sqlite(
                 target, timeout=300, max_retries=3, client=client,
+                **pm_identity_kwargs,
             )
             if pm_failure is not None:
                 return {
@@ -4453,7 +5130,10 @@ Grading criteria:
                     ),
                 }
 
-            pm = self._read_pm_state_via_sqlite(target, client=client)
+            pm = self._read_pm_state_via_sqlite(
+                target, client=client,
+                **pm_identity_kwargs,
+            )
             if (
                 pm.get("professional_mode") != "on"
                 or pm.get("session_uuid") != session_id
@@ -4569,7 +5249,7 @@ Has the worker genuinely completed its objective based on the evidence?
                     self._track_failed_base(fail_base)
                     logger.info(f"Tracked failure base '{fail_base}' for retry escalation")
                 return {
-                    "error": f"Kill rejected by grader (grade {grade_result['grade']}). {grade_result['feedback']}",
+                    "error": self._grader_rejection("Kill", grade_result),
                     "action": "send worker back to finish, then try again with updated evidence",
                 }
             logger.info(f"Grader approved kill for '{worker_id}' (grade {grade_result['grade']})")
@@ -4903,6 +5583,11 @@ Has the worker genuinely completed its objective based on the evidence?
         Preserves stdin/stdout so Claude Code's stdio pipe survives the restart.
         Does not return — os.execvp replaces the process image.
         """
+        if os.environ.get("IRONCLAUDE_CLIENT") == "codex":
+            return (
+                "restart_mcp is unsupported for a Codex Brain because in-place exec breaks "
+                "the current MCP transport. Use restart_daemon to restart and reconnect the Brain."
+            )
         logger.info("restart_mcp: closing DB and exec'ing fresh instance (argv=%s)", sys.argv)
         if self._db:
             try:
@@ -5127,7 +5812,7 @@ Does this message report a problem? If so, does it include an action already tak
             grade_result = self._call_grader(system_prompt, user_prompt)
         if not grade_result["approved"]:
             return {
-                "error": f"Message rejected by grader (grade {grade_result['grade']}). {grade_result['feedback']}",
+                "error": self._grader_rejection("Message", grade_result),
                 "action": "revise message to include action taken or pin an escalation, then try again",
             }
         logger.info("Grader approved post_message (grade %s)", grade_result["grade"])
@@ -5315,8 +6000,7 @@ def _create_mcp_server(tools: OrchestratorTools):
         Picks up code changes to orchestrator_mcp.py without restarting the brain session.
         The stdio pipe to Claude Code survives — os.execvp preserves open file descriptors.
         """
-        tools.restart_mcp()
-        return "restarting"  # never reached
+        return tools.restart_mcp()
 
     @mcp.tool()
     def game_launch(resolution: str = "1280x720") -> str:
@@ -5453,6 +6137,16 @@ def _create_mcp_server(tools: OrchestratorTools):
         original acknowledgement unchanged.
         """
         return json.dumps(tools.acknowledge_operator_message(source_ts, reason))
+
+    @mcp.tool()
+    def commit_worker(worker_id: str, message: str) -> str:
+        """Commit one reviewed worker assignment locally without pushing.
+
+        Authority is derived from the persisted worker registry, the worker's
+        state-manager database, and fresh Git evidence. Caller-supplied grades,
+        roles, refs, trees, owners, or completion claims are not accepted.
+        """
+        return json.dumps(tools.commit_worker(worker_id, message))
 
     @mcp.tool()
     def push_repo(repo: str, remote: str = "origin", branch: str = "") -> str:

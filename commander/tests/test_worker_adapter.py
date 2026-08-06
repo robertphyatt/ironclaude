@@ -301,6 +301,34 @@ def _spawn_tools(tmp_path, cfg, advisor_enabled=False, monkeypatch=None, ready_o
     t._wait_for_ready = MagicMock(return_value=True)
     t._call_grader = MagicMock(return_value={"grade": "A", "approved": True, "feedback": ""})
     t._call_local_grader = MagicMock(return_value={"grade": "A", "approved": True, "feedback": ""})
+    # Without this the spawn path builds a real WorkspaceClient, which reads the
+    # OPERATOR'S ~/.claude/plugins/cache and the installed commander version.
+    # These tests then pass or fail according to which plugin versions happen to
+    # be installed on the machine — they are about worker-adapter threading, not
+    # about workspace allocation.
+    workspace = MagicMock()
+    workspace.discover_installed_plugin_root.return_value = "/installed/ironclaude"
+
+    def _assignment(payload, **_transport):
+        guid = payload.get("workspace_guid", "44444444-4444-4444-8444-444444444444")
+        return {
+            "workspace_guid": guid,
+            "repository_identity": "identity:test",
+            "worktree_path": str(tmp_path),
+            "branch": f"ironclaude/{guid}",
+            "base_commit": "a" * 40,
+            "current_head": "a" * 40,
+            "owner_session_id": None,
+            "lifecycle_status": "active",
+            "integration_target": payload.get("integration_target", "main"),
+        }
+
+    workspace.allocate.side_effect = _assignment
+    workspace.bind.side_effect = lambda payload, **transport: {
+        **_assignment(payload),
+        "owner_session_id": payload["owner_session_id"],
+    }
+    t._workspace_client = workspace
     return t, mock_tmux, registry
 
 
@@ -316,14 +344,16 @@ def test_spawn_codex_threads_client_and_gates_slash(tmp_path, monkeypatch):
     # client threaded into wait + activate
     assert tools._wait_for_ready.call_args.kwargs.get("client") == "codex"
     assert tools._activate_pm_via_sqlite.call_args.kwargs.get("client") == "codex"
+    assert isinstance(tools._activate_pm_via_sqlite.call_args.kwargs["not_before"], float)
     # claude slash commands gated OFF for codex
     keys = [c.args[1] for c in tmux.send_keys.call_args_list]
     assert not any(k.startswith("/advisor") for k in keys)
     assert not any(k.startswith("/goal") for k in keys)
     # native identity + client/model persisted atomically
-    tools._read_pm_state_via_sqlite.assert_called_once_with(
-        "ic-w1", client="codex",
-    )
+    tools._read_pm_state_via_sqlite.assert_called_once()
+    assert tools._read_pm_state_via_sqlite.call_args.args == ("ic-w1",)
+    assert tools._read_pm_state_via_sqlite.call_args.kwargs["client"] == "codex"
+    assert isinstance(tools._read_pm_state_via_sqlite.call_args.kwargs["not_before"], float)
     registry.register_worker.assert_called_once()
     register_call = registry.register_worker.call_args
     assert register_call.args[0] == "w1"
