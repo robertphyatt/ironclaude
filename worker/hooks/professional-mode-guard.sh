@@ -390,8 +390,37 @@ Do NOT use Edit, Write, Bash, or any other write tool until professional mode is
   esac
 fi
 
-# ─── OFF: no enforcement ───
+# ─── OFF: no workflow-stage enforcement, but managed-worktree isolation is a
+# property of the ASSIGNMENT, not of the mode. A session that owns a managed
+# worktree must not silently write into the primary checkout just because
+# professional mode is off — that would strand work while the assignment
+# stays active. Run the same adapter the ON path uses to redirect a relative
+# write into the owned worktree, and block on adapter failure (a damaged or
+# ambiguous assignment). This does not add any workflow-stage gating: no
+# subsequent checks run on this branch, so e.g. `git commit` still passes.
 if [ "$prof_mode" = "off" ]; then
+  if ! workspace_prepare_input; then
+    block_pretooluse "professional-mode-guard" "BLOCKED — MANAGED WORKTREE ENFORCEMENT FAILED
+
+${WORKSPACE_ADAPTER_ERROR}
+
+Professional mode is off, but this session still owns a managed-worktree
+assignment. Writing through it anyway would silently strand your work in the
+wrong checkout, so the write is refused instead of falling back to the
+primary checkout. A read that stays inside the managed worktree is never
+blocked for lack of an assignment, so you can still inspect state before
+repairing.
+
+To repair, in order:
+  1. Inspect the assignment with the workspace-manager MCP tool
+     get_workspace_status (Claude: mcp__plugin_ironclaude_workspace-manager__get_workspace_status).
+  2. If that server is not registered in this session, run /reload-plugins —
+     the guard deploys to the shared hooks directory immediately, but the
+     workspace-manager server only registers per session.
+  3. If it is still unavailable, the workspace-manager MCP tools
+     return_to_managed_worktree / use_primary_checkout can release or
+     reconcile the assignment directly."
+  fi
   log_hook "professional-mode-guard" "Allowed" "professional mode off"
   workspace_allow
 fi
@@ -575,9 +604,15 @@ Git commit, push, merge, and rebase are blocked when not in the executing stage.
 
 Do NOT run git commit, git push, git merge, or git rebase outside of plan execution."
     fi
-    # Exception: allow git add (staging) in Bash — anchored, no chaining/redirection
-    if [ "$TOOL_NAME" = "Bash" ]; then
-      if ! _has_blocked_metachars "$FILE_PATH" && echo "$FILE_PATH" | grep -qE '^\s*git\s+add\b'; then
+    # Exception: allow git add (staging) in Bash — anchored, no chaining/redirection.
+    # Plans stage with `git -C <repo> add`, so the leading -C is normalized away
+    # before the anchor check — mirrors is_readonly_git/is_review_allowed in
+    # bash-readonly-guard.sh. The metachar gate MUST run first: _strip_dash_c's
+    # own header warns its [^[:space:]]+ path class would otherwise swallow a
+    # $(...) payload inside the -C argument.
+    if [ "$TOOL_NAME" = "Bash" ] && ! _has_blocked_metachars "$FILE_PATH"; then
+      GIT_ADD_NORMALIZED=$(_strip_dash_c "$FILE_PATH")
+      if echo "$GIT_ADD_NORMALIZED" | grep -qE '^\s*git\s+add\b'; then
         log_hook "professional-mode-guard" "Allowed" "git staging"
         workspace_allow
       fi

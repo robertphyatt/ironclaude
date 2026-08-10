@@ -192,3 +192,51 @@ def test_worktree_discovers_exact_remote_provider_runtime_over_existing_ssh_tran
     assert ssh.run_argv.call_args_list[3].args == (
         "worker-host", ["test", "-f", f"{root}/mcp-servers/workspace-manager/dist/cli.js"],
     )
+
+
+def test_reconcile_remote_builds_ssh_argv_against_remote_plugin_root(tmp_path: Path):
+    ssh = Mock()
+    ssh.run_argv.return_value = completed('{"state":"rebase-paused-clean"}\n')
+    client = WorkspaceClient(tmp_path, runner=Mock(), ssh_manager=ssh)
+    payload = {
+        "repository_path": "/srv/repo",
+        "workspace_guid": "22222222-2222-4222-8222-222222222222",
+        "owner_session_id": "11111111-1111-4111-8111-111111111111",
+        "rebase_recovery": "status",
+    }
+
+    assert client.reconcile(
+        payload, ssh_host="worker-host", remote_plugin_root="/opt/iron claude",
+    ) == {"state": "rebase-paused-clean"}
+    host, argv = ssh.run_argv.call_args.args
+    assert host == "worker-host"
+    assert argv[:3] == [
+        "node",
+        "/opt/iron claude/mcp-servers/workspace-manager/dist/cli.js",
+        "reconcile",
+    ]
+    assert json.loads(argv[3]) == payload
+
+
+def test_reconcile_local_builds_argv_against_plugin_root(tmp_path: Path):
+    runner = Mock(return_value=completed('{"state":"frozen-no-rebase"}\n'))
+    client = WorkspaceClient(tmp_path / "source", runner=runner)
+    plugin_root = tmp_path / "installed"
+    payload = {
+        "repository_path": "/repo",
+        "workspace_guid": "22222222-2222-4222-8222-222222222222",
+        "owner_session_id": "11111111-1111-4111-8111-111111111111",
+        "rebase_recovery": "continue",
+    }
+
+    assert client.reconcile(payload, plugin_root=plugin_root) == {
+        "state": "frozen-no-rebase",
+    }
+    argv = runner.call_args.args[0]
+    assert argv[:3] == [
+        "node",
+        str(plugin_root / "mcp-servers/workspace-manager/dist/cli.js"),
+        "reconcile",
+    ]
+    assert json.loads(argv[3]) == payload
+    assert runner.call_args.kwargs["shell"] is False

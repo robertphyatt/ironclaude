@@ -10,6 +10,53 @@
 > `vX.Y.Z`. Land changes under `## [Unreleased]` as you go, then rename that
 > heading to the new version at release time so the entry matches what shipped.
 
+## 1.1.5: self-recovering managed worktrees, Opus 4.8 pinning, Codex grader diagnostics
+
+- Managed worktrees now recover themselves in-session — no external terminal, ever. Finalize
+  verifies a clean tree *before* it freezes (fail fast on a dirty tree, no freeze), and every
+  integration path recycles the worktree in place rather than removing it, so the cwd, GUID,
+  worktree, and branch survive across sequential commits and the per-loop `integration_records`
+  row and candidate ref are cleared so a second finalize on the same GUID no longer collides. When
+  a finalize is interrupted and an assignment freezes at `ready_for_integration`, a new
+  ownership-gated `reconcile_finalization` MCP tool completes or aborts it with **no fresh human
+  intent and no sqlite surgery**: `reconcileFinalization` deletes a provably-stale
+  `integration_records` row (gated on both an ancestry proof and a present, differing candidate
+  ref — an absent candidate refuses) so a reused-GUID strand reaches the existing self-healing
+  path, and it never pushes. The frozen guard now permits read-only git and a memory-path write
+  while frozen, so the agent can inspect state and record findings instead of being locked out.
+- Operator-intervention gaps on the mechanical failure paths are closed. Stale primary-checkout
+  locks auto-reap at every ownership seam while a live owner renews its lock on each file operation
+  (heartbeat), so an active session is never reaped but a genuinely dead one still is; quoted
+  `git -C <owned-worktree>` is recognized as internal instead of falsely rejected; a session writes
+  its own gitignored `docs/plans` and `docs/reviews` artifacts without the human-only
+  `/use-primary-checkout`. Integration recovery is completed end-to-end: the status probe is
+  non-mutating, Commander triggers the deferred integrated-cleanup so an integrated-but-uncleaned
+  worktree no longer leaks, and a conflict/rebase resolution that changes the reviewed content
+  routes to a repair channel (fresh commit on approval, restore-frozen on decline) instead of
+  dead-ending.
+- End-to-end usability fixes from live field reports. The status payload gains `effectiveRoot`,
+  `primaryOwnedByThisSession` (an exact three-part ownership match), and a live `currentHead`, so a
+  row can tell an isolated session apart from one whose writes land in the primary checkout and no
+  longer reports a stale head. Worktree isolation is decoupled from professional mode (an owner
+  redirects writes into its worktree even with mode off), `git -C <path> add` is allowed
+  pre-execution, deactivation preserves `workflow_stage` mid-plan, isolated worktrees inherit
+  explicitly-configured shared resources (models, `.venv`) as anchored-exclude symlinks, and
+  `node_modules/` is ignored at the repo root so test-tool caches never dirty the managed worktree.
+- Opus tier pinned to `claude-opus-4-8`. Every path that passed the bare `opus` string to the
+  Claude CLI now uses `claude-opus-4-8` explicitly — config, defaults, fallback literals, provider
+  `EXPECTED_MODELS`, and the corresponding test assertions — preventing silent drift to Opus 5 as
+  the `opus` alias resolution changes. IronClaude currently **recommends Opus 4.8 over Opus 5**,
+  which tends to be too easily distracted to follow the structured workflow reliably; see the
+  README's Model Configuration section.
+- Codex grader failures now say what actually went wrong. On a nonzero exit the diagnostic was
+  `stderr or stdout` — and because `codex exec --json` streams JSONL, the `or` discarded stdout
+  whenever stderr was non-empty, while the surviving text was truncated to 300 characters *from the
+  head*, which on a JSON stream is `thread.started` boilerplate. The real error was cut off exactly
+  when it was needed. The diagnostic is now extracted tail-first (errors surface late in a stream),
+  bounded, labelled by channel, and reported from both streams. The extractor is deliberately
+  schema-agnostic: Codex's error-event shape is unconfirmed, so it does not key on a guessed event
+  type.
+
 ## 1.1.4: opt-in managed worktrees, human-only Git authority, Codex guard parity
 
 - Managed Git worktrees, opt-in per session. `/use-managed-worktree` assigns a worktree named from

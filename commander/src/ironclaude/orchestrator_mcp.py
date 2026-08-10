@@ -496,7 +496,7 @@ class OrchestratorTools:
     # which raises ValueError on a negative maxlen.
     GRADER_LOG_MAX_LINES = _positive_int_env("GRADER_LOG_MAX_LINES", 500)
 
-    def __init__(self, registry, tmux, ledger_path: str = "", grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "opus", opus_model: str = "opus", effort_level: str = "high", ssh_manager=None, config: dict | None = None, ollama_inventory=None, dispatch_cfg: dict | None = None):
+    def __init__(self, registry, tmux, ledger_path: str = "", grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "claude-opus-4-8", opus_model: str = "claude-opus-4-8", effort_level: str = "high", ssh_manager=None, config: dict | None = None, ollama_inventory=None, dispatch_cfg: dict | None = None):
         self.registry = registry
         self.tmux = tmux
         self.ledger_path = ledger_path
@@ -550,7 +550,7 @@ class OrchestratorTools:
         Looks up worker_type in advisor_models (one-tier-up map); falls back
         to the scalar advisor_model default when worker_type is unmapped.
         """
-        return self._advisor_cfg.get("advisor_models", {}).get(worker_type) or self._advisor_cfg.get("advisor_model", "opus")
+        return self._advisor_cfg.get("advisor_models", {}).get(worker_type) or self._advisor_cfg.get("advisor_model", "claude-opus-4-8")
 
     def _track_failed_base(self, base: str) -> None:
         """Record a worker base for retry escalation, keeping the set bounded.
@@ -1073,6 +1073,53 @@ class OrchestratorTools:
             **({"recommended_model": out["recommended_model"]} if "recommended_model" in out else {}),
         }
 
+    @staticmethod
+    def _codex_grader_stdout_diagnostic(stdout: str) -> str | None:
+        """Extract a bounded, human-readable diagnostic from codex exec --json stdout on a
+        nonzero exit. Scans JSONL lines tail-first (real errors surface late in the
+        stream; thread.started/turn.started boilerplate is at the head) for the first
+        line whose parsed JSON carries a text-shaped field. Schema-agnostic on purpose:
+        codex's own error-event shape is unconfirmed, so this does not key on a guessed
+        event type like turn.failed. Falls back to the last non-empty raw line when no
+        line parses as JSON. Never raises."""
+        if not stdout or not stdout.strip():
+            return None
+        lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
+        if not lines:
+            return None
+        for line in reversed(lines):
+            try:
+                ev = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(ev, dict):
+                continue
+            candidate = None
+            item = ev.get("item")
+            if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"]:
+                candidate = item["text"]
+            elif isinstance(ev.get("text"), str) and ev["text"]:
+                candidate = ev["text"]
+            elif isinstance(ev.get("message"), str) and ev["message"]:
+                candidate = ev["message"]
+            else:
+                err = ev.get("error")
+                if isinstance(err, str) and err:
+                    candidate = err
+                elif isinstance(err, dict) and isinstance(err.get("message"), str) and err["message"]:
+                    candidate = err["message"]
+            if candidate:
+                return re.sub(r"\s+", " ", candidate).strip()[:180]
+        return re.sub(r"\s+", " ", lines[-1]).strip()[:180]
+
+    @staticmethod
+    def _codex_grader_stderr_diagnostic(stderr: str) -> str | None:
+        """Bounded tail of codex exec stderr — tracebacks and CLI error banners put the
+        actual exception/error summary last, not first. Never raises."""
+        if not stderr or not stderr.strip():
+            return None
+        return re.sub(r"\s+", " ", stderr.strip()).strip()[-90:]
+
     def _call_grader(self, system_prompt: str, user_prompt: str, batch: bool = False) -> dict | list:
         """Grade via a per-call ``claude -p`` headless subprocess with no file/exec tools.
 
@@ -1162,11 +1209,16 @@ class OrchestratorTools:
                             except OSError:
                                 pass
                     if codex_proc.returncode != 0:
-                        diagnostic = (
-                            codex_proc.stderr.strip()
-                            or codex_proc.stdout.strip()
-                            or "no diagnostic output"
-                        )
+                        stdout_part = self._codex_grader_stdout_diagnostic(codex_proc.stdout)
+                        stderr_part = self._codex_grader_stderr_diagnostic(codex_proc.stderr)
+                        if stdout_part and stderr_part:
+                            diagnostic = f"{stdout_part} | stderr: {stderr_part}"
+                        elif stdout_part:
+                            diagnostic = stdout_part
+                        elif stderr_part:
+                            diagnostic = f"stderr: {stderr_part}"
+                        else:
+                            diagnostic = "no diagnostic output"
                         return self._grader_failure(
                             batch, f"Codex grader exited {codex_proc.returncode}: {diagnostic}")
                     return self._parse_codex_grader_output(codex_proc, batch)
@@ -2789,9 +2841,12 @@ class OrchestratorTools:
         *,
         recovery_name: str = "reconcile",
         recovery_payload: dict | None = None,
+        mode: str | None = None,
     ) -> dict:
         owner = assignment.get("owner_session_id")
         payload = recovery_payload or {"repository_path": repository}
+        if mode is not None:
+            payload = {**payload, "mode": mode}
         return {
             "error": str(error),
             "failure_phase": phase,
@@ -2807,6 +2862,111 @@ class OrchestratorTools:
             "assignment_preserved": True,
             "recovery": {recovery_name: payload},
         }
+
+    # A continued rebase is integrated only when it reaches one of these terminal
+    # states (see workspace-manager integration.ts finishLocalIntegration). Any
+    # other outcome — 'rebase-recovery-repair-required', a re-conflict raise —
+    # is NOT integrated and must be surfaced as a conflict for operator recovery.
+    _FINALIZATION_INTEGRATED_STATES = frozenset(
+        {"cleaned", "pushed", "pushed-only", "integrated-local"}
+    )
+
+    def _trigger_integrated_cleanup(
+        self, recovery_payload: dict, transport: dict
+    ) -> None:
+        """Run the deferred managed cleanup for an already-integrated assignment by
+        issuing a plain reconcile (NO rebase_recovery), which reaches
+        reconcileFinalization's integrated-cleanup branch (cleanupFinalized). The
+        integration already landed, so a cleanup failure is non-fatal: log and
+        swallow — never raise and never un-complete the worker."""
+        try:
+            self._workspace_client.reconcile(dict(recovery_payload), **transport)
+        except Exception as exc:  # noqa: BLE001 - cleanup is best-effort post-integration
+            logger.warning("integrated-cleanup reconcile failed (non-fatal): %s", exc)
+
+    def _classify_finalization_failure(
+        self,
+        worker_id: str,
+        repository: str,
+        assignment: dict,
+        error: object,
+        installed_root: str,
+        ssh_host: str | None,
+    ) -> dict:
+        """Probe managed-worktree state after a finalize failure and route recovery.
+
+        The status probe is non-mutating. A clean paused rebase is driven to
+        completion transparently (worker marked completed); a conflicted rebase or
+        a drifted frozen worktree preserves the assignment with a tagged recovery
+        mode and performs NO mutation. Any probe failure or unrecognized state
+        falls back to the untagged preserved failure (fail-closed).
+        """
+        transport = self._workspace_transport(installed_root, ssh_host)
+        recovery_payload = {
+            "repository_path": repository,
+            "workspace_guid": assignment["workspace_guid"],
+            "owner_session_id": assignment["owner_session_id"],
+        }
+        try:
+            status = self._workspace_client.reconcile(
+                {**recovery_payload, "rebase_recovery": "status"},
+                **transport,
+            )
+        except Exception:
+            return self._workspace_failure(
+                "finalization", repository, assignment, error,
+                recovery_payload=recovery_payload,
+            )
+        state = status.get("state") if isinstance(status, dict) else None
+        if state == "integrated":
+            # The status probe found the work already landed (e.g. finalize
+            # raised during post-integration cleanup) — there is nothing left
+            # to reconcile, so mark the worker completed and hand back the
+            # probe result rather than an untagged failure pointing at a
+            # possibly-deleted worktree.
+            self.registry.update_worker_status(worker_id, "completed")
+            self._trigger_integrated_cleanup(recovery_payload, transport)
+            return status
+        if state == "rebase-paused-clean":
+            try:
+                integrated = self._workspace_client.reconcile(
+                    {**recovery_payload, "rebase_recovery": "continue"},
+                    **transport,
+                )
+            except Exception:
+                integrated = None
+            if (
+                isinstance(integrated, dict)
+                and integrated.get("state") in self._FINALIZATION_INTEGRATED_STATES
+            ):
+                self.registry.update_worker_status(worker_id, "completed")
+                return integrated
+            if (
+                isinstance(integrated, dict)
+                and integrated.get("state") == "rebase-recovery-repair-required"
+            ):
+                return self._workspace_failure(
+                    "finalization", repository, assignment, error,
+                    recovery_payload=recovery_payload, mode="repair",
+                )
+            return self._workspace_failure(
+                "finalization", repository, assignment, error,
+                recovery_payload=recovery_payload, mode="conflict",
+            )
+        if state == "rebase-paused-conflict":
+            return self._workspace_failure(
+                "finalization", repository, assignment, error,
+                recovery_payload=recovery_payload, mode="conflict",
+            )
+        if state == "frozen-no-rebase":
+            return self._workspace_failure(
+                "finalization", repository, assignment, error,
+                recovery_payload=recovery_payload, mode="drift",
+            )
+        return self._workspace_failure(
+            "finalization", repository, assignment, error,
+            recovery_payload=recovery_payload,
+        )
 
     def _reserve_worker_workspace(
         self,
@@ -3089,15 +3249,121 @@ class OrchestratorTools:
                 **self._workspace_transport(installed_root, ssh_host),
             )
         except Exception as exc:
+            return self._classify_finalization_failure(
+                worker_id, repository, assignment, exc, installed_root, ssh_host,
+            )
+        self.registry.update_worker_status(worker_id, "completed")
+        return result
+
+    _RECOVERY_ACTIONS = frozenset(
+        {"status", "rerebase", "continue", "abort", "restore_frozen"}
+    )
+
+    def recover_worker_integration(self, worker_id: str, action: str) -> dict:
+        """Drive one managed-worktree integration-recovery reconcile for a worker.
+
+        action selects a single non-push finalization reconcile mode: 'status'
+        (non-mutating classification), 'continue'/'abort' (resolve a paused
+        rebase), or 'rerebase'/'restore_frozen' (recover a drifted frozen
+        worktree). Authority — repository, workspace_guid, owner_session_id,
+        transport — is derived from the persisted worker registry exactly as
+        commit_worker derives it; no caller-supplied refs/trees/owners are
+        accepted. A WorkspaceClientError is returned as a structured dict, never
+        raised.
+        """
+        if action not in self._RECOVERY_ACTIONS:
+            return {
+                "error": (
+                    f"recovery action is not allowed: {action}; "
+                    f"choose one of {sorted(self._RECOVERY_ACTIONS)}"
+                ),
+                "action": action,
+            }
+        worker = self.registry.get_worker(worker_id)
+        if not worker:
+            return {"error": f"worker not found: {worker_id}", "action": action}
+        try:
+            assignment = self._registry_workspace_assignment(worker)
+        except Exception as exc:
+            return {
+                "error": str(exc),
+                "failure_phase": "authority",
+                "action": action,
+                "assignment_preserved": True,
+            }
+        repository = worker.get("repo")
+        client = worker.get("client")
+        if not isinstance(repository, str) or not repository:
             return self._workspace_failure(
-                "finalization", repository, assignment, exc,
-                recovery_payload={
+                "authority", "", assignment,
+                "worker registry lacks repository path",
+            )
+        if client not in {"claude", "codex"}:
+            return self._workspace_failure(
+                "authority", repository, assignment,
+                "worker registry lacks supported provider client",
+            )
+
+        # NOTE: intentionally does NOT reuse commit_worker's review-state gate or
+        # its _derive_workspace_commit_evidence call. During a paused rebase HEAD
+        # is detached mid-replay while the branch ref still points at the original
+        # tip, so evidence derivation raises "worker checkout HEAD differs from its
+        # assigned local ref" in exactly the state this tool exists to recover.
+        if worker.get("machine"):
+            self._ensure_ssh_manager()
+        ssh_host = self._resolve_ssh_host(worker_id)
+        try:
+            installed_root = self._workspace_client.discover_installed_plugin_root(
+                client, ssh_host=ssh_host,
+            )
+        except Exception as exc:
+            return self._workspace_failure(
+                "authority", repository, assignment, exc,
+            )
+        try:
+            result = self._workspace_client.reconcile(
+                {
                     "repository_path": repository,
                     "workspace_guid": assignment["workspace_guid"],
                     "owner_session_id": assignment["owner_session_id"],
+                    "rebase_recovery": action,
                 },
+                **self._workspace_transport(installed_root, ssh_host),
             )
-        self.registry.update_worker_status(worker_id, "completed")
+        except Exception as exc:
+            # Fail-closed: ANY reconcile/transport error (WorkspaceClientError,
+            # a TypeError from a malformed payload, an ssh transport failure)
+            # becomes a structured dict — never a raise and never an implicit None.
+            return {
+                "error": str(exc),
+                "action": action,
+                "failure_phase": "integration_recovery",
+                "assignment_preserved": True,
+                "recovery": {
+                    "reconcile": {
+                        "repository_path": repository,
+                        "workspace_guid": assignment["workspace_guid"],
+                        "owner_session_id": assignment["owner_session_id"],
+                    },
+                },
+            }
+        if (
+            isinstance(result, dict)
+            and result.get("state") in self._FINALIZATION_INTEGRATED_STATES
+        ):
+            # Mirrors commit_worker's auto-continue: a recovery action that
+            # reaches a terminal integrated state landed the worker's work,
+            # so mark it completed here too. Non-terminal results (a repair
+            # still required, a paused rebase) must NOT mark completed.
+            self.registry.update_worker_status(worker_id, "completed")
+            cleanup_payload = {
+                "repository_path": repository,
+                "workspace_guid": assignment["workspace_guid"],
+                "owner_session_id": assignment["owner_session_id"],
+            }
+            self._trigger_integrated_cleanup(
+                cleanup_payload, self._workspace_transport(installed_root, ssh_host)
+            )
         return result
 
     def spawn_worker(
@@ -3510,7 +3776,7 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                     if mark_result in ("transition", "write_failed"):
                         self._post_slack_safe(
                             format_fable_unavailable(
-                                "spawn-died", redirected_to="opus", worker_id=worker_id,
+                                "spawn-died", redirected_to="claude-opus-4-8", worker_id=worker_id,
                             )
                         )
 
@@ -3862,7 +4128,7 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                     self._post_slack_safe(
                         format_fable_unavailable(
                             "spawn-died",
-                            redirected_to="opus",
+                            redirected_to="claude-opus-4-8",
                             worker_id=worker_id,
                         )
                     )
@@ -6149,6 +6415,21 @@ def _create_mcp_server(tools: OrchestratorTools):
         return json.dumps(tools.commit_worker(worker_id, message))
 
     @mcp.tool()
+    def recover_worker_integration(worker_id: str, action: str) -> str:
+        """Drive one managed-worktree integration-recovery step for a worker.
+
+        action selects a single non-push finalization reconcile mode: 'status'
+        (non-mutating classification of the worktree), 'continue'/'abort' (resolve
+        a paused integration rebase), or 'rerebase'/'restore_frozen' (recover a
+        drifted frozen worktree). Authority is derived from the persisted worker
+        registry; no caller-supplied refs, trees, or owners are accepted.
+
+        Returns JSON with the reconcile result, or a structured error dict when
+        the action is not allowed or the runtime refuses the recovery.
+        """
+        return json.dumps(tools.recover_worker_integration(worker_id, action))
+
+    @mcp.tool()
     def push_repo(repo: str, remote: str = "origin", branch: str = "") -> str:
         """Submit a git push request for operator confirmation via Slack.
 
@@ -6646,8 +6927,8 @@ def main():
         supabase_url=supabase_url, supabase_anon_key=supabase_anon_key,
         advisor_cfg=cfg.get("advisor", {}),
         dispatch_cfg=cfg.get("dispatch", {}),
-        grader_model=cfg.get("grader_model", "opus"),
-        opus_model=cfg.get("default_opus_model", "opus"),
+        grader_model=cfg.get("grader_model", "claude-opus-4-8"),
+        opus_model=cfg.get("default_opus_model", "claude-opus-4-8"),
         effort_level=cfg.get("effort_level", "high"),
         ssh_manager=ssh_manager,
         config=cfg,

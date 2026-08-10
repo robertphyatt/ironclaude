@@ -2152,7 +2152,7 @@ class IroncladeDaemon:
                 _ollama_url = "http://localhost:11434"
             cmd = f"export CLAUDE_CODE_ATTRIBUTION_HEADER=0; export ANTHROPIC_BASE_URL={shlex.quote(_ollama_url)}; export ANTHROPIC_AUTH_TOKEN=ollama; export ANTHROPIC_API_KEY=; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
         elif worker_type == "claude-opus":
-            cmd = make_opus_command(self.config.get("default_opus_model", "opus"), self.config.get("effort_level", "high"))
+            cmd = make_opus_command(self.config.get("default_opus_model", "claude-opus-4-8"), self.config.get("effort_level", "high"))
         elif worker_type == "claude-fable":
             cmd = make_opus_command("fable", self.config.get("effort_level", "high"))
         elif worker_type in WORKER_COMMANDS:
@@ -2197,7 +2197,7 @@ class IroncladeDaemon:
         # tier, no higher advisor available)
         advisor_cfg = self.config.get("advisor", {})
         if advisor_cfg.get("enabled") and worker_type != "claude-fable":
-            advisor_model = advisor_cfg.get("advisor_models", {}).get(worker_type) or advisor_cfg.get("advisor_model", "opus")
+            advisor_model = advisor_cfg.get("advisor_models", {}).get(worker_type) or advisor_cfg.get("advisor_model", "claude-opus-4-8")
             advisor_model = _resolve_fable_advisor_model(advisor_model)
             self.tmux.send_keys(session_name, f"/advisor {advisor_model}")
             self._wait_for_ready(session_name, timeout=10, marker="advisor")
@@ -3319,7 +3319,7 @@ def main():
     brain = select_brain_class(config, conn)(
         timeout_seconds=config.get("brain_timeout_seconds", 600),
         operator_name=config.get("operator_name", "Operator"),
-        model=config.get("brain_model", "opus"),
+        model=config.get("brain_model", "claude-opus-4-8"),
         effort_level=config.get("effort_level", "high"),
     )
 

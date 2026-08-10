@@ -3,13 +3,13 @@ import ironclaude.orchestrator_mcp as omcp
 from ironclaude.db import init_db
 from ironclaude.tmux_manager import _strip_ansi
 
-CLAUDE_MODELS = {"haiku": "haiku", "sonnet": "sonnet", "opus": "opus", "fable": "fable"}
+CLAUDE_MODELS = {"haiku": "haiku", "sonnet": "sonnet", "opus": "claude-opus-4-8", "fable": "fable"}
 CODEX_MODELS = {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol"}
 
 
 def _cfg(worker_pref="claude", worker_clients=("claude",), codex_enabled=False):
     return {
-        "grader_model": "opus", "brain_model": "sonnet", "default_opus_model": "opus",
+        "grader_model": "opus", "brain_model": "sonnet", "default_opus_model": "claude-opus-4-8",
         "advisor": {"advisor_model": "opus", "advisor_models": {}},
         "providers": {
             "clients": {
@@ -27,7 +27,7 @@ def _cfg(worker_pref="claude", worker_clients=("claude",), codex_enabled=False):
 
 
 def _legacy_cfg():
-    return {"grader_model": "opus", "default_opus_model": "opus", "brain_model": "sonnet",
+    return {"grader_model": "opus", "default_opus_model": "claude-opus-4-8", "brain_model": "sonnet",
             "advisor": {"advisor_model": "opus", "advisor_models": {}}}
 
 

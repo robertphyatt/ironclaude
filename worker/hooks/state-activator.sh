@@ -153,7 +153,7 @@ fi
 if [ "$DEACTIVATE_REQUEST" = "true" ]; then
   # Check for active wave_tasks before resetting workflow_stage
   ACTIVE_TASKS=$(sqlite3 "$DB_PATH" ".timeout 10000" \
-    "SELECT COUNT(*) FROM wave_tasks WHERE terminal_session='${SAFE_SESSION}' AND status IN ('pending', 'in_progress', 'review_pending');" 2>/dev/null) || ACTIVE_TASKS="0"
+    "SELECT COUNT(*) FROM wave_tasks WHERE terminal_session='${SAFE_SESSION}' AND status IN ('pending', 'in_progress', 'submitted');" 2>/dev/null) || ACTIVE_TASKS="0"
 
   if [ "$ACTIVE_TASKS" -gt 0 ] 2>/dev/null; then
     # Active execution detected: deactivate PM only, preserve workflow_stage

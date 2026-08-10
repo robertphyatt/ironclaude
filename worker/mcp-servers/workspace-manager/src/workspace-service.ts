@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type Database from 'better-sqlite3';
 import {
@@ -9,7 +10,9 @@ import {
   createAssignment,
   getAssignment,
   issueHumanIntent,
+  reapStalePrimaryOwner,
   releasePrimaryCheckoutOwnership,
+  reuseTerminalAssignment,
   transitionAssignment,
 } from './db.js';
 import {
@@ -18,9 +21,13 @@ import {
   discoverRepository,
   ensureManagedWorktreeExclusion,
   isAncestor,
+  linkSharedResources,
   listWorktrees,
   primaryBranch,
+  readSharedResourceConfig,
   removeWorktree,
+  runGit,
+  worktreeExists,
   worktreeHead,
   worktreeIsClean,
 } from './git.js';
@@ -41,7 +48,20 @@ export interface ProviderRootStatusRequest extends RepositoryRequest {
 }
 
 export type ProviderRootWorkspaceStatus =
-  | { status: 'assigned'; assignment: Assignment }
+  | {
+      status: 'assigned';
+      assignment: Assignment;
+      // These three fields are derived and always populated by
+      // getWorkspaceStatusForRoot; they are typed optional only so that
+      // unrelated inline constructors of this discriminated union (e.g.
+      // test mocks elsewhere) need not restate them.
+      /** Where this session's writes actually land: the primary checkout or its managed worktree. */
+      effectiveRoot?: 'primary' | 'managed';
+      /** True iff this exact session (repository + workspace GUID + owner session) owns the primary checkout. */
+      primaryOwnedByThisSession?: boolean;
+      /** Live Git HEAD of the assignment's worktree; falls back to the cached column if the read fails. */
+      currentHead?: string;
+    }
   | { status: 'unassigned'; repositoryIdentity: string; ownerSessionId: string };
 
 interface IntentRequest extends AssignmentRequest {
@@ -154,6 +174,19 @@ export class WorkspaceService {
       .get(repositoryIdentity) !== undefined;
   }
 
+  /**
+   * A repository-only match is not ownership: two different sessions on the
+   * same repository must never be conflated. Ownership requires the exact
+   * three-part binding (repository, workspace GUID, and owner session) that
+   * `acquirePrimaryCheckoutOwnership` records.
+   */
+  private sessionOwnsPrimary(repositoryIdentity: string, workspaceGuid: string, ownerSessionId: string): boolean {
+    return this.db.prepare(`
+      SELECT 1 FROM primary_checkout_owners
+      WHERE repository_identity = ? AND workspace_guid = ? AND owner_session_id = ?
+    `).get(repositoryIdentity, workspaceGuid, ownerSessionId) !== undefined;
+  }
+
   private materializeManagedWorktree(
     repository: RepositoryLocation,
     input: {
@@ -166,7 +199,7 @@ export class WorkspaceService {
     const baseCommit = worktreeHead(repository.primaryCheckoutPath);
     const worktreePath = managedWorktreePath(repository.primaryCheckoutPath, input.workspaceGuid);
     const branch = managedBranch(input.workspaceGuid);
-    const assignment = createAssignment(this.db, {
+    const assignmentInput = {
       workspaceGuid: input.workspaceGuid,
       repositoryIdentity: repository.repositoryIdentity,
       worktreePath,
@@ -176,7 +209,27 @@ export class WorkspaceService {
       ownerSessionId: input.ownerSessionId,
       workerId: input.workerId,
       integrationTarget: input.integrationTarget,
-    });
+    };
+    // A spent same-GUID row (terminal AND its worktree gone from disk and Git)
+    // is reset-and-reused in place so a re-allocated provider root reclaims its
+    // own retired GUID instead of colliding on the assignments PRIMARY KEY. A
+    // live row never reaches here (ensureSessionWorktree early-returns it); a
+    // terminal row whose worktree still exists is preserved by the worktreeGone
+    // conjunct and collides instead, protecting unrecovered work.
+    const priorRow = getAssignment(this.db, input.workspaceGuid);
+    const worktreeGone = priorRow !== undefined
+      && !existsSync(priorRow.worktree_path)
+      && !worktreeExists(repository.primaryCheckoutPath, priorRow.worktree_path);
+    const reuseSpent = priorRow !== undefined && priorRow.lifecycle_status === 'cleaned' && worktreeGone;
+    let assignment: Assignment;
+    if (reuseSpent) {
+      try {
+        runGit(repository.primaryCheckoutPath, ['update-ref', '-d', `refs/ironclaude/finalization/${input.workspaceGuid}/candidate`]);
+      } catch { /* ref may be absent */ }
+      assignment = reuseTerminalAssignment(this.db, assignmentInput);
+    } else {
+      assignment = createAssignment(this.db, assignmentInput);
+    }
 
     return this.materializeReservedAssignment(repository, assignment);
   }
@@ -191,6 +244,15 @@ export class WorkspaceService {
         assignment.worktree_path,
         assignment.branch,
         assignment.base_commit,
+      );
+      // A managed worktree is a clean checkout missing gitignored resources.
+      // Plant symlinks for the explicitly configured shared paths (and exclude
+      // them from Git's view) so resource-dependent tests can run in isolation.
+      linkSharedResources(
+        repository.primaryCheckoutPath,
+        assignment.worktree_path,
+        repository.repositoryIdentity,
+        readSharedResourceConfig(repository.repositoryIdentity),
       );
       transitionAssignment(this.db, assignment.workspace_guid, 'reserved', 'materialized');
       return transitionAssignment(this.db, assignment.workspace_guid, 'materialized', 'active');
@@ -361,8 +423,26 @@ export class WorkspaceService {
     if (assignments.length !== 1) {
       throw new Error('Workspace status is ambiguous for provider root and repository');
     }
-    this.validateManagedIdentity(repository, assignments[0]);
-    return { status: 'assigned', assignment: assignments[0] };
+    const assignment = assignments[0];
+    this.validateManagedIdentity(repository, assignment);
+    const primaryOwnedByThisSession = this.sessionOwnsPrimary(
+      repository.repositoryIdentity,
+      assignment.workspace_guid,
+      input.ownerSessionId,
+    );
+    let currentHead: string;
+    try {
+      currentHead = worktreeHead(assignment.worktree_path);
+    } catch {
+      currentHead = assignment.current_head;
+    }
+    return {
+      status: 'assigned',
+      assignment,
+      effectiveRoot: primaryOwnedByThisSession ? 'primary' : 'managed',
+      primaryOwnedByThisSession,
+      currentHead,
+    };
   }
 
   private checkoutIntentEvidence(
@@ -377,7 +457,13 @@ export class WorkspaceService {
       WHERE repository_identity = ?
     `).get(repository.repositoryIdentity) as { workspace_guid: string; owner_session_id: string } | undefined;
     if (operation === 'use-primary-checkout') {
-      if (primaryOwner) throw new Error('Primary checkout is already owned');
+      // Reap a dead/timed-out owner before the exclusivity throw so a stale row
+      // cannot deadlock issuance; a surviving (live) owner still blocks.
+      reapStalePrimaryOwner(this.db, repository.repositoryIdentity);
+      if (this.db.prepare('SELECT 1 FROM primary_checkout_owners WHERE repository_identity = ?')
+        .get(repository.repositoryIdentity)) {
+        throw new Error('Primary checkout is already owned');
+      }
     } else if (!primaryOwner
       || primaryOwner.workspace_guid !== assignment.workspace_guid
       || primaryOwner.owner_session_id !== ownerSessionId) {
@@ -479,6 +565,16 @@ export class WorkspaceService {
     if (assignment.lifecycle_status === 'abandoned') return assignment;
     if (!nonterminal(assignment.lifecycle_status)) {
       throw new Error('Only unresolved managed worktrees can be abandoned');
+    }
+    // A live owner must not abandon itself into a stale ownership row that then
+    // deadlocks the next acquirer until the TTL elapses: refuse while it holds the
+    // primary checkout, scoped to this exact assignment so a different session's
+    // ownership never blocks this one.
+    if (this.db.prepare(`
+      SELECT 1 FROM primary_checkout_owners
+      WHERE repository_identity = ? AND workspace_guid = ?
+    `).get(assignment.repository_identity, assignment.workspace_guid)) {
+      throw new Error('Return to the managed worktree before abandoning while holding the primary checkout.');
     }
     return transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, 'abandoned');
   }

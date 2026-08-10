@@ -488,6 +488,43 @@ When the staged diff contains only `.md` or documentation files with no code cha
 - Summarize without reading the document first (the summary must reflect actual findings)
 - Use the section 6 commit checklist for research-only directives (no diff review, no contamination check — the doc is the deliverable)
 
+### 6c. Guided Integration-Recovery Wizard
+
+When `commit_worker` fails and returns a `recovery` object with `recovery.reconcile.mode`, the worker's managed rebase drifted or paused on unmerged paths. This is a human decision point — the Brain NEVER auto-resolves a semantic conflict and NEVER integrates drifted work without {OPERATOR_NAME}'s explicit approval. Walk {OPERATOR_NAME} through recovery one step at a time; do not skip ahead.
+
+**`mode == "drift"`** — finalization drifted; the worktree is frozen, nothing has been mutated yet.
+
+1. Ask {OPERATOR_NAME}: proceed with recovery, or keep the work frozen?
+   - **Decline** → do nothing; the worktree stays frozen exactly as-is (no recovery tool call).
+   - **Proceed** → call `recover_worker_integration(worker_id, "rerebase")`.
+2. If the rerebase completes cleanly:
+   - Present the re-rebased result to {OPERATOR_NAME} and ask for approval.
+   - **Approve** → re-invoke `commit_worker` (it integrates the re-applied work via the isRepair path — {OPERATOR_NAME}'s explicit approval IS the human decision on the drifted content).
+   - **Decline** → call `recover_worker_integration(worker_id, "restore_frozen")` to reset the worktree back to frozen.
+3. If the rerebase instead reports a conflict:
+   - Present the unmerged paths to {OPERATOR_NAME}.
+   - Either resolve-in-worktree then call `recover_worker_integration(worker_id, "continue")`, or call `recover_worker_integration(worker_id, "abort")`.
+
+**`mode == "repair"`** — the paused rebase was resolved but the resolution changed the reviewed content, so the equality proof rejected automatic integration (the rebase has COMPLETED; HEAD is attached, not a paused rebase).
+
+1. Present the resolved result to {OPERATOR_NAME} and ask for approval.
+   - **Approve** → re-invoke `commit_worker` (it integrates the resolved work via the isRepair path — {OPERATOR_NAME}'s explicit approval IS the human decision on the changed content).
+   - **Decline** → call `recover_worker_integration(worker_id, "restore_frozen")` to reset the worktree back to the frozen pre-rebase commit.
+
+**`mode == "conflict"`** — a paused rebase with unmerged paths.
+
+1. Present the unmerged paths to {OPERATOR_NAME}.
+2. Either resolve-in-worktree then call `recover_worker_integration(worker_id, "continue")` (drives the paused-rebase continuation and integrates), or call `recover_worker_integration(worker_id, "abort")`.
+3. If `continue` returns `rebase-recovery-repair-required` — your resolution changed the reviewed content, so the equality proof rejected automatic integration; the rebase has COMPLETED (HEAD is attached, not a paused rebase):
+   - Present the resolved result to {OPERATOR_NAME} and ask for approval.
+   - **Approve** → re-invoke `commit_worker` (it integrates the resolved work via the isRepair path — {OPERATOR_NAME}'s explicit approval IS the human decision on the changed content).
+   - **Decline** → call `recover_worker_integration(worker_id, "restore_frozen")` to reset the worktree back to frozen.
+
+**Do NOT:**
+- Auto-resolve a semantic conflict — always present unmerged paths and let {OPERATOR_NAME} decide
+- Integrate drifted content without {OPERATOR_NAME}'s explicit approval — the rerebase result must be presented and approved before `commit_worker` is re-invoked
+- Call any `recover_worker_integration` action on a drift {OPERATOR_NAME} declined to recover
+
 ### 7. Adversarial Review Loop Protocol
 
 {OPERATOR_NAME} triggers this by saying "adversarial review loop" + what he cares about

@@ -231,7 +231,7 @@ class TestBrainModelFallback:
         with patch("claude_agent_sdk.query", new=mock_query):
             self._run_session(client)
 
-        assert client._model == "opus"
+        assert client._model == "claude-opus-4-8"
 
     def test_error_logged_on_fallback(self, caplog):
         import logging
@@ -1987,8 +1987,8 @@ class TestModelUnavailableText:
 
         # First session launched fable (bare), then fell back to opus[1m]
         assert models_built[0] == "fable"
-        assert any(m == "opus[1m]" for m in models_built), models_built
-        assert client._model == "opus"
+        assert any(m == "claude-opus-4-8[1m]" for m in models_built), models_built
+        assert client._model == "claude-opus-4-8"
         # The unavailability text was NOT surfaced as a brain response
         drained = client.get_pending_responses()
         assert all(unavailable_text not in r for r in drained)
@@ -2094,8 +2094,8 @@ class TestModelUnavailableFableTransition:
         assert "selected model" in callback_reason.lower()
 
         # Fallback still resolved to opus — existing behavior unchanged.
-        assert client._model == "opus"
-        assert any(m == "opus[1m]" for m in models_built), models_built
+        assert client._model == "claude-opus-4-8"
+        assert any(m == "claude-opus-4-8[1m]" for m in models_built), models_built
 
     def test_ModelUnavailable_non_fable_model_does_not_call_mark_or_callback(self, tmp_path, monkeypatch):
         """A non-fable failing model must not touch the fable-availability flag
@@ -2157,8 +2157,8 @@ class TestModelUnavailableFableTransition:
         models_built = self._drive_message_shaped_fallback(client)
 
         with_mark.assert_called_once()
-        assert client._model == "opus"
-        assert any(m == "opus[1m]" for m in models_built), models_built
+        assert client._model == "claude-opus-4-8"
+        assert any(m == "claude-opus-4-8[1m]" for m in models_built), models_built
 
     def test_callback_fires_on_write_failed(self, tmp_path, monkeypatch):
         """When mark_ returns write_failed (disk error), the callback still fires

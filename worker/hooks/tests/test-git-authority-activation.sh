@@ -249,5 +249,31 @@ assert_eq 'intent stores exact evidence JSON' '1' \
 assert_eq 'intent has bounded future expiry' '1' \
   "$(sqlite3 "$WORKSPACE_DB" "SELECT CASE WHEN expires_at > issued_at THEN 1 ELSE 0 END FROM human_intents ORDER BY intent_id DESC LIMIT 1;")"
 
+echo '=== deactivation preserves workflow_stage for active wave_tasks ==='
+reset_deactivation_fixture() {
+  sqlite3 "$STATE_DB" "DELETE FROM wave_tasks WHERE terminal_session='$SESSION'; UPDATE sessions SET professional_mode='on', workflow_stage='executing' WHERE terminal_session='$SESSION';"
+}
+
+reset_deactivation_fixture
+sqlite3 "$STATE_DB" "INSERT INTO wave_tasks (terminal_session, status) VALUES ('$SESSION', 'submitted');"
+run_prompt '/deactivate-professional-mode' >/dev/null
+assert_eq 'submitted wave_task preserves workflow_stage' 'executing' \
+  "$(sqlite3 "$STATE_DB" "SELECT workflow_stage FROM sessions WHERE terminal_session='$SESSION';")"
+assert_eq 'submitted wave_task deactivates professional_mode' 'off' \
+  "$(sqlite3 "$STATE_DB" "SELECT professional_mode FROM sessions WHERE terminal_session='$SESSION';")"
+
+echo '=== negative control: no active tasks resets workflow_stage to idle ==='
+reset_deactivation_fixture
+run_prompt '/deactivate-professional-mode' >/dev/null
+assert_eq 'no active tasks resets workflow_stage to idle' 'idle' \
+  "$(sqlite3 "$STATE_DB" "SELECT workflow_stage FROM sessions WHERE terminal_session='$SESSION';")"
+
+echo '=== negative control: review_passed-only wave resets workflow_stage to idle ==='
+reset_deactivation_fixture
+sqlite3 "$STATE_DB" "INSERT INTO wave_tasks (terminal_session, status) VALUES ('$SESSION', 'review_passed');"
+run_prompt '/deactivate-professional-mode' >/dev/null
+assert_eq 'review_passed-only wave resets workflow_stage to idle' 'idle' \
+  "$(sqlite3 "$STATE_DB" "SELECT workflow_stage FROM sessions WHERE terminal_session='$SESSION';")"
+
 printf '\nResults: %d passed, %d failed\n' "$PASSES" "$FAILS"
 [ "$FAILS" -eq 0 ]

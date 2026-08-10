@@ -23,6 +23,7 @@ const PUBLIC_TOOLS = [
   'commit',
   'commit_and_push',
   'push',
+  'reconcile_finalization',
 ] as const;
 
 const INTERNAL_COMMANDS = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile'] as const;
@@ -35,6 +36,7 @@ function publicDependencies(): PublicToolDependencies {
     returnToManagedWorktree: vi.fn().mockReturnValue({ managedWorktreePath: '/repo/.ironclaude/worktrees/workspace' }),
     listActiveAssignments: vi.fn().mockReturnValue([]),
     finalizeDirect: vi.fn().mockReturnValue({ state: 'integrated-local' }),
+    reconcileFinalization: vi.fn().mockReturnValue({ state: 'integrated-local' }),
   };
 }
 
@@ -114,6 +116,23 @@ describe('workspace-manager entrypoint surfaces', () => {
     expect(definition?.inputSchema.properties).toHaveProperty('workspace_guid');
   });
 
+  it('defines reconcile_finalization as ownership-gated with an optional mode passthrough', () => {
+    const definition = publicToolDefinitions.find((tool) => tool.name === 'reconcile_finalization');
+    expect(definition?.inputSchema.required).toEqual(['repository_path', 'workspace_guid']);
+    expect(definition?.inputSchema.properties).toHaveProperty('repository_path');
+    expect(definition?.inputSchema.properties).toHaveProperty('workspace_guid');
+    expect(definition?.inputSchema.properties).toHaveProperty('mode');
+    expect(definition?.inputSchema.additionalProperties).toBe(false);
+  });
+
+  it('dispatches reconcile_finalization exactly once', () => {
+    const dependencies = publicDependencies();
+    const result = dispatchPublicTool('reconcile_finalization', { marker: 'reconcile_finalization' }, dependencies);
+    expect(dependencies.reconcileFinalization).toHaveBeenCalledTimes(1);
+    expect(dependencies.reconcileFinalization).toHaveBeenCalledWith({ marker: 'reconcile_finalization' });
+    expect(result).toBeDefined();
+  });
+
   it('dispatches status lookup through exactly one compatible selector', () => {
     const assignment = { workspace_guid: 'workspace' } as never;
     const exact = vi.spyOn(WorkspaceService.prototype, 'getWorkspaceAssignment').mockReturnValue(assignment);
@@ -163,6 +182,9 @@ describe('workspace-manager entrypoint surfaces', () => {
       repository_path: '/repo', workspace_guid: 'workspace',
     })).toThrow('provider-root session');
     expect(() => dependencies.finalizeDirect('push', {
+      repository_path: '/repo', workspace_guid: 'workspace',
+    })).toThrow('provider-root session');
+    expect(() => dependencies.reconcileFinalization({
       repository_path: '/repo', workspace_guid: 'workspace',
     })).toThrow('provider-root session');
   });

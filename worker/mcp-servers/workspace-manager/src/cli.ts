@@ -59,6 +59,18 @@ function optionalString(args: Args, key: string): string | undefined {
   return value;
 }
 
+function optionalRebaseRecovery(
+  args: Args,
+): 'continue' | 'abort' | 'rerebase' | 'restore_frozen' | 'status' | undefined {
+  const value = args.rebase_recovery;
+  if (value === undefined) return undefined;
+  if (value !== 'continue' && value !== 'abort' && value !== 'rerebase'
+    && value !== 'restore_frozen' && value !== 'status') {
+    throw new Error("rebase_recovery must be 'continue', 'abort', 'rerebase', 'restore_frozen', or 'status'");
+  }
+  return value;
+}
+
 function requiredRecord(args: Args, key: string): Record<string, unknown> {
   const value = args[key];
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${key} must be an object`);
@@ -134,6 +146,7 @@ export function createInternalCommandDependencies(
       const repositoryPath = requiredString(args, 'repository_path');
       const workspaceGuid = optionalString(args, 'workspace_guid');
       const ownerSessionId = optionalString(args, 'owner_session_id');
+      const rebaseRecovery = optionalRebaseRecovery(args);
       if (workspaceGuid || ownerSessionId) {
         if (!workspaceGuid || !ownerSessionId) {
           throw new Error('workspace_guid and owner_session_id must be provided together for finalization reconciliation');
@@ -142,7 +155,11 @@ export function createInternalCommandDependencies(
           repositoryPath,
           workspaceGuid,
           providerRootSessionId: ownerSessionId,
+          rebaseRecovery,
         });
+      }
+      if (rebaseRecovery) {
+        throw new Error('rebase_recovery requires workspace_guid and owner_session_id for finalization reconciliation');
       }
       return service.reconcileRepository(repositoryPath);
     },

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import Database from 'better-sqlite3';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -11,10 +11,12 @@ import {
   consumeHumanIntent,
   createAssignment,
   createHumanIntent,
+  deleteIntegrationRecord,
   getAssignment,
   initDb,
   issueHumanIntent,
   migrateSchema,
+  reapStalePrimaryOwner,
   recordIntegration,
   releaseIntegrationLock,
   releasePrimaryCheckoutOwnership,
@@ -44,6 +46,13 @@ describe('workspace assignment store', () => {
     const database = initDb(join(directory, 'workspace.db'));
     databases.push(database);
     return database;
+  }
+
+  /** A real on-disk directory usable as a live owner's worktree_path. */
+  function liveWorktree(): string {
+    const worktree = mkdtempSync(join(tmpdir(), 'ironclaude-owner-worktree-'));
+    directories.push(worktree);
+    return worktree;
   }
 
   function assignment(database: Database.Database, workspaceGuid = GUID_ONE) {
@@ -104,6 +113,12 @@ describe('workspace assignment store', () => {
   it('serializes primary checkout and integration ownership and records integration', () => {
     const database = db();
     assignment(database);
+    // A live primary owner must survive stale-owner reaping, so this fixture owner is
+    // genuinely live: active lifecycle, a worktree that exists on disk, and (below) a
+    // fresh acquisition. Without this the placeholder worktree_path would read as a
+    // stale (missing-worktree) owner and the exclusivity assertion below would flip.
+    database.prepare("UPDATE assignments SET worktree_path = ?, lifecycle_status = 'active' WHERE workspace_guid = ?")
+      .run(liveWorktree(), GUID_ONE);
     bindAssignmentOwner(database, GUID_ONE, OWNER);
     expect(acquirePrimaryCheckoutOwnership(database, {
       repositoryIdentity: REPOSITORY, workspaceGuid: GUID_ONE, ownerSessionId: OWNER,
@@ -125,6 +140,120 @@ describe('workspace assignment store', () => {
     expect(recordIntegration(database, {
       workspaceGuid: GUID_ONE, repositoryIdentity: REPOSITORY, targetRef: 'refs/heads/main', integratedCommit: 'b'.repeat(40),
     }).integrated_commit).toBe('b'.repeat(40));
+  });
+
+  it('deletes an integration record by workspace guid, and is a no-op when none exists', () => {
+    const database = db();
+    assignment(database);
+    recordIntegration(database, {
+      workspaceGuid: GUID_ONE, repositoryIdentity: REPOSITORY, targetRef: 'refs/heads/main', integratedCommit: 'c'.repeat(40),
+    });
+    expect(database.prepare('SELECT 1 FROM integration_records WHERE workspace_guid = ?').get(GUID_ONE)).toBeTruthy();
+    deleteIntegrationRecord(database, GUID_ONE);
+    expect(database.prepare('SELECT 1 FROM integration_records WHERE workspace_guid = ?').get(GUID_ONE)).toBeUndefined();
+    expect(() => deleteIntegrationRecord(database, GUID_ONE)).not.toThrow();
+  });
+
+  it('reports whether it reaped and never removes a live owner', () => {
+    const database = db();
+    expect(reapStalePrimaryOwner(database, REPOSITORY)).toBe(false); // no owner row
+    assignment(database, GUID_ONE);
+    database.prepare("UPDATE assignments SET worktree_path = ?, lifecycle_status = 'active' WHERE workspace_guid = ?")
+      .run(liveWorktree(), GUID_ONE);
+    bindAssignmentOwner(database, GUID_ONE, OWNER);
+    acquirePrimaryCheckoutOwnership(database, {
+      repositoryIdentity: REPOSITORY, workspaceGuid: GUID_ONE, ownerSessionId: OWNER,
+    });
+    expect(reapStalePrimaryOwner(database, REPOSITORY)).toBe(false); // live: not reaped
+    database.prepare("UPDATE assignments SET lifecycle_status = 'cleaned' WHERE workspace_guid = ?").run(GUID_ONE);
+    expect(reapStalePrimaryOwner(database, REPOSITORY)).toBe(true); // terminal: reaped
+    expect(database.prepare('SELECT 1 FROM primary_checkout_owners WHERE repository_identity = ?').get(REPOSITORY))
+      .toBeUndefined();
+  });
+
+  it('reclaims a primary owner whose assignment reached a terminal lifecycle for a different session', () => {
+    const database = db();
+    assignment(database, GUID_ONE);
+    // Isolate terminal-ness as the sole staleness cause: worktree present, acquisition fresh.
+    database.prepare("UPDATE assignments SET worktree_path = ?, lifecycle_status = 'active' WHERE workspace_guid = ?")
+      .run(liveWorktree(), GUID_ONE);
+    bindAssignmentOwner(database, GUID_ONE, OWNER);
+    acquirePrimaryCheckoutOwnership(database, {
+      repositoryIdentity: REPOSITORY, workspaceGuid: GUID_ONE, ownerSessionId: OWNER,
+    });
+    database.prepare("UPDATE assignments SET lifecycle_status = 'abandoned' WHERE workspace_guid = ?").run(GUID_ONE);
+
+    assignment(database, GUID_TWO);
+    bindAssignmentOwner(database, GUID_TWO, OTHER_OWNER);
+    // Falsifier: pre-fix this throws 'Primary checkout is already owned'.
+    expect(acquirePrimaryCheckoutOwnership(database, {
+      repositoryIdentity: REPOSITORY, workspaceGuid: GUID_TWO, ownerSessionId: OTHER_OWNER,
+    }).workspace_guid).toBe(GUID_TWO);
+    expect(database.prepare('SELECT workspace_guid FROM primary_checkout_owners WHERE repository_identity = ?').get(REPOSITORY))
+      .toMatchObject({ workspace_guid: GUID_TWO });
+  });
+
+  it('never reaps a live primary owner: a different session is still refused', () => {
+    const database = db();
+    assignment(database, GUID_ONE);
+    database.prepare("UPDATE assignments SET worktree_path = ?, lifecycle_status = 'active' WHERE workspace_guid = ?")
+      .run(liveWorktree(), GUID_ONE);
+    bindAssignmentOwner(database, GUID_ONE, OWNER);
+    acquirePrimaryCheckoutOwnership(database, {
+      repositoryIdentity: REPOSITORY, workspaceGuid: GUID_ONE, ownerSessionId: OWNER,
+    });
+
+    assignment(database, GUID_TWO);
+    bindAssignmentOwner(database, GUID_TWO, OTHER_OWNER);
+    expect(() => acquirePrimaryCheckoutOwnership(database, {
+      repositoryIdentity: REPOSITORY, workspaceGuid: GUID_TWO, ownerSessionId: OTHER_OWNER,
+    })).toThrow('Primary checkout is already owned');
+    expect(database.prepare('SELECT workspace_guid FROM primary_checkout_owners WHERE repository_identity = ?').get(REPOSITORY))
+      .toMatchObject({ workspace_guid: GUID_ONE });
+  });
+
+  it('reclaims a primary owner whose recorded worktree no longer exists on disk', () => {
+    const database = db();
+    // The fixture helper records a placeholder /repos/... worktree_path that never exists.
+    assignment(database, GUID_ONE);
+    database.prepare("UPDATE assignments SET lifecycle_status = 'active' WHERE workspace_guid = ?").run(GUID_ONE);
+    bindAssignmentOwner(database, GUID_ONE, OWNER);
+    acquirePrimaryCheckoutOwnership(database, {
+      repositoryIdentity: REPOSITORY, workspaceGuid: GUID_ONE, ownerSessionId: OWNER,
+    });
+    // Active and fresh; only the missing worktree makes this row stale.
+    expect(existsSync(getAssignment(database, GUID_ONE)!.worktree_path)).toBe(false);
+
+    assignment(database, GUID_TWO);
+    bindAssignmentOwner(database, GUID_TWO, OTHER_OWNER);
+    expect(acquirePrimaryCheckoutOwnership(database, {
+      repositoryIdentity: REPOSITORY, workspaceGuid: GUID_TWO, ownerSessionId: OTHER_OWNER,
+    }).workspace_guid).toBe(GUID_TWO);
+  });
+
+  it('reclaims a primary owner past the 60-minute TTL but keeps a fresh one', () => {
+    const database = db();
+    assignment(database, GUID_ONE);
+    database.prepare("UPDATE assignments SET worktree_path = ?, lifecycle_status = 'active' WHERE workspace_guid = ?")
+      .run(liveWorktree(), GUID_ONE);
+    bindAssignmentOwner(database, GUID_ONE, OWNER);
+    acquirePrimaryCheckoutOwnership(database, {
+      repositoryIdentity: REPOSITORY, workspaceGuid: GUID_ONE, ownerSessionId: OWNER,
+    });
+
+    assignment(database, GUID_TWO);
+    bindAssignmentOwner(database, GUID_TWO, OTHER_OWNER);
+    // Fresh owner (active, worktree present, just acquired) is not reaped.
+    expect(() => acquirePrimaryCheckoutOwnership(database, {
+      repositoryIdentity: REPOSITORY, workspaceGuid: GUID_TWO, ownerSessionId: OTHER_OWNER,
+    })).toThrow('Primary checkout is already owned');
+
+    // Age the acquisition past the TTL (same datetime format the column stores).
+    database.prepare("UPDATE primary_checkout_owners SET acquired_at = datetime('now', '-61 minutes') WHERE repository_identity = ?")
+      .run(REPOSITORY);
+    expect(acquirePrimaryCheckoutOwnership(database, {
+      repositoryIdentity: REPOSITORY, workspaceGuid: GUID_TWO, ownerSessionId: OTHER_OWNER,
+    }).workspace_guid).toBe(GUID_TWO);
   });
 
   it.each<HumanIntentOperation>([

@@ -12,7 +12,7 @@ def _tools(tmp_path):
         "providers": {
             "clients": {
                 "claude": {"enabled": True, "path": "claude",
-                           "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "opus", "fable": "fable"}},
+                           "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "claude-opus-4-8", "fable": "fable"}},
                 "codex": {"enabled": False, "path": "codex",
                           "models": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol"}},
             },
@@ -66,7 +66,7 @@ def _codex_enabled_cfg(tmp_path, clients=("codex",)):
         "providers": {
             "clients": {
                 "claude": {"enabled": True, "path": "claude",
-                           "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "opus", "fable": "fable"}},
+                           "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "claude-opus-4-8", "fable": "fable"}},
                 "codex": {"enabled": True, "path": "codex",
                           "models": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol"}},
             },
@@ -93,7 +93,7 @@ def test_legacy_config_without_providers_uses_claude(tmp_path):
     assert out["grade"] == "C"
     argv = run.call_args.args[0]
     assert argv[0] == "claude"
-    assert argv[argv.index("--model") + 1] == "opus[1m]"
+    assert argv[argv.index("--model") + 1] == "claude-opus-4-8[1m]"
 
 
 def test_routed_claude_argv_still_opus(tmp_path):
@@ -209,6 +209,91 @@ def test_call_grader_codex_end_to_end(tmp_path, monkeypatch):
     assert run.call_args.args[0][0] == "codex"
 
 
+def _codex_error_proc(returncode, stdout, stderr):
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.stdout = stdout
+    proc.stderr = stderr
+    return proc
+
+
+def test_call_grader_codex_nonzero_exit_long_stream_survives_truncation(tmp_path, monkeypatch):
+    """Real error text past 300 chars of boilerplate must survive into error_detail.
+
+    Traced against current source: old code's diagnostic = stdout.strip() (unbounded),
+    then _grader_failure collapses whitespace and truncates the WHOLE combined message
+    to 300 chars from the head -> only early thread.started/reasoning text survives.
+    Expected: FAIL against current code (RED); PASS after the fix (GREEN).
+    """
+    tools = _codex_enabled_cfg(tmp_path, clients=("codex",))
+    _codex_avail(monkeypatch)
+    stdout = (FIXTURES / "codex_grader_error_long_stream.jsonl").read_text()
+    with patch.object(omcp.subprocess, "run",
+                      return_value=_codex_error_proc(1, stdout, "")):
+        out = tools._call_grader("sys", "user")
+    assert out["infrastructure_error"] is True
+    assert out["grade"] == "F"
+    assert "thread.started" not in out["error_detail"]
+    assert "schema validation failed: missing required field 'grade'" in out["error_detail"]
+
+
+def test_call_grader_codex_nonzero_exit_both_streams_present(tmp_path, monkeypatch):
+    """Neither stream may be silently dropped when both carry signal.
+
+    Traced against current source: old diagnostic = stderr.strip() or stdout.strip() —
+    the `or` short-circuit discards stdout entirely whenever stderr is non-empty.
+    Expected: FAIL against current code (RED, stdout marker absent); PASS after fix (GREEN).
+    """
+    tools = _codex_enabled_cfg(tmp_path, clients=("codex",))
+    _codex_avail(monkeypatch)
+    stdout = '{"type":"item.completed","item":{"type":"agent_message","text":"stdout-signal-marker"}}\n'
+    stderr = "stderr-signal-marker"
+    with patch.object(omcp.subprocess, "run",
+                      return_value=_codex_error_proc(1, stdout, stderr)):
+        out = tools._call_grader("sys", "user")
+    assert "stdout-signal-marker" in out["error_detail"]
+    assert "stderr-signal-marker" in out["error_detail"]
+
+
+def test_call_grader_codex_nonzero_exit_stderr_only(tmp_path, monkeypatch):
+    """stderr-only diagnostics must be legible as coming from stderr in Slack/logs.
+
+    Traced against current source: old diagnostic is the bare stderr text with no
+    channel label at all.
+    Expected: FAIL against current code (RED, no "stderr: " label); PASS after fix (GREEN).
+    """
+    tools = _codex_enabled_cfg(tmp_path, clients=("codex",))
+    _codex_avail(monkeypatch)
+    with patch.object(omcp.subprocess, "run",
+                      return_value=_codex_error_proc(1, "", "codex: authentication expired")):
+        out = tools._call_grader("sys", "user")
+    assert "stderr: codex: authentication expired" in out["error_detail"]
+
+
+def test_call_grader_codex_nonzero_exit_malformed_stdout(tmp_path, monkeypatch):
+    """Non-JSON stdout on a nonzero exit must degrade to bounded raw text, never raise.
+
+    Traced against current source: old code's stdout.strip() fallback already carries
+    plain text through untouched (whitespace-collapsed, well under the 300-char cap).
+    Expected: PASS against current code already (characterization); must keep passing
+    after the fix, proving the new tail-scan's malformed-JSON fallback path is safe.
+    """
+    tools = _codex_enabled_cfg(tmp_path, clients=("codex",))
+    _codex_avail(monkeypatch)
+    stdout = (
+        "panic: runtime error: index out of range [3] with length 3\n"
+        "goroutine 1 [running]:\n"
+        "main.main()\n"
+        "\t/build/src/main.go:42 +0x1a5"
+    )
+    with patch.object(omcp.subprocess, "run",
+                      return_value=_codex_error_proc(1, stdout, "")):
+        out = tools._call_grader("sys", "user")
+    assert out["infrastructure_error"] is True
+    assert "no diagnostic output" not in out["error_detail"]
+    assert "main.go:42" in out["error_detail"]
+
+
 def _codex_cfg_with_effort(tmp_path, effort):
     """Same config as _codex_enabled_cfg, but with a NON-DEFAULT effort level.
 
@@ -223,7 +308,7 @@ def _codex_cfg_with_effort(tmp_path, effort):
         "providers": {
             "clients": {
                 "claude": {"enabled": True, "path": "claude",
-                           "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "opus", "fable": "fable"}},
+                           "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "claude-opus-4-8", "fable": "fable"}},
                 "codex": {"enabled": True, "path": "codex",
                           "models": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol"}},
             },

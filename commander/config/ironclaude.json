@@ -12,7 +12,7 @@
   "advisor": {
     "enabled": true,
     "executor_model": "sonnet",
-    "advisor_model": "opus"
+    "advisor_model": "claude-opus-4-8"
   },
   "providers": {
     "clients": {

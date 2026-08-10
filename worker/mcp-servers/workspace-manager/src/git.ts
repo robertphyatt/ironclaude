@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 export interface RepositoryLocation {
@@ -122,23 +122,129 @@ export function addWorktree(primaryCheckoutPath: string, worktreePath: string, b
   runGit(primaryCheckoutPath, ['worktree', 'add', '-b', branch, '--', worktreePath, baseCommit]);
 }
 
+const SHARED_RESOURCE_CONFIG = 'worktree-shared-resources';
+
+/**
+ * Idempotently appends each exact line to the shared `<commonDir>/info/exclude`,
+ * preserving operator entries and a trailing-newline invariant. A line already
+ * present (or already appended in this call) is never duplicated.
+ */
+function appendExcludeLines(repositoryIdentity: string, lines: readonly string[]): void {
+  const infoDirectory = path.join(repositoryIdentity, 'info');
+  const excludePath = path.join(infoDirectory, 'exclude');
+  mkdirSync(infoDirectory, { recursive: true });
+  const existing = existsSync(excludePath) ? readFileSync(excludePath) : Buffer.alloc(0);
+  const present = new Set(existing.toString('utf8').split(/\r?\n/));
+  let buffer = existing;
+  let appended = false;
+  for (const line of lines) {
+    if (present.has(line)) continue;
+    present.add(line);
+    const separator = buffer.length === 0 || buffer[buffer.length - 1] === 10 ? '' : '\n';
+    buffer = Buffer.concat([buffer, Buffer.from(`${separator}${line}\n`, 'utf8')]);
+    appended = true;
+  }
+  if (appended) writeFileSync(excludePath, buffer);
+}
+
 /**
  * Keep nested managed worktrees out of primary-checkout status without
  * changing tracked ignore files or operator-wide Git configuration.
  */
 export function ensureManagedWorktreeExclusion(repositoryIdentity: string): void {
-  const infoDirectory = path.join(repositoryIdentity, 'info');
-  const excludePath = path.join(infoDirectory, 'exclude');
-  mkdirSync(infoDirectory, { recursive: true });
-  const existing = existsSync(excludePath) ? readFileSync(excludePath) : Buffer.alloc(0);
-  const hasExactEntry = existing.toString('utf8').split(/\r?\n/)
-    .some((line) => line === MANAGED_WORKTREE_EXCLUSION);
-  if (hasExactEntry) return;
-  const separator = existing.length === 0 || existing[existing.length - 1] === 10 ? '' : '\n';
-  writeFileSync(excludePath, Buffer.concat([
-    existing,
-    Buffer.from(`${separator}${MANAGED_WORKTREE_EXCLUSION}\n`, 'utf8'),
-  ]));
+  appendExcludeLines(repositoryIdentity, [MANAGED_WORKTREE_EXCLUSION]);
+}
+
+/**
+ * Excludes each planted shared-resource link from Git's view. Every entry is
+ * written anchored with NO trailing slash (`/models`): a symlink is not a
+ * directory, so a `models/` dir-slash ignore pattern would NOT match a `models`
+ * symlink, and the unignored link would read untracked — flipping
+ * `worktreeIsClean` false and making crash reconciliation, push-pending,
+ * cleanup, and `removeWorktree` all refuse.
+ */
+export function ensureExcludeEntries(repositoryIdentity: string, entries: readonly string[]): void {
+  appendExcludeLines(repositoryIdentity, entries.map((entry) => `/${entry}`));
+}
+
+/**
+ * Reads an explicit, per-repository list of relative paths to share into managed
+ * worktrees, one per line, from `<commonDir>/info/worktree-shared-resources`.
+ * Blank lines and `#` comments are ignored; a missing file yields no entries.
+ * Living in the common dir keeps it out of both primary and worktree status.
+ */
+export function readSharedResourceConfig(repositoryIdentity: string): string[] {
+  const configPath = path.join(repositoryIdentity, 'info', SHARED_RESOURCE_CONFIG);
+  if (!existsSync(configPath)) return [];
+  return readFileSync(configPath, 'utf8')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'));
+}
+
+/** Rejects any entry that could escape the worktree or carry gitignore semantics. */
+function isSafeSharedEntry(entry: string): boolean {
+  if (entry.length === 0) return false;
+  if (entry.startsWith('!') || entry.startsWith('#')) return false;
+  if (entry.startsWith('/') || path.isAbsolute(entry)) return false;
+  if (entry.endsWith('/')) return false;
+  if (entry.includes('\\')) return false;
+  if (/[*?[\]]/.test(entry)) return false;
+  if (entry.split('/').some((segment) => segment === '..')) return false;
+  return true;
+}
+
+/** True when anything already occupies the path (including a dangling symlink). */
+function pathPresent(target: string): boolean {
+  try {
+    lstatSync(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A managed worktree is a clean checkout MISSING gitignored resources (models,
+ * .venv, node_modules, caches), so resource-dependent tests fail in every
+ * isolated worker. For each explicitly configured relative path present in the
+ * primary checkout, plant a symlink into the worktree, then exclude the planted
+ * links from Git's view. Only listed paths are linked — the .gitignore is never
+ * auto-scanned, so secrets like `.env` are never exposed. One bad entry is
+ * logged and skipped; it never throws and never aborts allocation.
+ */
+export function linkSharedResources(
+  primaryCheckoutPath: string,
+  worktreePath: string,
+  repositoryIdentity: string,
+  entries: readonly string[],
+): void {
+  const linked: string[] = [];
+  for (const entry of entries) {
+    if (!isSafeSharedEntry(entry)) {
+      console.error(`[workspace-manager] refusing unsafe shared-resource entry: ${entry}`);
+      continue;
+    }
+    const source = path.join(primaryCheckoutPath, entry);
+    const target = path.join(worktreePath, entry);
+    if (!existsSync(source)) {
+      console.error(`[workspace-manager] shared resource absent in primary checkout; skipping: ${entry}`);
+      continue;
+    }
+    if (pathPresent(target)) {
+      console.error(`[workspace-manager] worktree path already exists; not overwriting: ${entry}`);
+      continue;
+    }
+    try {
+      symlinkSync(source, target);
+      linked.push(entry);
+    } catch (error) {
+      console.error(`[workspace-manager] failed to link shared resource ${entry}: ${String(error)}`);
+    }
+  }
+  if (linked.length > 0) {
+    ensureExcludeEntries(repositoryIdentity, linked);
+  }
 }
 
 export function removeWorktree(primaryCheckoutPath: string, worktreePath: string): void {

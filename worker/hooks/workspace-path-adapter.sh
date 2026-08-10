@@ -73,6 +73,48 @@ workspace_file_target_is_exempt() {
   return 0
 }
 
+# A managed-worktree session's OWN plan/review artifacts live under the PRIMARY
+# checkout's docs/plans and docs/reviews. Those trees are gitignored, so
+# redirecting the writes into the worktree overlay strands artifacts the operator
+# and the workflow expect in the primary tree — the escape refusal used to force
+# the human-only /use-primary-checkout. Exempt ONLY those two directories, ONLY
+# when git confirms the exact target is gitignored, and ONLY after the memory
+# carve-out's physical traversal/symlink guards resolve the path. This is NOT a
+# general primary-write escape: a TRACKED file (git check-ignore exit 1), any
+# path outside docs/plans and docs/reviews, and any git error all FAIL CLOSED.
+workspace_file_target_is_own_artifact() {
+  local candidate="$1" primary="$2" rest first remainder second base
+  case "$candidate" in /*) ;; *) return 1 ;; esac
+  [ -n "$primary" ] || return 1
+  case "$candidate" in
+    "$primary"/*) rest="${candidate#"$primary"/}" ;;
+    *) return 1 ;;
+  esac
+  # `*` in a case pattern spans `/`, so split the segments explicitly instead of
+  # matching `docs/plans/*` — that would also admit `docsX/plans/...` shapes.
+  first="${rest%%/*}"
+  case "$first" in docs) ;; *) return 1 ;; esac
+  [ "$first" != "$rest" ] || return 1
+  remainder="${rest#"$first"/}"
+  second="${remainder%%/*}"
+  case "$second" in plans|reviews) ;; *) return 1 ;; esac
+  [ "$second" != "$remainder" ] || return 1
+  # A real file component must follow docs/{plans,reviews}/ — not a bare directory.
+  base="${remainder#"$second"/}"
+  case "$base" in ''|*/) return 1 ;; esac
+  # Resolve physically against the primary root: reject `..` traversal and any
+  # symlinked component, mirroring workspace_file_target_is_exempt. Runs BEFORE
+  # check-ignore so git never sees a traversal or a symlink-redirected path.
+  [ -d "$primary" ] || return 1
+  [ "$(workspace_canonical_dir "$primary")" = "$primary" ] || return 1
+  workspace_resolve_target "$rest" "$primary" >/dev/null || return 1
+  # FAIL CLOSED: only a path git confirms is gitignored is exempt. A tracked file
+  # (exit 1) or any git error (exit >1) stays refused. `-q` suppresses stdout and
+  # 2>/dev/null suppresses stderr so nothing leaks into the hook's JSON output.
+  git -C "$primary" check-ignore -q -- "$rest" 2>/dev/null || return 1
+  return 0
+}
+
 workspace_sql_quote() {
   printf "%s" "$1" | sed "s/'/''/g"
 }
@@ -160,6 +202,7 @@ $line"; fi
 
 workspace_command_has_explicit_checkout_escape() {
   local command="$1" root="$2" primary="$3" workspace_db="$4" other others without_root before after boundary
+  local scrubbed q acc seg tail rest bchar achar achar_src word_ok before_ok after_ok
   # This is an explicit-path guard, not a process sandbox. Commands still start
   # in the managed root, while literal parent components and other checkout
   # paths are rejected. Arbitrary child processes remain ordinary shell code.
@@ -208,8 +251,59 @@ workspace_command_has_explicit_checkout_escape() {
   # in a ${var//pat/repl} pattern as literal characters, so `${command//"$root/"/}`
   # searched for a path wrapped in quote marks, never matched, and the escape
   # check silently failed OPEN on every machine without a newer bash.
+  # A COMPLETE quote-wrapped owned-worktree root word — `'<root>'`, `"<root>"`,
+  # `'<root>/<desc>'`, `"<root>/<desc>"` — resolves INSIDE this assignment, but
+  # the boundary loop below rejects it: the surrounding quote byte is not one of
+  # the token-boundary bytes it recognises, so `return 0` fires on the quote.
+  # `git -C '<root>' …` is what a model naturally writes. Pre-strip such a word
+  # before the loop, but ONLY when the opening quote starts the string or follows
+  # one of the loop's before-boundary bytes (:218-219) AND the closing quote ends
+  # the string or is followed by one of its after-boundary bytes (:225-226). That
+  # keeps the :202-206 concatenation-visibility contract intact: `'<root>'x`,
+  # `x'<root>'`, `'<root>x'`, `"<root>"-y` are NOT complete owned words, are left
+  # visible, and the loop/primary check below still rejects them. The stripped
+  # word always resolves under the root, so nothing new escapes. `..` / `~` /
+  # `$HOME` / `$(` / `cd -` were already refused above, so they never reach here.
+  # bash 3.2: quoted `"$q$root"` in `%%`/`#` matches those bytes literally, which
+  # is the intent (verified on 3.2.57), matching the :214-215 convention.
+  scrubbed="$command"
+  for q in "'" '"'; do
+    acc=''
+    rest="$scrubbed"
+    while [ -n "$rest" ]; do
+      seg="${rest%%"$q$root"*}"
+      if [ "$seg" = "$rest" ]; then acc="$acc$rest"; rest=''; break; fi
+      tail="${rest#*"$q$root"}"
+      word_ok=0
+      if [ "${tail:0:1}" = "$q" ]; then
+        achar_src="${tail#"$q"}"; word_ok=1
+      elif [ "${tail:0:1}" = '/' ] && [[ "$tail" == *"$q"* ]]; then
+        achar_src="${tail#*"$q"}"; word_ok=1
+      fi
+      if [ "$word_ok" = 1 ]; then
+        before_ok=0; after_ok=0
+        if [ -z "$seg" ]; then
+          before_ok=1
+        else
+          bchar="${seg: -1}"
+          case "$bchar" in ' '|$'\t'|$'\n'|'='|';'|'|'|'&'|'('|'>'|'<') before_ok=1 ;; esac
+        fi
+        if [ -z "$achar_src" ]; then
+          after_ok=1
+        else
+          achar="${achar_src:0:1}"
+          case "$achar" in ' '|$'\t'|$'\n'|';'|'|'|'&'|')'|'>'|'<') after_ok=1 ;; esac
+        fi
+        if [ "$before_ok" = 1 ] && [ "$after_ok" = 1 ]; then
+          acc="$acc$seg"; rest="$achar_src"; continue
+        fi
+      fi
+      acc="$acc$seg$q$root"; rest="$tail"
+    done
+    scrubbed="$acc"
+  done
   local _root_prefix="$root/"
-  without_root="${command//$_root_prefix/}"
+  without_root="${scrubbed//$_root_prefix/}"
   while [[ "$without_root" == *"$root"* ]]; do
     before="${without_root%%"$root"*}"
     after="${without_root#*"$root"}"
@@ -279,6 +373,11 @@ workspace_bind_effective_root() {
     IFS=$'\t' read -r owner_guid owner_session <<< "$owner_row"
     if [ "$owner_guid" = "$guid" ] && [ "$owner_session" = "$SESSION_TAG" ]; then
       effective_root="$primary"
+      # HEARTBEAT: the reap TTL below is fixed, so a LIVE owner must renew its
+      # own row on every confirmed file operation or an idle-vs-live owner look
+      # identical to the reaper. Scoped to this exact owner row; best-effort so
+      # a renewal failure never alters or fails the file-operation decision.
+      sqlite3 "$workspace_db" ".timeout 10000" "UPDATE primary_checkout_owners SET acquired_at = datetime('now') WHERE repository_identity='$(workspace_sql_quote "$repository_identity")' AND workspace_guid='$(workspace_sql_quote "$owner_guid")' AND owner_session_id='$(workspace_sql_quote "$owner_session")';" 2>/dev/null || :
     fi
   fi
   WORKSPACE_EFFECTIVE_ROOT="$effective_root"
@@ -370,6 +469,16 @@ workspace_prepare_input() {
   # read falls through to passthrough rather than stranding the session.
   if ! workspace_bind_effective_root "$workspace_db" "$repository_identity" "$event_cwd" "$safe_session"; then
     [ "$WORKSPACE_READONLY_INPUT" = '1' ] && return 0
+    # A frozen or otherwise unbindable assignment still must not strand an
+    # auto-memory write: professional-mode-guard.sh's memory allowance
+    # (:587-593) has always applied at any workflow stage. Pass the input
+    # through UNREWRITTEN, exactly like the read-only fallback above, reusing
+    # workspace_file_target_is_exempt's own symlink/traversal guard unchanged
+    # so a source-file Write (which fails that predicate) still falls through
+    # to `return 1` below.
+    if [ "$tool" = 'file' ] && workspace_file_target_is_exempt "$value"; then
+      return 0
+    fi
     return 1
   fi
   effective_root="$WORKSPACE_EFFECTIVE_ROOT"
@@ -381,7 +490,8 @@ workspace_prepare_input() {
         # and `cat` already reach, so refusing it isolates nothing. Auto-memory
         # writes are the one carve-out professional-mode-guard has always made
         # at any workflow stage. Both pass through unrewritten.
-        if [ "$WORKSPACE_READONLY_INPUT" = '1' ] || workspace_file_target_is_exempt "$value"; then
+        if [ "$WORKSPACE_READONLY_INPUT" = '1' ] || workspace_file_target_is_exempt "$value" \
+            || workspace_file_target_is_own_artifact "$value" "$WORKSPACE_PRIMARY_ROOT"; then
           return 0
         fi
         workspace_adapter_fail 'File target escapes or traverses the effective checkout root'; return 1

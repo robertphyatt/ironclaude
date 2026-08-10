@@ -303,7 +303,7 @@ def format_worker_stuck_killed(
     )
 
 
-def format_fable_unavailable(reason: str, redirected_to: str = "opus", worker_id: str | None = None) -> str:
+def format_fable_unavailable(reason: str, redirected_to: str = "claude-opus-4-8", worker_id: str | None = None) -> str:
     """Slack alert when Fable becomes unavailable and the daemon starts redirecting.
 
     Posted exactly once per detection episode (the caller decides based on

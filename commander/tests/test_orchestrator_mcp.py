@@ -32,6 +32,7 @@ from ironclaude.ssh_manager import MachineConfig
 from ironclaude.slack_interface import SlackBot
 from ironclaude.ollama_client import OllamaError
 from ironclaude.provider_router import ProviderHandle, NoCapabilityAvailable
+from ironclaude.workspace_client import WorkspaceClientError
 
 _REAL_ENSURE_WORKER_INSTRUCTIONS = OrchestratorTools._ensure_worker_instructions
 _REAL_SET_PM = OrchestratorTools._set_pm_via_sqlite
@@ -2275,7 +2276,7 @@ class TestFableAvailabilityIntegration:
 
     def test_worker_type_redirect_when_fable_unavailable(self, tools, tmp_path, monkeypatch):
         """_get_worker_command('claude-fable') matches _get_worker_command('claude-opus')
-        once Fable has been marked unavailable — same command, --model opus not fable."""
+        once Fable has been marked unavailable — same command, --model claude-opus-4-8 not fable."""
         from ironclaude import fable_availability
         monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "fable_state.json")
         fable_availability.mark_fable_unavailable("test")
@@ -2284,11 +2285,11 @@ class TestFableAvailabilityIntegration:
         cmd_opus = tools._get_worker_command("claude-opus")
 
         assert cmd_fable == cmd_opus
-        assert "--model opus" in cmd_fable
+        assert "--model claude-opus-4-8" in cmd_fable
         assert "--model fable" not in cmd_fable
 
     def test_advisor_redirect_when_fable_unavailable(self, registry, mock_tmux, tmp_path, db_conn, monkeypatch):
-        """A claude-opus worker whose tiered advisor is 'fable' gets /advisor opus
+        """A claude-opus worker whose tiered advisor is 'fable' gets /advisor claude-opus-4-8
         instead once Fable has been marked unavailable."""
         from ironclaude import fable_availability
         monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "fable_state.json")
@@ -2311,7 +2312,7 @@ class TestFableAvailabilityIntegration:
                 objective="Do the thing",
             )
         keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
-        assert "/advisor opus" in keys_sent
+        assert "/advisor claude-opus-4-8" in keys_sent
         assert "/advisor fable" not in keys_sent
 
     def test_spawn_retry_on_fable_death_marks_and_posts_slack(
@@ -2354,7 +2355,7 @@ class TestFableAvailabilityIntegration:
         spawn_calls = mock_tmux.spawn_session.call_args_list
         assert len(spawn_calls) == 2
         retry_cmd = spawn_calls[1][0][1]
-        assert "--model opus" in retry_cmd
+        assert "--model claude-opus-4-8" in retry_cmd
 
         worker = registry.get_worker("w-fable-death")
         assert worker["type"] == "claude-opus"
@@ -2476,7 +2477,7 @@ class TestFableAvailabilityIntegration:
     def test_batch_spawn_advisor_redirect_when_fable_unavailable(self, tools, mock_tmux, tmp_path, monkeypatch):
         """spawn_workers (batch path) filters advisor model through
         resolve_advisor_model — a claude-opus worker whose advisor_model is
-        'fable' gets /advisor opus instead once Fable is flagged unavailable."""
+        'fable' gets /advisor claude-opus-4-8 instead once Fable is flagged unavailable."""
         from ironclaude import fable_availability
         monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "fable_state.json")
         fable_availability.mark_fable_unavailable("test")
@@ -2519,7 +2520,7 @@ class TestFableAvailabilityIntegration:
             ])
 
         keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
-        assert "/advisor opus" in keys_sent
+        assert "/advisor claude-opus-4-8" in keys_sent
         assert "/advisor fable" not in keys_sent
 
     def test_recovery_does_not_fire_when_default_opus_model_starts_with_fable(
@@ -7282,7 +7283,7 @@ class TestAdvisorModelFor:
 
     def test_falls_back_to_default_opus_when_no_config(self, tools):
         tools._advisor_cfg = {}
-        assert tools._advisor_model_for("claude-sonnet") == "opus"
+        assert tools._advisor_model_for("claude-sonnet") == "claude-opus-4-8"
 
 
 class TestGetWorkerCommand:
@@ -9920,7 +9921,7 @@ class TestCallGraderSubprocess:
             result = tools._call_grader("sys", "usr")
         assert result["infrastructure_error"] is True
         assert "credential denied" in result["error_detail"]
-        assert "ignored stdout" not in result["error_detail"]
+        assert "ignored stdout" in result["error_detail"]
 
     def test_codex_grader_malformed_success_is_infrastructure_failure(self, tools):
         self._configure_codex_grader(tools)
@@ -10301,3 +10302,357 @@ class TestAcknowledgeOperatorMessage:
         monkeypatch.setattr(orchestrator_mcp, "persist_operator_message_acknowledgement", persist)
         assert tools.acknowledge_operator_message(self.SOURCE_TS, "no action") == expected
         assert calls == [(db_conn, self.SOURCE_TS, "no action")]
+
+
+_FINALIZE_OWNER = "11111111-1111-4111-8111-111111111111"
+
+
+def _finalize_worker(**overrides):
+    worker = {
+        "id": "worker-1",
+        "client": "codex",
+        "machine": None,
+        "repo": "/repo",
+        "native_session_id": _FINALIZE_OWNER,
+        "workspace_guid": "22222222-2222-4222-8222-222222222222",
+        "workspace_repository_identity": "machine:repo.git",
+        "workspace_path": "/repo/.ironclaude/worktrees/2222",
+        "workspace_branch": "ironclaude/2222",
+        "workspace_base_commit": "a" * 40,
+        "workspace_integration_target": "main",
+    }
+    worker.update(overrides)
+    return worker
+
+
+def _finalize_review_state(**overrides):
+    state = {
+        "workflow_stage": "execution_complete",
+        "unfinished_tasks": 0,
+        "latest_task_boundary_grade": "A",
+    }
+    state.update(overrides)
+    return state
+
+
+def _finalize_evidence(**overrides):
+    evidence = {
+        "canonicalBranch": "ironclaude/2222",
+        "localRef": "refs/heads/ironclaude/2222",
+        "stagedTree": "b" * 40,
+        "parentOid": "c" * 40,
+    }
+    evidence.update(overrides)
+    return evidence
+
+
+@pytest.fixture
+def finalize_failure_tools():
+    """commit_worker reaches finalize, which raises — the recovery classifier runs."""
+    tools = object.__new__(OrchestratorTools)
+    tools.registry = MagicMock()
+    tools.registry.get_worker.return_value = _finalize_worker()
+    tools.registry.update_worker_status = MagicMock()
+    tools._workspace_client = MagicMock()
+    tools._workspace_client.discover_installed_plugin_root.return_value = "/installed/codex"
+    tools._workspace_client.finalize.side_effect = WorkspaceClientError("finalize boom")
+    tools._read_worker_finalization_state = MagicMock(
+        return_value=_finalize_review_state()
+    )
+    tools._derive_workspace_commit_evidence = MagicMock(
+        return_value=_finalize_evidence()
+    )
+    tools._ensure_ssh_manager = MagicMock()
+    tools._resolve_ssh_host = MagicMock(return_value=None)
+    return tools
+
+
+class TestCommitWorkerFinalizationRecovery:
+    def test_clean_paused_rebase_is_driven_to_transparent_integration(
+        self, finalize_failure_tools,
+    ):
+        tools = finalize_failure_tools
+        integrated = {"state": "cleaned", "integratedCommit": "d" * 40}
+        tools._workspace_client.reconcile.side_effect = [
+            {"state": "rebase-paused-clean"},
+            integrated,
+        ]
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result == integrated
+        tools.registry.update_worker_status.assert_called_once_with(
+            "worker-1", "completed",
+        )
+        calls = tools._workspace_client.reconcile.call_args_list
+        assert len(calls) == 2
+        assert calls[0].args[0]["rebase_recovery"] == "status"
+        assert calls[1].args[0]["rebase_recovery"] == "continue"
+        # Both reconcile calls carry the exact local transport — a bare
+        # reconcile({...}) would yield kwargs == {} and break ssh workers.
+        assert calls[0].kwargs == {"plugin_root": "/installed/codex"}
+        assert calls[1].kwargs == {"plugin_root": "/installed/codex"}
+
+    def test_conflicted_paused_rebase_preserves_assignment_with_conflict_mode(
+        self, finalize_failure_tools,
+    ):
+        tools = finalize_failure_tools
+        tools._workspace_client.reconcile.return_value = {
+            "state": "rebase-paused-conflict",
+        }
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result["failure_phase"] == "finalization"
+        assert result["error"] == "finalize boom"
+        assert result["recovery"]["reconcile"]["mode"] == "conflict"
+        # Only the non-mutating status probe ran — no continue/rerebase.
+        calls = tools._workspace_client.reconcile.call_args_list
+        assert len(calls) == 1
+        assert calls[0].args[0]["rebase_recovery"] == "status"
+        assert calls[0].kwargs == {"plugin_root": "/installed/codex"}
+        tools.registry.update_worker_status.assert_not_called()
+
+    def test_frozen_drift_preserves_assignment_and_never_mutates_the_worktree(
+        self, finalize_failure_tools,
+    ):
+        tools = finalize_failure_tools
+        tools._workspace_client.reconcile.return_value = {"state": "frozen-no-rebase"}
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result["failure_phase"] == "finalization"
+        assert result["recovery"]["reconcile"]["mode"] == "drift"
+        # The frozen worktree stays frozen: the ONLY reconcile mode invoked is
+        # the read-only status probe (no rerebase/continue/restore_frozen).
+        modes = {
+            c.args[0]["rebase_recovery"]
+            for c in tools._workspace_client.reconcile.call_args_list
+        }
+        assert modes == {"status"}
+        tools.registry.update_worker_status.assert_not_called()
+
+    def test_status_probe_failure_falls_back_to_untagged_preserved_failure(
+        self, finalize_failure_tools,
+    ):
+        tools = finalize_failure_tools
+        tools._workspace_client.reconcile.side_effect = WorkspaceClientError(
+            "probe boom",
+        )
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result["failure_phase"] == "finalization"
+        assert result["error"] == "finalize boom"
+        assert "mode" not in result["recovery"]["reconcile"]
+        assert tools._workspace_client.reconcile.call_count == 1
+        tools.registry.update_worker_status.assert_not_called()
+
+    def test_clean_rebase_whose_continue_raises_is_treated_as_conflict(
+        self, finalize_failure_tools,
+    ):
+        tools = finalize_failure_tools
+        tools._workspace_client.reconcile.side_effect = [
+            {"state": "rebase-paused-clean"},
+            WorkspaceClientError("continue re-conflicted"),
+        ]
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result["recovery"]["reconcile"]["mode"] == "conflict"
+        tools.registry.update_worker_status.assert_not_called()
+
+    def test_auto_continue_repair_required_tagged_repair_not_conflict(self, finalize_failure_tools):
+        # A clean paused rebase auto-continues; if the resolution changed the
+        # reviewed content the continue returns 'rebase-recovery-repair-required'
+        # (rebase completed, not integrated). It must route to mode='repair'
+        # (commit_worker isRepair), NOT the dead-ending mode='conflict'.
+        tools = finalize_failure_tools
+        tools._workspace_client.reconcile.side_effect = [
+            {"state": "rebase-paused-clean"},
+            {"state": "rebase-recovery-repair-required"},
+        ]
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+        assert result["recovery"]["reconcile"]["mode"] == "repair"
+        tools.registry.update_worker_status.assert_not_called()
+        assert tools._workspace_client.reconcile.call_count == 2
+
+    def test_already_integrated_probe_marks_completed_and_returns_success(
+        self, finalize_failure_tools,
+    ):
+        # finalize raised (e.g. during cleanup) but the status probe shows the
+        # work already landed — the worker must be marked completed and the
+        # caller must get the reconcile result back, NOT an untagged
+        # _workspace_failure pointing at a possibly-deleted worktree.
+        tools = finalize_failure_tools
+        integrated_status = {"state": "integrated", "integratedCommit": "e" * 40}
+        tools._workspace_client.reconcile.return_value = integrated_status
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result == integrated_status
+        assert "recovery" not in result
+        assert "error" not in result
+        tools.registry.update_worker_status.assert_called_once_with(
+            "worker-1", "completed",
+        )
+        calls = tools._workspace_client.reconcile.call_args_list
+        assert len(calls) == 2
+        assert calls[0].args[0]["rebase_recovery"] == "status"
+        assert "rebase_recovery" not in calls[1].args[0]
+        assert (
+            calls[1].args[0]["workspace_guid"] == calls[0].args[0]["workspace_guid"]
+        )
+
+    def test_integrated_cleanup_error_is_non_fatal(self, finalize_failure_tools):
+        # A cleanup failure after the integration already landed must not
+        # un-complete the worker or surface as an error to the caller.
+        tools = finalize_failure_tools
+        integrated_status = {"state": "integrated", "integratedCommit": "e" * 40}
+        tools._workspace_client.reconcile.side_effect = [
+            integrated_status,
+            WorkspaceClientError("cleanup boom"),
+        ]
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result == integrated_status
+        tools.registry.update_worker_status.assert_called_once_with(
+            "worker-1", "completed",
+        )
+        assert tools._workspace_client.reconcile.call_count == 2
+
+
+@pytest.fixture
+def recover_tools():
+    tools = object.__new__(OrchestratorTools)
+    tools.registry = MagicMock()
+    tools.registry.get_worker.return_value = _finalize_worker()
+    tools._workspace_client = MagicMock()
+    tools._workspace_client.discover_installed_plugin_root.return_value = "/installed/codex"
+    tools._ensure_ssh_manager = MagicMock()
+    tools._resolve_ssh_host = MagicMock(return_value=None)
+    return tools
+
+
+class TestRecoverWorkerIntegration:
+    @pytest.mark.parametrize(
+        "action", ["status", "rerebase", "continue", "abort", "restore_frozen"],
+    )
+    def test_each_action_forwards_reconcile_mode_with_transport(
+        self, recover_tools, action,
+    ):
+        recover_tools._workspace_client.reconcile.return_value = {
+            "state": "rebase-frozen-restored",
+        }
+
+        result = recover_tools.recover_worker_integration("worker-1", action)
+
+        assert result == {"state": "rebase-frozen-restored"}
+        call = recover_tools._workspace_client.reconcile.call_args
+        assert call.args[0] == {
+            "repository_path": "/repo",
+            "workspace_guid": "22222222-2222-4222-8222-222222222222",
+            "owner_session_id": _FINALIZE_OWNER,
+            "rebase_recovery": action,
+        }
+        assert call.kwargs == {"plugin_root": "/installed/codex"}
+
+    def test_ssh_worker_recovery_uses_remote_transport(self, recover_tools):
+        recover_tools.registry.get_worker.return_value = _finalize_worker(
+            machine="worker-host", repo="/srv/repo",
+        )
+        recover_tools._resolve_ssh_host.return_value = "worker.example"
+        recover_tools._workspace_client.discover_installed_plugin_root.return_value = (
+            "/home/worker/.codex/plugins/cache/ironclaude/ironclaude/1.1.4"
+        )
+        recover_tools._workspace_client.reconcile.return_value = {
+            "state": "rebase-aborted",
+        }
+
+        recover_tools.recover_worker_integration("worker-1", "abort")
+
+        recover_tools._ensure_ssh_manager.assert_called_once()
+        assert recover_tools._workspace_client.reconcile.call_args.kwargs == {
+            "ssh_host": "worker.example",
+            "remote_plugin_root": (
+                "/home/worker/.codex/plugins/cache/ironclaude/ironclaude/1.1.4"
+            ),
+        }
+
+    @pytest.mark.parametrize(
+        "raised",
+        [
+            WorkspaceClientError("reconcile denied"),
+            # A non-WorkspaceClientError must NOT fall off the end as None
+            # (json.dumps(None) == "null" would crash the caller downstream).
+            TypeError("workspace-manager payload must be a dict"),
+        ],
+    )
+    def test_reconcile_failure_returns_structured_dict_not_raise_or_none(
+        self, recover_tools, raised,
+    ):
+        recover_tools._workspace_client.reconcile.side_effect = raised
+
+        result = recover_tools.recover_worker_integration("worker-1", "continue")
+
+        assert isinstance(result, dict)
+        assert result["error"] == str(raised)
+        assert result["action"] == "continue"
+        assert result["assignment_preserved"] is True
+        assert "reconcile" in result["recovery"]
+
+    @pytest.mark.parametrize(
+        "bad_action", ["rebase", "continue; echo x", "", "STATUS", "push"],
+    )
+    def test_unknown_action_is_rejected_without_any_reconcile_call(
+        self, recover_tools, bad_action,
+    ):
+        result = recover_tools.recover_worker_integration("worker-1", bad_action)
+
+        assert "not allowed" in result["error"]
+        assert result["action"] == bad_action
+        recover_tools._workspace_client.reconcile.assert_not_called()
+
+    def test_continue_action_reaching_integrated_state_marks_worker_completed(
+        self, recover_tools,
+    ):
+        # The wizard's drift step-3 'continue' integrates just like
+        # commit_worker's auto-continue does — the worker must be marked
+        # completed too, unlike the non-terminal recovery states below.
+        recover_tools._workspace_client.reconcile.return_value = {"state": "cleaned"}
+
+        result = recover_tools.recover_worker_integration("worker-1", "continue")
+
+        assert result == {"state": "cleaned"}
+        recover_tools.registry.update_worker_status.assert_called_once_with(
+            "worker-1", "completed",
+        )
+        calls = recover_tools._workspace_client.reconcile.call_args_list
+        assert len(calls) == 2
+        assert "rebase_recovery" not in calls[1].args[0]
+
+    def test_non_integrated_result_does_not_mark_worker_completed(
+        self, recover_tools,
+    ):
+        recover_tools._workspace_client.reconcile.return_value = {
+            "state": "rebase-recovery-repair-required",
+        }
+
+        result = recover_tools.recover_worker_integration("worker-1", "continue")
+
+        assert result == {"state": "rebase-recovery-repair-required"}
+        recover_tools.registry.update_worker_status.assert_not_called()
+
+    def test_registered_as_mcp_tool_returning_str(self, tools):
+        from ironclaude.orchestrator_mcp import _create_mcp_server
+
+        mcp_server = _create_mcp_server(tools)
+        wrapper_fn = mcp_server._tool_manager.get_tool(
+            "recover_worker_integration",
+        ).fn
+        result = wrapper_fn("w1", "bogus-action")
+
+        assert isinstance(result, str)
+        parsed = json.loads(result)
+        assert "not allowed" in parsed["error"]

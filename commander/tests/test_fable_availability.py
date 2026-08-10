@@ -90,7 +90,7 @@ def test_resolve_worker_type_passthrough_when_flag_inactive():
 
 def test_resolve_advisor_model_redirects_when_flag_active():
     fa.mark_fable_unavailable("r")
-    assert fa.resolve_advisor_model("fable") == "opus"
+    assert fa.resolve_advisor_model("fable") == "claude-opus-4-8"
 
 
 def test_resolve_advisor_model_passthrough():
@@ -340,7 +340,7 @@ class TestResolveGating:
     def test_model_unavailable_downgrades(self):
         self._flag("model_unavailable")
         assert fa.resolve_worker_type("claude-fable") == "claude-opus"
-        assert fa.resolve_advisor_model("fable") == "opus"
+        assert fa.resolve_advisor_model("fable") == "claude-opus-4-8"
 
     def test_unknown_downgrades(self):
         self._flag("unknown")

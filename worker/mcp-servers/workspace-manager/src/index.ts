@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { initDb } from './db.js';
 import { verifyDirectGitAuthority, type DirectGitOperation } from './git-authority.js';
 import { discoverRepository } from './git.js';
-import { finalizeDirectAuthority } from './integration.js';
+import { finalizeDirectAuthority, reconcileFinalization } from './integration.js';
 import { parseIronClaudeClient, resolveSessionIdentity } from './session-identity.js';
 import type { Assignment, SessionIdentity } from './types.js';
 import { WorkspaceService } from './workspace-service.js';
@@ -27,6 +27,7 @@ export interface PublicToolDependencies {
   returnToManagedWorktree: PublicSingleArgumentDependency;
   listActiveAssignments: PublicSingleArgumentDependency;
   finalizeDirect: (operation: DirectGitOperation, args: Args) => unknown;
+  reconcileFinalization: PublicSingleArgumentDependency;
 }
 
 export const PUBLIC_TOOL_NAMES = [
@@ -38,6 +39,7 @@ export const PUBLIC_TOOL_NAMES = [
   'commit',
   'commit_and_push',
   'push',
+  'reconcile_finalization',
 ] as const;
 
 const repositoryProperty = { type: 'string' as const, description: 'Path within the target Git repository.' };
@@ -125,6 +127,24 @@ export const publicToolDefinitions = [
       additionalProperties: false,
     },
   })),
+  {
+    name: 'reconcile_finalization',
+    description: 'Reconcile finalization state for this workspace, gated to the provider-root session; auto-completes when proof already holds.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        repository_path: repositoryProperty,
+        workspace_guid: workspaceProperty,
+        mode: {
+          type: 'string' as const,
+          enum: ['status', 'continue', 'abort', 'rerebase', 'restore_frozen'],
+          description: 'Optional explicit rebase-recovery mode; omitted defaults to auto-complete-when-proven.',
+        },
+      },
+      required: ['repository_path', 'workspace_guid'],
+      additionalProperties: false,
+    },
+  },
 ] as const;
 
 function requiredString(args: Args, key: string): string {
@@ -140,6 +160,16 @@ function optionalString(args: Args, key: string): string | undefined {
   return value;
 }
 
+function optionalMode(args: Args): 'status' | 'continue' | 'abort' | 'rerebase' | 'restore_frozen' | undefined {
+  const value = args.mode;
+  if (value === undefined) return undefined;
+  if (value !== 'status' && value !== 'continue' && value !== 'abort'
+    && value !== 'rerebase' && value !== 'restore_frozen') {
+    throw new Error("mode must be 'status', 'continue', 'abort', 'rerebase', or 'restore_frozen'");
+  }
+  return value;
+}
+
 export function dispatchPublicTool(name: string, args: Args, dependencies: PublicToolDependencies): unknown {
   switch (name) {
     case 'get_workspace_status': return dependencies.getWorkspaceStatus(args);
@@ -150,6 +180,7 @@ export function dispatchPublicTool(name: string, args: Args, dependencies: Publi
     case 'commit': return dependencies.finalizeDirect('commit', args);
     case 'commit_and_push': return dependencies.finalizeDirect('commit-and-push', args);
     case 'push': return dependencies.finalizeDirect('push', args);
+    case 'reconcile_finalization': return dependencies.reconcileFinalization(args);
     default: throw new Error(`Unknown public workspace tool: ${name}`);
   }
 }
@@ -231,6 +262,15 @@ export function createPublicToolDependencies(
       });
       const message = operation === 'push' ? '' : requiredString(args, 'message');
       return finalizeDirectAuthority(db, authority, message);
+    },
+    reconcileFinalization: (args) => {
+      requireProviderRoot();
+      return reconcileFinalization(db, {
+        repositoryPath: requiredString(args, 'repository_path'),
+        workspaceGuid: requiredString(args, 'workspace_guid'),
+        providerRootSessionId: identity.sessionId,
+        rebaseRecovery: optionalMode(args),
+      });
     },
   };
 }

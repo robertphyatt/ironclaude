@@ -26,12 +26,19 @@ reach and therefore stays human-only.
 2. If the project root is not inside a Git worktree, stop and report that
    isolation is not applicable to a non-Git project. Do not call
    workspace-manager.
-3. Call `list_active_assignments` for the canonical project root.
-   - One assignment already bound to this provider root: the session is already
-     isolated. Read it back with `get_workspace_status` and report it. Do not
-     allocate a second.
-   - More than one: stop and report the ambiguity. Do not select one.
-   - None: continue.
+3. Call `get_workspace_status` for this session's provider root (Claude Code:
+   `mcp__plugin_ironclaude_workspace-manager__get_workspace_status`; Codex:
+   Codex `workspace-manager` `get_workspace_status`), passing `provider_root`.
+   Branch on the returned `status` and, when assigned, `effectiveRoot` — never
+   on an assignment count.
+   - `status: "assigned"` and `effectiveRoot: "managed"`: the session is
+     already correctly isolated. Report it. Do not allocate a second.
+   - `status: "assigned"` and `effectiveRoot: "primary"`: the assignment
+     exists, but writes are landing in the primary checkout, not the managed
+     worktree. Report this truthfully. Do not call this "isolated." Point the
+     operator to `/return-to-managed-worktree` to re-enter isolation. Do not
+     allocate a second assignment.
+   - `status: "unassigned"`: continue.
 4. Require a clean primary checkout. If it is dirty, stop and report the exact
    dirty paths. Do not stash, commit, copy, reset, clean, or move those changes —
    the operator decides what happens to their own uncommitted work.

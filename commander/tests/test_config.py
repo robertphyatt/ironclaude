@@ -95,20 +95,20 @@ class TestLoadConfig:
         cfg = load_config("/nonexistent/path.json")
         assert cfg["advisor"]["enabled"] is True
         assert cfg["advisor"]["executor_model"] == "sonnet"
-        assert cfg["advisor"]["advisor_model"] == "opus"
+        assert cfg["advisor"]["advisor_model"] == "claude-opus-4-8"
 
     def test_advisor_models_map_default(self):
         """advisor_models provides a one-tier-up map per worker type."""
         cfg = load_config("/nonexistent/path.json")
         assert cfg["advisor"]["advisor_models"] == {
-            "claude-sonnet": "opus",
+            "claude-sonnet": "claude-opus-4-8",
             "claude-opus": "fable",
         }
 
     def test_advisor_model_scalar_fallback_retained(self):
         """The flat advisor_model scalar remains as a fallback for unknown worker types."""
         cfg = load_config("/nonexistent/path.json")
-        assert cfg["advisor"]["advisor_model"] == "opus"
+        assert cfg["advisor"]["advisor_model"] == "claude-opus-4-8"
 
     def test_dispatch_use_goal_default_false(self):
         """dispatch.use_goal is a feature flag defaulting to off."""
@@ -129,9 +129,9 @@ class TestLoadConfig:
         assert cfg["brain_model"] == "sonnet"
 
     def test_defaults_include_grader_model(self):
-        """grader_model defaults to opus."""
+        """grader_model defaults to claude-opus-4-8."""
         from ironclaude.config import DEFAULTS
-        assert DEFAULTS["grader_model"] == "opus"
+        assert DEFAULTS["grader_model"] == "claude-opus-4-8"
 
     def test_env_override_brain_model(self, tmp_path, monkeypatch):
         """BRAIN_MODEL env var overrides config."""
@@ -172,19 +172,19 @@ class TestLoadConfig:
         assert cfg["default_opus_model"] == "claude-opus-4-7"
 
     def test_default_opus_model_decoupled_from_brain_model(self, monkeypatch):
-        """With no relevant env vars, default_opus_model is 'opus' and is
+        """With no relevant env vars, default_opus_model is 'claude-opus-4-8' and is
         decoupled from brain_model (must NOT inherit brain_model's value)."""
         monkeypatch.delenv("ANTHROPIC_DEFAULT_OPUS_MODEL", raising=False)
         monkeypatch.delenv("BRAIN_MODEL", raising=False)
         monkeypatch.delenv("GRADER_MODEL", raising=False)
         cfg = load_config("/nonexistent/path.json")
-        assert cfg["default_opus_model"] == "opus"
+        assert cfg["default_opus_model"] == "claude-opus-4-8"
         assert cfg["default_opus_model"] != cfg["brain_model"]
 
     def test_defaults_include_default_opus_model(self):
-        """default_opus_model defaults to opus."""
+        """default_opus_model defaults to claude-opus-4-8."""
         from ironclaude.config import DEFAULTS
-        assert DEFAULTS["default_opus_model"] == "opus"
+        assert DEFAULTS["default_opus_model"] == "claude-opus-4-8"
 
     def test_defaults_include_effort_level(self):
         """effort_level defaults to 'high'."""
@@ -225,7 +225,7 @@ class TestLoadConfig:
         cfg = load_config(str(config_file))
         assert cfg["advisor"]["enabled"] is False
         assert cfg["advisor"]["executor_model"] == "sonnet"
-        assert cfg["advisor"]["advisor_model"] == "opus"
+        assert cfg["advisor"]["advisor_model"] == "claude-opus-4-8"
 
     def test_effort_level_out_of_allowlist_normalizes_to_high(self, tmp_path, monkeypatch):
         """An out-of-allowlist effort_level falls back to 'high'."""

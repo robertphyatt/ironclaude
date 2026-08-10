@@ -1,7 +1,7 @@
 {
   "name": "ironclaude",
-  "version": "1.1.4+codex.20260806024140",
-  "description": "Ironclad workflow discipline for Codex and Claude Code \u2014 professional mode, systematic planning, and multi-session orchestration",
+  "version": "1.1.5+codex.20260806024140",
+  "description": "Ironclad workflow discipline for Codex and Claude Code — professional mode, systematic planning, and multi-session orchestration",
   "author": {
     "name": "Robert Hyatt",
     "url": "https://github.com/robertphyatt"

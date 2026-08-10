@@ -844,7 +844,7 @@ class BrainClient:
             await _run_session(_build_options(self._model))
         except _ModelUnavailableFromMessage as exc:
             failing_model = self._model
-            resolved = "opus"
+            resolved = "claude-opus-4-8"
             logger.error(
                 f"BRAIN MODEL '{failing_model}' UNAVAILABLE (message-shaped) — resolving to '{resolved}'"
             )
@@ -856,7 +856,7 @@ class BrainClient:
         except Exception as exc:
             if _is_model_unavailable(exc):
                 failing_model = self._model
-                resolved = "opus"
+                resolved = "claude-opus-4-8"
                 logger.error(
                     f"BRAIN MODEL '{failing_model}' NOT AVAILABLE — resolving to '{resolved}'"
                 )

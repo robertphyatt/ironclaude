@@ -28,7 +28,7 @@ const TRANSITIONS: Readonly<Record<AssignmentLifecycle, readonly AssignmentLifec
   materialized: ['active', 'abandoned'],
   active: ['ready_for_integration', 'abandoned'],
   ready_for_integration: ['active', 'integrated', 'abandoned'],
-  integrated: ['cleaned'],
+  integrated: ['cleaned', 'active'],
   abandoned: ['cleaned'],
   cleaned: [],
 };
@@ -191,6 +191,43 @@ export function createAssignment(db: Database.Database, input: CreateAssignmentI
   return getAssignment(db, workspaceGuid)!;
 }
 
+/**
+ * Reset-and-reuses a spent same-GUID row IN PLACE so a re-allocated provider
+ * root reclaims its own retired workspace GUID instead of colliding on the
+ * assignments PRIMARY KEY. Scoped hard to a terminal cleaned/abandoned row: the
+ * WHERE clause refuses an integrated (or any non-terminal) row, and callers gate
+ * this behind a proven-gone worktree so no live work is ever overwritten. Clears
+ * the prior lifecycle's integration record and recovery/disposition proofs, then
+ * re-arms the row at `reserved` for a fresh materialization.
+ */
+export function reuseTerminalAssignment(db: Database.Database, input: CreateAssignmentInput): Assignment {
+  const workspaceGuid = requiredUuid(input.workspaceGuid, 'workspaceGuid');
+  const ownerSessionId = input.ownerSessionId == null ? null : requiredText(input.ownerSessionId, 'ownerSessionId');
+  db.transaction(() => {
+    db.prepare('DELETE FROM integration_records WHERE workspace_guid = ?').run(workspaceGuid);
+    const result = db.prepare(`
+      UPDATE assignments
+      SET repository_identity = ?, worktree_path = ?, branch = ?, base_commit = ?, current_head = ?,
+          owner_session_id = ?, worker_id = ?, integration_target = ?,
+          integrated_commit = NULL, recovery_ref = NULL, disposition = NULL,
+          lifecycle_status = 'reserved', updated_at = datetime('now')
+      WHERE workspace_guid = ? AND lifecycle_status = 'cleaned'
+    `).run(
+      requiredText(input.repositoryIdentity, 'repositoryIdentity'),
+      requiredText(input.worktreePath, 'worktreePath'),
+      requiredText(input.branch, 'branch'),
+      requiredText(input.baseCommit, 'baseCommit'),
+      requiredText(input.currentHead, 'currentHead'),
+      ownerSessionId,
+      input.workerId == null ? null : requiredText(input.workerId, 'workerId'),
+      requiredText(input.integrationTarget, 'integrationTarget'),
+      workspaceGuid,
+    );
+    if (result.changes !== 1) throw new Error('Terminal assignment reuse target changed concurrently');
+  })();
+  return getAssignment(db, workspaceGuid)!;
+}
+
 export function bindAssignmentOwner(db: Database.Database, workspaceGuid: string, ownerSessionId: string): Assignment {
   const existing = getAssignment(db, workspaceGuid);
   if (!existing) throw new Error('Assignment not found');
@@ -222,6 +259,51 @@ export function transitionAssignment(
   return getAssignment(db, workspaceGuid)!;
 }
 
+/** A dead/timed-out primary owner is reclaimable after this bounded idle window. */
+const PRIMARY_OWNER_TTL_MINUTES = 60;
+
+/**
+ * Reaps a stale primary-checkout owner row so a dead or timed-out session can no
+ * longer deadlock commit/finalize/use_primary_checkout with "Primary checkout is
+ * already owned". The current owner row is STALE when its owning assignment is
+ * missing, is terminal (integrated/abandoned/cleaned), its recorded worktree no
+ * longer exists on disk, or the acquisition is older than the bounded TTL. A LIVE
+ * owner (active/ready assignment, worktree present, fresh acquisition) is never
+ * reaped — exclusivity is the hard invariant. Returns whether a row was deleted.
+ *
+ * Race safety without a transaction wrapper (which would risk nesting inside a
+ * caller's transaction): the DELETE is keyed to the exact row identity just read
+ * (repository, workspace, owner, acquired_at). Two concurrent claimants that both
+ * observe the same stale row each delete only that row; the repository_identity
+ * PRIMARY KEY then admits exactly one re-INSERT, and a loser's retry re-conflicts
+ * and re-reaps or throws. A row re-acquired after a reap carries a fresh
+ * acquired_at (so the TTL case's keyed DELETE cannot match it) or a live
+ * assignment (so it is not stale to begin with); a same-second re-acquire by the
+ * same workspace+owner is unreachable here because re-acquisition requires an
+ * intervening release+INSERT that this keyed DELETE has not yet performed.
+ */
+export function reapStalePrimaryOwner(db: Database.Database, repositoryIdentity: string): boolean {
+  const owner = db.prepare('SELECT * FROM primary_checkout_owners WHERE repository_identity = ?')
+    .get(repositoryIdentity) as PrimaryCheckoutOwnership | undefined;
+  if (!owner) return false;
+  const assignment = getAssignment(db, owner.workspace_guid);
+  const terminal = assignment !== undefined
+    && (assignment.lifecycle_status === 'integrated'
+      || assignment.lifecycle_status === 'abandoned'
+      || assignment.lifecycle_status === 'cleaned');
+  const worktreeMissing = assignment !== undefined && !fs.existsSync(assignment.worktree_path);
+  const ttlExpired = db.prepare(
+    "SELECT 1 FROM primary_checkout_owners WHERE repository_identity = ? AND acquired_at < datetime('now', ?)",
+  ).get(repositoryIdentity, `-${PRIMARY_OWNER_TTL_MINUTES} minutes`) !== undefined;
+  const stale = assignment === undefined || terminal || worktreeMissing || ttlExpired;
+  if (!stale) return false;
+  const result = db.prepare(`
+    DELETE FROM primary_checkout_owners
+    WHERE repository_identity = ? AND workspace_guid = ? AND owner_session_id = ? AND acquired_at = ?
+  `).run(repositoryIdentity, owner.workspace_guid, owner.owner_session_id, owner.acquired_at);
+  return result.changes === 1;
+}
+
 export function acquirePrimaryCheckoutOwnership(
   db: Database.Database,
   input: AcquirePrimaryCheckoutOwnershipInput,
@@ -239,6 +321,21 @@ export function acquirePrimaryCheckoutOwnership(
     const owner = db.prepare('SELECT * FROM primary_checkout_owners WHERE repository_identity = ?')
       .get(input.repositoryIdentity) as PrimaryCheckoutOwnership | undefined;
     if (owner?.workspace_guid === input.workspaceGuid && owner.owner_session_id === input.ownerSessionId) return owner;
+    // A dead/timed-out owner is reclaimable: reap it and retry the INSERT exactly
+    // once. A second concurrent claimant that won the re-INSERT still holds the
+    // repository_identity PRIMARY KEY, so this retry re-conflicts and throws.
+    if (reapStalePrimaryOwner(db, input.repositoryIdentity)) {
+      try {
+        db.prepare(`
+          INSERT INTO primary_checkout_owners (repository_identity, workspace_guid, owner_session_id)
+          VALUES (?, ?, ?)
+        `).run(input.repositoryIdentity, input.workspaceGuid, input.ownerSessionId);
+        return db.prepare('SELECT * FROM primary_checkout_owners WHERE repository_identity = ?')
+          .get(input.repositoryIdentity) as PrimaryCheckoutOwnership;
+      } catch {
+        throw new Error('Primary checkout is already owned');
+      }
+    }
     throw new Error('Primary checkout is already owned');
   }
   return db.prepare('SELECT * FROM primary_checkout_owners WHERE repository_identity = ?')
@@ -280,6 +377,10 @@ export function releaseIntegrationLock(db: Database.Database, repositoryIdentity
     DELETE FROM integration_locks WHERE repository_identity = ? AND workspace_guid = ?
   `).run(repositoryIdentity, workspaceGuid);
   if (result.changes !== 1) throw new Error('Integration lock was not held by this assignment');
+}
+
+export function deleteIntegrationRecord(db: Database.Database, workspaceGuid: string): void {
+  db.prepare('DELETE FROM integration_records WHERE workspace_guid = ?').run(workspaceGuid);
 }
 
 export function recordIntegration(db: Database.Database, input: RecordIntegrationInput): IntegrationRecord {

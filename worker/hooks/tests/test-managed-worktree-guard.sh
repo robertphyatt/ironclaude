@@ -39,6 +39,17 @@ git -C "$PRIMARY" config user.name Test
 printf 'primary\n' > "$PRIMARY/src/existing.txt"
 git -C "$PRIMARY" add src/existing.txt
 git -C "$PRIMARY" commit -qm initial
+# docs/ is gitignored so a managed session's OWN plan/review artifacts — which
+# live under the PRIMARY checkout's docs/plans and docs/reviews — are exempt from
+# the escape guard when git confirms they are ignored. A force-added TRACKED file
+# under docs/plans proves the check-ignore gate still refuses tracked paths
+# (git check-ignore reports a tracked path as NOT ignored → exit 1).
+printf 'docs/\n' > "$PRIMARY/.gitignore"
+mkdir -p "$PRIMARY/docs/plans" "$PRIMARY/docs/reviews" "$PRIMARY/docs/other"
+printf 'tracked\n' > "$PRIMARY/docs/plans/tracked.md"
+git -C "$PRIMARY" add .gitignore
+git -C "$PRIMARY" add -f docs/plans/tracked.md
+git -C "$PRIMARY" commit -qm 'gitignore docs; track one plan artifact'
 BASE=$(git -C "$PRIMARY" rev-parse HEAD)
 REPOSITORY_IDENTITY=$(cd "$PRIMARY/.git" && pwd -P)
 MANAGED="$PRIMARY/.ironclaude/worktrees/$GUID"
@@ -71,7 +82,7 @@ CREATE TABLE registered_designs (
 INSERT INTO sessions VALUES ('$SESSION', 'on', 'executing', 1, 0, 0);
 INSERT INTO wave_tasks VALUES (
   '$SESSION', 1,
-  '["docs/notes.txt","src/claude.txt","src/codex-a.txt","src/codex-b.txt","src/command.txt","notes.txt"]',
+  '["docs/notes.txt","src/claude.txt","src/codex-a.txt","src/codex-b.txt","src/command.txt","notes.txt","docs/plans/x.md","docs/reviews/y.md","docs/plans/tracked.md","docs/other/z.md","src/x.txt","docs/plans/plink/evil.md"]',
   'in_progress'
 );
 SQL
@@ -351,6 +362,72 @@ mkdir -p "$TEST_HOME/.claude/projects/demo/deeper/memory"
 RESULT=$(run_guard "$(payload Write "$(jq -cn --arg p "$TEST_HOME/.claude/projects/demo/deeper/memory/note.md" '{file_path:$p,content:"bad"}')")")
 assert_eq 'nested pseudo-memory path denied' '2' "$(status_of "$RESULT")"
 
+# A managed session's OWN gitignored plan/review artifacts live under the PRIMARY
+# checkout's docs/plans and docs/reviews. The adapter used to refuse them as
+# escaping the worktree overlay, forcing the human-only /use-primary-checkout.
+# The carve-out lets them pass through UNREWRITTEN, but ONLY when git confirms the
+# exact target is gitignored — a TRACKED file, a path outside those two dirs, a
+# plain source path, `..` traversal, and a symlinked component all stay refused.
+#
+# Every REFUSE case below is in this wave's allowed_files, so the wave allowlist
+# cannot be what refuses it; the ADAPTER carve-out is the only thing that can, and
+# each denial asserts the adapter's 'MANAGED WORKTREE ENFORCEMENT FAILED' reason
+# (not the wave's 'FILE NOT IN PLAN'). That makes each negative falsifiable
+# against the carve-out itself: widen the dir gate or drop the check-ignore gate
+# and the guard would return 0 instead of 2.
+echo '=== own gitignored plan/review artifacts under the primary checkout ==='
+# ALLOW — gitignored docs/plans and docs/reviews artifacts pass through unrewritten.
+RESULT=$(run_guard "$(payload Write "$(jq -cn --arg p "$PRIMARY/docs/plans/x.md" '{file_path:$p,content:"plan"}')")")
+assert_eq 'gitignored primary docs/plans artifact allowed' '0' "$(status_of "$RESULT")"
+assert_eq 'gitignored docs/plans artifact is not rewritten' '' \
+  "$(output_of "$RESULT" | jq -r '.hookSpecificOutput.updatedInput.file_path // empty' 2>/dev/null)"
+RESULT=$(run_guard "$(payload Write "$(jq -cn --arg p "$PRIMARY/docs/reviews/y.md" '{file_path:$p,content:"review"}')")")
+assert_eq 'gitignored primary docs/reviews artifact allowed' '0' "$(status_of "$RESULT")"
+assert_eq 'gitignored docs/reviews artifact is not rewritten' '' \
+  "$(output_of "$RESULT" | jq -r '.hookSpecificOutput.updatedInput.file_path // empty' 2>/dev/null)"
+
+# REFUSE (C) — a TRACKED file under docs/plans (git check-ignore exit 1) stays refused.
+RESULT=$(run_guard "$(payload Write "$(jq -cn --arg p "$PRIMARY/docs/plans/tracked.md" '{file_path:$p,content:"bad"}')")")
+assert_eq 'tracked primary docs/plans file denied' '2' "$(status_of "$RESULT")"
+assert_contains 'tracked docs/plans denial is the worktree adapter, not the wave' \
+  "$(output_of "$RESULT")" 'MANAGED WORKTREE ENFORCEMENT FAILED'
+# REFUSE (D) — a gitignored path OUTSIDE docs/plans and docs/reviews stays refused,
+# proving the widening is bounded to those two directories.
+RESULT=$(run_guard "$(payload Write "$(jq -cn --arg p "$PRIMARY/docs/other/z.md" '{file_path:$p,content:"bad"}')")")
+assert_eq 'gitignored non-artifact primary docs path denied' '2' "$(status_of "$RESULT")"
+assert_contains 'non-artifact docs denial is the worktree adapter' \
+  "$(output_of "$RESULT")" 'MANAGED WORKTREE ENFORCEMENT FAILED'
+# REFUSE (E) — a plain primary source path stays refused (no general primary-write escape).
+RESULT=$(run_guard "$(payload Write "$(jq -cn --arg p "$PRIMARY/src/x.txt" '{file_path:$p,content:"bad"}')")")
+assert_eq 'primary src write still denied' '2' "$(status_of "$RESULT")"
+assert_contains 'primary src denial is the worktree adapter' \
+  "$(output_of "$RESULT")" 'MANAGED WORKTREE ENFORCEMENT FAILED'
+# REFUSE (F) — a `..` traversal out of docs/plans stays refused.
+RESULT=$(run_guard "$(payload Write "$(jq -cn --arg p "$PRIMARY/docs/plans/../../src/x" '{file_path:$p,content:"bad"}')")")
+assert_eq 'traversal out of docs/plans denied' '2' "$(status_of "$RESULT")"
+assert_contains 'traversal denial is the worktree adapter' \
+  "$(output_of "$RESULT")" 'MANAGED WORKTREE ENFORCEMENT FAILED'
+# REFUSE (G) — a symlinked component under docs/plans stays refused. `plink` is
+# gitignored (docs/) so check-ignore alone would pass it; only the physical
+# symlink guard refuses. In allowed_files, so a dropped guard would return 0.
+ln -s "$TEST_ROOT" "$PRIMARY/docs/plans/plink"
+RESULT=$(run_guard "$(payload Write "$(jq -cn --arg p "$PRIMARY/docs/plans/plink/evil.md" '{file_path:$p,content:"bad"}')")")
+assert_eq 'symlinked docs/plans component denied' '2' "$(status_of "$RESULT")"
+assert_contains 'symlink denial is the worktree adapter' \
+  "$(output_of "$RESULT")" 'MANAGED WORKTREE ENFORCEMENT FAILED'
+rm -f "$PRIMARY/docs/plans/plink"
+
+# The bug bites in the NON-executing stages where artifacts are actually written
+# (writing-plans emits docs/plans, reviewing emits docs/reviews). There the docs
+# gate governs and the wave allowlist never runs, so no allowed_files entry is
+# needed — this proves the reported bug is fixed, not merely hand-seeded above.
+sqlite3 "$STATE_DB" "UPDATE sessions SET workflow_stage='reviewing' WHERE terminal_session='$SESSION'"
+RESULT=$(run_guard "$(payload Write "$(jq -cn --arg p "$PRIMARY/docs/reviews/y.md" '{file_path:$p,content:"review"}')")")
+assert_eq 'reviewing-stage gitignored docs/reviews artifact allowed' '0' "$(status_of "$RESULT")"
+assert_eq 'reviewing-stage docs/reviews artifact is not rewritten' '' \
+  "$(output_of "$RESULT" | jq -r '.hookSpecificOutput.updatedInput.file_path // empty' 2>/dev/null)"
+sqlite3 "$STATE_DB" "UPDATE sessions SET workflow_stage='executing' WHERE terminal_session='$SESSION'"
+
 # The shared read-only predicates admit forms that still write or execute
 # (`git diff --output=<path>`, `rg --pre <prog>`). That misclassification only
 # matters where passthrough is DECIDED — an assignment that exists but cannot be
@@ -398,6 +475,42 @@ RESULT=$(run_guard "$(payload Bash "$(jq -cn --arg command "printf bad > '$PRIMA
 assert_eq 'explicit primary-checkout command denied' '2' "$(status_of "$RESULT")"
 RESULT=$(run_guard "$(payload Bash "$(jq -cn --arg command "printf bad > '$OTHER_MANAGED/escaped-other.txt'" '{command:$command}')")")
 assert_eq 'explicit other-assignment command denied' '2' "$(status_of "$RESULT")"
+
+# Bug B: a COMPLETE quote-wrapped owned-worktree root word resolves INSIDE this
+# assignment, but the boundary loop rejected it because the surrounding quote
+# byte is not one of its token-boundary bytes. `git -C '<root>' …` is what a
+# model naturally writes. The fix pre-strips such a word before the loop while
+# preserving the concatenation-visibility contract: any quote/byte concatenation
+# that reaches OUTSIDE the assignment must still be refused.
+echo '=== quoted owned-worktree root word (bug B) ==='
+# ALLOW — exact quoted root, both quote styles, and a quoted descendant.
+RESULT=$(run_guard "$(payload Bash "$(jq -cn --arg command "git -C '$MANAGED' status" '{command:$command}')")")
+assert_eq 'quoted exact owned-worktree root allowed (single quotes)' '0' "$(status_of "$RESULT")"
+RESULT=$(run_guard "$(payload Bash "$(jq -cn --arg command "git -C \"$MANAGED\" status" '{command:$command}')")")
+assert_eq 'quoted exact owned-worktree root allowed (double quotes)' '0' "$(status_of "$RESULT")"
+RESULT=$(run_guard "$(payload Bash "$(jq -cn --arg command "git -C \"$MANAGED/src\" log" '{command:$command}')")")
+assert_eq 'quoted owned-worktree descendant allowed' '0' "$(status_of "$RESULT")"
+# Regression guard: the pre-existing UNQUOTED bare-root form stays allowed.
+RESULT=$(run_guard "$(payload Bash "$(jq -cn --arg command "git -C $MANAGED add src/existing.txt" '{command:$command}')")")
+assert_eq 'unquoted bare owned-worktree root stays allowed' '0' "$(status_of "$RESULT")"
+# REFUSE — every quoted concatenation that escapes the assignment stays denied.
+RESULT=$(run_guard "$(payload Bash "$(jq -cn --arg command "git -C '$MANAGED'x status" '{command:$command}')")")
+assert_eq 'quoted-root trailing-byte concatenation still denied' '2' "$(status_of "$RESULT")"
+RESULT=$(run_guard "$(payload Bash "$(jq -cn --arg command "git -C x'$MANAGED' status" '{command:$command}')")")
+assert_eq 'quoted-root leading-byte concatenation still denied' '2' "$(status_of "$RESULT")"
+RESULT=$(run_guard "$(payload Bash "$(jq -cn --arg command "git -C '$PRIMARY' status" '{command:$command}')")")
+assert_eq 'quoted primary checkout still denied' '2' "$(status_of "$RESULT")"
+RESULT=$(run_guard "$(payload Bash "$(jq -cn --arg command "git -C '$MANAGED/..' status" '{command:$command}')")")
+assert_eq 'quoted parent traversal still denied' '2' "$(status_of "$RESULT")"
+RESULT=$(run_guard "$(payload Bash "$(jq -cn --arg command "git -C '$OTHER_MANAGED' status" '{command:$command}')")")
+assert_eq 'quoted other-assignment path still denied' '2' "$(status_of "$RESULT")"
+RESULT=$(run_guard "$(payload Bash '{"command":"git -C ~/repository status"}')")
+assert_eq 'tilde path still denied (unaffected by quoted-word strip)' '2' "$(status_of "$RESULT")"
+RESULT=$(run_guard "$(payload Bash "$(jq -cn --arg command "git -C \"\$(pwd)\" status" '{command:$command}')")")
+assert_eq 'command-substitution still denied (unaffected by quoted-word strip)' '2' "$(status_of "$RESULT")"
+RESULT=$(run_guard "$(payload Bash '{"command":"cd - && git status"}')")
+assert_eq 'cd - still denied (unaffected by quoted-word strip)' '2' "$(status_of "$RESULT")"
+
 RESULT=$(run_guard "$(payload exec_command '{"cmd":"printf codex > src/command.txt"}')")
 assert_eq 'Codex exec allowed' '0' "$(status_of "$RESULT")"
 CODEX_COMMAND=$(output_of "$RESULT" | jq -r '.hookSpecificOutput.updatedInput.cmd // empty' 2>/dev/null)
@@ -441,14 +554,70 @@ assert_eq 'Codex primary patch denied without authority' '2' "$(status_of "$RESU
 
 echo '=== lifecycle and primary authority ==='
 sqlite3 "$WORKSPACE_DB" "UPDATE assignments SET lifecycle_status='ready_for_integration' WHERE workspace_guid='$GUID'"
+# C(ii): a FROZEN assignment (lifecycle_status != 'active') must still let a
+# READ-ONLY input through — workspace_bind_effective_root fails the frozen
+# check at line ~351, and the caller's WORKSPACE_READONLY_INPUT fallback
+# (~372) is what turns that bind failure into passthrough instead of a block.
+# The Read case exercises the 'file' tool branch of that fallback; the
+# read-only Bash case exercises the 'command' branch. Both must return 0 with
+# NOTHING rewritten, since a failed bind never reaches the rewrite step.
+RESULT=$(run_guard "$(payload Read '{"file_path":"src/existing.txt"}')")
+assert_eq 'frozen assignment allows read-only Read (passthrough)' '0' "$(status_of "$RESULT")"
+assert_eq 'frozen assignment Read is not rewritten' '' \
+  "$(output_of "$RESULT" | jq -r '.hookSpecificOutput.updatedInput.file_path // empty' 2>/dev/null)"
+RESULT=$(run_guard "$(payload Bash '{"command":"git log --oneline -1"}')")
+assert_eq 'frozen assignment allows read-only Bash (passthrough)' '0' "$(status_of "$RESULT")"
+assert_eq 'frozen assignment read-only Bash is not rewritten' '' \
+  "$(output_of "$RESULT" | jq -r '.hookSpecificOutput.updatedInput.command // empty' 2>/dev/null)"
+# C: the frozen-guard memory-write carve-out. A memory-path Write is not
+# READ-ONLY (workspace_input_is_readonly only classifies Read and read-only
+# Bash), so it does not benefit from the WORKSPACE_READONLY_INPUT fallback
+# above. It must still pass through UNREWRITTEN while frozen, because
+# professional-mode-guard.sh has always allowed auto-memory writes at any
+# workflow stage — the frozen bind failure must not strand them.
+RESULT=$(run_guard "$(payload Write "$(jq -cn --arg p "$TEST_HOME/.claude/projects/demo/memory/note.md" '{file_path:$p,content:"frozen-remembered"}')")")
+assert_eq 'frozen assignment allows auto-memory write (passthrough)' '0' "$(status_of "$RESULT")"
+assert_eq 'frozen assignment auto-memory write is not redirected' '' \
+  "$(output_of "$RESULT" | jq -r '.hookSpecificOutput.updatedInput.file_path // empty' 2>/dev/null)"
+# Negative: a symlinked pseudo-memory escape must still be denied while frozen —
+# the carve-out reuses workspace_file_target_is_exempt's symlink guard (:51-74)
+# unchanged, so this proves the carve-out did not widen it.
+ln -sfn / "$TEST_HOME/.claude/projects/demo/memory/out"
+RESULT=$(run_guard "$(payload Write "$(jq -cn --arg p "$TEST_HOME/.claude/projects/demo/memory/out$PRIMARY/src/pwned.txt" '{file_path:$p,content:"bad"}')")")
+assert_eq 'frozen assignment denies symlinked auto-memory escape' '2' "$(status_of "$RESULT")"
+rm -f "$TEST_HOME/.claude/projects/demo/memory/out"
+# Negative: `*` in a case pattern spans `/`, so a deeper/memory path must not
+# inherit the exemption while frozen either.
+RESULT=$(run_guard "$(payload Write "$(jq -cn --arg p "$TEST_HOME/.claude/projects/demo/deeper/memory/note.md" '{file_path:$p,content:"bad"}')")")
+assert_eq 'frozen assignment denies nested pseudo-memory path' '2' "$(status_of "$RESULT")"
+# Falsifier: the SAME frozen assignment must still block a tracked-file
+# mutation — proving the read-only fallback did not also open the door for
+# writes. Asserting the frozen-lifecycle message text (not just exit 2) means
+# deleting the :351 frozen check, or widening the :372 fallback to cover
+# mutations, both make this fail rather than pass vacuously.
 RESULT=$(run_guard "$(payload Write '{"file_path":"src/claude.txt","content":"frozen"}')")
 assert_eq 'frozen assignment denies mutation' '2' "$(status_of "$RESULT")"
+assert_contains 'frozen mutation denial names the frozen lifecycle state' \
+  "$(output_of "$RESULT")" 'frozen in lifecycle state ready_for_integration'
 sqlite3 "$WORKSPACE_DB" "UPDATE assignments SET lifecycle_status='active' WHERE workspace_guid='$GUID'"
 sqlite3 "$WORKSPACE_DB" "INSERT INTO primary_checkout_owners VALUES ('$REPOSITORY_IDENTITY','$GUID','$SESSION',datetime('now'))"
 RESULT=$(run_guard "$(payload Write '{"file_path":"src/claude.txt","content":"primary-authorized"}')")
 assert_eq 'primary-authorized relative write allowed' '0' "$(status_of "$RESULT")"
 assert_eq 'primary-authorized path rewritten to primary root' "$PRIMARY/src/claude.txt" \
   "$(output_of "$RESULT" | jq -r '.hookSpecificOutput.updatedInput.file_path // empty' 2>/dev/null)"
+sqlite3 "$WORKSPACE_DB" "DELETE FROM primary_checkout_owners WHERE repository_identity='$REPOSITORY_IDENTITY'"
+
+# The 60-minute reap TTL never distinguishes an idle owner from a LIVE one
+# because acquired_at is never renewed. A confirmed owner's file operation
+# must renew its own row so the (unchanged) reap TTL becomes an idle signal.
+# Falsifier: without the renewal, acquired_at stays at -90 minutes and the
+# `> datetime('now','-5 minutes')` comparison returns 0.
+sqlite3 "$WORKSPACE_DB" "UPDATE assignments SET lifecycle_status='active' WHERE workspace_guid='$GUID'"
+sqlite3 "$WORKSPACE_DB" "INSERT INTO primary_checkout_owners VALUES ('$REPOSITORY_IDENTITY','$GUID','$SESSION',datetime('now','-90 minutes'))"
+RESULT=$(run_guard "$(payload Write '{"file_path":"src/claude.txt","content":"heartbeat"}')")
+assert_eq 'owner file op still allowed after stale acquired_at' '0' "$(status_of "$RESULT")"
+assert_eq 'owner file op renews the primary-checkout lock' '1' \
+  "$(sqlite3 "$WORKSPACE_DB" "SELECT (acquired_at > datetime('now','-5 minutes')) FROM primary_checkout_owners WHERE repository_identity='$REPOSITORY_IDENTITY'")"
 sqlite3 "$WORKSPACE_DB" "DELETE FROM primary_checkout_owners WHERE repository_identity='$REPOSITORY_IDENTITY'"
 
 echo '=== non-Git preservation ==='
@@ -484,6 +653,42 @@ CODEX_COMMAND=$(output_of "$RESULT" | jq -r '.hookSpecificOutput.updatedInput.cm
 (cd "$PRIMARY" && bash -c "$CODEX_COMMAND")
 assert_eq 'rewritten command changes managed worktree' 'command' "$(sed -n '1p' "$MANAGED/src/command.txt")"
 assert_eq 'rewritten command leaves primary absent' 'absent' "$([ -e "$PRIMARY/src/command.txt" ] && echo present || echo absent)"
+
+# Worktree isolation is a property of the ASSIGNMENT, not of professional mode.
+# A session that owns a managed worktree must not silently write into the
+# primary checkout just because professional mode is off — the mode-off
+# branch used to short-circuit before the adapter ran at all.
+echo '=== mode-off worktree redirection (#2) ==='
+sqlite3 "$STATE_DB" "UPDATE sessions SET professional_mode='off' WHERE terminal_session='$SESSION'"
+
+# (a) healthy owned assignment -> relative write still redirected into the worktree.
+RESULT=$(run_guard "$(payload Write '{"file_path":"src/claude.txt","content":"mode-off-managed\n"}')")
+assert_eq 'mode-off healthy assignment write allowed' '0' "$(status_of "$RESULT")"
+assert_eq 'mode-off healthy assignment write redirected to managed root' \
+  "$MANAGED/src/claude.txt" \
+  "$(output_of "$RESULT" | jq -r '.hookSpecificOutput.updatedInput.file_path // empty' 2>/dev/null)"
+
+# (d) mode-off means no WORKFLOW-STAGE gating — a git commit must still be
+# allowed (rewritten/passed), proving the redirect fix does not leak the
+# ON-path's commit/push block into the OFF path.
+RESULT=$(run_guard "$(payload Bash '{"command":"git commit -m x"}')")
+assert_eq 'mode-off git commit allowed (no ON-path gating leak)' '0' "$(status_of "$RESULT")"
+
+# (c) damaged/unhealthy assignment -> blocked, same as the ON path.
+sqlite3 "$WORKSPACE_DB" "UPDATE assignments SET lifecycle_status='ready_for_integration' WHERE workspace_guid='$GUID'"
+RESULT=$(run_guard "$(payload Write '{"file_path":"src/claude.txt","content":"bad"}')")
+assert_eq 'mode-off damaged assignment write blocked' '2' "$(status_of "$RESULT")"
+sqlite3 "$WORKSPACE_DB" "UPDATE assignments SET lifecycle_status='active' WHERE workspace_guid='$GUID'"
+
+# (b) no assignment -> plain passthrough, unchanged (nothing to isolate).
+sqlite3 "$WORKSPACE_DB" "UPDATE assignments SET owner_session_id='unbound-for-test' WHERE workspace_guid='$GUID'"
+RESULT=$(run_guard "$(payload Write '{"file_path":"src/claude.txt","content":"passthrough"}')")
+assert_eq 'mode-off no assignment write allowed' '0' "$(status_of "$RESULT")"
+assert_eq 'mode-off no assignment write not redirected' '' \
+  "$(output_of "$RESULT" | jq -r '.hookSpecificOutput.updatedInput.file_path // empty' 2>/dev/null)"
+sqlite3 "$WORKSPACE_DB" "UPDATE assignments SET owner_session_id='$SESSION' WHERE workspace_guid='$GUID'"
+
+sqlite3 "$STATE_DB" "UPDATE sessions SET professional_mode='on' WHERE terminal_session='$SESSION'"
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

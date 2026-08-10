@@ -3,7 +3,9 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import {
   acquireIntegrationLock,
+  deleteIntegrationRecord,
   getAssignment,
+  reapStalePrimaryOwner,
   recordIntegration,
   transitionAssignment,
 } from './db.js';
@@ -20,13 +22,18 @@ import {
   revalidateAuthorizedCommitState,
   type AuthorizedDirectGitOperation,
 } from './git-authority.js';
-import { WorkspaceService } from './workspace-service.js';
 import type { Assignment } from './types.js';
 
 export interface FinalizationResult {
-  state: 'cleaned' | 'pushed' | 'pushed-only' | 'integrated-local';
+  state: 'cleaned' | 'pushed' | 'pushed-only' | 'integrated-local'
+    | 'rebase-aborted' | 'rebase-recovery-repair-required'
+    | 'rebase-rerebased-ready-for-repair' | 'rebase-frozen-restored'
+    | 'rebase-paused-conflict' | 'rebase-paused-clean' | 'frozen-no-rebase'
+    | 'integrated' | 'not-ready';
   integratedCommit?: string;
   pushError?: string;
+  /** Human-facing explanation for a managed rebase-recovery outcome that did not integrate. */
+  detail?: string;
 }
 
 export interface CommanderLocalCommitInput {
@@ -49,6 +56,23 @@ export interface ReconcileFinalizationInput {
   repositoryPath: string;
   workspaceGuid: string;
   providerRootSessionId: string;
+  /**
+   * Managed mid-rebase recovery. Dispatched only for a ready assignment whose
+   * integration rebase is paused in progress. 'continue' drives a
+   * mechanically-recoverable rebase to completion and integrates only when the
+   * existing byte-equality proof still holds; 'abort' restores the frozen
+   * pre-rebase commit and leaves the integration target unchanged.
+   *
+   * 'status' is a strictly NON-mutating, lifecycle-aware probe handled at the top of
+   * reconcileFinalization: an integrated row reports 'integrated' (its worktree may be
+   * gone), a ready row is classified by rebase state, anything else is 'not-ready'.
+   *
+   * The no-paused-rebase modes recover a ready row whose finalization drifted and
+   * was reset to frozen with NO rebase in progress: 'rerebase' replays the frozen work
+   * onto the drifted target on the ATTACHED branch without integrating; 'restore_frozen'
+   * resets the clean worktree back to the frozen pre-rebase commit. Neither integrates.
+   */
+  rebaseRecovery?: 'continue' | 'abort' | 'rerebase' | 'restore_frozen' | 'status';
 }
 
 export interface FinalizationHooks {
@@ -291,6 +315,9 @@ function exactAssignment(
 }
 
 function fencePrimaryCheckout(db: Database.Database, repositoryIdentity: string): void {
+  // A dead/timed-out owner must not deadlock finalization: reap a stale row first,
+  // then fence on any surviving (live) owner.
+  reapStalePrimaryOwner(db, repositoryIdentity);
   if (db.prepare('SELECT 1 FROM primary_checkout_owners WHERE repository_identity = ?').get(repositoryIdentity)) {
     throw new Error('Finalization is fenced while primary checkout is owned');
   }
@@ -350,12 +377,34 @@ function markIntegrated(
   return getAssignment(db, assignment.workspace_guid)!;
 }
 
-function cleanupFinalized(db: Database.Database, repositoryPath: string, assignment: Assignment): void {
-  new WorkspaceService(db).cleanupWorkspace({
-    repositoryPath,
-    workspaceGuid: assignment.workspace_guid,
-    ownerSessionId: assignment.owner_session_id!,
-  });
+export function recycleFinalized(db: Database.Database, repositoryPath: string, assignment: Assignment): void {
+  // Re-read: several call sites pass an in-memory row whose disposition is stale
+  // relative to the DB; the fresh integrated_commit is the recycle base.
+  const current = getAssignment(db, assignment.workspace_guid);
+  if (!current || current.lifecycle_status !== 'integrated' || !current.integrated_commit) {
+    throw new Error('Recycle requires a durable integrated assignment; preserving worktree');
+  }
+  const integratedCommit = current.integrated_commit;
+  // Reachability proof carried forward from cleanupWorkspace: the integrated commit
+  // must be contained in the integration target (each site advanced/verified it first).
+  if (!isAncestor(repositoryPath, integratedCommit, targetRef(current))) {
+    throw new Error('Recycle integration proof is unreachable from the integration target; preserving worktree');
+  }
+  // HEAD is already the integrated commit at every call site, so NO git reset — a
+  // reset would destroy any stray tracked/index delta on the isRepair paths, which
+  // bypass Task 1's clean-tree gate.
+  db.transaction(() => {
+    db.prepare('DELETE FROM integration_records WHERE workspace_guid = ?').run(current.workspace_guid);
+    db.prepare(`
+      UPDATE assignments
+      SET base_commit = ?, current_head = ?, integrated_commit = NULL, disposition = NULL, updated_at = datetime('now')
+      WHERE workspace_guid = ? AND lifecycle_status = 'integrated'
+    `).run(integratedCommit, integratedCommit, current.workspace_guid);
+    transitionAssignment(db, current.workspace_guid, 'integrated', 'active');
+  })();
+  // Best-effort AFTER the DB commit: if the txn fails the row stays integrated with
+  // its record intact and crash reconciliation still works.
+  try { runGit(current.worktree_path, ['update-ref', '-d', candidateRef(current.workspace_guid)]); } catch { /* candidate ref may be absent */ }
 }
 
 function finishLocalIntegration(db: Database.Database, local: LocalFinalization): FinalizationResult {
@@ -366,7 +415,7 @@ function finishLocalIntegration(db: Database.Database, local: LocalFinalization)
       pushError: 'Remote has not proved the exact integrated candidate',
     };
   }
-  cleanupFinalized(db, local.repositoryPath, local.assignment);
+  recycleFinalized(db, local.repositoryPath, local.assignment);
   return { state: 'cleaned', integratedCommit: local.integratedCommit };
 }
 
@@ -487,6 +536,10 @@ function finalizeLocalCommit(
   runGit(sourcePath, ['update-ref', freezeRef(assignment.workspace_guid), frozenCommit]);
   if (worktreeHead(sourcePath) !== frozenCommit) {
     throw new Error('Reviewed commit changed before freeze; preserving worktree');
+  }
+  const dirty = runGit(sourcePath, ['status', '--porcelain=v1', '--untracked-files=all']).trim();
+  if (dirty !== '') {
+    throw new Error('Managed worktree has uncommitted changes; stage or revert them before commit:\n' + dirty);
   }
   transitionAssignment(db, assignment.workspace_guid, 'active', 'ready_for_integration');
   return continueFrozenFinalization(db, repositoryPath, assignment, sourcePath, frozenCommit, hooks);
@@ -623,7 +676,7 @@ export function finalizeDirectAuthority(
     db, exact.primaryCheckoutPath, exact.assignment, authority.worktreePath, committed, hooks,
   );
   if (authority.operation === 'commit') {
-    cleanupFinalized(db, local.repositoryPath, local.assignment);
+    recycleFinalized(db, local.repositoryPath, local.assignment);
     return { state: 'cleaned', integratedCommit: local.integratedCommit };
   }
 
@@ -673,7 +726,7 @@ export function finalizeDirectAuthority(
       pushError: `Remote is already the exact integrated candidate, but local success persistence failed: ${detail}`,
     };
   }
-  cleanupFinalized(db, local.repositoryPath, local.assignment);
+  recycleFinalized(db, local.repositoryPath, local.assignment);
   return { state: 'pushed', integratedCommit: local.integratedCommit };
 }
 
@@ -713,14 +766,161 @@ export function finalizeCommanderLocalCommit(
     const candidate = committed;
     runGit(exact.assignment.worktree_path, ['update-ref', candidateRef(exact.assignment.workspace_guid), candidate]);
     const local = finalizeAttestedCandidate(db, exact.primaryCheckoutPath, exact.assignment, candidate);
-    cleanupFinalized(db, local.repositoryPath, local.assignment);
+    recycleFinalized(db, local.repositoryPath, local.assignment);
     return { state: 'cleaned', integratedCommit: candidate };
   }
   const local = finalizeLocalCommit(
     db, exact.primaryCheckoutPath, exact.assignment, exact.assignment.worktree_path, committed, hooks,
   );
-  cleanupFinalized(db, local.repositoryPath, local.assignment);
+  recycleFinalized(db, local.repositoryPath, local.assignment);
   return { state: 'cleaned', integratedCommit: local.integratedCommit };
+}
+
+/**
+ * Managed recovery for a ready assignment whose integration rebase is paused
+ * mid-flight. It drives only mechanically-recoverable cases and STOPS on any
+ * case that needs a human. It never auto-resolves a conflict and never bypasses
+ * a proof: a content-changing resolution is REJECTED by the existing
+ * cumulativeBinaryEffect equality and routed to the fresh-commit (isRepair)
+ * channel, which the operator drives with a fresh commit authority.
+ */
+function recoverRebaseInProgress(
+  db: Database.Database,
+  exact: { assignment: Assignment; primaryCheckoutPath: string },
+  mode: 'continue' | 'abort',
+): FinalizationResult {
+  const assignment = exact.assignment;
+  const worktree = assignment.worktree_path;
+  const primary = exact.primaryCheckoutPath;
+  const ref = targetRef(assignment);
+  const frozen = runGit(primary, ['rev-parse', '--verify', `${freezeRef(assignment.workspace_guid)}^{commit}`]).trim();
+
+  if (mode === 'abort') {
+    runGit(worktree, ['rebase', '--abort']);
+    if (worktreeHead(worktree) !== frozen) {
+      throw new Error('Rebase recovery abort did not restore the frozen pre-rebase commit; preserving worktree');
+    }
+    return { state: 'rebase-aborted', detail: 'Rebase aborted; frozen pre-rebase commit restored, integration target unchanged.' };
+  }
+
+  // Case B: an unresolved conflict is not mechanically recoverable. Never
+  // auto-resolve — surface the unmerged paths and stop without advancing.
+  const unresolved = runGit(worktree, ['diff', '--name-only', '--diff-filter=U']).trim();
+  if (unresolved !== '') {
+    throw new Error(`Rebase recovery stopped: unresolved conflicts remain; preserving worktree. Unmerged paths: ${unresolved.split('\n').join(', ')}`);
+  }
+  try {
+    runGit(worktree, ['-c', 'core.editor=true', 'rebase', '--continue']);
+  } catch (error) {
+    // A later step re-conflicted: surface the newly unmerged paths and stop.
+    const reconflict = runGit(worktree, ['diff', '--name-only', '--diff-filter=U']).trim();
+    if (reconflict !== '') {
+      throw new Error(`Rebase recovery stopped: continuing re-conflicted; preserving worktree. Unmerged paths: ${reconflict.split('\n').join(', ')}`);
+    }
+    throw error;
+  }
+  // A multi-step rebase can pause again (a later edit/break, or a fresh conflict
+  // that continue reported without a nonzero exit): it is still not complete.
+  const stillRebaseDir = runGit(worktree, ['rev-parse', '--git-path', 'rebase-merge']).trim();
+  if (existsSync(path.resolve(worktree, stillRebaseDir))) {
+    const reconflict = runGit(worktree, ['diff', '--name-only', '--diff-filter=U']).trim();
+    throw new Error(`Rebase recovery stopped: rebase still in progress after continue; preserving worktree.${reconflict ? ` Unmerged paths: ${reconflict.split('\n').join(', ')}` : ''}`);
+  }
+
+  const head = worktreeHead(worktree);
+  const expectedTarget = runGit(primary, ['rev-parse', '--verify', `${ref}^{commit}`]).trim();
+  const reviewedEffect = cumulativeBinaryEffect(worktree, assignment.base_commit, frozen);
+  if (!isAncestor(primary, expectedTarget, head)
+    || cumulativeBinaryEffect(worktree, expectedTarget, head) !== reviewedEffect) {
+    // Case D: the resolution changed the reviewed content (or is not a descendant
+    // of the target). The equality proof rejects it. Preserve the worktree at the
+    // resolved HEAD and route to the fresh-commit isRepair channel; do NOT advance
+    // the target through the equality path here.
+    return {
+      state: 'rebase-recovery-repair-required',
+      detail: 'Rebase resolution changed the reviewed content; the equality proof rejected it. Integrate with a fresh commit (isRepair) authority; worktree preserved and integration target unchanged.',
+    };
+  }
+  // Case A: a conflict-free recovery whose cumulative effect matches the review.
+  // Integrate the continued HEAD through the existing attested-candidate coordinator.
+  runGit(worktree, ['update-ref', candidateRef(assignment.workspace_guid), head]);
+  const local = finalizeAttestedCandidate(db, primary, assignment, head);
+  return finishLocalIntegration(db, local);
+}
+
+/** Classifies a ready worktree by whether a rebase is paused and, if so, conflicted. */
+function classifyRebaseState(
+  worktree: string,
+): 'rebase-paused-conflict' | 'rebase-paused-clean' | 'frozen-no-rebase' {
+  // A linked worktree's rebase-merge dir is resolved via git-path, never probed as
+  // <worktree>/.git/rebase-merge (its .git is a gitdir file, not a directory).
+  const rebaseDir = runGit(worktree, ['rev-parse', '--git-path', 'rebase-merge']).trim();
+  if (!existsSync(path.resolve(worktree, rebaseDir))) return 'frozen-no-rebase';
+  const unmerged = runGit(worktree, ['diff', '--name-only', '--diff-filter=U']).trim();
+  return unmerged !== '' ? 'rebase-paused-conflict' : 'rebase-paused-clean';
+}
+
+/**
+ * Replays the frozen reviewed work onto the drifted integration target on the
+ * ATTACHED branch, using the SAME 2-arg rebase as finalize (rebase --onto ref base).
+ * The 2-arg form keeps HEAD attached so a later fresh-commit isRepair authority can
+ * integrate; a 3-arg rebase --onto target base frozenHead would detach and break
+ * validateExactCommitState. NEVER integrates: on success the caller drives isRepair.
+ */
+function rerebaseFromFrozen(
+  worktree: string,
+  assignment: Assignment,
+  frozen: string,
+): FinalizationResult {
+  if (worktreeHead(worktree) !== frozen) {
+    throw new Error('Rerebase requires the worktree at the frozen pre-rebase commit; preserving worktree');
+  }
+  if (!worktreeIsClean(worktree)) {
+    throw new Error('Rerebase requires a clean worktree; preserving worktree');
+  }
+  const ref = targetRef(assignment);
+  try {
+    runGit(worktree, ['rebase', '--onto', ref, assignment.base_commit]);
+  } catch {
+    // A conflicting replay leaves a paused rebase in place for continue/abort.
+    const unmerged = runGit(worktree, ['diff', '--name-only', '--diff-filter=U']).trim();
+    throw new Error(`Rerebase conflicted; a paused rebase is preserved for continue/abort.${unmerged ? ` Unmerged paths: ${unmerged.split('\n').join(', ')}` : ''}`);
+  }
+  return { state: 'rebase-rerebased-ready-for-repair', detail: worktreeHead(worktree) };
+}
+
+/** Resets a clean worktree back to the frozen pre-rebase commit; never touches the target. */
+function restoreFrozen(worktree: string, frozen: string): FinalizationResult {
+  if (!worktreeIsClean(worktree)) {
+    throw new Error('Restore frozen requires a clean worktree; preserving worktree');
+  }
+  runGit(worktree, ['reset', '--hard', frozen]);
+  if (worktreeHead(worktree) !== frozen) {
+    throw new Error('Restore frozen did not restore the frozen pre-rebase commit; preserving worktree');
+  }
+  return { state: 'rebase-frozen-restored', detail: 'Worktree reset to the frozen pre-rebase commit; integration target unchanged.' };
+}
+
+/**
+ * Managed recovery for a ready row whose finalization drifted with NO paused rebase.
+ * 'rerebase' and 'restore_frozen' require NO paused rebase and refuse otherwise. None
+ * integrate. (The non-mutating 'status' probe is handled at the top of
+ * reconcileFinalization, before the integrated-cleanup branch.)
+ */
+function recoverNoPausedRebase(
+  exact: { assignment: Assignment; primaryCheckoutPath: string },
+  mode: 'rerebase' | 'restore_frozen',
+): FinalizationResult {
+  const assignment = exact.assignment;
+  const worktree = assignment.worktree_path;
+  const state = classifyRebaseState(worktree);
+  if (state !== 'frozen-no-rebase') {
+    throw new Error(`Rebase ${mode} requires no paused rebase; a rebase is still in progress — resolve via continue/abort first; preserving worktree`);
+  }
+  const frozen = runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${freezeRef(assignment.workspace_guid)}^{commit}`]).trim();
+  return mode === 'rerebase'
+    ? rerebaseFromFrozen(worktree, assignment, frozen)
+    : restoreFrozen(worktree, frozen);
 }
 
 /** Crash recovery only advances a durable ready row once its record is reachable. */
@@ -728,6 +928,22 @@ export function reconcileFinalization(db: Database.Database, input: ReconcileFin
   const exact = exactAssignment(db, input.repositoryPath, input.workspaceGuid, input.providerRootSessionId);
   const assignment = exact.assignment;
   fencePrimaryCheckout(db, assignment.repository_identity);
+  // A 'status' request is a strictly NON-mutating, lifecycle-aware probe. It must
+  // return BEFORE the integrated-cleanup branch below (which resets/cleans and REMOVES
+  // the worktree) so a probe never mutates. exactAssignment + fencePrimaryCheckout above
+  // touch only the DB and repo discovery, so this is the earliest non-mutating point.
+  // An integrated row's worktree may already be gone, so it never calls
+  // classifyRebaseState (which runs git in the worktree).
+  if (input.rebaseRecovery === 'status') {
+    if (assignment.lifecycle_status === 'integrated') {
+      return { state: 'integrated' };
+    }
+    if (assignment.lifecycle_status === 'ready_for_integration') {
+      const state = classifyRebaseState(assignment.worktree_path);
+      return { state, detail: `Managed finalization worktree state: ${state}.` };
+    }
+    return { state: 'not-ready' };
+  }
   if (assignment.lifecycle_status === 'integrated') {
     const candidate = runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${candidateRef(assignment.workspace_guid)}^{commit}`]).trim();
     if (assignment.integrated_commit !== candidate) {
@@ -763,19 +979,78 @@ export function reconcileFinalization(db: Database.Database, input: ReconcileFin
     } else if (worktreeHead(assignment.worktree_path) !== candidate) {
       throw new Error('Integrated assignment source HEAD differs from candidate; preserving worktree');
     }
-    cleanupFinalized(db, exact.primaryCheckoutPath, assignment);
+    recycleFinalized(db, exact.primaryCheckoutPath, assignment);
     return { state: 'cleaned', integratedCommit: assignment.integrated_commit ?? undefined };
   }
   if (assignment.lifecycle_status !== 'ready_for_integration') {
     throw new Error('No ready finalization is available for reconciliation');
   }
-  const record = db.prepare(`
+  // No-paused-rebase recovery runs BEFORE the continue/abort guard: those modes
+  // recover a ready row whose finalization drifted and was reset to frozen with NO
+  // rebase in progress, so the guard below (which requires a paused rebase) must not
+  // see them. Returning here also keeps recoverRebaseInProgress on 'continue'|'abort'.
+  // ('status' is handled by the non-mutating early-return at the top of this function.)
+  if (input.rebaseRecovery === 'rerebase'
+    || input.rebaseRecovery === 'restore_frozen') {
+    return recoverNoPausedRebase(exact, input.rebaseRecovery);
+  }
+  if (input.rebaseRecovery) {
+    // Managed rebase recovery applies only while a rebase is actually paused.
+    // Without this guard, an 'abort' request on a non-rebase ready row would fall
+    // through to the frozen-replay path below and integrate — the inverse of abort.
+    const rebaseInProgressDir = runGit(assignment.worktree_path, ['rev-parse', '--git-path', 'rebase-merge']).trim();
+    if (!existsSync(path.resolve(assignment.worktree_path, rebaseInProgressDir))) {
+      throw new Error('Rebase recovery requested but no rebase is in progress; preserving worktree');
+    }
+  }
+  let record = db.prepare(`
     SELECT target_ref, integrated_commit FROM integration_records
     WHERE workspace_guid = ? AND repository_identity = ?
   `).get(assignment.workspace_guid, assignment.repository_identity) as {
     target_ref: string;
     integrated_commit: string;
   } | undefined;
+  if (record) {
+    // A reused workspace GUID can carry a STALE integration_records row from its
+    // prior lifecycle: main has since advanced past record.integrated_commit, so
+    // the record-present branch below would throw 'lacks reachable integration
+    // proof' on every reconciliation attempt, permanently stranding the row.
+    // Both proofs are required before deleting a durable record on a crash-
+    // recovery path — ancestry alone is not proof of staleness (a healthy,
+    // never-advanced record is trivially its own ancestor).
+    const staleCheckRef = targetRef(assignment);
+    const recordIsAncestorOfTarget = isAncestor(exact.primaryCheckoutPath, record.integrated_commit, staleCheckRef);
+    let staleCheckCandidate: string | undefined;
+    try {
+      staleCheckCandidate = runGit(
+        exact.primaryCheckoutPath, ['rev-parse', '--verify', `${candidateRef(assignment.workspace_guid)}^{commit}`],
+      ).trim();
+    } catch { /* an absent candidate is not provable staleness; refuse below */ }
+    const recordIsProvenStale = recordIsAncestorOfTarget
+      && staleCheckCandidate !== undefined
+      && staleCheckCandidate !== record.integrated_commit;
+    if (recordIsProvenStale) {
+      deleteIntegrationRecord(db, assignment.workspace_guid);
+      record = undefined;
+      // Finding 1: recycleFinalized deletes the prior lifecycle's candidate ref
+      // best-effort AFTER its DB commit, so a leftover candidate ref can survive
+      // and mismatch source HEAD, which would otherwise throw 'candidate and
+      // source HEAD differ' in the no-record branch below. Clear it ONLY when
+      // proven leftover (neither the current target nor the current source
+      // HEAD), gated inside this proven-stale block, so the genuine no-record
+      // 'candidate differs from source HEAD' case is untouched and its candidate
+      // is never cleared.
+      const staleCheckSourceHead = worktreeHead(assignment.worktree_path);
+      const staleCheckCurrentTarget = runGit(
+        exact.primaryCheckoutPath, ['rev-parse', '--verify', `${staleCheckRef}^{commit}`],
+      ).trim();
+      if (staleCheckCandidate !== staleCheckCurrentTarget && staleCheckCandidate !== staleCheckSourceHead) {
+        try {
+          runGit(exact.primaryCheckoutPath, ['update-ref', '-d', candidateRef(assignment.workspace_guid)]);
+        } catch { /* candidate ref already absent */ }
+      }
+    }
+  }
   if (!record) {
     const sourceHead = worktreeHead(assignment.worktree_path);
     const ref = targetRef(assignment);
@@ -788,6 +1063,11 @@ export function reconcileFinalization(db: Database.Database, input: ReconcileFin
     }
     const rebaseDirectory = runGit(assignment.worktree_path, ['rev-parse', '--git-path', 'rebase-merge']).trim();
     if (existsSync(path.resolve(assignment.worktree_path, rebaseDirectory))) {
+      if (input.rebaseRecovery) {
+        // Only 'continue'|'abort' reach here — the no-paused-rebase modes returned
+        // above. Narrow explicitly rather than widen recoverRebaseInProgress's mode.
+        return recoverRebaseInProgress(db, exact, input.rebaseRecovery === 'abort' ? 'abort' : 'continue');
+      }
       throw new Error('Crash reconciliation requires reviewed rebase-conflict repair before retry');
     }
     // Crash may have happened after checkout-owned fast-forward but before
@@ -822,7 +1102,7 @@ export function reconcileFinalization(db: Database.Database, input: ReconcileFin
             pushError: 'Remote has not proved the exact integrated candidate',
           };
         }
-        cleanupFinalized(db, exact.primaryCheckoutPath, integrated);
+        recycleFinalized(db, exact.primaryCheckoutPath, integrated);
         return { state: 'cleaned', integratedCommit: candidate };
       } finally {
         if (integrationRecorded) {
@@ -851,13 +1131,16 @@ export function reconcileFinalization(db: Database.Database, input: ReconcileFin
     );
     return finishLocalIntegration(db, local);
   }
+  // `record` is captured below inside a db.transaction() closure; TypeScript does
+  // not narrow a `let` through a closure boundary, so pin the durable value here.
+  const durableRecord = record;
   const ref = targetRef(assignment);
-  if (record.target_ref !== ref
-    || runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${ref}^{commit}`]).trim() !== record.integrated_commit) {
+  if (durableRecord.target_ref !== ref
+    || runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${ref}^{commit}`]).trim() !== durableRecord.integrated_commit) {
     throw new Error('Crash reconciliation lacks reachable integration proof; preserving worktree');
   }
   const candidate = runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${candidateRef(assignment.workspace_guid)}^{commit}`]).trim();
-  if (candidate !== record.integrated_commit || worktreeHead(assignment.worktree_path) !== candidate) {
+  if (candidate !== durableRecord.integrated_commit || worktreeHead(assignment.worktree_path) !== candidate) {
     throw new Error('Crash reconciliation candidate/source proof differs; preserving worktree');
   }
   const integrationPending = decodeIntegrationPendingDisposition(assignment.disposition);
@@ -879,7 +1162,7 @@ export function reconcileFinalization(db: Database.Database, input: ReconcileFin
     const result = db.prepare(`
       UPDATE assignments SET integrated_commit = ?, current_head = ?, disposition = ?, updated_at = datetime('now')
       WHERE workspace_guid = ? AND lifecycle_status = 'ready_for_integration'
-    `).run(record.integrated_commit, record.integrated_commit, nextDisposition, assignment.workspace_guid);
+    `).run(durableRecord.integrated_commit, durableRecord.integrated_commit, nextDisposition, assignment.workspace_guid);
     if (result.changes !== 1) throw new Error('Crash reconciliation assignment state changed concurrently');
     transitionAssignment(db, assignment.workspace_guid, 'ready_for_integration', 'integrated');
   })();
@@ -887,10 +1170,10 @@ export function reconcileFinalization(db: Database.Database, input: ReconcileFin
   if (nextDisposition) {
     return {
       state: 'integrated-local',
-      integratedCommit: record.integrated_commit,
+      integratedCommit: durableRecord.integrated_commit,
       pushError: 'Remote has not proved the exact integrated candidate',
     };
   }
-  cleanupFinalized(db, exact.primaryCheckoutPath, integrated);
-  return { state: 'cleaned', integratedCommit: record.integrated_commit };
+  recycleFinalized(db, exact.primaryCheckoutPath, integrated);
+  return { state: 'cleaned', integratedCommit: durableRecord.integrated_commit };
 }

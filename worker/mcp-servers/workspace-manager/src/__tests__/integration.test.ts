@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
   acquireIntegrationLock,
@@ -13,7 +13,8 @@ import {
   releaseIntegrationLock,
 } from '../db.js';
 import { verifyDirectGitAuthority, type CommitAndPushEvidence, type CommitEvidence, type PushEvidence } from '../git-authority.js';
-import { finalizeCommanderLocalCommit, finalizeDirectAuthority, reconcileFinalization } from '../integration.js';
+import { finalizeCommanderLocalCommit, finalizeDirectAuthority, reconcileFinalization, recycleFinalized } from '../integration.js';
+import { createInternalCommandDependencies } from '../cli.js';
 import { WorkspaceService } from '../workspace-service.js';
 import type { Assignment } from '../types.js';
 
@@ -118,6 +119,79 @@ describe('finalization coordinator', () => {
     return { frozen, candidate, destinationRef, disposition };
   }
 
+  // Seeds a real conflict-based mid-rebase: the integration rebase stops with
+  // README.md unmerged, the assignment left in ready_for_integration with a
+  // durable frozen ref. Mirrors the conflict path exercised at the refusal test.
+  function seedConflictMidRebase() {
+    const s = setup(false);
+    git(s.root, 'checkout', '-b', 'target-change');
+    writeFileSync(join(s.root, 'README.md'), 'target\n');
+    git(s.root, 'add', 'README.md');
+    git(s.root, 'commit', '-m', 'target change');
+    git(s.root, 'checkout', 'main');
+    git(s.root, 'merge', '--ff-only', 'target-change');
+    writeFileSync(join(s.assignment.worktree_path, 'README.md'), 'source\n');
+    git(s.assignment.worktree_path, 'add', 'README.md');
+    const authority = issueAndVerify(s.database, s.assignment, 'commit', commitEvidence(s.assignment));
+    expect(() => finalizeDirectAuthority(s.database, authority, 'conflict')).toThrow();
+    return s;
+  }
+
+  // Seeds a ready assignment whose finalization drifted with NO paused rebase: the
+  // reviewed work is committed and frozen, the integration target has advanced, and
+  // the worktree is reset --hard back to the frozen commit ATTACHED on its branch —
+  // exactly the state finalize's :468-471 catch leaves after a mid-rebase drift throw.
+  // `conflicting` decides whether the target change collides with the reviewed line.
+  function seedFrozenReadyNoRebase(conflicting: boolean) {
+    const { root, database, assignment } = setup(false);
+    const wt = assignment.worktree_path;
+    if (conflicting) {
+      writeFileSync(join(wt, 'README.md'), 'source line\n');
+      git(wt, 'add', 'README.md');
+    }
+    git(wt, 'commit', '-m', 'reviewed work');
+    const frozen = git(wt, 'rev-parse', 'HEAD');
+    if (conflicting) {
+      writeFileSync(join(root, 'README.md'), 'target line\n');
+      git(root, 'add', 'README.md');
+    } else {
+      writeFileSync(join(root, 'target.txt'), 'advanced target\n');
+      git(root, 'add', 'target.txt');
+    }
+    git(root, 'commit', '-m', 'advance integration target');
+    git(root, 'update-ref', `refs/ironclaude/finalization/${assignment.workspace_guid}/frozen`, frozen);
+    database.prepare("UPDATE assignments SET lifecycle_status = 'ready_for_integration' WHERE workspace_guid = ?")
+      .run(assignment.workspace_guid);
+    git(wt, 'reset', '--hard', frozen);
+    expect(existsSync(resolve(wt, git(wt, 'rev-parse', '--git-path', 'rebase-merge')))).toBe(false);
+    return { root, database, assignment, wt, frozen };
+  }
+
+  // Seeds an integrated row with NO disposition whose worktree HEAD is the candidate:
+  // exactly the shape whose plain-reconcile integrated branch reaches recycleFinalized
+  // (disposition null -> else-if worktreeHead === candidate -> recycleFinalized recycles
+  // the worktree in place). Shared by the status-probe survival test and the plain-reconcile
+  // recycle test so the "worktree survives after status" assertion is provably
+  // meaningful: the very same seed IS recycled by a plain reconcile.
+  function seedIntegratedNoDisposition(state: ReturnType<typeof setup>) {
+    git(state.assignment.worktree_path, 'commit', '-m', 'frozen authorized commit');
+    const frozen = git(state.assignment.worktree_path, 'rev-parse', 'HEAD');
+    git(state.assignment.worktree_path, 'commit', '--allow-empty', '-m', 'rebased integration candidate');
+    const candidate = git(state.assignment.worktree_path, 'rev-parse', 'HEAD');
+    git(state.root, 'merge', '--ff-only', candidate);
+    git(state.root, 'update-ref', `refs/ironclaude/finalization/${state.assignment.workspace_guid}/frozen`, frozen);
+    git(state.root, 'update-ref', `refs/ironclaude/finalization/${state.assignment.workspace_guid}/candidate`, candidate);
+    recordIntegration(state.database, {
+      workspaceGuid: state.assignment.workspace_guid, repositoryIdentity: state.assignment.repository_identity,
+      targetRef: 'refs/heads/main', integratedCommit: candidate,
+    });
+    state.database.prepare(`
+      UPDATE assignments SET lifecycle_status = 'integrated', integrated_commit = ?, current_head = ?, disposition = NULL
+      WHERE workspace_guid = ?
+    `).run(candidate, candidate, state.assignment.workspace_guid);
+    return { frozen, candidate };
+  }
+
   function issueAndVerify(
     database: ReturnType<typeof initDb>, assignment: Assignment, operation: 'commit' | 'commit-and-push' | 'push',
     evidence: CommitEvidence | CommitAndPushEvidence | PushEvidence,
@@ -145,9 +219,10 @@ describe('finalization coordinator', () => {
     expect(git(root, 'log', '-1', '--format=%s')).toBe('approved direct commit');
     expect(readFileSync(join(root, 'work.txt'), 'utf8')).toBe('approved\n');
     expect(git(root, 'status', '--porcelain=v1', '--untracked-files=all')).toBe('');
-    expect(existsSync(assignment.worktree_path)).toBe(false);
-    expect(database.prepare('SELECT integrated_commit FROM assignments WHERE workspace_guid = ?').get(assignment.workspace_guid))
-      .toMatchObject({ integrated_commit: git(root, 'rev-parse', 'HEAD') });
+    expect(existsSync(assignment.worktree_path)).toBe(true);
+    const integratedCommit = git(root, 'rev-parse', 'HEAD');
+    expect(database.prepare('SELECT lifecycle_status, base_commit, integrated_commit FROM assignments WHERE workspace_guid = ?').get(assignment.workspace_guid))
+      .toMatchObject({ lifecycle_status: 'active', base_commit: integratedCommit, integrated_commit: null });
     expect(git(root, 'show-ref', '--verify', `refs/ironclaude/finalization/${assignment.workspace_guid}/frozen`)).not.toBe('');
   });
 
@@ -160,6 +235,69 @@ describe('finalization coordinator', () => {
 
     expect(result.state).toBe('cleaned');
     expect(git(root, 'ls-remote', '--refs', 'origin', `refs/heads/${assignment.branch}`)).toBe('');
+  });
+
+  it('recycles the managed worktree in place after a clean Commander local integration', () => {
+    const { root, database, assignment } = setup(false);
+
+    const result = finalizeCommanderLocalCommit(
+      database, commanderInput(root, assignment, 'clean local integration'),
+    );
+
+    expect(result.state).toBe('cleaned');
+    const integratedCommit = result.integratedCommit!;
+    expect(git(root, 'rev-parse', 'HEAD')).toBe(integratedCommit);
+    // Worktree survives at the integrated commit — no removal, no reset.
+    expect(existsSync(assignment.worktree_path)).toBe(true);
+    expect(git(assignment.worktree_path, 'rev-parse', 'HEAD')).toBe(integratedCommit);
+    expect(database.prepare('SELECT lifecycle_status, base_commit, integrated_commit FROM assignments WHERE workspace_guid = ?')
+      .get(assignment.workspace_guid))
+      .toMatchObject({ lifecycle_status: 'active', base_commit: integratedCommit, integrated_commit: null });
+  });
+
+  it('permits a SECOND finalize in the same recycled session without an integration-record collision', () => {
+    const { root, database, assignment } = setup(false);
+    expect(finalizeCommanderLocalCommit(database, commanderInput(root, assignment, 'first local integration')).state)
+      .toBe('cleaned');
+
+    // The recycled worktree still exists at the integrated commit: stage fresh reviewed work.
+    writeFileSync(join(assignment.worktree_path, 'second.txt'), 'more approved work\n');
+    git(assignment.worktree_path, 'add', 'second.txt');
+    const recycled = database.prepare('SELECT * FROM assignments WHERE workspace_guid = ?')
+      .get(assignment.workspace_guid) as Assignment;
+
+    // Without the integration_records DELETE the 2nd markIntegrated INSERT would throw
+    // SQLITE_CONSTRAINT: integration_records.workspace_guid.
+    const second = finalizeCommanderLocalCommit(database, commanderInput(root, recycled, 'second local integration'));
+
+    expect(second.state).toBe('cleaned');
+    expect(readFileSync(join(root, 'second.txt'), 'utf8')).toBe('more approved work\n');
+    expect(git(root, 'log', '-1', '--format=%s')).toBe('second local integration');
+  });
+
+  it('push-pending integration preserves the worktree and leaves the row integrated (unchanged path)', () => {
+    const s = setup(true);
+    seedIntegratedPushPending(s);
+
+    // Remote never proved the candidate ref: reconcile stays push-pending, never recycles.
+    const result = reconcileFinalization(s.database, {
+      repositoryPath: s.root, workspaceGuid: s.assignment.workspace_guid, providerRootSessionId: OWNER,
+    });
+
+    expect(result.state).toBe('integrated-local');
+    expect(existsSync(s.assignment.worktree_path)).toBe(true);
+    expect(s.database.prepare('SELECT lifecycle_status FROM assignments WHERE workspace_guid = ?')
+      .get(s.assignment.workspace_guid)).toMatchObject({ lifecycle_status: 'integrated' });
+  });
+
+  it('refuses to recycle a non-integrated (active) assignment and preserves the worktree', () => {
+    const { root, database, assignment } = setup(false);
+    // The freshly-materialized row is active, not integrated: recycle must refuse.
+    expect(() => recycleFinalized(database, root, assignment))
+      .toThrow(/Recycle requires a durable integrated assignment/);
+    expect(existsSync(assignment.worktree_path)).toBe(true);
+    expect(database.prepare('SELECT lifecycle_status FROM assignments WHERE workspace_guid = ?')
+      .get(assignment.workspace_guid)).toMatchObject({ lifecycle_status: 'active' });
   });
 
   it('requires exact private Commander input bound to owner, assignment, ref, and tree', () => {
@@ -593,6 +731,18 @@ describe('finalization coordinator', () => {
     expect(git(inactive.assignment.worktree_path, 'log', '-1', '--format=%s')).toBe('initial');
   });
 
+  it('refuses to freeze a dirty managed worktree, leaving the assignment active and unfrozen', () => {
+    const { database, assignment } = setup(false);
+    const authority = issueAndVerify(database, assignment, 'commit', commitEvidence(assignment));
+    writeFileSync(join(assignment.worktree_path, 'stray.txt'), 'untracked stray file\n');
+
+    expect(() => finalizeDirectAuthority(database, authority, 'dirty tree at freeze'))
+      .toThrow(/uncommitted changes[\s\S]*stray\.txt/);
+
+    expect(database.prepare('SELECT lifecycle_status FROM assignments WHERE workspace_guid = ?')
+      .get(assignment.workspace_guid)).toMatchObject({ lifecycle_status: 'active' });
+  });
+
   it('rejects post-review index mutation for direct and reviewed Commander commits', () => {
     const direct = setup(false);
     const directAuthority = issueAndVerify(direct.database, direct.assignment, 'commit', commitEvidence(direct.assignment));
@@ -610,6 +760,36 @@ describe('finalization coordinator', () => {
       ...reviewed,
     })).toThrow('Reviewed commit evidence changed');
     expect(git(commander.assignment.worktree_path, 'log', '-1', '--format=%s')).toBe('initial');
+  });
+
+  it('reaps a terminal primary owner so finalization is no longer fenced, but a live owner still fences', () => {
+    const terminal = setup(false);
+    const staleOther = new WorkspaceService(terminal.database)
+      .ensureSessionWorktree({ repositoryPath: terminal.root, ownerSessionId: OTHER });
+    terminal.database.prepare("UPDATE assignments SET lifecycle_status = 'abandoned' WHERE workspace_guid = ?")
+      .run(staleOther.workspace_guid);
+    terminal.database.prepare(`
+      INSERT INTO primary_checkout_owners (repository_identity, workspace_guid, owner_session_id)
+      VALUES (?, ?, ?)
+    `).run(staleOther.repository_identity, staleOther.workspace_guid, OTHER);
+    // Falsifier: pre-fix fencePrimaryCheckout throws 'fenced' on ANY owner row.
+    expect(finalizeCommanderLocalCommit(
+      terminal.database, commanderInput(terminal.root, terminal.assignment, 'reviewed over a reaped stale owner'),
+    ).state).toBe('cleaned');
+    expect(terminal.database.prepare('SELECT 1 FROM primary_checkout_owners WHERE repository_identity = ?')
+      .get(terminal.assignment.repository_identity)).toBeUndefined();
+
+    const live = setup(false);
+    const liveOther = new WorkspaceService(live.database)
+      .ensureSessionWorktree({ repositoryPath: live.root, ownerSessionId: OTHER });
+    live.database.prepare(`
+      INSERT INTO primary_checkout_owners (repository_identity, workspace_guid, owner_session_id)
+      VALUES (?, ?, ?)
+    `).run(liveOther.repository_identity, liveOther.workspace_guid, OTHER);
+    expect(() => finalizeCommanderLocalCommit(
+      live.database, commanderInput(live.root, live.assignment, 'must stay fenced'),
+    )).toThrow('fenced');
+    expect(git(live.assignment.worktree_path, 'log', '-1', '--format=%s')).toBe('initial');
   });
 
   it('fences push-only authority at Task4 before Task3 can mutate a primary-owned checkout', () => {
@@ -722,6 +902,104 @@ describe('finalization coordinator', () => {
       });
   });
 
+  it('self-heals a reused-GUID strand carrying a stale integration record, by deleting it and re-integrating', () => {
+    const stale = setup(true);
+    git(stale.assignment.worktree_path, 'commit', '-m', 'candidate work');
+    const candidateCommit = git(stale.assignment.worktree_path, 'rev-parse', 'HEAD');
+    const preFfTip = git(stale.root, 'rev-parse', 'HEAD');
+    git(stale.root, 'update-ref', `refs/ironclaude/finalization/${stale.assignment.workspace_guid}/frozen`, candidateCommit);
+    acquireIntegrationLock(stale.database, {
+      repositoryIdentity: stale.assignment.repository_identity,
+      workspaceGuid: stale.assignment.workspace_guid,
+      targetRef: 'refs/heads/main', expectedTarget: preFfTip,
+    });
+    git(stale.root, 'merge', '--ff-only', candidateCommit);
+    git(stale.root, 'update-ref', `refs/ironclaude/finalization/${stale.assignment.workspace_guid}/candidate`, candidateCommit);
+    const destinationRef = `refs/heads/${stale.assignment.branch}`;
+    stale.database.prepare(`
+      UPDATE assignments SET lifecycle_status = 'ready_for_integration', disposition = ? WHERE workspace_guid = ?
+    `).run(JSON.stringify({
+      phase: 'integration-pending', frozenCommit: candidateCommit, remoteName: 'origin',
+      remoteUrl: git(stale.assignment.worktree_path, 'remote', 'get-url', 'origin'),
+      destinationRef, expectedRemoteOldOid: null,
+    }), stale.assignment.workspace_guid);
+    // Falsifier: pre-fix a truthy record ALWAYS takes the record-present branch, so
+    // this stale row (integrated_commit = the pre-ff tip, not the ff'd candidate)
+    // throws immediately instead of self-healing.
+    recordIntegration(stale.database, {
+      workspaceGuid: stale.assignment.workspace_guid,
+      repositoryIdentity: stale.assignment.repository_identity,
+      targetRef: 'refs/heads/main', integratedCommit: preFfTip,
+    });
+
+    const result = reconcileFinalization(stale.database, {
+      repositoryPath: stale.root, workspaceGuid: stale.assignment.workspace_guid, providerRootSessionId: OWNER,
+    });
+    expect(result).toMatchObject({ state: 'integrated-local', integratedCommit: candidateCommit });
+    expect(existsSync(stale.assignment.worktree_path)).toBe(true);
+    expect(stale.database.prepare('SELECT lifecycle_status FROM assignments WHERE workspace_guid = ?')
+      .get(stale.assignment.workspace_guid)).toMatchObject({ lifecycle_status: 'integrated' });
+    expect(stale.database.prepare('SELECT integrated_commit FROM integration_records WHERE workspace_guid = ?')
+      .get(stale.assignment.workspace_guid)).toMatchObject({ integrated_commit: candidateCommit });
+    expect(git(stale.root, 'ls-remote', '--refs', 'origin', destinationRef)).toBe('');
+  });
+
+  it('clears a proven-leftover candidate ref alongside a stale record and self-heals via frozen replay (push-human-only preserved)', () => {
+    const leftover = setup(true);
+    const rootTip = git(leftover.root, 'rev-parse', 'HEAD');
+    git(leftover.assignment.worktree_path, 'commit', '-m', 'work F');
+    const workF = git(leftover.assignment.worktree_path, 'rev-parse', 'HEAD');
+    // Main advances independently of the assignment (never merges workF), so the
+    // pre-existing tip is a strict ancestor of the new target and distinct from F.
+    git(leftover.root, 'commit', '--allow-empty', '-m', 'main advances independently');
+    const staleCandidateTree = git(leftover.root, 'rev-parse', `${rootTip}^{tree}`);
+    const staleCandidate = git(leftover.root, 'commit-tree', staleCandidateTree, '-p', rootTip, '-m', 'stale leftover candidate');
+    git(leftover.root, 'update-ref', `refs/ironclaude/finalization/${leftover.assignment.workspace_guid}/frozen`, workF);
+    git(leftover.root, 'update-ref', `refs/ironclaude/finalization/${leftover.assignment.workspace_guid}/candidate`, staleCandidate);
+    const destinationRef = `refs/heads/${leftover.assignment.branch}`;
+    leftover.database.prepare(`
+      UPDATE assignments SET lifecycle_status = 'ready_for_integration', disposition = ? WHERE workspace_guid = ?
+    `).run(JSON.stringify({
+      phase: 'integration-pending', frozenCommit: workF, remoteName: 'origin',
+      remoteUrl: git(leftover.assignment.worktree_path, 'remote', 'get-url', 'origin'),
+      destinationRef, expectedRemoteOldOid: null,
+    }), leftover.assignment.workspace_guid);
+    // No integration lock held: this exercises recovery from a durable ready row
+    // with no lock, no fresh candidate, only a frozen commit and a leftover ref.
+    recordIntegration(leftover.database, {
+      workspaceGuid: leftover.assignment.workspace_guid,
+      repositoryIdentity: leftover.assignment.repository_identity,
+      targetRef: 'refs/heads/main', integratedCommit: rootTip,
+    });
+
+    const result = reconcileFinalization(leftover.database, {
+      repositoryPath: leftover.root, workspaceGuid: leftover.assignment.workspace_guid, providerRootSessionId: OWNER,
+    });
+    expect(result.state).toBe('integrated-local');
+    // The frozen-replay path structurally cannot push (the only push sites are
+    // inside finalizeDirectAuthority), so this is a hard push-human-only guard.
+    expect(git(leftover.root, 'ls-remote', '--refs', 'origin', destinationRef)).toBe('');
+    expect(existsSync(leftover.assignment.worktree_path)).toBe(true);
+  });
+
+  it('refuses a stale record with no candidate ref: absence is not provable staleness, and the record is never deleted', () => {
+    const absentCandidate = setup(false);
+    const originalTip = git(absentCandidate.root, 'rev-parse', 'HEAD');
+    git(absentCandidate.root, 'commit', '--allow-empty', '-m', 'main advances');
+    absentCandidate.database.prepare("UPDATE assignments SET lifecycle_status = 'ready_for_integration' WHERE workspace_guid = ?")
+      .run(absentCandidate.assignment.workspace_guid);
+    recordIntegration(absentCandidate.database, {
+      workspaceGuid: absentCandidate.assignment.workspace_guid,
+      repositoryIdentity: absentCandidate.assignment.repository_identity,
+      targetRef: 'refs/heads/main', integratedCommit: originalTip,
+    });
+    expect(() => reconcileFinalization(absentCandidate.database, {
+      repositoryPath: absentCandidate.root, workspaceGuid: absentCandidate.assignment.workspace_guid, providerRootSessionId: OWNER,
+    })).toThrow('reachable integration proof');
+    expect(absentCandidate.database.prepare('SELECT 1 FROM integration_records WHERE workspace_guid = ?')
+      .get(absentCandidate.assignment.workspace_guid)).toBeTruthy();
+  });
+
   it('restores an integrated C&P candidate from durable pending-push state before judging remote outcome', () => {
     const pending = setup(true);
     git(pending.assignment.worktree_path, 'commit', '-m', 'frozen authorized commit');
@@ -800,7 +1078,7 @@ describe('finalization coordinator', () => {
     });
 
     expect(result).toMatchObject({ state: 'cleaned', integratedCommit: candidate });
-    expect(existsSync(pushed.assignment.worktree_path)).toBe(false);
+    expect(existsSync(pushed.assignment.worktree_path)).toBe(true);
     expect(pushed.database.prepare('SELECT disposition FROM assignments WHERE workspace_guid = ?').get(pushed.assignment.workspace_guid))
       .toMatchObject({ disposition: null });
     expect(git(pushed.root, 'ls-remote', '--refs', 'origin', destinationRef).split(/\s+/)[0]).toBe(candidate);
@@ -846,5 +1124,340 @@ describe('finalization coordinator', () => {
     expect(existsSync(failed.assignment.worktree_path)).toBe(true);
     expect(failed.database.prepare('SELECT disposition FROM assignments WHERE workspace_guid = ?')
       .get(failed.assignment.workspace_guid)).toMatchObject({ disposition: failedDisposition });
+  });
+
+  it('managed rebase recovery: a conflict-free mid-rebase continues, proofs pass, integrates (case A)', () => {
+    const { root, database, assignment } = setup(false);
+    const wt = assignment.worktree_path;
+    const base = assignment.base_commit;
+    // Reviewed work is a single disjoint-file commit (work.txt was staged by setup()).
+    git(wt, 'commit', '-m', 'reviewed work');
+    const frozen = git(wt, 'rev-parse', 'HEAD');
+    // Advance the target with a disjoint file so the replay never conflicts.
+    writeFileSync(join(root, 'target.txt'), 'advanced target\n');
+    git(root, 'add', 'target.txt');
+    git(root, 'commit', '-m', 'advance integration target');
+    git(root, 'update-ref', `refs/ironclaude/finalization/${assignment.workspace_guid}/frozen`, frozen);
+    database.prepare("UPDATE assignments SET lifecycle_status = 'ready_for_integration' WHERE workspace_guid = ?")
+      .run(assignment.workspace_guid);
+    // Seed a genuine conflict-free mid-rebase: rebase --onto main base, paused on `edit`.
+    try {
+      execFileSync('git', ['-C', wt, '-c', 'core.editor=true', 'rebase', '-i', '--onto', 'main', base], {
+        encoding: 'utf8', env: { ...process.env, GIT_SEQUENCE_EDITOR: "sed -i.bak 's/^pick/edit/'" },
+      });
+    } catch { /* rebase pauses at the `edit` stop; the state is asserted below */ }
+    expect(existsSync(resolve(wt, git(wt, 'rev-parse', '--git-path', 'rebase-merge')))).toBe(true);
+    expect(git(wt, 'diff', '--name-only', '--diff-filter=U')).toBe('');
+
+    const result = reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'continue',
+    });
+
+    expect(result.state).toBe('cleaned');
+    expect(result.integratedCommit).toBe(git(root, 'rev-parse', 'HEAD'));
+    expect(readFileSync(join(root, 'work.txt'), 'utf8')).toBe('approved\n');
+    expect(readFileSync(join(root, 'target.txt'), 'utf8')).toBe('advanced target\n');
+    expect(git(root, 'status', '--porcelain=v1', '--untracked-files=all')).toBe('');
+    expect(existsSync(wt)).toBe(true);
+  });
+
+  it('managed rebase recovery: unresolved conflicts STOP and do not advance the target (case B)', () => {
+    const s = seedConflictMidRebase();
+    const targetBefore = git(s.root, 'rev-parse', 'HEAD');
+    expect(git(s.assignment.worktree_path, 'diff', '--name-only', '--diff-filter=U')).toContain('README.md');
+
+    // The 'unresolved conflicts remain' prefix proves the op STOPPED before ever
+    // running `rebase --continue` — a re-conflict during continue carries a
+    // different prefix, so pinning the prefix (not just the path) falsifies the
+    // no-auto-resolve guard.
+    expect(() => reconcileFinalization(s.database, {
+      repositoryPath: s.root, workspaceGuid: s.assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'continue',
+    })).toThrow('unresolved conflicts remain');
+    expect(() => reconcileFinalization(s.database, {
+      repositoryPath: s.root, workspaceGuid: s.assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'continue',
+    })).toThrow('README.md');
+
+    expect(git(s.root, 'rev-parse', 'HEAD')).toBe(targetBefore);
+    // The rebase is left exactly as found — untouched, still in progress.
+    expect(existsSync(resolve(s.assignment.worktree_path,
+      git(s.assignment.worktree_path, 'rev-parse', '--git-path', 'rebase-merge')))).toBe(true);
+    expect(existsSync(s.assignment.worktree_path)).toBe(true);
+    expect(s.database.prepare('SELECT lifecycle_status FROM assignments WHERE workspace_guid = ?')
+      .get(s.assignment.workspace_guid)).toMatchObject({ lifecycle_status: 'ready_for_integration' });
+  });
+
+  it('managed rebase recovery: abort restores the frozen pre-rebase commit, target unchanged (case C)', () => {
+    const s = seedConflictMidRebase();
+    const frozen = git(s.root, 'rev-parse', `refs/ironclaude/finalization/${s.assignment.workspace_guid}/frozen`);
+    const targetBefore = git(s.root, 'rev-parse', 'HEAD');
+
+    const result = reconcileFinalization(s.database, {
+      repositoryPath: s.root, workspaceGuid: s.assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'abort',
+    });
+
+    expect(result.state).toBe('rebase-aborted');
+    expect(git(s.assignment.worktree_path, 'rev-parse', 'HEAD')).toBe(frozen);
+    expect(git(s.root, 'rev-parse', 'HEAD')).toBe(targetBefore);
+    expect(existsSync(s.assignment.worktree_path)).toBe(true);
+  });
+
+  it('managed rebase recovery: a content-changing resolution is REJECTED by the equality proof and routes to isRepair (case D)', () => {
+    const s = seedConflictMidRebase();
+    const wt = s.assignment.worktree_path;
+    const targetBefore = git(s.root, 'rev-parse', 'HEAD');
+    // Operator resolves the conflict in a way that CHANGES the tree (differs from reviewed 'source').
+    writeFileSync(join(wt, 'README.md'), 'resolved differently\n');
+    git(wt, 'add', 'README.md');
+    expect(git(wt, 'diff', '--name-only', '--diff-filter=U')).toBe('');
+
+    const result = reconcileFinalization(s.database, {
+      repositoryPath: s.root, workspaceGuid: s.assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'continue',
+    });
+
+    // The equality proof rejects the changed content: no equality-path integration.
+    expect(result.state).toBe('rebase-recovery-repair-required');
+    expect(git(s.root, 'rev-parse', 'HEAD')).toBe(targetBefore);
+    expect(existsSync(wt)).toBe(true);
+    expect(s.database.prepare('SELECT lifecycle_status FROM assignments WHERE workspace_guid = ?')
+      .get(s.assignment.workspace_guid)).toMatchObject({ lifecycle_status: 'ready_for_integration' });
+
+    // Routing proof: only a fresh isRepair commit authority integrates, advancing the target.
+    writeFileSync(join(wt, 'repair.txt'), 'fresh repair\n');
+    git(wt, 'add', 'repair.txt');
+    const repairAuthority = issueAndVerify(s.database, s.assignment, 'commit', commitEvidence(s.assignment));
+    expect(finalizeDirectAuthority(s.database, repairAuthority, 'fresh reviewed repair').state).toBe('cleaned');
+    expect(git(s.root, 'rev-parse', 'HEAD')).not.toBe(targetBefore);
+    // The resolved content and the fresh repair both landed on the target THROUGH
+    // the isRepair channel — never through the equality path.
+    expect(readFileSync(join(s.root, 'README.md'), 'utf8')).toBe('resolved differently\n');
+    expect(existsSync(join(s.root, 'repair.txt'))).toBe(true);
+    expect(existsSync(wt)).toBe(true);
+  });
+
+  it('managed rebase recovery: refuses when no rebase is in progress instead of integrating', () => {
+    const { root, database, assignment } = setup(false);
+    git(assignment.worktree_path, 'commit', '-m', 'reviewed work');
+    const frozen = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+    git(root, 'update-ref', `refs/ironclaude/finalization/${assignment.workspace_guid}/frozen`, frozen);
+    database.prepare("UPDATE assignments SET lifecycle_status = 'ready_for_integration' WHERE workspace_guid = ?")
+      .run(assignment.workspace_guid);
+    const targetBefore = git(root, 'rev-parse', 'HEAD');
+
+    expect(() => reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'abort',
+    })).toThrow('no rebase is in progress');
+
+    expect(git(root, 'rev-parse', 'HEAD')).toBe(targetBefore);
+    expect(existsSync(assignment.worktree_path)).toBe(true);
+    expect(database.prepare('SELECT lifecycle_status FROM assignments WHERE workspace_guid = ?')
+      .get(assignment.workspace_guid)).toMatchObject({ lifecycle_status: 'ready_for_integration' });
+  });
+
+  it('managed no-rebase recovery: status reports frozen-no-rebase, then rerebase replays frozen work onto the drifted target, ATTACHED, without integrating (case a)', () => {
+    const { root, database, assignment, wt } = seedFrozenReadyNoRebase(false);
+    const targetBefore = git(root, 'rev-parse', 'HEAD');
+
+    const status = reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'status',
+    });
+    expect(status.state).toBe('frozen-no-rebase');
+
+    const result = reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'rerebase',
+    });
+
+    expect(result.state).toBe('rebase-rerebased-ready-for-repair');
+    // ATTACHED: symbolic-ref succeeds (nonzero/throw when detached) and equals the branch.
+    expect(git(wt, 'symbolic-ref', '--quiet', '--short', 'HEAD')).toBe(assignment.branch);
+    expect(git(wt, 'rev-parse', 'HEAD')).toBe(result.detail);
+    // Both the reviewed work and the disjoint target change are present after replay.
+    expect(readFileSync(join(wt, 'work.txt'), 'utf8')).toBe('approved\n');
+    expect(readFileSync(join(wt, 'target.txt'), 'utf8')).toBe('advanced target\n');
+    // No paused rebase left behind; integration target NOT advanced.
+    expect(existsSync(resolve(wt, git(wt, 'rev-parse', '--git-path', 'rebase-merge')))).toBe(false);
+    expect(git(root, 'rev-parse', 'HEAD')).toBe(targetBefore);
+  });
+
+  it('managed no-rebase recovery: after a clean rerebase a fresh isRepair authority integrates the rebased content onto the target (case b, end-to-end)', () => {
+    const { root, database, assignment, wt } = seedFrozenReadyNoRebase(false);
+
+    const rerebased = reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'rerebase',
+    });
+    expect(rerebased.state).toBe('rebase-rerebased-ready-for-repair');
+
+    // A fresh reviewed repair commit atop the rebased head integrates: this proves the
+    // 2-arg rebase kept the branch ATTACHED, so validateExactCommitState's symbolic-ref
+    // and local===parent checks pass. A 3-arg detaching rebase would fail this path.
+    writeFileSync(join(wt, 'repair.txt'), 'fresh repair\n');
+    git(wt, 'add', 'repair.txt');
+    const repairAuthority = issueAndVerify(database, assignment, 'commit', commitEvidence(assignment));
+    expect(finalizeDirectAuthority(database, repairAuthority, 'fresh reviewed repair').state).toBe('cleaned');
+
+    // Rebased content + the fresh repair both landed on the target.
+    expect(readFileSync(join(root, 'work.txt'), 'utf8')).toBe('approved\n');
+    expect(readFileSync(join(root, 'target.txt'), 'utf8')).toBe('advanced target\n');
+    expect(existsSync(join(root, 'repair.txt'))).toBe(true);
+    expect(existsSync(wt)).toBe(true);
+  });
+
+  it('managed no-rebase recovery: a conflicting rerebase throws with the unmerged path and leaves a paused rebase (case c, status -> paused-conflict)', () => {
+    const { root, database, assignment, wt } = seedFrozenReadyNoRebase(true);
+    const targetBefore = git(root, 'rev-parse', 'HEAD');
+
+    // Pin the 'Rerebase conflicted' prefix AND the path: a raw git failure leaking
+    // through would satisfy a bare README.md match, so both together prove the branch.
+    expect(() => reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'rerebase',
+    })).toThrow('Rerebase conflicted');
+    expect(existsSync(resolve(wt, git(wt, 'rev-parse', '--git-path', 'rebase-merge')))).toBe(true);
+
+    const status = reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'status',
+    });
+    expect(status.state).toBe('rebase-paused-conflict');
+    // Target unchanged; rerebase never integrates.
+    expect(git(root, 'rev-parse', 'HEAD')).toBe(targetBefore);
+  });
+
+  it('managed no-rebase recovery: restore_frozen resets a clean worktree back to the frozen pre-rebase commit (case d)', () => {
+    const { root, database, assignment, wt, frozen } = seedFrozenReadyNoRebase(false);
+
+    const rerebased = reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'rerebase',
+    });
+    expect(rerebased.state).toBe('rebase-rerebased-ready-for-repair');
+    expect(git(wt, 'rev-parse', 'HEAD')).not.toBe(frozen);
+
+    const result = reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'restore_frozen',
+    });
+
+    expect(result.state).toBe('rebase-frozen-restored');
+    expect(git(wt, 'rev-parse', 'HEAD')).toBe(frozen);
+  });
+
+  it('reconcile status on an integrated row is non-mutating: returns integrated and preserves the worktree, target, and disposition', () => {
+    const s = setup(false);
+    const { candidate } = seedIntegratedNoDisposition(s);
+    const targetBefore = git(s.root, 'rev-parse', 'HEAD');
+
+    const status = reconcileFinalization(s.database, {
+      repositoryPath: s.root, workspaceGuid: s.assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'status',
+    });
+
+    // Crisp behavioral assertions first: pre-fix the integrated cleanup branch runs,
+    // returning 'cleaned' and REMOVING the worktree before the DB read below could run.
+    expect(status.state).toBe('integrated');
+    expect(existsSync(s.assignment.worktree_path)).toBe(true);
+    // A probe never advances the integration target or clears the disposition.
+    expect(git(s.root, 'rev-parse', 'HEAD')).toBe(targetBefore);
+    expect(s.database.prepare('SELECT lifecycle_status, disposition, integrated_commit FROM assignments WHERE workspace_guid = ?')
+      .get(s.assignment.workspace_guid))
+      .toMatchObject({ lifecycle_status: 'integrated', disposition: null, integrated_commit: candidate });
+  });
+
+  it('plain reconcile (no rebase_recovery) on that same integrated row STILL runs crash-recovery cleanup', () => {
+    const s = setup(false);
+    const { candidate } = seedIntegratedNoDisposition(s);
+
+    const result = reconcileFinalization(s.database, {
+      repositoryPath: s.root, workspaceGuid: s.assignment.workspace_guid, providerRootSessionId: OWNER,
+    });
+
+    expect(result).toMatchObject({ state: 'cleaned', integratedCommit: candidate });
+    // The mutating recycle path stays reachable without the probe: worktree recycled in place.
+    expect(existsSync(s.assignment.worktree_path)).toBe(true);
+  });
+
+  it('reconcile status on an integrated row whose worktree is gone returns integrated without probing the worktree', () => {
+    const s = setup(false);
+    seedIntegratedNoDisposition(s);
+    // Deregister AND delete the linked worktree so repository discovery survives (a
+    // dir removed by rmSync alone still lists in `git worktree list` and crashes
+    // discovery before the branch under test). This mirrors a post-cleanup integrated
+    // row whose worktree no longer exists.
+    git(s.root, 'worktree', 'remove', '--force', s.assignment.worktree_path);
+    expect(existsSync(s.assignment.worktree_path)).toBe(false);
+
+    // Pre-fix the integrated cleanup branch reads worktreeHead on the missing dir and
+    // throws; post-fix the top status early-return never calls classifyRebaseState or
+    // worktreeHead on an integrated row, so a gone worktree is fine.
+    const status = reconcileFinalization(s.database, {
+      repositoryPath: s.root, workspaceGuid: s.assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'status',
+    });
+    expect(status.state).toBe('integrated');
+  });
+
+  it('reconcile status on a ready frozen-no-rebase row still reports frozen-no-rebase', () => {
+    const { root, database, assignment } = seedFrozenReadyNoRebase(false);
+    const status = reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'status',
+    });
+    expect(status.state).toBe('frozen-no-rebase');
+  });
+
+  it('reconcile status on a ready paused-conflict row still reports rebase-paused-conflict', () => {
+    const conflict = seedConflictMidRebase();
+    const status = reconcileFinalization(conflict.database, {
+      repositoryPath: conflict.root, workspaceGuid: conflict.assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'status',
+    });
+    expect(status.state).toBe('rebase-paused-conflict');
+  });
+
+  it('reconcile status on an integrated push-pending row returns integrated without remote readback or disposition change', () => {
+    const s = setup();
+    const { disposition } = seedIntegratedPushPending(s);
+
+    // Pre-fix this row takes the integrated disposition branch (ls-remote readback +
+    // setDisposition) and returns 'integrated-local'; post-fix the top status
+    // early-return precedes all of it, so the push-pending disposition is untouched.
+    const status = reconcileFinalization(s.database, {
+      repositoryPath: s.root, workspaceGuid: s.assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'status',
+    });
+    expect(status.state).toBe('integrated');
+    expect(existsSync(s.assignment.worktree_path)).toBe(true);
+    expect(s.database.prepare('SELECT disposition FROM assignments WHERE workspace_guid = ?')
+      .get(s.assignment.workspace_guid)).toMatchObject({ disposition });
+  });
+
+  it('reconcile status on an active (not-ready) row returns not-ready without throwing', () => {
+    const { root, database, assignment } = setup(false);
+    const status = reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'status',
+    });
+    expect(status.state).toBe('not-ready');
+  });
+
+  it('managed no-rebase recovery: the reconcile validator accepts all five modes and rejects an unknown one (case e, bounded widening)', () => {
+    const { database } = setup(false);
+    const deps = createInternalCommandDependencies(database);
+    for (const mode of ['continue', 'abort', 'rerebase', 'restore_frozen', 'status'] as const) {
+      // Reaches past validation and fails on the missing guid/owner pairing, proving
+      // the value itself was accepted by optionalRebaseRecovery.
+      expect(() => deps.reconcile({ repository_path: '/x', rebase_recovery: mode }))
+        .toThrow('requires workspace_guid and owner_session_id');
+    }
+    expect(() => deps.reconcile({ repository_path: '/x', rebase_recovery: 'bogus' }))
+      .toThrow('rebase_recovery must be');
   });
 });

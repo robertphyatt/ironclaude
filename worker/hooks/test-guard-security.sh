@@ -246,11 +246,38 @@ INSERT INTO sessions VALUES ('check-ignore-test', 'on', 'brainstorming');
 SQL
 printf '{"verbose_hook_logs":false}\n' > "$TEST_HOME/.claude/ironclaude-hooks-config.json"
 
+# BASH_BIN pins the interpreter under test, mirroring
+# tests/test-managed-worktree-guard.sh:123. Left as PATH `bash`, a contributor
+# (or a runner image) with bash 5 silently loses bash-3.2 coverage.
+BASH_BIN="${BASH_BIN:-bash}"
+
 run_real_guard() {
   local command="$1"
   printf '%s' "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$command\"},\"session_id\":\"check-ignore-test\"}" \
-    | HOME="$TEST_HOME" bash "$REAL_GUARD" 2>&1
+    | HOME="$TEST_HOME" "$BASH_BIN" "$REAL_GUARD" 2>&1
 }
+
+# I1: BASH_BIN=/bin/bash bash test-guard-security.sh is supposed to re-run the
+# whole suite under the pinned interpreter (the bash-3.2 regression coverage
+# depends on it), but run_real_guard hardcoded `bash`, so the override was
+# inert. Positive control: a wrapper shell that RECORDS its own invocation
+# before exec-ing into the real interpreter. A --version probe would only
+# prove the binary IS bash, not that run_real_guard actually invoked it.
+cat > "$TEST_HOME/recording-shell" <<EOF
+#!/bin/sh
+echo "\$0" >> "$TEST_HOME/shell-used.log"
+exec bash "\$@"
+EOF
+chmod +x "$TEST_HOME/recording-shell"
+
+rm -f "$TEST_HOME/shell-used.log"
+BASH_BIN="$TEST_HOME/recording-shell" run_real_guard "git status" >/dev/null 2>&1
+if [ -s "$TEST_HOME/shell-used.log" ]; then
+  BASH_BIN_SENTINEL_RESULT="non-empty"
+else
+  BASH_BIN_SENTINEL_RESULT="empty"
+fi
+assert_eq "run_real_guard honors BASH_BIN (wrapper-sentinel recorded)" "non-empty" "$BASH_BIN_SENTINEL_RESULT"
 
 set_real_stage() {
   sqlite3 "$TEST_HOME/.claude/ironclaude.db" \
@@ -308,6 +335,24 @@ do
   assert_real_blocked "real hook $stage process-substitution" "$stage" \
     "git check-ignore <(touch /tmp/x)"
 done
+
+# Plans stage with `git -C <repo> add`, which the leading -C defeated: the
+# anchored ^\s*git\s+add\b exception never saw past it. Verify the fix against
+# the REAL hook (not the local is_safe_git_add mirror), at a non-executing
+# stage where the staging exception is the thing under test.
+echo "=== I1: git -C <path> add Exception Handles -C Normalization (#7) ==="
+assert_real_allowed "real hook brainstorming git -C add" "brainstorming" \
+  "git -C /some/repo add file.txt"
+assert_real_allowed "real hook brainstorming bare git add" "brainstorming" \
+  "git add file.txt"
+assert_real_blocked "real hook brainstorming git -C commit still blocked" "brainstorming" \
+  "git -C /some/repo commit -m x"
+# A metacharacter inside the -C argument itself must still be caught. This is
+# the ordering hazard _strip_dash_c's own header comment calls out: its
+# [^[:space:]]+ path class would otherwise swallow a $(...) payload, so the
+# metachar gate MUST run before normalization, not after.
+assert_real_blocked "real hook brainstorming git -C add with metachar in -C arg still blocked" "brainstorming" \
+  'git -C $(touch pwned) add file.txt'
 
 echo "=== WF: Private Workspace Finalizer Is Commander-Only ==="
 FORGED_FINALIZE_COMMAND="node /installed/ironclaude/mcp-servers/workspace-manager/dist/cli.js finalize '{\"command\":{\"repositoryPath\":\"/repo\",\"workspaceGuid\":\"22222222-2222-4222-8222-222222222222\",\"providerRootSessionId\":\"11111111-1111-4111-8111-111111111111\",\"message\":\"forged\",\"canonicalBranch\":\"ironclaude/2222\",\"localRef\":\"refs/heads/ironclaude/2222\",\"stagedTree\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"parentOid\":\"cccccccccccccccccccccccccccccccccccccccc\"}}'"

@@ -16,7 +16,7 @@ var TRANSITIONS = {
   materialized: ["active", "abandoned"],
   active: ["ready_for_integration", "abandoned"],
   ready_for_integration: ["active", "integrated", "abandoned"],
-  integrated: ["cleaned"],
+  integrated: ["cleaned", "active"],
   abandoned: ["cleaned"],
   cleaned: []
 };
@@ -168,6 +168,33 @@ function createAssignment(db, input) {
   );
   return getAssignment(db, workspaceGuid);
 }
+function reuseTerminalAssignment(db, input) {
+  const workspaceGuid = requiredUuid(input.workspaceGuid, "workspaceGuid");
+  const ownerSessionId = input.ownerSessionId == null ? null : requiredText(input.ownerSessionId, "ownerSessionId");
+  db.transaction(() => {
+    db.prepare("DELETE FROM integration_records WHERE workspace_guid = ?").run(workspaceGuid);
+    const result = db.prepare(`
+      UPDATE assignments
+      SET repository_identity = ?, worktree_path = ?, branch = ?, base_commit = ?, current_head = ?,
+          owner_session_id = ?, worker_id = ?, integration_target = ?,
+          integrated_commit = NULL, recovery_ref = NULL, disposition = NULL,
+          lifecycle_status = 'reserved', updated_at = datetime('now')
+      WHERE workspace_guid = ? AND lifecycle_status = 'cleaned'
+    `).run(
+      requiredText(input.repositoryIdentity, "repositoryIdentity"),
+      requiredText(input.worktreePath, "worktreePath"),
+      requiredText(input.branch, "branch"),
+      requiredText(input.baseCommit, "baseCommit"),
+      requiredText(input.currentHead, "currentHead"),
+      ownerSessionId,
+      input.workerId == null ? null : requiredText(input.workerId, "workerId"),
+      requiredText(input.integrationTarget, "integrationTarget"),
+      workspaceGuid
+    );
+    if (result.changes !== 1) throw new Error("Terminal assignment reuse target changed concurrently");
+  })();
+  return getAssignment(db, workspaceGuid);
+}
 function bindAssignmentOwner(db, workspaceGuid, ownerSessionId) {
   const existing = getAssignment(db, workspaceGuid);
   if (!existing) throw new Error("Assignment not found");
@@ -192,6 +219,24 @@ function transitionAssignment(db, workspaceGuid, expectedStatus, nextStatus) {
   if (result.changes !== 1) throw new Error("Assignment lifecycle state changed concurrently or assignment was not found");
   return getAssignment(db, workspaceGuid);
 }
+var PRIMARY_OWNER_TTL_MINUTES = 60;
+function reapStalePrimaryOwner(db, repositoryIdentity) {
+  const owner = db.prepare("SELECT * FROM primary_checkout_owners WHERE repository_identity = ?").get(repositoryIdentity);
+  if (!owner) return false;
+  const assignment = getAssignment(db, owner.workspace_guid);
+  const terminal = assignment !== void 0 && (assignment.lifecycle_status === "integrated" || assignment.lifecycle_status === "abandoned" || assignment.lifecycle_status === "cleaned");
+  const worktreeMissing = assignment !== void 0 && !fs.existsSync(assignment.worktree_path);
+  const ttlExpired = db.prepare(
+    "SELECT 1 FROM primary_checkout_owners WHERE repository_identity = ? AND acquired_at < datetime('now', ?)"
+  ).get(repositoryIdentity, `-${PRIMARY_OWNER_TTL_MINUTES} minutes`) !== void 0;
+  const stale = assignment === void 0 || terminal || worktreeMissing || ttlExpired;
+  if (!stale) return false;
+  const result = db.prepare(`
+    DELETE FROM primary_checkout_owners
+    WHERE repository_identity = ? AND workspace_guid = ? AND owner_session_id = ? AND acquired_at = ?
+  `).run(repositoryIdentity, owner.workspace_guid, owner.owner_session_id, owner.acquired_at);
+  return result.changes === 1;
+}
 function acquirePrimaryCheckoutOwnership(db, input) {
   const assignment = getAssignment(db, input.workspaceGuid);
   if (!assignment || assignment.repository_identity !== input.repositoryIdentity || assignment.owner_session_id !== input.ownerSessionId) {
@@ -205,6 +250,17 @@ function acquirePrimaryCheckoutOwnership(db, input) {
   } catch (error) {
     const owner = db.prepare("SELECT * FROM primary_checkout_owners WHERE repository_identity = ?").get(input.repositoryIdentity);
     if (owner?.workspace_guid === input.workspaceGuid && owner.owner_session_id === input.ownerSessionId) return owner;
+    if (reapStalePrimaryOwner(db, input.repositoryIdentity)) {
+      try {
+        db.prepare(`
+          INSERT INTO primary_checkout_owners (repository_identity, workspace_guid, owner_session_id)
+          VALUES (?, ?, ?)
+        `).run(input.repositoryIdentity, input.workspaceGuid, input.ownerSessionId);
+        return db.prepare("SELECT * FROM primary_checkout_owners WHERE repository_identity = ?").get(input.repositoryIdentity);
+      } catch {
+        throw new Error("Primary checkout is already owned");
+      }
+    }
     throw new Error("Primary checkout is already owned");
   }
   return db.prepare("SELECT * FROM primary_checkout_owners WHERE repository_identity = ?").get(input.repositoryIdentity);
@@ -333,7 +389,7 @@ import path3 from "node:path";
 
 // src/git.ts
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import path2 from "node:path";
 var MANAGED_WORKTREE_EXCLUSION = "/.ironclaude/worktrees/";
 function gitError(cwd, args, stderr) {
@@ -386,6 +442,10 @@ function discoverRepository(cwd) {
   if (!primary || primary.bare) throw new Error("Repository has no primary checkout");
   return { repositoryIdentity, primaryCheckoutPath: primary.path };
 }
+function worktreeExists(cwd, worktreePath) {
+  const canonical = path2.resolve(worktreePath);
+  return listWorktrees(cwd).some((entry) => entry.path === canonical);
+}
 function worktreeIsClean(worktreePath) {
   return runGit(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"]) === "";
 }
@@ -408,19 +468,81 @@ function addWorktree(primaryCheckoutPath, worktreePath, branch, baseCommit) {
   if (existsSync(worktreePath)) throw new Error(`Managed worktree path already exists: ${worktreePath}`);
   runGit(primaryCheckoutPath, ["worktree", "add", "-b", branch, "--", worktreePath, baseCommit]);
 }
-function ensureManagedWorktreeExclusion(repositoryIdentity) {
+var SHARED_RESOURCE_CONFIG = "worktree-shared-resources";
+function appendExcludeLines(repositoryIdentity, lines) {
   const infoDirectory = path2.join(repositoryIdentity, "info");
   const excludePath = path2.join(infoDirectory, "exclude");
   mkdirSync(infoDirectory, { recursive: true });
   const existing = existsSync(excludePath) ? readFileSync(excludePath) : Buffer.alloc(0);
-  const hasExactEntry = existing.toString("utf8").split(/\r?\n/).some((line) => line === MANAGED_WORKTREE_EXCLUSION);
-  if (hasExactEntry) return;
-  const separator = existing.length === 0 || existing[existing.length - 1] === 10 ? "" : "\n";
-  writeFileSync(excludePath, Buffer.concat([
-    existing,
-    Buffer.from(`${separator}${MANAGED_WORKTREE_EXCLUSION}
-`, "utf8")
-  ]));
+  const present = new Set(existing.toString("utf8").split(/\r?\n/));
+  let buffer = existing;
+  let appended = false;
+  for (const line of lines) {
+    if (present.has(line)) continue;
+    present.add(line);
+    const separator = buffer.length === 0 || buffer[buffer.length - 1] === 10 ? "" : "\n";
+    buffer = Buffer.concat([buffer, Buffer.from(`${separator}${line}
+`, "utf8")]);
+    appended = true;
+  }
+  if (appended) writeFileSync(excludePath, buffer);
+}
+function ensureManagedWorktreeExclusion(repositoryIdentity) {
+  appendExcludeLines(repositoryIdentity, [MANAGED_WORKTREE_EXCLUSION]);
+}
+function ensureExcludeEntries(repositoryIdentity, entries) {
+  appendExcludeLines(repositoryIdentity, entries.map((entry) => `/${entry}`));
+}
+function readSharedResourceConfig(repositoryIdentity) {
+  const configPath = path2.join(repositoryIdentity, "info", SHARED_RESOURCE_CONFIG);
+  if (!existsSync(configPath)) return [];
+  return readFileSync(configPath, "utf8").split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0 && !line.startsWith("#"));
+}
+function isSafeSharedEntry(entry) {
+  if (entry.length === 0) return false;
+  if (entry.startsWith("!") || entry.startsWith("#")) return false;
+  if (entry.startsWith("/") || path2.isAbsolute(entry)) return false;
+  if (entry.endsWith("/")) return false;
+  if (entry.includes("\\")) return false;
+  if (/[*?[\]]/.test(entry)) return false;
+  if (entry.split("/").some((segment) => segment === "..")) return false;
+  return true;
+}
+function pathPresent(target) {
+  try {
+    lstatSync(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function linkSharedResources(primaryCheckoutPath, worktreePath, repositoryIdentity, entries) {
+  const linked = [];
+  for (const entry of entries) {
+    if (!isSafeSharedEntry(entry)) {
+      console.error(`[workspace-manager] refusing unsafe shared-resource entry: ${entry}`);
+      continue;
+    }
+    const source = path2.join(primaryCheckoutPath, entry);
+    const target = path2.join(worktreePath, entry);
+    if (!existsSync(source)) {
+      console.error(`[workspace-manager] shared resource absent in primary checkout; skipping: ${entry}`);
+      continue;
+    }
+    if (pathPresent(target)) {
+      console.error(`[workspace-manager] worktree path already exists; not overwriting: ${entry}`);
+      continue;
+    }
+    try {
+      symlinkSync(source, target);
+      linked.push(entry);
+    } catch (error) {
+      console.error(`[workspace-manager] failed to link shared resource ${entry}: ${String(error)}`);
+    }
+  }
+  if (linked.length > 0) {
+    ensureExcludeEntries(repositoryIdentity, linked);
+  }
 }
 function removeWorktree(primaryCheckoutPath, worktreePath) {
   runGit(primaryCheckoutPath, ["worktree", "remove", "--", worktreePath]);
@@ -535,6 +657,7 @@ function issueDirectGitHumanIntent(db, input) {
 
 // src/workspace-service.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
+import { existsSync as existsSync2 } from "node:fs";
 import path4 from "node:path";
 function managedWorktreePath(primaryCheckoutPath, workspaceGuid) {
   return path4.join(primaryCheckoutPath, ".ironclaude", "worktrees", workspaceGuid);
@@ -585,11 +708,23 @@ var WorkspaceService = class {
   primaryCheckoutIsOwned(repositoryIdentity) {
     return this.db.prepare("SELECT 1 FROM primary_checkout_owners WHERE repository_identity = ?").get(repositoryIdentity) !== void 0;
   }
+  /**
+   * A repository-only match is not ownership: two different sessions on the
+   * same repository must never be conflated. Ownership requires the exact
+   * three-part binding (repository, workspace GUID, and owner session) that
+   * `acquirePrimaryCheckoutOwnership` records.
+   */
+  sessionOwnsPrimary(repositoryIdentity, workspaceGuid, ownerSessionId) {
+    return this.db.prepare(`
+      SELECT 1 FROM primary_checkout_owners
+      WHERE repository_identity = ? AND workspace_guid = ? AND owner_session_id = ?
+    `).get(repositoryIdentity, workspaceGuid, ownerSessionId) !== void 0;
+  }
   materializeManagedWorktree(repository, input) {
     const baseCommit = worktreeHead(repository.primaryCheckoutPath);
     const worktreePath = managedWorktreePath(repository.primaryCheckoutPath, input.workspaceGuid);
     const branch = managedBranch(input.workspaceGuid);
-    const assignment = createAssignment(this.db, {
+    const assignmentInput = {
       workspaceGuid: input.workspaceGuid,
       repositoryIdentity: repository.repositoryIdentity,
       worktreePath,
@@ -599,7 +734,20 @@ var WorkspaceService = class {
       ownerSessionId: input.ownerSessionId,
       workerId: input.workerId,
       integrationTarget: input.integrationTarget
-    });
+    };
+    const priorRow = getAssignment(this.db, input.workspaceGuid);
+    const worktreeGone = priorRow !== void 0 && !existsSync2(priorRow.worktree_path) && !worktreeExists(repository.primaryCheckoutPath, priorRow.worktree_path);
+    const reuseSpent = priorRow !== void 0 && priorRow.lifecycle_status === "cleaned" && worktreeGone;
+    let assignment;
+    if (reuseSpent) {
+      try {
+        runGit(repository.primaryCheckoutPath, ["update-ref", "-d", `refs/ironclaude/finalization/${input.workspaceGuid}/candidate`]);
+      } catch {
+      }
+      assignment = reuseTerminalAssignment(this.db, assignmentInput);
+    } else {
+      assignment = createAssignment(this.db, assignmentInput);
+    }
     return this.materializeReservedAssignment(repository, assignment);
   }
   materializeReservedAssignment(repository, assignment) {
@@ -609,6 +757,12 @@ var WorkspaceService = class {
         assignment.worktree_path,
         assignment.branch,
         assignment.base_commit
+      );
+      linkSharedResources(
+        repository.primaryCheckoutPath,
+        assignment.worktree_path,
+        repository.repositoryIdentity,
+        readSharedResourceConfig(repository.repositoryIdentity)
       );
       transitionAssignment(this.db, assignment.workspace_guid, "reserved", "materialized");
       return transitionAssignment(this.db, assignment.workspace_guid, "materialized", "active");
@@ -745,8 +899,26 @@ var WorkspaceService = class {
     if (assignments.length !== 1) {
       throw new Error("Workspace status is ambiguous for provider root and repository");
     }
-    this.validateManagedIdentity(repository, assignments[0]);
-    return { status: "assigned", assignment: assignments[0] };
+    const assignment = assignments[0];
+    this.validateManagedIdentity(repository, assignment);
+    const primaryOwnedByThisSession = this.sessionOwnsPrimary(
+      repository.repositoryIdentity,
+      assignment.workspace_guid,
+      input.ownerSessionId
+    );
+    let currentHead;
+    try {
+      currentHead = worktreeHead(assignment.worktree_path);
+    } catch {
+      currentHead = assignment.current_head;
+    }
+    return {
+      status: "assigned",
+      assignment,
+      effectiveRoot: primaryOwnedByThisSession ? "primary" : "managed",
+      primaryOwnedByThisSession,
+      currentHead
+    };
   }
   checkoutIntentEvidence(repository, assignment, ownerSessionId, operation) {
     this.validateManagedIdentity(repository, assignment);
@@ -755,7 +927,10 @@ var WorkspaceService = class {
       WHERE repository_identity = ?
     `).get(repository.repositoryIdentity);
     if (operation === "use-primary-checkout") {
-      if (primaryOwner) throw new Error("Primary checkout is already owned");
+      reapStalePrimaryOwner(this.db, repository.repositoryIdentity);
+      if (this.db.prepare("SELECT 1 FROM primary_checkout_owners WHERE repository_identity = ?").get(repository.repositoryIdentity)) {
+        throw new Error("Primary checkout is already owned");
+      }
     } else if (!primaryOwner || primaryOwner.workspace_guid !== assignment.workspace_guid || primaryOwner.owner_session_id !== ownerSessionId) {
       throw new Error("Primary checkout ownership does not match assignment binding");
     }
@@ -841,6 +1016,12 @@ var WorkspaceService = class {
     if (assignment.lifecycle_status === "abandoned") return assignment;
     if (!nonterminal(assignment.lifecycle_status)) {
       throw new Error("Only unresolved managed worktrees can be abandoned");
+    }
+    if (this.db.prepare(`
+      SELECT 1 FROM primary_checkout_owners
+      WHERE repository_identity = ? AND workspace_guid = ?
+    `).get(assignment.repository_identity, assignment.workspace_guid)) {
+      throw new Error("Return to the managed worktree before abandoning while holding the primary checkout.");
     }
     return transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, "abandoned");
   }

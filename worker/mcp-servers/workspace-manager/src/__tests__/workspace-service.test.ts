@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createHumanIntent, initDb, recordIntegration } from '../db.js';
+import { worktreeIsClean } from '../git.js';
 import { WorkspaceService } from '../workspace-service.js';
 
 const OWNER = '019f7742-abd8-7c62-af7b-fe07189f1ffd';
@@ -60,6 +61,29 @@ describe('WorkspaceService real-Git lifecycle', () => {
     const databaseDirectory = mkdtempSync(join(tmpdir(), 'ironclaude-workspace-manager-db-'));
     directories.push(databaseDirectory);
     return new WorkspaceService(initDb(join(databaseDirectory, `${root.split('/').at(-1)}.db`)));
+  }
+
+  /** The Git common dir is the durable repository identity; config lives here, outside every working tree. */
+  function commonDir(root: string): string {
+    return realpathSync(join(root, '.git'));
+  }
+
+  function ignoreResources(root: string, ...patterns: string[]): void {
+    writeFileSync(join(root, '.gitignore'), patterns.map((pattern) => `${pattern}\n`).join(''));
+    git(root, 'add', '.gitignore');
+    git(root, 'commit', '-m', 'ignore resources');
+  }
+
+  /** Writes the shared-resource config to <commonDir>/info, never inside a working tree. */
+  function writeSharedResourceConfig(root: string, ...entries: string[]): void {
+    const infoDirectory = join(commonDir(root), 'info');
+    mkdirSync(infoDirectory, { recursive: true });
+    writeFileSync(join(infoDirectory, 'worktree-shared-resources'), entries.map((entry) => `${entry}\n`).join(''));
+  }
+
+  function seedDirectory(root: string, name: string, file: string, content: string): void {
+    mkdirSync(join(root, name), { recursive: true });
+    writeFileSync(join(root, name, file), content);
   }
 
   it('creates a GUID-named private branch and independently indexed clean worktree', () => {
@@ -413,9 +437,78 @@ describe('WorkspaceService real-Git lifecycle', () => {
     expect(manager.getWorkspaceStatusForRoot({ repositoryPath: root, ownerSessionId: OWNER })).toEqual({
       status: 'assigned',
       assignment,
+      effectiveRoot: 'managed',
+      primaryOwnedByThisSession: false,
+      currentHead: assignment.current_head,
     });
     expect(manager.getWorkspaceStatusForRoot({ repositoryPath: root, ownerSessionId: OTHER_OWNER }).status)
       .toBe('unassigned');
+  });
+
+  it('reports the managed effective root with no primary ownership when this session does not own the primary checkout', () => {
+    const root = repository();
+    const database = initDb(join(root, 'status-effective-root.db'));
+    const manager = new WorkspaceService(database);
+    manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+
+    expect(manager.getWorkspaceStatusForRoot({ repositoryPath: root, ownerSessionId: OWNER })).toMatchObject({
+      status: 'assigned',
+      effectiveRoot: 'managed',
+      primaryOwnedByThisSession: false,
+    });
+  });
+
+  it('reports the primary effective root and ownership when the three-part owner row matches this session', () => {
+    const root = repository();
+    const database = initDb(join(root, 'status-effective-root-owned.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    database.prepare(`
+      INSERT INTO primary_checkout_owners (repository_identity, workspace_guid, owner_session_id)
+      VALUES (?, ?, ?)
+    `).run(assignment.repository_identity, assignment.workspace_guid, OWNER);
+
+    expect(manager.getWorkspaceStatusForRoot({ repositoryPath: root, ownerSessionId: OWNER })).toMatchObject({
+      status: 'assigned',
+      effectiveRoot: 'primary',
+      primaryOwnedByThisSession: true,
+    });
+  });
+
+  it('does not report primary ownership for a repository-only match when the owner row belongs to a different session', () => {
+    const root = repository();
+    const database = initDb(join(root, 'status-effective-root-other-session.db'));
+    const manager = new WorkspaceService(database);
+    manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    const otherAssignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OTHER_OWNER });
+    database.prepare(`
+      INSERT INTO primary_checkout_owners (repository_identity, workspace_guid, owner_session_id)
+      VALUES (?, ?, ?)
+    `).run(otherAssignment.repository_identity, otherAssignment.workspace_guid, OTHER_OWNER);
+
+    expect(manager.getWorkspaceStatusForRoot({ repositoryPath: root, ownerSessionId: OWNER })).toMatchObject({
+      status: 'assigned',
+      effectiveRoot: 'managed',
+      primaryOwnedByThisSession: false,
+    });
+  });
+
+  it('reads the live worktree HEAD for currentHead instead of the cached column after a fast-forward', () => {
+    const root = repository();
+    const database = initDb(join(root, 'status-current-head.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+
+    writeFileSync(join(assignment.worktree_path, 'note.txt'), 'progress\n');
+    git(assignment.worktree_path, 'add', 'note.txt');
+    git(assignment.worktree_path, 'commit', '-m', 'advance');
+    const liveHead = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+    expect(liveHead).not.toBe(assignment.current_head);
+
+    expect(manager.getWorkspaceStatusForRoot({ repositoryPath: root, ownerSessionId: OWNER })).toMatchObject({
+      status: 'assigned',
+      currentHead: liveHead,
+    });
   });
 
   it('rejects AI checkout switching without a matching, single-use human intent, including cross-session replay', () => {
@@ -530,6 +623,29 @@ describe('WorkspaceService real-Git lifecycle', () => {
     })).toThrow('ownership');
   });
 
+  it('refuses to abandon a workspace that still holds the primary checkout', () => {
+    const root = repository();
+    const database = initDb(join(root, 'abandon-guard.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    database.prepare(`
+      INSERT INTO primary_checkout_owners (repository_identity, workspace_guid, owner_session_id)
+      VALUES (?, ?, ?)
+    `).run(assignment.repository_identity, assignment.workspace_guid, OWNER);
+
+    expect(() => manager.abandonWorkspace({
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, ownerSessionId: OWNER,
+    })).toThrow('Return to the managed worktree before abandoning while holding the primary checkout');
+    expect(database.prepare('SELECT lifecycle_status FROM assignments WHERE workspace_guid = ?').get(assignment.workspace_guid))
+      .toMatchObject({ lifecycle_status: 'active' });
+
+    // Once ownership is released, abandonment proceeds.
+    database.prepare('DELETE FROM primary_checkout_owners WHERE repository_identity = ?').run(assignment.repository_identity);
+    expect(manager.abandonWorkspace({
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, ownerSessionId: OWNER,
+    }).lifecycle_status).toBe('abandoned');
+  });
+
   it('preserves abandoned worktrees without reachable recovery proof, then deletes verified branch before cleaning', () => {
     const root = repository();
     const database = initDb(join(root, 'cleanup.db'));
@@ -607,5 +723,304 @@ describe('WorkspaceService real-Git lifecycle', () => {
       .lifecycle_status).toBe('cleaned');
     expect(existsSync(assignment.worktree_path)).toBe(false);
     expect(git(root, 'branch', '--list', assignment.branch)).toBe('');
+  });
+
+  it('links configured shared resources into the worktree as symlinks and keeps it clean', () => {
+    const root = repository();
+    ignoreResources(root, 'models/', '.venv/');
+    seedDirectory(root, 'models', 'weights.bin', 'weights\n');
+    seedDirectory(root, '.venv', 'pyvenv.cfg', 'cfg\n');
+    writeSharedResourceConfig(root, 'models', '.venv');
+    // Config lives in the common dir, not the working tree: the primary stays clean.
+    expect(git(root, 'status', '--porcelain=v1', '--untracked-files=all')).toBe('');
+
+    const manager = service(root);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+
+    expect(lstatSync(join(assignment.worktree_path, 'models')).isSymbolicLink()).toBe(true);
+    expect(lstatSync(join(assignment.worktree_path, '.venv')).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(assignment.worktree_path, 'models', 'weights.bin'), 'utf8')).toBe('weights\n');
+    expect(readFileSync(join(assignment.worktree_path, '.venv', 'pyvenv.cfg'), 'utf8')).toBe('cfg\n');
+    // LOAD-BEARING: a `models/` dir-slash ignore does NOT match a `models` symlink, so without an
+    // anchored no-slash exclude entry the planted links read UNTRACKED and this predicate goes false —
+    // which is exactly what makes crash reconciliation, push-pending, cleanup, and removeWorktree refuse.
+    expect(worktreeIsClean(assignment.worktree_path)).toBe(true);
+  });
+
+  it('skips a listed resource absent in the primary and still activates the assignment', () => {
+    const root = repository();
+    ignoreResources(root, 'models/', 'absent-dir/');
+    seedDirectory(root, 'models', 'weights.bin', 'weights\n');
+    writeSharedResourceConfig(root, 'models', 'absent-dir');
+
+    const manager = service(root);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+
+    expect(assignment.lifecycle_status).toBe('active');
+    expect(lstatSync(join(assignment.worktree_path, 'models')).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(assignment.worktree_path, 'absent-dir'))).toBe(false);
+    expect(worktreeIsClean(assignment.worktree_path)).toBe(true);
+  });
+
+  it('never links an unlisted gitignored path even when it exists in the primary', () => {
+    const root = repository();
+    ignoreResources(root, 'models/', 'secret.env');
+    seedDirectory(root, 'models', 'weights.bin', 'weights\n');
+    writeFileSync(join(root, 'secret.env'), 'API_KEY=leak\n');
+    // Only `models` is listed; the gitignored secret is not.
+    writeSharedResourceConfig(root, 'models');
+
+    const manager = service(root);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+
+    expect(lstatSync(join(assignment.worktree_path, 'models')).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(assignment.worktree_path, 'secret.env'))).toBe(false);
+    expect(worktreeIsClean(assignment.worktree_path)).toBe(true);
+  });
+
+  it('does not overwrite a path that already exists in the fresh worktree', () => {
+    const root = repository();
+    // README.md is tracked and therefore present in every checkout; listing it must be a no-op.
+    writeSharedResourceConfig(root, 'README.md');
+
+    const manager = service(root);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+
+    expect(lstatSync(join(assignment.worktree_path, 'README.md')).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(assignment.worktree_path, 'README.md'), 'utf8')).toBe('initial\n');
+    expect(worktreeIsClean(assignment.worktree_path)).toBe(true);
+  });
+
+  it('rejects escaping or glob config entries even when their sources exist, planting nothing', () => {
+    const root = repository();
+    // Give the rejected entries REAL sources so ONLY isSafeSharedEntry can stop them:
+    // the existsSync(source) skip must not be what makes this test pass.
+    const escapeName = `ironclaude-escape-${randomUUID()}`;
+    const outside = join(realpathSync(root), '..', escapeName);
+    mkdirSync(join(outside, 'inner'), { recursive: true });
+    writeFileSync(join(outside, 'inner', 'marker'), 'do-not-reach\n');
+    directories.push(outside);
+    seedDirectory(root, 'mo*dels', 'weights.bin', 'weights\n');
+    writeSharedResourceConfig(root, `../${escapeName}`, '/etc/x', 'mo*dels');
+
+    const manager = service(root);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+
+    expect(assignment.lifecycle_status).toBe('active');
+    // The glob entry has a real source; only validation keeps it from being linked.
+    expect(existsSync(join(assignment.worktree_path, 'mo*dels'))).toBe(false);
+    // The `../` entry escapes the worktree; had it been honoured the link would land one level up.
+    expect(existsSync(join(realpathSync(root), '.ironclaude', 'worktrees', escapeName))).toBe(false);
+  });
+
+  it('creates no links when no shared-resource config is present', () => {
+    const root = repository();
+    ignoreResources(root, 'models/');
+    seedDirectory(root, 'models', 'weights.bin', 'weights\n');
+    // No config file written.
+
+    const manager = service(root);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+
+    expect(existsSync(join(assignment.worktree_path, 'models'))).toBe(false);
+    expect(worktreeIsClean(assignment.worktree_path)).toBe(true);
+  });
+
+  it('removes a worktree with planted links through cleanupWorkspace and preserves the primary resource', () => {
+    const root = repository();
+    ignoreResources(root, 'models/');
+    seedDirectory(root, 'models', 'weights.bin', 'weights\n');
+    writeSharedResourceConfig(root, 'models');
+    const database = initDb(join(root, 'cleanup-shared.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    expect(lstatSync(join(assignment.worktree_path, 'models')).isSymbolicLink()).toBe(true);
+
+    manager.abandonWorkspace({ repositoryPath: root, workspaceGuid: assignment.workspace_guid, ownerSessionId: OWNER });
+    const recoveryRef = `refs/ironclaude/recovery/${assignment.workspace_guid}`;
+    git(root, 'update-ref', recoveryRef, git(assignment.worktree_path, 'rev-parse', 'HEAD'));
+    database.prepare('UPDATE assignments SET recovery_ref = ? WHERE workspace_guid = ?')
+      .run(recoveryRef, assignment.workspace_guid);
+
+    // Removal must go through removeWorktree (git worktree remove), not rmSync.
+    expect(manager.cleanupWorkspace({
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, ownerSessionId: OWNER,
+    }).lifecycle_status).toBe('cleaned');
+    expect(existsSync(assignment.worktree_path)).toBe(false);
+    // The symlink was unlinked, not descended: the primary resource and its content survive.
+    expect(existsSync(join(root, 'models'))).toBe(true);
+    expect(readFileSync(join(root, 'models', 'weights.bin'), 'utf8')).toBe('weights\n');
+  });
+
+  it('reset-and-reuses a spent same-GUID worktree in place and clears its stale integration record', () => {
+    const root = repository();
+    const database = initDb(join(root, 'reuse-spent.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    const guid = assignment.workspace_guid;
+
+    // Drive the GUID to a spent (cleaned) terminal state by mirroring the
+    // integrated-cleanup fixture above: commit reviewed work, mark integrated,
+    // record the integration whose target_ref matches the assignment's own
+    // integration_target (default primary branch, never hard-coded), fast-forward
+    // that target onto the commit, then clean up.
+    writeFileSync(join(assignment.worktree_path, 'integrated.txt'), 'integrated\n');
+    git(assignment.worktree_path, 'add', 'integrated.txt');
+    git(assignment.worktree_path, 'commit', '-m', 'integrated work');
+    const integratedCommit = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+    const targetRef = `refs/heads/${assignment.integration_target}`;
+    database.prepare(`
+      UPDATE assignments SET lifecycle_status = 'integrated', integrated_commit = ? WHERE workspace_guid = ?
+    `).run(integratedCommit, guid);
+    recordIntegration(database, {
+      workspaceGuid: guid,
+      repositoryIdentity: assignment.repository_identity,
+      targetRef,
+      integratedCommit,
+    });
+    git(root, 'merge', '--ff-only', integratedCommit);
+    manager.cleanupWorkspace({ repositoryPath: root, workspaceGuid: guid, ownerSessionId: OWNER });
+
+    // Spent: worktree removed on disk, but the integration record still stands.
+    expect(existsSync(assignment.worktree_path)).toBe(false);
+    expect(database.prepare('SELECT 1 FROM integration_records WHERE workspace_guid = ?').get(guid)).toBeTruthy();
+
+    // Re-allocating the SAME owner (hence same GUID) must reset-and-reuse the
+    // spent row in place, not collide on assignments.workspace_guid.
+    // Falsifier (pre-GREEN): createAssignment INSERT throws
+    // "UNIQUE constraint failed: assignments.workspace_guid".
+    const reused = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    expect(reused.workspace_guid).toBe(guid);
+    expect(reused.lifecycle_status).toBe('active');
+    expect(existsSync(reused.worktree_path)).toBe(true);
+    // The recycled row carries no stale integration commit from its prior life.
+    // Falsifier: dropping `integrated_commit = NULL` from the reuse UPDATE leaves
+    // the retired SHA on the fresh active row.
+    expect(reused.integrated_commit).toBeNull();
+    // The prior lifecycle's integration record is cleared so the recycled row
+    // carries no stale integration proof.
+    expect(database.prepare('SELECT 1 FROM integration_records WHERE workspace_guid = ?').get(guid)).toBeUndefined();
+  });
+
+  it('refuses to reset an integrated same-GUID row whose worktree is gone, preserving its integration record', () => {
+    const root = repository();
+    const database = initDb(join(root, 'reuse-integrated-gone.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    const guid = assignment.workspace_guid;
+
+    // Drive the GUID to an INTEGRATED terminal state (live crash-recovery
+    // evidence), then remove the worktree from Git + disk WITHOUT cleaning up, so
+    // the row is terminal-and-worktree-gone (reuseSpent === true) yet still
+    // 'integrated'.
+    writeFileSync(join(assignment.worktree_path, 'integrated.txt'), 'integrated\n');
+    git(assignment.worktree_path, 'add', 'integrated.txt');
+    git(assignment.worktree_path, 'commit', '-m', 'integrated work');
+    const integratedCommit = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+    database.prepare(`
+      UPDATE assignments SET lifecycle_status = 'integrated', integrated_commit = ? WHERE workspace_guid = ?
+    `).run(integratedCommit, guid);
+    recordIntegration(database, {
+      workspaceGuid: guid,
+      repositoryIdentity: assignment.repository_identity,
+      targetRef: `refs/heads/${assignment.integration_target}`,
+      integratedCommit,
+    });
+    git(root, 'worktree', 'remove', '--force', assignment.worktree_path);
+    expect(existsSync(assignment.worktree_path)).toBe(false);
+    // Plant the finalization candidate ref that a real integrated row carries, so we
+    // can prove the reuse branch (which deletes it) is never entered for a non-cleaned row.
+    const candidateRef = `refs/ironclaude/finalization/${guid}/candidate`;
+    git(root, 'update-ref', candidateRef, integratedCommit);
+
+    // Re-allocating the SAME owner: an integrated row is NOT 'cleaned', so the reuse
+    // gate (lifecycle === 'cleaned' && worktreeGone) skips it and allocation falls to
+    // createAssignment's bare INSERT, which collides on the assignments PRIMARY KEY.
+    // Its crash-recovery evidence (row, integration record, candidate ref) is preserved.
+    // Falsifier: widening the gate back to any terminal row runs the reset (row
+    // 'reserved', integrated_commit NULL, record + candidate ref deleted), failing below.
+    expect(() => manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER }))
+      .toThrow('UNIQUE constraint failed');
+    // Preserved: the integrated row, its integration record, and its candidate ref.
+    expect(database.prepare('SELECT lifecycle_status, integrated_commit FROM assignments WHERE workspace_guid = ?')
+      .get(guid)).toMatchObject({ lifecycle_status: 'integrated', integrated_commit: integratedCommit });
+    expect(database.prepare('SELECT 1 FROM integration_records WHERE workspace_guid = ?').get(guid)).toBeTruthy();
+    expect(git(root, 'rev-parse', '--verify', candidateRef).trim()).toBe(integratedCommit);
+  });
+
+  it('refuses to reset an abandoned same-GUID row whose worktree is gone, preserving the row and its branch', () => {
+    const root = repository();
+    const database = initDb(join(root, 'reuse-abandoned-gone.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    const guid = assignment.workspace_guid;
+    const branch = assignment.branch;
+    writeFileSync(join(assignment.worktree_path, 'wip.txt'), 'unintegrated work\n');
+    git(assignment.worktree_path, 'add', 'wip.txt');
+    git(assignment.worktree_path, 'commit', '-m', 'abandoned work');
+    const branchHead = git(assignment.worktree_path, 'rev-parse', 'HEAD').trim();
+    manager.abandonWorkspace({ repositoryPath: root, workspaceGuid: guid, ownerSessionId: OWNER });
+    git(root, 'worktree', 'remove', '--force', assignment.worktree_path);
+    expect(existsSync(assignment.worktree_path)).toBe(false);
+
+    // Abandoned rows keep their branch (they can never be cleaned in production), so
+    // reuse via addWorktree -b would collide on the surviving branch. Narrowing reuse
+    // to 'cleaned' routes this to createAssignment's clean PRIMARY-KEY collision instead.
+    // Falsifier: re-admitting 'abandoned' commits the reset (row 'reserved'), then
+    // addWorktree throws a branch-already-exists error, failing both asserts below.
+    expect(() => manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER }))
+      .toThrow('UNIQUE constraint failed');
+    // The abandoned row is NOT corrupted to 'reserved'; the branch and its work survive.
+    expect(database.prepare('SELECT lifecycle_status FROM assignments WHERE workspace_guid = ?')
+      .get(guid)).toMatchObject({ lifecycle_status: 'abandoned' });
+    expect(git(root, 'rev-parse', '--verify', `refs/heads/${branch}`).trim()).toBe(branchHead);
+  });
+
+  it('never resets a live non-terminal same-GUID row: the early return preserves it untouched', () => {
+    const root = repository();
+    const database = initDb(join(root, 'reuse-live.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    const sentinel = '0'.repeat(40);
+    database.prepare('UPDATE assignments SET base_commit = ? WHERE workspace_guid = ?')
+      .run(sentinel, assignment.workspace_guid);
+
+    // A live (active) owner row short-circuits in ensureSessionWorktree's
+    // early-return branch, never reaching the reuse gate; the sentinel column
+    // survives untouched. Were the reset path reachable it would rewrite
+    // base_commit to the live primary HEAD.
+    const again = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    expect(again.workspace_guid).toBe(assignment.workspace_guid);
+    expect(again.lifecycle_status).toBe('active');
+    expect(again.base_commit).toBe(sentinel);
+  });
+
+  it('refuses to reset a terminal same-GUID row whose worktree still exists on disk, preserving its recovery proof', () => {
+    const root = repository();
+    const database = initDb(join(root, 'reuse-terminal-present.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    writeFileSync(join(assignment.worktree_path, 'recovery.txt'), 'recoverable\n');
+    git(assignment.worktree_path, 'add', 'recovery.txt');
+    git(assignment.worktree_path, 'commit', '-m', 'recoverable work');
+    const recoveryHead = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+    manager.abandonWorkspace({ repositoryPath: root, workspaceGuid: assignment.workspace_guid, ownerSessionId: OWNER });
+    const recoveryRef = `refs/ironclaude/recovery/${assignment.workspace_guid}`;
+    git(root, 'update-ref', recoveryRef, recoveryHead);
+    database.prepare('UPDATE assignments SET recovery_ref = ? WHERE workspace_guid = ?')
+      .run(recoveryRef, assignment.workspace_guid);
+
+    // Terminal (abandoned) but the worktree was never cleaned: it is still on
+    // disk. The worktreeGone conjunct must keep the reuse path from firing, so
+    // allocation collides on the PRIMARY KEY instead of destroying the row.
+    expect(existsSync(assignment.worktree_path)).toBe(true);
+    expect(() => manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER }))
+      .toThrow('UNIQUE constraint failed');
+    // Preserved: worktree intact, still abandoned, recovery proof NOT nulled.
+    // Deleting the worktreeGone conjunct makes the reset path run and null
+    // recovery_ref, failing this exact assertion.
+    expect(existsSync(assignment.worktree_path)).toBe(true);
+    expect(database.prepare('SELECT lifecycle_status, recovery_ref FROM assignments WHERE workspace_guid = ?')
+      .get(assignment.workspace_guid)).toMatchObject({ lifecycle_status: 'abandoned', recovery_ref: recoveryRef });
   });
 });

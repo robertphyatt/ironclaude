@@ -15,6 +15,15 @@ You can use the Worker alone for single-session discipline, or add the Commander
 
 ---
 
+## What's New in v1.1.5
+
+- **Managed worktrees recover themselves — no external terminal, ever.** Finalize checks for a clean tree before it freezes, recycles the worktree in place so the cwd, GUID, and branch survive across sequential commits, and — when a finalize is interrupted and an assignment freezes at `ready_for_integration` — a new ownership-gated `reconcile_finalization` command completes or aborts the bookkeeping in-session, with no fresh human intent and no sqlite surgery. Stale checkout locks auto-reap with live-owner heartbeats, and integration recovery (deferred cleanup, content-changing rebase resolutions) is completed end-to-end.
+- **Opus 4.8 recommended over Opus 5.** Every internal Opus-tier string now resolves to `claude-opus-4-8` to prevent silent drift to Opus 5 — which in practice is too easily distracted to follow IronClaude's structured workflow reliably. See [Model Configuration](#model-configuration).
+- **Codex grader failures now tell you what broke.** A nonzero exit used to report `stderr or stdout`, truncated from the head — and since `codex exec --json` streams JSONL, that meant 300 characters of `thread.started` boilerplate instead of the actual error. Diagnostics are now extracted tail-first, bounded, and labelled by channel.
+- See [CHANGELOG.md](CHANGELOG.md) for full details.
+
+---
+
 ## What's New in v1.1.4
 
 - **Managed worktrees, opt-in per session.** Two sessions sharing one checkout and one index overwrite each other silently. Run `/use-managed-worktree` and that session gets its own Git worktree, with file and command paths transparently rewritten into it — so a second session, or a Commander worker, can work the same repository without collision. **Nothing changes unless you ask for it:** professional mode works in your primary checkout by default, exactly as before. `/use-primary-checkout` returns an isolated session to the real checkout. Commander workers always get worktrees, since concurrency is the whole point of running them.
@@ -258,6 +267,13 @@ The Brain selects worker type per task, and each worker gets an advisor **one ti
 | `ollama` | Local LLM routed via `ANTHROPIC_BASE_URL` — see [Ollama Workers](#ollama-workers) | — |
 
 **Model tiering — capability on demand.** The always-on Brain runs on **Sonnet** by default and handles routine orchestration itself. When a directive is harder than it can confidently decide, it doesn't guess: it consults an Opus worker for the approach and the right worker tier, then spawns `claude-opus` or `claude-fable` as advised (the spawn-time grader can recommend `claude-fable`, and an approved Opus spawn escalates to Fable only when the grader explicitly recommends it). Combined with the one-tier-up advisors above — a Sonnet worker gets an Opus advisor, an Opus worker gets a Fable advisor — the system delivers **Fable-level capability on the hardest work without burning Fable tokens continuously**: the persistent component stays cheap, and the top tiers are reached transiently, on demand.
+
+> **Recommended model: Opus 4.8, not Opus 5.** IronClaude currently pins its Opus tier to
+> `claude-opus-4-8`, and that is the recommendation. In practice Opus 5 tends to be too "ADHD" —
+> too eager to jump ahead and improvise — to follow IronClaude's structured brainstorm → plan →
+> execute workflow reliably, so every internal Opus-tier string resolves to `claude-opus-4-8` to
+> keep the `opus` alias from silently drifting to Opus 5. If you want a different build, pin it
+> explicitly with `ANTHROPIC_DEFAULT_OPUS_MODEL` (below).
 
 The grader defaults to Opus. You can override any of these via environment variables to pin a specific model version:
 
