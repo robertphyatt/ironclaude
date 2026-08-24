@@ -63,3 +63,8 @@
     - If cleanup would materially expand scope, change behavior, require destructive action, affect external systems, or require new authority, describe the finding, evidence, proposed cleanup scope, and risk, then ask permission before proceeding
     - If cleanup is blocked or unsafe, record the finding and explain the constraint instead of suppressing it
     - Do not use this rule to justify speculative refactoring or unrequested features
+
+12. **Recipient-Based Communication Profiles**
+   - Before first substantive human-facing response, load and apply `ironclaude:elements-of-style`
+   - For AI-directed natural language, load and apply `ironclaude:write-lossless-ai-messages`
+   - Select by destination, not model; preserve machine schemas and protected technical content exactly

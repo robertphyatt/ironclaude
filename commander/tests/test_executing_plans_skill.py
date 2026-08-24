@@ -5,6 +5,9 @@ The tier-up plan review moved out of writing-plans Phase 4.5 into executing-plan
 silent deletion of that step during future skill edits, mirroring
 test_version_consistency.py's approach.
 """
+import json
+import re
+import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -274,3 +277,49 @@ def test_reviewer_archetypes_cover_verification_quality():
                    "defused by a later step of the same plan",
                    "provenance is an agent summary"):
         assert marker in text, marker
+
+
+def test_execution_complete_restages_cumulative_allowed_files():
+    """Step 7 (Plan complete) must re-stage the union of every task's allowed_files at
+    execution_complete, before the commit-message suggestion, so a subagent's git stash pop
+    (or any index churn) cannot yield a partial commit
+    (project_stash_pop_unstages_prior_tasks)."""
+    text = _read()
+    assert "Re-stage the cumulative allowed_files" in text, \
+        "Step 7 lost the cumulative allowed_files re-stage step"
+    step7 = text.index("Step 7: Plan complete")
+    restage = text.index("Re-stage the cumulative allowed_files", step7)
+    suggest = text.index("Suggest a commit message", step7)
+    assert restage < suggest, \
+        "the cumulative allowed_files re-stage must precede the commit-message suggestion"
+    for required in ("git stash pop", "union"):
+        assert required in text, f"Step 7 re-stage lost '{required}'"
+
+
+def test_execution_complete_restage_command_stages_from_non_root_cwd(tmp_path):
+    """The Step 7 re-stage one-liner must actually stage allowed_files when run from a
+    non-root cwd (the executing-plans invariant: Bash cwd is commander/), tolerate a
+    missing path, and stage nothing outside allowed_files."""
+    text = _read()
+    start = text.index("Re-stage the cumulative allowed_files")
+    cmd = re.search(r"```bash\n(.*?)```", text[start:], re.DOTALL).group(1)
+
+    repo = tmp_path / "repo"
+    (repo / "worker").mkdir(parents=True)
+    (repo / "commander").mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "worker" / "a.md").write_text("a")
+    (repo / "worker" / "outside.md").write_text("outside")  # not in allowed_files
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps({"tasks": [
+        {"allowed_files": ["worker/a.md", "worker/zz-missing.md"]},
+    ]}))
+
+    filled = cmd.replace("<plan-json-path>", str(plan)).replace("<repo-root>", str(repo))
+    result = subprocess.run(["bash", "-c", filled], cwd=repo / "commander",
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    staged = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
+        capture_output=True, text=True, check=True).stdout.split()
+    assert staged == ["worker/a.md"]

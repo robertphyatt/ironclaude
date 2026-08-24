@@ -70,6 +70,14 @@ run_prompt() {
   jq -cn --arg prompt "$prompt" --arg session_id "$session_id" '{prompt: $prompt, session_id: $session_id}' \
     | HOME="$TMP_HOME" bash "$HOOK"
 }
+# Like run_prompt but also sets hook_event_name=UserPromptSubmit so the
+# HUMAN_OPERATION intent block (state-activator.sh:53) is reachable.
+run_prompt_intent() {
+  local prompt="$1" session_id="${2:-$SESSION}"
+  jq -cn --arg prompt "$prompt" --arg session_id "$session_id" \
+    '{prompt: $prompt, session_id: $session_id, hook_event_name: "UserPromptSubmit"}' \
+    | HOME="$TMP_HOME" bash "$HOOK"
+}
 
 assert_deactivates() {
   local name="$1" prompt="$2"
@@ -106,6 +114,28 @@ assert_ignored "Markdown skill link URL target" '[$ironclaude:deactivate-profess
 assert_ignored "Markdown skill link uppercase label" '[$IRONCLAUDE:DEACTIVATE-PROFESSIONAL-MODE](/Users/example/.codex/plugins/cache/ironclaude/ironclaude/1.1.2/skills/deactivate-professional-mode/SKILL.md)'
 assert_ignored "Markdown skill link in code span" '`[$ironclaude:deactivate-professional-mode](/Users/example/.codex/plugins/cache/ironclaude/ironclaude/1.1.2/skills/deactivate-professional-mode/SKILL.md)`'
 assert_ignored "Markdown skill link with suffix" '[$ironclaude:deactivate-professional-mode](/Users/example/.codex/plugins/cache/ironclaude/ironclaude/1.1.2/skills/deactivate-professional-mode/SKILL.md) now'
+
+# Codex Desktop appends a trailing &#x20; (HTML space entity) that survives the
+# whitespace-only trim. These four cases cover the normalization fix and its bounds.
+# (a) POSITIVE: a codex deactivate link with a trailing &#x20; still deactivates.
+assert_deactivates "Codex deactivate link with trailing entity" \
+  '[$ironclaude:deactivate-professional-mode](/Users/example/.codex/plugins/cache/ironclaude/ironclaude/1.1.6/skills/deactivate-professional-mode/SKILL.md)&#x20;'
+# (b) NEGATIVE: stripping the trailing entity must not rescue a prose-suffixed link.
+assert_ignored "Codex deactivate link with prose suffix then entity" \
+  '[$ironclaude:deactivate-professional-mode](/Users/example/.codex/plugins/cache/ironclaude/ironclaude/1.1.6/skills/deactivate-professional-mode/SKILL.md) now&#x20;'
+# (c) POSITIVE: a codex commit-and-push link with a trailing &#x20; reaches the
+# HUMAN_OPERATION block. "Human intent issuance runtime is unavailable"
+# (state-activator.sh:112) is emitted ONLY inside `if [ -n "$HUMAN_OPERATION" ]`
+# (:74), so its presence proves HUMAN_OPERATION was set from the normalized prompt.
+reset_current
+op_pos_output=$(run_prompt_intent '[$ironclaude:commit-and-push](/Users/example/.codex/plugins/cache/ironclaude/ironclaude/1.1.6/skills/commit-and-push/SKILL.md)&#x20;')
+assert_contains "commit-and-push link with trailing entity reaches HUMAN_OPERATION" \
+  "Human intent issuance runtime is unavailable" "$op_pos_output"
+# (d) NEGATIVE: a prose-suffixed commit-and-push link does NOT reach HUMAN_OPERATION.
+reset_current
+op_neg_output=$(run_prompt_intent '[$ironclaude:commit-and-push](/Users/example/.codex/plugins/cache/ironclaude/ironclaude/1.1.6/skills/commit-and-push/SKILL.md) now&#x20;')
+assert_not_contains "prose-suffixed commit-and-push link does not reach HUMAN_OPERATION" \
+  "Human intent issuance runtime is unavailable" "$op_neg_output"
 
 reset_current
 sqlite3 "$DB_PATH" "INSERT INTO wave_tasks (terminal_session, status) VALUES ('${SESSION}', 'in_progress');"

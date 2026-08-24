@@ -12754,7 +12754,8 @@ function migrateSchema(db) {
       { name: "memory_search_required", type: "INTEGER NOT NULL", dflt: "0" },
       { name: "testing_theatre_checked", type: "INTEGER NOT NULL", dflt: "0" },
       { name: "review_block_count", type: "INTEGER NOT NULL", dflt: "0" },
-      { name: "plan_lineage", type: "INTEGER NOT NULL", dflt: "0" }
+      { name: "plan_lineage", type: "INTEGER NOT NULL", dflt: "0" },
+      { name: "inherit_review", type: "INTEGER NOT NULL", dflt: "0" }
     ];
     const currentColumns = db.prepare(`PRAGMA table_info(sessions)`).all();
     const columnNames = new Set(currentColumns.map((c) => c.name));
@@ -12817,6 +12818,7 @@ function initDb(dbPath) {
       review_pending INTEGER NOT NULL DEFAULT 0,
       review_block_count INTEGER NOT NULL DEFAULT 0,
       plan_lineage INTEGER NOT NULL DEFAULT 0,
+      inherit_review INTEGER NOT NULL DEFAULT 0,
       circuit_breaker INTEGER NOT NULL DEFAULT 0,
       memory_search_required INTEGER NOT NULL DEFAULT 0,
       testing_theatre_checked INTEGER NOT NULL DEFAULT 0,
@@ -13139,7 +13141,7 @@ function hasAdvisorRemediatedAtHash(db, sessionId, planLineage, planHash) {
         SELECT 1 FROM tier_up_reviews AS failed_review
         WHERE failed_review.terminal_session = remediation.terminal_session
           AND failed_review.plan_lineage = remediation.plan_lineage
-          AND failed_review.verdict = 'HAS-ISSUES'
+          AND failed_review.verdict IN ('SOLID', 'HAS-ISSUES', 'top-tier-self')
           AND failed_review.id < remediation.id
       )
     LIMIT 1
@@ -13153,14 +13155,6 @@ function getBlindTierUpReviewForLineage(db, sessionId, planLineage) {
       AND verdict IN ('SOLID', 'HAS-ISSUES', 'top-tier-self')
     ORDER BY id ASC LIMIT 1
   `).get(sessionId, planLineage);
-}
-function hasEarlierTierUpVerdict(db, sessionId, planLineage, verdict, beforeId) {
-  const row = db.prepare(`
-    SELECT 1 AS found FROM tier_up_reviews
-    WHERE terminal_session = ? AND plan_lineage = ? AND verdict = ? AND id < ?
-    LIMIT 1
-  `).get(sessionId, planLineage, verdict, beforeId);
-  return row !== void 0;
 }
 
 // src/session-identity.ts
@@ -13436,6 +13430,11 @@ var RETREAT_SOURCES = {
   reviewing: ["brainstorming", "debugging"],
   plan_interrupted: ["brainstorming", "debugging"]
 };
+function inheritReviewOnDesignReentry(from) {
+  if (from === "idle" || from === "execution_complete") return { inherit_review: 0 };
+  if (RETREAT_SOURCES[from]) return { inherit_review: 1 };
+  return {};
+}
 function canTransitionTo(current, target) {
   const forwardTargets = FORWARD_TRANSITIONS[current];
   if (forwardTargets && forwardTargets.includes(target)) {
@@ -13548,9 +13547,11 @@ function executeWorkflowTransition(db, sessionId, target, options) {
       };
     }
     const artifactFields = options.applyArtifacts?.(context) ?? {};
+    const designReentryFields = target === "brainstorming" || target === "debugging" ? inheritReviewOnDesignReentry(from) : {};
     updateSession(db, sessionId, {
       ...options.updateFields,
       ...artifactFields,
+      ...designReentryFields,
       workflow_stage: target
     });
     const action = typeof options.action === "function" ? options.action(context) : options.action;
@@ -14906,10 +14907,7 @@ function handleWriteTool(name, args, db, sessionId) {
         const newStage = session.workflow_stage === "brainstorming" ? "design_ready" : session.workflow_stage;
         consumeDesign(db, file);
         if (session.workflow_stage === "brainstorming") {
-          updateSession(db, resolvedId, {
-            workflow_stage: "design_ready",
-            plan_lineage: session.plan_lineage + 1
-          });
+          updateSession(db, resolvedId, session.inherit_review === 1 ? { workflow_stage: "design_ready", inherit_review: 0 } : { workflow_stage: "design_ready", plan_lineage: session.plan_lineage + 1 });
         }
         insertAuditLog(db, {
           terminal_session: resolvedId,
@@ -15027,7 +15025,8 @@ function handleWriteTool(name, args, db, sessionId) {
           }
           if (isPassingTierUpVerdict(canonicalReview.verdict)) {
             if (canonicalReview.plan_hash === planHash) return null;
-            return `BLOCKED \u2014 plan lineage ${session.plan_lineage} already has a passing ${canonicalReview.verdict} review for a different plan hash. Restore the exact reviewed plan or retreat to brainstorming after verifying a design-premise change. Do not dispatch another plan review.`;
+            if (hasAdvisorRemediatedAtHash(db, resolvedId, session.plan_lineage, planHash)) return null;
+            return `BLOCKED \u2014 plan lineage ${session.plan_lineage} has a passing ${canonicalReview.verdict} review for a different plan hash and no advisor-remediated record for the current plan. Run the non-blind fix advisor and record advisor-remediated for the current plan, or restore the exact reviewed plan. Do not dispatch another plan review.`;
           }
           if (canonicalReview.verdict === "HAS-ISSUES") {
             if (hasAdvisorRemediatedAtHash(db, resolvedId, session.plan_lineage, planHash)) return null;
@@ -15297,6 +15296,9 @@ function handleWriteTool(name, args, db, sessionId) {
           if (file) {
             registerDesign(db, file, resolvedId);
             consumeDesign(db, file);
+          }
+          if (session.inherit_review === 1) {
+            return { inherit_review: 0 };
           }
           return { plan_lineage: session.plan_lineage + 1 };
         }
@@ -15579,15 +15581,9 @@ function handleWriteTool(name, args, db, sessionId) {
             `BLOCKED \u2014 plan lineage ${session.plan_lineage} already consumed its one blind review (${existing.verdict}). Do not dispatch another plan review. Use the fix advisor and advisor-remediated path after HAS-ISSUES, or retreat to brainstorming when a verified design premise is invalid.`
           );
         }
-      } else if (!hasEarlierTierUpVerdict(
-        db,
-        resolvedId,
-        session.plan_lineage,
-        "HAS-ISSUES",
-        Number.MAX_SAFE_INTEGER
-      )) {
+      } else if (!getBlindTierUpReviewForLineage(db, resolvedId, session.plan_lineage)) {
         return err(
-          `BLOCKED \u2014 advisor-remediated requires a prior HAS-ISSUES review in plan lineage ${session.plan_lineage}.`
+          `BLOCKED \u2014 advisor-remediated requires a prior canonical blind review in plan lineage ${session.plan_lineage}.`
         );
       }
       try {

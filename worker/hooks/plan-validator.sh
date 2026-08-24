@@ -25,6 +25,7 @@
 # Sets: VALIDATION_LLM_BACKEND (global) = backend name used
 # Sets: VALIDATION_LLM_RESPONSE (global) = raw LLM response
 # Returns: 0 on success, 1 on failure
+# IRONCLAUDE_LLM_PATH: hook_validator; destination machine.
 call_validation_llm() {
   local prompt="$1"
   local schema="${2:-}"

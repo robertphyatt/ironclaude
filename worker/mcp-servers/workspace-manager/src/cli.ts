@@ -8,6 +8,7 @@ import { initDb } from './db.js';
 import {
   finalizeCommanderLocalCommit,
   reconcileFinalization,
+  syncWorktreeToTarget,
   type CommanderLocalCommitInput,
 } from './integration.js';
 import { WorkspaceService } from './workspace-service.js';
@@ -21,9 +22,12 @@ export interface InternalCommandDependencies {
   finalize: InternalDependency;
   abandon: InternalDependency;
   reconcile: InternalDependency;
+  cleanup: InternalDependency;
+  sync: InternalDependency;
+  reap: InternalDependency;
 }
 
-export const INTERNAL_COMMAND_NAMES = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile'] as const;
+export const INTERNAL_COMMAND_NAMES = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile', 'cleanup', 'sync', 'reap'] as const;
 
 function waitForCliDatabase(milliseconds: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
@@ -71,6 +75,13 @@ function optionalRebaseRecovery(
   return value;
 }
 
+function optionalAbandonMode(args: Args): 'rescue' | undefined {
+  const value = args.mode;
+  if (value === undefined) return undefined;
+  if (value !== 'rescue') throw new Error("mode must be 'rescue'");
+  return value;
+}
+
 function requiredRecord(args: Args, key: string): Record<string, unknown> {
   const value = args[key];
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${key} must be an object`);
@@ -88,6 +99,9 @@ export function dispatchInternalCommand(
     case 'finalize': return dependencies.finalize(args);
     case 'abandon': return dependencies.abandon(args);
     case 'reconcile': return dependencies.reconcile(args);
+    case 'cleanup': return dependencies.cleanup(args);
+    case 'sync': return dependencies.sync(args);
+    case 'reap': return dependencies.reap(args);
     default: throw new Error(`Unknown internal workspace command: ${name}`);
   }
 }
@@ -141,7 +155,18 @@ export function createInternalCommandDependencies(
       repositoryPath: requiredString(args, 'repository_path'),
       workspaceGuid: requiredString(args, 'workspace_guid'),
       ownerSessionId: requiredString(args, 'owner_session_id'),
+      mode: optionalAbandonMode(args),
     }),
+    cleanup: (args) => {
+      const repositoryPath = requiredString(args, 'repository_path');
+      const workspaceGuid = requiredString(args, 'workspace_guid');
+      const ownerSessionId = requiredString(args, 'owner_session_id');
+      const assignment = service.getWorkspaceAssignment({ repositoryPath, workspaceGuid, ownerSessionId });
+      if (assignment.lifecycle_status === 'reserved') {
+        return service.cleanupReservedAssignment({ repositoryPath, workspaceGuid, ownerSessionId });
+      }
+      return service.cleanupWorkspace({ repositoryPath, workspaceGuid, ownerSessionId });
+    },
     reconcile: (args) => {
       const repositoryPath = requiredString(args, 'repository_path');
       const workspaceGuid = optionalString(args, 'workspace_guid');
@@ -163,6 +188,15 @@ export function createInternalCommandDependencies(
       }
       return service.reconcileRepository(repositoryPath);
     },
+    sync: (args) => syncWorktreeToTarget(db, {
+      repositoryPath: requiredString(args, 'repository_path'),
+      workspaceGuid: requiredString(args, 'workspace_guid'),
+      providerRootSessionId: requiredString(args, 'owner_session_id'),
+    }),
+    reap: (args) => service.reapLeakedAssignment({
+      repositoryPath: requiredString(args, 'repository_path'),
+      workspaceGuid: requiredString(args, 'workspace_guid'),
+    }),
   };
 }
 

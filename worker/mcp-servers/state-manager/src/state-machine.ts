@@ -136,6 +136,20 @@ export const RETREAT_SOURCES: Record<string, readonly RetreatTarget[]> = {
 };
 
 /**
+ * Effort-scoped review budget: classify a design-phase (re-)entry from its FROM-stage
+ * so a retreat / mid-effort re-entry inherits the effort's one blind review, while a
+ * genuine new effort (entered from a terminal/fresh stage) mints a fresh budget. Applied
+ * whenever a transition targets `brainstorming` OR `debugging` (both design-phase entry
+ * points; targeting `debugging` too closes the mid-effort→debugging→brainstorming hole).
+ * A `brainstorming`/`debugging`/unknown FROM-stage preserves the prior classification.
+ */
+export function inheritReviewOnDesignReentry(from: WorkflowStage): Partial<Pick<Session, 'inherit_review'>> {
+  if (from === 'idle' || from === 'execution_complete') return { inherit_review: 0 };
+  if (RETREAT_SOURCES[from]) return { inherit_review: 1 };
+  return {};
+}
+
+/**
  * Check if a transition from `current` to `target` is valid via either
  * the forward transition table or retreat sources. Does NOT check
  * prerequisites (design, plan) — use validateWorkflowTransition for that.
@@ -327,9 +341,13 @@ export function executeWorkflowTransition(
     }
 
     const artifactFields = options.applyArtifacts?.(context) ?? {};
+    const designReentryFields = (target === 'brainstorming' || target === 'debugging')
+      ? inheritReviewOnDesignReentry(from)
+      : {};
     updateSession(db, sessionId, {
       ...options.updateFields,
       ...artifactFields,
+      ...designReentryFields,
       workflow_stage: target,
     });
 

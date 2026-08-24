@@ -256,6 +256,39 @@ export function deleteTemporaryBranch(primaryCheckoutPath: string, branch: strin
   runGit(primaryCheckoutPath, ['branch', '-D', '--', branch]);
 }
 
+/** Splits `git diff --name-only` output into a filtered, empty-string-free path list. */
+function splitPaths(output: string): string[] {
+  return output.split('\n').filter((line) => line.length > 0);
+}
+
+/** Files whose content differs between two commit-ish refs, via `git diff --name-only`. */
+export function changedPaths(cwd: string, a: string, b: string): string[] {
+  return splitPaths(runGit(cwd, ['diff', '--name-only', a, b]));
+}
+
+/**
+ * Union of unstaged, staged, and untracked (non-ignored) paths in a worktree —
+ * everything `worktreeIsClean` would flag, broken out per path instead of a
+ * single clean/dirty boolean.
+ */
+export function dirtyAndUntrackedPaths(cwd: string): string[] {
+  const unstaged = splitPaths(runGit(cwd, ['diff', '--name-only']));
+  const staged = splitPaths(runGit(cwd, ['diff', '--name-only', '--cached']));
+  const untracked = splitPaths(runGit(cwd, ['ls-files', '--others', '--exclude-standard']));
+  return [...new Set([...unstaged, ...staged, ...untracked])];
+}
+
+/**
+ * Git-native two-tree merge: fast-forwards a worktree's tracked content from
+ * `fromCommit` to `toCommit` while preserving local modifications on paths
+ * `fromCommit..toCommit` left untouched. Refuses (throws) when a
+ * locally-modified path also changed between the two commits, rather than
+ * silently discarding or overwriting the local edit.
+ */
+export function carryForwardFastForward(cwd: string, fromCommit: string, toCommit: string): void {
+  runGit(cwd, ['read-tree', '-m', '-u', fromCommit, toCommit]);
+}
+
 /** Returns false for a missing or unresolvable ref rather than treating it as proof. */
 export function isAncestor(cwd: string, ancestor: string, descendant: string): boolean {
   const result = spawnSync('git', ['-C', cwd, 'merge-base', '--is-ancestor', ancestor, descendant], { encoding: 'utf8' });

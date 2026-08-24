@@ -377,7 +377,16 @@ workspace_bind_effective_root() {
       # own row on every confirmed file operation or an idle-vs-live owner look
       # identical to the reaper. Scoped to this exact owner row; best-effort so
       # a renewal failure never alters or fails the file-operation decision.
-      sqlite3 "$workspace_db" ".timeout 10000" "UPDATE primary_checkout_owners SET acquired_at = datetime('now') WHERE repository_identity='$(workspace_sql_quote "$repository_identity")' AND workspace_guid='$(workspace_sql_quote "$owner_guid")' AND owner_session_id='$(workspace_sql_quote "$owner_session")';" 2>/dev/null || :
+      # Observability only, protocol-clean: this hook's stdout is the PreToolUse
+      # JSON decision channel, so the log goes to an append-only sideband file
+      # (never stdout, and never stderr either — some callers capture stderr
+      # alongside stdout when validating the decision, so even stderr is not
+      # safely inert here). Best-effort: a log write never alters or fails the
+      # file-operation decision.
+      if sqlite3 "$workspace_db" ".timeout 10000" "UPDATE primary_checkout_owners SET acquired_at = datetime('now') WHERE repository_identity='$(workspace_sql_quote "$repository_identity")' AND workspace_guid='$(workspace_sql_quote "$owner_guid")' AND owner_session_id='$(workspace_sql_quote "$owner_session")';" 2>/dev/null; then
+        printf 'workspace-path-adapter: heartbeat renewed owner_session=%s\n' "$owner_session" \
+          >> "$HOME/.claude/ironclaude-worktree-heartbeat.log" 2>/dev/null || :
+      fi
     fi
   fi
   WORKSPACE_EFFECTIVE_ROOT="$effective_root"

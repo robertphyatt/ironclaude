@@ -1,0 +1,146 @@
+{
+  "name": "Wave Advancement and Reviewed Carry Recovery",
+  "goal": "Repair reviewed-wave advancement, carry all preserved release artifacts into reviewed scope, and finish the PM-off release within one recovery lineage and one blind plan review.",
+  "requirements_file": "docs/plans/2026-08-15-wave-advancement-and-reviewed-carry-recovery-requirements.md",
+  "design_file": "docs/plans/2026-08-15-wave-advancement-and-reviewed-carry-recovery-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Repair reviewed-wave advancement and bootstrap the repaired runtime",
+      "description": "Terra implements and verifies transactional reviewed-wave advancement. Main reviews Task 1 on receipt 54 before cachebusting, then activates the byte-identical reviewed bundle in Codex and releases Task 2 through standard mark_executing ordering.",
+      "allowed_files": [
+        "worker/mcp-servers/state-manager/src/tools/write-tools.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/get-next-tasks-review-transition.test.ts",
+        "worker/mcp-servers/state-manager/dist/index.js",
+        "worker/.codex-plugin/plugin.json",
+        "docs/plans/2026-08-15-wave-advancement-and-reviewed-carry-recovery-design.md",
+        "docs/plans/2026-08-15-wave-advancement-and-reviewed-carry-recovery-requirements.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Verify main created /private/tmp/wave-advancement-reviewed-carry.json after advisor remediation and before start_execution, with exact SHA-256 and modes for all six documentation paths.",
+          "expected": "Pre-created oracle contains exactly six final documentation paths and remains outside repository scope."
+        },
+        {
+          "description": "Add real RED coverage for reviewing-to-next-wave, terminal completion, invalid evidence, standard ordering, idempotency, and rollback.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/__tests__/get-next-tasks-review-transition.test.ts",
+          "expected": "Nonzero exit on new advancement assertions before source repair."
+        },
+        {
+          "description": "Implement one get_next_tasks transaction: same-wave task-boundary A/B validation from reviewing; atomic successor creation, current_wave advance, executing stage, review-flag clear, theatre reset, and audit; equivalent terminal completion; no receipt mutation. Preserve mark_executing-first behavior and refuse missing, informational, C/D/F, malformed, or wrong-wave evidence before mutation."
+        },
+        {
+          "description": "Run focused GREEN transition and compatibility tests.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/__tests__/get-next-tasks-review-transition.test.ts src/__tests__/mark-executing-review-gate.test.ts src/__tests__/workflow-transition-idempotency.test.ts src/tools/write-tools.test.ts",
+          "expected": "All tests pass, including rollback preservation of sessions, tasks, grades, receipts, and audit rows."
+        },
+        {
+          "description": "Run TypeScript validation.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx tsc --noEmit",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Temporarily weaken the same-wave grade predicate and atomic stage update separately with apply_patch; require the focused transition test to fail for each mutation; restore source with apply_patch and rerun GREEN.",
+          "expected": "Both mutations are detected; final source is restored and GREEN."
+        },
+        {
+          "description": "Run the complete repository suite once before runtime mutation; repair any source defect only within Task 1, rerun affected focused proof, and permit one justified full-suite repetition before submission.",
+          "command": "make -C /Users/roberthyatt/Code/ironclaude test",
+          "expected": "Exit zero; cachebuster remains 1.1.6+codex.20260815051924."
+        },
+        {
+          "description": "Build final reviewed source, record its bundle hash, stage Task 1's six declared paths, submit, and run task-boundary review before cachebusting. C/D/F repairs, rebuilds, resubmits, and re-reviews Task 1 while cachebuster remains unchanged.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm run build && shasum -a 256 /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager/dist/index.js > /private/tmp/wave-advancement-reviewed-bundle.sha256 && git -C /Users/roberthyatt/Code/ironclaude add -- worker/mcp-servers/state-manager/src/tools/write-tools.ts worker/mcp-servers/state-manager/src/__tests__/get-next-tasks-review-transition.test.ts docs/plans/2026-08-15-wave-advancement-and-reviewed-carry-recovery-design.md docs/plans/2026-08-15-wave-advancement-and-reviewed-carry-recovery-requirements.md worker/.codex-plugin/plugin.json && git -C /Users/roberthyatt/Code/ironclaude add -f -- worker/mcp-servers/state-manager/dist/index.js && git -C /Users/roberthyatt/Code/ironclaude diff --cached --check",
+          "expected": "Build and cached check pass; A/B seals Task 1 atop receipt 54 before any cachebuster or install."
+        },
+        {
+          "description": "After A/B, main calls mark_executing with the existing runtime, defers get_next_tasks, runs the cachebuster helper exactly once, rebuilds, requires the bundle hash to equal Task 1's reviewed hash, and writes exact Codex bootstrap runtime evidence.",
+          "command": "/usr/bin/python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/update_plugin_cachebuster.py /Users/roberthyatt/Code/ironclaude/worker && cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm run build && shasum -a 256 -c /private/tmp/wave-advancement-reviewed-bundle.sha256 && /usr/bin/python3 -c 'import hashlib,json,pathlib; root=pathlib.Path(\"/Users/roberthyatt/Code/ironclaude/worker\"); version=json.loads((root/\".codex-plugin/plugin.json\").read_text())[\"version\"]; digest=lambda p: hashlib.sha256((root/p).read_bytes()).hexdigest(); expected={\"client\":\"codex\",\"manifest_sha256\":digest(\".codex-plugin/plugin.json\"),\"plugin_root\":f\"/Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/{version}\",\"plugin_version\":version,\"state_manager_bundle_sha256\":digest(\"mcp-servers/state-manager/dist/index.js\"),\"workspace_manager_bundle_sha256\":digest(\"mcp-servers/workspace-manager/dist/index.js\"),\"workspace_manager_cli_sha256\":digest(\"mcp-servers/workspace-manager/dist/cli.js\"),\"workspace_manager_hook_intent_sha256\":digest(\"mcp-servers/workspace-manager/dist/hook-intent.js\")}; target=pathlib.Path(\"/private/tmp/wave-advancement-bootstrap-runtime.json\"); target.write_text(json.dumps(expected,sort_keys=True)+\"\\n\"); print(target.read_text(),end=\"\")'",
+          "expected": "One fresh suffix replaces 20260815051924; reviewed bundle hash matches; eight-field Codex runtime object prints."
+        },
+        {
+          "description": "Main verifies the approved restart helper, launches delayed restart, and reinstalls Codex bootstrap runtime.",
+          "command": "shasum -a 256 /private/tmp/restart_codex.py && /usr/bin/python3 -c 'import subprocess; subprocess.Popen([\"/usr/bin/python3\", \"/private/tmp/restart_codex.py\"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)' && codex plugin add ironclaude@ironclaude --json",
+          "expected": "Helper SHA-256 is d09cc042bdac54f8fb87eb1a021724fe28b42b355690bdd97999fa2a8a16c38f; exact cachebuster installs; same task resumes."
+        },
+        {
+          "description": "After restart, main passes exact bootstrap runtime to run_diagnostics, requires same session and plan, Task 1 review_passed, and workflow_stage executing, then calls repaired get_next_tasks. Direct reviewing-to-get_next_tasks remains regression coverage; live release uses standard mark_executing ordering.",
+          "expected": "Task 2 pending in executing stage; no second blind plan review."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Carry exact artifacts, certify, and finish the release",
+      "description": "Main verifies and stages the exact seven-path carry on top of Task 1 receipt, runs final verification, preserves Task 1's fresh cachebuster, performs the final Claude/Codex reinstall, proves runtime identity, and completes task review.",
+      "allowed_files": [
+        "README.md",
+        "CHANGELOG.md",
+        "docs/plans/2026-08-14-professional-mode-off-operator-authority.md",
+        "docs/plans/2026-08-14-professional-mode-off-operator-authority.plan.json",
+        "docs/plans/2026-08-15-wave-advancement-and-reviewed-carry-recovery-design.md",
+        "docs/plans/2026-08-15-wave-advancement-and-reviewed-carry-recovery-requirements.md",
+        "worker/.codex-plugin/plugin.json"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Verify exact working-tree SHA-256 and mode values for six documentation paths and require manifest version to equal Task 1 bootstrap evidence.",
+          "command": "/usr/bin/python3 -c 'import hashlib,json,os,pathlib,stat; root=pathlib.Path(\"/Users/roberthyatt/Code/ironclaude\"); proof=json.loads(pathlib.Path(\"/private/tmp/wave-advancement-reviewed-carry.json\").read_text())[\"paths\"]; bad=[r for r in proof if hashlib.sha256((root/r[\"path\"]).read_bytes()).hexdigest()!=r[\"sha256\"] or oct(stat.S_IMODE(os.lstat(root/r[\"path\"]).st_mode))!=r[\"mode\"]]; not bad or (_ for _ in ()).throw(SystemExit(json.dumps(bad,sort_keys=True))); print(\"CARRY_WORKTREE_MATCH\")' && /usr/bin/python3 -c 'import json,pathlib; p=pathlib.Path(\"/Users/roberthyatt/Code/ironclaude/worker/.codex-plugin/plugin.json\"); expected=json.loads(pathlib.Path(\"/private/tmp/wave-advancement-bootstrap-runtime.json\").read_text())[\"plugin_version\"]; actual=json.loads(p.read_text())[\"version\"]; actual==expected or (_ for _ in ()).throw(SystemExit(f\"{actual} != {expected}\")); print(actual)'",
+          "expected": "CARRY_WORKTREE_MATCH and Task 1's exact fresh cachebuster print."
+        },
+        {
+          "description": "Stage exactly seven Task 2 paths and validate cached diff.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f -- README.md CHANGELOG.md docs/plans/2026-08-14-professional-mode-off-operator-authority.md docs/plans/2026-08-14-professional-mode-off-operator-authority.plan.json docs/plans/2026-08-15-wave-advancement-and-reviewed-carry-recovery-design.md docs/plans/2026-08-15-wave-advancement-and-reviewed-carry-recovery-requirements.md worker/.codex-plugin/plugin.json && git -C /Users/roberthyatt/Code/ironclaude diff --cached --check",
+          "expected": "Exit zero; candidate is Task 1 reviewed tree plus seven declared paths, with no unrelated entry."
+        },
+        {
+          "description": "Run full state-manager suite.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm test",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Run PM-off and deactivation hook acceptance.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-professional-mode-off-authority.sh && bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-professional-mode-deactivation.sh",
+          "expected": "Both suites exit zero."
+        },
+        {
+          "description": "Run one native Claude/Codex PM-off acceptance.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python /Users/roberthyatt/Code/ironclaude/commander/scripts/live_pm_off_provider_response.py --client all --source-root /Users/roberthyatt/Code/ironclaude",
+          "expected": "Both clients classify all fixtures raw_git with false confirmation and activation fields."
+        },
+        {
+          "description": "Run focused Commander PM-off, authority, parity, Brain, and push suites.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest /Users/roberthyatt/Code/ironclaude/commander/tests/test_professional_mode_off_contract.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_live_pm_off_provider_response.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_git_authority_skill_parity.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_activation_client_parity.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_deactivation_client_parity.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_claude_md_template.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_brain_client.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_codex_brain_client.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_human_authority_refusal.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_push.py -q",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Require Task 1's reviewed state-manager bundle hash to remain unchanged. If certification exposes a defect requiring a path outside Task 2's seven allowed files, stop before installation without undeclared repair, retreat, another lineage, or another blind review.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && shasum -a 256 -c /private/tmp/wave-advancement-reviewed-bundle.sha256",
+          "expected": "Reviewed bundle hash matches; source certification from Task 1 remains valid."
+        },
+        {
+          "description": "Validate plugin and versions without running cachebuster helper again.",
+          "command": "/usr/bin/python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py /Users/roberthyatt/Code/ironclaude/worker && /Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest /Users/roberthyatt/Code/ironclaude/commander/tests/test_version_consistency.py -q",
+          "expected": "Validation and version tests pass; Claude is 1.1.6 and Codex matches Task 1's exact fresh cachebuster."
+        },
+        {
+          "description": "Regenerate and print the final two-client oracle from final source bytes, recording installed cache roots separately from active runtime roots. Resolve Claude's active root from the canonical local-path marketplace worker directory when present; Codex remains cache-root bound.",
+          "command": "/usr/bin/python3 -c 'import hashlib,json,pathlib; source=pathlib.Path(\"/Users/roberthyatt/Code/ironclaude/worker\"); shared=[\"mcp-servers/state-manager/dist/index.js\",\"mcp-servers/workspace-manager/dist/index.js\",\"mcp-servers/workspace-manager/dist/cli.js\",\"mcp-servers/workspace-manager/dist/hook-intent.js\"]; manifests={\"claude\":\".claude-plugin/plugin.json\",\"codex\":\".codex-plugin/plugin.json\"}; homes={\"claude\":\".claude\",\"codex\":\".codex\"}; versions={c:json.loads((source/m).read_text())[\"version\"] for c,m in manifests.items()}; installed={c:pathlib.Path(\"/Users/roberthyatt\")/homes[c]/\"plugins/cache/ironclaude/ironclaude\"/versions[c] for c in manifests}; markets=json.loads(pathlib.Path(\"/Users/roberthyatt/.claude/plugins/known_marketplaces.json\").read_text()); local=pathlib.Path(markets.get(\"ironclaude\",{}).get(\"installLocation\",markets.get(\"ironclaude\",{}).get(\"source\",{}).get(\"path\",\"\")))/\"worker\"; active={\"claude\":local.resolve() if local.is_dir() else installed[\"claude\"],\"codex\":installed[\"codex\"]}; digest=lambda relative: hashlib.sha256((source/relative).read_bytes()).hexdigest(); runtimes={c:{\"client\":c,\"plugin_root\":str(active[c]),\"plugin_version\":versions[c],\"manifest_sha256\":digest(manifests[c]),\"state_manager_bundle_sha256\":digest(shared[0]),\"workspace_manager_bundle_sha256\":digest(shared[1]),\"workspace_manager_cli_sha256\":digest(shared[2]),\"workspace_manager_hook_intent_sha256\":digest(shared[3])} for c in manifests}; inventory=[{\"client\":c,\"root\":str(installed[c]),\"relative_path\":r,\"sha256\":digest(r)} for c,m in manifests.items() for r in [m,*shared]]; target=pathlib.Path(\"/private/tmp/pm-off-operator-authority-expected-runtime.json\"); target.write_text(json.dumps({\"expected_runtime\":runtimes,\"installed_roots\":{c:str(p) for c,p in installed.items()},\"inventory\":inventory},sort_keys=True)+\"\\n\"); print(target.read_text(),end=\"\")' && git -C /Users/roberthyatt/Code/ironclaude diff --cached --check",
+          "expected": "Eight diagnostic fields per active runtime, two installed cache roots, and ten installed-file inventory rows print; Claude's active root is its cache or canonical local-marketplace worker root; cached diff remains valid."
+        },
+        {
+          "description": "Main verifies restart helper, reinstalls Claude, launches delayed restart, and installs Codex last.",
+          "command": "shasum -a 256 /private/tmp/restart_codex.py && claude plugin uninstall ironclaude@ironclaude --scope user --keep-data --yes && claude plugin install ironclaude@ironclaude --scope user && claude plugin details ironclaude@ironclaude && /usr/bin/python3 -c 'import subprocess; subprocess.Popen([\"/usr/bin/python3\", \"/private/tmp/restart_codex.py\"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)' && codex plugin add ironclaude@ironclaude --json",
+          "expected": "Approved helper hash; Claude base 1.1.6; exact Codex cachebuster; codex plugin add is final source, build, plugin-installation, and runtime mutation."
+        },
+        {
+          "description": "After restart, main verifies Claude's user-cache registry root, all ten installed hashes, and any distinct canonical local-marketplace active root against the same oracle. It runs Claude diagnostics with exact expected_runtime.claude, Codex diagnostics with exact expected_runtime.codex, verifies same provider-root session and active Task 2, submits Task 2, and loads native task-boundary review. C/D/F may repair only Task 2's seven declared paths before regenerated evidence and repeated final install; any other required path is blocking. No new lineage or blind plan review.",
+          "command": "/usr/bin/python3 -c 'import hashlib,json,pathlib; proof=json.loads(pathlib.Path(\"/private/tmp/pm-off-operator-authority-expected-runtime.json\").read_text()); registry=json.loads(pathlib.Path(\"/Users/roberthyatt/.claude/plugins/installed_plugins.json\").read_text()); wanted=proof[\"expected_runtime\"][\"claude\"]; installed=proof[\"installed_roots\"][\"claude\"]; matches=[row for row in registry[\"plugins\"][\"ironclaude@ironclaude\"] if row.get(\"scope\")==\"user\" and row.get(\"version\")==wanted[\"plugin_version\"] and row.get(\"installPath\")==installed]; len(matches)==1 or (_ for _ in ()).throw(SystemExit(f\"Claude registry match count: {len(matches)}\")); missing=[item for item in proof[\"inventory\"] if not (pathlib.Path(item[\"root\"])/item[\"relative_path\"]).is_file()]; not missing or (_ for _ in ()).throw(SystemExit(json.dumps(missing,sort_keys=True))); mismatches=[item for item in proof[\"inventory\"] if hashlib.sha256((pathlib.Path(item[\"root\"])/item[\"relative_path\"]).read_bytes()).hexdigest()!=item[\"sha256\"]]; active=pathlib.Path(wanted[\"plugin_root\"]); active_items=[{\"relative_path\":r,\"sha256\":s} for r,s in [(\".claude-plugin/plugin.json\",wanted[\"manifest_sha256\"]),(\"mcp-servers/state-manager/dist/index.js\",wanted[\"state_manager_bundle_sha256\"]),(\"mcp-servers/workspace-manager/dist/index.js\",wanted[\"workspace_manager_bundle_sha256\"]),(\"mcp-servers/workspace-manager/dist/cli.js\",wanted[\"workspace_manager_cli_sha256\"]),(\"mcp-servers/workspace-manager/dist/hook-intent.js\",wanted[\"workspace_manager_hook_intent_sha256\"])]]; active_bad=[item for item in active_items if not (active/item[\"relative_path\"]).is_file() or hashlib.sha256((active/item[\"relative_path\"]).read_bytes()).hexdigest()!=item[\"sha256\"]]; not mismatches and not active_bad or (_ for _ in ()).throw(SystemExit(json.dumps({\"installed\":mismatches,\"active\":active_bad},sort_keys=True))); print(\"ALL_INSTALLED_AND_ACTIVE_BYTES_MATCH\")' && claude -p 'Read /private/tmp/pm-off-operator-authority-expected-runtime.json. Call exactly state-manager run_diagnostics with expected_runtime equal to expected_runtime.claude. Return only that tool result. Do not call write or workflow-transition tools.' --model sonnet --output-format json",
+          "expected": "Both clients match exact active roots, installed roots, versions, diagnostics, and hashes; Claude's local-marketplace source root is accepted only with separate cache and active-root byte equality; Task 2 Grade A/B seals seven carry paths and completes plan; no commit or push."
+        }
+      ]
+    }
+  ]
+}

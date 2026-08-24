@@ -102,6 +102,12 @@ Only when the exact tokens remain literal:
 
 ### Step 1: Check current state and trusted client
 
+<!-- IRONCLAUDE_LLM_PATH: direct_professional_session; destination human. -->
+
+Before the first substantive human-facing response, load and apply
+`ironclaude:elements-of-style`. If the skill is missing or unreadable, report
+incomplete installation and leave professional mode unchanged.
+
 Call the active client's provider-native `get_professional_mode`.
 
 The response must include `professional_mode`, `client`, and a nonempty `session_id`.
@@ -219,9 +225,10 @@ its exact name from this list:
 - Advisor Fallback
 - No Workflow Avoidance Under Stage/Context Restrictions
 - Boy Scout Rule
+- Recipient-Based Communication Profiles
 
 The enumerated name set must equal the uncovered concept set exactly. Do not
-substitute a numeric range, a count, “concepts 1–11,” “behavioral concepts,” or
+substitute a numeric range, a count, “concepts 1–12,” “behavioral concepts,” or
 another generic summary for the names. Do not list a covered concept.
 
 Preserve all unrelated project guidance and append only genuinely missing
@@ -237,7 +244,7 @@ Call `<READ_INSTRUCTION_FILE>` for root `AGENTS.md` to perform its existence che
 
 - In `update` mode, if it is absent, create it only through the exact write
   operation below.
-- If it exists, semantically check the workflow requirement and all eleven
+- If it exists, semantically check the workflow requirement and all twelve
   concepts across the whole file. Do not require matching headings or wording.
 - When classification is uncertain, treat the concept as uncovered.
 - In `update` mode, compute a full result that appends only missing canonical
@@ -315,9 +322,14 @@ Call `<WRITE_INSTRUCTION_FILE>` for root `AGENTS.md` with the complete canonical
     - If cleanup would materially expand scope, change behavior, require destructive action, affect external systems, or require new authority, describe the finding, evidence, proposed cleanup scope, and risk, then ask permission before proceeding
     - If cleanup is blocked or unsafe, record the finding and explain the constraint instead of suppressing it
     - Do not use this rule to justify speculative refactoring or unrequested features
+
+12. **Recipient-Based Communication Profiles**
+   - Before first substantive human-facing response, load and apply `ironclaude:elements-of-style`
+   - For AI-directed natural language, load and apply `ironclaude:write-lossless-ai-messages`
+   - Select by destination, not model; preserve machine schemas and protected technical content exactly
 ```
 
-For an existing file, use the same eleven-concept semantic meanings as the
+For an existing file, use the same twelve-concept semantic meanings as the
 Claude table below, except Advisor Fallback is covered only by a Codex-native
 one-tier-up `codex exec` review. Append the corresponding complete body from
 the canonical Codex template above for any missing concept.
@@ -325,7 +337,7 @@ the canonical Codex template above for any missing concept.
 Call `<WRITE_INSTRUCTION_FILE>` for root `AGENTS.md` with the full computed result after any append or prepend.
 
 Call `<READ_INSTRUCTION_FILE>` for root `AGENTS.md` as the read-back gate.
-Verify the workflow requirement and all eleven concepts from that returned
+Verify the workflow requirement and all twelve concepts from that returned
 content.
 
 #### Claude Code: `CLAUDE.md` and `.claude/rules/behavioral.md`
@@ -361,7 +373,7 @@ Full behavioral rules: [`.claude/rules/behavioral.md`](.claude/rules/behavioral.
 ```
 
 First semantically evaluate the existing `CLAUDE.md` together with
-`.claude/rules/behavioral.md` when the rules file exists. Do not create `.claude/rules/behavioral.md` solely because it is absent. If `CLAUDE.md` alone covers the workflow requirement and all eleven concepts, leave the rules file absent.
+`.claude/rules/behavioral.md` when the rules file exists. Do not create `.claude/rules/behavioral.md` solely because it is absent. If `CLAUDE.md` alone covers the workflow requirement and all twelve concepts, leave the rules file absent.
 
 Only if that evaluation finds missing concepts and
 `.claude/rules/behavioral.md` is absent in `update` mode, create it with the
@@ -434,6 +446,11 @@ Call `<WRITE_INSTRUCTION_FILE>` for `.claude/rules/behavioral.md` with the compl
     - If cleanup would materially expand scope, change behavior, require destructive action, affect external systems, or require new authority, describe the finding, evidence, proposed cleanup scope, and risk, then ask permission before proceeding
     - If cleanup is blocked or unsafe, record the finding and explain the constraint instead of suppressing it
     - Do not use this rule to justify speculative refactoring or unrequested features
+
+12. **Recipient-Based Communication Profiles**
+   - Before first substantive human-facing response, load and apply `ironclaude:elements-of-style`
+   - For AI-directed natural language, load and apply `ironclaude:write-lossless-ai-messages`
+   - Select by destination, not model; preserve machine schemas and protected technical content exactly
 ```
 
 For existing Claude files, semantically check both files together:
@@ -451,9 +468,10 @@ For existing Claude files, semantically check both files together:
 | 9 | Advisor Fallback | Instructions to use the `Agent` tool with Fable if available else Opus instead of skipping advisor review |
 | 10 | No Workflow Avoidance Under Stage/Context Restrictions | Instructions not to self-checkpoint or hand stage-blocked read-only work to the operator; open an investigation PM loop |
 | 11 | Boy Scout Rule | Instructions not to ignore evidence-backed pre-existing or adjacent defects; clean them up when within authorized task scope, ask permission before scope expansion, destructive action, or external-system effects after presenting finding/evidence/scope/risk, and record blocked or unsafe findings instead of suppressing them |
+| 12 | Recipient-Based Communication Profiles | Instructions to load `ironclaude:elements-of-style` for human-facing prose, load `ironclaude:write-lossless-ai-messages` for AI-directed natural language, select by destination rather than model, and preserve machine schemas and protected technical content exactly |
 
 Also semantically check the workflow requirement across both files. If all
-eleven concepts and the workflow requirement are covered, make no changes.
+twelve concepts and the workflow requirement are covered, make no changes.
 When classification is uncertain, treat the concept as uncovered.
 
 In `update` mode, if a concept is missing, append its corresponding complete
@@ -496,18 +514,27 @@ N. **Boy Scout Rule — Leave It Better Than You Found It**
     - Do not use this rule to justify speculative refactoring or unrequested features
 ```
 
-The full rule set has 11 concepts. New projects receive the compact index plus
-full rules `(11 principles)`. Existing projects use the same 11-principle template as the canonical source.
+Concept 12 (Recipient-Based Communication Profiles):
+
+```markdown
+N. **Recipient-Based Communication Profiles**
+   - Before first substantive human-facing response, load and apply `ironclaude:elements-of-style`
+   - For AI-directed natural language, load and apply `ironclaude:write-lossless-ai-messages`
+   - Select by destination, not model; preserve machine schemas and protected technical content exactly
+```
+
+The full rule set has 12 concepts. New projects receive the compact index plus
+full rules `(12 principles)`. Existing projects use the same 12-principle template as the canonical source.
 
 Call `<READ_INSTRUCTION_FILE>` for each existing Claude-owned instruction file as the read-back gate.
-Verify the workflow requirement and all eleven concepts from the returned
+Verify the workflow requirement and all twelve concepts from the returned
 content.
 
 **Read-back verification gate**
 
 Use the active branch's exact `<READ_INSTRUCTION_FILE>` read-back operation
 after all setup edits.
-Confirm the workflow requirement and all eleven concepts are semantically
+Confirm the workflow requirement and all twelve concepts are semantically
 covered. Confirm no inactive-client surface was written during this activation.
 
 Do not continue after a required-surface write or verification failure. Report

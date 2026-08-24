@@ -61,6 +61,12 @@ from ironclaude.slack_interface import parse_reply_to_marker
 from ironclaude.tmux_manager import _strip_ansi, detect_ask_user_menu
 from ironclaude.wiki_tools import WikiTools
 from ironclaude.workspace_client import WorkspaceClient, WorkspaceClientError
+from ironclaude.communication_profiles import (
+    CommunicationProfileError,
+    PROFILE_READY_MARKER,
+    apply_communication_profile,
+    skill_invocation,
+)
 
 logger = logging.getLogger("ironclaude.orchestrator_mcp")
 
@@ -175,6 +181,7 @@ WORKER_COMMANDS = {
 # existing ValueError for invalid worker types).
 _WORKER_TYPE_TIER = {"claude-opus": "opus", "claude-fable": "fable", "claude-sonnet": "sonnet"}
 
+# IRONCLAUDE_LLM_PATH: advisor
 # Codex's advisor channel. Claude workers are told their advisor with the
 # `/advisor <model>` slash command typed into their pane; codex cannot parse a
 # Claude slash command, so it gets the same directive as plain text over the same
@@ -190,7 +197,9 @@ _CODEX_ADVISOR_INSTRUCTION = (
     "report-only reviewer with `codex exec -m <one-tier-up-model>` using "
     "luna -> terra -> sol; at the sol ceiling, run a same-tier blind sol pass. "
     "Reconcile the review with evidence; never proceed unreviewed because an "
-    "advisor command is unavailable."
+    "advisor command is unavailable. Prepend the exact complete "
+    "write-lossless-ai-messages skill content to every report-only reviewer prompt "
+    "and keep the reviewer report lossless."
 )
 
 VALID_DIRECTIVE_STATUSES = frozenset({
@@ -395,12 +404,12 @@ def _init_brain_session_background(
     timeout: int = 30,
     _claude_dir: Path | None = None,
 ) -> None:
-    """Write professional_mode='off' to the Brain's sessions row at startup.
+    """Ensure the Brain's sessions row exists at startup (create-if-absent).
 
     Called from main() in a daemon thread. Polls for the PPID-keyed session ID
-    file written by session-init.sh, then writes professional_mode='off' to
-    ~/.claude/ironclaude.db using the same INSERT OR IGNORE + UPDATE pattern
-    as _set_pm_via_sqlite.
+    file written by session-init.sh, then INSERT OR IGNOREs a row in
+    ~/.claude/ironclaude.db. It NEVER writes professional_mode on an existing
+    row — daemon startup has no authority over the kill-switch field.
 
     Args:
         ppid: Claude CLI PID (os.getppid() from main() — our direct parent).
@@ -429,7 +438,10 @@ def _init_brain_session_background(
         )
         return
 
-    # INSERT OR IGNORE + UPDATE the session row directly by UUID (no tmux needed)
+    # INSERT OR IGNORE the session row directly by UUID (no tmux needed).
+    # Create-if-absent only: an existing session's professional_mode is never
+    # overwritten here (that would clobber a live 'on'/executing session — the
+    # PM kill-switch and deactivation own that field, not daemon startup).
     try:
         with sqlite3.connect(str(db_path), timeout=5) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -438,28 +450,9 @@ def _init_brain_session_background(
                 " VALUES (?, 'off')",
                 (session_uuid,),
             )
-            conn.execute(
-                "UPDATE sessions SET professional_mode='off', updated_at=datetime('now')"
-                " WHERE terminal_session=?",
-                (session_uuid,),
-            )
-            conn.commit()
-            conn.execute(
-                "INSERT INTO audit_log"
-                " (terminal_session, actor, action, old_value, new_value, context)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    session_uuid,
-                    "daemon:brain_init",
-                    "professional_mode_off",
-                    None,
-                    "off",
-                    "Brain session init via _init_brain_session_background",
-                ),
-            )
             conn.commit()
         logger.info(
-            f"Brain session initialized: professional_mode='off' "
+            f"Brain session row ensured (professional_mode untouched if row existed) "
             f"(session {session_uuid[:8]}...)"
         )
     except sqlite3.Error as e:
@@ -1167,6 +1160,14 @@ class OrchestratorTools:
             # No provider config -> legacy claude grader, byte-identical to pre-routing.
             grader_client, grader_model = "claude", self._grader_model
 
+        try:
+            construction_path = f"{grader_client}_grader"
+            profiled_system_prompt = apply_communication_profile(
+                construction_path, system_prompt
+            )
+        except CommunicationProfileError as exc:
+            return self._grader_failure(batch, str(exc))
+
         from ironclaude.main import ensure_brain_trusted
         # The Anthropic tool input_schema (what --json-schema becomes) MUST be a
         # top-level object — a top-level array is rejected (400 ...type: 'object').
@@ -1183,9 +1184,10 @@ class OrchestratorTools:
             try:
                 ensure_brain_trusted(self._grader_home)
                 with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as sf:
-                    sf.write(system_prompt)
+                    sf.write(profiled_system_prompt)
                     sysfile = sf.name
                 if grader_client == "codex":
+                    # IRONCLAUDE_LLM_PATH: codex_grader
                     schema_file = None
                     try:
                         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as scf:
@@ -1193,7 +1195,7 @@ class OrchestratorTools:
                             schema_file = scf.name
                         codex_proc = subprocess.run(
                             self._codex_grader_argv(schema_file, grader_model),
-                            input=f"{system_prompt}\n\n{user_prompt}",
+                            input=f"{profiled_system_prompt}\n\n{user_prompt}",
                             cwd=self._grader_home, env=self._codex_grader_env(),
                             capture_output=True, text=True, timeout=self.GRADER_TIMEOUT_SECONDS,
                         )
@@ -1222,6 +1224,7 @@ class OrchestratorTools:
                         return self._grader_failure(
                             batch, f"Codex grader exited {codex_proc.returncode}: {diagnostic}")
                     return self._parse_codex_grader_output(codex_proc, batch)
+                # IRONCLAUDE_LLM_PATH: claude_grader
                 cmd = self._claude_grader_argv(schema, sysfile, grader_model)
                 proc = subprocess.run(
                     cmd, input=user_prompt, cwd=self._grader_home, env=self._grader_env(),
@@ -2213,7 +2216,9 @@ class OrchestratorTools:
         return self._ensure_worker_instructions(repo, "claude")
 
     def _wait_for_ready(self, session_name: str, timeout: int = 30,
-                        ssh_host: str | None = None, client: str = "claude") -> bool:
+                        ssh_host: str | None = None, client: str = "claude",
+                        marker: str | None = None, log_offset: int | None = None,
+                        remote_log_dir: str | None = None) -> bool:
         """Poll tmux log until the worker is ready or timeout exceeded.
 
         Returns True if the client's ready indicator is found (claude: "ironclaude v";
@@ -2226,8 +2231,17 @@ class OrchestratorTools:
         codex_trust_dismissed = False
         codex_hooks_trust_dismissed = False
         while time.time() < deadline:
-            output = self.tmux.read_log_tail(session_name, lines=50, ssh_host=ssh_host)
+            output = (
+                self.tmux.read_log_tail(session_name, lines=50, ssh_host=ssh_host,
+                                        remote_log_dir=remote_log_dir)
+                if log_offset is None else self.tmux.read_log_since(
+                    session_name, log_offset, ssh_host=ssh_host,
+                    remote_log_dir=remote_log_dir,
+                )
+            )
             if output:
+                if marker is not None and marker in output:
+                    return True
                 if client == "codex" and "MCP startup interrupted" in output:
                     return False
                 lower = output.lower()
@@ -2263,6 +2277,29 @@ class OrchestratorTools:
                         return True
             time.sleep(1)
         return False
+
+    def _dispatch_worker_communication_profile(
+        self, session_name: str, client: str, *, ssh_host: str | None = None,
+        remote_log_dir: str | None = None,
+    ) -> str | None:
+        """Invoke managed-worker profile and reject markers that predate dispatch."""
+        # IRONCLAUDE_LLM_PATH: managed_worker
+        try:
+            invocation = skill_invocation("managed_worker", client)
+        except CommunicationProfileError as exc:
+            return f"Communication-profile infrastructure error: {exc}"
+        log_offset = self.tmux.get_log_size(
+            session_name, ssh_host=ssh_host, remote_log_dir=remote_log_dir,
+        )
+        if not self.tmux.send_keys(session_name, invocation, ssh_host=ssh_host):
+            return "Failed to deliver write-lossless-ai-messages activation"
+        if not self._wait_for_ready(
+            session_name, timeout=30, ssh_host=ssh_host, client=client,
+            marker=PROFILE_READY_MARKER, log_offset=log_offset,
+            remote_log_dir=remote_log_dir,
+        ):
+            return "write-lossless-ai-messages activation did not emit a fresh readiness marker"
+        return None
 
     def _descendant_pids(self, pid: int) -> list:
         """pid + all descendant PIDs (best-effort, POSIX ``pgrep -P``). Used by the codex
@@ -2884,6 +2921,112 @@ class OrchestratorTools:
         except Exception as exc:  # noqa: BLE001 - cleanup is best-effort post-integration
             logger.warning("integrated-cleanup reconcile failed (non-fatal): %s", exc)
 
+    def _complete_worker_if_session_dead(
+        self, worker_id: str, ssh_host: str | None,
+    ) -> bool:
+        """Mark worker_id completed ONLY when its tmux session is confirmed dead.
+
+        Shared gate for every 'the managed worktree already landed' completion
+        site: a missing/empty session or an ambiguous (raising) liveness check
+        must never complete a worker (fail toward never-complete-a-live-worker).
+        Returns True iff the worker was actually marked completed.
+        """
+        worker = self.registry.get_worker(worker_id)
+        session = worker.get("tmux_session") if isinstance(worker, dict) else None
+        if not (isinstance(session, str) and session):
+            return False
+        try:
+            alive = self.tmux.has_session(session, ssh_host=ssh_host)
+        except Exception:
+            return False
+        if alive:
+            return False
+        self.registry.update_worker_status(worker_id, "completed")
+        return True
+
+    # States the non-mutating rebase-recovery status probe recognizes as a
+    # genuine mid-finalization condition (an active or recently-resolved
+    # rebase/drift on the managed worktree) — as opposed to a probe failure or
+    # an unrecognized state, either of which is a real environment error and
+    # must NOT be treated as mid-finalization.
+    _MID_FINALIZATION_STATES = frozenset(
+        {"integrated", "rebase-paused-clean", "rebase-paused-conflict", "frozen-no-rebase"}
+    )
+
+    def _probe_finalization_status(
+        self,
+        repository: str,
+        assignment: dict,
+        installed_root: str,
+        ssh_host: str | None,
+    ) -> tuple[dict, dict | None, dict]:
+        """Issue the non-mutating rebase-recovery status probe.
+
+        Returns (recovery_payload, status, transport). status is None when the
+        probe itself raised or returned a non-dict shape — callers treat that
+        as fail-closed (no recognizable mid-finalization state). transport is
+        always returned so callers can issue further reconcile calls against
+        the same worktree without re-deriving it.
+        """
+        transport = self._workspace_transport(installed_root, ssh_host)
+        recovery_payload = {
+            "repository_path": repository,
+            "workspace_guid": assignment["workspace_guid"],
+            "owner_session_id": assignment["owner_session_id"],
+        }
+        try:
+            status = self._workspace_client.reconcile(
+                {**recovery_payload, "rebase_recovery": "status"},
+                **transport,
+            )
+        except Exception:
+            return recovery_payload, None, transport
+        return recovery_payload, status if isinstance(status, dict) else None, transport
+
+    def _drive_continue_recovery(
+        self,
+        worker_id: str,
+        recovery_payload: dict,
+        transport: dict,
+        error: object,
+        repository: str,
+        assignment: dict,
+        ssh_host: str | None,
+    ) -> dict:
+        """Drive a clean paused rebase to completion via a 'continue' reconcile.
+
+        Self-contained: callers only need the probe's recovery_payload/transport
+        plus the original failure context. Terminal routing: reaching one of the
+        recognized integrated states marks the worker completed; a repair-required
+        outcome is tagged mode='repair'; anything else (re-conflict, probe
+        failure) is tagged mode='conflict'.
+        """
+        try:
+            integrated = self._workspace_client.reconcile(
+                {**recovery_payload, "rebase_recovery": "continue"},
+                **transport,
+            )
+        except Exception:
+            integrated = None
+        if (
+            isinstance(integrated, dict)
+            and integrated.get("state") in self._FINALIZATION_INTEGRATED_STATES
+        ):
+            self._complete_worker_if_session_dead(worker_id, ssh_host)
+            return integrated
+        if (
+            isinstance(integrated, dict)
+            and integrated.get("state") == "rebase-recovery-repair-required"
+        ):
+            return self._workspace_failure(
+                "finalization", repository, assignment, error,
+                recovery_payload=recovery_payload, mode="repair",
+            )
+        return self._workspace_failure(
+            "finalization", repository, assignment, error,
+            recovery_payload=recovery_payload, mode="conflict",
+        )
+
     def _classify_finalization_failure(
         self,
         worker_id: str,
@@ -2901,57 +3044,28 @@ class OrchestratorTools:
         mode and performs NO mutation. Any probe failure or unrecognized state
         falls back to the untagged preserved failure (fail-closed).
         """
-        transport = self._workspace_transport(installed_root, ssh_host)
-        recovery_payload = {
-            "repository_path": repository,
-            "workspace_guid": assignment["workspace_guid"],
-            "owner_session_id": assignment["owner_session_id"],
-        }
-        try:
-            status = self._workspace_client.reconcile(
-                {**recovery_payload, "rebase_recovery": "status"},
-                **transport,
-            )
-        except Exception:
+        recovery_payload, status, transport = self._probe_finalization_status(
+            repository, assignment, installed_root, ssh_host,
+        )
+        if status is None:
             return self._workspace_failure(
                 "finalization", repository, assignment, error,
                 recovery_payload=recovery_payload,
             )
-        state = status.get("state") if isinstance(status, dict) else None
+        state = status.get("state")
         if state == "integrated":
             # The status probe found the work already landed (e.g. finalize
             # raised during post-integration cleanup) — there is nothing left
             # to reconcile, so mark the worker completed and hand back the
             # probe result rather than an untagged failure pointing at a
             # possibly-deleted worktree.
-            self.registry.update_worker_status(worker_id, "completed")
+            self._complete_worker_if_session_dead(worker_id, ssh_host)
             self._trigger_integrated_cleanup(recovery_payload, transport)
             return status
         if state == "rebase-paused-clean":
-            try:
-                integrated = self._workspace_client.reconcile(
-                    {**recovery_payload, "rebase_recovery": "continue"},
-                    **transport,
-                )
-            except Exception:
-                integrated = None
-            if (
-                isinstance(integrated, dict)
-                and integrated.get("state") in self._FINALIZATION_INTEGRATED_STATES
-            ):
-                self.registry.update_worker_status(worker_id, "completed")
-                return integrated
-            if (
-                isinstance(integrated, dict)
-                and integrated.get("state") == "rebase-recovery-repair-required"
-            ):
-                return self._workspace_failure(
-                    "finalization", repository, assignment, error,
-                    recovery_payload=recovery_payload, mode="repair",
-                )
-            return self._workspace_failure(
-                "finalization", repository, assignment, error,
-                recovery_payload=recovery_payload, mode="conflict",
+            return self._drive_continue_recovery(
+                worker_id, recovery_payload, transport, error, repository, assignment,
+                ssh_host,
             )
         if state == "rebase-paused-conflict":
             return self._workspace_failure(
@@ -3255,6 +3369,540 @@ class OrchestratorTools:
         self.registry.update_worker_status(worker_id, "completed")
         return result
 
+    def _worktree_has_new_work(
+        self,
+        worktree_path: str,
+        integration_target: str,
+        *,
+        ssh_host: str | None = None,
+    ) -> bool:
+        """True iff the worktree carries a NEW contribution to integrate.
+
+        CONTRIBUTION-relative, not target-relative. Worker output is a STAGED
+        INDEX tree, not commits on HEAD: _derive_workspace_commit_evidence ships
+        stagedTree=`git write-tree` with parentOid=HEAD, and finalize refuses
+        unless the recorded base_commit equals the worktree's merge-base with the
+        target (workspace-manager integration.ts). So the tree finalize would
+        integrate is `git write-tree`, and the baseline it integrates ONTO is the
+        worktree's OWN merge-base with the integration target — NOT the current
+        target tree. This method compares those two: the staged index tree versus
+        the merge-base tree.
+
+          staged index tree != merge-base tree  ⇒  new contribution (True)
+          staged index tree == merge-base tree  ⇒  nothing new (False)
+
+        Behaviour (a managed worktree shares refs with its primary checkout, so
+        the target ref resolves from inside the worktree):
+          - staged-only uncommitted (HEAD at merge-base, work in the index) → True
+            (the normal finished-worker shape; MUST NOT be dropped off-main)
+          - committed-ahead (a real divergent commit)                       → True
+          - merely-behind (HEAD an ancestor of an advanced target, nothing
+            staged; merge-base == HEAD, so its tree == the index tree)       → False
+            (no churn — a target-relative check would falsely return True)
+          - post-recycle already-integrated (HEAD reset onto the target, nothing
+            staged; merge-base tree == index tree)                           → False
+
+        A target-relative comparison would churn a merely-behind worker; a
+        commit-based `git rev-list <target>..HEAD` would report EMPTY for a
+        staged-only worker and DROP its reviewed work. `git write-tree` still
+        raises on an unmerged (paused-rebase) index — the merge-base call does
+        not read the index, so that raise is preserved and routed to recovery.
+        """
+        def git(*args: str) -> str:
+            argv = ["git", "-C", worktree_path, *args]
+            if ssh_host is None:
+                result = subprocess.run(
+                    argv, capture_output=True, text=True, check=False,
+                )
+            else:
+                if self._ssh_manager is None:
+                    raise WorkspaceClientError(
+                        "remote Git new-work check requires an SSH manager"
+                    )
+                result = self._ssh_manager.run_argv(ssh_host, argv)
+            if result.returncode != 0:
+                detail = (
+                    result.stderr.strip()
+                    if isinstance(result.stderr, str) and result.stderr.strip()
+                    else "no diagnostic"
+                )
+                raise WorkspaceClientError(
+                    f"new-work Git command failed: {' '.join(args)}: {detail}"
+                )
+            return result.stdout.strip() if isinstance(result.stdout, str) else ""
+
+        target_ref = (
+            integration_target
+            if integration_target.startswith("refs/")
+            else f"refs/heads/{integration_target}"
+        )
+        merge_base = git("merge-base", "HEAD", target_ref)
+        staged_tree = git("write-tree")
+        base_tree = git("rev-parse", "--verify", f"{merge_base}^{{tree}}")
+        return staged_tree != base_tree
+
+    def _worktree_head_is_target(
+        self,
+        worktree_path: str,
+        integration_target: str,
+        *,
+        ssh_host: str | None = None,
+    ) -> bool:
+        """True iff the worktree HEAD commit already equals the integration
+        target's head commit. Used by the non-terminal no-new-work arm to tell a
+        merely-behind worker (HEAD trails the target ⇒ ff-SYNC it) from one that
+        already sits exactly at the target (nothing to sync ⇒ true no-op). Refs
+        resolve from inside the shared managed worktree, exactly as the new-work
+        probe resolves them.
+        """
+        def git(*args: str) -> str:
+            argv = ["git", "-C", worktree_path, *args]
+            if ssh_host is None:
+                result = subprocess.run(
+                    argv, capture_output=True, text=True, check=False,
+                )
+            else:
+                if self._ssh_manager is None:
+                    raise WorkspaceClientError(
+                        "remote Git head-vs-target check requires an SSH manager"
+                    )
+                result = self._ssh_manager.run_argv(ssh_host, argv)
+            if result.returncode != 0:
+                detail = (
+                    result.stderr.strip()
+                    if isinstance(result.stderr, str) and result.stderr.strip()
+                    else "no diagnostic"
+                )
+                raise WorkspaceClientError(
+                    f"head-vs-target Git command failed: {' '.join(args)}: {detail}"
+                )
+            return result.stdout.strip() if isinstance(result.stdout, str) else ""
+
+        target_ref = (
+            integration_target
+            if integration_target.startswith("refs/")
+            else f"refs/heads/{integration_target}"
+        )
+        head = git("rev-parse", "--verify", "HEAD^{commit}")
+        target_head = git("rev-parse", "--verify", f"{target_ref}^{{commit}}")
+        return head == target_head
+
+    def _finalize_and_release_worker(
+        self, worker_id: str, reason: str, terminal: bool,
+    ) -> dict:
+        """Deterministically integrate (or rescue) a worker's managed worktree.
+
+        The single auto-integration seam shared by the daemon's terminal paths
+        (session-died, stuck-kill, kill_worker — terminal=True) and its idle path
+        (idle marker, worker still alive — terminal=False). Review gates are read
+        from the state DB with the SAME checks commit_worker enforces; worker
+        self-report is never trusted.
+
+        Dispatch (never trusts the caller's terminal flag over a live session):
+          - has_session defence-in-depth: a terminal request whose tmux session
+            is still alive is downgraded to the non-terminal behaviour, so no
+            action that removes the worktree dir ever runs against a live worker.
+          - terminal, gates pass, new work    → finalize dispose:'release'
+                                                 (integrate + remove dir)
+          - terminal, gates fail / unintegrable→ abandon mode:'rescue'
+                                                 (preserve on branch + remove dir)
+          - terminal, gates pass, NO new work  → abandon mode:'rescue' releases
+                                                 the already-integrated dir with
+                                                 no commit
+          - non-terminal, gates pass, new work → finalize dispose:'recycle'
+                                                 (integrate, dir kept)
+          - non-terminal, gates pass, no new,  → ff-sync the worktree (action
+            HEAD behind target                   'synced'); a sync failure is
+                                                 surfaced (never abandon/commit)
+          - non-terminal, gates pass, no new,  → no-op
+            HEAD == target
+          - non-terminal, gates fail           → surface only (no abandon)
+        A finalize CALL failure is routed through _classify_finalization_failure
+        (a recoverable lock/paused-rebase/drift is NEVER abandoned) and the
+        worker is left running to retry on a later cycle. Terminal successes mark
+        the worker completed; notifications fire only when something happened.
+        """
+        worker = self.registry.get_worker(worker_id)
+        if not worker:
+            return {"error": f"worker not found: {worker_id}", "action": "error"}
+
+        if not worker.get("workspace_guid"):
+            # Unmanaged worker — never assigned a managed worktree; there is
+            # nothing to integrate. Complete it only when it is terminal AND its
+            # session is confirmed dead (never complete a live worker). A
+            # live/non-terminal unmanaged worker is surfaced (preserved), not
+            # completed. Handled here so it never reaches the managed
+            # assignment/probe/finalize path (which raises 'authority' for a
+            # worker lacking workspace fields).
+            if worker.get("machine"):
+                self._ensure_ssh_manager()
+            unmanaged_ssh_host = self._resolve_ssh_host(worker_id)
+            unmanaged_session = worker.get("tmux_session")
+            unmanaged_alive = (
+                isinstance(unmanaged_session, str)
+                and unmanaged_session
+                and self.tmux.has_session(unmanaged_session, ssh_host=unmanaged_ssh_host)
+            )
+            if terminal and not unmanaged_alive:
+                self.registry.update_worker_status(worker_id, "completed")
+                return {"action": "completed", "worker_id": worker_id}
+            return {
+                "action": "surfaced",
+                "worker_id": worker_id,
+                "failure_phase": "authority",
+                "assignment_preserved": True,
+            }
+
+        try:
+            assignment = self._registry_workspace_assignment(worker)
+        except Exception as exc:
+            return {
+                "error": str(exc),
+                "failure_phase": "authority",
+                "assignment_preserved": True,
+                "action": "error",
+            }
+        repository = worker.get("repo")
+        client = worker.get("client")
+        if not isinstance(repository, str) or not repository:
+            failure = self._workspace_failure(
+                "authority", "", assignment,
+                "worker registry lacks repository path",
+            )
+            failure["action"] = "error"
+            return failure
+        if client not in {"claude", "codex"}:
+            failure = self._workspace_failure(
+                "authority", repository, assignment,
+                "worker registry lacks supported provider client",
+            )
+            failure["action"] = "error"
+            return failure
+
+        if worker.get("machine"):
+            self._ensure_ssh_manager()
+        ssh_host = self._resolve_ssh_host(worker_id)
+
+        # has_session defence-in-depth: never delete a live worker's cwd. A
+        # terminal request racing a still-alive session becomes non-terminal.
+        session_name = worker.get("tmux_session")
+        if (
+            terminal
+            and isinstance(session_name, str)
+            and session_name
+            and self.tmux.has_session(session_name, ssh_host=ssh_host)
+        ):
+            terminal = False
+
+        # discover_installed_plugin_root MUST run BEFORE the probe so the
+        # non-mutating status probe (and every later reconcile/finalize) has a
+        # plugin root + transport. A discovery failure is a real environment
+        # error — always 'authority'. Discovered ONCE here and reused below.
+        try:
+            installed_root = self._workspace_client.discover_installed_plugin_root(
+                client, ssh_host=ssh_host,
+            )
+        except Exception as exc:
+            return {
+                "error": str(exc),
+                "failure_phase": "authority",
+                "assignment_preserved": True,
+                "action": "surfaced",
+            }
+
+        # PROBE-FIRST ROUTER: classify the managed worktree with the NON-MUTATING
+        # status probe BEFORE any mint-capable finalize. finalize is reachable
+        # ONLY on the 'not-ready' (active) fall-through; every mid-finalization
+        # state is handled here WITHOUT minting an empty commit — the fix for a
+        # frozen/drifted worker minting an empty commit every cycle.
+        recovery_payload, status, transport = self._probe_finalization_status(
+            repository, assignment, installed_root, ssh_host,
+        )
+        state = status.get("state") if status is not None else None
+        if state == "not-ready":
+            pass  # Active worker — fall through to the gates / finalize flow.
+        elif state == "integrated":
+            # Work already landed (e.g. a prior cycle integrated then the
+            # deferred cleanup was interrupted): complete the worker and run the
+            # deferred managed cleanup — NEVER finalize an already-integrated
+            # worktree (that mints an empty commit).
+            self._complete_worker_if_session_dead(worker_id, ssh_host)
+            self._trigger_integrated_cleanup(recovery_payload, transport)
+            return status
+        elif state == "rebase-paused-clean":
+            # A clean paused rebase is driven to completion transparently; no
+            # finalize, no mint.
+            return self._drive_continue_recovery(
+                worker_id, recovery_payload, transport,
+                "mid-finalization paused rebase detected before finalize",
+                repository, assignment, ssh_host,
+            )
+        elif state == "rebase-paused-conflict":
+            return self._workspace_failure(
+                "finalization", repository, assignment,
+                "mid-finalization conflicted rebase detected before finalize",
+                recovery_payload=recovery_payload, mode="conflict",
+            )
+        elif state == "frozen-no-rebase":
+            return self._workspace_failure(
+                "finalization", repository, assignment,
+                "mid-finalization frozen drift detected before finalize",
+                recovery_payload=recovery_payload, mode="drift",
+            )
+        else:
+            # None (the probe raised) OR an unrecognized state: the worktree
+            # state is unknown, so NEVER finalize against it. Preserve the
+            # assignment and surface with the 'probe' tag (an environment/probe
+            # error, distinct from the mid-finalization 'finalization' states).
+            return {
+                "failure_phase": "probe",
+                "action": "surfaced",
+                "assignment_preserved": True,
+                "worker_id": worker_id,
+            }
+
+        # Review gates — identical to commit_worker; never trust self-report.
+        try:
+            review_state = self._read_worker_finalization_state(
+                assignment["owner_session_id"], ssh_host=ssh_host,
+            )
+        except Exception as exc:
+            # Gates unreadable: integrate nothing. A terminal worker stays
+            # running so a later cycle retries; nothing is destroyed.
+            return {
+                "error": str(exc),
+                "failure_phase": "authority",
+                "assignment_preserved": True,
+                "action": "surfaced",
+            }
+        gates_pass = (
+            review_state.get("workflow_stage") == "execution_complete"
+            and review_state.get("unfinished_tasks") == 0
+            and review_state.get("latest_task_boundary_grade") in {"A", "B"}
+        )
+
+        if not gates_pass:
+            if terminal:
+                return self._abandon_rescue_worker(
+                    worker_id, repository, client, assignment, ssh_host,
+                    already_integrated=False,
+                )
+            return {"action": "surfaced", "worker_id": worker_id}
+
+        # Gates pass — decide whether there is genuinely new work to integrate
+        # BEFORE deriving finalize evidence (the no-op path must not depend on
+        # evidence derivation succeeding). installed_root was discovered above
+        # (before the probe) and is reused here — never rediscovered.
+        try:
+            has_new_work = self._worktree_has_new_work(
+                assignment["worktree_path"], assignment["integration_target"],
+                ssh_host=ssh_host,
+            )
+        except Exception as exc:
+            # The new-work probe (`git write-tree`) raises when the worktree
+            # index is unmerged — e.g. a paused/conflicted rebase mid-finalize.
+            # Route THAT case through the same recovery classifier a finalize-
+            # call failure gets, so the outcome is failure_phase='finalization'
+            # (preserved + surfaced) instead of 'authority' (silently
+            # completed by main.py's completed-flip guards). A probe failure
+            # with no recognizable mid-finalization state is a genuine
+            # environment error and stays on the authority path.
+            _, status, _ = self._probe_finalization_status(
+                repository, assignment, installed_root, ssh_host,
+            )
+            state = status.get("state") if status is not None else None
+            if state in self._MID_FINALIZATION_STATES:
+                return self._classify_finalization_failure(
+                    worker_id, repository, assignment, exc, installed_root, ssh_host,
+                )
+            return {
+                "error": str(exc),
+                "failure_phase": "authority",
+                "assignment_preserved": True,
+                "action": "surfaced",
+            }
+
+        if not has_new_work:
+            # Nothing new to integrate. NEVER mint an empty commit.
+            if terminal:
+                # Dead session: release the leftover already-integrated dir.
+                return self._abandon_rescue_worker(
+                    worker_id, repository, client, assignment, ssh_host,
+                    already_integrated=True,
+                )
+            # Non-terminal (alive idle worker). R4: a merely-behind worker (HEAD
+            # trails an advanced target) is ff-SYNCED — the same workspace-manager
+            # sync the periodic sweep issues — NOT finalized (which would mint an
+            # empty commit) and NOT abandoned (which would drop the live dir).
+            # When HEAD already IS the target head there is nothing to sync.
+            try:
+                head_is_target = self._worktree_head_is_target(
+                    assignment["worktree_path"], assignment["integration_target"],
+                    ssh_host=ssh_host,
+                )
+            except Exception as exc:
+                return {
+                    "error": str(exc),
+                    "failure_phase": "authority",
+                    "assignment_preserved": True,
+                    "action": "surfaced",
+                }
+            if head_is_target:
+                return {"action": "noop", "worker_id": worker_id}
+            try:
+                self._workspace_client.sync(
+                    {
+                        "repository_path": repository,
+                        "workspace_guid": assignment["workspace_guid"],
+                        "owner_session_id": assignment["owner_session_id"],
+                    },
+                    **self._workspace_transport(installed_root, ssh_host),
+                )
+            except Exception as exc:
+                # A sync failure NEVER abandons and NEVER mints a commit: the
+                # merely-behind worker's reviewed work is already integrated on
+                # the target. Surface and leave the still-alive worker running to
+                # retry on a later cycle (mirrors the non-terminal gate-fail
+                # surface; no failure_phase => the daemon does not complete it).
+                return {
+                    "action": "surfaced",
+                    "worker_id": worker_id,
+                    "error": str(exc),
+                }
+            return {"action": "synced", "worker_id": worker_id}
+
+        # Gates pass AND new work — integrate. dispose selects the terminal
+        # disposition: 'release' removes the dir, 'recycle' keeps it in place.
+        try:
+            evidence = self._derive_workspace_commit_evidence(
+                assignment["worktree_path"], assignment["branch"],
+                ssh_host=ssh_host,
+            )
+        except Exception as exc:
+            return {
+                "error": str(exc),
+                "failure_phase": "authority",
+                "assignment_preserved": True,
+                "action": "surfaced",
+            }
+        command = {
+            "repositoryPath": repository,
+            "workspaceGuid": assignment["workspace_guid"],
+            "providerRootSessionId": assignment["owner_session_id"],
+            "message": f"ironclaude: auto-integrate {worker_id} ({reason})".strip(),
+            **evidence,
+            "dispose": "release" if terminal else "recycle",
+        }
+        try:
+            result = self._workspace_client.finalize(
+                {"command": command},
+                **self._workspace_transport(installed_root, ssh_host),
+            )
+        except Exception as exc:
+            # Transient / recoverable finalize failure — route through the same
+            # recovery classifier commit_worker uses and DO NOT mark completed
+            # (that IS the re-queue). A recoverable state is never abandoned.
+            return self._classify_finalization_failure(
+                worker_id, repository, assignment, exc, installed_root, ssh_host,
+            )
+        sha = result.get("integratedCommit") if isinstance(result, dict) else None
+        if terminal:
+            self.registry.update_worker_status(worker_id, "completed")
+        self._post_slack_safe(
+            f"Worker {worker_id} integrated as {sha}"
+            if sha else f"Worker {worker_id} integrated"
+        )
+        return {
+            "action": "integrated",
+            "sha": sha,
+            "worker_id": worker_id,
+            "result": result,
+        }
+
+    def _abandon_rescue_worker(
+        self,
+        worker_id: str,
+        repository: str,
+        client: str,
+        assignment: dict,
+        ssh_host: str | None,
+        *,
+        already_integrated: bool,
+    ) -> dict:
+        """Reclaim a terminal worker's worktree dir via abandon mode:'rescue'.
+
+        rescueAbandon preserves any straggler content on the worker's OWN branch
+        (never main), records recovery evidence, then removes ONLY the dir — no
+        commit ever lands on the integration target. Used for gate-fail
+        (preserve unreviewed work) and for the already-integrated-but-leftover
+        dir (nothing new to preserve). Only ever reached on a confirmed-dead
+        session (the caller downgrades a live-session terminal request first).
+        """
+        try:
+            installed_root = self._workspace_client.discover_installed_plugin_root(
+                client, ssh_host=ssh_host,
+            )
+        except Exception as exc:
+            failure = self._workspace_failure(
+                "authority", repository, assignment, exc,
+            )
+            failure["action"] = "surfaced"
+            return failure
+
+        # Fail-closed defense-in-depth: re-probe the worktree with a FRESH
+        # non-mutating status reconcile, independent of any probe a caller
+        # already ran. This is the last line of defense against a caller that
+        # bypasses the probe-first router — abandon-rescue must never run
+        # against a worktree that is mid-finalization (integrated / paused
+        # rebase / frozen drift), because that would strand the repo-wide
+        # integration_locks row. Any state other than exactly 'not-ready' —
+        # including a raised/None probe — refuses.
+        _payload, _status, _transport = self._probe_finalization_status(
+            repository, assignment, installed_root, ssh_host,
+        )
+        _state = _status.get("state") if _status is not None else None
+        if _state != "not-ready":
+            return self._workspace_failure(
+                "finalization", repository, assignment,
+                f"abandon-rescue refused: finalization lifecycle state is "
+                f"{_state!r} (not 'not-ready')",
+                recovery_payload=_payload if _payload else None,
+            )
+
+        try:
+            result = self._workspace_client.abandon(
+                {
+                    "repository_path": repository,
+                    "workspace_guid": assignment["workspace_guid"],
+                    "owner_session_id": assignment["owner_session_id"],
+                    "mode": "rescue",
+                },
+                **self._workspace_transport(installed_root, ssh_host),
+            )
+        except Exception as exc:
+            failure = self._workspace_failure(
+                "abandon", repository, assignment, exc,
+            )
+            failure["action"] = "surfaced"
+            return failure
+        self.registry.update_worker_status(worker_id, "completed")
+        if already_integrated:
+            return {
+                "action": "released",
+                "worker_id": worker_id,
+                "result": result,
+            }
+        branch = assignment.get("branch")
+        self._post_slack_safe(
+            f"Worker {worker_id} work preserved on branch {branch}"
+        )
+        return {
+            "action": "rescued",
+            "branch": branch,
+            "worker_id": worker_id,
+            "result": result,
+        }
+
     _RECOVERY_ACTIONS = frozenset(
         {"status", "rerebase", "continue", "abort", "restore_frozen"}
     )
@@ -3364,6 +4012,103 @@ class OrchestratorTools:
             self._trigger_integrated_cleanup(
                 cleanup_payload, self._workspace_transport(installed_root, ssh_host)
             )
+        return result
+
+    def drive_frozen_reconcile_recovery(self, worker_id: str) -> dict:
+        """Drive a PLAIN reconcile to recover a worker stuck in finalization drift.
+
+        A frozen-no-rebase drift (main moved under a frozen worktree) is classified
+        by _classify_finalization_failure as mode='drift'. The daemon's retry of the
+        original finalize re-enters finalizeCommanderLocalCommit's isRepair branch,
+        which mints an empty commit without rebasing and loops forever. The recovery
+        is a plain reconcile (NO rebase_recovery key), which drives
+        reconcileFinalization down the same recovery path commit_worker's
+        interrupted-CAS recovery uses — it re-integrates onto the moved main without
+        minting any commit here. This is plain-reconcile ONLY: there is no rerebase
+        fallback, so a non-integrated result is returned as-is for operator recovery.
+
+        Authority (repository, workspace_guid, owner_session_id, transport) is derived
+        from the persisted worker registry exactly as recover_worker_integration
+        derives it; no caller-supplied refs are accepted. Mints NO commit and NEVER
+        abandons the worker. This seam OWNS drift-success completion: when the plain
+        reconcile reaches a state in _FINALIZATION_INTEGRATED_STATES, the worker is
+        marked completed ONLY if its tmux session is confirmed dead — a live worker
+        is integrated but NOT completed, so it is never dropped from monitoring.
+        Returns the reconcile result dict (or a structured error dict).
+        """
+        worker = self.registry.get_worker(worker_id)
+        if not worker:
+            return {"error": f"worker not found: {worker_id}", "action": "drift"}
+        try:
+            assignment = self._registry_workspace_assignment(worker)
+        except Exception as exc:
+            return {
+                "error": str(exc),
+                "failure_phase": "authority",
+                "action": "drift",
+                "assignment_preserved": True,
+            }
+        repository = worker.get("repo")
+        client = worker.get("client")
+        if not isinstance(repository, str) or not repository:
+            return self._workspace_failure(
+                "authority", "", assignment,
+                "worker registry lacks repository path",
+            )
+        if client not in {"claude", "codex"}:
+            return self._workspace_failure(
+                "authority", repository, assignment,
+                "worker registry lacks supported provider client",
+            )
+        if worker.get("machine"):
+            self._ensure_ssh_manager()
+        ssh_host = self._resolve_ssh_host(worker_id)
+        try:
+            installed_root = self._workspace_client.discover_installed_plugin_root(
+                client, ssh_host=ssh_host,
+            )
+        except Exception as exc:
+            return self._workspace_failure(
+                "authority", repository, assignment, exc,
+            )
+        transport = self._workspace_transport(installed_root, ssh_host)
+        recovery_payload = {
+            "repository_path": repository,
+            "workspace_guid": assignment["workspace_guid"],
+            "owner_session_id": assignment["owner_session_id"],
+        }
+
+        def _reconcile(payload: dict) -> dict:
+            # Fail-closed: any reconcile/transport error becomes a structured dict,
+            # never a raise and never an implicit None (mirrors
+            # recover_worker_integration). No commit is ever minted here.
+            try:
+                result = self._workspace_client.reconcile(payload, **transport)
+            except Exception as exc:
+                return {
+                    "error": str(exc),
+                    "action": "drift",
+                    "failure_phase": "finalization",
+                    "assignment_preserved": True,
+                    "recovery": {"reconcile": dict(recovery_payload)},
+                }
+            return result if isinstance(result, dict) else {"state": result}
+
+        # PLAIN reconcile ONLY (no rebase_recovery key) — recovers both the
+        # interrupted-CAS state and a genuine frozen drift by re-integrating onto
+        # the moved main. There is no rerebase fallback.
+        result = _reconcile(dict(recovery_payload))
+        if result.get("state") in self._FINALIZATION_INTEGRATED_STATES:
+            # This seam owns drift-success completion. Never complete a worker
+            # whose tmux session is still alive — a live worker is integrated
+            # but stays under monitoring until its session is confirmed dead.
+            session_name = worker.get("tmux_session")
+            if not (
+                isinstance(session_name, str)
+                and session_name
+                and self.tmux.has_session(session_name, ssh_host=ssh_host)
+            ):
+                self.registry.update_worker_status(worker_id, "completed")
         return result
 
     def spawn_worker(
@@ -3976,6 +4721,19 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 recovery_payload=bind_payload,
             )
 
+        profile_error = self._dispatch_worker_communication_profile(
+            session_name, worker_client, ssh_host=ssh_host,
+            remote_log_dir=remote_log_dir,
+        )
+        if profile_error is not None:
+            if ssh_host:
+                cleanup_remote_session()
+            else:
+                self.tmux.kill_session(session_name, ssh_host=ssh_host)
+            return self._workspace_failure(
+                "dispatch", repo, assignment, profile_error,
+            )
+
         # Stage 5.5: enable advisor if configured (skip actual Claude/Fable — top tier,
         # no higher advisor available). Codex cannot parse `/advisor`, a Claude slash
         # command, so it receives the same directive as plain text over the same
@@ -4267,6 +5025,11 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                     recovery_payload=bind_payload,
                 ),
             }
+        profile_error = self._dispatch_worker_communication_profile(
+            session_name, item["client"],
+        )
+        if profile_error is not None:
+            return failed("dispatch", profile_error)
         return {
             **item,
             "assignment": bound_assignment,
@@ -4663,18 +5426,19 @@ You are grading a spawn_worker decision. Your verdict is a JSON object:
                     continue
 
                 effective_worker_type = outcome["effective_worker_type"]
-                if (
-                    outcome["client"] == "claude"
-                    and self._advisor_cfg.get("enabled")
-                    and not outcome["launch_used_claude_fable"]
-                ):
-                    advisor_model = self._advisor_model_for(
-                        effective_worker_type,
-                    )
-                    advisor_model = _resolve_fable_advisor_model(advisor_model)
-                    self.tmux.send_keys(
-                        session_name, f"/advisor {advisor_model}",
-                    )
+                if self._advisor_cfg.get("enabled") and not outcome["launch_used_claude_fable"]:
+                    if outcome["client"] == "codex":
+                        self.tmux.send_keys(
+                            session_name, _CODEX_ADVISOR_INSTRUCTION,
+                        )
+                    else:
+                        advisor_model = self._advisor_model_for(
+                            effective_worker_type,
+                        )
+                        advisor_model = _resolve_fable_advisor_model(advisor_model)
+                        self.tmux.send_keys(
+                            session_name, f"/advisor {advisor_model}",
+                        )
                     time.sleep(3)
 
                 if (
@@ -5245,12 +6009,16 @@ Grading criteria:
                     f"Terminal output (last ~30k chars):\n{sample_large}"
                 )
                 try:
+                    # IRONCLAUDE_LLM_PATH: session_summarizer
+                    prompt = apply_communication_profile("session_summarizer", prompt)
                     summary = self._get_ollama_client().post_generate({
                         "model": summarization_model,
                         "prompt": prompt,
                         "stream": False,
                         "options": {"num_predict": 200},
                     })
+                except CommunicationProfileError as e:
+                    summary = f"ERROR: communication-profile infrastructure error — {e}"
                 except OllamaError as e:
                     summary = f"ERROR: Ollama summarization failed — {e}"
 
@@ -5279,12 +6047,20 @@ Grading criteria:
             return {"error": f"target session '{target}' already exists"}
         if not self.tmux.has_session(session_name):
             return {"error": f"session '{session_name}' not found"}
+        try:
+            # Preflight before rename so unavailable skills leave adoption non-mutating.
+            skill_invocation("managed_worker", "claude")
+        except CommunicationProfileError as exc:
+            return {"error": f"Communication-profile infrastructure error: {exc}"}
         if not self.tmux.rename_session(session_name, target):
             return {"error": f"failed to rename '{session_name}' -> '{target}'"}
         try:
             self.tmux.setup_log_capture(target)
         except Exception as e:
             logger.warning(f"adopt_session: log capture setup failed for {target}: {e}")
+        profile_error = self._dispatch_worker_communication_profile(target, "claude")
+        if profile_error is not None:
+            return {"error": profile_error}
         self.registry.register_worker(worker_id, worker_type, target,
                                       repo=repo, description=description)
         pm = self._read_pm_state_via_sqlite(target)
@@ -5410,6 +6186,12 @@ Grading criteria:
                     ),
                 }
 
+            profile_error = self._dispatch_worker_communication_profile(
+                target, client,
+            )
+            if profile_error is not None:
+                return {"error": profile_error}
+
             self.registry.register_worker(
                 worker_id,
                 worker_type,
@@ -5524,7 +6306,21 @@ Has the worker genuinely completed its objective based on the evidence?
 
         pane_pid = self.tmux.list_pane_pid(session_name, ssh_host=ssh_host)
         self.tmux.kill_session(session_name, ssh_host=ssh_host)
-        self.registry.update_worker_status(worker_id, "completed")
+        # Reach the deterministic auto-integration seam instead of a bare
+        # completed-flip: the killed session is dead, so this integrates its
+        # reviewed work (or rescues it to its branch). A recoverable finalization
+        # failure re-queues (leave it running to retry); every other outcome —
+        # including a non-managed worker with no workspace assignment — completes.
+        _release = self._finalize_and_release_worker(
+            worker_id, reason="killed", terminal=True,
+        )
+        # kill_worker completes NOTHING itself — the seam owns completion. A
+        # POSITIVE predicate: the worker is completed only when the seam returns
+        # a genuine success (a dict with NO failure_phase). Any preserved/
+        # transient failure (authority/probe/abandon/finalization) or a None
+        # return leaves the worker uncompleted for a later retry cycle. This
+        # closes I1: a managed worker on a transient error is never completed.
+        _completed = isinstance(_release, dict) and not _release.get("failure_phase")
         _wr = self.registry.get_worker(worker_id)
         _runtime = None
         if _wr:
@@ -5543,11 +6339,19 @@ Has the worker genuinely completed its objective based on the evidence?
             kill_reason=evidence[:200] if evidence else None,
             runtime_seconds=_runtime,
         )
-        self.registry.log_event("worker_finished", worker_id=worker_id)
+        if _completed:
+            self.registry.log_event("worker_finished", worker_id=worker_id)
         # Post-kill sweep: query remaining work for Brain visibility
         remaining_work = self._get_remaining_work_after_kill(worker_id)
+        if _completed:
+            _status = f"Worker {worker_id} killed and marked completed."
+        else:
+            _status = (
+                f"Worker {worker_id} killed; unintegrated work preserved for "
+                "retry (not completed)."
+            )
         return {
-            "status": f"Worker {worker_id} killed and marked completed.",
+            "status": _status,
             "runtime_seconds": _runtime,
             "remaining_work": remaining_work,
         }

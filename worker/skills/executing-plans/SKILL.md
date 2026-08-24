@@ -158,9 +158,11 @@ Immediately after `create_plan`, before selecting or dispatching any reviewer, c
   closed rather than manufacturing a new review.
 - `HAS-ISSUES` with `current_hash_advisor_remediated`: skip reviewer dispatch and
   continue to Step 2.
-- A passing canonical verdict whose hash does not match the current plan: fail
-  closed. Restore the exact reviewed plan or make a verified retreat to
-  brainstorming; do not dispatch another plan review.
+- A passing canonical verdict whose hash does not match the current plan (an
+  inherited review after a retreat that changed the plan): run the non-blind fix
+  advisor to validate the change and record `advisor-remediated` at the current
+  hash, then continue to Step 2. Restoring the exact reviewed plan also clears it.
+  Do not dispatch another plan review.
 
 Read `tier_up_review_policy` from `~/.claude/ironclaude-hooks-config.json` (if the
 `IRONCLAUDE_HOOKS_CONFIG_PATH` env var is set, read that path instead — this mirrors
@@ -414,15 +416,19 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
       `reviewer_model=<the advisor's model>` and verdict `advisor-remediated`. It binds to
       the sha256 of the **revised** plan, which is a different hash than the `HAS-ISSUES`
       row — that pairing is what the gate checks.
-    - `start_execution` accepts either **`SOLID`** at the current hash, or
-      **`HAS-ISSUES` (earlier) + `advisor-remediated` (current hash)**. A bare
-      `advisor-remediated` with no preceding `HAS-ISSUES` is rejected.
+    - `start_execution` accepts a passing verdict (`SOLID`/`top-tier-self`) at the
+      current hash, or any canonical blind verdict (passing OR `HAS-ISSUES`) paired
+      with `advisor-remediated` at the current hash. A bare `advisor-remediated`
+      with no preceding canonical blind review is rejected.
     - **All findings `REJECTED`** (the reviewer was wrong): make no plan change, submit
       `advisor-remediated`, and continue. Forcing a fix for a non-defect is worse than the
       finding.
     - **Any surviving `REQUIRES-RETREAT`:** take the requirements/design-conflict branch in
-      item 9 above — it already carries the Mandatory Direct Transition Preflight. The new
-      design produces a new plan lineage, which earns its own single review.
+      item 9 above — it already carries the Mandatory Direct Transition Preflight.
+      A retreat INHERITS the current effort's already-consumed blind review — it does
+      NOT earn a new one; the changed plan proceeds via `advisor-remediated` (above).
+      Only a genuinely new operator-initiated effort (design entered from a terminal
+      or idle state) earns its own single blind review.
 
     Verification does not disappear; it moves. Code review still runs at every task
     boundary, so a defect the advisor missed surfaces there rather than in a second plan
@@ -653,7 +659,19 @@ boundary.
 
 When `mcp__plugin_ironclaude_state-manager__get_next_tasks` returns `{status: "complete"}`:
 1. The MCP automatically transitions workflow to execution_complete
-2. Suggest a commit message based on the plan's goal and changes:
+2. **Re-stage the cumulative allowed_files.** A subagent's `git stash pop` (or any index
+   churn) during execution can silently drop EARLIER tasks' staged content out of the git
+   index, yielding a PARTIAL commit with NO error. Before suggesting a commit, re-stage the
+   deduped **union** of every task's `allowed_files` from the plan JSON so the index holds
+   the full intended set regardless of churn. This runs in the orchestrator, AFTER the
+   subagents. Only these explicit paths are staged — a working change OUTSIDE allowed_files
+   is never touched. Stage only paths that exist on disk (replace `<plan-json-path>` and
+   `<repo-root>`):
+   ```bash
+   python3 -c "import json,sys; print('\n'.join(sorted({f for t in json.load(open(sys.argv[1]))['tasks'] for f in t.get('allowed_files', [])})))" <plan-json-path> \
+     | while IFS= read -r f; do if [ -e "<repo-root>/$f" ]; then git -C <repo-root> add -- "$f"; fi; done
+   ```
+3. Suggest a commit message based on the plan's goal and changes:
 
 Review the plan's Goal statement and the staged diff (`git diff --staged --stat`).
 Draft a concise commit message (1-2 sentences) that:

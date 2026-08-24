@@ -43,7 +43,7 @@ fi
 # the internal workspace-manager CLI. The prompt hook returns no nonce, expiry,
 # or evidence to conversation; public MCP consumers re-observe and atomically
 # match those fields later.
-TRIMMED_PROMPT=$(printf '%s' "$USER_PROMPT" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+TRIMMED_PROMPT=$(printf '%s' "$USER_PROMPT" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/(&#x20;|&#32;|&nbsp;|&#160;|&#xa0;|&#xA0;|[[:space:]])+$//')
 HOOK_EVENT_NAME=$(printf '%s' "$INPUT" | jq -r '.hook_event_name // empty' 2>/dev/null || true)
 THREAD_SOURCE=$(printf '%s' "$INPUT" | jq -r '.thread_source // empty' 2>/dev/null || true)
 EVENT_CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)
@@ -51,7 +51,7 @@ HUMAN_OPERATION=""
 HUMAN_CHANNEL=""
 
 if [ "$HOOK_EVENT_NAME" = "UserPromptSubmit" ] && [ "$THREAD_SOURCE" != "subagent" ]; then
-  for operation in commit commit-and-push push use-primary-checkout return-to-managed-worktree; do
+  for operation in commit commit-and-push push use-primary-checkout return-to-managed-worktree reconcile; do
     if [ "$TRIMMED_PROMPT" = "/$operation" ] || [ "$TRIMMED_PROMPT" = "/ironclaude:$operation" ]; then
       HUMAN_OPERATION="$operation"
       HUMAN_CHANNEL="claude-user-prompt"

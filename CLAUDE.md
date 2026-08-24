@@ -60,6 +60,11 @@
     - If cleanup is blocked or unsafe, record the finding and explain the constraint instead of suppressing it
     - Do not use this rule to justify speculative refactoring or unrequested features
 
+11. **Recipient-Based Communication Profiles**
+    - Before first substantive human-facing response, load and apply `ironclaude:elements-of-style`
+    - For AI-directed natural language, load and apply `ironclaude:write-lossless-ai-messages`
+    - Select by destination, not model; preserve machine schemas and protected technical content exactly
+
 ## Plan Mode Replacement
 
 IronClaude replaces Claude Code's built-in `EnterPlanMode`/`ExitPlanMode` tools with a three-stage workflow: brainstorming → writing-plans → executing-plans. When professional mode is active, `EnterPlanMode` is blocked by hooks — this is intentional, not a bug. The brainstorming skill is your planning phase.

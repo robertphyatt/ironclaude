@@ -197,6 +197,7 @@ Changes:
 
 ## Key Principles
 
+- Preserve code, commands, paths, errors, schemas, sentinels, protocol fields, plan data, and quoted source material exactly; apply style rules only to surrounding human-readable prose.
 - **Every word must earn its place**: If removing it doesn't change meaning, remove it
 - **Active voice is stronger**: "System deleted file" > "File was deleted by system"
 - **Specific beats vague**: "2 seconds" > "some time"

@@ -1,4 +1,8 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   PUBLIC_TOOL_NAMES,
   createPublicToolDependencies,
@@ -12,6 +16,7 @@ import {
   dispatchInternalCommand,
   type InternalCommandDependencies,
 } from '../cli.js';
+import { acquireIntegrationLock, initDb } from '../db.js';
 import { WorkspaceService } from '../workspace-service.js';
 
 const PUBLIC_TOOLS = [
@@ -24,9 +29,11 @@ const PUBLIC_TOOLS = [
   'commit_and_push',
   'push',
   'reconcile_finalization',
+  'sync_worktree_to_target',
+  'reconcile_worktree',
 ] as const;
 
-const INTERNAL_COMMANDS = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile'] as const;
+const INTERNAL_COMMANDS = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile', 'cleanup', 'sync', 'reap'] as const;
 
 function publicDependencies(): PublicToolDependencies {
   return {
@@ -37,6 +44,8 @@ function publicDependencies(): PublicToolDependencies {
     listActiveAssignments: vi.fn().mockReturnValue([]),
     finalizeDirect: vi.fn().mockReturnValue({ state: 'integrated-local' }),
     reconcileFinalization: vi.fn().mockReturnValue({ state: 'integrated-local' }),
+    syncWorktreeToTarget: vi.fn().mockReturnValue({ state: 'fast-forwarded' }),
+    reconcileWorktree: vi.fn().mockReturnValue({ state: 'reconciled' }),
   };
 }
 
@@ -47,10 +56,21 @@ function internalDependencies(): InternalCommandDependencies {
     finalize: vi.fn().mockReturnValue({ state: 'integrated-local' }),
     abandon: vi.fn().mockReturnValue({ lifecycle_status: 'abandoned' }),
     reconcile: vi.fn().mockReturnValue({ assignments: [], unregisteredWorktrees: [] }),
+    cleanup: vi.fn().mockReturnValue({ lifecycle_status: 'cleaned' }),
+    sync: vi.fn().mockReturnValue({ state: 'fast-forwarded' }),
+    reap: vi.fn().mockReturnValue({ lifecycle_status: 'reaped' }),
   };
 }
 
 describe('workspace-manager entrypoint surfaces', () => {
+  // Several tests below spy on WorkspaceService.prototype methods without a local
+  // .mockRestore(); without this, a spy set by an earlier test silently shadows the
+  // real implementation for any later test in this file that needs it for real
+  // (as the sync_worktree_to_target gate test below does).
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('exposes only the bounded public MCP surface', () => {
     expect(PUBLIC_TOOL_NAMES).toEqual(PUBLIC_TOOLS);
     expect(publicToolDefinitions.map((definition) => definition.name)).toEqual(PUBLIC_TOOLS);
@@ -133,6 +153,55 @@ describe('workspace-manager entrypoint surfaces', () => {
     expect(result).toBeDefined();
   });
 
+  it('drops workspace_guid from the commit, push, and commit_and_push required sets', () => {
+    const definitionOf = (name: string) => publicToolDefinitions.find((tool) => tool.name === name);
+    // Widened commit + push + commit-and-push lanes: the unassigned paths supply no
+    // guid, so the schema must not require one; the property stays exposed for the
+    // managed lanes (present guid → managed).
+    expect(definitionOf('commit')?.inputSchema.required).toEqual(['repository_path', 'message']);
+    expect(definitionOf('commit_and_push')?.inputSchema.required)
+      .toEqual(['repository_path', 'message']);
+    expect(definitionOf('push')?.inputSchema.required).toEqual(['repository_path']);
+    expect(definitionOf('commit')?.inputSchema.properties).toHaveProperty('workspace_guid');
+    expect(definitionOf('push')?.inputSchema.properties).toHaveProperty('workspace_guid');
+    expect(definitionOf('commit_and_push')?.inputSchema.properties).toHaveProperty('workspace_guid');
+    expect(definitionOf('push')?.inputSchema.additionalProperties).toBe(false);
+  });
+
+  it('defines sync_worktree_to_target as ownership-gated with required repository_path and workspace_guid', () => {
+    const definition = publicToolDefinitions.find((tool) => tool.name === 'sync_worktree_to_target');
+    expect(definition?.inputSchema.required).toEqual(['repository_path', 'workspace_guid']);
+    expect(definition?.inputSchema.properties).toHaveProperty('repository_path');
+    expect(definition?.inputSchema.properties).toHaveProperty('workspace_guid');
+    expect(definition?.inputSchema.additionalProperties).toBe(false);
+  });
+
+  it('dispatches sync_worktree_to_target exactly once', () => {
+    const dependencies = publicDependencies();
+    const result = dispatchPublicTool('sync_worktree_to_target', { marker: 'sync_worktree_to_target' }, dependencies);
+    expect(dependencies.syncWorktreeToTarget).toHaveBeenCalledTimes(1);
+    expect(dependencies.syncWorktreeToTarget).toHaveBeenCalledWith({ marker: 'sync_worktree_to_target' });
+    expect(result).toBeDefined();
+  });
+
+  it('defines reconcile_worktree as ownership-gated with required repository_path and workspace_guid, no message', () => {
+    expect(PUBLIC_TOOL_NAMES).toContain('reconcile_worktree');
+    const definition = publicToolDefinitions.find((tool) => tool.name === 'reconcile_worktree');
+    expect(definition?.inputSchema.required).toEqual(['repository_path', 'workspace_guid']);
+    expect(definition?.inputSchema.properties).toHaveProperty('repository_path');
+    expect(definition?.inputSchema.properties).toHaveProperty('workspace_guid');
+    expect(definition?.inputSchema.properties).not.toHaveProperty('message');
+    expect(definition?.inputSchema.additionalProperties).toBe(false);
+  });
+
+  it('dispatches reconcile_worktree exactly once', () => {
+    const dependencies = publicDependencies();
+    const result = dispatchPublicTool('reconcile_worktree', { marker: 'reconcile_worktree' }, dependencies);
+    expect(dependencies.reconcileWorktree).toHaveBeenCalledTimes(1);
+    expect(dependencies.reconcileWorktree).toHaveBeenCalledWith({ marker: 'reconcile_worktree' });
+    expect(result).toBeDefined();
+  });
+
   it('dispatches status lookup through exactly one compatible selector', () => {
     const assignment = { workspace_guid: 'workspace' } as never;
     const exact = vi.spyOn(WorkspaceService.prototype, 'getWorkspaceAssignment').mockReturnValue(assignment);
@@ -184,7 +253,27 @@ describe('workspace-manager entrypoint surfaces', () => {
     expect(() => dependencies.finalizeDirect('push', {
       repository_path: '/repo', workspace_guid: 'workspace',
     })).toThrow('provider-root session');
+    // The widened UNASSIGNED push lane (no workspace_guid) is equally gated: a
+    // subagent cannot reach it before requireProviderRoot refuses the turn.
+    expect(() => dependencies.finalizeDirect('push', {
+      repository_path: '/repo',
+    })).toThrow('provider-root session');
+    // The widened UNASSIGNED commit-and-push lane (no workspace_guid) is equally gated.
+    expect(() => dependencies.finalizeDirect('commit-and-push', {
+      repository_path: '/repo', message: 'subagent c-a-p',
+    })).toThrow('provider-root session');
+    // The widened commit lane is still gated to the provider root: a subagent
+    // reaching the public commit tool is refused before any authority is verified.
+    expect(() => dependencies.finalizeDirect('commit', {
+      repository_path: '/repo', message: 'subagent commit',
+    })).toThrow('provider-root session');
     expect(() => dependencies.reconcileFinalization({
+      repository_path: '/repo', workspace_guid: 'workspace',
+    })).toThrow('provider-root session');
+    expect(() => dependencies.syncWorktreeToTarget({
+      repository_path: '/repo', workspace_guid: 'workspace',
+    })).toThrow('provider-root session');
+    expect(() => dependencies.reconcileWorktree({
       repository_path: '/repo', workspace_guid: 'workspace',
     })).toThrow('provider-root session');
   });
@@ -254,5 +343,47 @@ describe('workspace-manager entrypoint surfaces', () => {
       expectedBaseCommit: args.expected_base_commit,
       expectedCurrentHead: args.expected_current_head,
     });
+  });
+
+  it('refuses sync_worktree_to_target on a ready_for_integration assignment and on a held integration lock', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ironclaude-dispatch-sync-'));
+    const databaseDir = mkdtempSync(join(tmpdir(), 'ironclaude-dispatch-sync-db-'));
+    try {
+      const git = (...args: string[]) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8' }).trim();
+      git('init', '--initial-branch=main');
+      git('config', 'user.name', 'Dispatch Sync Test');
+      git('config', 'user.email', 'dispatch-sync@example.invalid');
+      writeFileSync(join(root, 'README.md'), 'initial\n');
+      git('add', 'README.md');
+      git('commit', '-m', 'initial');
+      const database = initDb(join(databaseDir, 'state.db'));
+      const service = new WorkspaceService(database);
+      const ownerSessionId = '019f7742-abd8-7c62-af7b-fe07189f1ffd';
+      const assignment = service.ensureSessionWorktree({ repositoryPath: root, ownerSessionId });
+      const dependencies = createPublicToolDependencies(database, {
+        client: 'codex', sessionId: ownerSessionId, invocationThreadId: ownerSessionId, source: 'codex_meta',
+      });
+
+      database.prepare("UPDATE assignments SET lifecycle_status = 'ready_for_integration' WHERE workspace_guid = ?")
+        .run(assignment.workspace_guid);
+      expect(() => dependencies.syncWorktreeToTarget({
+        repository_path: root, workspace_guid: assignment.workspace_guid,
+      })).toThrow('active');
+
+      database.prepare("UPDATE assignments SET lifecycle_status = 'active' WHERE workspace_guid = ?")
+        .run(assignment.workspace_guid);
+      acquireIntegrationLock(database, {
+        repositoryIdentity: assignment.repository_identity,
+        workspaceGuid: assignment.workspace_guid,
+        targetRef: 'refs/heads/main',
+        expectedTarget: git('rev-parse', 'main'),
+      });
+      expect(() => dependencies.syncWorktreeToTarget({
+        repository_path: root, workspace_guid: assignment.workspace_guid,
+      })).toThrow('lock');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(databaseDir, { recursive: true, force: true });
+    }
   });
 });

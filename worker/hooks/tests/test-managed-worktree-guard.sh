@@ -17,6 +17,10 @@ assert_contains() {
   local label="$1" haystack="$2" needle="$3"
   if [[ "$haystack" == *"$needle"* ]]; then pass "$label"; else fail "$label" "missing=$needle"; fi
 }
+assert_not_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then fail "$label" "unexpectedly present=$needle"; else pass "$label"; fi
+}
 
 TEST_ROOT=$(mktemp -d)
 TEST_ROOT=$(cd "$TEST_ROOT" && pwd -P)
@@ -30,6 +34,7 @@ GUID="$SESSION"
 OTHER_GUID="$OTHER_SESSION"
 WORKSPACE_DB="$TEST_HOME/.claude/ironclaude-workspaces.db"
 STATE_DB="$TEST_HOME/.claude/ironclaude.db"
+HEARTBEAT_LOG="$TEST_HOME/.claude/ironclaude-worktree-heartbeat.log"
 
 mkdir -p "$TEST_HOME/.claude" "$PRIMARY/src" "$NON_GIT"
 printf '{"verbose_hook_logs":false}\n' > "$TEST_HOME/.claude/ironclaude-hooks-config.json"
@@ -620,6 +625,25 @@ assert_eq 'owner file op renews the primary-checkout lock' '1' \
   "$(sqlite3 "$WORKSPACE_DB" "SELECT (acquired_at > datetime('now','-5 minutes')) FROM primary_checkout_owners WHERE repository_identity='$REPOSITORY_IDENTITY'")"
 sqlite3 "$WORKSPACE_DB" "DELETE FROM primary_checkout_owners WHERE repository_identity='$REPOSITORY_IDENTITY'"
 
+# Cross-session negative (characterization: current source already behaves
+# correctly — no RED expected). A row whose workspace_guid matches THIS
+# session's guid but whose owner_session_id belongs to a DIFFERENT session
+# must not renew — the full :374 guard is `owner_guid = guid AND owner_session
+# = SESSION_TAG`. This seed isolates the owner_session conjunct: owner_guid
+# already equals guid, so dropping the owner_session half of the guard is what
+# this seed would expose (the heartbeat log would gain an entry stamped with
+# OTHER_SESSION); a fully-mismatched seed (both fields differ) would stay
+# silent even with that half removed, since owner_guid alone would still fail.
+sqlite3 "$WORKSPACE_DB" "UPDATE assignments SET lifecycle_status='active' WHERE workspace_guid='$GUID'"
+sqlite3 "$WORKSPACE_DB" "INSERT INTO primary_checkout_owners VALUES ('$REPOSITORY_IDENTITY','$GUID','$OTHER_SESSION',datetime('now','-90 minutes'))"
+RESULT=$(run_guard "$(payload Write '{"file_path":"src/claude.txt","content":"cross-session"}')")
+assert_eq 'cross-session file op still allowed' '0' "$(status_of "$RESULT")"
+assert_eq 'cross-session guid-match owner is NOT renewed' '1' \
+  "$(sqlite3 "$WORKSPACE_DB" "SELECT (acquired_at < datetime('now','-5 minutes')) FROM primary_checkout_owners WHERE repository_identity='$REPOSITORY_IDENTITY'")"
+assert_not_contains 'cross-session file op logs no heartbeat renewal for the mismatched owner' \
+  "$(cat "$HEARTBEAT_LOG" 2>/dev/null)" "owner_session=$OTHER_SESSION"
+sqlite3 "$WORKSPACE_DB" "DELETE FROM primary_checkout_owners WHERE repository_identity='$REPOSITORY_IDENTITY'"
+
 echo '=== non-Git preservation ==='
 RESULT=$(run_guard "$(payload Write '{"file_path":"notes.txt","content":"plain"}' "$NON_GIT")")
 assert_eq 'non-Git write preserves existing allow behavior' '0' "$(status_of "$RESULT")"
@@ -654,10 +678,12 @@ CODEX_COMMAND=$(output_of "$RESULT" | jq -r '.hookSpecificOutput.updatedInput.cm
 assert_eq 'rewritten command changes managed worktree' 'command' "$(sed -n '1p' "$MANAGED/src/command.txt")"
 assert_eq 'rewritten command leaves primary absent' 'absent' "$([ -e "$PRIMARY/src/command.txt" ] && echo present || echo absent)"
 
-# Worktree isolation is a property of the ASSIGNMENT, not of professional mode.
-# A session that owns a managed worktree must not silently write into the
-# primary checkout just because professional mode is off — the mode-off
-# branch used to short-circuit before the adapter ran at all.
+# Worktree isolation is a property of the ASSIGNMENT, not of professional mode:
+# a healthy owned assignment still redirects a relative write into the managed
+# worktree even while professional mode is off (sub-test (a)). But an adapter
+# FAILURE (damaged/unbindable assignment, or an escaping target) is ADVISORY
+# while off — the operator's write is never blocked (Invariant B); the guard
+# emits a WARNING and allows it.
 echo '=== mode-off worktree redirection (#2) ==='
 sqlite3 "$STATE_DB" "UPDATE sessions SET professional_mode='off' WHERE terminal_session='$SESSION'"
 
@@ -674,11 +700,21 @@ assert_eq 'mode-off healthy assignment write redirected to managed root' \
 RESULT=$(run_guard "$(payload Bash '{"command":"git commit -m x"}')")
 assert_eq 'mode-off git commit allowed (no ON-path gating leak)' '0' "$(status_of "$RESULT")"
 
-# (c) damaged/unhealthy assignment -> blocked, same as the ON path.
+# (c) damaged/unhealthy assignment while OFF -> ADVISORY allow, NOT a block
+#     (Invariant B: professional mode off never blocks an operator write; the
+#     redirect still applies for a HEALTHY assignment — sub-test (a) above).
 sqlite3 "$WORKSPACE_DB" "UPDATE assignments SET lifecycle_status='ready_for_integration' WHERE workspace_guid='$GUID'"
 RESULT=$(run_guard "$(payload Write '{"file_path":"src/claude.txt","content":"bad"}')")
-assert_eq 'mode-off damaged assignment write blocked' '2' "$(status_of "$RESULT")"
+assert_eq 'mode-off damaged assignment write advisory-allowed' '0' "$(status_of "$RESULT")"
+assert_contains 'mode-off damaged assignment advisory emits WARNING' "$(output_of "$RESULT")" 'WARNING'
+assert_contains 'mode-off damaged assignment advisory names the adapter failure' "$(output_of "$RESULT")" 'managed-worktree adapter failed'
 sqlite3 "$WORKSPACE_DB" "UPDATE assignments SET lifecycle_status='active' WHERE workspace_guid='$GUID'"
+
+# (e) healthy assignment + escaping target while OFF -> advisory allow too.
+OUT_OF_ROOT="$TEST_ROOT/outside/scratch.txt"
+RESULT=$(run_guard "$(payload Write "$(jq -nc --arg p "$OUT_OF_ROOT" '{file_path:$p, content:"x"}')")")
+assert_eq 'mode-off escaping-target write advisory-allowed' '0' "$(status_of "$RESULT")"
+assert_contains 'mode-off escaping-target advisory emits WARNING' "$(output_of "$RESULT")" 'WARNING'
 
 # (b) no assignment -> plain passthrough, unchanged (nothing to isolate).
 sqlite3 "$WORKSPACE_DB" "UPDATE assignments SET owner_session_id='unbound-for-test' WHERE workspace_guid='$GUID'"

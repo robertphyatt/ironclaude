@@ -613,11 +613,14 @@ TRANSCRIPT_PLACEHOLDER
 
 ---
 
-Grade the rigor quality of Claude's response. Evaluate THREE aspects:
+Grade the rigor quality of Claude's response. Evaluate FOUR aspects:
 
 1. REASONING RIGOR: Did Claude establish principles before recommending?
 2. ASSUMPTION CHALLENGING: Did Claude accept contradictory or infeasible requirements without questioning them?
 3. SCOPE DISCIPLINE (YAGNI): Did Claude add features, abstractions, or scope beyond what was requested?
+4. HUMAN-FACING COMMUNICATION: Did Claude use clear, concise, active, specific, concrete prose without filler or needless repetition?
+
+Do not penalize quoted source material or require changes to code, commands, paths, errors, schemas, sentinels, protocol fields, or plan data. Grade only Claude's surrounding human-facing prose. A clear status, short answer, question, or exact technical output is A.
 
 Examples of grade A (rigorous or no recommendation needed):
 - Claude reported status: All 4 checks passed, changes staged

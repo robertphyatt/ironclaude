@@ -37,6 +37,7 @@ from ironclaude.worker_registry import WorkerRegistry
 from ironclaude.protocol import read_pending_decisions, read_task_ledger, write_decision
 from ironclaude.notifications import (
     format_worker_spawned, format_worker_completed, format_worker_failed,
+    format_worker_session_ended_preserved,
     format_worker_idle, format_worker_checkin,
     format_heartbeat, format_brain_restarted, format_brain_compacted, format_brain_circuit_breaker,
     format_objective_received,
@@ -51,8 +52,21 @@ from ironclaude.fable_availability import (
     is_fable_unavailable as _is_fable_unavailable,
 )
 from ironclaude.orchestrator_mcp import ensure_worker_trusted, WORKER_COMMANDS
+from ironclaude.communication_profiles import (
+    CommunicationProfileError,
+    PROFILE_READY_MARKER,
+    apply_communication_profile,
+    skill_invocation,
+)
 from ironclaude.signal_forensics import _logged_kill
 from ironclaude.plugins import PluginRegistry, discover_plugins
+
+
+def _render_brain_system_prompt(prompt_path: str, config: dict) -> str:
+    """Load, substitute, and profile the Brain prompt without an unprofiled fallback."""
+    with open(prompt_path) as prompt_file:
+        substituted = _substitute_prompt(prompt_file.read(), config)
+    return apply_communication_profile("commander_brain", substituted)
 
 logger = logging.getLogger("ironclaude")
 
@@ -198,6 +212,402 @@ def _sweep_stale_sessions(db_path, live_uuids, max_age_hours):
         conn.close()
 
 
+# --- Managed-worktree reaper --------------------------------------------------
+# Releases LEAKED managed worktrees that dispatched workers left behind (finished
+# workers whose workspace assignment was never released, or an assignment that
+# never made it through `bind` and so carries no owner at all). Two separate
+# SQLite databases are involved — the commander `workers` table and the
+# workspace-manager `assignments` table — so the join happens in Python, never
+# via ATTACH/cross-database SQL (mirrors the Python-side filtering already used
+# by `_sweep_stale_sessions`).
+#
+# The reaper NEVER integrates and NEVER pushes. It only ever calls the
+# workspace-manager client's `cleanup`, `abandon(mode='rescue')`, or `sync` —
+# the same no-push transport every other release path in this codebase uses.
+
+_WORKTREE_REAP_TTL_HOURS = 24
+# A liveness signal independent of the TTL: an assignment row touched this
+# recently is presumed to be under active use (bind/sync/finalize in flight)
+# even if it would otherwise look TTL-eligible.
+_ASSIGNMENT_RECENT_ACTIVITY_MINUTES = 30
+
+_WORKTREE_CLEANUP_STATUSES = frozenset({"integrated", "abandoned"})
+_WORKTREE_ABANDON_STATUSES = frozenset({"active", "ready_for_integration", "materialized"})
+
+
+def _workspace_manager_db_path() -> str:
+    """Resolve the workspace-manager SQLite path the same way the CLI does."""
+    return os.environ.get("WORKSPACE_MANAGER_DB_PATH") or os.path.expanduser(
+        "~/.claude/ironclaude-workspaces.db"
+    )
+
+
+def _load_workers_by_workspace_guid(commander_conn) -> dict[str, dict]:
+    """Return {workspace_guid: worker_row} for every commander worker that has one.
+
+    A commander `workers` row is only ever INSERTed after a successful `bind`
+    (see orchestrator_mcp.py's spawn flow) — so every row returned here is
+    guaranteed to correspond to an assignment with a bound, non-null
+    owner_session_id. Pre-bind leaks (a worker that died before `bind`
+    succeeded) never reach the commander `workers` table at all and so cannot
+    appear here; they are found directly in the workspace-manager `assignments`
+    table by `_find_leaked_worktrees` instead.
+    """
+    rows = commander_conn.execute(
+        "SELECT * FROM workers WHERE workspace_guid IS NOT NULL AND workspace_guid != ''"
+    ).fetchall()
+    return {row["workspace_guid"]: dict(row) for row in rows}
+
+
+def _worker_is_live(worker: dict | None, tmux) -> bool:
+    """True if a matched commander worker is still running (status or tmux)."""
+    if worker is None:
+        return False
+    if worker.get("status") == "running":
+        return True
+    tmux_session = worker.get("tmux_session")
+    if tmux_session:
+        return bool(tmux.has_session(tmux_session))
+    return False
+
+
+def _assignment_recently_active(assignment: dict, now: float, recent_minutes: int) -> bool:
+    updated_at = assignment.get("updated_at")
+    if not updated_at:
+        return False
+    try:
+        updated_ts = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc
+        ).timestamp()
+    except (TypeError, ValueError):
+        # Unparseable timestamp — fail safe toward "recent" (protect).
+        return True
+    return (now - updated_ts) < (recent_minutes * 60)
+
+
+def _is_protected(
+    assignment: dict,
+    worker: dict | None,
+    tmux,
+    locked_workspace_guids: set[str],
+    now: float,
+    recent_minutes: int = _ASSIGNMENT_RECENT_ACTIVITY_MINUTES,
+) -> bool:
+    """Conjunction of every liveness protect-condition. Errs toward PROTECT:
+    any raised exception, or any single true condition, blocks the reap."""
+    try:
+        if _worker_is_live(worker, tmux):
+            return True
+        if _assignment_recently_active(assignment, now, recent_minutes):
+            return True
+        if assignment.get("workspace_guid") in locked_workspace_guids:
+            return True
+    except Exception as exc:  # noqa: BLE001 - fail-safe: any uncertainty protects
+        logger.warning(
+            "Worktree reaper: liveness check raised for %s — protecting: %s",
+            assignment.get("workspace_guid"), exc,
+        )
+        return True
+    return False
+
+
+def _find_leaked_worktrees(
+    commander_conn, workers_by_guid: dict[str, dict], ws_conn, ttl_hours: float,
+) -> list[tuple[dict, dict | None]]:
+    """Return [(assignment, worker_or_None), ...] candidates past their TTL.
+
+    Three candidate classes, each computed in SQL against its own DB:
+      1. finished commander workers (status completed/failed/killed, finished_at
+         past TTL) joined to their assignment by workspace_guid — always owned.
+      2. ownerless `active` assignments (owner_session_id empty) whose row is
+         stale past TTL — a worker died between materialize and bind.
+      3. `reserved` assignments stale past TTL — a worker died before ever
+         materializing a worktree.
+    Classes 2 and 3 never join to a commander worker row (register_worker only
+    ever runs after a successful bind), so `worker` is None for them.
+    """
+    cutoff = f"-{int(ttl_hours)} hours"
+    candidates: list[tuple[dict, dict | None]] = []
+
+    finished_workers = commander_conn.execute(
+        "SELECT * FROM workers WHERE status IN ('completed','failed','killed') "
+        "AND finished_at IS NOT NULL AND finished_at < datetime('now', ?) "
+        "AND workspace_guid IS NOT NULL AND workspace_guid != ''",
+        (cutoff,),
+    ).fetchall()
+    for row in finished_workers:
+        worker = dict(row)
+        assignment_row = ws_conn.execute(
+            "SELECT * FROM assignments WHERE workspace_guid = ? AND lifecycle_status != 'cleaned'",
+            (worker["workspace_guid"],),
+        ).fetchone()
+        if assignment_row is None:
+            continue
+        candidates.append((dict(assignment_row), worker))
+
+    ownerless_active = ws_conn.execute(
+        "SELECT * FROM assignments WHERE lifecycle_status = 'active' "
+        "AND (owner_session_id IS NULL OR owner_session_id = '') "
+        "AND updated_at < datetime('now', ?)",
+        (cutoff,),
+    ).fetchall()
+    for row in ownerless_active:
+        assignment = dict(row)
+        if assignment["workspace_guid"] not in workers_by_guid:
+            candidates.append((assignment, None))
+
+    reserved_orphans = ws_conn.execute(
+        "SELECT * FROM assignments WHERE lifecycle_status = 'reserved' "
+        "AND updated_at < datetime('now', ?)",
+        (cutoff,),
+    ).fetchall()
+    for row in reserved_orphans:
+        assignment = dict(row)
+        if assignment["workspace_guid"] not in workers_by_guid:
+            candidates.append((assignment, None))
+
+    return candidates
+
+
+def _release_leaked_assignment(
+    workspace_client, assignment: dict, worker: dict, transport: dict,
+) -> str:
+    """Release one owned assignment via cleanup or abandon(rescue). Never
+    integrates, never pushes. Returns the action taken (for logging/tests)."""
+    payload = {
+        "repository_path": worker["repo"],
+        "workspace_guid": assignment["workspace_guid"],
+        "owner_session_id": assignment["owner_session_id"],
+    }
+    if assignment["lifecycle_status"] in _WORKTREE_CLEANUP_STATUSES:
+        workspace_client.cleanup(payload, **transport)
+        return "cleanup"
+    workspace_client.abandon({**payload, "mode": "rescue"}, **transport)
+    return "abandon_rescue"
+
+
+def _reap_ownerless_assignment(workspace_client, assignment: dict, transport: dict) -> dict:
+    """Release one ownerless assignment via the owner-free `reap` CLI verb.
+
+    `reap` does not require a stored `owner_session_id` match, so it can
+    release a row that never completed `bind`. `repository_path` is derived
+    from the assignment's `worktree_path` by splitting on the managed-worktree
+    marker; raises ValueError if that marker is absent (an unmanaged or
+    malformed `worktree_path`), letting the caller fall back to surfacing."""
+    worktree_path = assignment.get("worktree_path") or ""
+    marker = "/.ironclaude/worktrees/"
+    if marker not in worktree_path:
+        raise ValueError(f"cannot derive repository_path from worktree_path: {worktree_path!r}")
+    repository_path = worktree_path.split(marker)[0]
+    return workspace_client.reap(
+        {"repository_path": repository_path, "workspace_guid": assignment["workspace_guid"]},
+        **transport,
+    )
+
+
+def _reap_leaked_worktrees(
+    commander_conn,
+    workspace_client,
+    tmux,
+    *,
+    workspace_db_path: str | None = None,
+    resolve_transport=None,
+    ttl_hours: float = _WORKTREE_REAP_TTL_HOURS,
+) -> dict:
+    """Periodic sweep: release LEAKED managed worktrees. Every maintenance pass
+    re-evaluates every TTL-eligible row (no "seen" bookkeeping), so a backlog of
+    pre-existing leaks from before this reaper existed is swept the same way as
+    a freshly-leaked one — the TTL + liveness gate makes that safe.
+
+    Scope is hard-limited to worker-owned assignments: an assignment whose
+    owner_session_id equals its own workspace_guid is the operator's own
+    primary-checkout session (workspace-manager mints workspace_guid ==
+    owner_session_id for that case) and is never touched here.
+    """
+    counts = {"released": 0, "surfaced": 0, "protected": 0, "errors": 0}
+    if resolve_transport is None:
+        resolve_transport = lambda _worker: {}  # noqa: E731 - trivial local default
+    now = time.time()
+    commander_conn.row_factory = sqlite3.Row
+    try:
+        workers_by_guid = _load_workers_by_workspace_guid(commander_conn)
+    except Exception as exc:
+        logger.warning("Worktree reaper: could not read commander workers: %s", exc)
+        return counts
+
+    db_path = workspace_db_path or _workspace_manager_db_path()
+    try:
+        ws_conn = sqlite3.connect(db_path, timeout=10)
+        ws_conn.row_factory = sqlite3.Row
+    except Exception as exc:
+        logger.warning("Worktree reaper: could not open workspace-manager DB: %s", exc)
+        return counts
+
+    try:
+        try:
+            lock_rows = ws_conn.execute(
+                "SELECT repository_identity, workspace_guid FROM integration_locks"
+            ).fetchall()
+        except Exception as exc:
+            logger.warning("Worktree reaper: could not read workspace-manager state: %s", exc)
+            return counts
+
+        # A stale integration lock is surfaced (logged) — never force-deleted.
+        for repo_identity, guid in lock_rows:
+            logger.warning(
+                "Worktree reaper: integration_locks row held for repo=%s workspace=%s — "
+                "surfaced, not force-deleted", repo_identity, guid,
+            )
+        locked_workspace_guids = {row[1] for row in lock_rows}
+
+        try:
+            candidates = _find_leaked_worktrees(commander_conn, workers_by_guid, ws_conn, ttl_hours)
+        except Exception as exc:
+            logger.warning("Worktree reaper: candidate scan failed: %s", exc)
+            return counts
+    finally:
+        ws_conn.close()
+
+    for assignment, worker in candidates:
+        owner = assignment.get("owner_session_id")
+        guid = assignment.get("workspace_guid")
+
+        # Scope: never the operator's own primary-checkout row.
+        if owner and owner == guid:
+            continue
+
+        if _is_protected(
+            assignment, worker, tmux, locked_workspace_guids, now,
+        ):
+            counts["protected"] += 1
+            continue
+
+        if not owner or worker is None:
+            # Structural gap: cleanup/abandon both require an exact, non-null
+            # owner_session_id match at the workspace-manager CLI boundary. A
+            # worker that died before `bind` succeeded leaves a permanently
+            # ownerless assignment (reserved, materialized, or active) that
+            # cleanup/abandon cannot release. Release it via the owner-free
+            # `reap` verb instead; fall back to surfacing if repository_path
+            # cannot be derived from worktree_path, or the reap call fails.
+            try:
+                _reap_ownerless_assignment(workspace_client, assignment, {})
+                counts["released"] += 1
+            except Exception:
+                logger.warning(
+                    "Worktree reaper: leaked ownerless assignment workspace=%s repo=%s "
+                    "status=%s — surfaced, cannot release without a bound owner_session_id",
+                    guid, assignment.get("repository_identity"), assignment.get("lifecycle_status"),
+                )
+                counts["surfaced"] += 1
+            continue
+
+        try:
+            action = _release_leaked_assignment(
+                workspace_client, assignment, worker, resolve_transport(worker),
+            )
+            logger.info(
+                "Worktree reaper: released workspace=%s worker=%s via %s",
+                guid, worker.get("id"), action,
+            )
+            counts["released"] += 1
+        except Exception as exc:
+            logger.warning(
+                "Worktree reaper: release failed for workspace=%s worker=%s: %s",
+                guid, worker.get("id"), exc,
+            )
+            counts["errors"] += 1
+
+    return counts
+
+
+def _sync_idle_worktrees(
+    commander_conn,
+    workspace_client,
+    *,
+    workspace_db_path: str | None = None,
+    resolve_transport=None,
+    git_runner=subprocess.run,
+) -> dict:
+    """Periodic-sweep approximation of a pre-assignment sync hook.
+
+    There is no true pre-assignment hook in main.py — worker spawn lives in
+    orchestrator_mcp.spawn_worker, which allocates a fresh workspace at spawn
+    time rather than drawing from a pre-synced pool. This sweep instead keeps
+    any idle (not currently running) managed worktree that is still `active`
+    fast-forwarded to its integration target, on the same hourly maintenance
+    cadence as the rest of `_run_maintenance`, so a worktree that gets reused
+    or inspected later starts from a fresher base. It is NOT a substitute for
+    a real pre-assignment hook and never blocks or gates a worker spawn.
+    """
+    counts = {"synced": 0, "current": 0, "errors": 0}
+    if resolve_transport is None:
+        resolve_transport = lambda _worker: {}  # noqa: E731 - trivial local default
+
+    commander_conn.row_factory = sqlite3.Row
+    try:
+        idle_workers = commander_conn.execute(
+            "SELECT * FROM workers WHERE status != 'running' "
+            "AND workspace_guid IS NOT NULL AND workspace_guid != ''"
+        ).fetchall()
+    except Exception as exc:
+        logger.warning("Worktree sync sweep: could not read commander workers: %s", exc)
+        return counts
+
+    db_path = workspace_db_path or _workspace_manager_db_path()
+    try:
+        ws_conn = sqlite3.connect(db_path, timeout=10)
+        ws_conn.row_factory = sqlite3.Row
+    except Exception as exc:
+        logger.warning("Worktree sync sweep: could not open workspace-manager DB: %s", exc)
+        return counts
+
+    try:
+        for row in idle_workers:
+            worker = dict(row)
+            try:
+                assignment_row = ws_conn.execute(
+                    "SELECT * FROM assignments WHERE workspace_guid = ? AND lifecycle_status = 'active'",
+                    (worker["workspace_guid"],),
+                ).fetchone()
+                if assignment_row is None:
+                    continue
+                assignment = dict(assignment_row)
+                target_ref = assignment.get("integration_target")
+                if not target_ref:
+                    continue
+                result = git_runner(
+                    ["git", "-C", worker["repo"], "rev-parse", "--verify", f"{target_ref}^{{commit}}"],
+                    capture_output=True, text=True, timeout=15, check=False,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"git rev-parse {target_ref} failed: {result.stderr.strip()}"
+                    )
+                target_head = result.stdout.strip()
+                if not target_head or target_head == assignment.get("current_head"):
+                    counts["current"] += 1
+                    continue
+                workspace_client.sync(
+                    {
+                        "repository_path": worker["repo"],
+                        "workspace_guid": assignment["workspace_guid"],
+                        "owner_session_id": assignment["owner_session_id"],
+                    },
+                    **resolve_transport(worker),
+                )
+                counts["synced"] += 1
+            except Exception as exc:
+                logger.warning(
+                    "Worktree sync sweep: sync failed for worker=%s: %s", worker.get("id"), exc,
+                )
+                counts["errors"] += 1
+    finally:
+        ws_conn.close()
+
+    return counts
+
+
 _LIMIT_COOLDOWN_S = 1800  # re-alert the SAME limit signal at most once per ~window
 # separators seen in the wild: middle-dot, colon, hyphen, em-dash; apostrophe may be straight or curly
 _ACCOUNT_LIMIT_RE = re.compile(r"you['’]?ve hit your limit(?:\s*[·:\-—]\s*(resets[^\n]*))?", re.IGNORECASE)
@@ -253,6 +663,22 @@ STALENESS_LIVENESS_EXTENSION = 900
 PM_GATE_STAGES = frozenset({"plan_ready", "design_ready"})
 PM_GATE_SLACK_SECONDS = 1800
 MAX_LIVENESS_DEFERRALS = 2
+
+# Cap on how many times the daemon will drive the plain-reconcile recovery
+# for a worker stuck in finalization drift before it stops retrying and
+# surfaces-and-holds (leaves the worker running, never abandons). The
+# counter is CUMULATIVE, not a count of consecutive cycles: it accrues across
+# every cycle the worker stays in drift and is cleared only when the drift
+# recovery integrates or the worker leaves the running set (see the periodic
+# non-running cleanup), so a worker cannot "reset" the cap by going idle.
+FINALIZE_DRIFT_RETRY_CAP = 3
+# Terminal states a reconcile reaches when the work has landed. Mirrors
+# OrchestratorTools._FINALIZATION_INTEGRATED_STATES (kept as a plain module
+# constant so the daemon does not reach through the orchestrator handle, which
+# is a MagicMock under test).
+FINALIZATION_INTEGRATED_STATES = frozenset(
+    {"cleaned", "pushed", "pushed-only", "integrated-local"}
+)
 
 STAGE_STALENESS_MULTIPLIER = {
     "executing": 1.5,
@@ -812,6 +1238,10 @@ class IroncladeDaemon:
         self._last_maintenance = 0.0
         self._state_manager_db_path = os.path.expanduser("~/.claude/ironclaude.db")
         self._ssh_manager = ssh_manager
+        # Lazily-built OrchestratorTools handle (owns the WorkspaceClient + review
+        # gate readers + evidence derivation) for deterministic auto-integration.
+        # main.py deliberately holds NO WorkspaceClient of its own.
+        self._orchestrator = None
         # Idle enforcement state
         self._idle_enforcement_start = 0.0
         self._idle_escalation_tier = 0
@@ -839,6 +1269,19 @@ class IroncladeDaemon:
         self._stage_entered_at: dict[str, float] = {}
         self._heartbeat_state_history: dict[str, list[tuple[str, int]]] = {}
         self._heartbeat_stuck_notified: set[str] = set()
+        # Finalization-drift recovery: per-worker count of consecutive cycles the
+        # daemon has driven the plain-reconcile recovery for a worker stuck in
+        # frozen drift, and the once-per-worker surfacing gate (used both to fire
+        # the session-died posts exactly once and to hold — never re-alert — a
+        # worker whose drift is unresolved after FINALIZE_DRIFT_RETRY_CAP cycles).
+        self._finalize_drift_retry: dict[str, int] = {}
+        self._session_died_notified: set[str] = set()
+        # Once-per-worker gate for the conflict/repair finalization-recovery
+        # operator surface (a stuck reconcile the daemon can neither drift-retry
+        # nor complete). Cleared alongside the drift state in the periodic
+        # non-running cleanup so it neither leaks nor permanently suppresses a
+        # re-alert on worker-id reuse.
+        self._finalize_recovery_alerted: set[str] = set()
         # Awaiting-operator surfacing (in-memory; refreshed by Brain re-emission)
         self._operator_waits: dict[str, dict] = {}
         self._operator_wait_alerted: dict[str, str] = {}
@@ -846,6 +1289,144 @@ class IroncladeDaemon:
 
     def shutdown(self):
         self._running = False
+
+    def _get_orchestrator(self):
+        """Return a memoized OrchestratorTools sharing this daemon's registry,
+        tmux, db and ssh manager. It owns the WorkspaceClient and the review-gate
+        readers, so the daemon reaches deterministic auto-integration through it
+        without constructing any workspace client itself. Returns None if the
+        handle cannot be built (auto-integration is best-effort; the daemon loop
+        must never die because of it)."""
+        if self._orchestrator is None:
+            try:
+                from ironclaude.orchestrator_mcp import OrchestratorTools
+                self._orchestrator = OrchestratorTools(
+                    self.registry,
+                    self.tmux,
+                    slack_bot=self.slack,
+                    db_conn=self._db,
+                    config=self.config,
+                    ssh_manager=self._ssh_manager,
+                )
+            except Exception as exc:  # noqa: BLE001 - best-effort integration
+                logger.warning("Could not build orchestrator handle: %s", exc)
+                return None
+        return self._orchestrator
+
+    def _finalize_and_release_worker(self, worker_id: str, reason: str, terminal: bool):
+        """Best-effort delegate to OrchestratorTools' auto-integration seam.
+
+        Returns the outcome dict, or None if the handle is unavailable or the
+        call raised (the daemon loop must never die on an integration attempt).
+        """
+        orchestrator = self._get_orchestrator()
+        if orchestrator is None:
+            return None
+        try:
+            return orchestrator._finalize_and_release_worker(
+                worker_id, reason=reason, terminal=terminal,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort integration
+            logger.warning(
+                "Auto-integration failed for %s (%s): %s", worker_id, reason, exc,
+            )
+            return None
+
+    @staticmethod
+    def _finalization_recovery_mode(outcome):
+        """Return the reconcile recovery mode for a finalization-failure outcome,
+        or None.
+
+        The classifier nests the mode under recovery.reconcile.mode (see
+        OrchestratorTools._workspace_failure); it is NOT a top-level key. Any
+        outcome that is not a finalization failure — a transient preserved
+        failure (authority/probe/abandon), a completion, or None — returns None,
+        which the driver treats as 'leave running, do nothing'.
+        """
+        if isinstance(outcome, dict) and outcome.get("failure_phase") == "finalization":
+            return outcome.get("recovery", {}).get("reconcile", {}).get("mode")
+        return None
+
+    def _drive_finalization_recovery(self, worker_id: str, outcome) -> str:
+        """Unified finalization-recovery driver for terminal AND idle finalize
+        outcomes. The orchestrator seam owns ALL worker completion now; this
+        driver NEVER calls update_worker_status. It switches on the reconcile
+        recovery mode and returns a disposition the caller may use:
+
+          'integrated' — a 'drift' recovery landed the work. The seam already
+                         completed a dead worker (a live idle worker was
+                         integrated-not-completed); the driver only clears the
+                         drift counter. No daemon completion.
+          'retrying'   — 'drift' under the cap: the seam was driven this cycle;
+                         the worker is left running to retry next cycle.
+          'held'       — 'drift' over FINALIZE_DRIFT_RETRY_CAP: the daemon STOPS
+                         driving the seam and holds the worker running. Never
+                         abandoned, never completed — the repo-wide integration
+                         lock the drift row may hold must not be stranded.
+          'surfaced'   — 'conflict'/'repair': surfaced to the operator exactly
+                         once (via _finalize_recovery_alerted). Never completed,
+                         never abandoned.
+          'transient'  — None / any other mode (authority/probe/None): leave the
+                         worker running, do nothing.
+
+        Mints no commit and never calls _abandon_rescue_worker.
+        """
+        mode = self._finalization_recovery_mode(outcome)
+        if mode == "drift":
+            attempts = self._finalize_drift_retry.get(worker_id, 0) + 1
+            self._finalize_drift_retry[worker_id] = attempts
+            if attempts > FINALIZE_DRIFT_RETRY_CAP:
+                # Surface-and-hold: stop driving, leave running, never abandon.
+                # Alert the operator exactly once (mirrors the conflict/repair
+                # surface below) -- a drift row held here may still hold the
+                # repo-wide integration lock and needs eyes on it.
+                if worker_id not in self._finalize_recovery_alerted:
+                    self._finalize_recovery_alerted.add(worker_id)
+                    self.slack.post_message(
+                        f"Worker {worker_id} finalization drift unresolved after "
+                        f"{FINALIZE_DRIFT_RETRY_CAP} attempts; held — reviewed work "
+                        f"preserved, not integrated, not completed; needs operator help."
+                    )
+                    self.brain.send_message(
+                        f"Worker {worker_id} finalization drift unresolved after "
+                        f"{FINALIZE_DRIFT_RETRY_CAP} attempts; held. Not completed, not "
+                        f"abandoned. Needs operator intervention."
+                    )
+                return "held"
+            orchestrator = self._get_orchestrator()
+            state = None
+            if orchestrator is not None:
+                try:
+                    result = orchestrator.drive_frozen_reconcile_recovery(worker_id)
+                    state = result.get("state") if isinstance(result, dict) else None
+                except Exception as exc:  # noqa: BLE001 - best-effort recovery
+                    logger.warning(
+                        "Drift reconcile recovery failed for %s: %s", worker_id, exc,
+                    )
+            if state in FINALIZATION_INTEGRATED_STATES:
+                # The seam integrated the work: a dead worker was completed by
+                # the seam, a live idle worker was integrated-not-completed. The
+                # daemon completes NOTHING here — just clear the retry counter.
+                self._finalize_drift_retry.pop(worker_id, None)
+                return "integrated"
+            return "retrying"
+        if mode in ("conflict", "repair"):
+            # A stuck reconcile the daemon can neither drift-retry nor complete:
+            # surface to the operator ONCE, never abandon, never complete.
+            if worker_id not in self._finalize_recovery_alerted:
+                self._finalize_recovery_alerted.add(worker_id)
+                self.slack.post_message(
+                    f"Worker {worker_id} finalization needs operator help "
+                    f"(reconcile mode={mode}); left running, not completed."
+                )
+                self.brain.send_message(
+                    f"Worker {worker_id} finalization stuck (reconcile mode="
+                    f"{mode}); needs operator intervention. Not completed, not "
+                    f"abandoned."
+                )
+            return "surfaced"
+        # Transient preserved failure (authority/probe) or None: leave running.
+        return "transient"
 
     def _get_operator_message_dispositions(self) -> dict[str, str]:
         """Return durable operator-message dispositions from the authoritative ledger."""
@@ -1030,6 +1611,55 @@ class IroncladeDaemon:
                 )
         except Exception as e:
             logger.warning(f"Maintenance: session sweep failed: {e}")
+
+        # 5. Reap leaked managed worktrees (release-only: cleanup / abandon(rescue))
+        try:
+            orchestrator = self._get_orchestrator()
+            if orchestrator is not None:
+                counts = _reap_leaked_worktrees(
+                    self._db, orchestrator._workspace_client, self.tmux,
+                    resolve_transport=self._worktree_reap_transport,
+                )
+                if counts["released"] or counts["surfaced"] or counts["errors"]:
+                    logger.info("Maintenance: worktree reaper %s", counts)
+        except Exception as e:
+            logger.warning(f"Maintenance: worktree reaper failed: {e}")
+
+        # 6. Sync idle managed worktrees toward their integration target — a
+        # periodic-sweep approximation of a pre-assignment sync hook (see
+        # `_sync_idle_worktrees` docstring for why there is no true hook here).
+        try:
+            orchestrator = self._get_orchestrator()
+            if orchestrator is not None:
+                counts = _sync_idle_worktrees(
+                    self._db, orchestrator._workspace_client,
+                    resolve_transport=self._worktree_reap_transport,
+                )
+                if counts["synced"] or counts["errors"]:
+                    logger.info("Maintenance: worktree sync sweep %s", counts)
+        except Exception as e:
+            logger.warning(f"Maintenance: worktree sync sweep failed: {e}")
+
+    def _worktree_reap_transport(self, worker: dict) -> dict:
+        """Best-effort transport kwargs (ssh_host/plugin_root) for a worktree
+        reaper release/sync call on this worker's host. Never raises — an
+        exception here degrades to a local-transport attempt, which the
+        client call itself will then fail (and log) if that guess is wrong."""
+        try:
+            orchestrator = self._get_orchestrator()
+            if orchestrator is None:
+                return {}
+            ssh_host = orchestrator._resolve_ssh_host(worker["id"])
+            installed_root = orchestrator._workspace_client.discover_installed_plugin_root(
+                worker.get("client") or "claude", ssh_host=ssh_host,
+            )
+            return orchestrator._workspace_transport(installed_root, ssh_host)
+        except Exception as exc:
+            logger.warning(
+                "Worktree reaper: transport resolution failed for worker=%s: %s",
+                worker.get("id"), exc,
+            )
+            return {}
 
     def poll_slack_commands(self):
         """Drain and process Slack commands."""
@@ -2040,11 +2670,14 @@ class IroncladeDaemon:
         brain_cwd = os.path.expanduser(self.config.get("brain_cwd", "~/.ironclaude/brain"))
         os.makedirs(brain_cwd, exist_ok=True)
         prompt_path = self.config.get("brain_prompt_path") or os.path.join(repo_root, "src", "brain", "system_prompt.md")
+        # IRONCLAUDE_LLM_PATH: commander_brain
         try:
-            with open(prompt_path) as f:
-                system_prompt = _substitute_prompt(f.read(), self.config)
+            system_prompt = _render_brain_system_prompt(prompt_path, self.config)
         except FileNotFoundError:
             logger.error(f"Brain system prompt not found: {prompt_path}")
+            return
+        except CommunicationProfileError as exc:
+            logger.error("Brain communication-profile infrastructure error: %s", exc)
             return
         success = self.brain.restart(system_prompt, cwd=brain_cwd)
         if success:
@@ -2090,7 +2723,8 @@ class IroncladeDaemon:
                 message = decision.get("message", "")
                 self.tmux.send_keys(f"ic-{worker_id}", message)
 
-    def _wait_for_ready(self, session_name: str, timeout: int = 30, marker: str = "ironclaude v") -> bool:
+    def _wait_for_ready(self, session_name: str, timeout: int = 30,
+                        marker: str = "ironclaude v", log_offset: int | None = None) -> bool:
         """Poll tmux log until the worker is ready or timeout exceeded.
 
         Returns True if marker is found in output, False on timeout.
@@ -2098,7 +2732,11 @@ class IroncladeDaemon:
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
-            output = self.tmux.read_log_tail(session_name, lines=20)
+            output = (
+                self.tmux.read_log_tail(session_name, lines=20)
+                if log_offset is None
+                else self.tmux.read_log_since(session_name, log_offset)
+            )
             if output:
                 lower = output.lower()
                 if "trust this folder" in lower:
@@ -2107,6 +2745,23 @@ class IroncladeDaemon:
                     return True
             time.sleep(1)
         return False
+
+    def _dispatch_worker_communication_profile(self, session_name: str) -> str | None:
+        """Activate the interactive AI profile and require a marker newer than dispatch."""
+        # IRONCLAUDE_LLM_PATH: managed_worker
+        try:
+            invocation = skill_invocation("managed_worker", "claude")
+        except CommunicationProfileError as exc:
+            return f"Communication-profile infrastructure error: {exc}"
+        log_offset = self.tmux.get_log_size(session_name)
+        if not self.tmux.send_keys(session_name, invocation):
+            return "Failed to deliver write-lossless-ai-messages activation"
+        if not self._wait_for_ready(
+            session_name, timeout=30, marker=PROFILE_READY_MARKER,
+            log_offset=log_offset,
+        ):
+            return "write-lossless-ai-messages activation did not emit a fresh readiness marker"
+        return None
 
     def _handle_spawn_worker(self, decision: dict):
         """Spawn a worker from a brain decision."""
@@ -2192,6 +2847,12 @@ class IroncladeDaemon:
 
         # Stage 5: wait for professional mode
         self._wait_for_ready(session_name, timeout=15, marker="Professional Mode: ON")
+
+        profile_error = self._dispatch_worker_communication_profile(session_name)
+        if profile_error is not None:
+            self.tmux.kill_session(session_name)
+            self.slack.post_message(f"Failed to activate communication profile for `{worker_id}`: {profile_error}")
+            return
 
         # Stage 5.5: enable advisor if configured (skip for claude-fable — top
         # tier, no higher advisor available)
@@ -2497,6 +3158,21 @@ class IroncladeDaemon:
                 self._stuck_liveness_count.pop(wid, None)
                 self._persist_staleness_state(wid)
 
+        # A worker no longer running has completed (integrated) or been reaped, so
+        # drop its finalization-drift state. This is the single clear point for the
+        # drift counter and the session-died surfacing gate: a still-running drift
+        # worker (retrying or held) stays in running_ids and is preserved, so the
+        # cap keeps accumulating and the surface never re-fires.
+        for wid in list(self._finalize_drift_retry.keys()):
+            if wid not in running_ids:
+                self._finalize_drift_retry.pop(wid, None)
+        for wid in list(self._session_died_notified):
+            if wid not in running_ids:
+                self._session_died_notified.discard(wid)
+        for wid in list(self._finalize_recovery_alerted):
+            if wid not in running_ids:
+                self._finalize_recovery_alerted.discard(wid)
+
     def _confirm_and_kill_stuck_worker(
         self, worker_id: str, session_name: str, duration: float,
         stage: str | None, prompt_waiting: bool, ssh_host: str | None,
@@ -2541,8 +3217,22 @@ class IroncladeDaemon:
                     logger.warning(f"Liveness check failed for {worker_id}: {e}")
 
         self.tmux.kill_session(session_name, ssh_host=ssh_host)
-        self.registry.update_worker_status(worker_id, "completed")
-        self.registry.log_event("worker_finished", worker_id=worker_id)
+        # Deterministic auto-integration for the now-dead session before the
+        # completed-flip. A recoverable finalization failure re-queues (leave the
+        # worker running so a later cycle retries); every other outcome completes.
+        outcome = self._finalize_and_release_worker(
+            worker_id, reason="stuck-killed", terminal=True,
+        )
+        # The seam owns ALL completion; the daemon completes nothing. Route the
+        # outcome through the unified recovery driver (drift-retry / surface /
+        # transient) which never calls update_worker_status.
+        self._drive_finalization_recovery(worker_id, outcome)
+        # Log worker_finished ONLY when the worker is actually completed (re-read
+        # the registry after the seam+driver ran). A still-running transient/held
+        # worker logs no finish.
+        _w = self.registry.get_worker(worker_id)
+        if isinstance(_w, dict) and _w.get("status") == "completed":
+            self.registry.log_event("worker_finished", worker_id=worker_id)
 
         minutes = int(duration / 60)
         log_worker_event(
@@ -2603,6 +3293,18 @@ class IroncladeDaemon:
             if marker_exists:
                 log_worker_event("WORKER_IDLE", worker_id=worker_id)
                 self.slack.post_message(format_worker_idle(worker_id))
+                # Idle-but-alive worker: recycle its work in place when gates pass
+                # AND there is genuinely new work. The nothing-new guard stops an
+                # empty commit on repeated Brain-down cycles; runs regardless of
+                # the Brain delivery below (work integrates even when Brain is down).
+                outcome = self._finalize_and_release_worker(
+                    worker_id, reason="idle", terminal=False,
+                )
+                # Route the (previously discarded) idle outcome through the
+                # unified recovery driver so a drift/conflict/repair finalization
+                # is driven/surfaced, not dropped. A live idle worker is never
+                # completed by the daemon.
+                self._drive_finalization_recovery(worker_id, outcome)
                 delivered = self.brain.send_message(
                     f"Worker {worker_id} idle."
                 )
@@ -2621,13 +3323,44 @@ class IroncladeDaemon:
 
             # Fallback: session died (crash, OOM, etc.)
             if not self.tmux.has_session(session_name, ssh_host=ssh_host):
-                self.registry.update_worker_status(worker_id, "completed")
-                self.registry.log_event("worker_finished", worker_id=worker_id)
-                log_worker_event("WORKER_DEAD", worker_id=worker_id)
-                self.slack.post_message(format_worker_completed(worker_id, "Session ended"))
-                self.brain.send_message(
-                    f"Worker {worker_id} session died (tmux gone)."
+                # Integrate (or rescue) the dead worker's reviewed work before the
+                # completed-flip. A recoverable finalization failure re-queues.
+                outcome = self._finalize_and_release_worker(
+                    worker_id, reason="session ended", terminal=True,
                 )
+                # The seam owns ALL completion; the daemon completes nothing.
+                # Route the outcome through the unified recovery driver
+                # (drift-retry / surface / transient) which never completes.
+                disposition = self._drive_finalization_recovery(worker_id, outcome)
+                # Log worker_finished ONLY when the worker is actually completed
+                # (re-read the registry after the seam+driver ran). A worker left
+                # running (transient/held/surfaced) logs no finish.
+                _w = self.registry.get_worker(worker_id)
+                _completed = isinstance(_w, dict) and _w.get("status") == "completed"
+                if _completed:
+                    self.registry.log_event("worker_finished", worker_id=worker_id)
+                # Surface the dead session exactly once per worker. A drift worker
+                # re-enters this branch every cycle while it stays running; gating
+                # on the notified set stops the Slack/Brain posts re-firing. The
+                # surface must reflect actual completion: a worker the seam left
+                # NOT completed (transient/drift/held; work preserved) must never
+                # be reported as "Worker Completed".
+                if worker_id not in self._session_died_notified:
+                    log_worker_event("WORKER_DEAD", worker_id=worker_id)
+                    if _completed:
+                        self.slack.post_message(format_worker_completed(worker_id, "Session ended"))
+                        self.brain.send_message(
+                            f"Worker {worker_id} session died (tmux gone)."
+                        )
+                    else:
+                        self.slack.post_message(
+                            format_worker_session_ended_preserved(worker_id, disposition)
+                        )
+                        self.brain.send_message(
+                            f"Worker {worker_id} session died (tmux gone); reviewed work "
+                            f"preserved, NOT completed — may need operator attention."
+                        )
+                    self._session_died_notified.add(worker_id)
                 continue
 
             # Proactive check-in: notify brain when cadence elapses
@@ -3325,14 +4058,17 @@ def main():
 
     # Start brain
     prompt_path = config.get("brain_prompt_path") or os.path.join(repo_root, "src", "brain", "system_prompt.md")
+    # IRONCLAUDE_LLM_PATH: commander_brain
     try:
-        with open(prompt_path) as f:
-            system_prompt = _substitute_prompt(f.read(), config)
+        system_prompt = _render_brain_system_prompt(prompt_path, config)
         ensure_brain_trusted(brain_cwd)
         brain.start(system_prompt, cwd=brain_cwd)
         logger.info("Brain SDK client started")
     except FileNotFoundError:
         logger.warning(f"Brain system prompt not found: {prompt_path} — brain will start on first check_brain()")
+    except CommunicationProfileError as exc:
+        logger.error("Brain communication-profile infrastructure error: %s", exc)
+        sys.exit(1)
 
     daemon = IroncladeDaemon(
         config=config, slack=slack, socket_handler=socket_handler,

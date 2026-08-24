@@ -9,6 +9,10 @@ import shutil
 import subprocess
 
 from ironclaude import paths
+from ironclaude.communication_profiles import (
+    CommunicationProfileError,
+    apply_communication_profile,
+)
 from ironclaude.ollama_client import OllamaClient, OllamaError
 
 logger = logging.getLogger(__name__)
@@ -207,13 +211,24 @@ class ShadowGrader:
         if repo_path is None:
             return self._build_error("grade_with_tools requires repo_path (tool calls disabled)")
 
+        # IRONCLAUDE_LLM_PATH: shadow_grader
+        try:
+            profiled_system_prompt = apply_communication_profile(
+                "shadow_grader", system_prompt
+            )
+        except CommunicationProfileError as exc:
+            return self._build_error(str(exc))
+
         try:
             client = self._get_client()
         except Exception as e:
             return self._build_error(f"Failed to init Ollama client: {e}")
 
         messages = [
-            {"role": "system", "content": GEMMA4_SYSTEM_PROMPT + "\n\n" + system_prompt},
+            {
+                "role": "system",
+                "content": GEMMA4_SYSTEM_PROMPT + "\n\n" + profiled_system_prompt,
+            },
             {"role": "user", "content": user_prompt},
         ]
         payload = {

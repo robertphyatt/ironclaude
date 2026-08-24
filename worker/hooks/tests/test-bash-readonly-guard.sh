@@ -141,4 +141,14 @@ allow "diff a b"
 rev_allow "diff a b"
 block "diff a b > out"
 
+# ── bare cd is read-only; chained cd is not (cwd-drift deadlock cure) ──
+allow "cd /tmp"
+allow "cd /Users/roberthyatt/Code/ironclaude"
+allow "cd"
+rev_allow "cd /tmp"
+# Chained/compound cd stays BLOCKED (metacharacter check unchanged) — non-widening controls.
+block "cd /tmp && ls"
+block "cd a ; rm b"
+rev_block "cd /tmp && rm x"
+
 if [ "$fail" -eq 0 ]; then echo "ALL PASS"; else echo "FAILURES"; exit 1; fi

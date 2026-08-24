@@ -5,13 +5,17 @@ import {
   acquireIntegrationLock,
   deleteIntegrationRecord,
   getAssignment,
-  reapStalePrimaryOwner,
   recordIntegration,
   transitionAssignment,
 } from './db.js';
 import {
+  carryForwardFastForward,
+  changedPaths,
+  deleteTemporaryBranch,
+  dirtyAndUntrackedPaths,
   discoverRepository,
   isAncestor,
+  removeWorktree,
   runGit,
   worktreeHead,
   worktreeIsClean,
@@ -21,6 +25,7 @@ import {
   pushExactAuthorizedIntegratedCandidate,
   revalidateAuthorizedCommitState,
   type AuthorizedDirectGitOperation,
+  type ReconcileEvidence,
 } from './git-authority.js';
 import type { Assignment } from './types.js';
 
@@ -29,7 +34,7 @@ export interface FinalizationResult {
     | 'rebase-aborted' | 'rebase-recovery-repair-required'
     | 'rebase-rerebased-ready-for-repair' | 'rebase-frozen-restored'
     | 'rebase-paused-conflict' | 'rebase-paused-clean' | 'frozen-no-rebase'
-    | 'integrated' | 'not-ready';
+    | 'integrated' | 'not-ready' | 'reconciled';
   integratedCommit?: string;
   pushError?: string;
   /** Human-facing explanation for a managed rebase-recovery outcome that did not integrate. */
@@ -45,6 +50,13 @@ export interface CommanderLocalCommitInput {
   localRef: string;
   stagedTree: string;
   parentOid: string;
+  /**
+   * Optional terminal disposition. Omitted or 'recycle' (the default) is
+   * exactly today's behavior: `recycleFinalized` resets the worktree in place
+   * for reuse. 'release' instead removes the worktree and its temporary
+   * branch via `releaseFinalized` — for a worker whose session has ended.
+   */
+  dispose?: 'recycle' | 'release';
 }
 
 export type CommanderReviewedEvidence = Pick<
@@ -73,6 +85,18 @@ export interface ReconcileFinalizationInput {
    * resets the clean worktree back to the frozen pre-rebase commit. Neither integrates.
    */
   rebaseRecovery?: 'continue' | 'abort' | 'rerebase' | 'restore_frozen' | 'status';
+}
+
+export interface SyncWorktreeToTargetInput {
+  repositoryPath: string;
+  workspaceGuid: string;
+  providerRootSessionId: string;
+}
+
+export interface SyncResult {
+  state: 'no-op' | 'fast-forwarded' | 'rebased';
+  head: string;
+  baseCommit: string;
 }
 
 export interface FinalizationHooks {
@@ -104,6 +128,7 @@ interface LocalFinalization {
 }
 
 const usedDirectAuthorities = new WeakSet<object>();
+const usedReconcileAuthorities = new WeakSet<AuthorizedDirectGitOperation>();
 
 interface IntegrationPendingDisposition {
   phase: 'integration-pending';
@@ -242,15 +267,26 @@ function requireMessage(message: string): void {
   if (message.length === 0) throw new Error('Finalization commit message must not be empty');
 }
 
+const REQUIRED_COMMANDER_FINALIZATION_KEYS = [
+  'repositoryPath', 'workspaceGuid', 'providerRootSessionId', 'message',
+  'canonicalBranch', 'localRef', 'stagedTree', 'parentOid',
+];
+
+/**
+ * `dispose` is the only OPTIONAL key: a payload that omits it (every existing
+ * caller, e.g. commit_worker in orchestrator_mcp.py) validates exactly as
+ * before. A payload that carries it must carry nothing else beyond the
+ * required set, and its value must be exactly 'recycle' or 'release'.
+ */
 function requireCommanderFinalizationInput(input: CommanderLocalCommitInput): void {
-  const expected = [
-    'repositoryPath', 'workspaceGuid', 'providerRootSessionId', 'message',
-    'canonicalBranch', 'localRef', 'stagedTree', 'parentOid',
-  ].sort();
+  const required = [...REQUIRED_COMMANDER_FINALIZATION_KEYS].sort();
+  const hasDispose = Object.prototype.hasOwnProperty.call(input, 'dispose');
+  const expected = (hasDispose ? [...required, 'dispose'] : required).sort();
   const actual = Object.keys(input).sort();
   if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])
-    || expected.some((key) => typeof input[key as keyof CommanderLocalCommitInput] !== 'string'
-      || (input[key as keyof CommanderLocalCommitInput] as string).length === 0)) {
+    || required.some((key) => typeof input[key as keyof CommanderLocalCommitInput] !== 'string'
+      || (input[key as keyof CommanderLocalCommitInput] as string).length === 0)
+    || (hasDispose && input.dispose !== 'recycle' && input.dispose !== 'release')) {
     throw new Error('Commander finalization input is malformed');
   }
 }
@@ -314,34 +350,188 @@ function exactAssignment(
   return { assignment, primaryCheckoutPath: repository.primaryCheckoutPath };
 }
 
-function fencePrimaryCheckout(db: Database.Database, repositoryIdentity: string): void {
-  // A dead/timed-out owner must not deadlock finalization: reap a stale row first,
-  // then fence on any surviving (live) owner.
-  reapStalePrimaryOwner(db, repositoryIdentity);
-  if (db.prepare('SELECT 1 FROM primary_checkout_owners WHERE repository_identity = ?').get(repositoryIdentity)) {
-    throw new Error('Finalization is fenced while primary checkout is owned');
+/**
+ * Advances a managed worktree's OWN branch onto the current integration target
+ * in-session, killing the manual `git merge --ff-only main` workflow. The
+ * target is ALWAYS `targetRef(assignment)`, read fresh from the primary
+ * checkout — never a caller-supplied ref. This function imports neither push
+ * helper and never updates any ref except the worktree's own branch (the
+ * ff-merge and the rebase both move only the checked-out branch; the target
+ * ref is read-only here).
+ *
+ * Gates (fail-closed, in order): requireProviderRoot() is enforced by the
+ * caller (mirrors reconcileFinalization); exactAssignment binds repository
+ * identity and owner; lifecycle must be exactly 'active' (a ready or
+ * integrated row refuses); the worktree must have no rebase already paused
+ * (probed the same way finalize's rebase-recovery path does, via
+ * classifyRebaseState); and no integration_locks row may be held for this
+ * repository and workspace.
+ *
+ * Mechanism, given T = targetRef commit, H = worktree HEAD, B = the
+ * assignment's base_commit:
+ *  - H === T: no-op.
+ *  - H is a strict ancestor of T (worktree behind, clean or dirty): a plain
+ *    `git merge --ff-only T`, which is dirty-tolerant and refuses on overlap.
+ *  - Otherwise (the worktree carries its own commits atop B): the worktree
+ *    must be clean, then `git rebase --onto T B`. A conflict aborts the
+ *    rebase, verifies HEAD is back at the original H, and throws reporting
+ *    the conflicting paths.
+ * On success the git operation always runs BEFORE the durable base_commit /
+ * current_head update, so a crash between them is healed by an idempotent
+ * re-run (the next call sees H already at T and takes the no-op branch).
+ */
+export function syncWorktreeToTarget(db: Database.Database, input: SyncWorktreeToTargetInput): SyncResult {
+  const exact = exactAssignment(db, input.repositoryPath, input.workspaceGuid, input.providerRootSessionId);
+  const assignment = exact.assignment;
+  if (assignment.lifecycle_status !== 'active') {
+    throw new Error('Sync requires an active assignment; preserving worktree');
+  }
+  const worktree = assignment.worktree_path;
+  if (classifyRebaseState(worktree) !== 'frozen-no-rebase') {
+    throw new Error('Sync refused: a rebase is already in progress in the worktree; preserving worktree');
+  }
+  const heldLock = db.prepare(`
+    SELECT 1 FROM integration_locks WHERE repository_identity = ? AND workspace_guid = ?
+  `).get(assignment.repository_identity, assignment.workspace_guid);
+  if (heldLock) {
+    throw new Error('Sync refused: an integration lock is held for this repository and workspace; preserving worktree');
+  }
+  const ref = targetRef(assignment);
+  const target = runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${ref}^{commit}`]).trim();
+  const head = worktreeHead(worktree);
+  if (head === target) {
+    return { state: 'no-op', head, baseCommit: assignment.base_commit };
+  }
+  if (isAncestor(worktree, head, target)) {
+    runGit(worktree, ['merge', '--ff-only', target]);
+    const newHead = worktreeHead(worktree);
+    db.prepare(`
+      UPDATE assignments SET base_commit = ?, current_head = ?, updated_at = datetime('now') WHERE workspace_guid = ?
+    `).run(target, newHead, assignment.workspace_guid);
+    return { state: 'fast-forwarded', head: newHead, baseCommit: target };
+  }
+  if (!worktreeIsClean(worktree)) {
+    throw new Error('Sync requires a clean worktree to rebase local commits onto the target; preserving worktree');
+  }
+  try {
+    runGit(worktree, ['rebase', '--onto', target, assignment.base_commit]);
+  } catch (error) {
+    const unresolved = runGit(worktree, ['diff', '--name-only', '--diff-filter=U']).trim();
+    try { runGit(worktree, ['rebase', '--abort']); } catch { /* best effort */ }
+    if (worktreeHead(worktree) !== head) {
+      throw new Error('Sync rebase abort did not restore the original worktree HEAD; preserving worktree');
+    }
+    throw new Error(
+      `Sync rebase conflicted and was aborted; preserving worktree.${
+        unresolved ? ` Unmerged paths: ${unresolved.split('\n').join(', ')}` : ''}`,
+    );
+  }
+  const newHead = worktreeHead(worktree);
+  db.prepare(`
+    UPDATE assignments SET base_commit = ?, current_head = ?, updated_at = datetime('now') WHERE workspace_guid = ?
+  `).run(target, newHead, assignment.workspace_guid);
+  return { state: 'rebased', head: newHead, baseCommit: target };
+}
+
+/**
+ * True only when the primary's HEAD symref is exactly the integration target ref.
+ * A detached HEAD makes `symbolic-ref --quiet` exit non-zero (runGit throws), which
+ * is treated as off-ref. The symref is stable across the ref CAS (the CAS moves the
+ * branch ref, not HEAD's symref), so a primary classified off-ref before the CAS
+ * stays off-ref in the checkout dispatch afterward.
+ */
+function primaryOnRef(primaryCheckoutPath: string, ref: string): boolean {
+  try {
+    return runGit(primaryCheckoutPath, ['symbolic-ref', '--quiet', 'HEAD']).trim() === ref;
+  } catch {
+    return false;
   }
 }
 
-function verifyPrimaryTarget(primaryCheckoutPath: string, ref: string, expectedTarget: string): void {
-  if (!worktreeIsClean(primaryCheckoutPath)) {
-    throw new Error('Finalization primary checkout is dirty; preserving worktree');
+/**
+ * Refuses BEFORE the ref CAS when the operator's primary checkout carries a local
+ * change to a path the carry-forward would rewrite. The overlap set is
+ * `dirtyAndUntrackedPaths(primary)` ∩ `changedPaths(expectedTarget, integrated)`;
+ * a non-empty intersection is exactly what `read-tree -m -u` would refuse, so we
+ * refuse here so `main` never advances on an un-applyable carry-forward.
+ *
+ * Self-gates on `primaryOnRef`: when the primary is off the target ref (case 1 —
+ * feature branch / detached) the integration advances by pure ref CAS and never
+ * touches the primary tree, so its local changes cannot overlap and are ignored.
+ * `dirtyAndUntrackedPaths` is HEAD-relative, so it is only meaningful BEFORE the
+ * CAS (while HEAD == expectedTarget); do not reuse it after the CAS has moved HEAD.
+ */
+function assertNoPrimaryOverlap(
+  primaryCheckoutPath: string,
+  ref: string,
+  expectedTarget: string,
+  integrated: string,
+): void {
+  if (!primaryOnRef(primaryCheckoutPath, ref)) return;
+  const dirty = dirtyAndUntrackedPaths(primaryCheckoutPath);
+  if (dirty.length === 0) return;
+  const changed = new Set(changedPaths(primaryCheckoutPath, expectedTarget, integrated));
+  const overlap = dirty.filter((entry) => changed.has(entry));
+  if (overlap.length > 0) {
+    throw new Error(
+      'Finalization primary checkout has local changes overlapping the carried-forward integration; '
+      + `preserving worktree. Overlapping paths: ${overlap.join(', ')}`,
+    );
   }
-  const checkedOutRef = runGit(primaryCheckoutPath, ['symbolic-ref', '--quiet', 'HEAD']).trim();
-  const actualHead = runGit(primaryCheckoutPath, ['rev-parse', '--verify', 'HEAD^{commit}']).trim();
+}
+
+/**
+ * Ref-level and (when on ref) checkout-level pre-checks. The operator's primary
+ * checkout is NOT required to be clean: a dirty tree or an off-ref checkout is
+ * tolerated here and reconciled later by the overlap refusal + carry-forward. The
+ * only hard requirement is that the target ref still resolves to expectedTarget,
+ * and — when the primary is actually on that ref — that its HEAD matches it.
+ */
+function verifyPrimaryTarget(primaryCheckoutPath: string, ref: string, expectedTarget: string): void {
   const actualTarget = runGit(primaryCheckoutPath, ['rev-parse', '--verify', `${ref}^{commit}`]).trim();
-  if (checkedOutRef !== ref || actualHead !== expectedTarget || actualTarget !== expectedTarget) {
+  if (actualTarget !== expectedTarget) {
     throw new Error('Finalization primary checkout is not cleanly checked out at expected target');
   }
+  if (primaryOnRef(primaryCheckoutPath, ref)) {
+    const actualHead = runGit(primaryCheckoutPath, ['rev-parse', '--verify', 'HEAD^{commit}']).trim();
+    if (actualHead !== expectedTarget) {
+      throw new Error('Finalization primary checkout is not cleanly checked out at expected target');
+    }
+  }
 }
 
-function verifyPrimaryAfterFastForward(primaryCheckoutPath: string, ref: string, integratedCommit: string): void {
-  const head = runGit(primaryCheckoutPath, ['rev-parse', '--verify', 'HEAD^{commit}']).trim();
+/**
+ * Post-CAS consistency check. When the primary is on the target ref, the checkout
+ * must have advanced to `integrated` (HEAD, no unmerged index entries, and every
+ * carried-forward path's index+worktree content == integrated's) — operator
+ * changes on OTHER paths are preserved and intentionally not asserted. When the
+ * primary is off the ref (case 1), only the ref itself must resolve to integrated;
+ * the operator's checkout was never touched. Content is compared against
+ * `integrated` directly (not HEAD-relative) because HEAD has already moved.
+ */
+function verifyPrimaryAfterFastForward(
+  primaryCheckoutPath: string,
+  ref: string,
+  expectedTarget: string,
+  integratedCommit: string,
+): void {
   const target = runGit(primaryCheckoutPath, ['rev-parse', '--verify', `${ref}^{commit}`]).trim();
-  const primaryTree = runGit(primaryCheckoutPath, ['rev-parse', '--verify', 'HEAD^{tree}']).trim();
-  const integratedTree = runGit(primaryCheckoutPath, ['rev-parse', '--verify', `${integratedCommit}^{tree}`]).trim();
-  if (head !== integratedCommit || target !== integratedCommit || primaryTree !== integratedTree || !worktreeIsClean(primaryCheckoutPath)) {
+  if (target !== integratedCommit) {
     throw new Error('Finalization primary checkout is inconsistent after checked fast-forward');
+  }
+  if (!primaryOnRef(primaryCheckoutPath, ref)) return;
+  const head = runGit(primaryCheckoutPath, ['rev-parse', '--verify', 'HEAD^{commit}']).trim();
+  const unmerged = runGit(primaryCheckoutPath, ['ls-files', '--unmerged']).trim();
+  if (head !== integratedCommit || unmerged !== '') {
+    throw new Error('Finalization primary checkout is inconsistent after checked fast-forward');
+  }
+  const carried = changedPaths(primaryCheckoutPath, expectedTarget, integratedCommit);
+  if (carried.length > 0) {
+    const worktreeDrift = runGit(primaryCheckoutPath, ['diff', '--name-only', integratedCommit, '--', ...carried]).trim();
+    const indexDrift = runGit(primaryCheckoutPath, ['diff', '--name-only', '--cached', integratedCommit, '--', ...carried]).trim();
+    if (worktreeDrift !== '' || indexDrift !== '') {
+      throw new Error('Finalization primary checkout is inconsistent after checked fast-forward');
+    }
   }
 }
 
@@ -407,6 +597,68 @@ export function recycleFinalized(db: Database.Database, repositoryPath: string, 
   try { runGit(current.worktree_path, ['update-ref', '-d', candidateRef(current.workspace_guid)]); } catch { /* candidate ref may be absent */ }
 }
 
+/**
+ * Terminal disposition for a completed worker: removes the worktree and its
+ * temporary branch instead of recycling in place, so a successfully-integrated
+ * worker does not leak its worktree directory. Mirrors cleanupWorkspace's
+ * integrated-row proofs (clean worktree, primary checkout not owned, reachable
+ * durable integration evidence via the integration_records join) before it
+ * ever removes anything; any failed proof preserves the worktree. Unlike
+ * cleanupWorkspace, this does not re-run validateManagedIdentity's
+ * worktree-path/branch/listWorktrees cross-check — that identity is already
+ * established by the finalization pipeline that ran immediately before this
+ * call (exactAssignment's repository+owner binding, requireAssignmentCommitBinding's
+ * branch/ref binding, and the checked fast-forward itself), so re-deriving it
+ * from managedWorktreePath here would be redundant, not an additional proof.
+ * Like cleanupWorkspace (and unlike recycleFinalized), the durable
+ * integration_records row and finalization refs are left in place: 'cleaned'
+ * is terminal (never reused), so there is nothing to make room for.
+ */
+function releaseFinalized(db: Database.Database, repositoryPath: string, assignment: Assignment): void {
+  // Re-read for the same reason recycleFinalized does: several call sites pass
+  // an in-memory row whose fields may be stale relative to the DB.
+  const current = getAssignment(db, assignment.workspace_guid);
+  if (!current || current.lifecycle_status !== 'integrated' || !current.integrated_commit) {
+    throw new Error('Release requires a durable integrated assignment; preserving worktree');
+  }
+  if (!worktreeIsClean(current.worktree_path)) {
+    throw new Error('Release requires a clean worktree; preserving worktree');
+  }
+  const ref = targetRef(current);
+  const actualHead = worktreeHead(current.worktree_path);
+  const integration = db.prepare(`
+    SELECT target_ref, integrated_commit FROM integration_records
+    WHERE workspace_guid = ? AND repository_identity = ?
+  `).get(current.workspace_guid, current.repository_identity) as {
+    target_ref: string;
+    integrated_commit: string;
+  } | undefined;
+  if (!integration
+    || integration.target_ref !== ref
+    || integration.integrated_commit !== current.integrated_commit
+    || actualHead !== current.integrated_commit
+    || !isAncestor(repositoryPath, current.integrated_commit, ref)) {
+    throw new Error('Release integration proof is unreachable from the integration target; preserving worktree');
+  }
+  removeWorktree(repositoryPath, current.worktree_path);
+  deleteTemporaryBranch(repositoryPath, current.branch);
+  transitionAssignment(db, current.workspace_guid, 'integrated', 'cleaned');
+}
+
+/** Applies a Commander finalize's requested terminal disposition; default/absent is recycle. */
+function disposeFinalized(
+  db: Database.Database,
+  repositoryPath: string,
+  assignment: Assignment,
+  dispose: 'recycle' | 'release' | undefined,
+): void {
+  if (dispose === 'release') {
+    releaseFinalized(db, repositoryPath, assignment);
+  } else {
+    recycleFinalized(db, repositoryPath, assignment);
+  }
+}
+
 function finishLocalIntegration(db: Database.Database, local: LocalFinalization): FinalizationResult {
   if (decodePushDisposition(local.assignment.disposition)) {
     return {
@@ -425,17 +677,45 @@ function repairPrimaryCheckoutAfterInterruptedCas(
   expectedTarget: string,
   candidate: string,
 ): void {
-  const checkedOutRef = runGit(repositoryPath, ['symbolic-ref', '--quiet', 'HEAD']).trim();
+  // The ref CAS is already durable (this is a post-CAS crash), so the target must
+  // resolve to the candidate before any tree work.
   const currentTarget = runGit(repositoryPath, ['rev-parse', '--verify', `${ref}^{commit}`]).trim();
-  const expectedTree = runGit(repositoryPath, ['rev-parse', '--verify', `${expectedTarget}^{tree}`]).trim();
-  const indexTree = runGit(repositoryPath, ['write-tree']).trim();
-  const unstaged = runGit(repositoryPath, ['diff', '--name-only']).trim();
-  const untracked = runGit(repositoryPath, ['ls-files', '--others', '--exclude-standard']).trim();
-  if (checkedOutRef !== ref || currentTarget !== candidate || indexTree !== expectedTree || unstaged !== '' || untracked !== '') {
+  if (currentTarget !== candidate) {
     throw new Error('Crash reconciliation primary checkout has unproved changes; preserving worktree');
   }
-  runGit(repositoryPath, ['read-tree', '--reset', '-u', candidate]);
-  verifyPrimaryAfterFastForward(repositoryPath, ref, candidate);
+  if (primaryOnRef(repositoryPath, ref)) {
+    assertNoPostCasOverlap(repositoryPath, expectedTarget, candidate);
+    carryForwardFastForward(repositoryPath, expectedTarget, candidate);
+  }
+  verifyPrimaryAfterFastForward(repositoryPath, ref, expectedTarget, candidate);
+}
+
+function pathLines(output: string): string[] {
+  return output.split('\n').filter((entry) => entry.length > 0);
+}
+
+function postCasLocalPaths(repositoryPath: string, expectedTarget: string): string[] {
+  return [...new Set([
+    ...pathLines(runGit(repositoryPath, ['diff', '--name-only', '--cached', expectedTarget, '--'])),
+    ...pathLines(runGit(repositoryPath, ['diff', '--name-only'])),
+    ...pathLines(runGit(repositoryPath, ['ls-files', '--others', '--exclude-standard'])),
+  ])].sort();
+}
+
+function assertNoPostCasOverlap(
+  repositoryPath: string,
+  expectedTarget: string,
+  candidate: string,
+): void {
+  const changed = new Set(changedPaths(repositoryPath, expectedTarget, candidate));
+  const overlap = postCasLocalPaths(repositoryPath, expectedTarget)
+    .filter((entry) => changed.has(entry));
+  if (overlap.length > 0) {
+    throw new Error(
+      'Crash reconciliation primary checkout has local changes overlapping the carried-forward integration; '
+      + `preserving worktree. Overlapping paths: ${overlap.join(', ')}`,
+    );
+  }
 }
 
 /** One private path for direct and reviewed-local finalization; it never pushes. */
@@ -447,7 +727,6 @@ function continueFrozenFinalization(
   frozenCommit: string,
   hooks?: FinalizationHooks,
 ): LocalFinalization {
-  fencePrimaryCheckout(db, assignment.repository_identity);
   const ready = getAssignment(db, assignment.workspace_guid);
   if (!ready || ready.lifecycle_status !== 'ready_for_integration') {
     throw new Error('Finalization requires durable ready state');
@@ -466,7 +745,15 @@ function continueFrozenFinalization(
   let targetAdvanced = false;
   let integrationRecorded = false;
   try {
-    fencePrimaryCheckout(db, ready.repository_identity);
+    // Diagnostics-only: base_commit is the reviewed boundary cumulativeBinaryEffect
+    // trusts below. A base_commit that is no longer the actual merge-base of the
+    // frozen commit and the target (e.g. a manual `git merge --ff-only main` that
+    // skipped the durable base_commit update) would silently widen the reviewed
+    // effect to include un-reviewed carried-forward content. Fail loud instead.
+    const mergeBase = runGit(sourcePath, ['merge-base', frozenCommit, expectedTarget]).trim();
+    if (mergeBase !== ready.base_commit) {
+      throw new Error('Finalization base_commit is not the merge-base; run sync_worktree_to_target');
+    }
     const reviewedEffect = cumulativeBinaryEffect(sourcePath, ready.base_commit, frozenCommit);
     rebaseStarted = true;
     runGit(sourcePath, ['rebase', '--onto', ref, ready.base_commit]);
@@ -481,20 +768,27 @@ function continueFrozenFinalization(
     }
     runGit(sourcePath, ['update-ref', candidateRef(ready.workspace_guid), integratedCommit]);
     hooks?.beforeCheckedFastForward?.();
-    fencePrimaryCheckout(db, ready.repository_identity);
     if (runGit(repositoryPath, ['rev-parse', '--verify', `${ref}^{commit}`]).trim() !== expectedTarget) {
       throw new Error('Finalization target moved; preserving worktree');
     }
     verifyPrimaryTarget(repositoryPath, ref, expectedTarget);
+    // Refuse an un-applyable carry-forward BEFORE the CAS so main never advances on
+    // a conflict. No-op when the primary is off ref (pure ref-advance case).
+    assertNoPrimaryOverlap(repositoryPath, ref, expectedTarget, integratedCommit);
     requireExactIntegrationLock(db, ready, ref, expectedTarget);
     hooks?.beforeTargetCompareAndSwap?.();
     runGit(repositoryPath, ['update-ref', ref, integratedCommit, expectedTarget]);
     targetAdvanced = true;
     hooks?.afterTargetCompareAndSwapBeforeCheckout?.();
-    runGit(repositoryPath, ['read-tree', '--reset', '-u', integratedCommit]);
-    verifyPrimaryAfterFastForward(repositoryPath, ref, integratedCommit);
+    // Case dispatch: on ref -> carry the checkout forward preserving unrelated
+    // operator work; off ref (feature branch / detached) -> pure ref advance, ZERO
+    // working-tree commands against the operator's primary checkout.
+    if (primaryOnRef(repositoryPath, ref)) {
+      carryForwardFastForward(repositoryPath, expectedTarget, integratedCommit);
+    }
+    verifyPrimaryAfterFastForward(repositoryPath, ref, expectedTarget, integratedCommit);
     hooks?.afterCheckedFastForwardBeforeRecord?.();
-    verifyPrimaryAfterFastForward(repositoryPath, ref, integratedCommit);
+    verifyPrimaryAfterFastForward(repositoryPath, ref, expectedTarget, integratedCommit);
     requireExactIntegrationLock(db, ready, ref, expectedTarget);
     const integrated = markIntegrated(db, ready, integratedCommit, ref, hooks);
     integrationRecorded = true;
@@ -563,16 +857,21 @@ function finalizeAttestedCandidate(
   let targetAdvanced = false;
   let integrationRecorded = false;
   try {
-    fencePrimaryCheckout(db, assignment.repository_identity);
     if (worktreeHead(assignment.worktree_path) !== candidate || !isAncestor(repositoryPath, expectedTarget, candidate)) {
       throw new Error('Fresh repair authority is not an exact descendant candidate; preserving worktree');
     }
     verifyPrimaryTarget(repositoryPath, ref, expectedTarget);
+    // Same three-case treatment as continueFrozenFinalization: refuse an
+    // un-applyable carry-forward BEFORE this CAS so a ready-repair finalize against
+    // a dirty-on-target OR off-ref primary never force-overwrites operator bytes.
+    assertNoPrimaryOverlap(repositoryPath, ref, expectedTarget, candidate);
     requireExactIntegrationLock(db, assignment, ref, expectedTarget);
     runGit(repositoryPath, ['update-ref', ref, candidate, expectedTarget]);
     targetAdvanced = true;
-    runGit(repositoryPath, ['read-tree', '--reset', '-u', candidate]);
-    verifyPrimaryAfterFastForward(repositoryPath, ref, candidate);
+    if (primaryOnRef(repositoryPath, ref)) {
+      carryForwardFastForward(repositoryPath, expectedTarget, candidate);
+    }
+    verifyPrimaryAfterFastForward(repositoryPath, ref, expectedTarget, candidate);
     requireExactIntegrationLock(db, assignment, ref, expectedTarget);
     const integrated = markIntegrated(db, assignment, candidate, ref);
     integrationRecorded = true;
@@ -583,6 +882,101 @@ function finalizeAttestedCandidate(
       releaseExactIntegrationLockIfHeld(db, assignment, ref, expectedTarget);
     }
   }
+}
+
+/**
+ * Finalizes an unassigned-primary authority: commits it exactly onto the
+ * current branch and stops there. No managed-workspace machinery (freeze,
+ * carry-forward, integration record, worktree cleanup) is touched.
+ */
+export function finalizePrimaryUnassignedCommit(
+  authority: AuthorizedDirectGitOperation,
+  message: string,
+): { state: 'committed'; commit: string } {
+  if (authority.checkoutMode !== 'primary-unassigned') throw new Error('Not an unassigned-primary authority');
+  if (authority.operation !== 'commit') throw new Error('Unassigned-primary lane commits only');
+  requireMessage(message);
+  const evidence = exactCommitEvidence(authority);
+  const commit = createExactCommit(authority.worktreePath, evidence, message);
+  return { state: 'committed', commit };
+}
+
+/**
+ * Finalizes an unassigned-primary PUSH authority: force-with-lease pushes the
+ * operator's own current branch to its own remote ref via the shared push
+ * executor, then classifies the remote readback. The executor's
+ * revalidateAuthorizedCommitState re-proves the unassigned preconditions and its
+ * assertRemoteEvidence re-proves the lease live, so no managed-integration
+ * machinery (integration lock, byte-equality, candidate refs) is touched and no
+ * fast-forward re-check on frozen evidence is needed (the ff proof ran live at
+ * verify).
+ */
+export function finalizePrimaryUnassignedPush(
+  authority: AuthorizedDirectGitOperation,
+  hooks?: FinalizationHooks,
+): FinalizationResult {
+  if (authority.checkoutMode !== 'primary-unassigned') throw new Error('Not an unassigned-primary authority');
+  if (authority.operation !== 'push') throw new Error('Unassigned-primary push lane pushes only');
+  const evidence = authority.evidence as {
+    localOid: string; remoteUrl: string; destinationRef: string; expectedRemoteOldOid: string | null;
+  };
+  let mutationError: string | undefined;
+  try {
+    pushExactAuthorizedRef(authority);
+    hooks?.afterRemoteMutationBeforeResult?.();
+  } catch (error) {
+    mutationError = error instanceof Error ? error.message : String(error);
+  }
+  let remote: string | null;
+  try {
+    remote = remoteRefOid(authority.worktreePath, evidence.remoteUrl, evidence.destinationRef);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`${mutationError ? `Push command failed: ${mutationError}. ` : ''}Unassigned-primary push remote readback failed: ${detail}`);
+  }
+  if (remote === evidence.localOid) return { state: 'pushed-only' };
+  if (remote === evidence.expectedRemoteOldOid || remote === null) {
+    throw new Error(`${mutationError ? `Push command failed: ${mutationError}. ` : ''}Unassigned-primary push remote has not proved the exact authorized commit`);
+  }
+  throw new Error(`${mutationError ? `Push command failed: ${mutationError}. ` : ''}Unassigned-primary push remote outcome is ambiguous`);
+}
+
+/**
+ * Finalizes an unassigned-primary COMMIT-AND-PUSH authority: commits the staged
+ * tree exactly onto the current branch (never-lose-work: this local commit
+ * persists even if the push then fails), then force-with-lease pushes that new
+ * commit via the shared executor and classifies the readback. No integration
+ * envelope — the operator is on their own branch, authorized by their own intent.
+ */
+export function finalizePrimaryUnassignedCommitAndPush(
+  authority: AuthorizedDirectGitOperation,
+  message: string,
+  hooks?: FinalizationHooks,
+): FinalizationResult {
+  if (authority.checkoutMode !== 'primary-unassigned') throw new Error('Not an unassigned-primary authority');
+  if (authority.operation !== 'commit-and-push') throw new Error('Unassigned-primary commit-and-push lane only');
+  requireMessage(message);
+  const commit = createExactCommit(authority.worktreePath, exactCommitEvidence(authority), message);
+  const evidence = authority.evidence as { remoteUrl: string; destinationRef: string; expectedRemoteOldOid: string | null };
+  let mutationError: string | undefined;
+  try {
+    pushExactAuthorizedRef(authority);
+    hooks?.afterRemoteMutationBeforeResult?.();
+  } catch (error) {
+    mutationError = error instanceof Error ? error.message : String(error);
+  }
+  let remote: string | null;
+  try {
+    remote = remoteRefOid(authority.worktreePath, evidence.remoteUrl, evidence.destinationRef);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`${mutationError ? `Push command failed: ${mutationError}. ` : ''}Unassigned-primary commit-and-push remote readback failed: ${detail}`);
+  }
+  if (remote === commit) return { state: 'pushed', integratedCommit: commit };
+  if (remote === evidence.expectedRemoteOldOid || remote === null) {
+    throw new Error(`${mutationError ? `Push command failed: ${mutationError}. ` : ''}Unassigned-primary commit-and-push remote has not proved the exact authorized commit`);
+  }
+  throw new Error(`${mutationError ? `Push command failed: ${mutationError}. ` : ''}Unassigned-primary commit-and-push remote outcome is ambiguous`);
 }
 
 /** Finalizes only an authority already verified and consumed by Task 3. */
@@ -598,7 +992,6 @@ export function finalizeDirectAuthority(
       || authority.worktreePath !== exact.assignment.worktree_path) {
       throw new Error('Push-only authority does not designate active managed workspace');
     }
-    fencePrimaryCheckout(db, exact.assignment.repository_identity);
     const evidence = authority.evidence as {
       localOid: string; remoteUrl: string; destinationRef: string; expectedRemoteOldOid: string | null;
     };
@@ -632,7 +1025,6 @@ export function finalizeDirectAuthority(
     || authority.worktreePath !== exact.assignment.worktree_path) {
     throw new Error('Direct finalization authority does not designate managed workspace');
   }
-  fencePrimaryCheckout(db, exact.assignment.repository_identity);
   const isRepair = exact.assignment.lifecycle_status === 'ready_for_integration';
   if (exact.assignment.lifecycle_status !== 'active' && !isRepair) throw new Error('Only active or ready repair assignment can begin finalization');
   if (isRepair && authority.operation !== 'commit') throw new Error('Ready repair requires fresh exact commit authority');
@@ -730,6 +1122,44 @@ export function finalizeDirectAuthority(
   return { state: 'pushed', integratedCommit: local.integratedCommit };
 }
 
+/**
+ * Finalizes a managed worktree's own reconcile authority: integrates its
+ * current HEAD into local main (or, for a paused REPAIR row, the frozen
+ * candidate) and always KEEPS the worktree alive — a reconcile never removes
+ * or releases it, and (like every local finalization path in this file)
+ * never pushes.
+ */
+export function finalizeReconcile(
+  db: Database.Database,
+  authority: AuthorizedDirectGitOperation,
+): FinalizationResult {
+  if (authority.operation !== 'reconcile') throw new Error('Reconcile finalization requires reconcile authority');
+  if (authority.checkoutMode !== 'managed') throw new Error('Reconcile is only valid for a managed worktree');
+  if (usedReconcileAuthorities.has(authority)) throw new Error('Direct Git reconcile authority is single-use');
+  usedReconcileAuthorities.add(authority);
+  revalidateAuthorizedCommitState(authority);
+  const exact = exactAssignment(db, authority.worktreePath, authority.workspaceGuid, authority.providerRootSessionId);
+  const headOid = (authority.evidence as ReconcileEvidence).headOid;
+  if (worktreeHead(authority.worktreePath) !== headOid) throw new Error('Reconcile HEAD changed since issuance; re-run /reconcile');
+  if (exact.assignment.lifecycle_status === 'active') {
+    const local = finalizeLocalCommit(db, exact.primaryCheckoutPath, exact.assignment, authority.worktreePath, headOid);
+    recycleFinalized(db, local.repositoryPath, local.assignment);
+    return { state: 'reconciled', integratedCommit: local.integratedCommit };
+  }
+  if (exact.assignment.lifecycle_status === 'ready_for_integration') {
+    try { runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${freezeRef(exact.assignment.workspace_guid)}^{commit}`]); }
+    catch { throw new Error('Ready repair lacks durable frozen finalization state'); }
+    runGit(authority.worktreePath, ['update-ref', candidateRef(exact.assignment.workspace_guid), headOid]);
+    const local = finalizeAttestedCandidate(db, exact.primaryCheckoutPath, exact.assignment, headOid);
+    if (decodePushDisposition(local.assignment.disposition)) {
+      return { state: 'integrated-local', integratedCommit: local.integratedCommit, pushError: 'Remote has not proved the exact integrated candidate' };
+    }
+    recycleFinalized(db, local.repositoryPath, local.assignment);
+    return { state: 'reconciled', integratedCommit: local.integratedCommit };
+  }
+  throw new Error('Reconcile requires an active or ready-for-integration managed assignment; run reconcile_finalization to recover');
+}
+
 /** Reviewed Brain/Commander work follows same local coordinator and never pushes. */
 export function finalizeCommanderLocalCommit(
   db: Database.Database,
@@ -739,7 +1169,6 @@ export function finalizeCommanderLocalCommit(
   requireCommanderFinalizationInput(input);
   requireMessage(input.message);
   const exact = exactAssignment(db, input.repositoryPath, input.workspaceGuid, input.providerRootSessionId);
-  fencePrimaryCheckout(db, exact.assignment.repository_identity);
   const isRepair = exact.assignment.lifecycle_status === 'ready_for_integration';
   if (exact.assignment.lifecycle_status !== 'active' && !isRepair) throw new Error('Only active or ready repair assignment can begin finalization');
   if (isRepair) {
@@ -766,13 +1195,13 @@ export function finalizeCommanderLocalCommit(
     const candidate = committed;
     runGit(exact.assignment.worktree_path, ['update-ref', candidateRef(exact.assignment.workspace_guid), candidate]);
     const local = finalizeAttestedCandidate(db, exact.primaryCheckoutPath, exact.assignment, candidate);
-    recycleFinalized(db, local.repositoryPath, local.assignment);
+    disposeFinalized(db, local.repositoryPath, local.assignment, input.dispose);
     return { state: 'cleaned', integratedCommit: candidate };
   }
   const local = finalizeLocalCommit(
     db, exact.primaryCheckoutPath, exact.assignment, exact.assignment.worktree_path, committed, hooks,
   );
-  recycleFinalized(db, local.repositoryPath, local.assignment);
+  disposeFinalized(db, local.repositoryPath, local.assignment, input.dispose);
   return { state: 'cleaned', integratedCommit: local.integratedCommit };
 }
 
@@ -927,11 +1356,10 @@ function recoverNoPausedRebase(
 export function reconcileFinalization(db: Database.Database, input: ReconcileFinalizationInput): FinalizationResult {
   const exact = exactAssignment(db, input.repositoryPath, input.workspaceGuid, input.providerRootSessionId);
   const assignment = exact.assignment;
-  fencePrimaryCheckout(db, assignment.repository_identity);
   // A 'status' request is a strictly NON-mutating, lifecycle-aware probe. It must
   // return BEFORE the integrated-cleanup branch below (which resets/cleans and REMOVES
-  // the worktree) so a probe never mutates. exactAssignment + fencePrimaryCheckout above
-  // touch only the DB and repo discovery, so this is the earliest non-mutating point.
+  // the worktree) so a probe never mutates. exactAssignment touches only the DB and
+  // repo discovery, so this is the earliest non-mutating point.
   // An integrated row's worktree may already be gone, so it never calls
   // classifyRebaseState (which runs git in the worktree).
   if (input.rebaseRecovery === 'status') {
@@ -1080,10 +1508,9 @@ export function reconcileFinalization(db: Database.Database, input: ReconcileFin
       const expectedTarget = recoveryIntegrationLockExpectedTarget(db, assignment, ref);
       let integrationRecorded = false;
       try {
-        fencePrimaryCheckout(db, assignment.repository_identity);
         requireExactIntegrationLock(db, assignment, ref, expectedTarget);
         try {
-          verifyPrimaryAfterFastForward(exact.primaryCheckoutPath, ref, candidate);
+          verifyPrimaryAfterFastForward(exact.primaryCheckoutPath, ref, expectedTarget, candidate);
         } catch {
           repairPrimaryCheckoutAfterInterruptedCas(exact.primaryCheckoutPath, ref, expectedTarget, candidate);
         }

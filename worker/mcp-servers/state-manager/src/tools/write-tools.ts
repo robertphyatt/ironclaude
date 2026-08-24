@@ -38,7 +38,6 @@ import {
   insertTierUpReview,
   getBlindTierUpReviewForLineage,
   hasAdvisorRemediatedAtHash,
-  hasEarlierTierUpVerdict,
 } from '../db.js';
 import {
   validateProfessionalModeTransition,
@@ -633,10 +632,11 @@ export function handleWriteTool(
         dbConsumeDesign(db, file);
 
         if (session.workflow_stage === 'brainstorming') {
-          updateSession(db, resolvedId, {
-            workflow_stage: 'design_ready',
-            plan_lineage: session.plan_lineage + 1,
-          });
+          // Effort-scoped review budget: inherit (keep lineage, clear one-shot flag) when
+          // this design-ready follows a retreat/mid-effort re-entry; else mint a fresh budget.
+          updateSession(db, resolvedId, session.inherit_review === 1
+            ? { workflow_stage: 'design_ready', inherit_review: 0 }
+            : { workflow_stage: 'design_ready', plan_lineage: session.plan_lineage + 1 });
         }
 
         insertAuditLog(db, {
@@ -790,9 +790,13 @@ export function handleWriteTool(
 
           if (isPassingTierUpVerdict(canonicalReview.verdict)) {
             if (canonicalReview.plan_hash === planHash) return null;
-            return `BLOCKED — plan lineage ${session.plan_lineage} already has a passing ` +
-              `${canonicalReview.verdict} review for a different plan hash. Restore the exact ` +
-              'reviewed plan or retreat to brainstorming after verifying a design-premise change. ' +
+            // Decision C: a plan changed after an inheriting retreat re-binds via a non-blind
+            // advisor-remediated record at the current hash — no fresh blind review.
+            if (hasAdvisorRemediatedAtHash(db, resolvedId, session.plan_lineage, planHash)) return null;
+            return `BLOCKED — plan lineage ${session.plan_lineage} has a passing ` +
+              `${canonicalReview.verdict} review for a different plan hash and no advisor-remediated ` +
+              'record for the current plan. Run the non-blind fix advisor and record advisor-remediated ' +
+              'for the current plan, or restore the exact reviewed plan. ' +
               'Do not dispatch another plan review.';
           }
 
@@ -1129,6 +1133,12 @@ export function handleWriteTool(
           if (file) {
             dbRegisterDesign(db, file, resolvedId);
             dbConsumeDesign(db, file);
+          }
+          // Effort-scoped review budget: a retreat/mid-effort re-entry inherited the
+          // effort's review (inherit_review===1) -> keep the lineage, clear the one-shot
+          // flag. A genuine new effort (0) mints a fresh review budget by incrementing.
+          if (session.inherit_review === 1) {
+            return { inherit_review: 0 };
           }
           return { plan_lineage: session.plan_lineage + 1 };
         },
@@ -1477,11 +1487,9 @@ export function handleWriteTool(
             'a verified design premise is invalid.',
           );
         }
-      } else if (!hasEarlierTierUpVerdict(
-        db, resolvedId, session.plan_lineage, 'HAS-ISSUES', Number.MAX_SAFE_INTEGER,
-      )) {
+      } else if (!getBlindTierUpReviewForLineage(db, resolvedId, session.plan_lineage)) {
         return err(
-          `BLOCKED — advisor-remediated requires a prior HAS-ISSUES review in plan lineage ` +
+          `BLOCKED — advisor-remediated requires a prior canonical blind review in plan lineage ` +
           `${session.plan_lineage}.`,
         );
       }

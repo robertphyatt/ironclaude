@@ -1,0 +1,661 @@
+"""Managed-worktree reaper: release-only sweep for leaked worktrees.
+
+Two separate SQLite databases are involved in production (the commander
+`workers` table and the workspace-manager `assignments` table), so these
+tests build each with the real schema and pass real sqlite3 connections —
+only the workspace client and tmux manager are stubbed (never pattern-kill;
+no os.kill by name anywhere in this file).
+
+One deliberate deviation from a literal "reserved/ownerless row -> cleanup"
+expectation: reading the workspace-manager CLI source
+(worker/mcp-servers/workspace-manager/src/workspace-service.ts,
+`getWorkspaceAssignment`) shows `cleanup` and `abandon` both require an EXACT
+match against the assignment's stored `owner_session_id` — including when it
+is NULL, which a non-empty `owner_session_id` string can never satisfy. A
+worker-reserved assignment is created with `owner_session_id: null` and only
+gains an owner via a successful `bind` (see `reserveWorkerWorktree` /
+`bindWorkerWorktree`); a commander `workers` row is only ever inserted AFTER
+that bind succeeds (see orchestrator_mcp.py's spawn flow). So an ownerless
+assignment can never be joined to a commander worker row, and cleanup/abandon
+would always fail with a binding-mismatch error at the real CLI boundary.
+
+The reaper instead RELEASES an ownerless leak via the owner-free `reap` CLI
+verb, which does not require a stored `owner_session_id` match: it derives
+`repository_path` from the assignment's `worktree_path` by splitting on the
+managed-worktree marker `/.ironclaude/worktrees/`. Surfacing (logging,
+never force-deleting) remains the FALLBACK for the case that marker cannot
+derive a `repository_path` — an unmanaged or malformed `worktree_path` — or
+the `reap` call itself fails, the same treatment already specified for a
+stale `integration_locks` row.
+"""
+
+import sqlite3
+import subprocess
+from pathlib import Path
+from unittest.mock import Mock
+
+import pytest
+
+from ironclaude.main import (
+    _find_leaked_worktrees,
+    _is_protected,
+    _reap_leaked_worktrees,
+    _sync_idle_worktrees,
+    _WORKTREE_REAP_TTL_HOURS,
+)
+from ironclaude.workspace_client import WorkspaceClient
+
+_W1 = "11111111-1111-4111-8111-111111111111"
+_W2 = "22222222-2222-4222-8222-222222222222"
+_OWNER = "33333333-3333-4333-8333-333333333333"
+
+
+def _make_commander_db(path):
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        """CREATE TABLE workers (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            machine TEXT,
+            repo TEXT,
+            description TEXT NOT NULL DEFAULT '',
+            tmux_session TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'running',
+            task_id INTEGER,
+            spawned_at TEXT NOT NULL DEFAULT (datetime('now')),
+            finished_at TEXT,
+            client TEXT,
+            model TEXT,
+            native_session_id TEXT,
+            workspace_guid TEXT,
+            workspace_repository_identity TEXT,
+            workspace_path TEXT,
+            workspace_branch TEXT,
+            workspace_base_commit TEXT,
+            workspace_integration_target TEXT
+        )"""
+    )
+    conn.commit()
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _make_workspace_db(path):
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        """CREATE TABLE assignments (
+            workspace_guid TEXT PRIMARY KEY,
+            repository_identity TEXT NOT NULL,
+            worktree_path TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            base_commit TEXT NOT NULL,
+            current_head TEXT NOT NULL,
+            owner_session_id TEXT,
+            worker_id TEXT,
+            lifecycle_status TEXT NOT NULL DEFAULT 'reserved',
+            integration_target TEXT NOT NULL,
+            integrated_commit TEXT,
+            recovery_ref TEXT,
+            disposition TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE primary_checkout_owners (
+            repository_identity TEXT PRIMARY KEY,
+            workspace_guid TEXT NOT NULL,
+            owner_session_id TEXT NOT NULL,
+            acquired_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE integration_locks (
+            repository_identity TEXT PRIMARY KEY,
+            workspace_guid TEXT NOT NULL,
+            target_ref TEXT NOT NULL,
+            expected_target TEXT NOT NULL,
+            acquired_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    conn.commit()
+    return conn
+
+
+def _insert_worker(conn, id_, *, status, finished_ago=None, workspace_guid=None,
+                    repo="/repo", tmux_session="ic-worker", client="claude"):
+    finished_sql = f"datetime('now', '-{finished_ago}')" if finished_ago else "NULL"
+    conn.execute(
+        f"INSERT INTO workers (id, type, repo, tmux_session, status, finished_at, "
+        f"client, workspace_guid) VALUES (?, 'claude', ?, ?, ?, {finished_sql}, ?, ?)",
+        (id_, repo, tmux_session, status, client, workspace_guid),
+    )
+    conn.commit()
+
+
+def _insert_assignment(conn, guid, *, repository_identity="repo-id", owner_session_id=None,
+                        lifecycle_status="active", integration_target="main",
+                        current_head="abc123", updated_ago=None, worktree_path="/wt"):
+    updated_sql = f"datetime('now', '-{updated_ago}')" if updated_ago else "datetime('now')"
+    conn.execute(
+        f"INSERT INTO assignments (workspace_guid, repository_identity, worktree_path, "
+        f"branch, base_commit, current_head, owner_session_id, lifecycle_status, "
+        f"integration_target, updated_at) VALUES (?, ?, ?, 'ironclaude/x', 'abc123', "
+        f"?, ?, ?, ?, {updated_sql})",
+        (guid, repository_identity, worktree_path, current_head, owner_session_id, lifecycle_status,
+         integration_target),
+    )
+    conn.commit()
+
+
+class TestReapLeakedWorktrees:
+    def test_finished_worker_integrated_assignment_is_cleaned_up(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_worker(commander, "w1", status="completed", finished_ago="25 hours", workspace_guid=_W1)
+        _insert_assignment(ws_conn, _W1, owner_session_id=_OWNER, lifecycle_status="integrated",
+                            updated_ago="25 hours")
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+        tmux.has_session.return_value = False
+
+        counts = _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(ws))
+
+        client.cleanup.assert_called_once_with(
+            {"repository_path": "/repo", "workspace_guid": _W1, "owner_session_id": _OWNER},
+        )
+        client.abandon.assert_not_called()
+        assert counts["released"] == 1
+
+    def test_unrelated_primary_owner_does_not_protect_finished_worker(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_worker(commander, "w1", status="completed", finished_ago="25 hours", workspace_guid=_W1)
+        _insert_assignment(
+            ws_conn, _W1, owner_session_id=_OWNER, lifecycle_status="integrated",
+            updated_ago="25 hours",
+        )
+        _insert_assignment(
+            ws_conn, _W2, owner_session_id=_W2, lifecycle_status="active",
+            updated_ago="25 hours",
+        )
+        ws_conn.execute(
+            "INSERT INTO primary_checkout_owners "
+            "(repository_identity, workspace_guid, owner_session_id) VALUES ('repo-id', ?, ?)",
+            (_W2, _W2),
+        )
+        ws_conn.commit()
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+        tmux.has_session.return_value = False
+
+        counts = _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(ws))
+
+        client.cleanup.assert_called_once_with(
+            {"repository_path": "/repo", "workspace_guid": _W1, "owner_session_id": _OWNER},
+        )
+        assert counts == {"released": 1, "surfaced": 0, "protected": 0, "errors": 0}
+        owner = sqlite3.connect(str(ws)).execute(
+            "SELECT workspace_guid, owner_session_id FROM primary_checkout_owners "
+            "WHERE repository_identity = 'repo-id'"
+        ).fetchone()
+        assert owner == (_W2, _W2)
+        other = sqlite3.connect(str(ws)).execute(
+            "SELECT lifecycle_status, owner_session_id FROM assignments WHERE workspace_guid = ?",
+            (_W2,),
+        ).fetchone()
+        assert other == ("active", _W2)
+
+    def test_real_workspace_cleanup_reaps_finished_worker_under_unrelated_primary_owner(self, tmp_path, monkeypatch):
+        repository = tmp_path / "repository"
+        repository.mkdir()
+
+        def git(*args):
+            return subprocess.run(
+                ["git", "-C", str(repository), *args], check=True,
+                capture_output=True, text=True,
+            ).stdout.strip()
+
+        git("init", "--initial-branch=main")
+        git("config", "user.name", "Reaper Test")
+        git("config", "user.email", "reaper@example.invalid")
+        (repository / "README.md").write_text("initial\n")
+        git("add", "README.md")
+        git("commit", "-m", "initial")
+
+        package = Path(__file__).resolve().parents[2] / "worker/mcp-servers/workspace-manager"
+        plugin_root = tmp_path / "plugin"
+        temporary_cli = plugin_root / "mcp-servers/workspace-manager/dist/cli.js"
+        temporary_cli.parent.mkdir(parents=True)
+        subprocess.run([
+            str(package / "node_modules/.bin/esbuild"), "src/cli.ts", "--bundle",
+            "--platform=node", "--format=esm", f"--outfile={temporary_cli}",
+            "--external:fsevents", "--external:better-sqlite3",
+        ], cwd=package, check=True, capture_output=True, text=True)
+        (temporary_cli.parents[1] / "node_modules").symlink_to(
+            package / "node_modules", target_is_directory=True,
+        )
+
+        workspace_db = tmp_path / "workspaces.db"
+        monkeypatch.setenv("WORKSPACE_MANAGER_DB_PATH", str(workspace_db))
+        client = WorkspaceClient(plugin_root, commander_version="1.1.6")
+        w1 = client.allocate({
+            "repository_path": str(repository), "workspace_guid": _W1,
+            "owner_session_id": _OWNER, "worker_id": "w1", "integration_target": "main",
+        })
+        w2 = client.allocate({
+            "repository_path": str(repository), "workspace_guid": _W2,
+            "owner_session_id": _W2, "worker_id": "w2", "integration_target": "main",
+        })
+        w1_path = Path(w1["worktree_path"])
+        (w1_path / "integrated.txt").write_text("integrated\n")
+        subprocess.run(["git", "-C", str(w1_path), "add", "integrated.txt"], check=True)
+        subprocess.run(["git", "-C", str(w1_path), "commit", "-m", "integrated work"], check=True)
+        integrated = subprocess.run(
+            ["git", "-C", str(w1_path), "rev-parse", "HEAD"], check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        git("merge", "--ff-only", integrated)
+
+        ws_conn = sqlite3.connect(str(workspace_db))
+        ws_conn.execute(
+            "UPDATE assignments SET lifecycle_status = 'integrated', integrated_commit = ?, "
+            "updated_at = datetime('now', '-25 hours') WHERE workspace_guid = ?",
+            (integrated, _W1),
+        )
+        ws_conn.execute(
+            "INSERT INTO integration_records (workspace_guid, repository_identity, target_ref, integrated_commit) "
+            "VALUES (?, ?, 'refs/heads/main', ?)",
+            (_W1, w1["repository_identity"], integrated),
+        )
+        ws_conn.execute(
+            "INSERT INTO primary_checkout_owners (repository_identity, workspace_guid, owner_session_id) VALUES (?, ?, ?)",
+            (w2["repository_identity"], _W2, _W2),
+        )
+        ws_conn.commit()
+        ws_conn.close()
+
+        (repository / "README.md").write_text("operator staged\n")
+        git("add", "README.md")
+        (repository / "README.md").write_text("operator unstaged\n")
+        (repository / "operator-notes.txt").write_text("operator untracked\n")
+        branch = git("symbolic-ref", "--quiet", "--short", "HEAD")
+        readme_hash = git("hash-object", "README.md")
+        readme_index = git("ls-files", "-s", "--", "README.md")
+        notes_hash = git("hash-object", "operator-notes.txt")
+        notes_index = git("ls-files", "-s", "--", "operator-notes.txt")
+        primary_status = git("status", "--porcelain=v1", "--untracked-files=all")
+
+        commander = _make_commander_db(tmp_path / "commander.db")
+        _insert_worker(
+            commander, "w1", status="completed", finished_ago="25 hours",
+            workspace_guid=_W1, repo=str(repository),
+        )
+        tmux = Mock()
+        tmux.has_session.return_value = False
+
+        counts = _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(workspace_db))
+
+        assert counts == {"released": 1, "surfaced": 0, "protected": 0, "errors": 0}
+        assert not w1_path.exists()
+        assert git("branch", "--list", w1["branch"]) == ""
+        check = sqlite3.connect(str(workspace_db))
+        assert check.execute(
+            "SELECT lifecycle_status FROM assignments WHERE workspace_guid = ?", (_W1,),
+        ).fetchone() == ("cleaned",)
+        assert git("symbolic-ref", "--quiet", "--short", "HEAD") == branch
+        assert git("hash-object", "README.md") == readme_hash
+        assert git("ls-files", "-s", "--", "README.md") == readme_index
+        assert git("hash-object", "operator-notes.txt") == notes_hash
+        assert git("ls-files", "-s", "--", "operator-notes.txt") == notes_index
+        assert git("status", "--porcelain=v1", "--untracked-files=all") == primary_status
+        assert check.execute(
+            "SELECT lifecycle_status, owner_session_id FROM assignments WHERE workspace_guid = ?", (_W2,),
+        ).fetchone() == ("active", _W2)
+        assert check.execute(
+            "SELECT workspace_guid, owner_session_id FROM primary_checkout_owners WHERE repository_identity = ?",
+            (w2["repository_identity"],),
+        ).fetchone() == (_W2, _W2)
+        check.close()
+
+    def test_finished_worker_unintegrated_assignment_is_abandon_rescued(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_worker(commander, "w1", status="failed", finished_ago="25 hours", workspace_guid=_W1)
+        _insert_assignment(ws_conn, _W1, owner_session_id=_OWNER, lifecycle_status="active",
+                            updated_ago="25 hours")
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+        tmux.has_session.return_value = False
+
+        counts = _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(ws))
+
+        client.abandon.assert_called_once_with(
+            {"repository_path": "/repo", "workspace_guid": _W1, "owner_session_id": _OWNER, "mode": "rescue"},
+        )
+        client.cleanup.assert_not_called()
+        assert counts["released"] == 1
+
+    def test_running_worker_status_is_never_a_candidate_even_past_ttl(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        # A resumed/misreported worker: status flipped back to running but a
+        # stale finished_at from an earlier lifecycle is still on the row.
+        _insert_worker(commander, "w1", status="running", finished_ago="25 hours", workspace_guid=_W1)
+        _insert_assignment(ws_conn, _W1, owner_session_id=_OWNER, lifecycle_status="active",
+                            updated_ago="25 hours")
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+        tmux.has_session.return_value = False
+
+        counts = _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(ws))
+
+        client.cleanup.assert_not_called()
+        client.abandon.assert_not_called()
+        assert counts["released"] == 0
+
+    def test_live_tmux_session_protects_a_finished_worker_past_ttl(self, tmp_path):
+        """Safety-critical: a live tmux session must never be reaped, even
+        when the commander row says 'completed' and is past TTL."""
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_worker(commander, "w1", status="completed", finished_ago="25 hours",
+                        workspace_guid=_W1, tmux_session="ic-live")
+        _insert_assignment(ws_conn, _W1, owner_session_id=_OWNER, lifecycle_status="active")
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+        tmux.has_session.return_value = True  # session is actually still alive
+
+        counts = _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(ws))
+
+        client.cleanup.assert_not_called()
+        client.abandon.assert_not_called()
+        assert counts["protected"] == 1
+        assert counts["released"] == 0
+
+    def test_operator_owned_assignment_is_never_in_scope(self, tmp_path):
+        """owner_session_id == workspace_guid marks the operator's own
+        primary-checkout row (workspace-manager mints them equal); the reaper
+        must refuse to touch it even if it is otherwise TTL-eligible and
+        joined to a finished worker row."""
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_worker(commander, "w1", status="completed", finished_ago="25 hours", workspace_guid=_W2)
+        _insert_assignment(ws_conn, _W2, owner_session_id=_W2, lifecycle_status="active",
+                            updated_ago="25 hours")
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+        tmux.has_session.return_value = False
+
+        counts = _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(ws))
+
+        client.cleanup.assert_not_called()
+        client.abandon.assert_not_called()
+        assert counts["released"] == 0
+
+    def test_ownerless_reserved_underivable_path_stays_surfaced(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_assignment(ws_conn, _W2, owner_session_id=None, lifecycle_status="reserved",
+                            updated_ago="25 hours")
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+
+        counts = _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(ws))
+
+        client.cleanup.assert_not_called()
+        client.abandon.assert_not_called()
+        client.reap.assert_not_called()
+        assert counts["surfaced"] == 1
+
+    def test_ownerless_active_underivable_path_stays_surfaced(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_assignment(ws_conn, _W2, owner_session_id="", lifecycle_status="active",
+                            updated_ago="25 hours")
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+
+        counts = _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(ws))
+
+        client.cleanup.assert_not_called()
+        client.abandon.assert_not_called()
+        client.reap.assert_not_called()
+        assert counts["surfaced"] == 1
+
+    def test_ownerless_active_row_with_managed_path_is_reaped(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_assignment(
+            ws_conn, _W2, owner_session_id="", lifecycle_status="active",
+            updated_ago="25 hours",
+            worktree_path=f"/repo/.ironclaude/worktrees/{_W2}",
+        )
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+
+        counts = _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(ws))
+
+        client.reap.assert_called_once_with(
+            {"repository_path": "/repo", "workspace_guid": _W2},
+        )
+        client.cleanup.assert_not_called()
+        client.abandon.assert_not_called()
+        assert counts["released"] == 1
+
+    def test_held_integration_lock_is_surfaced_and_never_deleted(self, tmp_path, caplog):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        ws_conn.execute(
+            "INSERT INTO integration_locks (repository_identity, workspace_guid, target_ref, "
+            "expected_target) VALUES ('repo-id', ?, 'refs/heads/main', 'abc123')",
+            (_W1,),
+        )
+        ws_conn.commit()
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+
+        with caplog.at_level("WARNING"):
+            _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(ws))
+
+        assert any("integration_locks" in r.message for r in caplog.records)
+        client.cleanup.assert_not_called()
+        client.abandon.assert_not_called()
+        remaining = sqlite3.connect(str(ws)).execute(
+            "SELECT COUNT(*) FROM integration_locks"
+        ).fetchone()[0]
+        assert remaining == 1
+
+    def test_held_integration_lock_protects_its_own_assignment(self, tmp_path):
+        """A finished worker whose workspace currently holds the integration
+        lock is mid-finalization — protect it, do not release underneath it."""
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_worker(commander, "w1", status="completed", finished_ago="25 hours", workspace_guid=_W1)
+        _insert_assignment(ws_conn, _W1, owner_session_id=_OWNER, lifecycle_status="ready_for_integration",
+                            updated_ago="25 hours")
+        ws_conn.execute(
+            "INSERT INTO integration_locks (repository_identity, workspace_guid, target_ref, "
+            "expected_target) VALUES ('repo-id', ?, 'refs/heads/main', 'abc123')",
+            (_W1,),
+        )
+        ws_conn.commit()
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+        tmux.has_session.return_value = False
+
+        counts = _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(ws))
+
+        client.cleanup.assert_not_called()
+        client.abandon.assert_not_called()
+        assert counts["protected"] == 1
+
+    def test_default_ttl_is_24_hours(self):
+        assert _WORKTREE_REAP_TTL_HOURS == 24
+
+    def test_finished_worker_within_ttl_is_not_reaped(self, tmp_path):
+        """Falsifiability: deleting the TTL guard must break this test — a
+        worker that finished 1 hour ago (well under the 24h TTL) must not be
+        released even though it is owned, terminal, and otherwise leak-shaped."""
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_worker(commander, "w1", status="completed", finished_ago="1 hours", workspace_guid=_W1)
+        _insert_assignment(ws_conn, _W1, owner_session_id=_OWNER, lifecycle_status="integrated",
+                            updated_ago="1 hours")
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+        tmux.has_session.return_value = False
+
+        counts = _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(ws))
+
+        client.cleanup.assert_not_called()
+        client.abandon.assert_not_called()
+        assert counts["released"] == 0
+
+    def test_reserved_row_within_ttl_is_not_surfaced(self, tmp_path):
+        """Falsifiability: deleting the TTL guard must break this test — a
+        reserved row updated 1 hour ago must not even be surfaced yet."""
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_assignment(ws_conn, _W2, owner_session_id=None, lifecycle_status="reserved",
+                            updated_ago="1 hours")
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+
+        counts = _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(ws))
+
+        client.cleanup.assert_not_called()
+        client.abandon.assert_not_called()
+        assert counts["surfaced"] == 0
+
+    def test_any_liveness_exception_fails_safe_toward_protect(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_worker(commander, "w1", status="completed", finished_ago="25 hours", workspace_guid=_W1)
+        _insert_assignment(ws_conn, _W1, owner_session_id=_OWNER, lifecycle_status="active",
+                            updated_ago="25 hours")
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+        tmux.has_session.side_effect = RuntimeError("tmux not reachable")
+
+        counts = _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(ws))
+
+        client.cleanup.assert_not_called()
+        client.abandon.assert_not_called()
+        assert counts["protected"] == 1
+
+
+class TestIsProtected:
+    def test_no_signals_does_not_protect(self):
+        assignment = {"workspace_guid": _W1, "repository_identity": "repo-id", "updated_at": None}
+        tmux = Mock()
+        tmux.has_session.return_value = False
+        assert _is_protected(assignment, None, tmux, set(), now=0.0) is False
+
+
+class TestFindLeakedWorktrees:
+    def test_cleaned_assignments_are_never_candidates(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_worker(commander, "w1", status="completed", finished_ago="25 hours", workspace_guid=_W1)
+        _insert_assignment(ws_conn, _W1, owner_session_id=_OWNER, lifecycle_status="cleaned")
+        candidates = _find_leaked_worktrees(commander, {}, ws_conn, 24)
+        assert candidates == []
+
+
+class TestSyncIdleWorktrees:
+    def test_behind_main_idle_worktree_gets_synced(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_worker(commander, "w1", status="completed", workspace_guid=_W1)
+        _insert_assignment(ws_conn, _W1, owner_session_id=_OWNER, lifecycle_status="active",
+                            current_head="old-head", integration_target="main")
+        ws_conn.close()
+        client = Mock()
+        git_runner = Mock(return_value=Mock(returncode=0, stdout="new-head\n", stderr=""))
+
+        counts = _sync_idle_worktrees(commander, client, workspace_db_path=str(ws), git_runner=git_runner)
+
+        client.sync.assert_called_once_with(
+            {"repository_path": "/repo", "workspace_guid": _W1, "owner_session_id": _OWNER},
+        )
+        assert counts["synced"] == 1
+
+    def test_current_head_worktree_is_not_synced(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_worker(commander, "w1", status="completed", workspace_guid=_W1)
+        _insert_assignment(ws_conn, _W1, owner_session_id=_OWNER, lifecycle_status="active",
+                            current_head="same-head", integration_target="main")
+        ws_conn.close()
+        client = Mock()
+        git_runner = Mock(return_value=Mock(returncode=0, stdout="same-head\n", stderr=""))
+
+        counts = _sync_idle_worktrees(commander, client, workspace_db_path=str(ws), git_runner=git_runner)
+
+        client.sync.assert_not_called()
+        assert counts["current"] == 1
+
+    def test_running_worker_worktree_is_not_synced(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_worker(commander, "w1", status="running", workspace_guid=_W1)
+        _insert_assignment(ws_conn, _W1, owner_session_id=_OWNER, lifecycle_status="active",
+                            current_head="old-head", integration_target="main")
+        ws_conn.close()
+        client = Mock()
+        git_runner = Mock(return_value=Mock(returncode=0, stdout="new-head\n", stderr=""))
+
+        counts = _sync_idle_worktrees(commander, client, workspace_db_path=str(ws), git_runner=git_runner)
+
+        client.sync.assert_not_called()
+        git_runner.assert_not_called()
+        assert counts == {"synced": 0, "current": 0, "errors": 0}
+
+    def test_git_error_is_logged_and_skipped_not_raised(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_worker(commander, "w1", status="completed", workspace_guid=_W1)
+        _insert_assignment(ws_conn, _W1, owner_session_id=_OWNER, lifecycle_status="active",
+                            current_head="old-head", integration_target="main")
+        ws_conn.close()
+        client = Mock()
+        git_runner = Mock(return_value=Mock(returncode=128, stdout="", stderr="fatal: bad ref"))
+
+        counts = _sync_idle_worktrees(commander, client, workspace_db_path=str(ws), git_runner=git_runner)
+
+        client.sync.assert_not_called()
+        assert counts["errors"] == 1

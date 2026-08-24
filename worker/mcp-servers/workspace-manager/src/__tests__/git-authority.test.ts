@@ -15,6 +15,7 @@ import {
   issueDirectGitHumanIntent,
   pushExactAuthorizedIntegratedCandidate,
   pushExactAuthorizedRef,
+  resolveUnassignedPrimaryCheckout,
   revalidateAuthorizedCommitState,
   verifyDirectGitAuthority,
   type CommitAndPushEvidence,
@@ -23,6 +24,7 @@ import {
   type DirectGitOperation,
   type PushEvidence,
 } from '../git-authority.js';
+import { issueHumanIntentFromHook } from '../hook-intent.js';
 import { WorkspaceService } from '../workspace-service.js';
 import type { Assignment } from '../types.js';
 
@@ -283,15 +285,52 @@ describe('direct Git authority', () => {
     expect(verify(root, database, assignment, 'commit', expected, nonce).checkoutMode).toBe('managed');
   });
 
-  it('denies another assignment primary ownership and revalidates ownership after authorization', () => {
-    const foreign = setup(false);
-    const manager = new WorkspaceService(foreign.database);
-    const other = manager.ensureSessionWorktree({ repositoryPath: foreign.root, ownerSessionId: OTHER_OWNER });
-    const foreignExpected = commitEvidence(foreign.assignment);
-    const foreignNonce = issue(foreign.database, foreign.assignment, 'commit', foreignExpected);
-    acquirePrimary(foreign.database, other, OTHER_OWNER);
-    expect(() => verify(foreign.root, foreign.database, foreign.assignment, 'commit', foreignExpected, foreignNonce))
-      .toThrow('owned by another');
+  it.each([
+    'different workspace with same provider root',
+    'same workspace with different provider root',
+  ] as const)('keeps managed commit and commit-and-push authority under %s foreign primary ownership', (mismatch) => {
+    for (const operation of ['commit', 'commit-and-push'] as const) {
+      const foreign = setup(true);
+      let owner: Assignment;
+      let ownerSessionId: string;
+      if (mismatch === 'different workspace with same provider root') {
+        owner = new WorkspaceService(foreign.database).reserveWorkerWorktree({
+          repositoryPath: foreign.root,
+          workspaceGuid: randomUUID(),
+          workerId: `foreign-${operation}`,
+          integrationTarget: 'main',
+        });
+        ownerSessionId = OWNER;
+      } else {
+        owner = foreign.assignment;
+        ownerSessionId = OTHER_OWNER;
+      }
+      foreign.database.prepare(`
+        INSERT INTO primary_checkout_owners (repository_identity, workspace_guid, owner_session_id)
+        VALUES (?, ?, ?)
+      `).run(owner.repository_identity, owner.workspace_guid, ownerSessionId);
+      const expected = operation === 'commit'
+        ? commitEvidence(foreign.assignment)
+        : commitAndPushEvidence(foreign.assignment);
+      const nonce = issue(foreign.database, foreign.assignment, operation, expected);
+      const before = foreign.database.prepare(
+        'SELECT workspace_guid, owner_session_id FROM primary_checkout_owners WHERE repository_identity = ?',
+      ).get(foreign.assignment.repository_identity);
+
+      const authority = verify(foreign.root, foreign.database, foreign.assignment, operation, expected, nonce);
+
+      expect(authority).toMatchObject({
+        checkoutMode: 'managed',
+        worktreePath: foreign.assignment.worktree_path,
+      });
+      expect(() => revalidateAuthorizedCommitState(authority)).not.toThrow();
+      expect(foreign.database.prepare(
+        'SELECT workspace_guid, owner_session_id FROM primary_checkout_owners WHERE repository_identity = ?',
+      ).get(foreign.assignment.repository_identity)).toEqual(before);
+    }
+  });
+
+  it('revalidates ownership after authorization', () => {
 
     const changed = setup(true);
     const commitExpected = commitEvidence(changed.assignment);
@@ -517,5 +556,587 @@ describe('direct Git authority', () => {
     git(merge.assignment.worktree_path, 'checkout', merge.assignment.branch);
     git(merge.assignment.worktree_path, 'merge', '--no-ff', 'side', '-m', 'merge work');
     expect(() => pushExactAuthorizedRef(mergeAuthority)).toThrow('evidence');
+  });
+
+  function unassignedDatabase(): ReturnType<typeof initDb> {
+    const databaseDirectory = mkdtempSync(join(tmpdir(), 'ironclaude-git-authority-db-'));
+    directories.push(databaseDirectory);
+    return initDb(join(databaseDirectory, 'authority.db'));
+  }
+
+  it('resolves an unassigned primary checkout with zero assignments for the session', () => {
+    const root = repository(false);
+    const database = unassignedDatabase();
+
+    const result = resolveUnassignedPrimaryCheckout(database, root, OWNER);
+
+    expect(result).toEqual({ mode: 'primary-unassigned', path: realpathSync(root) });
+  });
+
+  it('refuses an unassigned primary checkout owned by another session', () => {
+    const root = repository(false);
+    const database = unassignedDatabase();
+    const foreignWorker = new WorkspaceService(database).reserveWorkerWorktree({
+      repositoryPath: root,
+      workspaceGuid: randomUUID(),
+      workerId: 'foreign-worker',
+      integrationTarget: 'main',
+    });
+    database.prepare(`
+      INSERT INTO primary_checkout_owners (repository_identity, workspace_guid, owner_session_id)
+      VALUES (?, ?, ?)
+    `).run(foreignWorker.repository_identity, foreignWorker.workspace_guid, OTHER_OWNER);
+
+    expect(() => resolveUnassignedPrimaryCheckout(database, root, OWNER)).toThrow(/owned by another session/);
+  });
+
+  it('refuses an unassigned primary checkout in detached HEAD', () => {
+    const root = repository(false);
+    const sha = git(root, 'rev-parse', 'HEAD');
+    git(root, 'checkout', sha);
+    const database = unassignedDatabase();
+
+    expect(() => resolveUnassignedPrimaryCheckout(database, root, OWNER)).toThrow(/detached|branch/);
+  });
+
+  function issueUnassigned(database: ReturnType<typeof initDb>, root: string) {
+    return issueDirectGitHumanIntent(database, {
+      repositoryPath: root,
+      workspaceGuid: undefined,
+      providerRootSessionId: OWNER,
+      humanChannel: 'codex-user-prompt',
+      operation: 'commit',
+    });
+  }
+
+  function verifyUnassigned(database: ReturnType<typeof initDb>, root: string) {
+    return verifyDirectGitAuthority(database, {
+      repositoryPath: root,
+      workspaceGuid: undefined,
+      providerRootSessionId: OWNER,
+      humanChannel: 'codex-user-prompt',
+      operation: 'commit',
+    });
+  }
+
+  it('issues and consumes an unassigned-primary commit authority via the primary sentinel', () => {
+    const root = repository(false);
+    const database = unassignedDatabase();
+    writeFileSync(join(root, 'unassigned.txt'), 'staged\n');
+    git(root, 'add', 'unassigned.txt');
+
+    issueUnassigned(database, root);
+    const authority = verifyUnassigned(database, root);
+
+    expect(authority.checkoutMode).toBe('primary-unassigned');
+    expect(authority.workspaceGuid.startsWith('primary:')).toBe(true);
+    expect(authority.worktreePath).toBe(realpathSync(root));
+    // Single-use: the sentinel intent is consumed exactly once.
+    expect(() => verifyUnassigned(database, root)).toThrow('requires a matching human intent');
+  });
+
+  it('does not let a managed-guid intent satisfy an unassigned-primary verify', () => {
+    const root = repository(false);
+    const database = unassignedDatabase();
+    writeFileSync(join(root, 'unassigned.txt'), 'staged\n');
+    git(root, 'add', 'unassigned.txt');
+
+    issueUnassigned(database, root);
+    const authority = verifyUnassigned(database, root); // consumes the sentinel intent
+
+    // Plant a managed-lane intent that matches repo + operation + channel + provider
+    // + evidence EXACTLY; the sole discriminator left is the workspace_guid
+    // (a real UUID vs the primary sentinel). It must NOT satisfy an unassigned verify.
+    createHumanIntent(database, {
+      operation: 'commit',
+      humanChannel: 'codex-user-prompt',
+      providerRootSessionId: OWNER,
+      repositoryIdentity: authority.repositoryIdentity,
+      workspaceGuid: randomUUID(),
+      expectedEvidence: authority.evidence,
+      expiresAt: '2030-01-01T00:00:00.000Z',
+      nonce: randomUUID(),
+    });
+
+    expect(() => verifyUnassigned(database, root)).toThrow('requires a matching human intent');
+  });
+
+  it('does not let an unassigned-primary sentinel intent satisfy a managed verify', () => {
+    const { root, database, assignment } = setup(false);
+    // Managed commit evidence the server will observe for this assignment.
+    const evidence = commitEvidence(assignment);
+
+    // Plant a sentinel-guid intent matching repo + operation + channel + provider
+    // + evidence EXACTLY; the sole discriminator is the workspace_guid (primary
+    // sentinel vs the assignment's real UUID). A managed verify must NOT consume it.
+    createHumanIntent(database, {
+      operation: 'commit',
+      humanChannel: 'codex-user-prompt',
+      providerRootSessionId: OWNER,
+      repositoryIdentity: assignment.repository_identity,
+      workspaceGuid: `primary:${assignment.repository_identity}`,
+      expectedEvidence: evidence,
+      expiresAt: '2030-01-01T00:00:00.000Z',
+      nonce: randomUUID(),
+    });
+
+    expect(() => verifyDirectGitAuthority(database, {
+      repositoryPath: root,
+      workspaceGuid: assignment.workspace_guid,
+      providerRootSessionId: OWNER,
+      humanChannel: 'codex-user-prompt',
+      operation: 'commit',
+    })).toThrow('requires a matching human intent');
+  });
+
+  it('does not let an unassigned intent from one repo satisfy an unassigned verify in another', () => {
+    const rootX = repository(false);
+    const rootY = repository(false);
+    const database = unassignedDatabase();
+
+    issueUnassigned(database, rootX);
+
+    // Cross-repo isolation: repoY's verify binds repoY's repository_identity (a
+    // distinct WHERE column) and a repoY-derived sentinel; the repoX intent
+    // cannot satisfy it.
+    expect(() => verifyUnassigned(database, rootY)).toThrow('requires a matching human intent');
+  });
+
+  function issueUnassignedPush(database: ReturnType<typeof initDb>, root: string, humanChannel = 'codex-user-prompt') {
+    return issueDirectGitHumanIntent(database, {
+      repositoryPath: root,
+      workspaceGuid: undefined,
+      providerRootSessionId: OWNER,
+      humanChannel,
+      operation: 'push',
+    });
+  }
+
+  function verifyUnassignedPush(database: ReturnType<typeof initDb>, root: string, humanChannel = 'codex-user-prompt') {
+    return verifyDirectGitAuthority(database, {
+      repositoryPath: root,
+      workspaceGuid: undefined,
+      providerRootSessionId: OWNER,
+      humanChannel,
+      operation: 'push',
+    });
+  }
+
+  it('issues, consumes, and pushes an unassigned-primary push authority (fast-forward), moving the remote', () => {
+    const root = repository(true);
+    const database = unassignedDatabase();
+    const remoteBefore = git(root, 'ls-remote', '--refs', 'origin', 'refs/heads/main').split(/\s+/)[0];
+    // A NEW local commit ahead of origin — non-vacuous oracle: the remote must MOVE.
+    writeFileSync(join(root, 'ahead.txt'), 'ahead\n');
+    git(root, 'add', 'ahead.txt');
+    git(root, 'commit', '-m', 'local ahead of origin');
+    const localHead = git(root, 'rev-parse', 'HEAD');
+    expect(remoteBefore).not.toBe(localHead);
+
+    issueUnassignedPush(database, root);
+    const authority = verifyUnassignedPush(database, root);
+    expect(authority.checkoutMode).toBe('primary-unassigned');
+    expect(authority.operation).toBe('push');
+    expect(authority.workspaceGuid.startsWith('primary:')).toBe(true);
+
+    pushExactAuthorizedRef(authority); // any throw fails the test
+
+    expect(git(root, 'ls-remote', '--refs', 'origin', 'refs/heads/main').split(/\s+/)[0]).toBe(localHead);
+  });
+
+  it('refuses a non-fast-forward unassigned-primary push at issuance', () => {
+    const root = repository(true);
+    const database = unassignedDatabase();
+    const c0 = git(root, 'rev-parse', 'HEAD');
+    // Advance origin/main past local, then move local back to c0 — origin is now
+    // AHEAD of local: a genuine non-fast-forward the ff-proof must refuse.
+    writeFileSync(join(root, 'remote-ahead.txt'), 'remote ahead\n');
+    git(root, 'add', 'remote-ahead.txt');
+    git(root, 'commit', '-m', 'remote ahead');
+    git(root, 'push', 'origin', 'main:refs/heads/main');
+    git(root, 'reset', '--hard', c0);
+
+    expect(() => issueUnassignedPush(database, root)).toThrow(/fast-forward/);
+  });
+
+  it('allows an unassigned-primary push of a new branch with no remote ref (empty lease)', () => {
+    const root = repository(true);
+    const database = unassignedDatabase();
+    git(root, 'checkout', '-b', 'feature');
+    writeFileSync(join(root, 'feature.txt'), 'feature\n');
+    git(root, 'add', 'feature.txt');
+    git(root, 'commit', '-m', 'feature work');
+
+    issueUnassignedPush(database, root);
+    const authority = verifyUnassignedPush(database, root);
+    expect(authority.operation).toBe('push');
+    pushExactAuthorizedRef(authority);
+    expect(git(root, 'ls-remote', '--refs', 'origin', 'refs/heads/feature').split(/\s+/)[0])
+      .toBe(git(root, 'rev-parse', 'HEAD'));
+  });
+
+  it('re-proves zero assignments at push time: an assignment planted after verify blocks the push', () => {
+    const root = repository(true);
+    const database = unassignedDatabase();
+    writeFileSync(join(root, 'ahead.txt'), 'ahead\n');
+    git(root, 'add', 'ahead.txt');
+    git(root, 'commit', '-m', 'local ahead');
+
+    issueUnassignedPush(database, root);
+    const authority = verifyUnassignedPush(database, root);
+    // A managed assignment for this session appears AFTER the authority was verified.
+    new WorkspaceService(database).ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+
+    expect(() => pushExactAuthorizedRef(authority)).toThrow(/zero active assignments/);
+  });
+
+  it('re-proves primary ownership at push time: a foreign owner planted after verify blocks the push', () => {
+    const root = repository(true);
+    const database = unassignedDatabase();
+    writeFileSync(join(root, 'ahead.txt'), 'ahead\n');
+    git(root, 'add', 'ahead.txt');
+    git(root, 'commit', '-m', 'local ahead');
+
+    issueUnassignedPush(database, root);
+    const authority = verifyUnassignedPush(database, root);
+    const foreign = new WorkspaceService(database).reserveWorkerWorktree({
+      repositoryPath: root, workspaceGuid: randomUUID(), workerId: 'foreign-worker', integrationTarget: 'main',
+    });
+    database.prepare(`
+      INSERT INTO primary_checkout_owners (repository_identity, workspace_guid, owner_session_id)
+      VALUES (?, ?, ?)
+    `).run(foreign.repository_identity, foreign.workspace_guid, OTHER_OWNER);
+
+    expect(() => pushExactAuthorizedRef(authority)).toThrow(/owned by another session/);
+  });
+
+  it('does not let a commit sentinel intent satisfy an unassigned-primary push verify', () => {
+    const root = repository(true);
+    const database = unassignedDatabase();
+    writeFileSync(join(root, 'ahead.txt'), 'ahead\n');
+    git(root, 'add', 'ahead.txt');
+    git(root, 'commit', '-m', 'local ahead');
+    issueUnassigned(database, root); // operation: 'commit'
+    expect(() => verifyUnassignedPush(database, root)).toThrow('requires a matching human intent');
+  });
+
+  it('does not consume an unassigned-primary push intent minted on a different channel', () => {
+    const root = repository(true);
+    const database = unassignedDatabase();
+    writeFileSync(join(root, 'ahead.txt'), 'ahead\n');
+    git(root, 'add', 'ahead.txt');
+    git(root, 'commit', '-m', 'local ahead');
+    issueUnassignedPush(database, root, 'claude-user-prompt');
+    expect(() => verifyUnassignedPush(database, root, 'codex-user-prompt'))
+      .toThrow('requires a matching human intent');
+  });
+
+  it('does not consume an expired unassigned-primary push intent', () => {
+    const root = repository(true);
+    const database = unassignedDatabase();
+    writeFileSync(join(root, 'ahead.txt'), 'ahead\n');
+    git(root, 'add', 'ahead.txt');
+    git(root, 'commit', '-m', 'local ahead');
+    issueUnassignedPush(database, root);
+    database.prepare("UPDATE human_intents SET expires_at = '2000-01-01T00:00:00.000Z'").run();
+    expect(() => verifyUnassignedPush(database, root)).toThrow('requires a matching human intent');
+  });
+
+  function issueUnassignedCap(database: ReturnType<typeof initDb>, root: string, humanChannel = 'codex-user-prompt') {
+    return issueDirectGitHumanIntent(database, {
+      repositoryPath: root,
+      workspaceGuid: undefined,
+      providerRootSessionId: OWNER,
+      humanChannel,
+      operation: 'commit-and-push',
+    });
+  }
+
+  function verifyUnassignedCap(database: ReturnType<typeof initDb>, root: string, humanChannel = 'codex-user-prompt') {
+    return verifyDirectGitAuthority(database, {
+      repositoryPath: root,
+      workspaceGuid: undefined,
+      providerRootSessionId: OWNER,
+      humanChannel,
+      operation: 'commit-and-push',
+    });
+  }
+
+  it('issues and consumes an unassigned-primary commit-and-push authority (fast-forward over parent)', () => {
+    const root = repository(true);
+    const database = unassignedDatabase();
+    writeFileSync(join(root, 'staged.txt'), 'staged\n');
+    git(root, 'add', 'staged.txt');
+
+    issueUnassignedCap(database, root);
+    const authority = verifyUnassignedCap(database, root);
+    expect(authority.checkoutMode).toBe('primary-unassigned');
+    expect(authority.operation).toBe('commit-and-push');
+    expect(authority.workspaceGuid.startsWith('primary:')).toBe(true);
+  });
+
+  it('refuses a non-fast-forward unassigned-primary commit-and-push at issuance', () => {
+    const root = repository(true);
+    const database = unassignedDatabase();
+    const c0 = git(root, 'rev-parse', 'HEAD');
+    // Advance origin/main past HEAD, then move local back to c0 so the commit's
+    // parent (= HEAD = c0) is BEHIND origin — a non-fast-forward the ff-over-parent
+    // proof must refuse.
+    writeFileSync(join(root, 'remote-ahead.txt'), 'remote ahead\n');
+    git(root, 'add', 'remote-ahead.txt');
+    git(root, 'commit', '-m', 'remote ahead');
+    git(root, 'push', 'origin', 'main:refs/heads/main');
+    git(root, 'reset', '--hard', c0);
+    writeFileSync(join(root, 'staged.txt'), 'staged\n');
+    git(root, 'add', 'staged.txt');
+
+    expect(() => issueUnassignedCap(database, root)).toThrow(/fast-forward/);
+  });
+
+  it('allows an unassigned-primary commit-and-push on a new branch with no remote ref', () => {
+    const root = repository(true);
+    const database = unassignedDatabase();
+    git(root, 'checkout', '-b', 'feature');
+    writeFileSync(join(root, 'staged.txt'), 'staged\n');
+    git(root, 'add', 'staged.txt');
+
+    issueUnassignedCap(database, root);
+    const authority = verifyUnassignedCap(database, root);
+    expect(authority.operation).toBe('commit-and-push');
+  });
+
+  // Sentinel isolation BOTH directions (requirements R6 "and vice versa"): the
+  // operation column + the canonical-JSON evidence byte-match make every cross-lane
+  // consumption fail.
+  it('does not let a commit or push intent satisfy a commit-and-push verify (forward)', () => {
+    const rootA = repository(true);
+    const dbA = unassignedDatabase();
+    writeFileSync(join(rootA, 'staged.txt'), 'staged\n');
+    git(rootA, 'add', 'staged.txt');
+    issueUnassigned(dbA, rootA); // operation 'commit'
+    expect(() => verifyUnassignedCap(dbA, rootA)).toThrow('requires a matching human intent');
+
+    const rootB = repository(true);
+    const dbB = unassignedDatabase();
+    writeFileSync(join(rootB, 'ahead.txt'), 'ahead\n');
+    git(rootB, 'add', 'ahead.txt');
+    git(rootB, 'commit', '-m', 'local ahead');
+    issueUnassignedPush(dbB, rootB); // operation 'push'
+    expect(() => verifyUnassignedCap(dbB, rootB)).toThrow('requires a matching human intent');
+  });
+
+  it('does not let a commit-and-push intent satisfy a commit or push verify (reverse)', () => {
+    const rootA = repository(true);
+    const dbA = unassignedDatabase();
+    writeFileSync(join(rootA, 'staged.txt'), 'staged\n');
+    git(rootA, 'add', 'staged.txt');
+    issueUnassignedCap(dbA, rootA); // operation 'commit-and-push'
+    expect(() => verifyUnassigned(dbA, rootA)).toThrow('requires a matching human intent'); // verify as 'commit'
+
+    const rootB = repository(true);
+    const dbB = unassignedDatabase();
+    writeFileSync(join(rootB, 'staged.txt'), 'staged\n');
+    git(rootB, 'add', 'staged.txt');
+    issueUnassignedCap(dbB, rootB); // operation 'commit-and-push'
+    expect(() => verifyUnassignedPush(dbB, rootB)).toThrow('requires a matching human intent'); // verify as 'push'
+  });
+
+  // Issuance-gate battery for the widened hook lane: a zero-assignment session may
+  // now issue an UNASSIGNED commit, push, or commit-and-push intent, but nothing else widens.
+  function hookArgs(root: string, operation: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      hook_event_name: 'UserPromptSubmit',
+      invocation_source: 'human',
+      operation,
+      human_channel: 'codex-user-prompt',
+      repository_path: root,
+      owner_session_id: OWNER,
+      ...extra,
+    };
+  }
+
+  it('issues an unassigned commit intent from the hook when the session holds zero assignments', () => {
+    const root = repository(false);
+    const database = unassignedDatabase();
+
+    const receipt = issueHumanIntentFromHook(database, hookArgs(root, 'commit'));
+
+    // The widening: zero assignments no longer throws for a bare commit; it issues.
+    expect(receipt).toMatchObject({ issued: true, operation: 'commit' });
+  });
+
+  it('issues an unassigned push intent from the hook when the session holds zero assignments', () => {
+    const root = repository(true); // push evidence observes origin, so a remote is required
+    const database = unassignedDatabase();
+
+    const receipt = issueHumanIntentFromHook(database, hookArgs(root, 'push'));
+
+    // The widening: zero assignments now also issues for a bare push (human-only lane).
+    expect(receipt).toMatchObject({ issued: true, operation: 'push' });
+  });
+
+  it('issues an unassigned commit-and-push intent from the hook when the session holds zero assignments', () => {
+    const root = repository(true); // commit-and-push evidence observes origin
+    const database = unassignedDatabase();
+    writeFileSync(join(root, 'staged.txt'), 'staged\n');
+    git(root, 'add', 'staged.txt');
+
+    const receipt = issueHumanIntentFromHook(database, hookArgs(root, 'commit-and-push'));
+
+    // The widening: zero assignments now also issues for a bare commit-and-push (human-only lane).
+    expect(receipt).toMatchObject({ issued: true, operation: 'commit-and-push' });
+  });
+
+  it('refuses every non-commit, non-push, non-commit-and-push hook operation when the session holds zero assignments', () => {
+    // Bounds the widening to commit + push + commit-and-push only: dropping the operation
+    // guard would let one of these issue instead of throw.
+    for (const operation of ['use-primary-checkout', 'return-to-managed-worktree'] as const) {
+      const root = repository(false);
+      const database = unassignedDatabase();
+      expect(() => issueHumanIntentFromHook(database, hookArgs(root, operation)))
+        .toThrow('exactly one active assignment');
+    }
+  });
+
+  it('refuses a zero-assignment hook commit that supplies a workspace_guid', () => {
+    const root = repository(false);
+    const database = unassignedDatabase();
+
+    // The unassigned lane takes NO guid: dropping the `requestedGuid === undefined`
+    // condition would let this issue an intent instead of throwing.
+    expect(() => issueHumanIntentFromHook(database, hookArgs(root, 'commit', { workspace_guid: randomUUID() })))
+      .toThrow('exactly one active assignment');
+  });
+
+  it('mints a reconcile intent from the hook when the session holds exactly one active assignment', () => {
+    const { root, database } = setup(false);
+
+    const receipt = issueHumanIntentFromHook(database, hookArgs(root, 'reconcile')) as { operation: string };
+
+    expect(receipt.operation).toBe('reconcile');
+  });
+
+  it('refuses a hook reconcile when the session holds zero assignments (stays in the assigned branch)', () => {
+    const root = repository(false);
+    const database = unassignedDatabase();
+
+    // Reconcile is deliberately absent from the unassigned-widening operation list
+    // (:49): proves it falls through to the assigned-branch guard, not the
+    // zero-assignment commit/push/commit-and-push lane.
+    expect(() => issueHumanIntentFromHook(database, hookArgs(root, 'reconcile')))
+      .toThrow('exactly one active assignment');
+  });
+
+  it('cannot hold two active assignments in one repository (bounds the hook count to 0 or 1)', () => {
+    // The literal "two assignments reach the hook, so it throws" case is
+    // unbuildable: the partial unique index active_assignment_owner_repository is
+    // on (owner_session_id, repository_identity) with the SAME non-terminal
+    // predicate the hook query filters on, so length is always 0 or 1 and the
+    // retained `length !== 1` throw is unreachable-but-defensive. The honest proof
+    // of the "more than one" bound is that the DB refuses the second active row.
+    const root = repository(false);
+    const databaseDirectory = mkdtempSync(join(tmpdir(), 'ironclaude-git-authority-db-'));
+    directories.push(databaseDirectory);
+    const database = initDb(join(databaseDirectory, 'authority.db'));
+    const service = new WorkspaceService(database);
+    service.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    const second = service.reserveWorkerWorktree({
+      repositoryPath: root, workspaceGuid: randomUUID(), workerId: 'second-worker', integrationTarget: 'main',
+    });
+
+    // Matching the column list (not just /UNIQUE/) proves it is THAT index, so the
+    // guard fails if someone drops or rescopes it and lets the count exceed 1.
+    expect(() => database.prepare('UPDATE assignments SET owner_session_id = ? WHERE workspace_guid = ?')
+      .run(OWNER, second.workspace_guid))
+      .toThrow(/owner_session_id, assignments\.repository_identity/);
+  });
+
+  describe('reconcile direct-Git operation', () => {
+    it('observes managed reconcile evidence pinned to live HEAD, and denies it for a non-managed checkout', () => {
+      const { root, database, assignment } = setup(false);
+      git(assignment.worktree_path, 'commit', '-m', 'reconcile target');
+      const headOid = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+
+      issueDirectGitHumanIntent(database, {
+        repositoryPath: root,
+        workspaceGuid: assignment.workspace_guid,
+        providerRootSessionId: OWNER,
+        humanChannel: 'codex-user-prompt',
+        operation: 'reconcile',
+      });
+      const authority = verifyDirectGitAuthority(database, {
+        repositoryPath: root,
+        workspaceGuid: assignment.workspace_guid,
+        providerRootSessionId: OWNER,
+        humanChannel: 'codex-user-prompt',
+        operation: 'reconcile',
+      });
+
+      expect(authority.evidence).toEqual({
+        checkoutMode: 'managed',
+        canonicalBranch: assignment.branch,
+        localRef: `refs/heads/${assignment.branch}`,
+        headOid,
+      });
+
+      // Non-managed (primary) checkout must deny reconcile evidence entirely.
+      const primary = setup(false);
+      acquirePrimary(primary.database, primary.assignment);
+      expect(() => issueDirectGitHumanIntent(primary.database, {
+        repositoryPath: primary.root,
+        workspaceGuid: primary.assignment.workspace_guid,
+        providerRootSessionId: OWNER,
+        humanChannel: 'codex-user-prompt',
+        operation: 'reconcile',
+      })).toThrow('evidence');
+    });
+
+    it('authorizes reconcile from live HEAD but structurally excludes it from push authority', () => {
+      const { root, database, assignment } = setup(false);
+      git(assignment.worktree_path, 'commit', '-m', 'reconcile target');
+
+      issueDirectGitHumanIntent(database, {
+        repositoryPath: root,
+        workspaceGuid: assignment.workspace_guid,
+        providerRootSessionId: OWNER,
+        humanChannel: 'codex-user-prompt',
+        operation: 'reconcile',
+      });
+      const authority = verifyDirectGitAuthority(database, {
+        repositoryPath: root,
+        workspaceGuid: assignment.workspace_guid,
+        providerRootSessionId: OWNER,
+        humanChannel: 'codex-user-prompt',
+        operation: 'reconcile',
+      });
+
+      expect(authority.operation).toBe('reconcile');
+      // This exact message fires only at the single-use gate (:614) — it only
+      // reaches that branch when :613 does NOT special-case 'reconcile' AND the
+      // authority was excluded from usablePushAuthorizations at verify-time
+      // (:563). A bare .toThrow() would also pass if :613 threw its own,
+      // differently-worded error instead — pin the exact text to catch that.
+      expect(() => pushExactAuthorizedRef(authority)).toThrow('Direct Git push authority is single-use');
+    });
+
+    it('fails reconcile verification when live HEAD no longer byte-matches the evidence pinned at issuance', () => {
+      const { root, database, assignment } = setup(false);
+      issueDirectGitHumanIntent(database, {
+        repositoryPath: root,
+        workspaceGuid: assignment.workspace_guid,
+        providerRootSessionId: OWNER,
+        humanChannel: 'codex-user-prompt',
+        operation: 'reconcile',
+      });
+      git(assignment.worktree_path, 'commit', '-m', 'head moved after mint');
+
+      expect(() => verifyDirectGitAuthority(database, {
+        repositoryPath: root,
+        workspaceGuid: assignment.workspace_guid,
+        providerRootSessionId: OWNER,
+        humanChannel: 'codex-user-prompt',
+        operation: 'reconcile',
+      })).toThrow('requires a matching human intent');
+    });
   });
 });

@@ -86,3 +86,8 @@ Work WITH this system, not against it. The brainstorming skill IS your planning 
     - Do NOT propose to "checkpoint / bank progress / resume fresh / find a safe stopping point" mid-execution. Plan/task artifacts on disk ARE the checkpoint. Pauses are operator-initiated via `plan-interruption`.
     - Do NOT ask the operator to run read-only queries (sqlite, grep, bash) because the current stage blocks Bash. The correct move is an investigation PM loop whose execute stage unblocks Bash — do it yourself.
     - See `ironclaude:workflow-durability` for the decision table.
+
+13. **Recipient-Based Communication Profiles**
+    - Before first substantive human-facing response, load and apply `ironclaude:elements-of-style`
+    - For AI-directed natural language, load and apply `ironclaude:write-lossless-ai-messages`
+    - Select by destination, not model; preserve machine schemas and protected technical content exactly

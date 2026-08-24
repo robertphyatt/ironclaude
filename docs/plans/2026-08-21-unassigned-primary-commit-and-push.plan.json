@@ -1,0 +1,85 @@
+{
+  "name": "Unassigned-primary human /commit-and-push (Loop 2)",
+  "goal": "Add a human-only /commit-and-push lane for an unassigned primary checkout - commit the staged tree exactly onto the current branch, then push it to its own origin ref ff-only via force-with-lease, one intent, no envelope.",
+  "requirements_file": "docs/plans/2026-08-21-unassigned-primary-commit-and-push-requirements.md",
+  "design_file": "docs/plans/2026-08-21-unassigned-primary-commit-and-push-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Unassigned commit-and-push authority + mint + combined evidence (TDD)",
+      "description": "Compose the shipped commit + push lanes for commit-and-push. hook-intent.ts:48-56 widen zero-assignment route to admit commit-and-push. git-authority.ts: new observeUnassignedCommitAndPushEvidence(path) -> CommitAndPushEvidence (commit fields stagedTree/parentOid/parentRef + remote fields origin/remoteUrl==pushUrl-else-deny/destinationRef=localRef/expectedRemoteOldOid) with an inline ff-proof over parentOid (pushed commit is a child of HEAD; ff-over-parent implies ff-over-child; cannot reuse assertFastForwardPush which keys on localOid). Relax issue :413 + verify :451 guards to also admit commit-and-push; 3-way evidence branch; change verify WeakSet add to `if (input.operation !== 'commit')` so commit-and-push is added to usablePushAuthorizations; update guard message. Managed lanes untouched.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/hook-intent.ts",
+        "worker/mcp-servers/workspace-manager/src/git-authority.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/git-authority.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED. git-authority.test.ts: (a) positive commit-and-push authority (repository(true), unassignedDatabase, stage a file uncommitted, issue+verify operation commit-and-push, assert checkoutMode primary-unassigned + operation commit-and-push + workspaceGuid startsWith primary:); (b) ff-over-parent non-ff refused (origin advanced past HEAD -> issue throws /fast-forward/); (c) new-branch null allowed; (d) sentinel isolation BOTH directions (R6 'and vice versa'): forward - commit intent cannot satisfy commit-and-push verify, push intent cannot satisfy commit-and-push verify; reverse - commit-and-push intent cannot satisfy a commit verify (verifyUnassigned), commit-and-push intent cannot satisfy a push verify (verifyUnassignedPush); all four throw 'requires a matching human intent' (each uses repository(true) + a staged uncommitted file); (e) hook mint issueHumanIntentFromHook(hookArgs(root,'commit-and-push')) -> {issued:true, operation:'commit-and-push'}, UPDATE the throw-loop (currently ['commit-and-push','use-primary-checkout','return-to-managed-worktree']) to drop commit-and-push (other two still throw 'exactly one active assignment').",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test",
+          "expected": "Non-zero (RED): commit-and-push issue/verify throws 'supports commit and push only'; hook throws 'exactly one active assignment'. Retained negatives pass."
+        },
+        {
+          "description": "GREEN. Per design Components 1-3: hook-intent.ts:48-56 widen to (commit||push||commit-and-push). git-authority.ts: add observeUnassignedCommitAndPushEvidence (CommitAndPushEvidence + inline isAncestor ff-over-parent proof); relax issue :413 + verify :451 guards to !==commit && !==push && !==commit-and-push; 3-way evidence branch; verify WeakSet add -> if (input.operation !== 'commit'); guard message names all three ops.",
+          "command": "",
+          "expected": "hook-intent admits commit-and-push; git-authority has observeUnassignedCommitAndPushEvidence, relaxed guards, 3-way evidence, WeakSet add for non-commit; managed lanes unchanged."
+        },
+        {
+          "description": "GREEN verify.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test",
+          "expected": "0 fail. New commit-and-push authority/ff/hook tests pass; retained negatives pass; all pre-existing pass."
+        },
+        {
+          "description": "Stage the three Task-1 files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/hook-intent.ts worker/mcp-servers/workspace-manager/src/git-authority.ts worker/mcp-servers/workspace-manager/src/__tests__/git-authority.test.ts",
+          "expected": "Three files staged."
+        },
+        {
+          "description": "No-regression evidence: unfiltered staged diff.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --staged --name-only",
+          "expected": "Exactly the three Task-1 files and nothing else staged."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Unassigned commit-and-push finalizer + wiring (TDD)",
+      "description": "Add finalizePrimaryUnassignedCommitAndPush (integration.ts) = guard primary-unassigned+commit-and-push, requireMessage, createExactCommit(exactCommitEvidence) -> commit, pushExactAuthorizedRef (its commit-and-push branch: skips integrated-guard for the assignment-less sentinel, revalidates via the primary-unassigned branch, computes pushed oid via assertPostCommitPushState, force-with-lease push) in try/mutationError + afterRemoteMutationBeforeResult hook, remoteRefOid readback classified vs the new commit oid (pushed / has-not-proved / ambiguous). Never-lose-work: commit persists if push fails. index.ts: three-way primary-unassigned dispatch on operation; commit_and_push schema required -> ['repository_path','message']. Managed finalizeDirectAuthority + pushExactAuthorizedIntegratedCandidate NOT touched.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/integration.ts",
+        "worker/mcp-servers/workspace-manager/src/index.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/integration-core.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "RED. integration-core.test.ts: import finalizePrimaryUnassignedCommitAndPush; extend issueAndVerifyUnassignedOp operation union to include 'commit-and-push'. Using setupUnassignedPrimaryWithRemote + a staged (uncommitted) file: (a) success -> capture parentHead+remoteBefore, finalize -> state 'pushed', assert HEAD^ === parentHead + HEAD^{tree} === staged tree + ls-remote origin main === new HEAD (result.integratedCommit); (b) never-lose-work: capture parentHead before finalize; advance origin/main after verify VIA PLUMBING that does NOT move local HEAD (intruder = git commit-tree HEAD^{tree} -p parentHead -m 'origin advanced after verify'; git push origin intruder:refs/heads/main) - the Loop-1 local-commit recipe is WRONG (moves HEAD, wrong error, vacuous assert); then finalize throws /evidence changed or is malformed/ (createExactCommit SUCCEEDS then assertRemoteEvidence breaks the lease), and assert non-vacuously the local commit persists AND is the lane's: HEAD^ === parentHead AND HEAD^{tree} === staged tree, and ls-remote origin main still === intruder; (c) guard: finalizePrimaryUnassignedCommitAndPush throws on a push authority (/commit-and-push/) and finalizePrimaryUnassignedPush throws on a commit-and-push authority (/pushes only/). tool-dispatch.test.ts: UPDATE schema it-block (commit_and_push required -> ['repository_path','message'], push still ['repository_path'], commit ['repository_path','message'], workspace_guid property still exposed); extend subagent-refusal with omitted-guid commit_and_push ({repository_path, message}) -> 'provider-root session'.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test",
+          "expected": "Non-zero (RED): finalizePrimaryUnassignedCommitAndPush undefined / commit_and_push schema still requires workspace_guid."
+        },
+        {
+          "description": "GREEN. integration.ts: add finalizePrimaryUnassignedCommitAndPush(authority, message, hooks?) (createExactCommit then pushExactAuthorizedRef + remoteRefOid readback classification vs the new commit; exact code in design Component 4). index.ts: import it; three-way primary-unassigned dispatch on operation; commit_and_push schema required -> ['repository_path','message'].",
+          "command": "",
+          "expected": "integration.ts exports finalizePrimaryUnassignedCommitAndPush; index.ts dispatch three-way + commit_and_push drops mandatory workspace_guid; managed lanes untouched."
+        },
+        {
+          "description": "GREEN verify.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test",
+          "expected": "0 fail. Finalizer/never-lose-work/guard/schema/subagent tests pass; managed commit-and-push + Loop-1 push + unassigned commit byte-identical; full suite green."
+        },
+        {
+          "description": "Stage the four Task-2 files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/integration.ts worker/mcp-servers/workspace-manager/src/index.ts worker/mcp-servers/workspace-manager/src/__tests__/integration-core.test.ts worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts",
+          "expected": "Four files staged."
+        },
+        {
+          "description": "No-regression evidence: unfiltered staged diff (Task 1 + Task 2 files).",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --staged --name-only",
+          "expected": "Exactly the 3 Task-1 + 4 Task-2 files = 7 paths, nothing else staged."
+        }
+      ]
+    }
+  ]
+}

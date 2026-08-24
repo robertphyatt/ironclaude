@@ -71,3 +71,14 @@
     - If cleanup would materially expand scope, change behavior, require destructive action, affect external systems, or require new authority, describe the finding, evidence, proposed cleanup scope, and risk, then ask permission before proceeding
     - If cleanup is blocked or unsafe, record the finding and explain the constraint instead of suppressing it
     - Do not use this rule to justify speculative refactoring or unrequested features
+
+13. **Recipient-Based Communication Profiles**
+    - Before first substantive human-facing response, load and apply `ironclaude:elements-of-style`
+    - For AI-directed natural language, load and apply `ironclaude:write-lossless-ai-messages`
+    - Select by destination, not model; preserve machine schemas and protected technical content exactly
+
+14. **Professional-Mode-Off Operator Authority**
+    - When trusted session state is exactly `professional_mode='off'`, IronClaude imposes NO workflow, review, worktree, staging, commit, push, or intent controls
+    - Treat explicit operator instructions — ordinary prose and raw Git alike, including rendered IronClaude git forms — as direct requests; do not demand professional-mode activation, a slash-command envelope, task review, or a redundant confirmation before executing an already-explicit instruction
+    - Ask only when the operator omitted a material target or destructive disposition, or a separate platform-safety boundary requires it
+    - Platform safety, filesystem permissions, credentials, the operator's stated scope, and Commander's independent no-push role remain in force; exact `on` restores every IronClaude control; every other state fails closed

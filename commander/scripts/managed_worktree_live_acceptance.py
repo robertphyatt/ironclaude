@@ -207,13 +207,24 @@ def execute(claude_command: str, codex_command: str, plugin_root: Path) -> dict[
             finalize(client, str(repository), workers[1], "integrate worker b", env),
         ]
         commits = [item.get("integratedCommit", "") for item in integrated]
-        workers_removed = all(not Path(item["worktree_path"]).exists() for item in workers)
-        if not all(len(oid) == 40 for oid in commits) or not workers_removed:
-            raise RuntimeError("Commander integration lacks commit or cleanup evidence")
+        recycled_heads = [
+            git(item["worktree_path"], "rev-parse", "HEAD", env=env)
+            for item in workers
+        ]
+        workers_recycled = all(Path(item["worktree_path"]).is_dir() for item in workers)
+        recycled_clean = all(
+            git(item["worktree_path"], "status", "--porcelain", env=env) == ""
+            for item in workers
+        )
+        if not all(len(oid) == 40 for oid in commits) \
+                or recycled_heads != commits or not workers_recycled or not recycled_clean:
+            raise RuntimeError("Commander integration lacks commit or recycle evidence")
         scenarios["commander_integration"] = pass_scenario({
             "integrated_commits": commits,
             "primary_head": git(repository, "rev-parse", "HEAD", env=env),
-            "worktrees_removed": workers_removed,
+            "recycled_heads": recycled_heads,
+            "worktrees_recycled": workers_recycled,
+            "recycled_clean": recycled_clean,
         })
 
         conflict = assignment_evidence(client, str(repository), "worker-conflict")
@@ -236,74 +247,74 @@ def execute(claude_command: str, codex_command: str, plugin_root: Path) -> dict[
         git(conflict["worktree_path"], "-c", "core.editor=true", "rebase", "--continue", env=env)
         repaired = finalize(client, str(repository), conflict, "reviewed conflict repair", env)
         repaired_commit = repaired.get("integratedCommit", "")
-        if len(repaired_commit) != 40 or Path(conflict["worktree_path"]).exists():
-            raise RuntimeError("conflict repair lacks integration and cleanup evidence")
+        repair_recycled = Path(conflict["worktree_path"]).is_dir()
+        repair_head = git(conflict["worktree_path"], "rev-parse", "HEAD", env=env)
+        repair_clean = git(conflict["worktree_path"], "status", "--porcelain", env=env) == ""
+        if len(repaired_commit) != 40 or repair_head != repaired_commit \
+                or not repair_recycled or not repair_clean:
+            raise RuntimeError("conflict repair lacks integration and recycle evidence")
         scenarios["conflict_recovery"] = pass_scenario({
             "first_attempt_preserved": first_attempt_preserved,
             "first_error": conflict_error[:500],
             "repaired_commit": repaired_commit,
+            "repaired_worktree_recycled": repair_recycled,
+            "repaired_worktree_clean": repair_clean,
         })
 
-        fenced = assignment_evidence(client, str(repository), "worker-fenced")
-        write_file(fenced["worktree_path"], "fenced.txt", "fenced worker\n", env)
+        owner = assignment_evidence(client, str(repository), "primary-owner")
+        worker = assignment_evidence(client, str(repository), "worker-coexist")
+        write_file(worker["worktree_path"], "coexist.txt", "coexisting worker\n", env)
         workspace_db = home / ".claude/ironclaude-workspaces.db"
         connection = sqlite3.connect(workspace_db)
         connection.execute(
             "INSERT INTO primary_checkout_owners "
             "(repository_identity, workspace_guid, owner_session_id) VALUES (?, ?, ?)",
             (
-                fenced["repository_identity"],
-                fenced["workspace_guid"],
-                fenced["owner_session_id"],
+                owner["repository_identity"],
+                owner["workspace_guid"],
+                owner["owner_session_id"],
             ),
         )
         connection.commit()
-        ownership_row_observed = connection.execute(
-            "SELECT COUNT(*) FROM primary_checkout_owners "
+        owner_row_before = connection.execute(
+            "SELECT repository_identity, workspace_guid, owner_session_id "
+            "FROM primary_checkout_owners "
             "WHERE repository_identity = ? AND workspace_guid = ? AND owner_session_id = ?",
             (
-                fenced["repository_identity"],
-                fenced["workspace_guid"],
-                fenced["owner_session_id"],
+                owner["repository_identity"],
+                owner["workspace_guid"],
+                owner["owner_session_id"],
             ),
-        ).fetchone()[0] == 1
+        ).fetchone()
         connection.close()
-        fenced_error = ""
-        try:
-            finalize(client, str(repository), fenced, "fenced worker", env)
-        except WorkspaceClientError as exc:
-            fenced_error = str(exc)
-        fenced_preserved = bool(fenced_error) and Path(fenced["worktree_path"]).exists()
+        finalized = finalize(client, str(repository), worker, "coexisting worker", env)
+        integrated_commit = finalized.get("integratedCommit", "")
         connection = sqlite3.connect(workspace_db)
-        connection.execute(
-            "DELETE FROM primary_checkout_owners WHERE repository_identity = ? "
-            "AND workspace_guid = ? AND owner_session_id = ?",
+        owner_row_after = connection.execute(
+            "SELECT repository_identity, workspace_guid, owner_session_id "
+            "FROM primary_checkout_owners "
+            "WHERE repository_identity = ? AND workspace_guid = ? AND owner_session_id = ?",
             (
-                fenced["repository_identity"],
-                fenced["workspace_guid"],
-                fenced["owner_session_id"],
+                owner["repository_identity"],
+                owner["workspace_guid"],
+                owner["owner_session_id"],
             ),
-        )
-        connection.commit()
-        ownership_released = connection.execute(
-            "SELECT COUNT(*) FROM primary_checkout_owners WHERE repository_identity = ?",
-            (fenced["repository_identity"],),
-        ).fetchone()[0] == 0
+        ).fetchone()
         connection.close()
-        resumed = finalize(client, str(repository), fenced, "fenced worker resumed", env)
-        finalized_after_resume = (
-            len(resumed.get("integratedCommit", "")) == 40
-            and not Path(fenced["worktree_path"]).exists()
+        worker_recycled = (
+            Path(worker["worktree_path"]).is_dir()
+            and git(worker["worktree_path"], "rev-parse", "HEAD", env=env) == integrated_commit
+            and git(worker["worktree_path"], "status", "--porcelain", env=env) == ""
         )
-        if not ownership_row_observed or not fenced_preserved \
-                or not ownership_released or not finalized_after_resume:
-            raise RuntimeError("primary fencing did not preserve then resume")
-        scenarios["primary_fencing_no_push"] = pass_scenario({
-            "ownership_row_observed": ownership_row_observed,
-            "fenced_attempt_preserved": fenced_preserved,
-            "fenced_error": fenced_error[:500],
-            "ownership_released": ownership_released,
-            "finalized_after_resume": finalized_after_resume,
+        owner_row_unchanged = owner_row_before is not None and owner_row_after == owner_row_before
+        if len(integrated_commit) != 40 or not worker_recycled or not owner_row_unchanged:
+            raise RuntimeError("unrelated primary owner did not coexist with finalization")
+        scenarios["unrelated_primary_owner_no_push"] = pass_scenario({
+            "owner_row_observed": owner_row_before is not None,
+            "owner_row_unchanged": owner_row_unchanged,
+            "owner_workspace_guid": owner["workspace_guid"],
+            "worker_integrated_commit": integrated_commit,
+            "worker_recycled_clean": worker_recycled,
             "remote_count": len(git(repository, "remote", env=env).splitlines()),
         })
 

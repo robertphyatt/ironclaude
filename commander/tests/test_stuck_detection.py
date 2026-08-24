@@ -280,6 +280,7 @@ class TestConfirmAndKillStuckWorker:
         daemon._stuck_hash["w1"] = 123
         daemon._stuck_alert_sent["w1"] = True
         daemon.tmux.list_pane_pid.return_value = "9999"
+        daemon._finalize_and_release_worker = MagicMock(return_value=None)
 
         mock_child = MagicMock()
         mock_child.cpu_percent.side_effect = [None, 0.0]
@@ -294,7 +295,10 @@ class TestConfirmAndKillStuckWorker:
             daemon._confirm_and_kill_stuck_worker("w1", "ic-w1", 3700, "executing", False, None)
 
         daemon.tmux.kill_session.assert_called_once_with("ic-w1", ssh_host=None)
-        daemon.registry.update_worker_status.assert_called_once_with("w1", "completed")
+        daemon._finalize_and_release_worker.assert_called_once_with(
+            "w1", reason="stuck-killed", terminal=True,
+        )
+        daemon.registry.update_worker_status.assert_not_called()
         daemon.slack.post_message.assert_called_once()
         daemon.brain.send_message.assert_called_once()
         msg = daemon.brain.send_message.call_args[0][0]

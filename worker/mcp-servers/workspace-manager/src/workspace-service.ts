@@ -43,6 +43,17 @@ interface AssignmentRequest extends RepositoryRequest {
   ownerSessionId: string;
 }
 
+interface AbandonWorkspaceInput extends AssignmentRequest {
+  /**
+   * 'rescue' reclaims the worktree DIRECTORY without losing unintegrated work:
+   * any uncommitted change is committed onto the worker's OWN branch (never
+   * main), the commit is recorded as recovery evidence, and only the worktree
+   * directory is removed — the branch survives so a future reaper can still
+   * reach the rescued commit.
+   */
+  mode?: 'rescue';
+}
+
 export interface ProviderRootStatusRequest extends RepositoryRequest {
   ownerSessionId: string;
 }
@@ -167,11 +178,6 @@ export class WorkspaceService {
     if (!observed || observed.branch !== `refs/heads/${assignment.branch}`) {
       throw new Error('Managed worktree Git identity does not match durable assignment; reconciliation must preserve it');
     }
-  }
-
-  private primaryCheckoutIsOwned(repositoryIdentity: string): boolean {
-    return this.db.prepare('SELECT 1 FROM primary_checkout_owners WHERE repository_identity = ?')
-      .get(repositoryIdentity) !== undefined;
   }
 
   /**
@@ -560,7 +566,8 @@ export class WorkspaceService {
     return { managedWorktreePath: assignment.worktree_path, assignment };
   }
 
-  abandonWorkspace(input: AssignmentRequest): Assignment {
+  abandonWorkspace(input: AbandonWorkspaceInput): Assignment {
+    const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
     if (assignment.lifecycle_status === 'abandoned') return assignment;
     if (!nonterminal(assignment.lifecycle_status)) {
@@ -576,29 +583,131 @@ export class WorkspaceService {
     `).get(assignment.repository_identity, assignment.workspace_guid)) {
       throw new Error('Return to the managed worktree before abandoning while holding the primary checkout.');
     }
+    if (input.mode === 'rescue') {
+      return this.rescueAbandon(repository, assignment);
+    }
     return transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, 'abandoned');
   }
 
   /**
-   * Deletes only a terminal assignment whose recorded recovery/integration
-   * proof still reaches its actual Git HEAD. Every failed proof preserves work.
+   * Commits any uncommitted worktree content onto the worker's OWN branch
+   * (never main), mints a durable `refs/ironclaude/recovery/<guid>` ref at that
+   * commit and records the REF NAME as recovery evidence, transitions the
+   * assignment to abandoned, then removes ONLY the worktree directory. The
+   * durable ref — not the worker branch — is the anchor: a later reaper may
+   * delete the branch, and the rescued commit stays reachable through the ref.
    */
-  cleanupWorkspace(input: AssignmentRequest): Assignment {
+  private rescueAbandon(repository: RepositoryLocation, assignment: Assignment): Assignment {
+    const worktreePresent = existsSync(assignment.worktree_path)
+      && worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path);
+    if (worktreePresent) {
+      if (!worktreeIsClean(assignment.worktree_path)) {
+        runGit(assignment.worktree_path, ['add', '-A']);
+        runGit(assignment.worktree_path, ['commit', '-m', 'ironclaude: rescue-commit before reclaiming worktree']);
+      }
+      const rescuedHead = worktreeHead(assignment.worktree_path);
+      const recoveryRef = `refs/ironclaude/recovery/${assignment.workspace_guid}`;
+      runGit(repository.primaryCheckoutPath, ['update-ref', recoveryRef, rescuedHead]);
+      this.db.prepare(`
+        UPDATE assignments SET recovery_ref = ?, updated_at = datetime('now') WHERE workspace_guid = ?
+      `).run(recoveryRef, assignment.workspace_guid);
+    }
+    const abandoned = transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, 'abandoned');
+    if (worktreePresent) removeWorktree(repository.primaryCheckoutPath, assignment.worktree_path);
+    return abandoned;
+  }
+
+  /**
+   * Carve-out for a reserved row that never got as far as owning a real
+   * worktree (`addWorktree` never ran or failed before it could complete):
+   * there is nothing on disk to remove and no branch to preserve, so the row
+   * is deleted outright. Refuses — deferring to `cleanupWorkspace`'s proven
+   * proofs — the moment a worktree actually exists for this row.
+   */
+  cleanupReservedAssignment(input: AssignmentRequest): Assignment {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
-    if (assignment.lifecycle_status !== 'integrated' && assignment.lifecycle_status !== 'abandoned') {
-      throw new Error('Only integrated or abandoned worktrees are eligible for cleanup');
+    if (assignment.lifecycle_status !== 'reserved') {
+      throw new Error('Only a reserved, never-materialized assignment is eligible for this carve-out');
     }
-    this.validateManagedIdentity(repository, assignment);
-    if (!worktreeIsClean(assignment.worktree_path)) {
+    if (existsSync(assignment.worktree_path) || worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path)) {
+      throw new Error('Reserved assignment has a materialized worktree; use cleanupWorkspace instead');
+    }
+    const result = this.db.prepare(`
+      DELETE FROM assignments WHERE workspace_guid = ? AND lifecycle_status = 'reserved'
+    `).run(assignment.workspace_guid);
+    if (result.changes !== 1) throw new Error('Reserved assignment changed concurrently');
+    return { ...assignment, lifecycle_status: 'cleaned' as const };
+  }
+
+  /** True iff `ref` resolves in `root`; a missing or unresolvable ref returns false rather than throwing. */
+  private refResolves(root: string, ref: string): boolean {
+    try {
+      runGit(root, ['rev-parse', '--verify', '--quiet', ref]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** True iff `ref` is an actual git ref (not merely a resolvable object such as a raw SHA). */
+  private refIsDurableRef(root: string, ref: string): boolean {
+    try {
+      runGit(root, ['show-ref', '--verify', '--quiet', ref]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Guarantees a durable git ref anchors an abandoned row's recovery commit before its
+   * branch can be deleted. A ref-name `recovery_ref` is returned unchanged (no-op). A
+   * legacy raw-SHA `recovery_ref` that still resolves to a reachable object is upgraded:
+   * mint `refs/ironclaude/recovery/<guid>` at that commit and record the REF NAME. A
+   * `recovery_ref` that is neither a durable ref nor a reachable object throws, so the
+   * row and its branch are preserved (never-lose-work).
+   */
+  private ensureDurableRecoveryAnchor(repository: RepositoryLocation, assignment: Assignment): string {
+    const current = assignment.recovery_ref;
+    if (!current) throw new Error('Abandoned assignment lacks recovery evidence; preserving it');
+    if (this.refIsDurableRef(repository.primaryCheckoutPath, current)) return current;
+    if (!this.refResolves(repository.primaryCheckoutPath, current)) {
+      throw new Error('Recovery evidence is neither a durable ref nor a reachable commit; preserving it');
+    }
+    const recoveryRef = `refs/ironclaude/recovery/${assignment.workspace_guid}`;
+    runGit(repository.primaryCheckoutPath, ['update-ref', recoveryRef, current]);
+    this.db.prepare(`
+      UPDATE assignments SET recovery_ref = ?, updated_at = datetime('now') WHERE workspace_guid = ?
+    `).run(recoveryRef, assignment.workspace_guid);
+    return recoveryRef;
+  }
+
+  /**
+   * Deletes a terminal (integrated or abandoned) assignment only when its
+   * recorded recovery/integration proof still holds, then removes the worktree
+   * (when present) and its private branch. Every failed proof preserves work.
+   *
+   * Handles both the present-worktree case (proof anchored on the live worktree
+   * HEAD, byte-identical to the original cleanup path) and the worktree-gone
+   * case a reaper reaches after `rescueAbandon` has already removed the
+   * directory: there the abandoned proof is that the durable recovery ref still
+   * resolves, and branch deletion is skipped when the branch is already gone (a
+   * `git branch -D` on a nonexistent branch would otherwise throw).
+   */
+  private tombstoneTerminalAssignment(repository: RepositoryLocation, assignment: Assignment): Assignment {
+    const present = existsSync(assignment.worktree_path)
+      && worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path);
+    if (present && !worktreeIsClean(assignment.worktree_path)) {
       throw new Error('Managed worktree is dirty; preserving it');
     }
-    if (this.primaryCheckoutIsOwned(repository.repositoryIdentity)) {
-      throw new Error('Primary checkout remains owned; preserving managed worktree');
-    }
-    const actualHead = worktreeHead(assignment.worktree_path);
     if (assignment.lifecycle_status === 'abandoned') {
-      if (!assignment.recovery_ref || !isAncestor(repository.primaryCheckoutPath, actualHead, assignment.recovery_ref)) {
+      if (present) {
+        if (!assignment.recovery_ref
+          || !isAncestor(repository.primaryCheckoutPath, worktreeHead(assignment.worktree_path), assignment.recovery_ref)) {
+          throw new Error('Abandoned worktree lacks reachable durable recovery evidence; preserving it');
+        }
+      } else if (!assignment.recovery_ref || !this.refResolves(repository.primaryCheckoutPath, assignment.recovery_ref)) {
         throw new Error('Abandoned worktree lacks reachable durable recovery evidence; preserving it');
       }
     } else {
@@ -613,14 +722,103 @@ export class WorkspaceService {
         || !integration
         || integration.target_ref !== integrationTargetRef(assignment.integration_target)
         || integration.integrated_commit !== assignment.integrated_commit
-        || actualHead !== assignment.integrated_commit
+        || (present && worktreeHead(assignment.worktree_path) !== assignment.integrated_commit)
         || !isAncestor(repository.primaryCheckoutPath, assignment.integrated_commit, integration.target_ref)) {
         throw new Error('Integrated worktree lacks reachable durable integration evidence; preserving it');
       }
     }
-    removeWorktree(repository.primaryCheckoutPath, assignment.worktree_path);
-    deleteTemporaryBranch(repository.primaryCheckoutPath, assignment.branch);
+    if (assignment.lifecycle_status === 'abandoned') {
+      this.ensureDurableRecoveryAnchor(repository, assignment);
+    }
+    if (present) removeWorktree(repository.primaryCheckoutPath, assignment.worktree_path);
+    // Safe now that the recovery/integration ref anchors the commit; skip when
+    // the branch is already gone so cleanup of a branch-reaped row still tombstones.
+    if (this.refResolves(repository.primaryCheckoutPath, `refs/heads/${assignment.branch}`)) {
+      deleteTemporaryBranch(repository.primaryCheckoutPath, assignment.branch);
+    }
     return transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, 'cleaned');
+  }
+
+  /**
+   * Deletes only a terminal assignment whose recorded recovery/integration
+   * proof still reaches its actual Git HEAD. Every failed proof preserves work.
+   */
+  cleanupWorkspace(input: AssignmentRequest): Assignment {
+    const repository = discoverRepository(input.repositoryPath);
+    const assignment = this.getWorkspaceAssignment(input);
+    if (assignment.lifecycle_status !== 'integrated' && assignment.lifecycle_status !== 'abandoned') {
+      throw new Error('Only integrated or abandoned worktrees are eligible for cleanup');
+    }
+    const present = existsSync(assignment.worktree_path)
+      && worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path);
+    if (present) this.validateManagedIdentity(repository, assignment);
+    return this.tombstoneTerminalAssignment(repository, assignment);
+  }
+
+  /**
+   * Owner-agnostic reaper for a LEAKED managed assignment — one whose owning
+   * session is gone, so `cleanupWorkspace`'s owner-match can never fire. It
+   * still proves canonical managed identity (repository, path, branch) before
+   * touching anything, and preserves work at every step: a present worktree is
+   * rescued (`rescueAbandon` anchors its content on a durable recovery ref), a
+   * worktree-gone row mints a recovery ref at the surviving branch tip (or, when
+   * even the branch is gone, at the recorded base commit) BEFORE transitioning
+   * to abandoned, and a present worktree on a foreign branch is refused and
+   * preserved. Only after work is anchored does it tombstone the row.
+   */
+  reapLeakedAssignment(input: { repositoryPath: string; workspaceGuid: string }): Assignment {
+    const repository = discoverRepository(input.repositoryPath);
+    const assignment = getAssignment(this.db, input.workspaceGuid);
+    if (!assignment
+      || assignment.repository_identity !== repository.repositoryIdentity
+      || assignment.worktree_path !== managedWorktreePath(repository.primaryCheckoutPath, assignment.workspace_guid)
+      || assignment.branch !== managedBranch(assignment.workspace_guid)) {
+      throw new Error('Leaked assignment does not match canonical managed identity for this repository');
+    }
+    if (assignment.lifecycle_status === 'cleaned') return assignment;
+    if (assignment.lifecycle_status === 'reserved') {
+      return this.reapReservedAssignment(repository, assignment);
+    }
+    const present = existsSync(assignment.worktree_path)
+      && worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path);
+    // A present worktree on a foreign branch is ambiguous; refuse and preserve it.
+    if (present) this.validateManagedIdentity(repository, assignment);
+    if (assignment.lifecycle_status !== 'integrated' && assignment.lifecycle_status !== 'abandoned') {
+      if (present) {
+        this.rescueAbandon(repository, assignment);
+      } else {
+        const recoveryRef = `refs/ironclaude/recovery/${assignment.workspace_guid}`;
+        const branchRef = `refs/heads/${assignment.branch}`;
+        const anchor = this.refResolves(repository.primaryCheckoutPath, branchRef)
+          ? branchRef
+          : assignment.base_commit;
+        // Mint the durable recovery ref BEFORE transitioning to abandoned: work
+        // must be anchored before the row is marked terminal.
+        runGit(repository.primaryCheckoutPath, ['update-ref', recoveryRef, anchor]);
+        this.db.prepare(`
+          UPDATE assignments SET recovery_ref = ?, updated_at = datetime('now') WHERE workspace_guid = ?
+        `).run(recoveryRef, assignment.workspace_guid);
+        transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, 'abandoned');
+      }
+    }
+    return this.tombstoneTerminalAssignment(repository, getAssignment(this.db, input.workspaceGuid)!);
+  }
+
+  /**
+   * Owner-agnostic variant of `cleanupReservedAssignment`'s carve-out: a
+   * reserved row that never materialized a real worktree has nothing on disk to
+   * remove and no branch to preserve, so the row is deleted outright. Refuses
+   * the moment a worktree actually exists — that row is not a bare reservation.
+   */
+  private reapReservedAssignment(repository: RepositoryLocation, assignment: Assignment): Assignment {
+    if (existsSync(assignment.worktree_path) || worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path)) {
+      throw new Error('Reserved assignment has a materialized worktree; use cleanupWorkspace instead');
+    }
+    const result = this.db.prepare(`
+      DELETE FROM assignments WHERE workspace_guid = ? AND lifecycle_status = 'reserved'
+    `).run(assignment.workspace_guid);
+    if (result.changes !== 1) throw new Error('Reserved assignment changed concurrently');
+    return { ...assignment, lifecycle_status: 'cleaned' as const };
   }
 
   /** Read-only reconciliation intentionally never deletes missing or unknown worktrees. */

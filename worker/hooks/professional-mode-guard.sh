@@ -178,6 +178,17 @@ is_safe_codex_agents_patch() {
   esac
 }
 
+# ─── The TWO named Invariant-B exceptions (G3) ───
+# Professional mode off means ZERO enforcement (Invariant B) — with exactly two
+# deliberate carve-outs, both AGENT-restraint only (they never block an operator
+# write, prose, or raw Git). Both run BEFORE the prof_mode branches so they hold
+# regardless of mode, by design:
+#   G3a: hooks-config anti-tamper (below) — the agent may not rewrite its own
+#        guardrail settings (mirrors human-only PM deactivation).
+#   G3b: Commander-only private workspace-transport block (further below) — the
+#        agent's Bash may not invoke the internal workspace-manager CLI.
+# Keeping these on while PM is off is the operator-approved decision for Loop 1.
+
 # ─── Human-only: never let the agent write the hooks-config file ───
 # tier_up_review_policy and other guardrail settings live here. The agent must
 # have no normal write-path to its own constraints (mirrors human-only PM
@@ -390,36 +401,18 @@ Do NOT use Edit, Write, Bash, or any other write tool until professional mode is
   esac
 fi
 
-# ─── OFF: no workflow-stage enforcement, but managed-worktree isolation is a
-# property of the ASSIGNMENT, not of the mode. A session that owns a managed
-# worktree must not silently write into the primary checkout just because
-# professional mode is off — that would strand work while the assignment
-# stays active. Run the same adapter the ON path uses to redirect a relative
-# write into the owned worktree, and block on adapter failure (a damaged or
-# ambiguous assignment). This does not add any workflow-stage gating: no
-# subsequent checks run on this branch, so e.g. `git commit` still passes.
+# ─── OFF: no enforcement (Invariant B). Managed-worktree isolation is a
+# property of the ASSIGNMENT, not of the mode, so when a session owns a managed
+# worktree the off-branch still runs the same adapter the ON path uses to
+# redirect a relative write into the owned worktree (concurrent-agent isolation
+# is intentionally decoupled from professional mode). But an adapter FAILURE is
+# ADVISORY here: professional mode is off, so the operator's write is never
+# blocked — emit a WARNING (log_warning always surfaces, unlike log_hook which
+# is silent for non-block decisions unless verbose) and allow. No workflow-stage
+# gating runs on this branch.
 if [ "$prof_mode" = "off" ]; then
   if ! workspace_prepare_input; then
-    block_pretooluse "professional-mode-guard" "BLOCKED — MANAGED WORKTREE ENFORCEMENT FAILED
-
-${WORKSPACE_ADAPTER_ERROR}
-
-Professional mode is off, but this session still owns a managed-worktree
-assignment. Writing through it anyway would silently strand your work in the
-wrong checkout, so the write is refused instead of falling back to the
-primary checkout. A read that stays inside the managed worktree is never
-blocked for lack of an assignment, so you can still inspect state before
-repairing.
-
-To repair, in order:
-  1. Inspect the assignment with the workspace-manager MCP tool
-     get_workspace_status (Claude: mcp__plugin_ironclaude_workspace-manager__get_workspace_status).
-  2. If that server is not registered in this session, run /reload-plugins —
-     the guard deploys to the shared hooks directory immediately, but the
-     workspace-manager server only registers per session.
-  3. If it is still unavailable, the workspace-manager MCP tools
-     return_to_managed_worktree / use_primary_checkout can release or
-     reconcile the assignment directly."
+    log_warning "professional-mode-guard" "PM off: managed-worktree adapter failed (${WORKSPACE_ADAPTER_ERROR}) — allowing write (advisory, Invariant B)"
   fi
   log_hook "professional-mode-guard" "Allowed" "professional mode off"
   workspace_allow
@@ -524,6 +517,38 @@ Try your action again. If this persists, report the error to the user."
   }
 fi
 
+# resolve_enclosing_git_root TARGET_PATH
+# Bounded helper for the docs/ whitelist below: a design/plan write into a repo
+# NESTED below the session cwd (PROJECT_ROOT) must still resolve to a docs/*
+# relative path. The PreToolUse guard runs BEFORE Write creates parent
+# directories, so TARGET_PATH's own parent may not exist yet — walk up to the
+# nearest EXISTING ancestor before asking git for its repo root (a
+# nonexistent-dir `git -C` call exits nonzero and would silently no-op).
+# Echoes the canonicalized (cd + pwd -P, trailing slash stripped, matching the
+# PROJECT_ROOT derivation above) repo root, or nothing if TARGET_PATH is not
+# absolute, no ancestor exists, or the ancestor is not inside a git repo. The
+# caller — not this function — is responsible for bounding the result to
+# PROJECT_ROOT; this only finds "the nearest enclosing repo," which could be
+# anywhere on the machine.
+resolve_enclosing_git_root() {
+  local target="$1"
+  local ancestor root
+  [[ "$target" == /* ]] || return 1
+  ancestor=$(dirname -- "$target")
+  while [ "$ancestor" != "/" ] && [ ! -d "$ancestor" ]; do
+    ancestor=$(dirname -- "$ancestor")
+  done
+  [ -d "$ancestor" ] || return 1
+  root=$(git -C "$ancestor" rev-parse --show-toplevel 2>/dev/null) || return 1
+  [ -n "$root" ] || return 1
+  root=$(cd -- "$root" 2>/dev/null && pwd -P) || return 1
+  root=$(normalize_path "$root")
+  if [ "$root" != "/" ]; then
+    root="${root%/}"
+  fi
+  echo "$root"
+}
+
 # docs/ path whitelist (design + plan gate)
 if [[ "$TOOL_NAME" == "Edit" || "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "MultiEdit" || "$TOOL_NAME" == "NotebookEdit" ]]; then
   DOCS_TARGET_FILES="${WORKSPACE_TARGET_FILES:-$FILE_PATH}"
@@ -532,8 +557,14 @@ if [[ "$TOOL_NAME" == "Edit" || "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "Mult
   DOCS_HAS_PLAN="false"
   while IFS= read -r DOCS_TARGET; do
     [ -n "$DOCS_TARGET" ] || { DOCS_ALL="false"; break; }
+    ENCLOSING_GIT_ROOT=$(resolve_enclosing_git_root "$DOCS_TARGET" 2>/dev/null) || ENCLOSING_GIT_ROOT=""
     if [ -n "$WORKSPACE_EFFECTIVE_ROOT" ] && [[ "$DOCS_TARGET" == "$WORKSPACE_EFFECTIVE_ROOT/"* ]]; then
       DOCS_RELATIVE="${DOCS_TARGET#${WORKSPACE_EFFECTIVE_ROOT}/}"
+    elif [ -n "$ENCLOSING_GIT_ROOT" ] && [[ "$ENCLOSING_GIT_ROOT" == "$PROJECT_ROOT"/* ]] && [[ "$DOCS_TARGET" == "$ENCLOSING_GIT_ROOT/"* ]]; then
+      # Nested-repo case: GIT_ROOT is a git repo BELOW PROJECT_ROOT and the
+      # target is under it — bounded so this never admits an unrelated repo
+      # elsewhere on the machine (GIT_ROOT must itself be inside PROJECT_ROOT).
+      DOCS_RELATIVE="${DOCS_TARGET#${ENCLOSING_GIT_ROOT}/}"
     elif [[ "$DOCS_TARGET" == "$PROJECT_ROOT/"* ]]; then
       DOCS_RELATIVE="${DOCS_TARGET#${PROJECT_ROOT}/}"
     else

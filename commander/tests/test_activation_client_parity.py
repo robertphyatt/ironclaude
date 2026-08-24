@@ -73,6 +73,10 @@ CANONICAL_SHARED_BODIES = (
     - If cleanup would materially expand scope, change behavior, require destructive action, affect external systems, or require new authority, describe the finding, evidence, proposed cleanup scope, and risk, then ask permission before proceeding
     - If cleanup is blocked or unsafe, record the finding and explain the constraint instead of suppressing it
     - Do not use this rule to justify speculative refactoring or unrequested features""",
+    """12. **Recipient-Based Communication Profiles**
+   - Before first substantive human-facing response, load and apply `ironclaude:elements-of-style`
+   - For AI-directed natural language, load and apply `ironclaude:write-lossless-ai-messages`
+   - Select by destination, not model; preserve machine schemas and protected technical content exactly""",
 )
 
 CANONICAL_CODEX_SEARCH_BODY = """6. **Search Before Guessing**
@@ -364,7 +368,7 @@ def test_claude_checks_combined_semantics_before_creating_absent_rules_file():
         "Do not create `.claude/rules/behavioral.md` solely because it is absent."
     ) in claude
     assert (
-        "If `CLAUDE.md` alone covers the workflow requirement and all eleven "
+        "If `CLAUDE.md` alone covers the workflow requirement and all twelve "
         "concepts, leave the rules file absent."
     ) in claude
 
@@ -416,6 +420,7 @@ CONCEPT_NAMES = (
     "Advisor Fallback",
     "No Workflow Avoidance Under Stage/Context Restrictions",
     "Boy Scout Rule",
+    "Recipient-Based Communication Profiles",
 )
 
 
@@ -427,7 +432,7 @@ def test_activation_source_requires_exact_verify_only_diagnostics():
     assert all(f"- {concept}" in contract for concept in CONCEPT_NAMES)
     assert "enumerated name set must equal the uncovered concept set exactly" in contract
     assert "Do not\nsubstitute a numeric range" in contract
-    assert "concepts 1–11" in contract
+    assert "concepts 1–12" in contract
     assert "behavioral concepts" in contract
 
 

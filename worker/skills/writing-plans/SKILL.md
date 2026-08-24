@@ -249,6 +249,9 @@ If a task genuinely does not need tests (pure config, documentation, version bum
 
 ### Phase 4: Write Plan Document
 
+Before writing the human Markdown plan, load and apply
+`ironclaude:elements-of-style`.
+
 **Step 5: Create plan document**
 
 Save to `docs/plans/YYYY-MM-DD-<feature-name>.md`:
@@ -313,6 +316,15 @@ Expected: Changes staged (professional mode blocks commit)
 
 [Repeat structure...]
 ```
+
+Before writing the machine plan JSON, load and apply
+`ironclaude:write-lossless-ai-messages` to natural-language fields only. Make
+plan JSON as efficient as possible while remaining lossless. Preserve schema,
+task IDs, depends_on, allowed_files, ordered steps, commands, expected results,
+paths, authority boundaries, and complete actionable state exactly. Compression
+must not create human/machine plan drift. It must not drop fields. It must not change exact technical values.
+`IC_LOSSLESS_AI_MESSAGES_ACTIVE` must not appear in
+plan artifacts.
 
 **Step 5.5: Create machine-readable plan JSON**
 

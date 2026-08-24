@@ -1,0 +1,98 @@
+{
+  "name": "Durable Recovery Anchor (C-1)",
+  "goal": "Stop tombstoneTerminalAssignment from deleting a private branch on a raw-SHA recovery_ref; upgrade a legacy raw-SHA row to refs/ironclaude/recovery/<guid> before branch deletion.",
+  "requirements_file": "docs/plans/2026-08-20-durable-recovery-anchor-requirements.md",
+  "design_file": "docs/plans/2026-08-20-durable-recovery-anchor-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Durable-anchor gate + reader-side upgrade (RED then GREEN)",
+      "description": "Add private refIsDurableRef (git show-ref --verify actual-ref test) and ensureDurableRecoveryAnchor (no-op for ref-name recovery_ref; mint refs/ironclaude/recovery/<guid> + DB-upgrade for a legacy raw SHA; throw for unanchorable) to WorkspaceService, and call ensureDurableRecoveryAnchor in tombstoneTerminalAssignment's abandoned path before removeWorktree/deleteTemporaryBranch. TDD: write four tests first (legacy raw-SHA absent + present upgrade; ref-name no-op regression using a vi.spyOn(database,'prepare') detector that asserts no recovery_ref UPDATE runs; unanchorable-preserve), verify RED, implement, verify GREEN.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/workspace-service.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add vi to the vitest import at line 1 of workspace-service.test.ts (currently `{ afterEach, describe, expect, it }` -> `{ afterEach, describe, expect, it, vi }`). Then append four tests to the existing describe block, mirroring the harness near lines 1109-1154 (repository(), initDb, new WorkspaceService, ensureSessionWorktree, git(), writeFileSync, existsSync, join). Construct a legacy raw-SHA row by rescue-abandoning then deleting the minted recovery ref and overwriting recovery_ref with the bare SHA. Tests: (a) legacy raw-SHA absent worktree -> upgrade + branch-safe; (b) legacy raw-SHA present worktree -> upgrade + branch-safe; (c) ref-name recovery_ref -> no re-mint, proven by vi.spyOn(database,'prepare') asserting zero UPDATE statements touching recovery_ref during cleanup (updated_at cannot detect this: transitionAssignment always rewrites updated_at); (d) raw-SHA object absent -> throws /preserving it/, row+branch preserved.",
+          "command": "",
+          "expected": "vi added to the import; four new tests added to workspace-service.test.ts"
+        },
+        {
+          "description": "Run only the recovery_ref-tagged tests to confirm RED.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts -t \"recovery_ref\"",
+          "expected": "the two legacy raw-SHA upgrade tests FAIL: current code passes the abandoned proof on the bare SHA, deletes the branch, and mints no refs/ironclaude/recovery/<guid>, so git rev-parse/cat-file on that ref errors."
+        },
+        {
+          "description": "Add refIsDurableRef and ensureDurableRecoveryAnchor as private methods immediately after refResolves (ending :651). refIsDurableRef runs runGit(root,['show-ref','--verify','--quiet',ref]) in try/catch. ensureDurableRecoveryAnchor: throw if !recovery_ref; return current if refIsDurableRef(current); throw if !refResolves(current); else mint refs/ironclaude/recovery/<guid> via runGit update-ref at current, UPDATE assignments SET recovery_ref=?, updated_at=datetime('now') WHERE workspace_guid=?, return the ref name. Then in tombstoneTerminalAssignment insert, after the abandoned/integrated proof if/else block and before `if (present) removeWorktree(...)`: `if (assignment.lifecycle_status === 'abandoned') { this.ensureDurableRecoveryAnchor(repository, assignment); }`.",
+          "command": "",
+          "expected": "workspace-service.ts has both helpers and the call site"
+        },
+        {
+          "description": "Run the full workspace-service test file to confirm GREEN.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts",
+          "expected": "Test Files 1 passed; all tests pass including the four new ones."
+        },
+        {
+          "description": "Stage the source and test files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/workspace-service.ts worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts",
+          "expected": "both files staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Build + full regression + stage dist",
+      "description": "Rebuild the 3 dist bundles from the refactored workspace-service.ts and run the full regression. No tests required: rebuilds generated bundles and runs existing suites.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Build.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build",
+          "expected": "tsc + 3 esbuild bundles; no type errors"
+        },
+        {
+          "description": "workspace-manager suite.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test",
+          "expected": "Test Files 8 passed (8); all green"
+        },
+        {
+          "description": "state-manager suite.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm test",
+          "expected": "Test Files 13 passed (13); Tests 196 passed (196)"
+        },
+        {
+          "description": "Hook suites.",
+          "command": "for t in /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-*.sh; do echo \"== $t ==\"; bash \"$t\" || echo \"SUITE FAILED: $t\"; done",
+          "expected": "each 0 failed; no 'SUITE FAILED'"
+        },
+        {
+          "description": "Build commander pytest batch lists. The absolute ls glob already yields absolute paths, so NO prefix is prepended. Portable split -l; rm -f clears stale batch files; wc -l is in-band proof.",
+          "command": "rm -f /tmp/dra_tests.txt /tmp/dra_batch_* && ls /Users/roberthyatt/Code/ironclaude/commander/tests/test_*.py | sort > /tmp/dra_tests.txt && total=$(wc -l < /tmp/dra_tests.txt) && per=$(( (total + 3) / 4 )) && split -l \"$per\" /tmp/dra_tests.txt /tmp/dra_batch_ && wc -l /tmp/dra_tests.txt /tmp/dra_batch_*",
+          "expected": "4 batch files _aa.._ad, line counts summing to the /tmp/dra_tests.txt total (if only 3 files appear, run only those)."
+        },
+        {
+          "description": "Run commander pytest batches (repeat for _aa,_ab,_ac,_ad as separate Bash calls), excluding destructive tests. The test -s guard aborts rather than silently running the full suite; batch files hold absolute paths so no prefix is added.",
+          "command": "test -s /tmp/dra_batch_aa || { echo \"FATAL: /tmp/dra_batch_aa missing/empty — refusing to run pytest without file args\"; exit 1; } && cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q -m \"not destructive\" $(tr '\\n' ' ' < /tmp/dra_batch_aa)",
+          "expected": "across the batches: 2867 passed, 2 deselected, 0 failed"
+        },
+        {
+          "description": "Stage the 3 dist bundles.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/hook-intent.js",
+          "expected": "3 bundles staged"
+        },
+        {
+          "description": "Return shell cwd to repo root.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude",
+          "expected": "cwd is /Users/roberthyatt/Code/ironclaude"
+        }
+      ]
+    }
+  ]
+}

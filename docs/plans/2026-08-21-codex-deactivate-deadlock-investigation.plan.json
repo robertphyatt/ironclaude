@@ -1,0 +1,47 @@
+{
+  "name": "Codex deactivate-deadlock investigation",
+  "goal": "Prove why $ironclaude:deactivate-professional-mode in Codex session 019fc3b0 did not set professional_mode=off, and write a findings note naming the confirmed root cause (H-A hook-not-run / H-B 0-rows-UPDATE / H-C split-DB / H-D prompt-bytes-mismatch) with the fix direction. Strictly read-only; no code, config, DB, or professional-mode change.",
+  "requirements_file": "docs/plans/2026-08-21-codex-deactivate-deadlock-investigation-requirements.md",
+  "design_file": "docs/plans/2026-08-21-codex-deactivate-deadlock-investigation-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Root-cause the Codex deactivate failure and write the findings note",
+      "description": "Read-only diagnosis. Step 1 (authoritative H-A): is state-activator.sh wired for codex + did it run (state-cache A1 existence/timestamp). Step 2 (H-D): the deactivate branch is gated ONLY by the :138/:144/:148 regexes + empty-prompt exit, NOT hook_event_name (:53 wraps only the human-intent block); extract the operator's deactivate bytes from the rollout JSONL and test locally; capture .prompt/.session_id from logs_2.sqlite if logged. Step 3 (durable branch evidence): audit_log action='professional_mode_off' (success, state-activator.sh:163/:173) + the stdout-only 0-rows warning searched in the codex transcript. Step 4 (H-B vs H-C): STATE_MANAGER_DB_PATH override (hook DB_PATH is hardcoded ~/.claude/ironclaude.db, MCP getDbPath db.ts:30-35) + the sessions row key vs SESSION_TAG (from .session_id, defaults none). Then write docs/plans/2026-08-21-codex-deactivate-deadlock-findings.md naming the confirmed hypothesis with evidence + fix direction. No tests required: read-only diagnosis; values measured live and pasted.",
+      "allowed_files": ["docs/plans/2026-08-21-codex-deactivate-deadlock-findings.md"],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "R1 + A1 (authoritative H-A): grep the codex config + plugin hook manifest for a prompt-submit -> state-activator.sh binding (this wiring is authoritative, not a logs_2 absence). Then cat the state cache (written ONLY by state-activator.sh :214-220 conditional on the sessions row existing) and read its timestamp vs 21:51Z.",
+          "command": "grep -n \"state-activator\" /Users/roberthyatt/.codex/config.toml",
+          "expected": "Whether Codex binds state-activator.sh (record wiring or provable absence, commands shown). Also: ls -la the codex cache root; grep -rn state-activator the codex plugin root; cat /Users/roberthyatt/.claude/ironclaude-state-cache-019fc3b0-2757-7b22-b792-0011f9b29929.json and read timestamp. Timestamp at/after 21:51Z proves the hook ran with the correct key (proves wiring+key, not per-turn). No wiring + no cache -> strong H-A."
+        },
+        {
+          "description": "R2/H-D: the deactivate branch (state-activator.sh:137-151) is gated ONLY by the :138 slash regex, :144 codex-link regex, :148 exact string, plus empty-prompt exit :38-40. The hook_event_name==UserPromptSubmit gate at :53 wraps only the HUMAN_OPERATION block :53-72, NOT deactivation. Extract the operator's deactivate bytes from the rollout JSONL (grep for skills/deactivate-professional-mode/SKILL.md, sed the user input_text line) and test against :138/:144/:148 locally. Also capture .prompt/.session_id from logs_2.sqlite if it logs hook stdin.",
+          "command": "grep -n \"skills/deactivate-professional-mode/SKILL.md\" /Users/roberthyatt/.codex/sessions/2026/08/02/rollout-2026-08-02T12-15-29-019fc3b0-2757-7b22-b792-0011f9b29929.jsonl",
+          "expected": "The exact operator bytes and whether they match :138/:144/:148. H-D = .prompt missing/empty OR bytes match none of the three. hook_event_name must NOT drive the verdict. logs_2 payload capture is bonus (schema via .tables/.schema first, bounded -readonly)."
+        },
+        {
+          "description": "R3a durable branch evidence: the SUCCESS path writes audit_log action='professional_mode_off' (state-activator.sh:163/:173). The 0-rows warning (:166/:176) is stdout-only, searched in the codex transcript (single-term grep). There is no ironclaude hook-log file.",
+          "command": "sqlite3 -readonly /Users/roberthyatt/.claude/ironclaude.db \"SELECT created_at, terminal_session, actor, action, old_value, new_value, context FROM audit_log WHERE action='professional_mode_off' AND terminal_session LIKE '%019fc3b0%';\"",
+          "expected": "The audit row or provable absence, plus: grep -c 'Deactivation UPDATE affected 0 rows' the rollout JSONL. Audit row present -> UPDATE succeeded -> H-C; audit row absent + warning present -> H-B; audit row absent + no warning + hook proven to run -> deactivate branch never fired -> H-D. Success stdout is verbose-gated (absence proves nothing); log_warning is ungated."
+        },
+        {
+          "description": "R3b H-B vs H-C: hook DB_PATH is hardcoded ~/.claude/ironclaude.db (hook-logger.sh:29); the state-manager MCP uses getDbPath (src/db.ts:30-35) = STATE_MANAGER_DB_PATH override else the same file. Check the override for the codex MCP, and read the sessions row key vs SAFE_SESSION (from .session_id, defaults none).",
+          "command": "grep -n \"STATE_MANAGER_DB_PATH\" /Users/roberthyatt/.codex/config.toml",
+          "expected": "Whether STATE_MANAGER_DB_PATH is set for the codex MCP (set + different file -> H-C). Also grep the codex plugin MCP config. Then: sqlite3 -readonly ~/.claude/ironclaude.db SELECT terminal_session, professional_mode, updated_at FROM sessions WHERE terminal_session LIKE '%019fc3b0%' — does the row exist under the exact key the hook's UPDATE targets (mismatch -> H-B)."
+        },
+        {
+          "description": "R4: Write docs/plans/2026-08-21-codex-deactivate-deadlock-findings.md with the ACTUAL Step 1-4 output as evidence, naming the ONE confirmed hypothesis (H-A codex never runs the hook / H-B 0-rows UPDATE session-key mismatch / H-C split-DB STATE_MANAGER_DB_PATH / H-D prompt bytes match none of :138/:144/:148) with evidence for it AND against the others, plus fix direction and any unanswered question.",
+          "command": "",
+          "expected": "The findings note exists and names one confirmed root cause with pasted evidence."
+        },
+        {
+          "description": "Stage the findings note (docs/ gitignored -> -f).",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-08-21-codex-deactivate-deadlock-findings.md",
+          "expected": "The findings note is staged (professional mode blocks commit)."
+        }
+      ]
+    }
+  ]
+}

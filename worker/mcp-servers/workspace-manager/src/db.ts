@@ -48,6 +48,14 @@ function requiredUuid(value: string, label: string): string {
   return value;
 }
 
+const WORKSPACE_SENTINEL_PATTERN = /^primary:.+$/;
+function requiredIntentWorkspaceRef(value: string, label: string): string {
+  if (!UUID_PATTERN.test(value) && !WORKSPACE_SENTINEL_PATTERN.test(value)) {
+    throw new Error(`${label} must be a UUID or a primary-checkout sentinel`);
+  }
+  return value;
+}
+
 function canonicalIsoTimestamp(value: string, label: string): string {
   if (value.length === 0 || Number.isNaN(Date.parse(value))) {
     throw new Error(`${label} must be an ISO timestamp`);
@@ -153,6 +161,60 @@ export function migrateSchema(db: Database.Database): void {
       INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
     `);
   })();
+
+  if (!db.prepare('SELECT 1 FROM schema_migrations WHERE version = 2').get()) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE human_intents_v2 (
+          intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          operation TEXT NOT NULL CHECK (operation IN ('use-primary-checkout', 'return-to-managed-worktree', 'commit', 'commit-and-push', 'push')),
+          human_channel TEXT NOT NULL,
+          provider_root_session_id TEXT NOT NULL,
+          repository_identity TEXT NOT NULL,
+          workspace_guid TEXT NOT NULL,
+          expected_evidence TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          nonce TEXT NOT NULL UNIQUE,
+          issued_at TEXT NOT NULL DEFAULT (datetime('now')),
+          consumed_at TEXT
+        );
+        INSERT INTO human_intents_v2 (intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at)
+          SELECT intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at FROM human_intents WHERE workspace_guid IS NOT NULL;
+        DROP TABLE human_intents;
+        ALTER TABLE human_intents_v2 RENAME TO human_intents;
+        CREATE INDEX IF NOT EXISTS human_intents_lookup_idx
+          ON human_intents(operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, nonce);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (2);
+      `);
+    })();
+  }
+
+  if (!db.prepare('SELECT 1 FROM schema_migrations WHERE version = 3').get()) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE human_intents_v3 (
+          intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          operation TEXT NOT NULL CHECK (operation IN ('use-primary-checkout', 'return-to-managed-worktree', 'commit', 'commit-and-push', 'push', 'reconcile', 'close-out')),
+          human_channel TEXT NOT NULL,
+          provider_root_session_id TEXT NOT NULL,
+          repository_identity TEXT NOT NULL,
+          workspace_guid TEXT NOT NULL,
+          expected_evidence TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          nonce TEXT NOT NULL UNIQUE,
+          issued_at TEXT NOT NULL DEFAULT (datetime('now')),
+          consumed_at TEXT
+        );
+        INSERT INTO human_intents_v3 (intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at)
+          SELECT intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at FROM human_intents;
+        DROP TABLE human_intents;
+        ALTER TABLE human_intents_v3 RENAME TO human_intents;
+        CREATE INDEX IF NOT EXISTS human_intents_lookup_idx
+          ON human_intents(operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, nonce);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (3);
+      `);
+    })();
+  }
 }
 
 export function initDb(dbPath?: string): Database.Database {
@@ -301,7 +363,14 @@ export function reapStalePrimaryOwner(db: Database.Database, repositoryIdentity:
     DELETE FROM primary_checkout_owners
     WHERE repository_identity = ? AND workspace_guid = ? AND owner_session_id = ? AND acquired_at = ?
   `).run(repositoryIdentity, owner.workspace_guid, owner.owner_session_id, owner.acquired_at);
-  return result.changes === 1;
+  const reclaimed = result.changes === 1;
+  // Observability only, protocol-clean: this server's stdout is the MCP stdio
+  // transport (see index.ts's StdioServerTransport), so any log must go to
+  // stderr via console.error, never console.log/stdout.
+  if (reclaimed) {
+    console.error('reapStalePrimaryOwner: reclaimed stale primary-checkout owner');
+  }
+  return reclaimed;
 }
 
 export function acquirePrimaryCheckoutOwnership(
@@ -407,7 +476,7 @@ export function createHumanIntent(db: Database.Database, input: CreateHumanInten
     requiredText(input.humanChannel, 'humanChannel'),
     requiredText(input.providerRootSessionId, 'providerRootSessionId'),
     requiredText(input.repositoryIdentity, 'repositoryIdentity'),
-    requiredUuid(input.workspaceGuid, 'workspaceGuid'),
+    requiredIntentWorkspaceRef(input.workspaceGuid, 'workspaceGuid'),
     canonicalJson(input.expectedEvidence),
     expiresAt,
     requiredText(input.nonce, 'nonce'),

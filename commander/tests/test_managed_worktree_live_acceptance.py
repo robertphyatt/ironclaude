@@ -45,7 +45,7 @@ def test_live_acceptance_uses_real_git_evidence_and_six_scenarios(tmp_path):
         "direct_isolation",
         "commander_integration",
         "conflict_recovery",
-        "primary_fencing_no_push",
+        "unrelated_primary_owner_no_push",
     }
     assert all(item["status"] == "PASS" for item in payload["scenarios"].values())
     isolation = payload["scenarios"]["direct_isolation"]["evidence"]
@@ -56,16 +56,21 @@ def test_live_acceptance_uses_real_git_evidence_and_six_scenarios(tmp_path):
     assert isolation["worktrees_removed"] is True
     integration = payload["scenarios"]["commander_integration"]["evidence"]
     assert all(len(oid) == 40 for oid in integration["integrated_commits"])
-    assert integration["worktrees_removed"] is True
+    assert integration["recycled_heads"] == integration["integrated_commits"]
+    assert integration["worktrees_recycled"] is True
+    assert integration["recycled_clean"] is True
     conflict = payload["scenarios"]["conflict_recovery"]["evidence"]
     assert conflict["first_attempt_preserved"] is True
     assert len(conflict["repaired_commit"]) == 40
-    fencing = payload["scenarios"]["primary_fencing_no_push"]["evidence"]
-    assert fencing["ownership_row_observed"] is True
-    assert fencing["fenced_attempt_preserved"] is True
-    assert "fenced while primary checkout is owned" in fencing["fenced_error"]
-    assert fencing["ownership_released"] is True
-    assert fencing["finalized_after_resume"] is True
+    assert conflict["repaired_worktree_recycled"] is True
+    assert conflict["repaired_worktree_clean"] is True
+    coexistence = payload["scenarios"]["unrelated_primary_owner_no_push"]["evidence"]
+    assert coexistence["owner_row_observed"] is True
+    assert coexistence["owner_row_unchanged"] is True
+    assert len(coexistence["owner_workspace_guid"]) == 36
+    assert len(coexistence["worker_integrated_commit"]) == 40
+    assert coexistence["worker_recycled_clean"] is True
+    assert coexistence["remote_count"] == 0
 
 
 def test_live_acceptance_contains_no_mock_success_escape_hatch():

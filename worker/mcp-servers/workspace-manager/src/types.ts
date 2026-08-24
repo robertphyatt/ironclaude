@@ -95,7 +95,9 @@ export type HumanIntentOperation =
   | 'return-to-managed-worktree'
   | 'commit'
   | 'commit-and-push'
-  | 'push';
+  | 'push'
+  | 'reconcile'
+  | 'close-out';
 
 export interface HumanIntent {
   intent_id: number;

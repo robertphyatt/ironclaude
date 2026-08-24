@@ -1,0 +1,231 @@
+{
+  "name": "Direct-Human Professional-Mode Deactivation Availability",
+  "goal": "Make exact direct-human professional-mode deactivation succeed through a stable authenticated runtime or a trusted emergency closure without disposable cache-path vetoes.",
+  "requirements_file": "docs/plans/2026-08-18-direct-human-pm-deactivation-availability-requirements.md",
+  "design_file": "docs/plans/2026-08-18-direct-human-pm-deactivation-availability-design.md",
+  "plan_file": "docs/plans/2026-08-18-direct-human-pm-deactivation-availability.md",
+  "machine_plan_file": "docs/plans/2026-08-18-direct-human-pm-deactivation-availability.plan.json",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Add durable provider bindings, generation leases, and trusted closure",
+      "description": "Persist exact provider-root session/runtime identity, lease in-flight generations, and define one canonical primary/emergency deactivation transaction.",
+      "allowed_files": [
+        "worker/mcp-servers/state-manager/src/provider-runtime-bindings.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/provider-runtime-bindings.test.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/provider-runtime-bindings.mutation.test.ts",
+        "worker/mcp-servers/state-manager/src/provider-installation-observations.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/provider-installation-observations.test.ts",
+        "worker/mcp-servers/state-manager/src/stable-runtime-generations.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/stable-runtime-generations.test.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/stable-runtime-generations.mutation.test.ts",
+        "worker/mcp-servers/state-manager/src/provider-runtime-leases.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/provider-runtime-leases.test.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/provider-runtime-leases.mutation.test.ts",
+        "worker/mcp-servers/state-manager/src/trusted-deactivation-fallback.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/trusted-deactivation-fallback.test.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/trusted-deactivation-fallback.mutation.test.ts",
+        "worker/mcp-servers/state-manager/src/db.ts",
+        "worker/mcp-servers/state-manager/src/types.ts",
+        "worker/mcp-servers/state-manager/src/mode-transition-hook.ts",
+        "worker/mcp-servers/state-manager/src/professional-mode-epochs.ts",
+        "worker/mcp-servers/state-manager/src/session-identity.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/session-identity.test.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/professional-mode-epochs.test.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/professional-mode-epochs.mutation.test.ts",
+        "worker/mcp-servers/state-manager/dist/index.js",
+        "worker/mcp-servers/state-manager/dist/mode-transition-hook.js"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Write RED real-database binding, lease, emergency-closure, identity, idempotency, concurrency, and mutation tests.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/__tests__/provider-runtime-bindings.test.ts src/__tests__/provider-runtime-bindings.mutation.test.ts src/__tests__/provider-installation-observations.test.ts src/__tests__/stable-runtime-generations.test.ts src/__tests__/stable-runtime-generations.mutation.test.ts src/__tests__/provider-runtime-leases.test.ts src/__tests__/provider-runtime-leases.mutation.test.ts src/__tests__/trusted-deactivation-fallback.test.ts src/__tests__/trusted-deactivation-fallback.mutation.test.ts src/__tests__/professional-mode-epochs.test.ts src/__tests__/professional-mode-epochs.mutation.test.ts src/__tests__/session-identity.test.ts",
+          "expected": "Nonzero exit from missing modules/schema and unmet lease/fallback assertions; record exact failures."
+        },
+        {
+          "description": "Implement digest-bound runtime bindings, separate installation observations, DB-authoritative prepared/committed generations and heads, fenced leases, replay-safe session attachment, and one canonical primary/emergency epoch-mode-audit transaction.",
+          "expected": "Established trusted UserPromptSubmit authority remains unchanged; no public off tool or general raw SQL fallback."
+        },
+        {
+          "description": "Run focused GREEN, typecheck, and production mutations.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/__tests__/provider-runtime-bindings.test.ts src/__tests__/provider-runtime-bindings.mutation.test.ts src/__tests__/provider-installation-observations.test.ts src/__tests__/stable-runtime-generations.test.ts src/__tests__/stable-runtime-generations.mutation.test.ts src/__tests__/provider-runtime-leases.test.ts src/__tests__/provider-runtime-leases.mutation.test.ts src/__tests__/trusted-deactivation-fallback.test.ts src/__tests__/trusted-deactivation-fallback.mutation.test.ts src/__tests__/professional-mode-epochs.test.ts src/__tests__/professional-mode-epochs.mutation.test.ts src/__tests__/pm-deactivation-audit.test.ts src/__tests__/session-identity.test.ts && npx tsc --noEmit",
+          "expected": "Exit zero; session, digest, lease, fallback provenance, and transaction mutations each make their targeted test fail before restoration."
+        },
+        {
+          "description": "Build tracked bundles, stage exact Task 1 paths, and validate cached diff.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm run build && npm run bundle:mode-transition-hook",
+          "expected": "Exit zero; tracked bundles contain binding, lease, and trusted-closure markers."
+        },
+        {
+          "description": "Stage the exact Task 1 allowlist and validate cached diff.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -- worker/mcp-servers/state-manager/src/provider-runtime-bindings.ts worker/mcp-servers/state-manager/src/__tests__/provider-runtime-bindings.test.ts worker/mcp-servers/state-manager/src/__tests__/provider-runtime-bindings.mutation.test.ts worker/mcp-servers/state-manager/src/provider-installation-observations.ts worker/mcp-servers/state-manager/src/__tests__/provider-installation-observations.test.ts worker/mcp-servers/state-manager/src/stable-runtime-generations.ts worker/mcp-servers/state-manager/src/__tests__/stable-runtime-generations.test.ts worker/mcp-servers/state-manager/src/__tests__/stable-runtime-generations.mutation.test.ts worker/mcp-servers/state-manager/src/provider-runtime-leases.ts worker/mcp-servers/state-manager/src/__tests__/provider-runtime-leases.test.ts worker/mcp-servers/state-manager/src/__tests__/provider-runtime-leases.mutation.test.ts worker/mcp-servers/state-manager/src/trusted-deactivation-fallback.ts worker/mcp-servers/state-manager/src/__tests__/trusted-deactivation-fallback.test.ts worker/mcp-servers/state-manager/src/__tests__/trusted-deactivation-fallback.mutation.test.ts worker/mcp-servers/state-manager/src/db.ts worker/mcp-servers/state-manager/src/types.ts worker/mcp-servers/state-manager/src/mode-transition-hook.ts worker/mcp-servers/state-manager/src/professional-mode-epochs.ts worker/mcp-servers/state-manager/src/session-identity.ts worker/mcp-servers/state-manager/src/__tests__/session-identity.test.ts worker/mcp-servers/state-manager/src/__tests__/professional-mode-epochs.test.ts worker/mcp-servers/state-manager/src/__tests__/professional-mode-epochs.mutation.test.ts worker/mcp-servers/state-manager/dist/index.js worker/mcp-servers/state-manager/dist/mode-transition-hook.js && git -C /Users/roberthyatt/Code/ironclaude diff --cached --check",
+          "expected": "Exit zero; no Task 1 path remains unstaged."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Deploy a leased stable transition generation and connect trusted hooks",
+      "description": "Package the verified transition/native closure under an atomic version-independent generation, embed the emergency closure in the trusted hook, and make hooks, diagnostics, provider startup, and Commander deploy it consistently.",
+      "allowed_files": [
+        "worker/mcp-servers/state-manager/cli/stable-transition-runtime.js",
+        "worker/mcp-servers/state-manager/scripts/build-trusted-deactivation-fallback.mjs",
+        "worker/mcp-servers/state-manager/src/__tests__/stable-transition-runtime.test.ts",
+        "worker/mcp-servers/state-manager/cli/mcp-server-wrapper.js",
+        "worker/mcp-servers/state-manager/package.json",
+        "worker/mcp-servers/state-manager/src/runtime-fingerprint.ts",
+        "worker/mcp-servers/state-manager/src/tools/read-tools.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/runtime-fingerprint.test.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/run-diagnostics.test.ts",
+        "worker/mcp-servers/state-manager/dist/index.js",
+        "worker/mcp-servers/state-manager/dist/mode-transition-hook.js",
+        "worker/mcp-servers/state-manager/dist/trusted-deactivation-fallback.js",
+        "worker/hooks/state-activator.sh",
+        "worker/hooks/session-init.sh",
+        "worker/hooks/tests/test-professional-mode-deactivation.sh",
+        "worker/hooks/tests/test-git-authority-activation.sh",
+        "worker/hooks/tests/test-professional-mode-off-authority.sh",
+        "Makefile",
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_main_validate.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Write RED generation packaging, manifest, lease retention, atomic swap, stale-root, path-escape, emergency fallback, and diagnostics tests; record the stale-root rejection baseline as testing theatre.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/__tests__/stable-transition-runtime.test.ts src/__tests__/runtime-fingerprint.test.ts src/__tests__/run-diagnostics.test.ts src/__tests__/provider-runtime-leases.test.ts src/__tests__/trusted-deactivation-fallback.test.ts",
+          "expected": "Nonzero exit before deployer, lease retention, fallback build, and diagnostics behavior exist."
+        },
+        {
+          "description": "Implement manifest-verified stable generations, atomic current/last-known-good publication, active execution leases, safe cleanup, generated hook-embedded emergency closure, and provider-startup deployment.",
+          "expected": "No newest-cache execution authority; all generation bytes are manifest-bound and self-tested; no in-use generation can be removed."
+        },
+        {
+          "description": "Replace cache-root deactivation veto with exact-session stable binding and trusted emergency closure while preserving exact prompt/provenance matching.",
+          "expected": "Stale legitimate roots and runtime failures deactivate; forged, agent, Commander, cross-session, and missing-session paths cannot."
+        },
+        {
+          "description": "Run exact state-manager GREEN and typecheck.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/__tests__/stable-transition-runtime.test.ts src/__tests__/runtime-fingerprint.test.ts src/__tests__/run-diagnostics.test.ts src/__tests__/provider-runtime-bindings.test.ts src/__tests__/provider-runtime-leases.test.ts src/__tests__/trusted-deactivation-fallback.test.ts src/__tests__/professional-mode-epochs.test.ts && npx tsc --noEmit",
+          "expected": "Exit zero; every listed file appears in the terminal summary."
+        },
+        {
+          "description": "Run exact hook and Commander GREEN, including generation-race and fallback negative controls.",
+          "command": "bash -n /Users/roberthyatt/Code/ironclaude/worker/hooks/state-activator.sh && bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-professional-mode-deactivation.sh && bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-git-authority-activation.sh && bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-professional-mode-off-authority.sh && cd /Users/roberthyatt/Code/ironclaude && commander/.venv/bin/python -m pytest commander/tests/test_main_validate.py::TestDeployWorkerHooks commander/tests/test_deactivation_client_parity.py -q",
+          "expected": "Exit zero with zero hook failures; in-use generation survives supersession/cleanup; partial generation, drift, and unauthorized fallback fail before mode mutation."
+        },
+        {
+          "description": "Build all transition artifacts, stage exact Task 2 paths, and validate cached diff.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm run build && npm run bundle:mode-transition-hook && npm run build:trusted-deactivation-fallback",
+          "expected": "Exit zero; generated fallback parity passes."
+        },
+        {
+          "description": "Stage the exact Task 2 allowlist and validate cached diff.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -- worker/mcp-servers/state-manager/cli/stable-transition-runtime.js worker/mcp-servers/state-manager/scripts/build-trusted-deactivation-fallback.mjs worker/mcp-servers/state-manager/src/__tests__/stable-transition-runtime.test.ts worker/mcp-servers/state-manager/cli/mcp-server-wrapper.js worker/mcp-servers/state-manager/package.json worker/mcp-servers/state-manager/src/runtime-fingerprint.ts worker/mcp-servers/state-manager/src/tools/read-tools.ts worker/mcp-servers/state-manager/src/__tests__/runtime-fingerprint.test.ts worker/mcp-servers/state-manager/src/__tests__/run-diagnostics.test.ts worker/mcp-servers/state-manager/dist/index.js worker/mcp-servers/state-manager/dist/mode-transition-hook.js && git -C /Users/roberthyatt/Code/ironclaude add -f -- worker/mcp-servers/state-manager/dist/trusted-deactivation-fallback.js && git -C /Users/roberthyatt/Code/ironclaude add -- worker/hooks/state-activator.sh worker/hooks/session-init.sh worker/hooks/tests/test-professional-mode-deactivation.sh worker/hooks/tests/test-git-authority-activation.sh worker/hooks/tests/test-professional-mode-off-authority.sh Makefile commander/src/ironclaude/main.py commander/tests/test_main_validate.py && git -C /Users/roberthyatt/Code/ironclaude diff --cached --check",
+          "expected": "Exit zero; no Task 2 path remains unstaged."
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Add provider-native acceptance, runtime oracle, and documentation",
+      "description": "Prove real Claude/Codex deactivation from independent DB, runtime, trace, and Git evidence; build an executable final-byte oracle; document the stable boundary and deferred permission-propagation rule.",
+      "allowed_files": [
+        "commander/scripts/live_pm_deactivation_provider_response.py",
+        "commander/tests/test_live_pm_deactivation_provider_response.py",
+        "commander/scripts/build_pm_deactivation_runtime_oracle.py",
+        "commander/tests/test_pm_deactivation_runtime_oracle.py",
+        "commander/scripts/verify_installed_pm_deactivation_runtime.py",
+        "commander/tests/test_verify_installed_pm_deactivation_runtime.py",
+        "commander/scripts/reinstall_pm_deactivation_runtime.py",
+        "commander/tests/test_reinstall_pm_deactivation_runtime.py",
+        "worker/skills/deactivate-professional-mode/SKILL.md",
+        "commander/tests/test_deactivation_client_parity.py",
+        "README.md",
+        "CHANGELOG.md",
+        "docs/plans/2026-07-20-v1-1-overall-roadmap.md"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "Write RED fresh-provider harness and runtime-oracle contracts for isolated DB/Git/runtime fixtures, one session per fixture, no retries, and independent evidence.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude && commander/.venv/bin/python -m pytest commander/tests/test_live_pm_deactivation_provider_response.py commander/tests/test_pm_deactivation_runtime_oracle.py commander/tests/test_verify_installed_pm_deactivation_runtime.py commander/tests/test_reinstall_pm_deactivation_runtime.py -q",
+          "expected": "Nonzero exit before harness/oracle exist, then RED verifier assertions until all real evidence checks are implemented."
+        },
+        {
+          "description": "Implement Claude/Codex fixtures, closed runtime-oracle build/verify, installed-runtime receipt verification, and preflighted recoverable release coordinator without running live inference or installation in this task.",
+          "expected": "Self-report, missing trace, retry, Git drift, duplicate authority, missing oracle field, wrong helper hash, unsafe phase ordering, or final-byte mismatch fails."
+        },
+        {
+          "description": "Update skill, parity tests, README, changelog, and roadmap with stable bridge, emergency closure, leases, human-only reporting, and deferred no-redundant-permission backlog rule.",
+          "expected": "Wave 25 remains in progress until Task 4 A/B receipt; scope does not implement later roadmap waves."
+        },
+        {
+          "description": "Run focused pytest GREEN, repeat all Task 1-3 focused checks, stage exact paths, and validate cached diff.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude && commander/.venv/bin/python -m pytest commander/tests/test_live_pm_deactivation_provider_response.py commander/tests/test_pm_deactivation_runtime_oracle.py commander/tests/test_verify_installed_pm_deactivation_runtime.py commander/tests/test_reinstall_pm_deactivation_runtime.py commander/tests/test_deactivation_client_parity.py commander/tests/test_version_consistency.py -q",
+          "expected": "Exit zero; cached diff check passes; no unstaged Task 3 path remains."
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Build final bytes, verify, release, and prove the fresh runtime",
+      "description": "Declare the A/B completion gate, apply one cachebuster, build and verify final bytes, run each provider fixture once, reinstall last, and prove the loaded runtime before task review.",
+      "allowed_files": [
+        "worker/.codex-plugin/plugin.json",
+        "worker/mcp-servers/state-manager/dist/index.js",
+        "worker/mcp-servers/state-manager/dist/mode-transition-hook.js",
+        "worker/mcp-servers/state-manager/dist/trusted-deactivation-fallback.js",
+        "docs/plans/2026-07-20-v1-1-overall-roadmap.md"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {
+          "description": "Before installation, declare the roadmap completion gate, replace the Codex suffix once, and rebuild every tracked/generated runtime artifact.",
+          "command": "python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/update_plugin_cachebuster.py /Users/roberthyatt/Code/ironclaude/worker && cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm run build && npm run bundle:mode-transition-hook && npm run verify:trusted-deactivation-fallback",
+          "expected": "Base 1.1.6 preserved; one new cachebuster; roadmap says Wave 25 completes only from Task 4 A/B; no later repository artifact byte mutation follows."
+        },
+        {
+          "description": "Validate final plugin/version bytes and build then independently verify the exact runtime oracle.",
+          "command": "/usr/bin/python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py /Users/roberthyatt/Code/ironclaude/worker && cd /Users/roberthyatt/Code/ironclaude && commander/.venv/bin/python -m pytest commander/tests/test_version_consistency.py commander/tests/test_pm_deactivation_runtime_oracle.py commander/tests/test_verify_installed_pm_deactivation_runtime.py commander/tests/test_reinstall_pm_deactivation_runtime.py -q && commander/.venv/bin/python commander/scripts/build_pm_deactivation_runtime_oracle.py --source-root /Users/roberthyatt/Code/ironclaude --output /private/tmp/direct-human-pm-deactivation-expected-runtime.json && commander/.venv/bin/python commander/scripts/build_pm_deactivation_runtime_oracle.py --source-root /Users/roberthyatt/Code/ironclaude --verify /private/tmp/direct-human-pm-deactivation-expected-runtime.json",
+          "expected": "Every command exits zero; oracle contains nonempty final-byte hashes for both provider manifests, bundles, stable manifest, native closure, fallback payload, and cachebuster."
+        },
+        {
+          "description": "Run the complete repository suite against the final cachebusted bytes and capture terminal success.",
+          "command": "make -C /Users/roberthyatt/Code/ironclaude test",
+          "expected": "Terminal exit zero from hooks, complete state-manager, workspace-manager, and Commander suites; partial output is not success."
+        },
+        {
+          "description": "Run every fresh Claude/Codex positive, negative, emergency-fallback, and lease-race fixture once with no retry before installation.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude && commander/.venv/bin/python commander/scripts/live_pm_deactivation_provider_response.py --client all --source-root /Users/roberthyatt/Code/ironclaude",
+          "expected": "Every fixture passes from independent evidence; no retry, self-report substitution, or operator handback."
+        },
+        {
+          "description": "Stage exact release paths and validate the final candidate.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -- worker/.codex-plugin/plugin.json worker/mcp-servers/state-manager/dist/index.js worker/mcp-servers/state-manager/dist/mode-transition-hook.js && git -C /Users/roberthyatt/Code/ironclaude add -f -- worker/mcp-servers/state-manager/dist/trusted-deactivation-fallback.js && git -C /Users/roberthyatt/Code/ironclaude add -- docs/plans/2026-07-20-v1-1-overall-roadmap.md && git -C /Users/roberthyatt/Code/ironclaude diff --cached --check",
+          "expected": "Exit zero; no unstaged Task 4 path remains."
+        },
+        {
+          "description": "Preflight the recoverable release coordinator, known-good identities, helper hash, oracle custody, credentials, disk, and phase stop rules before mutation.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude && commander/.venv/bin/python commander/scripts/reinstall_pm_deactivation_runtime.py --source-root /Users/roberthyatt/Code/ironclaude --restart-script /private/tmp/restart_codex.py --restart-script-sha256 d09cc042bdac54f8fb87eb1a021724fe28b42b355690bdd97999fa2a8a16c38f --oracle /private/tmp/direct-human-pm-deactivation-expected-runtime.json --preflight-only --receipt /private/tmp/wave25-install-preflight.json",
+          "expected": "Exit zero; no mutation; receipt proves every prerequisite and exact recovery identity."
+        },
+        {
+          "description": "Launch the sole external release coordinator as the final source/plugin/runtime mutation and execute no later command in the old Codex process.",
+          "command": "/usr/bin/python3 -c 'import subprocess; subprocess.Popen([\"/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python\", \"/Users/roberthyatt/Code/ironclaude/commander/scripts/reinstall_pm_deactivation_runtime.py\", \"--source-root\", \"/Users/roberthyatt/Code/ironclaude\", \"--restart-script\", \"/private/tmp/restart_codex.py\", \"--restart-script-sha256\", \"d09cc042bdac54f8fb87eb1a021724fe28b42b355690bdd97999fa2a8a16c38f\", \"--oracle\", \"/private/tmp/direct-human-pm-deactivation-expected-runtime.json\", \"--execute\", \"--timeout-seconds\", \"180\", \"--receipt\", \"/private/tmp/wave25-install-receipt.json\"], start_new_session=True, stdout=open(\"/private/tmp/wave25-install.log\", \"ab\"), stderr=subprocess.STDOUT)'",
+          "expected": "Coordinator performs Claude recovery-aware install, Codex add, restart, readiness, and receipt phases in order; fresh task resumes after restart."
+        },
+        {
+          "description": "In the fresh task, run exact installed-runtime verifiers for Claude and Codex, then submit and review Task 4.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude && commander/.venv/bin/python commander/scripts/verify_installed_pm_deactivation_runtime.py --client claude --oracle /private/tmp/direct-human-pm-deactivation-expected-runtime.json --install-receipt /private/tmp/wave25-install-receipt.json --receipt /private/tmp/wave25-claude-installed-proof.json && commander/.venv/bin/python commander/scripts/verify_installed_pm_deactivation_runtime.py --client codex --oracle /private/tmp/direct-human-pm-deactivation-expected-runtime.json --install-receipt /private/tmp/wave25-install-receipt.json --receipt /private/tmp/wave25-codex-installed-proof.json",
+          "expected": "Claude and Codex each prove exact mode/epoch/audit/preservation evidence; Grade A or B resolves the predeclared Wave 25 completion gate."
+        },
+        {
+          "description": "Advance only the thread plan to Wave 26 and begin its brainstorming without repository mutation, commit, or push.",
+          "expected": "Wave 25 workflow is execution_complete; Wave 26 is sole in-progress goal step."
+        }
+      ]
+    }
+  ]
+}

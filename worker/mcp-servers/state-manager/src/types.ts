@@ -57,6 +57,7 @@ export interface Session {
   review_pending: number;
   review_block_count: number;
   plan_lineage: number;
+  inherit_review: number;
   circuit_breaker: number;
   memory_search_required: number;
   testing_theatre_checked: number;

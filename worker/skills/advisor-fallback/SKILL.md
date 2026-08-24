@@ -39,6 +39,11 @@ Dispatch a fresh, blind subagent with the `Agent` tool (`subagent_type="general-
 to pressure-test. Have it follow the `ironclaude:adversarial-review` methodology (orientation → deep read
 → verify every finding with grep/read evidence, drop the unverified → severity-classified, report-only).
 
+Before dispatch, read `worker/skills/write-lossless-ai-messages/SKILL.md`. Prepend its exact complete
+skill content to the reviewer prompt, ahead of task, evidence, and questions. The programmatic load does
+not activate an interactive worker skill: do not include `IC_LOSSLESS_AI_MESSAGES_ACTIVE` in the prompt or
+report. Keep the report natural-language and lossless; this grants no new tools.
+
 **Claude tier ladder (one tier up):** `sonnet → opus`, `opus → fable`, `fable → (top tier — skip; no
 higher advisor)`. If the resolved model is `fable` and Fable is unavailable, use `opus` (read the flag at
 `IRONCLAUDE_FABLE_STATE_PATH` if set else `~/.ironclaude/state/fable_unavailable.json`; on any read error
@@ -55,6 +60,10 @@ codex exec --json --ephemeral --skip-git-repo-check -s read-only -m <ONE_TIER_UP
 ```
 
 - Deliver the adversarial-review instruction + the code/diff under review on **stdin** (trailing `-`).
+- Before constructing stdin, read `worker/skills/write-lossless-ai-messages/SKILL.md` and prepend its exact
+  complete skill content ahead of the adversarial-review instruction and inline code/diff. Programmatic
+  loading must not add `IC_LOSSLESS_AI_MESSAGES_ACTIVE` to the reviewer prompt or output. This grants no
+  new tools.
 - Read the findings from the **last** `item.completed` event whose `item.type == "agent_message"`, field
   `.text` (the model may emit intermediate narration; take the last agent_message). Without `--json` the
   response text is printed directly — either form works; `--json` + last-`agent_message` is the reliable

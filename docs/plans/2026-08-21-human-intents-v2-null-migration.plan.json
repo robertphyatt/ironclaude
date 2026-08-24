@@ -1,0 +1,45 @@
+{
+  "name": "human_intents v2 migration NULL-guid tolerance (Loop 0)",
+  "goal": "Make the workspace-manager v2 migration NULL-tolerant so a legacy NULL-guid human_intents row no longer crashes every workspace-manager call.",
+  "requirements_file": "docs/plans/2026-08-21-human-intents-v2-null-migration-requirements.md",
+  "design_file": "docs/plans/2026-08-21-human-intents-v2-null-migration-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Make the v2 migration NULL-tolerant (TDD)",
+      "description": "Add WHERE workspace_guid IS NOT NULL to the v2 migration INSERT..SELECT (db.ts:182) so a legacy NULL-guid human_intents row is dropped instead of crashing the migration on the new NOT NULL. Guard with a regression test using a legacy NULLABLE human_intents fixture (the existing V1_DDL at db.test.ts:457-462 is NOT NULL and cannot reproduce the crash). Tests run against src via vitest (no build needed for TDD); build+deploy is post-commit. Filter workspace_guid only; do not reintroduce the FK or touch other logic.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/db.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/db.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED. Append to worker/mcp-servers/workspace-manager/src/__tests__/db.test.ts (after the existing 'human_intents FK-drop migration (v2)' describe block, near line 480) a LEGACY_NULLABLE_HUMAN_INTENTS_DDL (schema_migrations + a human_intents whose workspace_guid is NULLABLE, no FK + INSERT version 1) and a describe/it 'drops NULL-guid rows and migrates without crashing': new Database(':memory:'), pragma foreign_keys=ON, exec the DDL, insert one valid row (nonce keep-valid, a UUID guid) and one NULL-guid row (nonce dead-null), call migrateSchema(database), then assert schema_migrations versions == [1,2], the keep-valid row survives, COUNT of NULL workspace_guid rows == 0, and a sentinel 'primary:/repo' insert does not throw. Exact code in the human plan Task 1 Step 1.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test",
+          "expected": "Run ends non-zero (RED): the new test fails because migrateSchema throws a NOT NULL constraint error copying the NULL-guid row into human_intents_v2. Every pre-existing test still passes. Proves the new check can fail."
+        },
+        {
+          "description": "GREEN. In worker/mcp-servers/workspace-manager/src/db.ts line 182, append ' WHERE workspace_guid IS NOT NULL' to the v2 migration copy SELECT so it reads '... consumed_at FROM human_intents WHERE workspace_guid IS NOT NULL;'. Only the trailing WHERE is added; FK stays dropped; no other line changes.",
+          "command": "",
+          "expected": "db.ts:182 SELECT now ends with 'FROM human_intents WHERE workspace_guid IS NOT NULL;'; no other line changed."
+        },
+        {
+          "description": "GREEN verify. Run the full workspace-manager vitest suite.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test",
+          "expected": "Exit 0, 0 failures. The new test passes and every pre-existing test still passes, including the existing v2 test (db.test.ts:465-479) whose non-NULL row copies byte-identically under the WHERE filter."
+        },
+        {
+          "description": "Stage both source files (professional mode blocks commit; the human commits). Do NOT stage anything else; plan docs stay unstaged until after the next step's check.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/db.ts worker/mcp-servers/workspace-manager/src/__tests__/db.test.ts",
+          "expected": "Both files staged."
+        },
+        {
+          "description": "No-regression evidence bounded to the two source files. With only those two staged, run the UNFILTERED staged diff (no pathspec, so a stray third staged file appears and fails the check - falsifiable). dist is gitignored so the commit is source-only.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --staged --name-only",
+          "expected": "Exactly the two lines worker/mcp-servers/workspace-manager/src/db.ts and worker/mcp-servers/workspace-manager/src/__tests__/db.test.ts and nothing else staged; no other source touched, so no other suite can regress."
+        }
+      ]
+    }
+  ]
+}

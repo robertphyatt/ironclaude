@@ -48,11 +48,10 @@ def test_directive_in_activation_skill():
     assert text.count("just reason it through") >= 2          # full template block + Concept 9 block
     assert "| 9 | Advisor Fallback |" in text                 # concept-detection table row (propagation vector)
     assert "Concept 9 (Advisor Fallback):" in text            # append-path canonical block header
-    # v1.0.24 added an 11th concept (Boy Scout Rule) after No Workflow Avoidance Under Stage/Context
-    # Restrictions) — count strings track the whole rule set, not the Advisor
-    # Fallback rule specifically. Kept as pins so a future edit that adds a
-    # concept but forgets to bump the count is caught.
-    assert "11 concepts" in text                               # count string bumped 10 -> 11
-    assert "(11 principles)" in text                           # count string bumped 10 -> 11
-    assert "11-principle template" in text                     # cross-references bumped 10 -> 11
+    # Communication Profiles adds a 12th concept after Boy Scout Rule. Count
+    # strings track the whole rule set, not Advisor Fallback specifically.
+    # Keep these pins so future concept additions must update every count.
+    assert "12 concepts" in text
+    assert "(12 principles)" in text
+    assert "12-principle template" in text
     assert PRIMARY in text and FALLBACK in text                # tier-relative fallback named

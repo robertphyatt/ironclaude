@@ -157,7 +157,7 @@ describe('submit_tier_up_review', () => {
     expect(db.prepare('SELECT * FROM audit_log ORDER BY id').all()).toEqual(beforeAudit);
   });
 
-  it('accepts advisor-remediated only after same-lineage HAS-ISSUES', () => {
+  it('accepts advisor-remediated only after a same-lineage canonical blind review', () => {
     seed(db, 'final_plan_prep');
     handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'HAS-ISSUES' }, db, SESSION_ID);
     db.prepare('UPDATE sessions SET plan_json=? WHERE terminal_session=?')
@@ -169,7 +169,7 @@ describe('submit_tier_up_review', () => {
     const beforeReviews = db.prepare('SELECT * FROM tier_up_reviews ORDER BY id').all();
     const beforeAudit = db.prepare('SELECT * FROM audit_log ORDER BY id').all();
     const crossLineage = parse(handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'advisor-remediated' }, db, SESSION_ID));
-    expect(crossLineage.error).toContain('prior HAS-ISSUES');
+    expect(crossLineage.error).toContain('prior canonical blind review');
     expect(db.prepare('SELECT * FROM tier_up_reviews ORDER BY id').all()).toEqual(beforeReviews);
     expect(db.prepare('SELECT * FROM audit_log ORDER BY id').all()).toEqual(beforeAudit);
   });
@@ -269,6 +269,26 @@ describe('start_execution — tier-up gate', () => {
       expectReviewAndAuditUnchanged(before);
     },
   );
+
+  it('decision C: advisor-remediated on a passing (SOLID) base at a changed hash unlocks start_execution', () => {
+    setPolicy('enforced');
+    // Canonical SOLID at the original hash.
+    handleWriteTool('submit_tier_up_review', { reviewer_model: 'opus', verdict: 'SOLID' }, db, SESSION_ID);
+    // Plan changes (e.g. a post-retreat allowed_files fix) -> new hash.
+    const changed = JSON.stringify({ name: 'changed', goal: 'g', design_file: 'd-design.md', tasks: [] });
+    db.prepare('UPDATE sessions SET plan_json=? WHERE terminal_session=?').run(changed, SESSION_ID);
+
+    // Without an advisor-remediated record at the new hash: still fail-closed.
+    expect(parse(handleWriteTool('start_execution', {}, db, SESSION_ID)).error).toContain('different plan hash');
+    expect(stage()).toBe('final_plan_prep');
+
+    // advisor-remediated on the SOLID base (no prior HAS-ISSUES) is now accepted (decision C)...
+    const rem = parse(handleWriteTool('submit_tier_up_review', { reviewer_model: 'fable', verdict: 'advisor-remediated' }, db, SESSION_ID));
+    expect(rem.error).toBeUndefined();
+    // ...and it unlocks start_execution at the changed hash.
+    expect(parse(handleWriteTool('start_execution', {}, db, SESSION_ID)).error).toBeUndefined();
+    expect(stage()).toBe('executing');
+  });
 
   it.each([
     ['HAS-ISSUES', 'SOLID', 'HAS-ISSUES'],
@@ -394,12 +414,12 @@ describe('start_execution — tier-up gate', () => {
     expect(stage()).toBe('executing');
   });
 
-  it('advisor-remediated with NO preceding HAS-ISSUES is rejected before mutation', () => {
+  it('advisor-remediated with NO preceding canonical blind review is rejected before mutation', () => {
     setPolicy('enforced');
     const beforeReviews = db.prepare('SELECT * FROM tier_up_reviews ORDER BY id').all();
     const beforeAudit = db.prepare('SELECT * FROM audit_log ORDER BY id').all();
     const submitted = parse(handleWriteTool('submit_tier_up_review', { reviewer_model: 'fable', verdict: 'advisor-remediated' }, db, SESSION_ID));
-    expect(submitted.error).toContain('prior HAS-ISSUES');
+    expect(submitted.error).toContain('prior canonical blind review');
     expect(db.prepare('SELECT * FROM tier_up_reviews ORDER BY id').all()).toEqual(beforeReviews);
     expect(db.prepare('SELECT * FROM audit_log ORDER BY id').all()).toEqual(beforeAudit);
     const before = reviewAndAuditSnapshot();

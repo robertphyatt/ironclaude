@@ -83,6 +83,15 @@ verified session.
 
 Other user, project, sandbox, and approval controls remain in force.
 
+With professional mode off, IronClaude workflow, review, worktree, staging,
+commit, push, and intent controls are inactive. Explicit operator instructions —
+including rendered IronClaude git forms (/commit, /commit-and-push, /push) — are
+direct requests: run them (raw Git included) without requiring professional-mode
+activation, a slash-command envelope, task review, or a redundant confirmation.
+Ask only when the operator omitted a material target or destructive disposition,
+or when a separate platform-safety boundary requires it. Exact `on` restores
+every control; any other state fails closed.
+
 To re-enable: /activate-professional-mode
 ```
 

@@ -1,0 +1,269 @@
+{
+  "name": "Provider-Neutral Review Entry and Recovery",
+  "goal": "Make Claude Code and Codex task review enter through native client actions, strictly reuse exact candidates, clear review state on retreat, and self-review under the repaired runtime without manual operator work.",
+  "requirements_file": "docs/plans/2026-08-13-provider-neutral-review-entry-requirements.md",
+  "design_file": "docs/plans/2026-08-13-provider-neutral-review-entry-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Bootstrap provider-neutral review and complete same-task acceptance",
+      "description": "A Terra subagent implements and verifies strict review entry and retry, client-native routing, testing-theatre and retreat lifecycle repair, and submission-time legacy-orphan reconciliation while carrying the reviewed staged candidate; the main session owns final reinstall, runtime proof, submission, and same-task review.",
+      "allowed_files": [
+        "CHANGELOG.md",
+        "README.md",
+        "commander/tests/test_executing_plans_skill.py",
+        "commander/tests/test_git_authority_skill_parity.py",
+        "commander/tests/test_guard_block_messages.py",
+        "commander/tests/test_review_checklist.py",
+        "commander/tests/test_review_entry_client_parity.py",
+        "commander/tests/test_review_receipt_skill.py",
+        "docs/plans/2026-08-12-reviewed-index-and-primary-commit-design.md",
+        "docs/plans/2026-08-12-reviewed-index-and-primary-commit-requirements.md",
+        "docs/plans/2026-08-12-reviewed-index-and-primary-commit.md",
+        "docs/plans/2026-08-12-reviewed-index-and-primary-commit.plan.json",
+        "docs/plans/2026-08-13-provider-neutral-review-entry-design.md",
+        "docs/plans/2026-08-13-provider-neutral-review-entry-requirements.md",
+        "docs/plans/2026-08-13-provider-neutral-review-entry.md",
+        "docs/plans/2026-08-13-provider-neutral-review-entry.plan.json",
+        "worker/.codex-plugin/plugin.json",
+        "worker/hooks/get-back-to-work-claude.sh",
+        "worker/hooks/get-back-to-work-impl.sh",
+        "worker/hooks/hook-logger.sh",
+        "worker/hooks/hooks.json",
+        "worker/hooks/plan-task-context.sh",
+        "worker/hooks/professional-mode-guard.sh",
+        "worker/hooks/session-init.sh",
+        "worker/hooks/skill-state-bridge.sh",
+        "worker/hooks/test-stop-wrapper.sh",
+        "worker/hooks/tests/test-git-authority-activation.sh",
+        "worker/hooks/tests/test-review-entry-parity.sh",
+        "worker/hooks/tests/test-workflow-transition-idempotency.sh",
+        "worker/mcp-servers/state-manager/dist/index.js",
+        "worker/mcp-servers/state-manager/src/__tests__/mark-executing-review-gate.test.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/review-pending-flavor-b.test.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/review-receipts.test.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/workflow-transition-idempotency.test.ts",
+        "worker/mcp-servers/state-manager/src/db.ts",
+        "worker/mcp-servers/state-manager/src/review-receipts.ts",
+        "worker/mcp-servers/state-manager/src/state-machine.ts",
+        "worker/mcp-servers/state-manager/src/tools/write-tools.test.ts",
+        "worker/mcp-servers/state-manager/src/tools/write-tools.ts",
+        "worker/mcp-servers/state-manager/src/types.ts",
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js",
+        "worker/mcp-servers/workspace-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/package.json",
+        "worker/mcp-servers/workspace-manager/src/__tests__/db.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/git-authority.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/reviewed-index.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts",
+        "worker/mcp-servers/workspace-manager/src/db.ts",
+        "worker/mcp-servers/workspace-manager/src/git-authority.ts",
+        "worker/mcp-servers/workspace-manager/src/hook-intent.ts",
+        "worker/mcp-servers/workspace-manager/src/index.ts",
+        "worker/mcp-servers/workspace-manager/src/integration.ts",
+        "worker/mcp-servers/workspace-manager/src/reviewed-index.ts",
+        "worker/mcp-servers/workspace-manager/src/types.ts",
+        "worker/skills/code-review/SKILL.md",
+        "worker/skills/commit/SKILL.md",
+        "worker/skills/executing-plans/SKILL.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Record carried staged paths before implementation.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached --name-only > /private/tmp/provider-neutral-review-entry-staged-before.txt",
+          "expected": "Staged path evidence is written."
+        },
+        {
+          "description": "Record the carried staged patch before implementation.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached --binary > /private/tmp/provider-neutral-review-entry-before.patch",
+          "expected": "Binary-safe staged patch evidence is written."
+        },
+        {
+          "description": "Record the unrelated unstaged state-activator hash.",
+          "command": "shasum -a 256 /Users/roberthyatt/Code/ironclaude/worker/hooks/state-activator.sh > /private/tmp/provider-neutral-review-entry-state-activator.sha256",
+          "expected": "Hash evidence is written; state-activator remains unstaged."
+        },
+        {
+          "description": "Add and run RED state-manager tests for exact retry, mismatch denial, candidate scope digest, compensated entry, verdict recovery, retreat, and transactional orphan reconciliation during replacement-task submission.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager test -- --run src/__tests__/review-receipts.test.ts src/__tests__/workflow-transition-idempotency.test.ts src/tools/write-tools.test.ts",
+          "expected": "Nonzero from missing provider-neutral state behavior, not fixture or environment errors."
+        },
+        {
+          "description": "Add and run RED hook tests for native client routing, report-only access, testing-theatre lifecycle, and write denial.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-review-entry-parity.sh",
+          "expected": "Nonzero from missing native review-entry behavior."
+        },
+        {
+          "description": "Add and run RED Commander tests for Claude and Codex skill instructions and review ownership.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest /Users/roberthyatt/Code/ironclaude/commander/tests/test_review_entry_client_parity.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_review_receipt_skill.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_executing_plans_skill.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_guard_block_messages.py -q",
+          "expected": "Nonzero from missing client-parity contract."
+        },
+        {
+          "description": "Implement re-runnable receipt-scope and retreat-lineage persistence, strict idempotent candidate reuse, compensated authoritative review entry, transactional retreat cleanup, testing-theatre lifecycle, and durable legacy-orphan reconciliation in the replacement task's first post-repair submission transaction. Candidate preparation performs no orphan retirement."
+        },
+        {
+          "description": "Implement narrow client-native review instruction rendering and full report-only review access; update code-review and executing-plans without generalized routing or grade changes."
+        },
+        {
+          "description": "Run focused GREEN state-manager verification.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager test -- --run src/__tests__/review-receipts.test.ts src/__tests__/workflow-transition-idempotency.test.ts src/tools/write-tools.test.ts src/__tests__/mark-executing-review-gate.test.ts src/__tests__/review-pending-flavor-b.test.ts",
+          "expected": "Exit zero; mutation-sensitive cases prove review-entry and retreat assertions are behavioral."
+        },
+        {
+          "description": "Type-check state-manager source.",
+          "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager/node_modules/.bin/tsc --noEmit --project /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager/tsconfig.json",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Run native review-entry hook parity tests.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-review-entry-parity.sh",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Run workflow-transition hook regressions.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-workflow-transition-idempotency.sh",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Run stop-wrapper client-message regressions.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/test-stop-wrapper.sh",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Run read-only and write-blocking guard regressions.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-bash-readonly-guard.sh",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Run focused Commander review-contract tests.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest /Users/roberthyatt/Code/ironclaude/commander/tests/test_review_entry_client_parity.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_review_receipt_skill.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_executing_plans_skill.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_guard_block_messages.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_review_checklist.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_rules_references_resolve.py -q",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Limit the workspace-manager full Vitest runner to one worker; change only package.json test script from vitest run to vitest run --maxWorkers=1 after 15-worker and two-worker runs passed 215 tests but ended with the same onTaskUpdate RPC timeout.",
+          "expected": "No Vitest config, production behavior, or global test timeout changes."
+        },
+        {
+          "description": "Run the complete workspace-manager suite with the bounded runner, first repetition.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test",
+          "expected": "Exit zero; all 215 tests pass; no [vitest-worker]: Timeout calling \"onTaskUpdate\" error."
+        },
+        {
+          "description": "Run the complete workspace-manager suite with the bounded runner, second repetition.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test",
+          "expected": "Exit zero; all 215 tests pass; no [vitest-worker]: Timeout calling \"onTaskUpdate\" error."
+        },
+        {
+          "description": "Update documentation and build state-manager for pre-release testing.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager run build",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Run the complete repository suite exactly once.",
+          "command": "make -C /Users/roberthyatt/Code/ironclaude test",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Replace this candidate's Codex cachebuster exactly once.",
+          "command": "/usr/bin/python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/update_plugin_cachebuster.py /Users/roberthyatt/Code/ironclaude/worker",
+          "expected": "Base remains 1.1.6; cachebuster changes once."
+        },
+        {
+          "description": "Build the final state-manager bundle after cachebusting.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager run build",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Validate plugin structure and metadata.",
+          "command": "/usr/bin/python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py /Users/roberthyatt/Code/ironclaude/worker",
+          "expected": "Plugin validation passes."
+        },
+        {
+          "description": "Verify release-version consistency.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest /Users/roberthyatt/Code/ironclaude/commander/tests/test_version_consistency.py -q",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Record the complete expected Codex runtime fingerprint from the final source candidate before installation.",
+          "command": "/usr/bin/python3 -c 'import hashlib,json,pathlib; root=pathlib.Path(\"/Users/roberthyatt/Code/ironclaude/worker\"); version=json.loads((root/\".codex-plugin/plugin.json\").read_text())[\"version\"]; digest=lambda relative: hashlib.sha256((root/relative).read_bytes()).hexdigest(); expected={\"client\":\"codex\",\"manifest_sha256\":digest(\".codex-plugin/plugin.json\"),\"plugin_root\":f\"/Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/{version}\",\"plugin_version\":version,\"state_manager_bundle_sha256\":digest(\"mcp-servers/state-manager/dist/index.js\"),\"workspace_manager_bundle_sha256\":digest(\"mcp-servers/workspace-manager/dist/index.js\"),\"workspace_manager_cli_sha256\":digest(\"mcp-servers/workspace-manager/dist/cli.js\"),\"workspace_manager_hook_intent_sha256\":digest(\"mcp-servers/workspace-manager/dist/hook-intent.js\")}; target=pathlib.Path(\"/private/tmp/provider-neutral-review-entry-expected-runtime.json\"); target.write_text(json.dumps(expected,sort_keys=True)+\"\\n\"); print(target.read_text(),end=\"\")'",
+          "expected": "Printed JSON contains all eight required expected_runtime fields measured before installation."
+        },
+        {
+          "description": "Stage every normal source, test, hook, skill, manifest, and carried candidate path in the exact task allowlist; leave state-activator unstaged.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -- CHANGELOG.md README.md commander/tests/test_executing_plans_skill.py commander/tests/test_git-authority_skill_parity.py commander/tests/test_guard_block_messages.py commander/tests/test_review_checklist.py commander/tests/test_review_entry_client_parity.py commander/tests/test_review_receipt_skill.py worker/.codex-plugin/plugin.json worker/hooks/get-back-to-work-claude.sh worker/hooks/get-back-to-work-impl.sh worker/hooks/hook-logger.sh worker/hooks/hooks.json worker/hooks/plan-task-context.sh worker/hooks/professional-mode-guard.sh worker/hooks/session-init.sh worker/hooks/skill-state-bridge.sh worker/hooks/test-stop-wrapper.sh worker/hooks/tests/test-git-authority-activation.sh worker/hooks/tests/test-review-entry-parity.sh worker/hooks/tests/test-workflow-transition-idempotency.sh worker/mcp-servers/state-manager/src/__tests__/mark-executing-review-gate.test.ts worker/mcp-servers/state-manager/src/__tests__/review-pending-flavor-b.test.ts worker/mcp-servers/state-manager/src/__tests__/review-receipts.test.ts worker/mcp-servers/state-manager/src/__tests__/workflow-transition-idempotency.test.ts worker/mcp-servers/state-manager/src/db.ts worker/mcp-servers/state-manager/src/review-receipts.ts worker/mcp-servers/state-manager/src/state-machine.ts worker/mcp-servers/state-manager/src/tools/write-tools.test.ts worker/mcp-servers/state-manager/src/tools/write-tools.ts worker/mcp-servers/state-manager/src/types.ts worker/mcp-servers/workspace-manager/package.json worker/mcp-servers/workspace-manager/src/__tests__/db.test.ts worker/mcp-servers/workspace-manager/src/__tests__/git-authority.test.ts worker/mcp-servers/workspace-manager/src/__tests__/reviewed-index.test.ts worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts worker/mcp-servers/workspace-manager/src/db.ts worker/mcp-servers/workspace-manager/src/git-authority.ts worker/mcp-servers/workspace-manager/src/hook-intent.ts worker/mcp-servers/workspace-manager/src/index.ts worker/mcp-servers/workspace-manager/src/integration.ts worker/mcp-servers/workspace-manager/src/reviewed-index.ts worker/mcp-servers/workspace-manager/src/types.ts worker/skills/code-review/SKILL.md worker/skills/commit/SKILL.md worker/skills/executing-plans/SKILL.md",
+          "expected": "Exact normal allowlist is staged."
+        },
+        {
+          "description": "Force-stage every ignored plan and generated artifact in the exact task allowlist.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f -- docs/plans/2026-08-12-reviewed-index-and-primary-commit-design.md docs/plans/2026-08-12-reviewed-index-and-primary-commit-requirements.md docs/plans/2026-08-12-reviewed-index-and-primary-commit.md docs/plans/2026-08-12-reviewed-index-and-primary-commit.plan.json docs/plans/2026-08-13-provider-neutral-review-entry-design.md docs/plans/2026-08-13-provider-neutral-review-entry-requirements.md docs/plans/2026-08-13-provider-neutral-review-entry.md docs/plans/2026-08-13-provider-neutral-review-entry.plan.json worker/mcp-servers/state-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/hook-intent.js",
+          "expected": "Exact ignored artifacts are staged."
+        },
+        {
+          "description": "Check the complete cached candidate.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached --check",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Prove unrelated state-activator bytes remain unchanged.",
+          "command": "shasum -a 256 -c /private/tmp/provider-neutral-review-entry-state-activator.sha256",
+          "expected": "Hash check passes."
+        },
+        {
+          "description": "Prove no other tracked change remains unstaged.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --name-only -- . ':(exclude)worker/hooks/state-activator.sh'",
+          "expected": "No output."
+        },
+        {
+          "description": "Inspect the final staged and unstaged path boundary.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude status --short",
+          "expected": "Every staged path is allowed; state-activator is the unchanged unstaged source path."
+        },
+        {
+          "description": "Main session verifies the trusted delayed-restart helper before final mutation sequence.",
+          "command": "shasum -a 256 /private/tmp/restart_codex.py",
+          "expected": "Output is d09cc042bdac54f8fb87eb1a021724fe28b42b355690bdd97999fa2a8a16c38f."
+        },
+        {
+          "description": "Main session removes the old Claude plugin runtime while preserving data.",
+          "command": "claude plugin uninstall ironclaude@ironclaude --scope user --keep-data --yes",
+          "expected": "Old Claude runtime is removed."
+        },
+        {
+          "description": "Main session installs the repaired Claude plugin runtime.",
+          "command": "claude plugin install ironclaude@ironclaude --scope user",
+          "expected": "New Claude runtime installs."
+        },
+        {
+          "description": "Main session verifies Claude plugin details.",
+          "command": "claude plugin details ironclaude@ironclaude",
+          "expected": "Details show the new cachebuster."
+        },
+        {
+          "description": "Main session arms the trusted delayed Codex restart helper.",
+          "command": "/usr/bin/python3 -c 'import subprocess; subprocess.Popen([\"/usr/bin/python3\", \"/private/tmp/restart_codex.py\"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)'",
+          "expected": "Detached helper starts and waits for final Codex installation."
+        },
+        {
+          "description": "Main session installs Codex as the final mutation.",
+          "command": "codex plugin add ironclaude@ironclaude --json",
+          "expected": "New Codex runtime installs as final mutation and delayed restart begins."
+        },
+        {
+          "description": "After restart, main session reads /private/tmp/provider-neutral-review-entry-expected-runtime.json, passes that exact pre-install object to run_diagnostics.expected_runtime, then reads resume and workspace status.",
+          "expected": "Same provider-root session and active Task 1 use the new runtime; all eight expected identities and hashes match."
+        },
+        {
+          "description": "Main session submits Task 1 through executing-plans; the repaired submission transaction reconciles proven legacy receipt 22 before setting submitted and review-pending state. Then load $ironclaude:code-review --task-boundary once without manually preparing a candidate.",
+          "expected": "Submission atomically retires only the proven old-lineage receipt; native review enters reviewing and creates or strictly reuses only the current plan's authenticated candidate."
+        },
+        {
+          "description": "Main session completes testing-theatre detection and records the task verdict through code-review.",
+          "expected": "A or B seals the cumulative reviewed tree and completes Task 1; infrastructure failures record no grade."
+        }
+      ]
+    }
+  ],
+  "estimated_memory_gb": 4
+}

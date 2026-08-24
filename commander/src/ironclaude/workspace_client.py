@@ -13,7 +13,7 @@ class WorkspaceClientError(RuntimeError):
     """Workspace-manager transport or response failure."""
 
 
-_COMMANDS = frozenset({"allocate", "bind", "finalize", "abandon", "reconcile"})
+_COMMANDS = frozenset({"allocate", "bind", "finalize", "abandon", "reconcile", "cleanup", "sync", "reap"})
 
 
 class WorkspaceClient:
@@ -227,3 +227,12 @@ class WorkspaceClient:
 
     def reconcile(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
         return self._invoke("reconcile", payload, **transport)
+
+    def cleanup(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
+        return self._invoke("cleanup", payload, **transport)
+
+    def sync(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
+        return self._invoke("sync", payload, **transport)
+
+    def reap(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
+        return self._invoke("reap", payload, **transport)

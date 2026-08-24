@@ -8,13 +8,15 @@ import subprocess
 from ironclaude.db import DIRECT_REPLY_FALLBACK_REASON, init_db
 import time
 import json
+import logging
 from pathlib import Path
 
 import psutil
 import pytest
 from unittest.mock import MagicMock, patch
 
-from ironclaude.main import CHECKIN_CADENCE, PM_GATE_STAGES, PM_GATE_SLACK_SECONDS, IroncladeDaemon, ensure_brain_trusted
+from ironclaude.main import CHECKIN_CADENCE, FINALIZE_DRIFT_RETRY_CAP, PM_GATE_STAGES, PM_GATE_SLACK_SECONDS, IroncladeDaemon, ensure_brain_trusted
+from ironclaude.orchestrator_mcp import OrchestratorTools
 
 
 def _brain_instruction_surfaces() -> list[str]:
@@ -146,12 +148,16 @@ class TestCheckWorkersDoneMarker:
         daemon.registry.update_worker_status.assert_not_called()
 
     def test_dead_session_still_detected(self, daemon):
-        """Worker whose tmux session died is still detected (fallback)."""
+        """Worker whose tmux session died is still detected (fallback). The seam
+        owns completion now: against the bare-MagicMock registry the real seam
+        returns an 'authority' (preserved) outcome, so the DAEMON completes
+        nothing itself — completion is the seam's job, asserted at the
+        orchestrator level."""
         worker = {"id": "w2", "tmux_session": "ic-w2"}
         daemon.registry.get_running_workers.return_value = [worker]
         daemon.tmux.has_session.return_value = False
         daemon.check_workers()
-        daemon.registry.update_worker_status.assert_called_once_with("w2", "completed")
+        daemon.registry.update_worker_status.assert_not_called()
 
     def test_live_worker_not_touched(self, daemon):
         """Worker with live session and no .done marker is left alone."""
@@ -2259,7 +2265,9 @@ class TestCheckWorkersRemote:
         call_args = daemon.tmux.has_session.call_args
         assert call_args[0][0] == "ic-w-remote"
         assert call_args[1].get("ssh_host") == "remote-worker" or (len(call_args[0]) > 1 and call_args[0][1] == "remote-worker")
-        daemon.registry.update_worker_status.assert_called_with("w-remote", "completed")
+        # Seam owns completion: bare-MagicMock registry yields an 'authority'
+        # (preserved) outcome, so the daemon completes nothing itself.
+        daemon.registry.update_worker_status.assert_not_called()
 
     def test_local_worker_unaffected(self, daemon):
         """Local worker (machine=None) uses local file checks, not SSH."""
@@ -2270,7 +2278,9 @@ class TestCheckWorkersRemote:
 
         daemon.check_workers()
 
-        daemon.registry.update_worker_status.assert_called_with("w-local", "completed")
+        # Seam owns completion: bare-MagicMock registry yields an 'authority'
+        # (preserved) outcome, so the daemon completes nothing itself.
+        daemon.registry.update_worker_status.assert_not_called()
 
     def test_get_worker_workflow_stage_remote(self, daemon):
         """_get_worker_workflow_stage queries remote DB via tmux.run_sqlite_query."""
@@ -3464,3 +3474,494 @@ def test_daemon_fixture_isolates_state_manager_db_path(daemon, tmp_path):
     (main.py:995 DELETEs from audit_log against it). Equality, not startswith:
     the fake home lives under tmp_path, so startswith passes without the override."""
     assert daemon._state_manager_db_path == str(tmp_path / "state-manager.db")
+
+
+# A frozen-drift finalization failure as _classify_finalization_failure emits it:
+# failure_phase='finalization' at the top level, mode nested under
+# recovery.reconcile.mode (NOT a top-level key).
+def _drift_outcome():
+    return {
+        "error": "finalize drift",
+        "failure_phase": "finalization",
+        "assignment_preserved": True,
+        "recovery": {"reconcile": {"repository_path": "/repo", "mode": "drift"}},
+    }
+
+
+def _drift_session_died(daemon, *, drive_states):
+    """Wire a single running worker whose tmux session is dead and whose finalize
+    returns a frozen-drift failure; drive_frozen_reconcile_recovery yields the
+    given per-cycle states. Returns the orchestrator mock."""
+    worker = {"id": "w1", "tmux_session": "ic-w1"}
+    daemon.registry.get_running_workers.return_value = [worker]
+    daemon.tmux.has_session.return_value = False
+    orch = MagicMock()
+    orch._finalize_and_release_worker.return_value = _drift_outcome()
+    orch.drive_frozen_reconcile_recovery.side_effect = drive_states
+    daemon._get_orchestrator = MagicMock(return_value=orch)
+    return orch
+
+
+class TestFinalizeDriftRecovery:
+    """C-1: a frozen-drift finalize must drive the capped plain-reconcile recovery
+    (never the empty-commit-minting isRepair retry), surface-and-hold over the cap
+    (never abandon, never complete), and fire the session-died posts exactly once."""
+
+    def test_finalize_drift_seam_integrates_clears_counter_daemon_completes_nothing(self, daemon):
+        orch = _drift_session_died(daemon, drive_states=[{"state": "cleaned"}])
+        daemon.check_workers()
+        orch.drive_frozen_reconcile_recovery.assert_called_once_with("w1")
+        # The seam integrated (and completed a dead worker) itself; the DAEMON
+        # completes nothing. The counter-clear on the integrated state is the
+        # discriminator that still fails on an integrate-path regression.
+        daemon.registry.update_worker_status.assert_not_called()
+        assert daemon._finalize_drift_retry.get("w1") is None
+        orch._abandon_rescue_worker.assert_not_called()
+
+    def test_finalize_drift_under_cap_drives_seam_and_leaves_running(self, daemon):
+        orch = _drift_session_died(
+            daemon, drive_states=[{"state": "frozen-no-rebase"}],
+        )
+        daemon.check_workers()
+        orch.drive_frozen_reconcile_recovery.assert_called_once_with("w1")
+        # Not integrated -> worker left running (never completed), counter at 1.
+        daemon.registry.update_worker_status.assert_not_called()
+        assert daemon._finalize_drift_retry["w1"] == 1
+        orch._abandon_rescue_worker.assert_not_called()
+
+    def test_finalize_drift_over_cap_surfaces_and_holds(self, daemon):
+        cycles = FINALIZE_DRIFT_RETRY_CAP + 2
+        orch = _drift_session_died(
+            daemon, drive_states=[{"state": "frozen-no-rebase"}] * cycles,
+        )
+        for _ in range(cycles):
+            daemon.check_workers()
+        # The seam is driven at most cap times, then driving STOPS (surface-and-hold).
+        assert orch.drive_frozen_reconcile_recovery.call_count == FINALIZE_DRIFT_RETRY_CAP
+        # Never completed, never abandoned — the held drift row keeps its lock.
+        daemon.registry.update_worker_status.assert_not_called()
+        orch._abandon_rescue_worker.assert_not_called()
+        # Two DISTINCT once-per-worker surfaces fire across every cycle: the
+        # session-died post (first cycle) and the drift-over-cap "held" alert
+        # (the first over-cap cycle) — each gated separately, so 2 total, not
+        # a re-fire of either one.
+        assert daemon.slack.post_message.call_count == 2
+        posted = [c.args[0] for c in daemon.slack.post_message.call_args_list]
+        assert any("preserved" in p.lower() for p in posted)
+        assert any("held" in p.lower() for p in posted)
+        assert daemon._finalize_drift_retry["w1"] == cycles
+
+    def test_finalize_drift_session_died_posts_fire_exactly_once(self, daemon):
+        cycles = FINALIZE_DRIFT_RETRY_CAP + 2
+        _drift_session_died(
+            daemon, drive_states=[{"state": "frozen-no-rebase"}] * cycles,
+        )
+        for _ in range(cycles):
+            daemon.check_workers()
+        # Session-died Slack AND Brain fire exactly once despite the worker
+        # re-entering the dead-session branch every cycle. Over the cap the
+        # distinct drift-"held" alert also fires exactly once, for 2 posts
+        # total — each surface individually gated, neither one re-firing.
+        assert daemon.slack.post_message.call_count == 2
+        assert daemon.brain.send_message.call_count == 2
+
+    def test_finalize_drift_retry_then_integrate_still_posts_once(self, daemon):
+        """Retry-then-integrate lifecycle: the session-died Slack/Brain posts fire
+        exactly once across the WHOLE lifecycle (not again on the integrate cycle)
+        and the worker ends completed."""
+        orch = _drift_session_died(
+            daemon,
+            drive_states=[
+                {"state": "frozen-no-rebase"},
+                {"state": "frozen-no-rebase"},
+                {"state": "cleaned"},
+            ],
+        )
+        for _ in range(3):
+            daemon.check_workers()
+        assert daemon.slack.post_message.call_count == 1
+        assert daemon.brain.send_message.call_count == 1
+        # The seam completes the (dead) worker on integrate; the DAEMON completes
+        # nothing. drive_count==3 stays the integrate-path discriminator.
+        daemon.registry.update_worker_status.assert_not_called()
+        assert orch.drive_frozen_reconcile_recovery.call_count == 3
+
+    def test_finalize_drift_stuck_kill_site_drives_seam_not_bare_complete(self, daemon):
+        """The stuck-kill completed-flip site routes a frozen-drift outcome through
+        the recovery seam instead of bare-completing the worker."""
+        daemon.tmux.list_pane_pid.return_value = None  # skip liveness probe
+        daemon._persist_staleness_state = MagicMock()
+        orch = MagicMock()
+        orch._finalize_and_release_worker.return_value = _drift_outcome()
+        orch.drive_frozen_reconcile_recovery.return_value = {"state": "frozen-no-rebase"}
+        daemon._get_orchestrator = MagicMock(return_value=orch)
+        daemon._confirm_and_kill_stuck_worker(
+            "w1", "ic-w1", 1200.0, "execution", False, None,
+        )
+        orch.drive_frozen_reconcile_recovery.assert_called_once_with("w1")
+        # Drift not integrated -> worker left running, never bare-completed/abandoned.
+        daemon.registry.update_worker_status.assert_not_called()
+        orch._abandon_rescue_worker.assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# I-1 — a mid-finalization new-work probe failure on a terminal worker must
+# not be silently completed by the daemon's completed-flip guards. Uses a
+# REAL OrchestratorTools (only the workspace_client/registry boundary is
+# mocked) against a real conflicted git worktree, so the outcome exercised
+# here is exactly what production classification produces.
+# --------------------------------------------------------------------------
+
+_I1_OWNER = "33333333-3333-4333-8333-333333333333"
+_I1_GUID = "44444444-4444-4444-8444-444444444444"
+
+
+def _i1_git(cwd, *args):
+    subprocess.run(
+        ["git", *args], cwd=str(cwd), check=True,
+        capture_output=True, text=True,
+    )
+
+
+def _i1_conflicted_worktree(base):
+    """Real git checkout on branch ironclaude/wt left with an UNMERGED index
+    (an unresolved merge conflict on f.txt) -- the same index shape a paused
+    rebase leaves behind. `git write-tree` fails against it exactly like it
+    does mid-rebase, so the orchestrator's new-work probe raises."""
+    base.mkdir(parents=True, exist_ok=True)
+    _i1_git(base, "init", "-q", "-b", "main")
+    _i1_git(base, "config", "user.email", "t@example.com")
+    _i1_git(base, "config", "user.name", "Tester")
+    (base / "f.txt").write_text("base\n")
+    _i1_git(base, "add", "-A")
+    _i1_git(base, "commit", "-qm", "base")
+    _i1_git(base, "checkout", "-q", "-b", "ironclaude/wt")
+    (base / "f.txt").write_text("wt-change\n")
+    _i1_git(base, "add", "-A")
+    _i1_git(base, "commit", "-qm", "wt work")
+    _i1_git(base, "checkout", "-q", "main")
+    (base / "f.txt").write_text("main-change\n")
+    _i1_git(base, "add", "-A")
+    _i1_git(base, "commit", "-qm", "main work")
+    _i1_git(base, "checkout", "-q", "ironclaude/wt")
+    # Merge conflict, left unresolved on purpose (non-zero exit expected).
+    subprocess.run(
+        ["git", "merge", "main"], cwd=str(base),
+        capture_output=True, text=True, check=False,
+    )
+    return base
+
+
+def _i1_orchestrator_tools(worktree):
+    """A real OrchestratorTools whose `_finalize_and_release_worker` runs for
+    real against the given worktree, with only the workspace_client/registry
+    boundary mocked -- exactly the shape the daemon's session-died/stuck-kill
+    seams call in production."""
+    tools = object.__new__(OrchestratorTools)
+    tools.registry = MagicMock()
+    tools.registry.get_worker.return_value = {
+        "id": "w1",
+        "client": "codex",
+        "machine": None,
+        "repo": "/repo",
+        "native_session_id": _I1_OWNER,
+        "tmux_session": "ic-w1",
+        "workspace_guid": _I1_GUID,
+        "workspace_repository_identity": "machine:repo.git",
+        "workspace_path": str(worktree),
+        "workspace_branch": "ironclaude/wt",
+        "workspace_base_commit": "a" * 40,
+        "workspace_integration_target": "main",
+    }
+    tools.registry.update_worker_status = MagicMock()
+    tools.tmux = MagicMock()
+    tools.tmux.has_session.return_value = False  # session already dead
+    tools._ssh_manager = None
+    tools._workspace_client = MagicMock()
+    tools._workspace_client.discover_installed_plugin_root.return_value = "/installed"
+    # The status probe confirms a genuinely mid-finalization worktree (a
+    # paused/conflicted rebase) -- the case a bare new-work probe failure must
+    # be routed through, not treated as an environment ('authority') error.
+    tools._workspace_client.reconcile.return_value = {"state": "rebase-paused-conflict"}
+    tools._read_worker_finalization_state = MagicMock(return_value={
+        "workflow_stage": "execution_complete",
+        "unfinished_tasks": 0,
+        "latest_task_boundary_grade": "A",
+    })
+    tools._ensure_ssh_manager = MagicMock()
+    tools._resolve_ssh_host = MagicMock(return_value=None)
+    tools._slack = MagicMock()
+    return tools
+
+
+class TestUnmergedProbeNotCompleted:
+    """I-1: a terminal worker whose managed worktree is mid-finalization (an
+    unmerged index from a paused/conflicted rebase) must NOT be silently
+    marked completed by the daemon's completed-flip guards -- the orchestrator
+    must surface it as a finalization failure instead of an authority one."""
+
+    def test_unmerged_probe_not_completed_session_died(self, daemon, tmp_path):
+        worktree = _i1_conflicted_worktree(tmp_path / "wt")
+        tools = _i1_orchestrator_tools(worktree)
+        daemon.registry.get_running_workers.return_value = [
+            {"id": "w1", "tmux_session": "ic-w1"},
+        ]
+        daemon.tmux.has_session.return_value = False
+        daemon._get_orchestrator = MagicMock(return_value=tools)
+        daemon.check_workers()
+        # The new-work probe raised on the unmerged index; the mid-finalization
+        # status classifies it 'finalization', not 'authority' -- the worker
+        # must be left running, never bare-completed.
+        daemon.registry.update_worker_status.assert_not_called()
+
+    def test_unmerged_probe_not_completed_stuck_kill(self, daemon, tmp_path):
+        worktree = _i1_conflicted_worktree(tmp_path / "wt")
+        tools = _i1_orchestrator_tools(worktree)
+        daemon.tmux.list_pane_pid.return_value = None  # skip liveness probe
+        daemon._persist_staleness_state = MagicMock()
+        daemon._get_orchestrator = MagicMock(return_value=tools)
+        daemon._confirm_and_kill_stuck_worker(
+            "w1", "ic-w1", 1200.0, "execution", False, None,
+        )
+        daemon.registry.update_worker_status.assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# Capstone — the DAEMON completes NOTHING; the orchestrator seam owns ALL
+# completion. Every finalize path routes its outcome through the unified
+# _drive_finalization_recovery driver, which NEVER calls update_worker_status.
+# worker_finished is logged only when the worker is ACTUALLY completed (a
+# registry re-read), a conflict/repair worker is surfaced exactly once, and the
+# live idle worker is never completed by the daemon.
+# --------------------------------------------------------------------------
+
+
+def _worker_finished_calls(registry):
+    """Return the log_event calls whose event name is 'worker_finished'."""
+    return [
+        c for c in registry.log_event.call_args_list
+        if c.args and c.args[0] == "worker_finished"
+    ]
+
+
+def _seam_session_died(daemon, outcome):
+    """Wire a single dead-session worker whose finalize seam returns `outcome`."""
+    worker = {"id": "w1", "tmux_session": "ic-w1"}
+    daemon.registry.get_running_workers.return_value = [worker]
+    daemon.tmux.has_session.return_value = False
+    orch = MagicMock()
+    orch._finalize_and_release_worker.return_value = outcome
+    daemon._get_orchestrator = MagicMock(return_value=orch)
+    return orch
+
+
+def _seam_stuck_kill(daemon, outcome):
+    """Wire the stuck-kill site to a finalize seam returning `outcome`."""
+    daemon.tmux.list_pane_pid.return_value = None  # skip liveness probe
+    daemon._persist_staleness_state = MagicMock()
+    orch = MagicMock()
+    orch._finalize_and_release_worker.return_value = outcome
+    daemon._get_orchestrator = MagicMock(return_value=orch)
+    return orch
+
+
+_STAYS_RUNNING_OUTCOMES = [
+    None,
+    {"failure_phase": "authority", "assignment_preserved": True},
+    {"action": "surfaced"},
+]
+
+
+class TestDaemonCompletesNothing:
+    """The seam owns completion. On any transient/preserved outcome the daemon
+    leaves the worker running: no update_worker_status flip, no worker_finished
+    log. (The session-died `_session_died_notified` post and the stuck-kill
+    stuck-killed/MANDATORY-SWEEP posts still fire — those are not completion.)"""
+
+    @pytest.mark.parametrize("outcome", _STAYS_RUNNING_OUTCOMES)
+    def test_session_died_stays_running_never_completes(self, daemon, outcome):
+        _seam_session_died(daemon, outcome)
+        # Bare-MagicMock registry: get_worker returns a non-dict, so the
+        # completion re-read gate is False.
+        daemon.check_workers()
+        daemon.registry.update_worker_status.assert_not_called()
+        assert _worker_finished_calls(daemon.registry) == []
+
+    @pytest.mark.parametrize("outcome", _STAYS_RUNNING_OUTCOMES)
+    def test_stuck_kill_stays_running_never_completes(self, daemon, outcome):
+        _seam_stuck_kill(daemon, outcome)
+        daemon._confirm_and_kill_stuck_worker(
+            "w1", "ic-w1", 1200.0, "execution", False, None,
+        )
+        daemon.registry.update_worker_status.assert_not_called()
+        assert _worker_finished_calls(daemon.registry) == []
+
+    def test_drift_outcome_drives_seam_daemon_completes_nothing(self, daemon):
+        orch = _seam_session_died(daemon, _drift_outcome())
+        orch.drive_frozen_reconcile_recovery.return_value = {"state": "cleaned"}
+        daemon.check_workers()
+        orch.drive_frozen_reconcile_recovery.assert_called_once_with("w1")
+        # The driver drove the seam; the daemon performs NO completion itself.
+        daemon.registry.update_worker_status.assert_not_called()
+
+    def test_drift_over_cap_surfaces_exactly_once(self, daemon):
+        cycles = FINALIZE_DRIFT_RETRY_CAP + 3
+        orch = _drift_session_died(
+            daemon, drive_states=[{"state": "frozen-no-rebase"}] * cycles,
+        )
+        for _ in range(cycles):
+            daemon.check_workers()
+        # Two DISTINCT operator surfaces, each firing exactly once across
+        # every cycle (never re-alerting): the session-died post and the
+        # drift-over-cap "held" alert.
+        assert daemon.slack.post_message.call_count == 2
+        assert daemon.brain.send_message.call_count == 2
+        assert orch.drive_frozen_reconcile_recovery.call_count == FINALIZE_DRIFT_RETRY_CAP
+        daemon.registry.update_worker_status.assert_not_called()
+
+    @pytest.mark.parametrize("mode", ["conflict", "repair"])
+    def test_conflict_or_repair_surfaced_once_never_completed(self, daemon, mode):
+        outcome = {
+            "failure_phase": "finalization",
+            "assignment_preserved": True,
+            "recovery": {"reconcile": {"mode": mode}},
+        }
+        # Drive the unified driver directly, twice, to prove the alert is
+        # once-only via the new _finalize_recovery_alerted gate.
+        d1 = daemon._drive_finalization_recovery("w1", outcome)
+        posts_after_first = daemon.slack.post_message.call_count
+        d2 = daemon._drive_finalization_recovery("w1", outcome)
+        assert d1 == "surfaced" and d2 == "surfaced"
+        assert "w1" in daemon._finalize_recovery_alerted
+        assert posts_after_first == 1
+        assert daemon.slack.post_message.call_count == 1  # no re-alert
+        # Never completed, never abandoned.
+        daemon.registry.update_worker_status.assert_not_called()
+
+    def test_idle_drift_outcome_drives_driver_completes_nothing(self, daemon):
+        """The idle branch (terminal=False) now routes its (previously discarded)
+        outcome through the driver; a drift outcome drives the seam and the
+        daemon completes nothing."""
+        worker = {"id": "w1", "tmux_session": "ic-w1"}
+        daemon.registry.get_running_workers.return_value = [worker]
+        marker = os.path.join(daemon.tmux.log_dir, "ic-w1.done")
+        with open(marker, "w") as f:
+            f.write("2026-03-01T00:00:00Z")
+        orch = MagicMock()
+        orch._finalize_and_release_worker.return_value = _drift_outcome()
+        orch.drive_frozen_reconcile_recovery.return_value = {"state": "frozen-no-rebase"}
+        daemon._get_orchestrator = MagicMock(return_value=orch)
+        daemon.check_workers()
+        orch.drive_frozen_reconcile_recovery.assert_called_once_with("w1")
+        daemon.registry.update_worker_status.assert_not_called()
+
+    def test_seam_completion_logs_worker_finished(self, daemon):
+        """When the worker is ACTUALLY completed (the seam completed it; the
+        registry re-read reports 'completed'), worker_finished IS logged. The
+        outcome deliberately does NOT itself signal completion (None) — only the
+        registry status does, so the gate must read the REGISTRY, not the
+        outcome, or this test cannot log worker_finished."""
+        _seam_session_died(daemon, None)
+        daemon.registry.get_worker.return_value = {"id": "w1", "status": "completed"}
+        daemon.check_workers()
+        # Daemon still performs no completion flip of its own...
+        daemon.registry.update_worker_status.assert_not_called()
+        # ...but the finished event is logged because the worker is completed.
+        assert len(_worker_finished_calls(daemon.registry)) == 1
+
+    def test_seam_completion_stuck_kill_logs_worker_finished(self, daemon):
+        # Outcome does NOT signal completion (None); only the registry status
+        # does — the gate must read the registry.
+        _seam_stuck_kill(daemon, None)
+        daemon.registry.get_worker.return_value = {"id": "w1", "status": "completed"}
+        daemon._confirm_and_kill_stuck_worker(
+            "w1", "ic-w1", 1200.0, "execution", False, None,
+        )
+        daemon.registry.update_worker_status.assert_not_called()
+        assert len(_worker_finished_calls(daemon.registry)) == 1
+
+
+# --------------------------------------------------------------------------
+# Operator-facing messaging accuracy — the dead-session branch must not label
+# an uncompleted (drift/transient/held) worker "Worker Completed"; it gets an
+# accurate "preserved, not completed" surface instead. The drift-over-cap
+# "held" disposition, which surfaces nothing today, must alert the operator
+# exactly once. MESSAGING/OBSERVABILITY ONLY.
+# --------------------------------------------------------------------------
+
+
+class TestDeadSessionAccurateSurface:
+    def test_dead_session_completed_worker_posts_worker_completed(self, daemon):
+        """Guard-preservation: a worker the seam actually completed still gets
+        the accurate 'Worker Completed' surface (not the preserved one)."""
+        worker = {"id": "w1", "tmux_session": "ic-w1"}
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = False
+        orch = MagicMock()
+        orch._finalize_and_release_worker.return_value = None
+        daemon._get_orchestrator = MagicMock(return_value=orch)
+        daemon.registry.get_worker.return_value = {"id": "w1", "status": "completed"}
+        daemon.check_workers()
+        assert daemon.slack.post_message.call_count == 1
+        posted = daemon.slack.post_message.call_args[0][0]
+        assert "Worker Completed" in posted
+        assert "preserved" not in posted.lower()
+
+    def test_dead_session_not_completed_posts_preserved_not_completed(self, daemon, caplog):
+        """A worker left NOT completed (drift/transient/held; work preserved)
+        must never be labeled 'Worker Completed' — it gets the accurate
+        preserved surface instead, and fires only once even across a second
+        check_workers cycle (the once-per-worker _session_died_notified gate).
+        WORKER_DEAD must also log exactly once across both cycles (not once
+        per cycle)."""
+        worker = {"id": "w1", "tmux_session": "ic-w1"}
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = False
+        orch = MagicMock()
+        orch._finalize_and_release_worker.return_value = None  # transient/preserved
+        daemon._get_orchestrator = MagicMock(return_value=orch)
+        daemon.registry.get_worker.return_value = {"id": "w1", "status": "running"}
+        with caplog.at_level(logging.INFO, logger="ironclaude"):
+            daemon.check_workers()
+            assert daemon.slack.post_message.call_count == 1
+            posted = daemon.slack.post_message.call_args[0][0]
+            assert "Worker Completed" not in posted
+            assert "preserved" in posted.lower()
+            assert "not completed" in posted.lower()
+            brain_msg = daemon.brain.send_message.call_args[0][0]
+            assert "preserved" in brain_msg.lower()
+            # Second cycle: the once-per-worker gate suppresses a repeat post.
+            daemon.check_workers()
+            assert daemon.slack.post_message.call_count == 1
+        worker_dead_records = []
+        for record in caplog.records:
+            try:
+                payload = json.loads(record.message)
+            except (ValueError, TypeError):
+                continue
+            if payload.get("event_type") == "WORKER_DEAD":
+                worker_dead_records.append(record)
+        assert len(worker_dead_records) == 1
+
+    def test_dead_session_drift_held_over_cap_surfaces_once(self, daemon):
+        """The drift-over-cap 'held' disposition surfaces NOTHING today; it
+        must post to slack+brain exactly once (never re-alerting on a
+        subsequent over-cap call for the same worker)."""
+        outcome = {
+            "failure_phase": "finalization",
+            "assignment_preserved": True,
+            "recovery": {"reconcile": {"mode": "drift"}},
+        }
+        daemon._finalize_drift_retry["w1"] = FINALIZE_DRIFT_RETRY_CAP  # next call exceeds cap
+        disposition = daemon._drive_finalization_recovery("w1", outcome)
+        assert disposition == "held"
+        assert daemon.slack.post_message.call_count == 1
+        assert daemon.brain.send_message.call_count == 1
+        posted = daemon.slack.post_message.call_args[0][0]
+        assert "held" in posted.lower()
+        assert "w1" in daemon._finalize_recovery_alerted
+        # A second over-cap call for the same worker does not re-alert.
+        disposition2 = daemon._drive_finalization_recovery("w1", outcome)
+        assert disposition2 == "held"
+        assert daemon.slack.post_message.call_count == 1
+        assert daemon.brain.send_message.call_count == 1

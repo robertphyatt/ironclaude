@@ -149,8 +149,10 @@ class TestValidateBrainMessage:
     @pytest.mark.parametrize("ref", ["#42", "d42", "D42", "directive 42", "directive #42"])
     def test_directive_ref_patterns(self, daemon, ref):
         msg = f"{ref} status update — testing completed successfully."
+        daemon._grader.grade = MagicMock(return_value={"valid": True})
         valid, reason = daemon._validate_brain_message(msg)
         assert valid is True, f"Pattern '{ref}' should be recognized as directive reference"
+        daemon._grader.grade.assert_called_once()
 
 
 class TestCheckPostKillSweep:

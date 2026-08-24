@@ -347,6 +347,7 @@ def test_spawn_codex_threads_client_and_gates_slash(tmp_path, monkeypatch):
     assert isinstance(tools._activate_pm_via_sqlite.call_args.kwargs["not_before"], float)
     # claude slash commands gated OFF for codex
     keys = [c.args[1] for c in tmux.send_keys.call_args_list]
+    assert "$ironclaude:write-lossless-ai-messages" in keys
     assert not any(k.startswith("/advisor") for k in keys)
     assert not any(k.startswith("/goal") for k in keys)
     # native identity + client/model persisted atomically
@@ -368,4 +369,5 @@ def test_spawn_claude_still_sends_advisor(tmp_path, monkeypatch):
     tools.spawn_worker(worker_id="w2", worker_type="claude-sonnet", repo=str(tmp_path), objective="do Y")
     assert tools._wait_for_ready.call_args.kwargs.get("client") == "claude"
     keys = [c.args[1] for c in tmux.send_keys.call_args_list]
+    assert "/write-lossless-ai-messages" in keys
     assert any(k.startswith("/advisor") for k in keys)   # advisor still sent for claude

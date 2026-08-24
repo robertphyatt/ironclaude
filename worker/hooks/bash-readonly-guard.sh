@@ -81,7 +81,7 @@ is_review_allowed() {
   local normalized
   normalized=$(_strip_dash_c "$cmd")
   # Unchanged members, byte-exact with :477 plus diff. No env prefix.
-  if printf '%s' "$normalized" | grep -qE '^\s*(sqlite3|git\s+(diff|status|log|show|blame|ls-files|check-ignore)|pytest|make\s+test|cat|head|tail|wc|grep|rg|find|ls|diff)\b'; then return 0; fi
+  if printf '%s' "$normalized" | grep -qE '^\s*(sqlite3|git\s+(diff|status|log|show|blame|ls-files|check-ignore)|pytest|make\s+test|cat|head|tail|wc|grep|rg|find|ls|diff|cd)\b'; then return 0; fi
   # Env prefixes (any VAR=value, including PATH=) and any <path>/python -m pytest
   # are admitted to the pytest forms only — not to the alternation above. Stated
   # exactly because the set is wider than "the pytest forms" suggests: this repo
@@ -98,7 +98,7 @@ is_review_allowed() {
 is_readonly_research_bash() {
   local cmd="$1"
   if _has_blocked_metachars "$cmd"; then return 1; fi
-  if ! printf '%s' "$cmd" | grep -qE '^[[:space:]]*(cat|head|tail|wc|grep|rg|find|ls|diff)([[:space:]]|$)'; then return 1; fi
+  if ! printf '%s' "$cmd" | grep -qE '^[[:space:]]*(cat|head|tail|wc|grep|rg|find|ls|diff|cd)([[:space:]]|$)'; then return 1; fi
   if _find_has_write_action "$cmd"; then return 1; fi
   return 0
 }

@@ -1,0 +1,72 @@
+{
+  "name": "/reconcile verb — integrate a worktree into local main, keep it alive",
+  "goal": "Add a human /reconcile verb that integrates a managed worktree's current HEAD into LOCAL main and keeps the worktree alive (never pushes), extracting verb 3 from the fused /commit.",
+  "requirements_file": "docs/plans/2026-08-23-worktree-reconcile-requirements.md",
+  "design_file": "docs/plans/2026-08-23-worktree-reconcile-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "v3 human_intents migration + HumanIntentOperation type",
+      "description": "Add a v3 human_intents migration (mirror the v2 recreate) widening the operation CHECK to admit 'reconcile' and 'close-out' (close-out is CHECK+type only this loop); no WHERE filter (v2 already made workspace_guid NOT NULL). Add both values to HumanIntentOperation (types.ts:93-98). Existing db.test.ts assertions on the schema_migrations version list move from [1,2] to [1,2,3] (~:474, ~:552) — update them in the same task. VERIFY the v2 pattern (db.ts:165-190, CHECK :170, INSERT..SELECT :181-182, schema_migrations guard/bump :187) at RED.",
+      "allowed_files": ["worker/mcp-servers/workspace-manager/src/db.ts", "worker/mcp-servers/workspace-manager/src/types.ts", "worker/mcp-servers/workspace-manager/src/__tests__/db.test.ts"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: db.test.ts — after migration, human_intents accepts operation='reconcile' and 'close-out'; rejects operation='bogus' (CHECK bounded); a pre-seeded v2-era row survives v3; and update the existing schema_migrations-version assertions to expect [1,2,3].", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/db.test.ts", "expected": "FAIL (CHECK rejects reconcile; version-list assertions expect [1,2,3])"},
+        {"description": "GREEN: add the v3 migration block after the v2 block (~db.ts:190), guarded by schema_migrations version=3, in a db.transaction: create human_intents_v3 with the operation CHECK admitting the 7 values and the same columns as v2 (workspace_guid TEXT NOT NULL, no FK); INSERT..SELECT all columns from human_intents (NO WHERE); DROP+RENAME; recreate human_intents_lookup_idx; INSERT OR IGNORE schema_migrations VALUES (3). Add | 'reconcile' | 'close-out' to HumanIntentOperation (types.ts:93-98)."},
+        {"description": "Run db.test.ts.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/db.test.ts", "expected": "PASS"},
+        {"description": "Stage the three files.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/db.ts worker/mcp-servers/workspace-manager/src/types.ts worker/mcp-servers/workspace-manager/src/__tests__/db.test.ts", "expected": "staged"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "HEAD-pin evidence + observe/verify reconcile branch + push-exclusion (git-authority.ts)",
+      "description": "Add 'reconcile' to DirectGitOperation (:7) and widen the exported DirectGitAuthorityEvidence union (~:35, compiler-forced) to include ReconcileEvidence; an observeDirectEvidence reconcile branch (:393-439) returning HEAD-pin evidence {checkoutMode:'managed',canonicalBranch,localRef,headOid}, managed-only; a reconcileEvidence validator mirroring commitEvidence (:111-121) with exactKeys(['checkoutMode','canonicalBranch','localRef','headOid']); a reconcile arm in verifyDirectGitAuthority's managed legacy-evidence chain (:519-564); the push-exclusion at :563 -> if (input.operation !== 'commit' && input.operation !== 'reconcile') usablePushAuthorizations.add(authority); AND add 'reconcile' to the pushExactAuthorizedRef guard at :613 so a reconcile authority is refused with the clean single-use message (R2 defense-in-depth + a falsifiable negative test). NOTE: :563 is not the SOLE barrier (ReconcileEvidence's absent stagedTree also trips assertPostCommitPushState) — so the negative test MUST pin the exact message to detect loss of the :563 mechanism.",
+      "allowed_files": ["worker/mcp-servers/workspace-manager/src/git-authority.ts", "worker/mcp-servers/workspace-manager/src/__tests__/git-authority.test.ts"],
+      "depends_on": [1],
+      "steps": [
+        {"description": "RED: git-authority.test.ts — observeDirectEvidence(managed,'reconcile') returns the HEAD-pin shape; non-managed reconcile refused; verifyDirectGitAuthority with a reconcile intent + matching HEAD returns operation:'reconcile' authority that is NOT usable for push, asserted with the PINNED message: expect(() => pushExactAuthorizedRef(authority)).toThrow('Direct Git push authority is single-use') (this message fires only at :614 when the authority is excluded from usablePushAuthorizations — so the test fails if the :563 exclusion is dropped); a reconcile intent whose evidence headOid differs from live HEAD fails the match.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/git-authority.test.ts", "expected": "FAIL"},
+        {"description": "GREEN: DirectGitOperation +'reconcile'; widen DirectGitAuthorityEvidence union (+ReconcileEvidence); observeDirectEvidence reconcile branch (managed-only, headOid=rev-parse HEAD^{commit}, no stagedTree/remote); reconcileEvidence validator; verify managed-path reconcile arm; :563 exclusion adds && !== 'reconcile'; :613 pushExactAuthorizedRef guard adds a reconcile refusal (single-use message)."},
+        {"description": "Run git-authority.test.ts.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/git-authority.test.ts", "expected": "PASS"},
+        {"description": "Stage the two files.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/git-authority.ts worker/mcp-servers/workspace-manager/src/__tests__/git-authority.test.ts", "expected": "staged"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "finalizeReconcile finalizer (integration.ts) + FinalizationResult",
+      "description": "Export finalizeReconcile(db, authority): own single-use WeakSet; assert authority.operation==='reconcile' AND authority.checkoutMode==='managed'; revalidateAuthorizedCommitState; exactAssignment; assert worktreeHead===evidence.headOid (R3 HEAD-pin); if lifecycle 'active' -> finalizeLocalCommit(db,primary,assignment,worktree,headOid) + recycleFinalized -> {state:'reconciled', integratedCommit}; if 'ready_for_integration' (repair, R5) -> durable frozen-ref check (mirror :1029-1032) + assert live headOid + update-ref candidateRef + finalizeAttestedCandidate, THEN preserve any push-pending obligation: if decodePushDisposition(local.assignment.disposition) is non-null return {state:'integrated-local', integratedCommit, pushError:'Remote has not proved the exact integrated candidate'} (mirror finishLocalIntegration :660-670) — recycleFinalized + 'reconciled' ONLY when the disposition is null; else throw directing to reconcile_finalization. Add 'reconciled' to FinalizationResult (:31-41; integratedCommit? already :37). In integration-cases.ts widen the issueAndVerify helper op union (:237-252) to include 'reconcile'.",
+      "allowed_files": ["worker/mcp-servers/workspace-manager/src/integration.ts", "worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts"],
+      "depends_on": [2],
+      "steps": [
+        {"description": "RED: integration-cases.ts (part==='core', after :271) reconcile cases mirroring :256-271 + :284-298 (widen issueAndVerify op union to 'reconcile' first): commit staged work so HEAD is real; mint+verify reconcile authority; finalizeReconcile -> state 'reconciled', local main advanced, worktree exists, row back to 'active', base_commit=integrated; remote main byte-unchanged (never pushes); second finalize throws (own single-use); HEAD moved AFTER verify -> throws (HEAD-pin); dirty worktree -> throws; REPAIR: a ready_for_integration row seeded from a conflict-paused commit-and-push (seedIntegratedPushPending :139-162 shape) -> finalizeReconcile returns 'integrated-local' and PRESERVES the disposition/integration record (does NOT recycle).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/integration-core.test.ts", "expected": "FAIL (finalizeReconcile undefined)"},
+        {"description": "GREEN: implement finalizeReconcile per the description (own WeakSet, operation+managed asserts, HEAD-pin assert; active branch = finalizeLocalCommit+recycleFinalized -> 'reconciled'; repair branch = frozen-ref + headOid assert + finalizeAttestedCandidate + push-pending-preservation guard); FinalizationResult state union +'reconciled'."},
+        {"description": "Run the reconcile suite then the FULL suite (background if >120s); paste the measured pass count.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run", "expected": "all green (measure and paste count; no regression)"},
+        {"description": "Stage the two files.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/integration.ts worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts", "expected": "staged"}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "wiring: hook-intent + reconcile_worktree tool + state-activator (+ mint-gate tests)",
+      "description": "hook-intent.ts:66 extend the managed op condition to include 'reconcile' (routes to issueDirectGitHumanIntent; do NOT touch the length-0 unassigned branch :49). index.ts: PUBLIC_TOOL_NAMES +'reconcile_worktree'; PublicToolDependencies +reconcileWorktree; tool definition (template sync_worktree_to_target :150-162, required [repository_path,workspace_guid], no message, additionalProperties:false); dispatch case; dependency mirroring finalizeDirect (:270-286) = requireProviderRoot + verifyDirectGitAuthority(op:'reconcile') + finalizeReconcile; import finalizeReconcile (:15). state-activator.sh:54 add 'reconcile' to the verb loop. The mint-gate widening (hook-intent :66) is tested in git-authority.test.ts (where issueHumanIntentFromHook is exercised, :944-1009) — so git-authority.test.ts is in allowed_files.",
+      "allowed_files": ["worker/mcp-servers/workspace-manager/src/hook-intent.ts", "worker/mcp-servers/workspace-manager/src/index.ts", "worker/hooks/state-activator.sh", "worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts", "worker/mcp-servers/workspace-manager/src/__tests__/git-authority.test.ts"],
+      "depends_on": [3],
+      "steps": [
+        {"description": "RED: (a) tool-dispatch.test.ts — reconcile_worktree in PUBLIC_TOOL_NAMES; dispatch routes to deps.reconcileWorktree; schema requires repository_path+workspace_guid, no message, additionalProperties:false; the dep enforces requireProviderRoot (non-provider-root throws). (b) git-authority.test.ts (mint gate, near :944-1009) — issueHumanIntentFromHook with ONE managed assignment + a /reconcile hook payload mints an intent with operation='reconcile'; with ZERO assignments it throws 'exactly one active assignment' (bounds the widening; the :49 unassigned branch stays closed).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/tool-dispatch.test.ts src/__tests__/git-authority.test.ts", "expected": "FAIL"},
+        {"description": "GREEN: hook-intent.ts:66 condition +reconcile; index.ts tool name/interface/definition/dispatch/dependency + import finalizeReconcile; state-activator.sh:54 +reconcile."},
+        {"description": "Run both test files then the FULL suite (background if >120s); paste the count.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run", "expected": "all green; paste count"},
+        {"description": "Stage the five files.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/hook-intent.ts worker/mcp-servers/workspace-manager/src/index.ts worker/hooks/state-activator.sh worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts worker/mcp-servers/workspace-manager/src/__tests__/git-authority.test.ts", "expected": "staged"}
+      ]
+    },
+    {
+      "id": 5,
+      "name": "reconcile skill",
+      "description": "Create worker/skills/reconcile/SKILL.md mirroring worker/skills/commit/SKILL.md: human-only exact-form gate (/reconcile, /ironclaude:reconcile, $ironclaude:reconcile, codex link); require professional mode on + provider-root + one matching assignment; call workspace-manager reconcile_worktree with repository_path + workspace_guid only; NEVER push; require successful local-integration evidence; on failure report exact error and preserve the assignment. Do NOT promise a clean 'refuse on divergence' — a conflicting target advance pauses mid-rebase (parity with /commit); on such a failure report the exact error and direct to reconcile_finalization. No tests required: skill Markdown has no test framework; Tasks 1-4 prove the behavior; the verb is inert without this skill (state-activator codex-link regex references skills/<op>/SKILL.md).",
+      "allowed_files": ["worker/skills/reconcile/SKILL.md"],
+      "depends_on": [4],
+      "steps": [
+        {"description": "Read worker/skills/commit/SKILL.md for the exact human-only exact-form template.", "command": "cat /Users/roberthyatt/Code/ironclaude/worker/skills/commit/SKILL.md", "expected": "the commit skill template"},
+        {"description": "Create worker/skills/reconcile/SKILL.md mirroring it: exact reconcile forms, professional-mode+provider-root+one-assignment gate, call reconcile_worktree with repository_path+workspace_guid, NEVER push, require local-integration evidence, preserve assignment on failure, and (do not promise a clean divergence refusal) direct to reconcile_finalization on a paused-rebase error."},
+        {"description": "Stage the skill.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/skills/reconcile/SKILL.md", "expected": "staged"}
+      ]
+    }
+  ]
+}

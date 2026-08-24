@@ -1,0 +1,218 @@
+{
+  "name": "Primary Checkout Overlap-Based Finalization",
+  "goal": "Permit reviewed worker integration and proven managed-worktree cleanup under unrelated live primary ownership while preserving direct-primary exclusivity and concrete safety gates.",
+  "requirements_file": "docs/plans/2026-08-12-primary-checkout-overlap-finalization-requirements.md",
+  "design_file": "docs/plans/2026-08-12-primary-checkout-overlap-finalization-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Remove workspace-manager ownership fences with behavioral coverage",
+      "description": "Preserve staged integration and cleanup fence removal; add authority-routing and post-CAS staged/unstaged/untracked overlap tests; complete only foreign-owner authority routing and reconciliation classification while preserving direct-primary exclusivity and every ref, reachability, identity, evidence, recovery, and deletion safeguard.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts",
+        "worker/mcp-servers/workspace-manager/src/integration.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts",
+        "worker/mcp-servers/workspace-manager/src/workspace-service.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/git-authority.test.ts",
+        "worker/mcp-servers/workspace-manager/src/git-authority.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Preserve existing staged live-owner, normal overlap, status, push-only, release, repair-channel, interrupted-CAS, and cleanup coverage; replace permissive overlap regex with complete deterministic error. Strengthen direct cleanup with tracked staged+unstaged primary work and exact content hash/index/status preservation. In git-authority tests encode no owner -> managed, exact owner -> primary, and independently parameterize different-workspace/same-provider plus same-workspace/different-provider foreign ownership for commit and commit-and-push managed revalidation with unchanged owner rows; preserve exact-owner transition invalidation. Add on-ref post-CAS staged/unstaged/untracked non-overlap and overlap matrix plus off-ref interrupted-CAS recovery with exact branch, bytes, index, status, target ref, worktree, assignment, lock, and unrelated-owner assertions."
+        },
+        {
+          "description": "Run current integration, cleanup, and authority files RED.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test -- --run src/__tests__/integration-core.test.ts src/__tests__/integration-recovery.test.ts src/__tests__/workspace-service.test.ts src/__tests__/git-authority.test.ts",
+          "expected": "FAIL only new authority/post-CAS cases: foreign owner receives exact direct-authority denial; non-overlapping staged recovery receives crash-unproved error; overlap lacks exact conflict paths. Existing staged integration/cleanup cases remain GREEN."
+        },
+        {
+          "description": "Make resolveEffectiveCheckout return managed for no or foreign owner and primary only for exact workspace/provider root. Replace post-CAS whole-index equality veto with sorted staged-against-expectedTarget, unstaged, and untracked path union intersected with changedPaths(expectedTarget,candidate); on overlap report exact `Crash reconciliation primary checkout has local changes overlapping the carried-forward integration; preserving worktree. Overlapping paths: <sorted paths>`, otherwise carry forward. Preserve staged integration/cleanup fence removals plus locks, CAS, freeze/effect proof, authority evidence, lifecycle, identity, reachability, mark-integrated, cleanup, and recovery-release behavior."
+        },
+        {
+          "description": "Prove all three workspace-manager ownership fences are absent.",
+          "command": "python3 -c 'from pathlib import Path; integration = Path(\"/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/src/integration.ts\").read_text(); cleanup = Path(\"/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/src/workspace-service.ts\").read_text(); authority = Path(\"/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/src/git-authority.ts\").read_text(); assert \"fencePrimaryCheckout\" not in integration; assert \"Finalization is fenced while primary checkout is owned\" not in integration; assert \"reapStalePrimaryOwner\" not in integration; assert \"primaryCheckoutIsOwned\" not in cleanup; assert \"Primary checkout remains owned; preserving managed worktree\" not in cleanup; assert \"Direct Git authority primary checkout is owned by another assignment or provider root\" not in authority'",
+          "expected": "Exit 0; any remaining helper, error, import, call, or foreign-owner denial fails."
+        },
+        {
+          "description": "Run expanded integration, cleanup, and authority files GREEN.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test -- --run src/__tests__/integration-core.test.ts src/__tests__/integration-recovery.test.ts src/__tests__/workspace-service.test.ts src/__tests__/git-authority.test.ts",
+          "expected": "All four files pass; no predicted post-change count."
+        },
+        {
+          "description": "Prove direct-primary exclusivity still rejects a second live claimant.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test -- --run src/__tests__/db.test.ts -t \"never reaps a live primary owner\"",
+          "expected": "1 passed, 22 skipped."
+        },
+        {
+          "description": "Stage only Task 1 source and tests; preserve all existing staged work.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -- worker/mcp-servers/workspace-manager/src/integration.ts worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts worker/mcp-servers/workspace-manager/src/workspace-service.ts worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts worker/mcp-servers/workspace-manager/src/git-authority.ts worker/mcp-servers/workspace-manager/src/__tests__/git-authority.test.ts",
+          "expected": "Task 1 files staged; prior staged files unchanged."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Remove repository-wide ownership from Commander reaper liveness",
+      "description": "Add a terminal-worker regression under unrelated primary ownership; remove only repository ownership from reaper protection; preserve worker/tmux, recent-activity, operator-assignment, integration-lock, owner-binding, TTL, and fail-safe guards.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_worktree_reaper.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Add exact TestReapLeakedWorktrees live-owner unit case from human plan; create active owner assignment plus owner row; require eligible integrated worker cleanup, released=1, protected=0, no errors, and unchanged unrelated active assignment and primary-owner row. Add temporary real-Git acceptance using current source bundled under tmp_path and actual WorkspaceClient.cleanup transport; require worktree/branch removal, cleaned lifecycle, and unchanged primary branch/content hashes/index/status plus unrelated owner state."
+        },
+        {
+          "description": "Run Commander reaper file RED.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest /Users/roberthyatt/Code/ironclaude/commander/tests/test_worktree_reaper.py -q",
+          "expected": "FAIL: cleanup not called and protected=1 under current repository-wide owner guard."
+        },
+        {
+          "description": "Remove primary_owned_repos parameter, predicate, query, and call argument; delete obsolete ownership-protection test and update no-signal signature; preserve every remaining liveness, lock, scope, transport, and fail-safe guard."
+        },
+        {
+          "description": "Prove obsolete Commander reaper predicate is absent.",
+          "command": "python3 -c 'from pathlib import Path; source = Path(\"/Users/roberthyatt/Code/ironclaude/commander/src/ironclaude/main.py\").read_text(); assert \"primary_owned_repos\" not in source; assert \"SELECT repository_identity FROM primary_checkout_owners\" not in source'",
+          "expected": "Exit 0; either remaining predicate fails."
+        },
+        {
+          "description": "Run full Commander reaper file GREEN.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest /Users/roberthyatt/Code/ironclaude/commander/tests/test_worktree_reaper.py -q",
+          "expected": "All reaper tests pass, including real transport/worktree cleanup; no predicted count."
+        },
+        {
+          "description": "Stage only Task 2 source and test; preserve all existing staged work.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -- commander/src/ironclaude/main.py commander/tests/test_worktree_reaper.py",
+          "expected": "Task 2 files staged; prior staged files unchanged."
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Build verify and cachebust shared plugin",
+      "description": "Replace only Codex cachebuster, rebuild workspace-manager bundles, run focused and full suites, validate plugin, capture runtime hashes, and stage exact generated files.",
+      "allowed_files": [
+        "worker/.codex-plugin/plugin.json",
+        "worker/mcp-servers/workspace-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "Replace only Codex cachebuster suffix; retain release 1.1.6.",
+          "command": "python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/update_plugin_cachebuster.py /Users/roberthyatt/Code/ironclaude/worker",
+          "expected": "Manifest changes from 1.1.6+codex.20260812213409 to one fresh 1.1.6+codex timestamp."
+        },
+        {
+          "description": "Build TypeScript and workspace-manager server, CLI, and hook-intent bundles.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager run build",
+          "expected": "TypeScript and all three bundles complete without errors."
+        },
+        {
+          "description": "Prove executable server and CLI omit all ownership-fence errors and retain overlap error.",
+          "command": "python3 -c 'from pathlib import Path; paths = [Path(\"/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/index.js\"), Path(\"/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js\")]; forbidden = [\"Finalization is fenced while primary checkout is owned\", \"Primary checkout remains owned; preserving managed worktree\", \"Direct Git authority primary checkout is owned by another assignment or provider root\"]; [(_ for _ in ()).throw(AssertionError(f\"{p}: {marker}\")) for p in paths for marker in forbidden if marker in p.read_text()]; assert all(\"Overlapping paths:\" in p.read_text() for p in paths)'",
+          "expected": "Exit 0 for both bundles."
+        },
+        {
+          "description": "Run workspace-manager integration, recovery, cleanup, and ownership files.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test -- --run src/__tests__/integration-core.test.ts src/__tests__/integration-recovery.test.ts src/__tests__/workspace-service.test.ts src/__tests__/git-authority.test.ts src/__tests__/db.test.ts",
+          "expected": "All five files pass."
+        },
+        {
+          "description": "Run Commander reaper file.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest /Users/roberthyatt/Code/ironclaude/commander/tests/test_worktree_reaper.py -q",
+          "expected": "Reaper tests pass."
+        },
+        {
+          "description": "Run complete repository suite.",
+          "command": "make -C /Users/roberthyatt/Code/ironclaude test",
+          "expected": "Hook, workspace-manager, and Commander suites exit 0; no predicted count."
+        },
+        {
+          "description": "Verify release/cachebuster consistency.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python -m pytest /Users/roberthyatt/Code/ironclaude/commander/tests/test_version_consistency.py -q",
+          "expected": "Version-consistency tests pass for release 1.1.6 plus one supported Codex suffix."
+        },
+        {
+          "description": "Validate plugin structure.",
+          "command": "python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py /Users/roberthyatt/Code/ironclaude/worker",
+          "expected": "Plugin validation succeeds."
+        },
+        {
+          "description": "Capture manifest, state-manager bundle, workspace-manager server, CLI, and hook-intent SHA-256 values for Task 4 runtime proof.",
+          "command": "shasum -a 256 /Users/roberthyatt/Code/ironclaude/worker/.codex-plugin/plugin.json /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager/dist/index.js /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/index.js /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/hook-intent.js",
+          "expected": "Five exact hashes retained for expected_runtime."
+        },
+        {
+          "description": "Stage cachebuster and exact generated workspace-manager bundles; preserve existing staged files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -- worker/.codex-plugin/plugin.json worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/hook-intent.js",
+          "expected": "Task 3 files staged; existing staged files untouched."
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Reinstall IronClaude last and prove same-task activation",
+      "description": "Main orchestrator restarts Commander, reinstalls Claude, verifies and arms existing Codex restart helper, performs final Codex reinstall, resumes same task, and proves exact runtime activation without later shell calls.",
+      "allowed_files": [
+        "worker/.claude-plugin/plugin.json",
+        "worker/.codex-plugin/plugin.json"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {
+          "description": "Call get_resume_state; require session 019fc5e5-fc72-7493-b785-bee8cda62b1b, this lineage, Task 4 in progress, professional mode on."
+        },
+        {
+          "description": "Restart live Commander through identity-checked SIGHUP CLI; never invoke Claude login or start a second daemon.",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/ironclaude restart",
+          "expected": "Restart signal sent to verified ironclaude.main PID."
+        },
+        {
+          "description": "Verify fresh Commander startup.",
+          "command": "tail -n 80 /tmp/ic/daemon.log",
+          "expected": "Latest sequence ends with Daemon started and no singleton, authentication, or startup failure."
+        },
+        {
+          "description": "Uninstall cached Claude plugin while preserving data.",
+          "command": "claude plugin uninstall ironclaude@ironclaude --scope user --keep-data --yes",
+          "expected": "Cached plugin removed; persistent data preserved."
+        },
+        {
+          "description": "Install Claude plugin from local ironclaude marketplace.",
+          "command": "claude plugin install ironclaude@ironclaude --scope user",
+          "expected": "Claude installs IronClaude 1.1.6."
+        },
+        {
+          "description": "Verify Claude inventory contains workspace-manager and release 1.1.6.",
+          "command": "claude plugin details ironclaude@ironclaude",
+          "expected": "Expected workspace-manager inventory and release shown."
+        },
+        {
+          "description": "Verify existing restart helper hash and inspect it for 20-second delay, exact ChatGPT executable, bounded SIGTERM wait, and com.openai.codex relaunch; do not rewrite helper.",
+          "command": "shasum -a 256 /private/tmp/restart_codex.py",
+          "expected": "d09cc042bdac54f8fb87eb1a021724fe28b42b355690bdd97999fa2a8a16c38f  /private/tmp/restart_codex.py"
+        },
+        {
+          "description": "Arm verified restart helper as penultimate shell action.",
+          "command": "/usr/bin/python3 -c 'import subprocess; subprocess.Popen([\"/usr/bin/python3\", \"/private/tmp/restart_codex.py\"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)'",
+          "expected": "Detached helper waits while current process remains alive for final install."
+        },
+        {
+          "description": "FINAL SHELL ACTION: reinstall Codex from local ironclaude marketplace; run no later shell command.",
+          "command": "codex plugin add ironclaude@ironclaude --json",
+          "expected": "Exit 0; JSON reports enabled Task 3 cachebuster from local ironclaude marketplace."
+        },
+        {
+          "description": "After helper restart, reopen same task; call get_resume_state and require exact session, lineage, Task 4, and professional-mode continuity."
+        },
+        {
+          "description": "Call run_diagnostics with Task 3 cache version/root and exact manifest, state-manager, workspace-manager server, CLI, and hook-intent hashes; require 13/13, source/cache parity, native identity, Runtime activation match PASS; submit through task-boundary review; no commit/push."
+        }
+      ]
+    }
+  ]
+}

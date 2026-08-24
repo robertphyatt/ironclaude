@@ -37,16 +37,22 @@ if [ "$HAS_OUTPUT" = "true" ]; then
   exit 0
 else
   # ─── PreToolUse: BLOCK Task dispatch when breaker is tripped ───
-  CB=$(db_read_or_fail "SUBAGENT-CIRCUIT-BREAKER" \
-    "SELECT circuit_breaker FROM sessions WHERE terminal_session='$(echo "$SESSION_TAG" | sed "s/'/''/g")';") || {
+  # Invariant B: the breaker restrains AGENT dispatch only while professional
+  # mode is on; with PM off/undecided there is no workflow to protect, so the
+  # block below never fires (never blocks the operator's dispatch). Both columns
+  # are NOT NULL, so ROW is always "mode|flag".
+  ROW=$(db_read_or_fail "SUBAGENT-CIRCUIT-BREAKER" \
+    "SELECT professional_mode || '|' || circuit_breaker FROM sessions WHERE terminal_session='$(echo "$SESSION_TAG" | sed "s/'/''/g")';") || {
     block_pretooluse "SUBAGENT-CIRCUIT-BREAKER" "BLOCKED — DATABASE ERROR
 
 Cannot read circuit breaker state from the database. This is a temporary error.
 
 Try dispatching the Task again. If this persists, report the error to the user."
   }
+  PM="${ROW%%|*}"
+  CB="${ROW##*|}"
 
-  if [ "$CB" = "1" ] && [ "$TOOL_NAME" = "Agent" ]; then
+  if [ "$PM" = "on" ] && [ "$CB" = "1" ] && [ "$TOOL_NAME" = "Agent" ]; then
     block_pretooluse "SUBAGENT-CIRCUIT-BREAKER" "BLOCKED — SUBAGENT CONTEXT LIMIT HIT
 
 A previous subagent ran out of context. Dispatching more subagents is blocked.

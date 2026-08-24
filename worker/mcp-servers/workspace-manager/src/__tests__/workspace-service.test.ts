@@ -1,11 +1,11 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { createHumanIntent, initDb, recordIntegration } from '../db.js';
+import { createAssignment, createHumanIntent, initDb, recordIntegration } from '../db.js';
 import { worktreeIsClean } from '../git.js';
 import { WorkspaceService } from '../workspace-service.js';
 
@@ -692,6 +692,40 @@ describe('WorkspaceService real-Git lifecycle', () => {
     expect(git(unknownPath, 'status', '--porcelain')).toBe('');
   });
 
+  it('rescue-abandon commits uncommitted work onto the worker branch, reclaims the dir, and preserves the branch', () => {
+    const root = repository();
+    const database = initDb(join(root, 'rescue.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    const branch = assignment.branch;
+    // Uncommitted, untracked content: not reachable from main, not committed anywhere yet.
+    writeFileSync(join(assignment.worktree_path, 'unintegrated.txt'), 'rescue me\n');
+    expect(worktreeIsClean(assignment.worktree_path)).toBe(false);
+    expect(git(root, 'log', 'main', '--oneline', '--', 'unintegrated.txt')).toBe('');
+
+    const abandoned = manager.abandonWorkspace({
+      repositoryPath: root,
+      workspaceGuid: assignment.workspace_guid,
+      ownerSessionId: OWNER,
+      mode: 'rescue',
+    });
+
+    expect(abandoned.lifecycle_status).toBe('abandoned');
+    // Falsifier: without rescue, this content is unreachable once the dir is gone.
+    expect(existsSync(assignment.worktree_path)).toBe(false);
+    // The branch must SURVIVE reclamation, or the rescued commit would be stranded.
+    expect(git(root, 'branch', '--list', branch)).not.toBe('');
+    const branchTip = git(root, 'rev-parse', branch);
+    expect(git(root, 'cat-file', '-p', `${branchTip}:unintegrated.txt`)).toBe('rescue me');
+    // recovery_ref records the durable RECOVERY REF NAME, which resolves to the exact
+    // rescued commit — the anchor survives even if the branch is later deleted.
+    const recoveryRef = `refs/ironclaude/recovery/${assignment.workspace_guid}`;
+    expect(abandoned.recovery_ref).toBe(recoveryRef);
+    expect(git(root, 'rev-parse', recoveryRef)).toBe(branchTip);
+    // The rescue-commit must never land on main.
+    expect(git(root, 'log', 'main', '--oneline', '--', 'unintegrated.txt')).toBe('');
+  });
+
   it('preserves integrated-looking work until its exact recorded target contains the recorded commit', () => {
     const root = repository();
     const database = initDb(join(root, 'integrated.db'));
@@ -723,6 +757,54 @@ describe('WorkspaceService real-Git lifecycle', () => {
       .lifecycle_status).toBe('cleaned');
     expect(existsSync(assignment.worktree_path)).toBe(false);
     expect(git(root, 'branch', '--list', assignment.branch)).toBe('');
+  });
+
+  it('cleans a proven integrated worktree while another session owns the primary checkout', () => {
+    const root = repository();
+    const database = initDb(join(root, 'integrated-under-other-owner.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    const other = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OTHER_OWNER });
+    writeFileSync(join(assignment.worktree_path, 'integrated.txt'), 'integrated\n');
+    git(assignment.worktree_path, 'add', 'integrated.txt');
+    git(assignment.worktree_path, 'commit', '-m', 'integrated work');
+    const integratedCommit = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+    const targetRef = 'refs/heads/main';
+    database.prepare(`
+      UPDATE assignments SET lifecycle_status = 'integrated', integrated_commit = ? WHERE workspace_guid = ?
+    `).run(integratedCommit, assignment.workspace_guid);
+    recordIntegration(database, {
+      workspaceGuid: assignment.workspace_guid,
+      repositoryIdentity: assignment.repository_identity,
+      targetRef,
+      integratedCommit,
+    });
+    git(root, 'merge', '--ff-only', integratedCommit);
+    database.prepare(`
+      INSERT INTO primary_checkout_owners (repository_identity, workspace_guid, owner_session_id)
+      VALUES (?, ?, ?)
+    `).run(other.repository_identity, other.workspace_guid, OTHER_OWNER);
+    writeFileSync(join(root, 'README.md'), 'operator staged\n');
+    git(root, 'add', 'README.md');
+    writeFileSync(join(root, 'README.md'), 'operator unstaged\n');
+    const primaryHash = git(root, 'hash-object', join(root, 'README.md'));
+    const primaryIndex = git(root, 'ls-files', '-s', '--', 'README.md');
+    const primaryBefore = git(root, 'status', '--porcelain=v1', '--untracked-files=all');
+
+    expect(manager.cleanupWorkspace({
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, ownerSessionId: OWNER,
+    }).lifecycle_status).toBe('cleaned');
+    expect(existsSync(assignment.worktree_path)).toBe(false);
+    expect(git(root, 'branch', '--list', assignment.branch)).toBe('');
+    expect(git(root, 'hash-object', join(root, 'README.md'))).toBe(primaryHash);
+    expect(git(root, 'ls-files', '-s', '--', 'README.md')).toBe(primaryIndex);
+    expect(git(root, 'status', '--porcelain=v1', '--untracked-files=all')).toBe(primaryBefore);
+    expect(database.prepare(
+      'SELECT workspace_guid, owner_session_id FROM primary_checkout_owners WHERE repository_identity = ?',
+    ).get(assignment.repository_identity)).toMatchObject({
+      workspace_guid: other.workspace_guid,
+      owner_session_id: OTHER_OWNER,
+    });
   });
 
   it('links configured shared resources into the worktree as symlinks and keeps it clean', () => {
@@ -1022,5 +1104,280 @@ describe('WorkspaceService real-Git lifecycle', () => {
     expect(existsSync(assignment.worktree_path)).toBe(true);
     expect(database.prepare('SELECT lifecycle_status, recovery_ref FROM assignments WHERE workspace_guid = ?')
       .get(assignment.workspace_guid)).toMatchObject({ lifecycle_status: 'abandoned', recovery_ref: recoveryRef });
+  });
+
+  it('rescueAbandon anchors the rescued commit on a durable ref that survives branch deletion', () => {
+    const root = repository();
+    const database = initDb(join(root, 'rescue-durable-ref.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    const guid = assignment.workspace_guid;
+    const branch = assignment.branch;
+    // Uncommitted, untracked content: reachable from nothing until rescue anchors it.
+    writeFileSync(join(assignment.worktree_path, 'unintegrated.txt'), 'rescue me\n');
+
+    const abandoned = manager.abandonWorkspace({
+      repositoryPath: root, workspaceGuid: guid, ownerSessionId: OWNER, mode: 'rescue',
+    });
+
+    const recoveryRef = `refs/ironclaude/recovery/${guid}`;
+    // recovery_ref stores the durable REF NAME, not a bare SHA.
+    expect(abandoned.recovery_ref).toBe(recoveryRef);
+    const rescuedCommit = git(root, 'rev-parse', recoveryRef);
+
+    // Delete the worker branch. Without a durable recovery ref, the rescued commit
+    // would become unreachable and the work lost — the exact never-lose-work failure.
+    git(root, 'branch', '-D', branch);
+    expect(git(root, 'rev-parse', recoveryRef)).toBe(rescuedCommit);
+    expect(git(root, 'cat-file', '-p', `${recoveryRef}:unintegrated.txt`)).toBe('rescue me');
+  });
+
+  it('cleanupWorkspace tombstones a rescue-abandoned row (branch deleted, ref preserved)', () => {
+    const root = repository();
+    const database = initDb(join(root, 'rescue-tombstone.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    const guid = assignment.workspace_guid;
+    writeFileSync(join(assignment.worktree_path, 'unintegrated.txt'), 'rescue me\n');
+
+    manager.abandonWorkspace({ repositoryPath: root, workspaceGuid: guid, ownerSessionId: OWNER, mode: 'rescue' });
+    const recoveryRef = `refs/ironclaude/recovery/${guid}`;
+    const rescuedCommit = git(root, 'rev-parse', recoveryRef);
+    // Rescue removed the worktree directory but preserved the branch.
+    expect(existsSync(assignment.worktree_path)).toBe(false);
+
+    expect(manager.cleanupWorkspace({ repositoryPath: root, workspaceGuid: guid, ownerSessionId: OWNER })
+      .lifecycle_status).toBe('cleaned');
+    // The worker branch is now gone, but the recovery ref still anchors the rescued work.
+    expect(git(root, 'branch', '--list', assignment.branch)).toBe('');
+    expect(git(root, 'rev-parse', recoveryRef)).toBe(rescuedCommit);
+  });
+
+  it('reapLeakedAssignment preserves then tombstones an ownerless active row (present worktree)', () => {
+    const root = repository();
+    const database = initDb(join(root, 'reap-active-present.db'));
+    const manager = new WorkspaceService(database);
+    const guid = randomUUID();
+    const assignment = manager.reserveWorkerWorktree({
+      repositoryPath: root, workspaceGuid: guid, workerId: 'worker-1',
+    });
+    expect(assignment.owner_session_id).toBeNull();
+    expect(assignment.lifecycle_status).toBe('active');
+    // Uncommitted work in the leaked worktree: must survive the reap.
+    writeFileSync(join(assignment.worktree_path, 'leaked.txt'), 'leaked work\n');
+
+    const reaped = manager.reapLeakedAssignment({ repositoryPath: root, workspaceGuid: guid });
+    expect(reaped.lifecycle_status).toBe('cleaned');
+    // Work preserved on a durable recovery ref; worktree and branch both gone.
+    const recoveryRef = `refs/ironclaude/recovery/${guid}`;
+    expect(git(root, 'cat-file', '-p', `${recoveryRef}:leaked.txt`)).toBe('leaked work');
+    expect(existsSync(assignment.worktree_path)).toBe(false);
+    expect(git(root, 'branch', '--list', assignment.branch)).toBe('');
+  });
+
+  it('reapLeakedAssignment tombstones an ownerless row whose worktree is gone but branch survives', () => {
+    const root = repository();
+    const database = initDb(join(root, 'reap-worktree-gone-branch.db'));
+    const manager = new WorkspaceService(database);
+    const guid = randomUUID();
+    const assignment = manager.reserveWorkerWorktree({
+      repositoryPath: root, workspaceGuid: guid, workerId: 'worker-1',
+    });
+    writeFileSync(join(assignment.worktree_path, 'committed.txt'), 'committed work\n');
+    git(assignment.worktree_path, 'add', 'committed.txt');
+    git(assignment.worktree_path, 'commit', '-m', 'committed work');
+    const branchTip = git(root, 'rev-parse', assignment.branch);
+    // Worktree removed from Git + disk, but the branch (and its commit) survive.
+    git(root, 'worktree', 'remove', '--force', assignment.worktree_path);
+    expect(existsSync(assignment.worktree_path)).toBe(false);
+
+    const reaped = manager.reapLeakedAssignment({ repositoryPath: root, workspaceGuid: guid });
+    expect(reaped.lifecycle_status).toBe('cleaned');
+    // The recovery ref was minted at the surviving branch tip before the branch was deleted.
+    const recoveryRef = `refs/ironclaude/recovery/${guid}`;
+    expect(git(root, 'rev-parse', recoveryRef)).toBe(branchTip);
+    expect(git(root, 'branch', '--list', assignment.branch)).toBe('');
+  });
+
+  it('reapLeakedAssignment on an ownerless row with worktree AND branch gone records base_commit and tombstones', () => {
+    const root = repository();
+    const database = initDb(join(root, 'reap-worktree-and-branch-gone.db'));
+    const manager = new WorkspaceService(database);
+    const guid = randomUUID();
+    const assignment = manager.reserveWorkerWorktree({
+      repositoryPath: root, workspaceGuid: guid, workerId: 'worker-1',
+    });
+    const baseCommit = assignment.base_commit;
+    git(root, 'worktree', 'remove', '--force', assignment.worktree_path);
+    git(root, 'branch', '-D', assignment.branch);
+    expect(existsSync(assignment.worktree_path)).toBe(false);
+    expect(git(root, 'branch', '--list', assignment.branch)).toBe('');
+
+    const reaped = manager.reapLeakedAssignment({ repositoryPath: root, workspaceGuid: guid });
+    expect(reaped.lifecycle_status).toBe('cleaned');
+    // With no worktree and no branch, the recovery ref falls back to the recorded base commit.
+    const recoveryRef = `refs/ironclaude/recovery/${guid}`;
+    expect(git(root, 'rev-parse', recoveryRef)).toBe(baseCommit);
+  });
+
+  it('reapLeakedAssignment refuses+preserves a present worktree checked out on a FOREIGN branch', () => {
+    const root = repository();
+    const database = initDb(join(root, 'reap-foreign-branch.db'));
+    const manager = new WorkspaceService(database);
+    const guid = randomUUID();
+    const assignment = manager.reserveWorkerWorktree({
+      repositoryPath: root, workspaceGuid: guid, workerId: 'worker-1',
+    });
+    // Check the managed worktree out onto a DIFFERENT branch: its Git identity no
+    // longer matches the durable assignment, so reconciliation must preserve it.
+    git(assignment.worktree_path, 'checkout', '-b', 'foreign-branch');
+
+    expect(() => manager.reapLeakedAssignment({ repositoryPath: root, workspaceGuid: guid }))
+      .toThrow('does not match durable assignment');
+    // Preserved: row untouched, worktree still on disk.
+    expect(existsSync(assignment.worktree_path)).toBe(true);
+    expect(database.prepare('SELECT lifecycle_status FROM assignments WHERE workspace_guid = ?')
+      .get(guid)).toMatchObject({ lifecycle_status: 'active' });
+  });
+
+  it('reapLeakedAssignment routes a reserved never-materialized row to a row-delete', () => {
+    const root = repository();
+    const database = initDb(join(root, 'reap-reserved.db'));
+    const manager = new WorkspaceService(database);
+    const guid = randomUUID();
+    const worktreePath = join(realpathSync(root), '.ironclaude', 'worktrees', guid);
+    const baseCommit = git(root, 'rev-parse', 'HEAD');
+    // A reserved row whose materialization never planted a worktree on disk.
+    createAssignment(database, {
+      workspaceGuid: guid,
+      repositoryIdentity: commonDir(root),
+      worktreePath,
+      branch: `ironclaude/${guid}`,
+      baseCommit,
+      currentHead: baseCommit,
+      ownerSessionId: null,
+      workerId: 'worker-1',
+      integrationTarget: 'main',
+    });
+    expect(existsSync(worktreePath)).toBe(false);
+    expect(database.prepare('SELECT lifecycle_status FROM assignments WHERE workspace_guid = ?')
+      .get(guid)).toMatchObject({ lifecycle_status: 'reserved' });
+
+    const reaped = manager.reapLeakedAssignment({ repositoryPath: root, workspaceGuid: guid });
+    expect(reaped.lifecycle_status).toBe('cleaned');
+    // Nothing on disk and nothing to anchor: the row is deleted outright.
+    expect(database.prepare('SELECT 1 FROM assignments WHERE workspace_guid = ?').get(guid)).toBeUndefined();
+  });
+
+  it('tombstone upgrades a legacy raw-SHA recovery_ref (absent worktree) to a durable ref before deleting the branch', () => {
+    const root = repository();
+    const database = initDb(join(root, 'legacy-absent.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    const guid = assignment.workspace_guid;
+    const branch = assignment.branch;
+    writeFileSync(join(assignment.worktree_path, 'unintegrated.txt'), 'rescue me\n');
+    manager.abandonWorkspace({ repositoryPath: root, workspaceGuid: guid, ownerSessionId: OWNER, mode: 'rescue' });
+    const recoveryRef = `refs/ironclaude/recovery/${guid}`;
+    const rescuedCommit = git(root, 'rev-parse', recoveryRef);
+    // Simulate a DEPLOYED pre-fix legacy row: only the branch anchors the commit, and
+    // recovery_ref is a bare SHA (no durable ref).
+    git(root, 'update-ref', '-d', recoveryRef);
+    database.prepare('UPDATE assignments SET recovery_ref = ? WHERE workspace_guid = ?').run(rescuedCommit, guid);
+    expect(existsSync(assignment.worktree_path)).toBe(false);
+    expect(git(root, 'branch', '--list', branch)).not.toBe('');
+
+    expect(manager.cleanupWorkspace({ repositoryPath: root, workspaceGuid: guid, ownerSessionId: OWNER })
+      .lifecycle_status).toBe('cleaned');
+
+    // Branch deleted, but the rescued commit is now anchored by a durable ref that
+    // survives the deletion, and the DB records the ref NAME, not the bare SHA.
+    expect(git(root, 'branch', '--list', branch)).toBe('');
+    expect(git(root, 'rev-parse', recoveryRef)).toBe(rescuedCommit);
+    expect(git(root, 'cat-file', '-p', `${recoveryRef}:unintegrated.txt`)).toBe('rescue me');
+    expect(database.prepare('SELECT recovery_ref FROM assignments WHERE workspace_guid = ?').get(guid))
+      .toMatchObject({ recovery_ref: recoveryRef });
+  });
+
+  it('tombstone upgrades a legacy raw-SHA recovery_ref (present worktree) before deleting the branch', () => {
+    const root = repository();
+    const database = initDb(join(root, 'legacy-present.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    const guid = assignment.workspace_guid;
+    const branch = assignment.branch;
+    writeFileSync(join(assignment.worktree_path, 'recovery.txt'), 'recoverable\n');
+    git(assignment.worktree_path, 'add', 'recovery.txt');
+    git(assignment.worktree_path, 'commit', '-m', 'recoverable work');
+    const rescuedCommit = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+    // Default abandon keeps the worktree on disk; set a bare-SHA recovery_ref (legacy).
+    manager.abandonWorkspace({ repositoryPath: root, workspaceGuid: guid, ownerSessionId: OWNER });
+    database.prepare('UPDATE assignments SET recovery_ref = ? WHERE workspace_guid = ?').run(rescuedCommit, guid);
+    expect(existsSync(assignment.worktree_path)).toBe(true);
+
+    expect(manager.cleanupWorkspace({ repositoryPath: root, workspaceGuid: guid, ownerSessionId: OWNER })
+      .lifecycle_status).toBe('cleaned');
+
+    const recoveryRef = `refs/ironclaude/recovery/${guid}`;
+    expect(git(root, 'branch', '--list', branch)).toBe('');
+    expect(git(root, 'rev-parse', recoveryRef)).toBe(rescuedCommit);
+    expect(database.prepare('SELECT recovery_ref FROM assignments WHERE workspace_guid = ?').get(guid))
+      .toMatchObject({ recovery_ref: recoveryRef });
+  });
+
+  it('tombstone leaves a normal ref-name recovery_ref untouched (no re-mint, no DB rewrite)', () => {
+    const root = repository();
+    const database = initDb(join(root, 'refname-noop.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    const guid = assignment.workspace_guid;
+    const branch = assignment.branch;
+    writeFileSync(join(assignment.worktree_path, 'unintegrated.txt'), 'rescue me\n');
+    manager.abandonWorkspace({ repositoryPath: root, workspaceGuid: guid, ownerSessionId: OWNER, mode: 'rescue' });
+    const recoveryRef = `refs/ironclaude/recovery/${guid}`;
+    const rescuedCommit = git(root, 'rev-parse', recoveryRef);
+    const before = database.prepare('SELECT recovery_ref FROM assignments WHERE workspace_guid = ?').get(guid) as { recovery_ref: string };
+    expect(before.recovery_ref).toBe(recoveryRef);
+
+    // R2 "no DB write" detector: no UPDATE touching recovery_ref may run while
+    // cleaning up a ref-name row. updated_at cannot detect this — the lifecycle
+    // transition unconditionally rewrites updated_at on the abandoned->cleaned tombstone.
+    const prepareSpy = vi.spyOn(database, 'prepare');
+    expect(manager.cleanupWorkspace({ repositoryPath: root, workspaceGuid: guid, ownerSessionId: OWNER })
+      .lifecycle_status).toBe('cleaned');
+    const recoveryRefWrites = prepareSpy.mock.calls
+      .map((call) => String(call[0]))
+      .filter((sql) => /update/i.test(sql) && /recovery_ref/i.test(sql));
+    prepareSpy.mockRestore();
+    expect(recoveryRefWrites).toEqual([]);
+
+    const after = database.prepare('SELECT recovery_ref FROM assignments WHERE workspace_guid = ?').get(guid) as { recovery_ref: string };
+    expect(after.recovery_ref).toBe(recoveryRef);
+    expect(git(root, 'rev-parse', recoveryRef)).toBe(rescuedCommit);
+    expect(git(root, 'branch', '--list', branch)).toBe('');
+  });
+
+  it('tombstone refuses (preserves) a raw-SHA recovery_ref whose object no longer exists', () => {
+    const root = repository();
+    const database = initDb(join(root, 'unanchorable.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    const guid = assignment.workspace_guid;
+    const branch = assignment.branch;
+    writeFileSync(join(assignment.worktree_path, 'unintegrated.txt'), 'rescue me\n');
+    manager.abandonWorkspace({ repositoryPath: root, workspaceGuid: guid, ownerSessionId: OWNER, mode: 'rescue' });
+    const recoveryRef = `refs/ironclaude/recovery/${guid}`;
+    git(root, 'update-ref', '-d', recoveryRef);
+    // A bare full-hex SHA that names no existing object. git rev-parse --verify accepts a
+    // full 40-hex without an existence check, so the gate's mint (update-ref) is what fails
+    // here — fail-closed: it throws before any branch deletion, preserving the row.
+    database.prepare('UPDATE assignments SET recovery_ref = ? WHERE workspace_guid = ?').run('1'.repeat(40), guid);
+
+    expect(() => manager.cleanupWorkspace({ repositoryPath: root, workspaceGuid: guid, ownerSessionId: OWNER }))
+      .toThrow();
+    // Row NOT tombstoned; the worker branch is preserved.
+    expect(database.prepare('SELECT lifecycle_status FROM assignments WHERE workspace_guid = ?').get(guid))
+      .toMatchObject({ lifecycle_status: 'abandoned' });
+    expect(git(root, 'branch', '--list', branch)).not.toBe('');
   });
 });

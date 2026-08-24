@@ -1,11 +1,11 @@
 import type Database from 'better-sqlite3';
 import path from 'node:path';
 import { consumeHumanIntent, consumeMatchingHumanIntent, getAssignment, issueHumanIntent } from './db.js';
-import { discoverRepository, listWorktrees, runGit } from './git.js';
+import { discoverRepository, isAncestor, listWorktrees, runGit } from './git.js';
 import type { Assignment, HumanIntentReceipt } from './types.js';
 
-export type DirectGitOperation = 'commit' | 'commit-and-push' | 'push';
-export type DirectGitCheckoutMode = 'managed' | 'primary';
+export type DirectGitOperation = 'commit' | 'commit-and-push' | 'push' | 'reconcile';
+export type DirectGitCheckoutMode = 'managed' | 'primary' | 'primary-unassigned';
 
 interface BranchEvidence {
   checkoutMode: DirectGitCheckoutMode;
@@ -32,11 +32,16 @@ export interface PushEvidence extends RemoteEvidence {
   localOid: string;
 }
 
-export type DirectGitAuthorityEvidence = CommitEvidence | CommitAndPushEvidence | PushEvidence;
+export interface ReconcileEvidence extends BranchEvidence {
+  checkoutMode: 'managed';
+  headOid: string;
+}
+
+export type DirectGitAuthorityEvidence = CommitEvidence | CommitAndPushEvidence | PushEvidence | ReconcileEvidence;
 
 export interface VerifyDirectGitAuthorityInput {
   repositoryPath: string;
-  workspaceGuid: string;
+  workspaceGuid?: string;
   providerRootSessionId: string;
   humanChannel: string;
   operation: DirectGitOperation;
@@ -46,7 +51,7 @@ export interface VerifyDirectGitAuthorityInput {
 
 export interface IssueDirectGitHumanIntentInput {
   repositoryPath: string;
-  workspaceGuid: string;
+  workspaceGuid?: string;
   providerRootSessionId: string;
   humanChannel: string;
   operation: DirectGitOperation;
@@ -118,6 +123,16 @@ function commitEvidence(value: unknown, assignment: Assignment, checkoutMode: Di
   const parentOid = oid(source.parentOid)!;
   if (parentRef !== 'HEAD') denyEvidence();
   return { ...branch, stagedTree, parentRef: 'HEAD', parentOid };
+}
+
+function reconcileEvidence(value: unknown, assignment: Assignment, checkoutMode: DirectGitCheckoutMode): ReconcileEvidence {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) denyEvidence();
+  const source = value as Record<string, unknown>;
+  exactKeys(source, ['checkoutMode', 'canonicalBranch', 'localRef', 'headOid']);
+  const branch = branchEvidence(source, assignment, checkoutMode);
+  const headOid = oid(source.headOid)!;
+  if (checkoutMode !== 'managed') denyEvidence();
+  return { ...branch, checkoutMode: 'managed', headOid };
 }
 
 function remoteEvidence(value: Record<string, unknown>, assignment: Assignment, checkoutMode: DirectGitCheckoutMode): RemoteEvidence {
@@ -248,9 +263,9 @@ interface EffectiveCheckout {
   path: string;
 }
 
-function resolveEffectiveCheckout(db: Database.Database, input: VerifyDirectGitAuthorityInput): EffectiveCheckout {
+function resolveEffectiveCheckout(db: Database.Database, input: VerifyDirectGitAuthorityInput, workspaceGuid: string): EffectiveCheckout {
   const repository = discoverRepository(input.repositoryPath);
-  const assignment = getAssignment(db, input.workspaceGuid);
+  const assignment = getAssignment(db, workspaceGuid);
   if (!assignment
     || assignment.repository_identity !== repository.repositoryIdentity
     || assignment.owner_session_id !== input.providerRootSessionId) {
@@ -272,9 +287,122 @@ function resolveEffectiveCheckout(db: Database.Database, input: VerifyDirectGitA
   if (!primaryOwner) return { assignment, mode: 'managed', path: assignment.worktree_path };
   if (primaryOwner.workspace_guid !== assignment.workspace_guid
     || primaryOwner.owner_session_id !== input.providerRootSessionId) {
-    throw new Error('Direct Git authority primary checkout is owned by another assignment or provider root');
+    return { assignment, mode: 'managed', path: assignment.worktree_path };
   }
   return { assignment, mode: 'primary', path: repository.primaryCheckoutPath };
+}
+
+/**
+ * Resolves the primary checkout as a direct-Git target for a session that holds
+ * no managed assignment at all — used by the unassigned commit AND push lanes.
+ * Re-proves the lane's preconditions (zero active assignments, primary ownership,
+ * a checked-out branch); callable both at issuance/verify and at push-time
+ * revalidation so a change after verify is caught.
+ */
+export function resolveUnassignedPrimaryCheckout(
+  db: Database.Database,
+  repositoryPath: string,
+  providerRootSessionId: string,
+): { mode: 'primary-unassigned'; path: string } {
+  const repository = discoverRepository(repositoryPath);
+  const active = db.prepare(`
+    SELECT COUNT(*) AS n FROM assignments
+    WHERE repository_identity = ? AND owner_session_id = ?
+      AND lifecycle_status NOT IN ('integrated', 'abandoned', 'cleaned')
+  `).get(repository.repositoryIdentity, providerRootSessionId) as { n: number };
+  if (active.n !== 0) throw new Error('Unassigned-primary direct-Git requires zero active assignments for this session and repository');
+  const primaryOwner = db.prepare(`
+    SELECT owner_session_id FROM primary_checkout_owners WHERE repository_identity = ?
+  `).get(repository.repositoryIdentity) as { owner_session_id: string } | undefined;
+  if (primaryOwner && primaryOwner.owner_session_id !== providerRootSessionId) {
+    throw new Error('Primary checkout is owned by another session');
+  }
+  let branch: string;
+  try {
+    branch = runGit(repository.primaryCheckoutPath, ['symbolic-ref', '--quiet', '--short', 'HEAD']).trim();
+  } catch {
+    throw new Error('Unassigned-primary direct-Git requires a checked-out branch (HEAD is detached)');
+  }
+  if (branch.length === 0) throw new Error('Unassigned-primary direct-Git requires a checked-out branch (HEAD is detached)');
+  return { mode: 'primary-unassigned', path: repository.primaryCheckoutPath };
+}
+
+function observeUnassignedCommitEvidence(path: string): DirectGitAuthorityEvidence {
+  const canonicalBranch = runGit(path, ['symbolic-ref', '--quiet', '--short', 'HEAD']).trim();
+  const localRef = `refs/heads/${canonicalBranch}`;
+  return {
+    checkoutMode: 'primary-unassigned',
+    canonicalBranch,
+    localRef,
+    stagedTree: runGit(path, ['write-tree']).trim(),
+    parentRef: 'HEAD',
+    parentOid: runGit(path, ['rev-parse', '--verify', 'HEAD^{commit}']).trim(),
+  };
+}
+
+/**
+ * Fast-forward-only proof for the unassigned-primary push lane. The operator is
+ * pushing their own current branch to its own remote ref; a lease-matched
+ * non-fast-forward would rewrite a shared branch (e.g. main). A null
+ * expectedRemoteOldOid means the remote ref does not yet exist (a new branch) —
+ * nothing to rewrite. Evaluated LIVE at issuance/verify (not on frozen evidence).
+ */
+export function assertFastForwardPush(worktreePath: string, evidence: PushEvidence): void {
+  if (evidence.expectedRemoteOldOid === null) return;
+  if (!isAncestor(worktreePath, evidence.expectedRemoteOldOid, evidence.localOid)) {
+    throw new Error('Unassigned-primary push must be fast-forward; non-fast-forward to a shared branch is refused');
+  }
+}
+
+function observeUnassignedPushEvidence(path: string): PushEvidence {
+  const canonicalBranch = runGit(path, ['symbolic-ref', '--quiet', '--short', 'HEAD']).trim();
+  const localRef = `refs/heads/${canonicalBranch}`;
+  const remoteName = 'origin';
+  const remoteUrl = runGit(path, ['remote', 'get-url', remoteName]).trim();
+  const pushUrl = runGit(path, ['remote', 'get-url', '--push', remoteName]).trim();
+  if (remoteUrl !== pushUrl) denyEvidence();
+  const evidence: PushEvidence = {
+    checkoutMode: 'primary-unassigned',
+    canonicalBranch,
+    localRef,
+    localOid: runGit(path, ['rev-parse', '--verify', `${localRef}^{commit}`]).trim(),
+    remoteName,
+    remoteUrl,
+    destinationRef: localRef,
+    expectedRemoteOldOid: remoteOldOid(path, remoteName, localRef),
+  };
+  assertFastForwardPush(path, evidence);
+  return evidence;
+}
+
+function observeUnassignedCommitAndPushEvidence(path: string): CommitAndPushEvidence {
+  const canonicalBranch = runGit(path, ['symbolic-ref', '--quiet', '--short', 'HEAD']).trim();
+  const localRef = `refs/heads/${canonicalBranch}`;
+  const remoteName = 'origin';
+  const remoteUrl = runGit(path, ['remote', 'get-url', remoteName]).trim();
+  const pushUrl = runGit(path, ['remote', 'get-url', '--push', remoteName]).trim();
+  if (remoteUrl !== pushUrl) denyEvidence();
+  const parentOid = runGit(path, ['rev-parse', '--verify', 'HEAD^{commit}']).trim();
+  const expectedRemoteOldOid = remoteOldOid(path, remoteName, localRef);
+  // The pushed commit is created at finalize as a CHILD of parentOid, so
+  // fast-forward-over-parent implies fast-forward-over-child. The push evidence
+  // carries no localOid yet (the commit does not exist), so prove ff over the
+  // parent here instead of reusing assertFastForwardPush (which keys on localOid).
+  if (expectedRemoteOldOid !== null && !isAncestor(path, expectedRemoteOldOid, parentOid)) {
+    throw new Error('Unassigned-primary push must be fast-forward; non-fast-forward to a shared branch is refused');
+  }
+  return {
+    checkoutMode: 'primary-unassigned',
+    canonicalBranch,
+    localRef,
+    stagedTree: runGit(path, ['write-tree']).trim(),
+    parentRef: 'HEAD',
+    parentOid,
+    remoteName,
+    remoteUrl,
+    destinationRef: localRef,
+    expectedRemoteOldOid,
+  };
 }
 
 function observeDirectEvidence(checkout: EffectiveCheckout, operation: DirectGitOperation): DirectGitAuthorityEvidence {
@@ -290,6 +418,15 @@ function observeDirectEvidence(checkout: EffectiveCheckout, operation: DirectGit
       stagedTree: runGit(checkout.path, ['write-tree']).trim(),
       parentRef: 'HEAD',
       parentOid: runGit(checkout.path, ['rev-parse', '--verify', 'HEAD^{commit}']).trim(),
+    };
+  }
+
+  if (operation === 'reconcile') {
+    if (checkout.mode !== 'managed') denyEvidence();
+    return {
+      ...branch,
+      checkoutMode: 'managed',
+      headOid: runGit(checkout.path, ['rev-parse', '--verify', 'HEAD^{commit}']).trim(),
     };
   }
 
@@ -329,14 +466,35 @@ export function issueDirectGitHumanIntent(
   db: Database.Database,
   input: IssueDirectGitHumanIntentInput,
 ): HumanIntentReceipt {
-  const checkout = resolveEffectiveCheckout(db, input);
+  if (input.workspaceGuid === undefined) {
+    if (input.operation !== 'commit' && input.operation !== 'push' && input.operation !== 'commit-and-push') {
+      throw new Error('Unassigned-primary lane supports commit, push, and commit-and-push only');
+    }
+    const repository = discoverRepository(input.repositoryPath);
+    const unassigned = resolveUnassignedPrimaryCheckout(db, input.repositoryPath, input.providerRootSessionId);
+    const evidence = input.operation === 'commit'
+      ? observeUnassignedCommitEvidence(unassigned.path)
+      : input.operation === 'push'
+        ? observeUnassignedPushEvidence(unassigned.path)
+        : observeUnassignedCommitAndPushEvidence(unassigned.path);
+    return issueHumanIntent(db, {
+      operation: input.operation,
+      humanChannel: input.humanChannel,
+      providerRootSessionId: input.providerRootSessionId,
+      repositoryIdentity: repository.repositoryIdentity,
+      workspaceGuid: `primary:${repository.repositoryIdentity}`,
+      expectedEvidence: evidence,
+    });
+  }
+  const checkout = resolveEffectiveCheckout(db, input, input.workspaceGuid);
+  const assignment = checkout.assignment;
   const evidence = observeDirectEvidence(checkout, input.operation);
   return issueHumanIntent(db, {
     operation: input.operation,
     humanChannel: input.humanChannel,
     providerRootSessionId: input.providerRootSessionId,
-    repositoryIdentity: checkout.assignment.repository_identity,
-    workspaceGuid: checkout.assignment.workspace_guid,
+    repositoryIdentity: assignment.repository_identity,
+    workspaceGuid: assignment.workspace_guid,
     expectedEvidence: evidence,
   });
 }
@@ -346,7 +504,43 @@ export function verifyDirectGitAuthority(
   db: Database.Database,
   input: VerifyDirectGitAuthorityInput,
 ): AuthorizedDirectGitOperation {
-  const checkout = resolveEffectiveCheckout(db, input);
+  if (input.workspaceGuid === undefined) {
+    if (input.operation !== 'commit' && input.operation !== 'push' && input.operation !== 'commit-and-push') {
+      throw new Error('Unassigned-primary lane supports commit, push, and commit-and-push only');
+    }
+    const repository = discoverRepository(input.repositoryPath);
+    const unassigned = resolveUnassignedPrimaryCheckout(db, input.repositoryPath, input.providerRootSessionId);
+    const evidence = input.operation === 'commit'
+      ? observeUnassignedCommitEvidence(unassigned.path)
+      : input.operation === 'push'
+        ? observeUnassignedPushEvidence(unassigned.path)
+        : observeUnassignedCommitAndPushEvidence(unassigned.path);
+    const sentinel = `primary:${repository.repositoryIdentity}`;
+    const intent = consumeMatchingHumanIntent(db, {
+      operation: input.operation,
+      humanChannel: input.humanChannel,
+      providerRootSessionId: input.providerRootSessionId,
+      repositoryIdentity: repository.repositoryIdentity,
+      workspaceGuid: sentinel,
+      expectedEvidence: evidence,
+    });
+    if (!intent) throw new Error('Direct Git operation requires a matching human intent');
+    const authority: AuthorizedDirectGitOperation = {
+      operation: input.operation,
+      providerRootSessionId: input.providerRootSessionId,
+      repositoryIdentity: repository.repositoryIdentity,
+      workspaceGuid: sentinel,
+      checkoutMode: 'primary-unassigned',
+      worktreePath: unassigned.path,
+      evidence,
+    };
+    Object.freeze(evidence);
+    Object.freeze(authority);
+    authorityDatabases.set(authority, db);
+    if (input.operation !== 'commit') usablePushAuthorizations.add(authority);
+    return authority;
+  }
+  const checkout = resolveEffectiveCheckout(db, input, input.workspaceGuid);
   const assignment = checkout.assignment;
   const suppliedLegacyEvidence = input.expectedEvidence !== undefined || input.nonce !== undefined;
   if ((input.expectedEvidence === undefined) !== (input.nonce === undefined)) denyEvidence();
@@ -363,6 +557,8 @@ export function verifyDirectGitAuthority(
   } else if (input.operation === 'push') {
     evidence = pushEvidence(input.expectedEvidence, assignment, checkout.mode);
     assertPushState(checkout.path, evidence);
+  } else if (input.operation === 'reconcile') {
+    evidence = reconcileEvidence(input.expectedEvidence, assignment, checkout.mode);
   } else {
     throw new Error('Direct Git authority operation is not allowed');
   }
@@ -390,7 +586,7 @@ export function verifyDirectGitAuthority(
   Object.freeze(evidence);
   Object.freeze(authority);
   authorityDatabases.set(authority, db);
-  if (input.operation !== 'commit') usablePushAuthorizations.add(authority);
+  if (input.operation !== 'commit' && input.operation !== 'reconcile') usablePushAuthorizations.add(authority);
   return authority;
 }
 
@@ -401,21 +597,36 @@ export function verifyDirectGitAuthority(
 export function revalidateAuthorizedCommitState(authority: AuthorizedDirectGitOperation): void {
   const db = authorityDatabases.get(authority);
   if (!db) throw new Error('Direct Git authority is not recognized');
-  const checkout = resolveEffectiveCheckout(db, {
-    repositoryPath: authority.worktreePath,
-    workspaceGuid: authority.workspaceGuid,
-    providerRootSessionId: authority.providerRootSessionId,
-    humanChannel: 'internal-revalidation',
-    operation: authority.operation,
-    expectedEvidence: authority.evidence,
-    nonce: 'internal-revalidation',
-  });
-  if (checkout.mode !== authority.checkoutMode || checkout.path !== authority.worktreePath) {
-    throw new Error('Direct Git authority effective checkout changed');
+  let checkoutPath: string;
+  if (authority.checkoutMode === 'primary-unassigned') {
+    // The unassigned lane has no assignment row to resolve. Re-prove the same
+    // preconditions the sentinel was issued under — zero active assignments,
+    // primary ownership, a checked-out branch — LIVE at push time, so an
+    // assignment or a foreign primary owner that appeared after verify blocks
+    // the push. (resolveEffectiveCheckout requires an assignment and would throw.)
+    const unassigned = resolveUnassignedPrimaryCheckout(db, authority.worktreePath, authority.providerRootSessionId);
+    if (unassigned.path !== authority.worktreePath) {
+      throw new Error('Direct Git authority effective checkout changed');
+    }
+    checkoutPath = unassigned.path;
+  } else {
+    const checkout = resolveEffectiveCheckout(db, {
+      repositoryPath: authority.worktreePath,
+      workspaceGuid: authority.workspaceGuid,
+      providerRootSessionId: authority.providerRootSessionId,
+      humanChannel: 'internal-revalidation',
+      operation: authority.operation,
+      expectedEvidence: authority.evidence,
+      nonce: 'internal-revalidation',
+    }, authority.workspaceGuid);
+    if (checkout.mode !== authority.checkoutMode || checkout.path !== authority.worktreePath) {
+      throw new Error('Direct Git authority effective checkout changed');
+    }
+    checkoutPath = checkout.path;
   }
   try {
-    const branch = runGit(checkout.path, ['symbolic-ref', '--quiet', '--short', 'HEAD']).trim();
-    runGit(checkout.path, ['rev-parse', '--verify', `${authority.evidence.localRef}^{commit}`]);
+    const branch = runGit(checkoutPath, ['symbolic-ref', '--quiet', '--short', 'HEAD']).trim();
+    runGit(checkoutPath, ['rev-parse', '--verify', `${authority.evidence.localRef}^{commit}`]);
     if (branch !== authority.evidence.canonicalBranch) denyEvidence();
   } catch (error) {
     if (error instanceof Error && error.message === 'Direct Git authority evidence changed or is malformed') throw error;

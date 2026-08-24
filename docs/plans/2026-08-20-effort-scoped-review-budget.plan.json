@@ -1,0 +1,258 @@
+{
+  "name": "Effort-Scoped Review Budget",
+  "goal": "Bind the one-blind-plan-review budget to the operator-initiated effort (not the auto plan_lineage), so a retreat cannot mint a fresh blind review, while a changed plan proceeds via advisor-remediation and a new effort still earns its one review.",
+  "requirements_file": "docs/plans/2026-08-20-effort-scoped-review-budget-requirements.md",
+  "design_file": "docs/plans/2026-08-20-effort-scoped-review-budget-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Session schema — inherit_review column",
+      "description": "Add inherit_review INTEGER NOT NULL DEFAULT 0 to the SESSIONS table only: CREATE TABLE sessions in db.ts (after plan_lineage :253), the sessions expectedColumns migration array (:161-166), the Session interface in types.ts (after :59; NOT TierUpReviewEntry :39), and the ONE sessions CREATE in session-init.sh (after :64; NOT the tier_up_reviews CREATE :138-141). TDD: a migration test that seeds professional_mode (or migrateSchema early-returns) and proves the column added with default 0.",
+      "allowed_files": [
+        "worker/mcp-servers/state-manager/src/db.ts",
+        "worker/mcp-servers/state-manager/src/types.ts",
+        "worker/hooks/session-init.sh",
+        "worker/mcp-servers/state-manager/src/__tests__/inherit-review-migration.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Create inherit-review-migration.test.ts: seed a sessions table with terminal_session AND professional_mode TEXT NOT NULL DEFAULT 'undecided' (required: migrateSchema early-returns at db.ts:59-62 without it; must be TEXT not INTEGER), run migrateSchema(db), assert inherit_review exists and the seeded row reads 0.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/__tests__/inherit-review-migration.test.ts",
+          "expected": "FAIL: migrateSchema does not yet add inherit_review."
+        },
+        {
+          "description": "In db.ts CREATE TABLE sessions, add `inherit_review INTEGER NOT NULL DEFAULT 0,` after the `plan_lineage INTEGER NOT NULL DEFAULT 0,` line (:253).",
+          "command": "",
+          "expected": "column added to sessions CREATE"
+        },
+        {
+          "description": "In db.ts sessions expectedColumns array (:161-166), add `{ name: 'inherit_review', type: 'INTEGER NOT NULL', dflt: '0' },`.",
+          "command": "",
+          "expected": "migration entry added"
+        },
+        {
+          "description": "In types.ts Session interface (:48-65), add `inherit_review: number;` after `plan_lineage: number;` (:59). Do NOT touch TierUpReviewEntry (:36-44).",
+          "command": "",
+          "expected": "Session interface carries inherit_review; TierUpReviewEntry unchanged"
+        },
+        {
+          "description": "In session-init.sh, add `inherit_review INTEGER NOT NULL DEFAULT 0,` after the `plan_lineage INTEGER NOT NULL DEFAULT 0,` line (:64) in the ONE sessions CREATE. Do NOT touch the tier_up_reviews CREATE (:138-141). No test: bash schema mirror.",
+          "command": "",
+          "expected": "the single sessions CREATE carries inherit_review; tier_up_reviews unchanged"
+        },
+        {
+          "description": "Run the migration test to confirm GREEN.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/__tests__/inherit-review-migration.test.ts",
+          "expected": "Test Files 1 passed."
+        },
+        {
+          "description": "Stage the four files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/state-manager/src/db.ts worker/mcp-servers/state-manager/src/types.ts worker/hooks/session-init.sh worker/mcp-servers/state-manager/src/__tests__/inherit-review-migration.test.ts",
+          "expected": "four files staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Effort-scoped lineage increment (MCP-transition set-site)",
+      "description": "Add exported helper inheritReviewOnDesignReentry(from) and apply it in executeWorkflowTransition when target is brainstorming OR debugging (idle/execution_complete -> {inherit_review:0}; RETREAT_SOURCES[from] -> {inherit_review:1}; else {}). Gate the plan_lineage increment in mark_design_ready + consumeDesign on inherit_review === 0. Fix the idempotency test's hand-built schema to add the column. TDD: retreat inherits, new-effort increments, mark_brainstorming-from-executing inherits, mid-effort->debugging->brainstorming inherits (C2 two-hop), execution_complete->brainstorming->debugging->brainstorming increments.",
+      "allowed_files": [
+        "worker/mcp-servers/state-manager/src/state-machine.ts",
+        "worker/mcp-servers/state-manager/src/tools/write-tools.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/effort-scoped-review-budget.test.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/workflow-transition-idempotency.test.ts"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Create effort-scoped-review-budget.test.ts using initDb(':memory:') (real schema). Cases: (a) retreat executing->brainstorming then mark_design_ready keeps plan_lineage unchanged; (b) execution_complete->brainstorming then mark_design_ready increments; (c) mark_brainstorming from executing sets inherit_review=1 (next mark_design_ready no increment); (d) mark_debugging from executing then debugging->brainstorming then mark_design_ready keeps plan_lineage unchanged (two-hop); (e) execution_complete->brainstorming->debugging->brainstorming then mark_design_ready increments.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/__tests__/effort-scoped-review-budget.test.ts",
+          "expected": "FAIL: current code increments on every brainstorming->design_ready and never sets inherit_review; (a),(c),(d) fail."
+        },
+        {
+          "description": "In state-machine.ts add exported inheritReviewOnDesignReentry(from): idle/execution_complete -> {inherit_review:0}; RETREAT_SOURCES[from] -> {inherit_review:1}; else {}. In executeWorkflowTransition after artifactFields, add designReentryFields = (target==='brainstorming' || target==='debugging') ? inheritReviewOnDesignReentry(from) : {}; spread into updateSession before workflow_stage.",
+          "command": "",
+          "expected": "design-phase entry sets inherit_review from FROM-stage for both brainstorming and debugging targets"
+        },
+        {
+          "description": "In write-tools.ts mark_design_ready applyArtifacts, replace the unconditional plan_lineage+1 with: if session.inherit_review===1 return {inherit_review:0}; else return {plan_lineage: session.plan_lineage+1}. In consumeDesign brainstorming-branch, gate identically.",
+          "command": "",
+          "expected": "both increment sites gated on inherit_review"
+        },
+        {
+          "description": "In workflow-transition-idempotency.test.ts createTestDb, add `inherit_review INTEGER NOT NULL DEFAULT 0,` after the `plan_lineage INTEGER NOT NULL DEFAULT 0,` line in its sessions CREATE (C3 fix).",
+          "command": "",
+          "expected": "idempotency test schema has inherit_review"
+        },
+        {
+          "description": "Run both tests to confirm GREEN.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/__tests__/effort-scoped-review-budget.test.ts src/__tests__/workflow-transition-idempotency.test.ts",
+          "expected": "both files pass; all five new cases pass; idempotency suite green."
+        },
+        {
+          "description": "Stage the four files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/state-manager/src/state-machine.ts worker/mcp-servers/state-manager/src/tools/write-tools.ts worker/mcp-servers/state-manager/src/__tests__/effort-scoped-review-budget.test.ts worker/mcp-servers/state-manager/src/__tests__/workflow-transition-idempotency.test.ts",
+          "expected": "four files staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "skill-state-bridge.sh set-site (C2b dominant live path)",
+      "description": "The brainstorming/systematic-debugging skill invocation fires skill-state-bridge.sh, which raw-UPDATEs workflow_stage from any stage BEFORE the skill runs (making the later mark_brainstorming a no-op) — bypassing the executeWorkflowTransition flag. Append an inherit_review assignment computed from CURRENT_STAGE to the hook UPDATES for the brainstorming and systematic-debugging cases. TDD: a hook test.",
+      "allowed_files": [
+        "worker/hooks/skill-state-bridge.sh",
+        "worker/hooks/tests/test-skill-state-bridge-inherit-review.sh"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "Create test-skill-state-bridge-inherit-review.sh mirroring an existing hook test (e.g. test-session-init-plan-lineage.sh): init a temp DB with the real sessions schema, seed a session, set workflow_stage='executing', pipe a Skill/brainstorming invocation into skill-state-bridge.sh, assert inherit_review=1; second case workflow_stage='execution_complete' -> brainstorming -> inherit_review=0.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-skill-state-bridge-inherit-review.sh",
+          "expected": "FAIL: the hook does not yet write inherit_review; the =1 assertion fails."
+        },
+        {
+          "description": "In skill-state-bridge.sh, after the case block (sets UPDATES/STAGE_CHANGE) and before the idempotent-exit check, add: TARGET_FOR_BUDGET=${STAGE_CHANGE#workflow_stage=}; if TARGET_FOR_BUDGET is brainstorming or debugging, case CURRENT_STAGE: idle|execution_complete -> UPDATES=\"${UPDATES}, inherit_review=0\"; the 8 RETREAT_SOURCES stages -> UPDATES=\"${UPDATES}, inherit_review=1\"; else leave unchanged.",
+          "command": "",
+          "expected": "hook appends inherit_review from CURRENT_STAGE for brainstorming/debugging targets"
+        },
+        {
+          "description": "Run the hook test to confirm GREEN.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-skill-state-bridge-inherit-review.sh",
+          "expected": "both cases pass (executing->brainstorming sets 1; execution_complete->brainstorming sets 0)."
+        },
+        {
+          "description": "Stage the two files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/skill-state-bridge.sh worker/hooks/tests/test-skill-state-bridge-inherit-review.sh",
+          "expected": "two files staged"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Advisor-remediated on a passing base (decision C)",
+      "description": "hasAdvisorRemediatedAtHash accepts a passing predecessor; submit_tier_up_review allows advisor-remediated when any canonical blind review exists (via getBlindTierUpReviewForLineage); start_execution passes a passing verdict at a different hash when advisor-remediated exists at the current hash (KEEP the 'different plan hash' + 'Do not dispatch another plan review' substrings). Update the two existing 'prior HAS-ISSUES' assertions. TDD incl. HAS-ISSUES-path and no-base regressions.",
+      "allowed_files": [
+        "worker/mcp-servers/state-manager/src/db.ts",
+        "worker/mcp-servers/state-manager/src/tools/write-tools.ts",
+        "worker/mcp-servers/state-manager/src/tools/write-tools.tier-up.test.ts"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {
+          "description": "In write-tools.tier-up.test.ts add: (a) SOLID canonical at H1, plan changed to H2 -> submit_tier_up_review(advisor-remediated) at H2 succeeds and start_execution at H2 passes; (b) same without the record -> start_execution at H2 blocks; (c) bare advisor-remediated with NO prior canonical blind verdict still refused; (d) HAS-ISSUES->advisor-remediated still passes. Update the two toContain('prior HAS-ISSUES') assertions (:172, :402) to toContain('prior canonical blind review').",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/tools/write-tools.tier-up.test.ts",
+          "expected": "FAIL: case (a) fails; the updated :172/:402 assertions fail against the old message."
+        },
+        {
+          "description": "In db.ts hasAdvisorRemediatedAtHash, change the inner EXISTS clause `AND failed_review.verdict = 'HAS-ISSUES'` to `AND failed_review.verdict IN ('SOLID', 'HAS-ISSUES', 'top-tier-self')`.",
+          "command": "",
+          "expected": "a passing predecessor now satisfies remediation"
+        },
+        {
+          "description": "In write-tools.ts submit_tier_up_review, replace the advisor-remediated guard with: else if (!getBlindTierUpReviewForLineage(db, resolvedId, session.plan_lineage)) return err('BLOCKED - advisor-remediated requires a prior canonical blind review in plan lineage ' + session.plan_lineage + '.'). getBlindTierUpReviewForLineage is already imported.",
+          "command": "",
+          "expected": "advisor-remediated allowed on any canonical blind base"
+        },
+        {
+          "description": "In write-tools.ts start_execution gate isPassingTierUpVerdict branch, after the exact-hash-match return add: if (hasAdvisorRemediatedAtHash(db, resolvedId, session.plan_lineage, planHash)) return null; and reword the BLOCKED message KEEPING the substrings 'different plan hash' and 'Do not dispatch another plan review'.",
+          "command": "",
+          "expected": "passing verdict at a different hash passes with advisor-remediated at current hash; existing message-substring assertions still hold"
+        },
+        {
+          "description": "Run the tier-up tests to confirm GREEN.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/tools/write-tools.tier-up.test.ts",
+          "expected": "Test Files 1 passed; all cases pass including regressions and the updated assertions."
+        },
+        {
+          "description": "Stage the three files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/state-manager/src/db.ts worker/mcp-servers/state-manager/src/tools/write-tools.ts worker/mcp-servers/state-manager/src/tools/write-tools.tier-up.test.ts",
+          "expected": "three files staged"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "executing-plans skill text",
+      "description": "Update the executing-plans skill to describe inherit-on-retreat + advisor-remediation-for-changes and stop promising a fresh review on retreat. No tests required: skill documentation; behavior enforced+tested by Tasks 1-4.",
+      "allowed_files": [
+        "worker/skills/executing-plans/SKILL.md"
+      ],
+      "depends_on": [4],
+      "steps": [
+        {
+          "description": "Replace the Step 1.5 bullet about a passing canonical verdict whose hash does not match (fail closed / restore exact / retreat) with the advisor-remediate wording (full text in the human plan).",
+          "command": "",
+          "expected": "Step 1.5 hash-mismatch branch routes to advisor-remediation"
+        },
+        {
+          "description": "Replace the Step 10 acceptance line (SOLID or HAS-ISSUES+advisor-remediated) with the passing-or-HAS-ISSUES + advisor-remediated wording.",
+          "command": "",
+          "expected": "Step 10 acceptance reflects decision C"
+        },
+        {
+          "description": "Replace the Step 10 REQUIRES-RETREAT line 'The new design produces a new plan lineage, which earns its own single review.' with the inherit-on-retreat wording.",
+          "command": "",
+          "expected": "Step 10 REQUIRES-RETREAT reflects inherit-on-retreat"
+        },
+        {
+          "description": "Stage SKILL.md.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/skills/executing-plans/SKILL.md",
+          "expected": "SKILL.md staged"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "name": "Build + full regression + stage dist",
+      "description": "Rebuild the state-manager dist bundle and run the full regression. No tests required: rebuilds the generated bundle and runs existing suites (incl. the new hook test).",
+      "allowed_files": [
+        "worker/mcp-servers/state-manager/dist/index.js"
+      ],
+      "depends_on": [5],
+      "steps": [
+        {
+          "description": "Build.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm run build",
+          "expected": "tsc + esbuild bundle; no type errors"
+        },
+        {
+          "description": "state-manager suite.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm test",
+          "expected": "all test files pass (prior + 2 new state-manager test files)"
+        },
+        {
+          "description": "workspace-manager suite.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test",
+          "expected": "Test Files 8 passed (8)"
+        },
+        {
+          "description": "Hook suites (includes the new skill-state-bridge inherit-review test).",
+          "command": "for t in /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-*.sh; do echo \"== $t ==\"; bash \"$t\" || echo \"SUITE FAILED: $t\"; done",
+          "expected": "each 0 failed; no 'SUITE FAILED'"
+        },
+        {
+          "description": "Build commander pytest batch lists.",
+          "command": "rm -f /tmp/esrb_tests.txt && ls /Users/roberthyatt/Code/ironclaude/commander/tests/test_*.py | sort > /tmp/esrb_tests.txt && total=$(wc -l < /tmp/esrb_tests.txt) && per=$(( (total + 3) / 4 )) && split -l \"$per\" /tmp/esrb_tests.txt /tmp/esrb_batch_ && wc -l /tmp/esrb_tests.txt /tmp/esrb_batch_aa /tmp/esrb_batch_ab /tmp/esrb_batch_ac /tmp/esrb_batch_ad",
+          "expected": "4 batch files _aa.._ad"
+        },
+        {
+          "description": "Run commander pytest batches (repeat for _aa,_ab,_ac,_ad as separate Bash calls).",
+          "command": "test -s /tmp/esrb_batch_aa || { echo \"FATAL: /tmp/esrb_batch_aa missing/empty\"; exit 1; } && cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q -m \"not destructive\" $(tr '\\n' ' ' < /tmp/esrb_batch_aa)",
+          "expected": "across the batches: all pass, 2 deselected, 0 failed (orchestrator memory-floor failures are the known environmental gap)"
+        },
+        {
+          "description": "Stage dist bundle.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/state-manager/dist/index.js",
+          "expected": "bundle staged"
+        },
+        {
+          "description": "Return shell cwd to repo root.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude",
+          "expected": "cwd is /Users/roberthyatt/Code/ironclaude"
+        }
+      ]
+    }
+  ]
+}

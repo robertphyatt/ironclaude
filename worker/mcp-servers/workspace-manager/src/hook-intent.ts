@@ -44,15 +44,26 @@ export function issueHumanIntentFromHook(db: Database.Database, args: Args): unk
       AND lifecycle_status NOT IN ('integrated', 'abandoned', 'cleaned')
     ORDER BY created_at ASC
   `).all(repository.repositoryIdentity, ownerSessionId) as Assignment[];
+  const requestedGuid = optionalString(args, 'workspace_guid');
+  if (assignments.length === 0) {
+    if (requestedGuid === undefined && (operation === 'commit' || operation === 'push' || operation === 'commit-and-push')) {
+      return issueDirectGitHumanIntent(db, {
+        repositoryPath,
+        providerRootSessionId: ownerSessionId,
+        humanChannel,
+        operation: operation as DirectGitOperation,
+      });
+    }
+    throw new Error('Human intent issuance requires exactly one active assignment for provider root and repository');
+  }
   if (assignments.length !== 1) {
     throw new Error('Human intent issuance requires exactly one active assignment for provider root and repository');
   }
   const assignment = assignments[0];
-  const requestedGuid = optionalString(args, 'workspace_guid');
   if (requestedGuid !== undefined && requestedGuid !== assignment.workspace_guid) {
     throw new Error('Human intent workspace binding does not match active assignment');
   }
-  if (operation === 'commit' || operation === 'commit-and-push' || operation === 'push') {
+  if (operation === 'commit' || operation === 'commit-and-push' || operation === 'push' || operation === 'reconcile') {
     return issueDirectGitHumanIntent(db, {
       repositoryPath,
       workspaceGuid: assignment.workspace_guid,

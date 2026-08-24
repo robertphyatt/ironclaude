@@ -62,6 +62,7 @@ if command -v sqlite3 &>/dev/null; then
       review_pending INTEGER NOT NULL DEFAULT 0,
       review_block_count INTEGER NOT NULL DEFAULT 0,
       plan_lineage INTEGER NOT NULL DEFAULT 0,
+      inherit_review INTEGER NOT NULL DEFAULT 0,
       circuit_breaker INTEGER NOT NULL DEFAULT 0,
       memory_search_required INTEGER NOT NULL DEFAULT 0,
       testing_theatre_checked INTEGER NOT NULL DEFAULT 0,

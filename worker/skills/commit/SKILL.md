@@ -25,11 +25,13 @@ consuming the single-use intent.
 
 1. Read professional mode and workspace status through active client's
    provider-native state-manager and workspace-manager. Require professional
-   mode on, provider-root identity, one matching assignment, and reviewed staged
-   changes.
+   mode on, provider-root identity, reviewed staged changes, and EITHER one
+   matching managed assignment OR zero assignments (a plain primary checkout —
+   the unassigned-primary commit lane).
 2. Choose concise commit `message` describing reviewed staged work. Call
-   workspace-manager `commit` with only `repository_path`, `workspace_guid`,
-   and `message`.
+   workspace-manager `commit` with `repository_path` and `message`, plus
+   `workspace_guid` ONLY when a managed assignment exists; for a plain primary
+   checkout with no assignment, omit `workspace_guid` entirely.
 3. Require successful local finalization/integration evidence. Never call push
    and never reinterpret missing intent as permission.
 

@@ -32,6 +32,13 @@ function requiredUuid(value, label) {
   if (!UUID_PATTERN.test(value)) throw new Error(`${label} must be a UUID`);
   return value;
 }
+var WORKSPACE_SENTINEL_PATTERN = /^primary:.+$/;
+function requiredIntentWorkspaceRef(value, label) {
+  if (!UUID_PATTERN.test(value) && !WORKSPACE_SENTINEL_PATTERN.test(value)) {
+    throw new Error(`${label} must be a UUID or a primary-checkout sentinel`);
+  }
+  return value;
+}
 function canonicalIsoTimestamp(value, label) {
   if (value.length === 0 || Number.isNaN(Date.parse(value))) {
     throw new Error(`${label} must be an ISO timestamp`);
@@ -134,6 +141,32 @@ function migrateSchema(db) {
       INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
     `);
   })();
+  if (!db.prepare("SELECT 1 FROM schema_migrations WHERE version = 2").get()) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE human_intents_v2 (
+          intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          operation TEXT NOT NULL CHECK (operation IN ('use-primary-checkout', 'return-to-managed-worktree', 'commit', 'commit-and-push', 'push')),
+          human_channel TEXT NOT NULL,
+          provider_root_session_id TEXT NOT NULL,
+          repository_identity TEXT NOT NULL,
+          workspace_guid TEXT NOT NULL,
+          expected_evidence TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          nonce TEXT NOT NULL UNIQUE,
+          issued_at TEXT NOT NULL DEFAULT (datetime('now')),
+          consumed_at TEXT
+        );
+        INSERT INTO human_intents_v2 (intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at)
+          SELECT intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at FROM human_intents WHERE workspace_guid IS NOT NULL;
+        DROP TABLE human_intents;
+        ALTER TABLE human_intents_v2 RENAME TO human_intents;
+        CREATE INDEX IF NOT EXISTS human_intents_lookup_idx
+          ON human_intents(operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, nonce);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (2);
+      `);
+    })();
+  }
 }
 function initDb(dbPath) {
   const resolvedPath = dbPath || getDbPath();
@@ -235,7 +268,11 @@ function reapStalePrimaryOwner(db, repositoryIdentity) {
     DELETE FROM primary_checkout_owners
     WHERE repository_identity = ? AND workspace_guid = ? AND owner_session_id = ? AND acquired_at = ?
   `).run(repositoryIdentity, owner.workspace_guid, owner.owner_session_id, owner.acquired_at);
-  return result.changes === 1;
+  const reclaimed = result.changes === 1;
+  if (reclaimed) {
+    console.error("reapStalePrimaryOwner: reclaimed stale primary-checkout owner");
+  }
+  return reclaimed;
 }
 function acquirePrimaryCheckoutOwnership(db, input) {
   const assignment = getAssignment(db, input.workspaceGuid);
@@ -284,7 +321,7 @@ function createHumanIntent(db, input) {
     requiredText(input.humanChannel, "humanChannel"),
     requiredText(input.providerRootSessionId, "providerRootSessionId"),
     requiredText(input.repositoryIdentity, "repositoryIdentity"),
-    requiredUuid(input.workspaceGuid, "workspaceGuid"),
+    requiredIntentWorkspaceRef(input.workspaceGuid, "workspaceGuid"),
     canonicalJson(input.expectedEvidence),
     expiresAt,
     requiredText(input.nonce, "nonce")
@@ -575,9 +612,9 @@ function remoteOldOid(worktreePath, remoteName, destinationRef) {
 function integrationDestinationRef(assignment) {
   return assignment.integration_target.startsWith("refs/") ? assignment.integration_target : `refs/heads/${assignment.integration_target}`;
 }
-function resolveEffectiveCheckout(db, input) {
+function resolveEffectiveCheckout(db, input, workspaceGuid) {
   const repository = discoverRepository(input.repositoryPath);
-  const assignment = getAssignment(db, input.workspaceGuid);
+  const assignment = getAssignment(db, workspaceGuid);
   if (!assignment || assignment.repository_identity !== repository.repositoryIdentity || assignment.owner_session_id !== input.providerRootSessionId) {
     throw new Error("Direct Git authority provider root, repository, or workspace binding does not match");
   }
@@ -595,9 +632,95 @@ function resolveEffectiveCheckout(db, input) {
   `).get(repository.repositoryIdentity);
   if (!primaryOwner) return { assignment, mode: "managed", path: assignment.worktree_path };
   if (primaryOwner.workspace_guid !== assignment.workspace_guid || primaryOwner.owner_session_id !== input.providerRootSessionId) {
-    throw new Error("Direct Git authority primary checkout is owned by another assignment or provider root");
+    return { assignment, mode: "managed", path: assignment.worktree_path };
   }
   return { assignment, mode: "primary", path: repository.primaryCheckoutPath };
+}
+function resolveUnassignedPrimaryCheckout(db, repositoryPath, providerRootSessionId) {
+  const repository = discoverRepository(repositoryPath);
+  const active = db.prepare(`
+    SELECT COUNT(*) AS n FROM assignments
+    WHERE repository_identity = ? AND owner_session_id = ?
+      AND lifecycle_status NOT IN ('integrated', 'abandoned', 'cleaned')
+  `).get(repository.repositoryIdentity, providerRootSessionId);
+  if (active.n !== 0) throw new Error("Unassigned-primary direct-Git requires zero active assignments for this session and repository");
+  const primaryOwner = db.prepare(`
+    SELECT owner_session_id FROM primary_checkout_owners WHERE repository_identity = ?
+  `).get(repository.repositoryIdentity);
+  if (primaryOwner && primaryOwner.owner_session_id !== providerRootSessionId) {
+    throw new Error("Primary checkout is owned by another session");
+  }
+  let branch;
+  try {
+    branch = runGit(repository.primaryCheckoutPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
+  } catch {
+    throw new Error("Unassigned-primary direct-Git requires a checked-out branch (HEAD is detached)");
+  }
+  if (branch.length === 0) throw new Error("Unassigned-primary direct-Git requires a checked-out branch (HEAD is detached)");
+  return { mode: "primary-unassigned", path: repository.primaryCheckoutPath };
+}
+function observeUnassignedCommitEvidence(path6) {
+  const canonicalBranch = runGit(path6, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
+  const localRef = `refs/heads/${canonicalBranch}`;
+  return {
+    checkoutMode: "primary-unassigned",
+    canonicalBranch,
+    localRef,
+    stagedTree: runGit(path6, ["write-tree"]).trim(),
+    parentRef: "HEAD",
+    parentOid: runGit(path6, ["rev-parse", "--verify", "HEAD^{commit}"]).trim()
+  };
+}
+function assertFastForwardPush(worktreePath, evidence) {
+  if (evidence.expectedRemoteOldOid === null) return;
+  if (!isAncestor(worktreePath, evidence.expectedRemoteOldOid, evidence.localOid)) {
+    throw new Error("Unassigned-primary push must be fast-forward; non-fast-forward to a shared branch is refused");
+  }
+}
+function observeUnassignedPushEvidence(path6) {
+  const canonicalBranch = runGit(path6, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
+  const localRef = `refs/heads/${canonicalBranch}`;
+  const remoteName = "origin";
+  const remoteUrl = runGit(path6, ["remote", "get-url", remoteName]).trim();
+  const pushUrl = runGit(path6, ["remote", "get-url", "--push", remoteName]).trim();
+  if (remoteUrl !== pushUrl) denyEvidence();
+  const evidence = {
+    checkoutMode: "primary-unassigned",
+    canonicalBranch,
+    localRef,
+    localOid: runGit(path6, ["rev-parse", "--verify", `${localRef}^{commit}`]).trim(),
+    remoteName,
+    remoteUrl,
+    destinationRef: localRef,
+    expectedRemoteOldOid: remoteOldOid(path6, remoteName, localRef)
+  };
+  assertFastForwardPush(path6, evidence);
+  return evidence;
+}
+function observeUnassignedCommitAndPushEvidence(path6) {
+  const canonicalBranch = runGit(path6, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
+  const localRef = `refs/heads/${canonicalBranch}`;
+  const remoteName = "origin";
+  const remoteUrl = runGit(path6, ["remote", "get-url", remoteName]).trim();
+  const pushUrl = runGit(path6, ["remote", "get-url", "--push", remoteName]).trim();
+  if (remoteUrl !== pushUrl) denyEvidence();
+  const parentOid = runGit(path6, ["rev-parse", "--verify", "HEAD^{commit}"]).trim();
+  const expectedRemoteOldOid = remoteOldOid(path6, remoteName, localRef);
+  if (expectedRemoteOldOid !== null && !isAncestor(path6, expectedRemoteOldOid, parentOid)) {
+    throw new Error("Unassigned-primary push must be fast-forward; non-fast-forward to a shared branch is refused");
+  }
+  return {
+    checkoutMode: "primary-unassigned",
+    canonicalBranch,
+    localRef,
+    stagedTree: runGit(path6, ["write-tree"]).trim(),
+    parentRef: "HEAD",
+    parentOid,
+    remoteName,
+    remoteUrl,
+    destinationRef: localRef,
+    expectedRemoteOldOid
+  };
 }
 function observeDirectEvidence(checkout, operation) {
   const { assignment } = checkout;
@@ -643,14 +766,31 @@ function observeDirectEvidence(checkout, operation) {
   throw new Error("Direct Git authority operation is not allowed");
 }
 function issueDirectGitHumanIntent(db, input) {
-  const checkout = resolveEffectiveCheckout(db, input);
+  if (input.workspaceGuid === void 0) {
+    if (input.operation !== "commit" && input.operation !== "push" && input.operation !== "commit-and-push") {
+      throw new Error("Unassigned-primary lane supports commit, push, and commit-and-push only");
+    }
+    const repository = discoverRepository(input.repositoryPath);
+    const unassigned = resolveUnassignedPrimaryCheckout(db, input.repositoryPath, input.providerRootSessionId);
+    const evidence2 = input.operation === "commit" ? observeUnassignedCommitEvidence(unassigned.path) : input.operation === "push" ? observeUnassignedPushEvidence(unassigned.path) : observeUnassignedCommitAndPushEvidence(unassigned.path);
+    return issueHumanIntent(db, {
+      operation: input.operation,
+      humanChannel: input.humanChannel,
+      providerRootSessionId: input.providerRootSessionId,
+      repositoryIdentity: repository.repositoryIdentity,
+      workspaceGuid: `primary:${repository.repositoryIdentity}`,
+      expectedEvidence: evidence2
+    });
+  }
+  const checkout = resolveEffectiveCheckout(db, input, input.workspaceGuid);
+  const assignment = checkout.assignment;
   const evidence = observeDirectEvidence(checkout, input.operation);
   return issueHumanIntent(db, {
     operation: input.operation,
     humanChannel: input.humanChannel,
     providerRootSessionId: input.providerRootSessionId,
-    repositoryIdentity: checkout.assignment.repository_identity,
-    workspaceGuid: checkout.assignment.workspace_guid,
+    repositoryIdentity: assignment.repository_identity,
+    workspaceGuid: assignment.workspace_guid,
     expectedEvidence: evidence
   });
 }
@@ -704,9 +844,6 @@ var WorkspaceService = class {
     if (!observed || observed.branch !== `refs/heads/${assignment.branch}`) {
       throw new Error("Managed worktree Git identity does not match durable assignment; reconciliation must preserve it");
     }
-  }
-  primaryCheckoutIsOwned(repositoryIdentity) {
-    return this.db.prepare("SELECT 1 FROM primary_checkout_owners WHERE repository_identity = ?").get(repositoryIdentity) !== void 0;
   }
   /**
    * A repository-only match is not ownership: two different sessions on the
@@ -1012,6 +1149,7 @@ var WorkspaceService = class {
     return { managedWorktreePath: assignment.worktree_path, assignment };
   }
   abandonWorkspace(input) {
+    const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
     if (assignment.lifecycle_status === "abandoned") return assignment;
     if (!nonterminal(assignment.lifecycle_status)) {
@@ -1023,7 +1161,141 @@ var WorkspaceService = class {
     `).get(assignment.repository_identity, assignment.workspace_guid)) {
       throw new Error("Return to the managed worktree before abandoning while holding the primary checkout.");
     }
+    if (input.mode === "rescue") {
+      return this.rescueAbandon(repository, assignment);
+    }
     return transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, "abandoned");
+  }
+  /**
+   * Commits any uncommitted worktree content onto the worker's OWN branch
+   * (never main), mints a durable `refs/ironclaude/recovery/<guid>` ref at that
+   * commit and records the REF NAME as recovery evidence, transitions the
+   * assignment to abandoned, then removes ONLY the worktree directory. The
+   * durable ref — not the worker branch — is the anchor: a later reaper may
+   * delete the branch, and the rescued commit stays reachable through the ref.
+   */
+  rescueAbandon(repository, assignment) {
+    const worktreePresent = existsSync2(assignment.worktree_path) && worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path);
+    if (worktreePresent) {
+      if (!worktreeIsClean(assignment.worktree_path)) {
+        runGit(assignment.worktree_path, ["add", "-A"]);
+        runGit(assignment.worktree_path, ["commit", "-m", "ironclaude: rescue-commit before reclaiming worktree"]);
+      }
+      const rescuedHead = worktreeHead(assignment.worktree_path);
+      const recoveryRef = `refs/ironclaude/recovery/${assignment.workspace_guid}`;
+      runGit(repository.primaryCheckoutPath, ["update-ref", recoveryRef, rescuedHead]);
+      this.db.prepare(`
+        UPDATE assignments SET recovery_ref = ?, updated_at = datetime('now') WHERE workspace_guid = ?
+      `).run(recoveryRef, assignment.workspace_guid);
+    }
+    const abandoned = transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, "abandoned");
+    if (worktreePresent) removeWorktree(repository.primaryCheckoutPath, assignment.worktree_path);
+    return abandoned;
+  }
+  /**
+   * Carve-out for a reserved row that never got as far as owning a real
+   * worktree (`addWorktree` never ran or failed before it could complete):
+   * there is nothing on disk to remove and no branch to preserve, so the row
+   * is deleted outright. Refuses — deferring to `cleanupWorkspace`'s proven
+   * proofs — the moment a worktree actually exists for this row.
+   */
+  cleanupReservedAssignment(input) {
+    const repository = discoverRepository(input.repositoryPath);
+    const assignment = this.getWorkspaceAssignment(input);
+    if (assignment.lifecycle_status !== "reserved") {
+      throw new Error("Only a reserved, never-materialized assignment is eligible for this carve-out");
+    }
+    if (existsSync2(assignment.worktree_path) || worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path)) {
+      throw new Error("Reserved assignment has a materialized worktree; use cleanupWorkspace instead");
+    }
+    const result = this.db.prepare(`
+      DELETE FROM assignments WHERE workspace_guid = ? AND lifecycle_status = 'reserved'
+    `).run(assignment.workspace_guid);
+    if (result.changes !== 1) throw new Error("Reserved assignment changed concurrently");
+    return { ...assignment, lifecycle_status: "cleaned" };
+  }
+  /** True iff `ref` resolves in `root`; a missing or unresolvable ref returns false rather than throwing. */
+  refResolves(root, ref) {
+    try {
+      runGit(root, ["rev-parse", "--verify", "--quiet", ref]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  /** True iff `ref` is an actual git ref (not merely a resolvable object such as a raw SHA). */
+  refIsDurableRef(root, ref) {
+    try {
+      runGit(root, ["show-ref", "--verify", "--quiet", ref]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  /**
+   * Guarantees a durable git ref anchors an abandoned row's recovery commit before its
+   * branch can be deleted. A ref-name `recovery_ref` is returned unchanged (no-op). A
+   * legacy raw-SHA `recovery_ref` that still resolves to a reachable object is upgraded:
+   * mint `refs/ironclaude/recovery/<guid>` at that commit and record the REF NAME. A
+   * `recovery_ref` that is neither a durable ref nor a reachable object throws, so the
+   * row and its branch are preserved (never-lose-work).
+   */
+  ensureDurableRecoveryAnchor(repository, assignment) {
+    const current = assignment.recovery_ref;
+    if (!current) throw new Error("Abandoned assignment lacks recovery evidence; preserving it");
+    if (this.refIsDurableRef(repository.primaryCheckoutPath, current)) return current;
+    if (!this.refResolves(repository.primaryCheckoutPath, current)) {
+      throw new Error("Recovery evidence is neither a durable ref nor a reachable commit; preserving it");
+    }
+    const recoveryRef = `refs/ironclaude/recovery/${assignment.workspace_guid}`;
+    runGit(repository.primaryCheckoutPath, ["update-ref", recoveryRef, current]);
+    this.db.prepare(`
+      UPDATE assignments SET recovery_ref = ?, updated_at = datetime('now') WHERE workspace_guid = ?
+    `).run(recoveryRef, assignment.workspace_guid);
+    return recoveryRef;
+  }
+  /**
+   * Deletes a terminal (integrated or abandoned) assignment only when its
+   * recorded recovery/integration proof still holds, then removes the worktree
+   * (when present) and its private branch. Every failed proof preserves work.
+   *
+   * Handles both the present-worktree case (proof anchored on the live worktree
+   * HEAD, byte-identical to the original cleanup path) and the worktree-gone
+   * case a reaper reaches after `rescueAbandon` has already removed the
+   * directory: there the abandoned proof is that the durable recovery ref still
+   * resolves, and branch deletion is skipped when the branch is already gone (a
+   * `git branch -D` on a nonexistent branch would otherwise throw).
+   */
+  tombstoneTerminalAssignment(repository, assignment) {
+    const present = existsSync2(assignment.worktree_path) && worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path);
+    if (present && !worktreeIsClean(assignment.worktree_path)) {
+      throw new Error("Managed worktree is dirty; preserving it");
+    }
+    if (assignment.lifecycle_status === "abandoned") {
+      if (present) {
+        if (!assignment.recovery_ref || !isAncestor(repository.primaryCheckoutPath, worktreeHead(assignment.worktree_path), assignment.recovery_ref)) {
+          throw new Error("Abandoned worktree lacks reachable durable recovery evidence; preserving it");
+        }
+      } else if (!assignment.recovery_ref || !this.refResolves(repository.primaryCheckoutPath, assignment.recovery_ref)) {
+        throw new Error("Abandoned worktree lacks reachable durable recovery evidence; preserving it");
+      }
+    } else {
+      const integration = this.db.prepare(`
+        SELECT target_ref, integrated_commit FROM integration_records
+        WHERE workspace_guid = ? AND repository_identity = ?
+      `).get(assignment.workspace_guid, repository.repositoryIdentity);
+      if (!assignment.integrated_commit || !integration || integration.target_ref !== integrationTargetRef(assignment.integration_target) || integration.integrated_commit !== assignment.integrated_commit || present && worktreeHead(assignment.worktree_path) !== assignment.integrated_commit || !isAncestor(repository.primaryCheckoutPath, assignment.integrated_commit, integration.target_ref)) {
+        throw new Error("Integrated worktree lacks reachable durable integration evidence; preserving it");
+      }
+    }
+    if (assignment.lifecycle_status === "abandoned") {
+      this.ensureDurableRecoveryAnchor(repository, assignment);
+    }
+    if (present) removeWorktree(repository.primaryCheckoutPath, assignment.worktree_path);
+    if (this.refResolves(repository.primaryCheckoutPath, `refs/heads/${assignment.branch}`)) {
+      deleteTemporaryBranch(repository.primaryCheckoutPath, assignment.branch);
+    }
+    return transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, "cleaned");
   }
   /**
    * Deletes only a terminal assignment whose recorded recovery/integration
@@ -1035,30 +1307,64 @@ var WorkspaceService = class {
     if (assignment.lifecycle_status !== "integrated" && assignment.lifecycle_status !== "abandoned") {
       throw new Error("Only integrated or abandoned worktrees are eligible for cleanup");
     }
-    this.validateManagedIdentity(repository, assignment);
-    if (!worktreeIsClean(assignment.worktree_path)) {
-      throw new Error("Managed worktree is dirty; preserving it");
+    const present = existsSync2(assignment.worktree_path) && worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path);
+    if (present) this.validateManagedIdentity(repository, assignment);
+    return this.tombstoneTerminalAssignment(repository, assignment);
+  }
+  /**
+   * Owner-agnostic reaper for a LEAKED managed assignment — one whose owning
+   * session is gone, so `cleanupWorkspace`'s owner-match can never fire. It
+   * still proves canonical managed identity (repository, path, branch) before
+   * touching anything, and preserves work at every step: a present worktree is
+   * rescued (`rescueAbandon` anchors its content on a durable recovery ref), a
+   * worktree-gone row mints a recovery ref at the surviving branch tip (or, when
+   * even the branch is gone, at the recorded base commit) BEFORE transitioning
+   * to abandoned, and a present worktree on a foreign branch is refused and
+   * preserved. Only after work is anchored does it tombstone the row.
+   */
+  reapLeakedAssignment(input) {
+    const repository = discoverRepository(input.repositoryPath);
+    const assignment = getAssignment(this.db, input.workspaceGuid);
+    if (!assignment || assignment.repository_identity !== repository.repositoryIdentity || assignment.worktree_path !== managedWorktreePath(repository.primaryCheckoutPath, assignment.workspace_guid) || assignment.branch !== managedBranch(assignment.workspace_guid)) {
+      throw new Error("Leaked assignment does not match canonical managed identity for this repository");
     }
-    if (this.primaryCheckoutIsOwned(repository.repositoryIdentity)) {
-      throw new Error("Primary checkout remains owned; preserving managed worktree");
+    if (assignment.lifecycle_status === "cleaned") return assignment;
+    if (assignment.lifecycle_status === "reserved") {
+      return this.reapReservedAssignment(repository, assignment);
     }
-    const actualHead = worktreeHead(assignment.worktree_path);
-    if (assignment.lifecycle_status === "abandoned") {
-      if (!assignment.recovery_ref || !isAncestor(repository.primaryCheckoutPath, actualHead, assignment.recovery_ref)) {
-        throw new Error("Abandoned worktree lacks reachable durable recovery evidence; preserving it");
+    const present = existsSync2(assignment.worktree_path) && worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path);
+    if (present) this.validateManagedIdentity(repository, assignment);
+    if (assignment.lifecycle_status !== "integrated" && assignment.lifecycle_status !== "abandoned") {
+      if (present) {
+        this.rescueAbandon(repository, assignment);
+      } else {
+        const recoveryRef = `refs/ironclaude/recovery/${assignment.workspace_guid}`;
+        const branchRef = `refs/heads/${assignment.branch}`;
+        const anchor = this.refResolves(repository.primaryCheckoutPath, branchRef) ? branchRef : assignment.base_commit;
+        runGit(repository.primaryCheckoutPath, ["update-ref", recoveryRef, anchor]);
+        this.db.prepare(`
+          UPDATE assignments SET recovery_ref = ?, updated_at = datetime('now') WHERE workspace_guid = ?
+        `).run(recoveryRef, assignment.workspace_guid);
+        transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, "abandoned");
       }
-    } else {
-      const integration = this.db.prepare(`
-        SELECT target_ref, integrated_commit FROM integration_records
-        WHERE workspace_guid = ? AND repository_identity = ?
-      `).get(assignment.workspace_guid, repository.repositoryIdentity);
-      if (!assignment.integrated_commit || !integration || integration.target_ref !== integrationTargetRef(assignment.integration_target) || integration.integrated_commit !== assignment.integrated_commit || actualHead !== assignment.integrated_commit || !isAncestor(repository.primaryCheckoutPath, assignment.integrated_commit, integration.target_ref)) {
-        throw new Error("Integrated worktree lacks reachable durable integration evidence; preserving it");
-      }
     }
-    removeWorktree(repository.primaryCheckoutPath, assignment.worktree_path);
-    deleteTemporaryBranch(repository.primaryCheckoutPath, assignment.branch);
-    return transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, "cleaned");
+    return this.tombstoneTerminalAssignment(repository, getAssignment(this.db, input.workspaceGuid));
+  }
+  /**
+   * Owner-agnostic variant of `cleanupReservedAssignment`'s carve-out: a
+   * reserved row that never materialized a real worktree has nothing on disk to
+   * remove and no branch to preserve, so the row is deleted outright. Refuses
+   * the moment a worktree actually exists — that row is not a bare reservation.
+   */
+  reapReservedAssignment(repository, assignment) {
+    if (existsSync2(assignment.worktree_path) || worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path)) {
+      throw new Error("Reserved assignment has a materialized worktree; use cleanupWorkspace instead");
+    }
+    const result = this.db.prepare(`
+      DELETE FROM assignments WHERE workspace_guid = ? AND lifecycle_status = 'reserved'
+    `).run(assignment.workspace_guid);
+    if (result.changes !== 1) throw new Error("Reserved assignment changed concurrently");
+    return { ...assignment, lifecycle_status: "cleaned" };
   }
   /** Read-only reconciliation intentionally never deletes missing or unknown worktrees. */
   reconcileRepository(repositoryPath) {
@@ -1111,11 +1417,22 @@ function issueHumanIntentFromHook(db, args) {
       AND lifecycle_status NOT IN ('integrated', 'abandoned', 'cleaned')
     ORDER BY created_at ASC
   `).all(repository.repositoryIdentity, ownerSessionId);
+  const requestedGuid = optionalString(args, "workspace_guid");
+  if (assignments.length === 0) {
+    if (requestedGuid === void 0 && (operation === "commit" || operation === "push" || operation === "commit-and-push")) {
+      return issueDirectGitHumanIntent(db, {
+        repositoryPath,
+        providerRootSessionId: ownerSessionId,
+        humanChannel,
+        operation
+      });
+    }
+    throw new Error("Human intent issuance requires exactly one active assignment for provider root and repository");
+  }
   if (assignments.length !== 1) {
     throw new Error("Human intent issuance requires exactly one active assignment for provider root and repository");
   }
   const assignment = assignments[0];
-  const requestedGuid = optionalString(args, "workspace_guid");
   if (requestedGuid !== void 0 && requestedGuid !== assignment.workspace_guid) {
     throw new Error("Human intent workspace binding does not match active assignment");
   }

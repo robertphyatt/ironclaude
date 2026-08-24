@@ -1,0 +1,73 @@
+{
+  "name": "Worktree Reaper — Leak Closure",
+  "goal": "Let the Commander reaper reclaim leaked ownerless managed worktrees (and tombstone gone-worktree rows), preserving unintegrated work on a durable git ref first — closing the worktree leak with no operator git commands.",
+  "requirements_file": "docs/plans/2026-08-19-worktree-reaper-leak-requirements.md",
+  "design_file": "docs/plans/2026-08-19-worktree-reaper-leak-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "workspace-service.ts — durable preserve + gone-tolerant tombstone + reaper reap",
+      "description": "R0: rescueAbandon (:607-610) mints refs/ironclaude/recovery/<guid> at the rescued commit (update-ref in the primary checkout) and stores the REF NAME in recovery_ref (not a raw SHA) so a later branch delete cannot strand the commit. R1: private tombstoneTerminalAssignment(repository, assignment) — present worktree keeps cleanupWorkspace's CURRENT proof predicates VERBATIM (isAncestor(actualHead, recovery_ref) abandoned / integration block :660-674 integrated) gating on-disk worktreeIsClean/worktreeHead/removeWorktree on present; absent worktree requires recovery_ref/integrated evidence to RESOLVE (rev-parse helper); deleteTemporaryBranch runs only after a durable ref/integration exists; transition→cleaned. cleanupWorkspace keeps owner-match + status guard + present validateManagedIdentity and delegates. R2: reapLeakedAssignment({repositoryPath,workspaceGuid}) NO owner match — getAssignment by guid, repo-identity + managedWorktreePath/managedBranch shape; reserved→reaper variant of cleanupReservedAssignment (delete row); present→validateManagedIdentity observed-branch guard (throw on foreign branch); unresolved present→rescueAbandon; unresolved absent→mint recovery ref at branch tip if branch resolves else at base_commit, record, →abandoned; NEVER →abandoned before recovery ref written; then tombstoneTerminalAssignment. TDD; never-lose-work proven by asserting the recovery ref resolves AFTER branch deletion.",
+      "allowed_files": ["worker/mcp-servers/workspace-manager/src/workspace-service.ts", "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: workspace-service.test.ts tests (real temp repo): rescueAbandon anchors on a durable ref surviving branch -D; cleanupWorkspace tombstones a rescue-abandoned row (ref preserved); reapLeakedAssignment preserves+tombstones ownerless present; tombstones ownerless gone-worktree branch-survives (ref at branch tip); records base_commit when worktree AND branch gone; refuses+preserves a present worktree on a FOREIGN branch; routes a reserved never-materialized row to row-delete."},
+        {"description": "Run one RED.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts -t \"durable ref that survives branch deletion\" --testTimeout=30000", "expected": "FAIL (recovery_ref is a raw SHA; no ref minted)"},
+        {"description": "GREEN R0: rescueAbandon (:607-610) mints recoveryRef = `refs/ironclaude/recovery/${workspace_guid}` via runGit(primaryCheckoutPath, ['update-ref', recoveryRef, rescuedHead]) and stores the ref NAME; update the docstring (branch no longer the sole anchor)."},
+        {"description": "GREEN R1: add private tombstoneTerminalAssignment(repository, assignment) per the human plan — present proof VERBATIM from current cleanupWorkspace, absent proof = recovery_ref/integration resolves (add or reuse a rev-parse refResolves helper), deleteTemporaryBranch only after durable ref/integration, transition→cleaned."},
+        {"description": "GREEN R1: rewire cleanupWorkspace to keep getWorkspaceAssignment owner-match + integrated|abandoned guard + present validateManagedIdentity, then return this.tombstoneTerminalAssignment(repository, assignment) (present behavior byte-identical)."},
+        {"description": "GREEN R2: add reapLeakedAssignment per the human plan — no owner match, repo+shape check, reserved→reaper cleanupReserved variant, present→validateManagedIdentity guard, unresolved present→rescueAbandon, unresolved absent→mint recovery ref (branch tip or base_commit)+record+→abandoned, never →abandoned before the ref, then tombstoneTerminalAssignment. Confirm rescueAbandon(:599), cleanupReservedAssignment(:624), validateManagedIdentity(:170) signatures."},
+        {"description": "Run full file GREEN.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts --testTimeout=30000", "expected": "all workspace-service.test.ts tests pass"},
+        {"description": "Type-check.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx tsc --noEmit", "expected": "exit 0"},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/workspace-service.ts worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts", "expected": "staged"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "cli.ts — reap verb",
+      "description": "Add a 'reap' CLI verb → service.reapLeakedAssignment({repositoryPath, workspaceGuid}), no ownerSessionId. Extend InternalCommandDependencies (:19-27) + INTERNAL_COMMAND_NAMES (:29) + dispatch (:101) + dependencies entry (:166) using requiredString (cli.ts:52, NOT requireString). Because reap becomes a REQUIRED InternalCommandDependencies member, tool-dispatch.test.ts's internalDependencies() literal must also gain a reap mock or tsc (TS2741) fails. TDD.",
+      "allowed_files": ["worker/mcp-servers/workspace-manager/src/cli.ts", "worker/mcp-servers/workspace-manager/src/__tests__/cli.test.ts", "worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts"],
+      "depends_on": [1],
+      "steps": [
+        {"description": "RED: cli.test.ts — 3 tests: INTERNAL_COMMAND_NAMES contains 'reap'; dispatch routes 'reap' to dependencies.reap once; the reap handler calls service.reapLeakedAssignment with {repositoryPath, workspaceGuid} (no owner)."},
+        {"description": "Run RED.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/cli.test.ts -t \"reap\" --testTimeout=30000", "expected": "FAIL (Unknown command: reap)"},
+        {"description": "GREEN cli.ts: extend InternalCommandDependencies with reap; add 'reap' to INTERNAL_COMMAND_NAMES; add case 'reap': return dependencies.reap(args); after case 'cleanup' (:101); add reap: entry near cleanup (:166) using requiredString(args,'repository_path') + requiredString(args,'workspace_guid')."},
+        {"description": "GREEN tool-dispatch.test.ts: add reap: vi.fn() (matching the sibling mock shape) to its internalDependencies() literal so the InternalCommandDependencies object is complete for tsc."},
+        {"description": "Run GREEN + whole-project tsc.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/cli.test.ts src/__tests__/tool-dispatch.test.ts --testTimeout=30000 && npx tsc --noEmit", "expected": "cli.test.ts + tool-dispatch.test.ts pass; tsc exit 0"},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/cli.ts worker/mcp-servers/workspace-manager/src/__tests__/cli.test.ts worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts", "expected": "staged"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "WorkspaceClient.reap + reaper ownerless wiring",
+      "description": "C2: add 'reap' to workspace_client.py _COMMANDS (:16) + a reap method mirroring cleanup (:231). C3/R3: reaper ownerless branch (main.py:466-479) calls _reap_ownerless_assignment deriving repository_path from worktree_path (split '/.ironclaude/worktrees/'), workspace_client.reap({repository_path,workspace_guid}, **{}) with transport {} (NOT resolve_transport(None), which raises on the real daemon transport); success→counts['released'], exception→existing surfaced log + counts['surfaced']. Optional harden _worktree_reap_transport :1636 to (worker or {}).get('id'). TDD.",
+      "allowed_files": ["commander/src/ironclaude/workspace_client.py", "commander/src/ironclaude/main.py", "commander/tests/test_workspace_client.py", "commander/tests/test_worktree_reaper.py"],
+      "depends_on": [2],
+      "steps": [
+        {"description": "RED: (a) test_workspace_client.py — client.reap(payload) invokes the 'reap' CLI command (mirror the cleanup test); (b) test_worktree_reaper.py — a NEW reap-success test: an ownerless active leaked TTL-eligible candidate whose worktree_path IS a real managed path → reaper calls workspace_client.reap with the derived repository_path and counts['released'] increments. This REQUIRES extending _insert_assignment (:137, currently hardcodes worktree_path='/wt') with a worktree_path parameter; the new test passes '/repo/.ironclaude/worktrees/<guid>' so derivation succeeds. Do NOT change the shared /wt default — the two existing ownerless /wt tests (:401,:417) must keep surfacing (derivation raises on the marker-less /wt path)."},
+        {"description": "Run RED.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_workspace_client.py tests/test_worktree_reaper.py -q", "expected": "FAIL (reap not in _COMMANDS / ownerless still surfaced)"},
+        {"description": "GREEN C2: workspace_client.py add 'reap' to _COMMANDS (:16) + def reap(self, payload, **transport): return self._invoke('reap', payload, **transport)."},
+        {"description": "GREEN C3/R3: add _reap_ownerless_assignment(workspace_client, assignment, transport) deriving repository_path via the '/.ironclaude/worktrees/' marker (raise if underivable) + workspace_client.reap({repository_path, workspace_guid}, **transport); replace the ownerless branch with try: call it with transport {} , counts['released']+=1; except Exception: existing surfaced warning + counts['surfaced']+=1."},
+        {"description": "GREEN test clarity (test_worktree_reaper.py): (a) rewrite the module docstring paragraph (lines ~9-24) — ownerless rows are now RELEASED via the owner-free reap CLI verb; surfacing is the FALLBACK when repository_path is underivable from worktree_path or the reap call fails; (b) rename test_reserved_ownerless_row_is_surfaced_not_force_called → test_ownerless_reserved_underivable_path_stays_surfaced and test_ownerless_active_row_is_surfaced_not_force_called → test_ownerless_active_underivable_path_stays_surfaced, keep all existing asserts and ADD client.reap.assert_not_called() to each (the /wt fixture has no marker so derivation raises before any CLI call)."},
+        {"description": "Run GREEN.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_workspace_client.py tests/test_worktree_reaper.py -q", "expected": "pass"},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/workspace_client.py commander/src/ironclaude/main.py commander/tests/test_workspace_client.py commander/tests/test_worktree_reaper.py", "expected": "staged"}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Build + full regression + stage dist",
+      "description": "Rebuild the git-tracked dist bundles from refactored src and run the full cross-suite regression, then stage the bundles. No tests authored.",
+      "allowed_files": ["worker/mcp-servers/workspace-manager/dist/index.js", "worker/mcp-servers/workspace-manager/dist/cli.js", "worker/mcp-servers/workspace-manager/dist/hook-intent.js"],
+      "depends_on": [3],
+      "steps": [
+        {"description": "Build.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build", "expected": "tsc + 3 esbuild bundles; no type errors"},
+        {"description": "workspace-manager suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test", "expected": "Test Files 8 passed (8); all green"},
+        {"description": "state-manager suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm test", "expected": "Test Files 13 passed (13); Tests 196 passed (196)"},
+        {"description": "Hook suites.", "command": "for t in /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-*.sh; do echo \"== $t ==\"; bash \"$t\" || echo \"SUITE FAILED: $t\"; done", "expected": "each 0 failed; no 'SUITE FAILED'"},
+        {"description": "Commander pytest (~17 min; run to completion, no background watcher).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "all pass, exit 0"},
+        {"description": "Stage dist bundles.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/hook-intent.js", "expected": "staged"},
+        {"description": "Return shell cwd to repo root.", "command": "cd /Users/roberthyatt/Code/ironclaude", "expected": "cwd is /Users/roberthyatt/Code/ironclaude"}
+      ]
+    }
+  ]
+}

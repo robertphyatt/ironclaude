@@ -1,0 +1,59 @@
+{
+  "name": "WSM DB Stale-Workspace Cleanup (v3)",
+  "goal": "Remove stale workspace_guid 082b7cb0-e725-4064-8355-2495b1eb3877 and its FK children from ironclaude-workspaces.db via an FK-safe transactional delete, record a findings note, enter execution_complete.",
+  "requirements_file": "docs/2026-08-16-wsm-db-cleanup-v3-requirements.md",
+  "design_file": "docs/plans/2026-08-16-wsm-db-cleanup-v3-design.md",
+  "plan_file": "docs/plans/2026-08-16-wsm-db-cleanup-v3.md",
+  "machine_plan_file": "docs/plans/2026-08-16-wsm-db-cleanup-v3.plan.json",
+  "estimated_memory_gb": 0.5,
+  "tasks": [
+    {
+      "id": 1,
+      "name": "FK-safe delete of stale workspace row + findings note",
+      "description": "FK-safe transactional delete of workspace_guid 082b7cb0 from ironclaude-workspaces.db (FK children first, assignments last, foreign_keys=ON before BEGIN), backup+verify first, changes() must equal per-table baseline, post-verify target-total=0 and negative-control d1475 GUID=1, then write an unstaged findings note. Absolute paths only (no ~/$HOME). Any STOP condition: report to Brain and hold; recovery is human-authorized. Never touch 2d8031c7-1ba3-4722-8de5-cb8a69b70e55. No tests: idempotent external-DB mutation; verification is inline via baseline capture + changes() equality + post-verify.",
+      "allowed_files": ["docs/2026-08-16-wsm-db-cleanup-findings.md"],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Step 0 — substring sweep FIRST, before any mutation. Foreign-row hit (GUID in a row whose workspace_guid differs from target) -> STOP + report. Zero lines -> already clean: skip Steps 1-5, write 'already clean' findings note in Step 6, enter execution_complete. Otherwise proceed.",
+          "command": "sqlite3 /Users/roberthyatt/.claude/ironclaude-workspaces.db \".dump\" | grep -F '082b7cb0'",
+          "expected": "Lines are INSERT statements into assignments/primary_checkout_owners/integration_locks/integration_records/human_intents keyed on the target GUID, OR zero lines (already clean). A foreign-row hit is a STOP condition, not a pass."
+        },
+        {
+          "description": "Step 1 — discovery. Record per-table baseline row counts. Every returned row's workspace_guid must equal the target; any mismatch -> STOP.",
+          "command": "sqlite3 -header -column /Users/roberthyatt/.claude/ironclaude-workspaces.db \"SELECT 'assignments' AS tbl, * FROM assignments WHERE workspace_guid='082b7cb0-e725-4064-8355-2495b1eb3877'; SELECT 'primary_checkout_owners' AS tbl, * FROM primary_checkout_owners WHERE workspace_guid='082b7cb0-e725-4064-8355-2495b1eb3877'; SELECT 'integration_locks' AS tbl, * FROM integration_locks WHERE workspace_guid='082b7cb0-e725-4064-8355-2495b1eb3877'; SELECT 'integration_records' AS tbl, * FROM integration_records WHERE workspace_guid='082b7cb0-e725-4064-8355-2495b1eb3877'; SELECT 'human_intents' AS tbl, * FROM human_intents WHERE workspace_guid='082b7cb0-e725-4064-8355-2495b1eb3877';\"",
+          "expected": "Per-table baseline counts recorded for use as the Step 4 changes() oracle. Every row's workspace_guid equals the target."
+        },
+        {
+          "description": "Step 2 — backup the DB before any delete.",
+          "command": "cp /Users/roberthyatt/.claude/ironclaude-workspaces.db /Users/roberthyatt/.claude/ironclaude-workspaces.db.bak-d1475",
+          "expected": "Backup file created."
+        },
+        {
+          "description": "Step 3 — verify backup exists and is non-empty. Missing or 0 bytes -> STOP.",
+          "command": "ls -la /Users/roberthyatt/.claude/ironclaude-workspaces.db /Users/roberthyatt/.claude/ironclaude-workspaces.db.bak-d1475",
+          "expected": "Both files present, size > 0."
+        },
+        {
+          "description": "Step 4 — FK-safe transactional delete (children first, assignments last). PRAGMA foreign_keys=ON precedes BEGIN. Each changes() must equal the Step 1 baseline for that table. Any SQL error -> automatic rollback -> report exact error + STOP. Never retry with foreign_keys=OFF.",
+          "command": "sqlite3 /Users/roberthyatt/.claude/ironclaude-workspaces.db <<'SQL'\nPRAGMA foreign_keys = ON;\nBEGIN;\nDELETE FROM primary_checkout_owners WHERE workspace_guid='082b7cb0-e725-4064-8355-2495b1eb3877';\nSELECT changes();\nDELETE FROM integration_locks WHERE workspace_guid='082b7cb0-e725-4064-8355-2495b1eb3877';\nSELECT changes();\nDELETE FROM integration_records WHERE workspace_guid='082b7cb0-e725-4064-8355-2495b1eb3877';\nSELECT changes();\nDELETE FROM human_intents WHERE workspace_guid='082b7cb0-e725-4064-8355-2495b1eb3877';\nSELECT changes();\nDELETE FROM assignments WHERE workspace_guid='082b7cb0-e725-4064-8355-2495b1eb3877';\nSELECT changes();\nCOMMIT;\nSQL",
+          "expected": "Each changes() equals the Step 1 per-table baseline. COMMIT succeeds with no FK-violation error."
+        },
+        {
+          "description": "Step 5a — post-verify target GUID fully removed across all 5 tables.",
+          "command": "sqlite3 /Users/roberthyatt/.claude/ironclaude-workspaces.db \"SELECT (SELECT COUNT(*) FROM assignments WHERE workspace_guid='082b7cb0-e725-4064-8355-2495b1eb3877') + (SELECT COUNT(*) FROM primary_checkout_owners WHERE workspace_guid='082b7cb0-e725-4064-8355-2495b1eb3877') + (SELECT COUNT(*) FROM integration_locks WHERE workspace_guid='082b7cb0-e725-4064-8355-2495b1eb3877') + (SELECT COUNT(*) FROM integration_records WHERE workspace_guid='082b7cb0-e725-4064-8355-2495b1eb3877') + (SELECT COUNT(*) FROM human_intents WHERE workspace_guid='082b7cb0-e725-4064-8355-2495b1eb3877') AS total_remaining;\"",
+          "expected": "0"
+        },
+        {
+          "description": "Step 5b — negative control: d1475's own GUID row untouched.",
+          "command": "sqlite3 /Users/roberthyatt/.claude/ironclaude-workspaces.db \"SELECT COUNT(*) FROM assignments WHERE workspace_guid='2d8031c7-1ba3-4722-8de5-cb8a69b70e55';\"",
+          "expected": "1"
+        },
+        {
+          "description": "Step 6 — write findings note at docs/2026-08-16-wsm-db-cleanup-findings.md recording: Step 0 sweep result; tables holding rows for 082b7cb0 and the exact column (workspace_guid in every case); exact queries run; per-table rows deleted (changes() from Step 4); Step 5 results (total_remaining=0; d1475 own-GUID count=1). Do NOT git add this file. Then enter execution_complete.",
+          "expected": "Findings note written (unstaged). Single task complete."
+        }
+      ]
+    }
+  ]
+}

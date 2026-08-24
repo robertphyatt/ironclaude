@@ -79,3 +79,28 @@ def test_writing_plans_does_not_instruct_recording_review_rounds():
         "writing-plans must not carry a foundation-style review-obligations table"
     assert "reviewer-driven correction" not in text, \
         "writing-plans must not carry a foundation-style reviewer-drift audit column"
+
+
+def test_writing_plans_routes_human_and_machine_artifacts_to_profiles():
+    text = _skill_text()
+    assert "elements-of-style" in text
+    assert "write-lossless-ai-messages" in text
+    assert text.index("elements-of-style") < text.index("Create plan document")
+    assert text.index("write-lossless-ai-messages") < text.index("Create machine-readable plan JSON")
+    for protected in (
+        "schema", "task IDs", "depends_on", "allowed_files", "ordered steps",
+        "commands", "expected results", "paths", "authority", "actionable state",
+    ):
+        assert protected in text
+
+    parity_section = text[text.index("Operator → brainstorming → requirements/design → plan parity audit"):]
+    assert "same" in parity_section and "commands" in parity_section
+
+
+def test_writing_plans_limits_json_compression_to_natural_language_fields():
+    text = " ".join(_skill_text().lower().split())
+    assert "natural-language fields only" in text
+    assert "must not drop fields" in text
+    assert "must not change exact technical values" in text
+    assert "ic_lossless_ai_messages_active" in text
+    assert "must not appear in plan artifacts" in text

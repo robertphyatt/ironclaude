@@ -186,6 +186,46 @@ class TmuxManager:
         """Get the log file path for a session."""
         return os.path.join(self.log_dir, f"{name}.log")
 
+    def get_log_size(self, name: str, ssh_host: str | None = None,
+                     remote_log_dir: str | None = None) -> int:
+        """Return current byte size of a session log, or zero when unavailable."""
+        if ssh_host:
+            log_path = os.path.join(remote_log_dir or self.log_dir, f"{name}.log")
+            result = self._run(
+                ["wc", "-c", log_path], ssh_host=ssh_host,
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                return 0
+            try:
+                return max(0, int(result.stdout.split()[0]))
+            except (IndexError, ValueError):
+                return 0
+        try:
+            return os.path.getsize(self.get_log_path(name))
+        except OSError:
+            return 0
+
+    def read_log_since(self, name: str, offset: int, *, max_bytes: int = 65536,
+                       ssh_host: str | None = None,
+                       remote_log_dir: str | None = None) -> str:
+        """Read at most ``max_bytes`` appended after a previously observed offset."""
+        offset = max(0, offset)
+        if ssh_host:
+            log_path = os.path.join(remote_log_dir or self.log_dir, f"{name}.log")
+            result = self._run(
+                ["dd", f"if={log_path}", "bs=1", f"skip={offset}",
+                 f"count={max_bytes}", "status=none"],
+                ssh_host=ssh_host, capture_output=True, text=True,
+            )
+            return _strip_ansi(result.stdout) if result.returncode == 0 else ""
+        try:
+            with open(self.get_log_path(name), encoding="utf-8", errors="replace") as stream:
+                stream.seek(offset)
+                return _strip_ansi(stream.read(max_bytes))
+        except OSError:
+            return ""
+
     def capture_pane(self, name: str, lines: int = 50, ssh_host: str | None = None) -> str:
         """Capture rendered terminal output via tmux capture-pane."""
         kwargs = dict(capture_output=True, text=True)

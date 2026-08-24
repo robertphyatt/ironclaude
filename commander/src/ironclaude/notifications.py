@@ -38,6 +38,18 @@ def format_worker_completed(worker_id: str, summary: str) -> str:
     return f"*Worker Completed:* `{worker_id}`\nResult: {_escape_mrkdwn(summary)}"
 
 
+def format_worker_session_ended_preserved(worker_id: str, disposition: str) -> str:
+    """The dead-session branch's non-completion surface: the worker's tmux
+    session ended but the seam left it NOT completed (a transient, drift, or
+    held recovery disposition) — the reviewed work is preserved on its
+    branch, never lost, but must not be reported as 'Worker Completed'."""
+    return (
+        f"*Worker session ended — work preserved (NOT completed):* `{worker_id}`\n"
+        f"Reviewed work is preserved on its branch (recovery: {_escape_mrkdwn(disposition)}); "
+        f"NOT completed. May need operator attention."
+    )
+
+
 def format_worker_idle(worker_id: str) -> str:
     return f"*Worker Idle:* `{worker_id}` went idle (stop hook fired). Brain notified."
 

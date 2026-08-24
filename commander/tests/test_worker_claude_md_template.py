@@ -62,7 +62,7 @@ class TestWorkerClaudeMdTemplate:
         assert AGENTS_TEMPLATE_PATH.read_text() == canonical
 
     def test_worker_templates_have_semantic_concept_parity(self):
-        """Both provider templates carry one workflow and the same 11 concepts."""
+        """Both provider templates carry one workflow and the same 12 concepts."""
         claude = TEMPLATE_PATH.read_text()
         codex = AGENTS_TEMPLATE_PATH.read_text()
         workflow = (
@@ -82,6 +82,7 @@ class TestWorkerClaudeMdTemplate:
             "Advisor Fallback",
             "No Workflow Avoidance Under Stage/Context Restrictions",
             "Boy Scout Rule",
+            "Recipient-Based Communication Profiles",
         ]
         assert _concept_headings(claude) == expected
         assert _concept_headings(codex) == expected

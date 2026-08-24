@@ -1,0 +1,731 @@
+{
+  "name": "Review Receipt Rebase and Operator-Free Worktree Recovery",
+  "goal": "Reconcile cumulative reviewed trees across safe descendant HEAD movement, unwind failed review preparation without deadlock, and then complete the approved operator-free worktree lifecycle.",
+  "requirements_file": "docs/plans/2026-08-15-review-receipt-rebase-and-preparation-recovery-requirements.md",
+  "design_file": "docs/plans/2026-08-15-review-receipt-rebase-and-preparation-recovery-design.md",
+  "plan_file": "docs/plans/2026-08-15-review-receipt-rebase-and-preparation-recovery.md",
+  "machine_plan_file": "docs/plans/2026-08-15-review-receipt-rebase-and-preparation-recovery.plan.json",
+  "supporting_artifacts": [
+    "docs/plans/2026-08-15-operator-free-managed-worktree-lifecycle-design.md",
+    "docs/plans/2026-08-15-operator-free-managed-worktree-lifecycle-requirements.md",
+    "docs/plans/2026-08-15-operator-free-managed-worktree-lifecycle.md",
+    "docs/plans/2026-08-15-operator-free-managed-worktree-lifecycle.plan.json"
+  ],
+  "bootstrap_evidence": {
+    "paths": [
+      "docs/plans/2026-08-15-review-receipt-rebase-and-preparation-recovery-design.md",
+      "docs/plans/2026-08-15-review-receipt-rebase-and-preparation-recovery-requirements.md",
+      "docs/plans/2026-08-15-review-receipt-rebase-and-preparation-recovery.md",
+      "docs/plans/2026-08-15-review-receipt-rebase-and-preparation-recovery.plan.json",
+      "docs/plans/2026-08-15-operator-free-managed-worktree-lifecycle-design.md",
+      "docs/plans/2026-08-15-operator-free-managed-worktree-lifecycle-requirements.md",
+      "docs/plans/2026-08-15-operator-free-managed-worktree-lifecycle.md",
+      "docs/plans/2026-08-15-operator-free-managed-worktree-lifecycle.plan.json"
+    ]
+  },
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Reconcile descendant receipts and unwind failed preparation",
+      "description": "Carry the completed plan-artifact implementation, reconcile an active reviewed tree onto a verified descendant HEAD in an isolated index, reopen safe no-candidate preparation failures atomically, activate a bounded Codex bootstrap, and review the cumulative result.",
+      "allowed_files": [
+        "worker/mcp-servers/state-manager/src/plan-artifacts.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/plan-artifacts.test.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/plan-artifacts.mutation.test.ts",
+        "worker/mcp-servers/state-manager/src/db.ts",
+        "worker/mcp-servers/state-manager/src/types.ts",
+        "worker/mcp-servers/state-manager/src/state-machine.ts",
+        "worker/mcp-servers/state-manager/src/review-receipts.ts",
+        "worker/mcp-servers/state-manager/src/tools/write-tools.ts",
+        "worker/mcp-servers/state-manager/src/tools/write-tools.test.ts",
+        "worker/mcp-servers/state-manager/src/tools/write-tools.tier-up.test.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/review-receipts.test.ts",
+        "worker/mcp-servers/state-manager/src/__tests__/workflow-transition-idempotency.test.ts",
+        "worker/mcp-servers/state-manager/dist/index.js",
+        "worker/.codex-plugin/plugin.json",
+        "worker/skills/brainstorming/SKILL.md",
+        "worker/skills/writing-plans/SKILL.md",
+        "worker/skills/executing-plans/SKILL.md",
+        "commander/tests/test_brainstorming_skill.py",
+        "commander/tests/test_writing_plans_skill.py",
+        "commander/tests/test_executing_plans_skill.py",
+        "commander/tests/test_review_receipt_skill.py",
+        "worker/hooks/test-guard-security.sh"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Reconfirm active receipt 57, live HEAD ancestry, branch, ref/object identity, disjoint path sets, staged receipt paths, and preserved Task 1 paths without mutation.",
+          "command": "sqlite3 -readonly -header -column /Users/roberthyatt/.claude/ironclaude.db \"SELECT id,status,parent_oid,tree_oid,receipt_ref,checkout_mode,workspace_guid FROM review_receipts WHERE terminal_session='019fc5e5-fc72-7493-b785-bee8cda62b1b' AND id=57;\"",
+          "expected": "Receipt 57 is active with parent 7ba7894e01089dfbbbc946b3ea93a3935e876e81 and tree cb6e3d09ec9665793699b88f003afece78a6778b; any drift stops before implementation."
+        },
+        {
+          "description": "Prove live HEAD and its exact parent-to-HEAD paths.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude show -s --format='%H%n%P%n%T%n%D' HEAD && git -C /Users/roberthyatt/Code/ironclaude diff --name-only 7ba7894e01089dfbbbc946b3ea93a3935e876e81 HEAD",
+          "expected": "HEAD is f07e3e7e75c7352f40686578daa4e75f3ccef698 on refs/heads/main and changes only commander/src/ironclaude/main.py and commander/tests/test_daemon.py."
+        },
+        {
+          "description": "Write RED real-Git descendant/identical/conflict/drift tests and state tests for safe no-candidate unwind, preservation, negative controls, zero grade, and idempotency."
+        },
+        {
+          "description": "Run RED focused state-manager suite.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm test -- --run src/__tests__/review-receipts.test.ts src/__tests__/workflow-transition-idempotency.test.ts src/__tests__/plan-artifacts.test.ts src/__tests__/plan-artifacts.mutation.test.ts src/tools/write-tools.test.ts src/tools/write-tools.tier-up.test.ts",
+          "expected": "New reconciliation assertions fail at the strict parent gate and new unwind assertions show stranded submitted state; existing assertions remain green."
+        },
+        {
+          "description": "Implement authenticated descendant reconciliation in review-receipts.ts with equal-parent fast path, merge-base ancestry proof, isolated three-tree read, exact unmerged-path diagnostics, reconciled baseline tree, and live-HEAD pending parent."
+        },
+        {
+          "description": "Implement safe pre-candidate unwind in write-tools.ts: same lineage/wave and no pending candidate; submitted to in_progress, executing stage, review flags cleared, one infrastructure audit, no grade, and idempotent repeat."
+        },
+        {
+          "description": "Run GREEN focused state-manager suite.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm test -- --run src/__tests__/review-receipts.test.ts src/__tests__/workflow-transition-idempotency.test.ts src/__tests__/plan-artifacts.test.ts src/__tests__/plan-artifacts.mutation.test.ts src/tools/write-tools.test.ts src/tools/write-tools.tier-up.test.ts",
+          "expected": "All selected tests pass."
+        },
+        {
+          "description": "Run state-manager typecheck.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx tsc --noEmit",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Temporarily weaken descendant ancestry and safe-unwind gating one at a time; require targeted test failures; restore source immediately with apply_patch.",
+          "expected": "Each mutation is killed by a named test; final source equals intended GREEN implementation."
+        },
+        {
+          "description": "Run hook guard regression.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/test-guard-security.sh",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Run skill-contract regression.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python -m pytest tests/test_brainstorming_skill.py tests/test_writing_plans_skill.py tests/test_executing_plans_skill.py tests/test_review_receipt_skill.py -q",
+          "expected": "All selected tests pass."
+        },
+        {
+          "description": "Run complete repository suite once.",
+          "command": "make -C /Users/roberthyatt/Code/ironclaude test",
+          "expected": "Exit zero; one bounded repeat only after a deterministic source repair."
+        },
+        {
+          "description": "Build tracked state-manager bundle.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm run build",
+          "expected": "Exit zero; dist/index.js contains reconciliation and unwind behavior."
+        },
+        {
+          "description": "Replace Task 1 Codex cachebuster exactly once.",
+          "command": "/usr/bin/python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/update_plugin_cachebuster.py /Users/roberthyatt/Code/ironclaude/worker",
+          "expected": "Base remains 1.1.6 and one new Codex suffix replaces the previous suffix."
+        },
+        {
+          "description": "Validate bootstrap plugin.",
+          "command": "/usr/bin/python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py /Users/roberthyatt/Code/ironclaude/worker",
+          "expected": "Plugin validation passed."
+        },
+        {
+          "description": "Run bootstrap version consistency.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python -m pytest tests/test_version_consistency.py -q",
+          "expected": "All tests pass."
+        },
+        {
+          "description": "Write measured bootstrap runtime oracle.",
+          "command": "/usr/bin/python3 -c 'import hashlib,json,pathlib; root=pathlib.Path(\"/Users/roberthyatt/Code/ironclaude/worker\"); manifest=root/\".codex-plugin/plugin.json\"; version=json.loads(manifest.read_text())[\"version\"]; cache=pathlib.Path(\"/Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude\")/version; sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest(); data={\"client\":\"codex\",\"plugin_root\":str(cache),\"plugin_version\":version,\"manifest_sha256\":sha(manifest),\"state_manager_bundle_sha256\":sha(root/\"mcp-servers/state-manager/dist/index.js\"),\"workspace_manager_bundle_sha256\":sha(root/\"mcp-servers/workspace-manager/dist/index.js\"),\"workspace_manager_cli_sha256\":sha(root/\"mcp-servers/workspace-manager/dist/cli.js\"),\"workspace_manager_hook_intent_sha256\":sha(root/\"mcp-servers/workspace-manager/dist/hook-intent.js\")}; pathlib.Path(\"/private/tmp/review-receipt-recovery-bootstrap-runtime.json\").write_text(json.dumps(data,sort_keys=True)+\"\\n\")'",
+          "expected": "File contains exact source version, deterministic Codex cache root, and SHA-256 for manifest plus all four bundles, followed by exactly one LF."
+        },
+        {
+          "description": "Parse and verify the measured bootstrap runtime oracle before installation.",
+          "command": "/usr/bin/python3 -c 'import hashlib,json,pathlib; root=pathlib.Path(\"/Users/roberthyatt/Code/ironclaude/worker\"); manifest=root/\".codex-plugin/plugin.json\"; version=json.loads(manifest.read_text())[\"version\"]; cache=pathlib.Path(\"/Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude\")/version; sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest(); expected={\"client\":\"codex\",\"plugin_root\":str(cache),\"plugin_version\":version,\"manifest_sha256\":sha(manifest),\"state_manager_bundle_sha256\":sha(root/\"mcp-servers/state-manager/dist/index.js\"),\"workspace_manager_bundle_sha256\":sha(root/\"mcp-servers/workspace-manager/dist/index.js\"),\"workspace_manager_cli_sha256\":sha(root/\"mcp-servers/workspace-manager/dist/cli.js\"),\"workspace_manager_hook_intent_sha256\":sha(root/\"mcp-servers/workspace-manager/dist/hook-intent.js\")}; p=pathlib.Path(\"/private/tmp/review-receipt-recovery-bootstrap-runtime.json\"); raw=p.read_bytes(); assert raw.endswith(b\"\\n\") and not raw.endswith(b\"\\n\\n\"), \"runtime oracle must end with exactly one LF\"; actual=json.loads(raw); assert actual == expected, f\"runtime oracle drift: {actual}\"'",
+          "expected": "Oracle parses as JSON, ends with exactly one LF, and equals every recomputed source field."
+        },
+        {
+          "description": "Stage exact Task 1 implementation paths.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f -- worker/mcp-servers/state-manager/src/plan-artifacts.ts worker/mcp-servers/state-manager/src/__tests__/plan-artifacts.test.ts worker/mcp-servers/state-manager/src/__tests__/plan-artifacts.mutation.test.ts worker/mcp-servers/state-manager/src/db.ts worker/mcp-servers/state-manager/src/types.ts worker/mcp-servers/state-manager/src/state-machine.ts worker/mcp-servers/state-manager/src/review-receipts.ts worker/mcp-servers/state-manager/src/tools/write-tools.ts worker/mcp-servers/state-manager/src/tools/write-tools.test.ts worker/mcp-servers/state-manager/src/tools/write-tools.tier-up.test.ts worker/mcp-servers/state-manager/src/__tests__/review-receipts.test.ts worker/mcp-servers/state-manager/src/__tests__/workflow-transition-idempotency.test.ts worker/mcp-servers/state-manager/dist/index.js worker/.codex-plugin/plugin.json worker/skills/brainstorming/SKILL.md worker/skills/writing-plans/SKILL.md worker/skills/executing-plans/SKILL.md commander/tests/test_brainstorming_skill.py commander/tests/test_writing_plans_skill.py commander/tests/test_executing_plans_skill.py commander/tests/test_review_receipt_skill.py worker/hooks/test-guard-security.sh",
+          "expected": "Exit zero; immutable plan evidence remains separate from allowed_files."
+        },
+        {
+          "description": "Validate cached candidate.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached --check",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Verify delayed restart helper hash.",
+          "command": "/usr/bin/python3 -c 'import hashlib,pathlib; p=pathlib.Path(\"/private/tmp/restart_codex.py\"); expected=\"d09cc042bdac54f8fb87eb1a021724fe28b42b355690bdd97999fa2a8a16c38f\"; actual=hashlib.sha256(p.read_bytes()).hexdigest(); assert actual == expected, f\"restart helper hash mismatch: {actual}\"'",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Launch verified delayed restart helper.",
+          "command": "/usr/bin/python3 -c 'import subprocess; subprocess.Popen([\"/usr/bin/python3\",\"/private/tmp/restart_codex.py\"],start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)'",
+          "expected": "Exit zero; restart scheduled without source mutation."
+        },
+        {
+          "description": "Install bounded Codex bootstrap runtime.",
+          "command": "codex plugin add ironclaude@ironclaude --json",
+          "expected": "Codex installs exact Task 1 bootstrap cachebuster."
+        },
+        {
+          "description": "After restart, pass exact bootstrap oracle to run_diagnostics and prove provider-root session, installed root/version/hashes, current lineage, active Task 1, active receipt 57, and immutable plan-evidence receipt.",
+          "expected": "Every expected_runtime field matches and the repaired prepare_review_candidate is callable."
+        },
+        {
+          "description": "Submit Task 1 and complete provider-native task-boundary code review.",
+          "expected": "Preparation reconciles receipt 57 onto descendant HEAD; candidate includes prior reviewed bytes, immutable plan evidence, and Task 1; grade A/B; no post-submission source/build/cachebuster/install mutation."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Unify checkout authority and allocate PM-on worktrees automatically",
+      "description": "Create one generation-fenced effective-root contract, automatic PM-on direct/Commander allocation, and verified checkout switching while preserving exact PM-off bypass.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/effective-checkout.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/effective-checkout.test.ts",
+        "worker/mcp-servers/workspace-manager/src/types.ts",
+        "worker/mcp-servers/workspace-manager/src/db.ts",
+        "worker/mcp-servers/workspace-manager/src/workspace-service.ts",
+        "worker/mcp-servers/workspace-manager/src/git-authority.ts",
+        "worker/mcp-servers/workspace-manager/src/index.ts",
+        "worker/mcp-servers/workspace-manager/src/cli.ts",
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/hooks/workspace-path-adapter.sh",
+        "worker/hooks/state-activator.sh",
+        "worker/hooks/session-init.sh",
+        "worker/skills/activate-professional-mode/SKILL.md",
+        "worker/skills/use-managed-worktree/SKILL.md",
+        "commander/src/ironclaude/templates/worker_agents.md",
+        "commander/src/ironclaude/templates/worker_claude_md.md",
+        "worker/mcp-servers/workspace-manager/src/__tests__/db.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/git-authority.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/cli.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts",
+        "worker/hooks/tests/test-managed-worktree-guard.sh",
+        "worker/hooks/tests/test-git-authority-activation.sh",
+        "commander/tests/test_workspace_activation_skill.py",
+        "commander/tests/test_activation_client_parity.py",
+        "commander/tests/test_worker_claude_md_template.py"
+      ],
+      "depends_on": [
+        1
+      ],
+      "steps": [
+        {
+          "description": "Write RED automatic-allocation, exact ownership, generation, switching, root-parity, template-parity, and PM-off tests."
+        },
+        {
+          "description": "Run RED workspace tests.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test -- --run src/__tests__/effective-checkout.test.ts src/__tests__/db.test.ts src/__tests__/workspace-service.test.ts src/__tests__/git-authority.test.ts src/__tests__/cli.test.ts src/__tests__/tool-dispatch.test.ts",
+          "expected": "New tests fail for opt-in allocation and duplicated authority."
+        },
+        {
+          "description": "Run RED hook tests.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-managed-worktree-guard.sh",
+          "expected": "New root-parity cases fail."
+        },
+        {
+          "description": "Run RED activation tests.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-git-authority-activation.sh",
+          "expected": "New automatic-allocation cases fail."
+        },
+        {
+          "description": "Run RED Commander parity tests.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python -m pytest tests/test_workspace_activation_skill.py tests/test_activation_client_parity.py tests/test_worker_claude_md_template.py -q",
+          "expected": "New automatic-allocation/template assertions fail."
+        },
+        {
+          "description": "Implement shared snapshot, automatic PM-on allocation, exact PM-off bypass, and generation-safe verified switching across every consumer."
+        },
+        {
+          "description": "Build current CLI before hook GREEN.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run bundle:cli",
+          "expected": "Exit zero; dist/cli.js contains snapshot route."
+        },
+        {
+          "description": "Run GREEN workspace tests.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test -- --run src/__tests__/effective-checkout.test.ts src/__tests__/db.test.ts src/__tests__/workspace-service.test.ts src/__tests__/git-authority.test.ts src/__tests__/cli.test.ts src/__tests__/tool-dispatch.test.ts",
+          "expected": "All selected tests pass."
+        },
+        {
+          "description": "Run GREEN hook tests.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-managed-worktree-guard.sh",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Run GREEN activation tests.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-git-authority-activation.sh",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Run GREEN Commander parity tests.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python -m pytest tests/test_workspace_activation_skill.py tests/test_activation_client_parity.py tests/test_worker_claude_md_template.py -q",
+          "expected": "All selected tests pass."
+        },
+        {
+          "description": "Run workspace typecheck.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx tsc --noEmit",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Run hook syntax checks.",
+          "command": "bash -n /Users/roberthyatt/Code/ironclaude/worker/hooks/workspace-path-adapter.sh",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Stage exact Task 2 paths.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f -- worker/mcp-servers/workspace-manager/src/effective-checkout.ts worker/mcp-servers/workspace-manager/src/__tests__/effective-checkout.test.ts worker/mcp-servers/workspace-manager/src/types.ts worker/mcp-servers/workspace-manager/src/db.ts worker/mcp-servers/workspace-manager/src/workspace-service.ts worker/mcp-servers/workspace-manager/src/git-authority.ts worker/mcp-servers/workspace-manager/src/index.ts worker/mcp-servers/workspace-manager/src/cli.ts worker/mcp-servers/workspace-manager/dist/cli.js worker/hooks/workspace-path-adapter.sh worker/hooks/state-activator.sh worker/hooks/session-init.sh worker/skills/activate-professional-mode/SKILL.md worker/skills/use-managed-worktree/SKILL.md commander/src/ironclaude/templates/worker_agents.md commander/src/ironclaude/templates/worker_claude_md.md worker/mcp-servers/workspace-manager/src/__tests__/db.test.ts worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts worker/mcp-servers/workspace-manager/src/__tests__/git-authority.test.ts worker/mcp-servers/workspace-manager/src/__tests__/cli.test.ts worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts worker/hooks/tests/test-managed-worktree-guard.sh worker/hooks/tests/test-git-authority-activation.sh commander/tests/test_workspace_activation_skill.py commander/tests/test_activation_client_parity.py commander/tests/test_worker_claude_md_template.py",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Validate Task 2 cached diff.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached --check",
+          "expected": "Exit zero."
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Reconcile stale and dirty assignments without operator mechanics",
+      "description": "Preserve every dirty state before rebuilding or synchronizing, reconcile clean and local-commit assignments, and retain existing integration authority.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/lifecycle-reconciler.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/lifecycle-reconciler.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/lifecycle-reconciler.mutation.test.ts",
+        "worker/mcp-servers/workspace-manager/src/types.ts",
+        "worker/mcp-servers/workspace-manager/src/git.ts",
+        "worker/mcp-servers/workspace-manager/src/integration.ts",
+        "worker/mcp-servers/workspace-manager/src/workspace-service.ts",
+        "worker/mcp-servers/workspace-manager/src/index.ts",
+        "worker/mcp-servers/workspace-manager/src/cli.ts",
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/src/__tests__/git.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/integration-core.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/integration-recovery.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/cli.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts"
+      ],
+      "depends_on": [
+        2
+      ],
+      "steps": [
+        {
+          "description": "Write RED freshness, clean-sync, clean-rebase, all-dirty-state preservation, recovery-ref, ignored-resource, conflict, race, replay, clean-recreation, and metadata-healing tests."
+        },
+        {
+          "description": "Run RED reconciliation tests.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test -- --run src/__tests__/lifecycle-reconciler.test.ts src/__tests__/lifecycle-reconciler.mutation.test.ts src/__tests__/git.test.ts src/__tests__/integration-core.test.ts src/__tests__/integration-recovery.test.ts src/__tests__/workspace-service.test.ts src/__tests__/cli.test.ts src/__tests__/tool-dispatch.test.ts",
+          "expected": "New dirty-preservation and clean-recreation cases fail."
+        },
+        {
+          "description": "Implement exact inventory, recovery commit/ref, clean managed-checkout recreation, synchronization outcomes, conflict restoration, and idempotent Git-before-DB healing."
+        },
+        {
+          "description": "Wire reconciler into activation/resume, public sync, managed return, Commander CLI, and pre-finalization without weakening existing gates."
+        },
+        {
+          "description": "Build current CLI before any CLI consumer runs.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run bundle:cli",
+          "expected": "Exit zero; dist/cli.js contains reconciliation routes."
+        },
+        {
+          "description": "Run GREEN reconciliation and executable mutation tests.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test -- --run src/__tests__/lifecycle-reconciler.test.ts src/__tests__/lifecycle-reconciler.mutation.test.ts src/__tests__/git.test.ts src/__tests__/integration-core.test.ts src/__tests__/integration-recovery.test.ts src/__tests__/workspace-service.test.ts src/__tests__/cli.test.ts src/__tests__/tool-dispatch.test.ts",
+          "expected": "All selected tests pass; CAS, recovery-ref, Git-before-DB, and rollback mutations are rejected."
+        },
+        {
+          "description": "Run workspace typecheck.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx tsc --noEmit",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Stage exact Task 3 paths.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f -- worker/mcp-servers/workspace-manager/src/lifecycle-reconciler.ts worker/mcp-servers/workspace-manager/src/__tests__/lifecycle-reconciler.test.ts worker/mcp-servers/workspace-manager/src/__tests__/lifecycle-reconciler.mutation.test.ts worker/mcp-servers/workspace-manager/src/types.ts worker/mcp-servers/workspace-manager/src/git.ts worker/mcp-servers/workspace-manager/src/integration.ts worker/mcp-servers/workspace-manager/src/workspace-service.ts worker/mcp-servers/workspace-manager/src/index.ts worker/mcp-servers/workspace-manager/src/cli.ts worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/src/__tests__/git.test.ts worker/mcp-servers/workspace-manager/src/__tests__/integration-core.test.ts worker/mcp-servers/workspace-manager/src/__tests__/integration-recovery.test.ts worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts worker/mcp-servers/workspace-manager/src/__tests__/cli.test.ts worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Validate Task 3 cached diff.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached --check",
+          "expected": "Exit zero."
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Add authorized discard and plan-scoped adoption",
+      "description": "Consume exact destructive authority, perform cleanup/sync internally, adopt task and planning paths authenticated from the active exact repository/session/lineage registration into managed assignments, and provide provider-native skill behavior.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/task-scope.ts",
+        "worker/mcp-servers/workspace-manager/src/managed-adoption.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/managed-adoption.test.ts",
+        "worker/skills/discard-managed-worktree/SKILL.md",
+        "worker/skills/discard-managed-worktree/test-scenarios/01-without-skill.md",
+        "worker/skills/discard-managed-worktree/test-scenarios/02-with-skill.md",
+        "worker/skills/discard-managed-worktree/test-scenarios/03-edge-cases.md",
+        "commander/tests/test_discard_managed_worktree_skill.py",
+        "commander/scripts/live_worktree_disposition_provider_response.py",
+        "commander/tests/test_live_worktree_disposition_provider_response.py",
+        "worker/mcp-servers/workspace-manager/src/types.ts",
+        "worker/mcp-servers/workspace-manager/src/db.ts",
+        "worker/mcp-servers/workspace-manager/src/hook-intent.ts",
+        "worker/mcp-servers/workspace-manager/src/workspace-service.ts",
+        "worker/mcp-servers/workspace-manager/src/lifecycle-reconciler.ts",
+        "worker/mcp-servers/workspace-manager/src/index.ts",
+        "worker/mcp-servers/workspace-manager/src/cli.ts",
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js",
+        "worker/mcp-servers/workspace-manager/src/__tests__/db.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/cli.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts",
+        "worker/hooks/state-activator.sh",
+        "worker/hooks/tests/test-git-authority-activation.sh",
+        "worker/hooks/tests/test-managed-worktree-guard.sh",
+        "worker/skills/use-managed-worktree/SKILL.md",
+        "worker/skills/executing-plans/SKILL.md",
+        "commander/tests/test_use_managed_worktree_skill.py",
+        "commander/tests/test_git_authority_skill_parity.py"
+      ],
+      "depends_on": [
+        3
+      ],
+      "steps": [
+        {
+          "description": "Write RED discard preview/authority/replay/drift, managed cleanup, authenticated scope, temporary-index adoption, entry-class, primary-index, overlap, and provider-parity tests; run writing-skills pressure scenarios."
+        },
+        {
+          "description": "Run RED workspace tests.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test -- --run src/__tests__/managed-adoption.test.ts src/__tests__/db.test.ts src/__tests__/workspace-service.test.ts src/__tests__/cli.test.ts src/__tests__/tool-dispatch.test.ts",
+          "expected": "New discard/adoption cases fail."
+        },
+        {
+          "description": "Run RED hook tests.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-git-authority-activation.sh",
+          "expected": "New discard-intent cases fail."
+        },
+        {
+          "description": "Run RED Commander skill tests.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python -m pytest tests/test_discard_managed_worktree_skill.py tests/test_use_managed_worktree_skill.py tests/test_git_authority_skill_parity.py tests/test_live_worktree_disposition_provider_response.py -q",
+          "expected": "New skill/provider assertions fail."
+        },
+        {
+          "description": "Implement exact discard authority, internal cleanup/sync, authenticated task scope, and temporary-index primary-to-managed adoption. Planning paths resolve only from the active exact repository/session/lineage registration; reject stale, foreign, replaced, or unregistered plan evidence."
+        },
+        {
+          "description": "Update skills so agents never hand back Git/worktree commands or reconfirm supplied authority."
+        },
+        {
+          "description": "Build current CLI before Commander consumers run.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run bundle:cli",
+          "expected": "Exit zero; dist/cli.js contains discard and adoption routes."
+        },
+        {
+          "description": "Build current hook-intent bundle before hook/provider consumers run.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run bundle:hook-intent",
+          "expected": "Exit zero; dist/hook-intent.js contains destructive-intent bindings."
+        },
+        {
+          "description": "Run GREEN workspace tests.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test -- --run src/__tests__/managed-adoption.test.ts src/__tests__/db.test.ts src/__tests__/workspace-service.test.ts src/__tests__/cli.test.ts src/__tests__/tool-dispatch.test.ts",
+          "expected": "All selected tests pass."
+        },
+        {
+          "description": "Run GREEN hook tests.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-git-authority-activation.sh",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Run GREEN Commander skill tests.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python -m pytest tests/test_discard_managed_worktree_skill.py tests/test_use_managed_worktree_skill.py tests/test_git_authority_skill_parity.py tests/test_live_worktree_disposition_provider_response.py -q",
+          "expected": "All selected tests pass."
+        },
+        {
+          "description": "Run workspace typecheck.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx tsc --noEmit",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Run fresh provider behavior acceptance.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python scripts/live_worktree_disposition_provider_response.py --client all --claude-model sonnet --claude-timeout 540 --codex-timeout 180",
+          "expected": "Claude and Codex choose exact IronClaude authority, no operator shell command, no redundant confirmation, and no PM activation request."
+        },
+        {
+          "description": "Stage exact Task 4 paths.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f -- worker/mcp-servers/workspace-manager/src/task-scope.ts worker/mcp-servers/workspace-manager/src/managed-adoption.ts worker/mcp-servers/workspace-manager/src/__tests__/managed-adoption.test.ts worker/skills/discard-managed-worktree/SKILL.md worker/skills/discard-managed-worktree/test-scenarios/01-without-skill.md worker/skills/discard-managed-worktree/test-scenarios/02-with-skill.md worker/skills/discard-managed-worktree/test-scenarios/03-edge-cases.md commander/tests/test_discard_managed_worktree_skill.py commander/scripts/live_worktree_disposition_provider_response.py commander/tests/test_live_worktree_disposition_provider_response.py worker/mcp-servers/workspace-manager/src/types.ts worker/mcp-servers/workspace-manager/src/db.ts worker/mcp-servers/workspace-manager/src/hook-intent.ts worker/mcp-servers/workspace-manager/src/workspace-service.ts worker/mcp-servers/workspace-manager/src/lifecycle-reconciler.ts worker/mcp-servers/workspace-manager/src/index.ts worker/mcp-servers/workspace-manager/src/cli.ts worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/hook-intent.js worker/mcp-servers/workspace-manager/src/__tests__/db.test.ts worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts worker/mcp-servers/workspace-manager/src/__tests__/cli.test.ts worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts worker/hooks/state-activator.sh worker/hooks/tests/test-git-authority-activation.sh worker/hooks/tests/test-managed-worktree-guard.sh worker/skills/use-managed-worktree/SKILL.md worker/skills/executing-plans/SKILL.md commander/tests/test_use_managed_worktree_skill.py commander/tests/test_git_authority_skill_parity.py",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Validate Task 4 cached diff.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached --check",
+          "expected": "Exit zero."
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Make Commander orchestrate the same lifecycle",
+      "description": "Drive automatic allocation, reconciliation, adoption, finalization, rescue, and cleanup through deployed no-push routes with Claude/Codex template parity.",
+      "allowed_files": [
+        "commander/src/ironclaude/workspace_client.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/src/ironclaude/main.py",
+        "commander/src/brain/system_prompt.md",
+        "commander/src/ironclaude/templates/worker_agents.md",
+        "commander/src/ironclaude/templates/worker_claude_md.md",
+        "commander/scripts/managed_worktree_live_acceptance.py",
+        "commander/tests/test_workspace_client.py",
+        "commander/tests/test_orchestrator_mcp.py",
+        "commander/tests/test_daemon.py",
+        "commander/tests/test_worker_finalize_release.py",
+        "commander/tests/test_worktree_reaper.py",
+        "commander/tests/test_worker_worktree_authority.py",
+        "commander/tests/test_managed_worktree_parity.py",
+        "commander/tests/test_managed_worktree_live_acceptance.py",
+        "commander/tests/test_worktree_lifecycle_mutations.py",
+        "commander/tests/test_brain_integration_recovery_wizard.py",
+        "commander/tests/test_worker_claude_md_template.py"
+      ],
+      "depends_on": [
+        4
+      ],
+      "steps": [
+        {
+          "description": "Write RED Commander allocation, stale/dirty dispatch, preservation, adoption, ownership, finalization, reaper, transport, template-parity, and no-manual-instruction tests."
+        },
+        {
+          "description": "Run RED Commander tests.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python -m pytest tests/test_workspace_client.py tests/test_orchestrator_mcp.py tests/test_daemon.py tests/test_worker_finalize_release.py tests/test_worktree_reaper.py tests/test_worker_worktree_authority.py tests/test_managed_worktree_parity.py tests/test_managed_worktree_live_acceptance.py tests/test_worktree_lifecycle_mutations.py tests/test_brain_integration_recovery_wizard.py tests/test_worker_claude_md_template.py -q",
+          "expected": "New orchestration and no-manual-instruction cases fail."
+        },
+        {
+          "description": "Implement no-push resolver/reconcile/disposition/adoption client routes, pre-dispatch and finalization orchestration, structured recovery state, protect-on-error reaping, and exact provider-template parity."
+        },
+        {
+          "description": "Extend live acceptance to exercise lifecycle operations through client-specific installed roots; version-only checks are insufficient."
+        },
+        {
+          "description": "Run GREEN Commander and executable mutation tests.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python -m pytest tests/test_workspace_client.py tests/test_orchestrator_mcp.py tests/test_daemon.py tests/test_worker_finalize_release.py tests/test_worktree_reaper.py tests/test_worker_worktree_authority.py tests/test_managed_worktree_parity.py tests/test_managed_worktree_live_acceptance.py tests/test_worktree_lifecycle_mutations.py tests/test_brain_integration_recovery_wizard.py tests/test_worker_claude_md_template.py -q",
+          "expected": "All selected tests pass; no-push, reaper protection, provider handback, and finalization mutations are rejected."
+        },
+        {
+          "description": "Run focused real-Git acceptance.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python -m pytest tests/test_managed_worktree_live_acceptance.py -q",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Stage exact Task 5 paths.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -- commander/src/ironclaude/workspace_client.py commander/src/ironclaude/orchestrator_mcp.py commander/src/ironclaude/main.py commander/src/brain/system_prompt.md commander/src/ironclaude/templates/worker_agents.md commander/src/ironclaude/templates/worker_claude_md.md commander/scripts/managed_worktree_live_acceptance.py commander/tests/test_workspace_client.py commander/tests/test_orchestrator_mcp.py commander/tests/test_daemon.py commander/tests/test_worker_finalize_release.py commander/tests/test_worktree_reaper.py commander/tests/test_worker_worktree_authority.py commander/tests/test_managed_worktree_parity.py commander/tests/test_managed_worktree_live_acceptance.py commander/tests/test_worktree_lifecycle_mutations.py commander/tests/test_brain_integration_recovery_wizard.py commander/tests/test_worker_claude_md_template.py",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Validate Task 5 cached diff.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached --check",
+          "expected": "Exit zero."
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "name": "Build and review the final release candidate",
+      "description": "Document behavior, make the repository suite include state-manager, build four tracked bundles, verify the repository, replace the final cachebuster, record the complete runtime oracle, and earn A/B before installation.",
+      "allowed_files": [
+        "Makefile",
+        "README.md",
+        "CHANGELOG.md",
+        "worker/.codex-plugin/plugin.json",
+        "worker/mcp-servers/state-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js"
+      ],
+      "depends_on": [
+        5
+      ],
+      "steps": [
+        {
+          "description": "Document automatic allocation, shared authority, preservation, discard, adoption, Commander behavior, plan-artifact receipts/index escrow, PM-off bypass, and push boundaries; add test-state-manager to Makefile test aggregation."
+        },
+        {
+          "description": "Build state-manager.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm run build",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Build workspace-manager.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Run focused state-manager verification.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm test -- --run src/__tests__/plan-artifacts.test.ts src/__tests__/plan-artifacts.mutation.test.ts src/__tests__/review-receipts.test.ts src/__tests__/workflow-transition-idempotency.test.ts src/tools/write-tools.test.ts src/tools/write-tools.tier-up.test.ts",
+          "expected": "All selected tests pass."
+        },
+        {
+          "description": "Run focused workspace verification.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test -- --run src/__tests__/db.test.ts src/__tests__/effective-checkout.test.ts src/__tests__/lifecycle-reconciler.test.ts src/__tests__/lifecycle-reconciler.mutation.test.ts src/__tests__/managed-adoption.test.ts src/__tests__/workspace-service.test.ts src/__tests__/git-authority.test.ts src/__tests__/integration-core.test.ts src/__tests__/integration-recovery.test.ts src/__tests__/cli.test.ts src/__tests__/tool-dispatch.test.ts",
+          "expected": "All selected tests pass."
+        },
+        {
+          "description": "Run focused hook verification.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-managed-worktree-guard.sh",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Run focused authority-hook verification.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-git-authority-activation.sh",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Run focused Commander verification.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python -m pytest tests/test_workspace_client.py tests/test_orchestrator_mcp.py tests/test_daemon.py tests/test_worker_finalize_release.py tests/test_worktree_reaper.py tests/test_worker_worktree_authority.py tests/test_managed_worktree_parity.py tests/test_managed_worktree_live_acceptance.py tests/test_worktree_lifecycle_mutations.py tests/test_discard_managed_worktree_skill.py tests/test_live_worktree_disposition_provider_response.py tests/test_worker_claude_md_template.py -q",
+          "expected": "All selected tests pass."
+        },
+        {
+          "description": "Run provider-native disposition verification.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python scripts/live_worktree_disposition_provider_response.py --client all --claude-model sonnet --claude-timeout 540 --codex-timeout 180",
+          "expected": "Both providers return exact accepted behavior."
+        },
+        {
+          "description": "Run complete repository suite once, including state-manager.",
+          "command": "make -C /Users/roberthyatt/Code/ironclaude test",
+          "expected": "Exit zero with complete state-manager, hook, workspace-manager, and Commander suites; at most one justified repetition after deterministic repair."
+        },
+        {
+          "description": "Replace final Codex cachebuster exactly once.",
+          "command": "/usr/bin/python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/update_plugin_cachebuster.py /Users/roberthyatt/Code/ironclaude/worker",
+          "expected": "Base remains 1.1.6 and one final Codex suffix replaces the Task 1 bootstrap suffix."
+        },
+        {
+          "description": "Rebuild final state-manager bytes.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm run build",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Rebuild final workspace-manager bytes.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Validate plugin.",
+          "command": "/usr/bin/python3 /Users/roberthyatt/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py /Users/roberthyatt/Code/ironclaude/worker",
+          "expected": "Plugin validation passed."
+        },
+        {
+          "description": "Run version consistency.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python -m pytest tests/test_version_consistency.py -q",
+          "expected": "All tests pass."
+        },
+        {
+          "description": "Write measured two-client runtime oracle with exact plugin roots, manifest, and four bundle hashes.",
+          "command": "/usr/bin/python3 -c 'import hashlib,json,pathlib; source=pathlib.Path(\"/Users/roberthyatt/Code/ironclaude/worker\"); shared=[\"mcp-servers/state-manager/dist/index.js\",\"mcp-servers/workspace-manager/dist/index.js\",\"mcp-servers/workspace-manager/dist/cli.js\",\"mcp-servers/workspace-manager/dist/hook-intent.js\"]; manifests={\"claude\":\".claude-plugin/plugin.json\",\"codex\":\".codex-plugin/plugin.json\"}; versions={c:json.loads((source/m).read_text())[\"version\"] for c,m in manifests.items()}; roots={\"claude\":\"/Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.6\",\"codex\":\"/Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/\"+versions[\"codex\"]}; digest=lambda p:hashlib.sha256((source/p).read_bytes()).hexdigest(); out={\"expected_runtime\":{c:{\"client\":c,\"plugin_version\":versions[c],\"plugin_root\":roots[c],\"manifest_sha256\":digest(m),\"state_manager_bundle_sha256\":digest(shared[0]),\"workspace_manager_bundle_sha256\":digest(shared[1]),\"workspace_manager_cli_sha256\":digest(shared[2]),\"workspace_manager_hook_intent_sha256\":digest(shared[3])} for c,m in manifests.items()}}; p=pathlib.Path(\"/private/tmp/operator-free-worktree-expected-runtime.json\"); p.write_text(json.dumps(out,sort_keys=True)+\"\\n\"); print(p.read_text(),end=\"\")'",
+          "expected": "Printed JSON contains complete eight-field Claude/Codex expectations, including exact deterministic plugin roots."
+        },
+        {
+          "description": "Verify source manifests and bundles equal the complete runtime oracle before uninstall.",
+          "command": "/usr/bin/python3 -c 'import hashlib,json,pathlib; source=pathlib.Path(\"/Users/roberthyatt/Code/ironclaude/worker\"); data=json.loads(pathlib.Path(\"/private/tmp/operator-free-worktree-expected-runtime.json\").read_text())[\"expected_runtime\"]; manifests={\"claude\":\".claude-plugin/plugin.json\",\"codex\":\".codex-plugin/plugin.json\"}; bundles={\"state_manager_bundle_sha256\":\"mcp-servers/state-manager/dist/index.js\",\"workspace_manager_bundle_sha256\":\"mcp-servers/workspace-manager/dist/index.js\",\"workspace_manager_cli_sha256\":\"mcp-servers/workspace-manager/dist/cli.js\",\"workspace_manager_hook_intent_sha256\":\"mcp-servers/workspace-manager/dist/hook-intent.js\"}; digest=lambda p:hashlib.sha256((source/p).read_bytes()).hexdigest(); [(lambda e,c: (_ for _ in ()).throw(AssertionError(f\"runtime oracle drift: {c}\")) if e else None)(data[c][\"manifest_sha256\"] != digest(manifests[c]) or any(data[c][k] != digest(p) for k,p in bundles.items()),c) for c in data]'",
+          "expected": "Exit zero; both clients' source bytes equal oracle digests."
+        },
+        {
+          "description": "Stage release Makefile, documentation, and manifest.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -- Makefile README.md CHANGELOG.md worker/.codex-plugin/plugin.json",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Force-stage four tracked generated bundles.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f -- worker/mcp-servers/state-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/hook-intent.js",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Validate Task 6 cached diff.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached --check",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Record typed release-candidate evidence before Task 6 submission.",
+          "expected": "Call record_task_evidence with repository_path=/Users/roberthyatt/Code/ironclaude, task_id=6, evidence_kind=release_candidate, evidence_path=/private/tmp/operator-free-worktree-expected-runtime.json; server stores exact oracle digest and release-candidate bindings."
+        },
+        {
+          "description": "Submit Task 6 and complete task-boundary review before installation.",
+          "expected": "Grade A or B; source release candidate becomes immutable."
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "name": "Reinstall last and prove provider-native runtime behavior",
+      "description": "Use only Task 6 reviewed evidence, reinstall Claude and Codex as the final runtime mutation, and prove installed behavior from fresh provider-native sessions without source write authority.",
+      "evidence_only": true,
+      "allowed_files": [
+        "ironclaude://evidence-only"
+      ],
+      "evidence_files": [
+        "worker/.codex-plugin/plugin.json",
+        "worker/mcp-servers/state-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js",
+        "/private/tmp/operator-free-worktree-expected-runtime.json"
+      ],
+      "depends_on": [
+        6
+      ],
+      "steps": [
+        {
+          "description": "Verify Task 6 A/B receipt and typed release-candidate evidence before installation.",
+          "expected": "Call verify_evidence_receipt with repository_path=/Users/roberthyatt/Code/ironclaude, source_task_id=6, evidence_kind=release_candidate, evidence_path=/private/tmp/operator-free-worktree-expected-runtime.json; exact reviewed tree and oracle digest match. No pre-install diagnostics claim installed final bytes."
+        },
+        {
+          "description": "Verify delayed restart helper exists.",
+          "command": "test -f /private/tmp/restart_codex.py",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Verify delayed restart helper hash fail-closed.",
+          "command": "/usr/bin/python3 -c 'import hashlib,pathlib; p=pathlib.Path(\"/private/tmp/restart_codex.py\"); expected=\"d09cc042bdac54f8fb87eb1a021724fe28b42b355690bdd97999fa2a8a16c38f\"; actual=hashlib.sha256(p.read_bytes()).hexdigest(); assert actual == expected, f\"restart helper hash mismatch: {actual}\"'",
+          "expected": "Exit zero; exact preapproved SHA-256 matched."
+        },
+        {
+          "description": "Uninstall Claude user plugin.",
+          "command": "claude plugin uninstall ironclaude@ironclaude --scope user --keep-data --yes",
+          "expected": "Exit zero."
+        },
+        {
+          "description": "Install Claude user plugin.",
+          "command": "claude plugin install ironclaude@ironclaude --scope user",
+          "expected": "Claude installs base 1.1.6."
+        },
+        {
+          "description": "Launch verified delayed restart helper.",
+          "command": "/usr/bin/python3 -c 'import subprocess; subprocess.Popen([\"/usr/bin/python3\",\"/private/tmp/restart_codex.py\"],start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)'",
+          "expected": "Exit zero; restart scheduled without source mutation."
+        },
+        {
+          "description": "Install Codex plugin as final mutation.",
+          "command": "codex plugin add ironclaude@ironclaude --json",
+          "expected": "Codex installs exact oracle cachebuster."
+        },
+        {
+          "description": "After restart, run installed-root, version, manifest, four-bundle, diagnostics, session, and Task 7 proof against typed Task 6 evidence.",
+          "expected": "run_diagnostics receives each exact client expected_runtime object from the sealed oracle; all observations equal Task 6 evidence."
+        },
+        {
+          "description": "Run fresh Claude provider-native disposable-repository acceptance.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python scripts/managed_worktree_live_acceptance.py --client claude --provider-native --runtime-oracle /private/tmp/operator-free-worktree-expected-runtime.json --claude-model sonnet --claude-timeout 540 --codex-timeout 180",
+          "expected": "Only isolated disposable repositories and databases are mutated; roots cannot overlap source, installed roots, live databases, assignments, or real refs. PM-on auto-allocates managed root and emits no operator worktree/index handback or redundant confirmation."
+        },
+        {
+          "description": "Run fresh Codex provider-native disposable-repository acceptance.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python scripts/managed_worktree_live_acceptance.py --client codex --provider-native --runtime-oracle /private/tmp/operator-free-worktree-expected-runtime.json --claude-model sonnet --claude-timeout 540 --codex-timeout 180",
+          "expected": "Only isolated disposable repositories and databases are mutated; roots cannot overlap source, installed roots, live databases, assignments, or real refs. PM-on auto-allocates managed root and emits no operator worktree/index handback or redundant confirmation."
+        },
+        {
+          "description": "Reverify Task 6 reviewed release evidence after acceptance.",
+          "expected": "verify_evidence_receipt returns same receipt, tree, oracle digest, install receipts, diagnostics, provider/model/timeouts, sandbox roots, behavior results, and protected-state non-mutation proof."
+        },
+        {
+          "description": "Submit Task 7 and run task-boundary review.",
+          "expected": "A/B or explicit non-repairable post-install blocker; no later source/build/cachebuster/install/commit/push."
+        }
+      ]
+    }
+  ]
+}

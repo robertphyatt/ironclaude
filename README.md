@@ -15,6 +15,17 @@ You can use the Worker alone for single-session discipline, or add the Commander
 
 ---
 
+## What's New in v1.1.6
+
+- **Human-controlled git, end to end.** New human-only lanes for an unassigned primary checkout — `/commit`, `/push` (ff-only, `--force-with-lease`), and `/commit-and-push` — plus a new `/reconcile` verb that integrates a managed worktree into local `main` and *keeps the worktree alive* for continued work (publishing stays the separate `/push`). Each lane mints single-use authority from your typed command; the model issues the call but can never supply the authority that makes it succeed.
+- **The managed-worktree leak is closed — without losing work.** A reaper reclaims leaked worktree assignments and preserves any reviewed work on a recovery ref, and professional-mode kill-switch invariants guarantee a human is never blocked and that professional-mode-off means no enforcement. Smaller fixes land alongside: a stash-pop no longer un-stages prior tasks, a legacy NULL-guid row no longer crashes the workspace-manager CLI, and Codex Desktop's `/deactivate` and `/commit` gates fire again.
+- **The daemon's worktree auto-recovery is redesigned probe-first — it never mints an empty commit, strands the integration lock, or completes a worker it shouldn't.** `_finalize_and_release_worker` runs a non-mutating status probe *before* anything that can mint, so a frozen/drifted/paused/already-integrated worktree is recovered without re-entering the branch that used to mint an empty commit every cycle; the interrupted-CAS state releases the repo-wide lock instead of stranding it; and a fail-closed abandon guard refuses to remove anything but an active worktree.
+- **The daemon completes nothing — the orchestrator seam owns all completion, and never completes a live worker.** A managed worker is never marked "completed" on a transient error (its reviewed work is preserved for retry), a *live* idle worker whose work integrated stays under monitoring instead of being dropped as a zombie, and a drift held past the retry cap raises a one-time operator alert. The dead-session surface no longer reports "Worker Completed" for a worker it deliberately left preserved-but-uncompleted.
+- **Opus 4.8 still recommended over Opus 5.** Every internal Opus-tier string resolves to `claude-opus-4-8`; see [Model Configuration](#model-configuration).
+- See [CHANGELOG.md](CHANGELOG.md) for full details.
+
+---
+
 ## What's New in v1.1.5
 
 - **Managed worktrees recover themselves — no external terminal, ever.** Finalize checks for a clean tree before it freezes, recycles the worktree in place so the cwd, GUID, and branch survive across sequential commits, and — when a finalize is interrupted and an assignment freezes at `ready_for_integration` — a new ownership-gated `reconcile_finalization` command completes or aborts the bookkeeping in-session, with no fresh human intent and no sqlite surgery. Stale checkout locks auto-reap with live-owner heartbeats, and integration recovery (deferred cleanup, content-changing rebase resolutions) is completed end-to-end.

@@ -12,6 +12,10 @@ import os
 import re
 
 from ironclaude import paths
+from ironclaude.communication_profiles import (
+    CommunicationProfileError,
+    apply_communication_profile,
+)
 from ironclaude.ollama_client import OllamaClient, OllamaError
 
 logger = logging.getLogger(__name__)
@@ -77,11 +81,19 @@ class LocalGrader:
         Returns parsed JSON dict on success, or
         {"infrastructure_error": True, "error_detail": "..."} on failure.
         """
+        # IRONCLAUDE_LLM_PATH: local_grader
+        try:
+            profiled_system_prompt = apply_communication_profile(
+                "local_grader", system_prompt
+            )
+        except CommunicationProfileError as exc:
+            return self._build_infrastructure_error(str(exc))
+
         client = self._get_client()
         model = self._cfg.get("model", _DEFAULT_MODEL)
         payload: dict = {
             "model": model,
-            "prompt": f"{system_prompt}\n\n{user_prompt}",
+            "prompt": f"{profiled_system_prompt}\n\n{user_prompt}",
             "stream": False,
             "options": {"temperature": 0.1, "num_predict": -1},
         }

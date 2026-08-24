@@ -61,9 +61,10 @@ def test_surfaces_nonzero_and_stderr_without_parsing(tmp_path: Path):
 
 def test_exposes_only_no_push_lifecycle_methods(tmp_path: Path):
     client = WorkspaceClient(tmp_path, runner=Mock(return_value=completed()))
-    assert {name for name in ("allocate", "bind", "finalize", "abandon", "reconcile") if hasattr(client, name)} == {
-        "allocate", "bind", "finalize", "abandon", "reconcile"
-    }
+    assert {
+        name for name in ("allocate", "bind", "finalize", "abandon", "reconcile", "cleanup", "sync")
+        if hasattr(client, name)
+    } == {"allocate", "bind", "finalize", "abandon", "reconcile", "cleanup", "sync"}
     assert not hasattr(client, "push")
     with pytest.raises(WorkspaceClientError, match="not allowed"):
         client._invoke("push", {})
@@ -72,10 +73,89 @@ def test_exposes_only_no_push_lifecycle_methods(tmp_path: Path):
 def test_each_public_method_uses_its_exact_internal_command(tmp_path: Path):
     runner = Mock(return_value=completed())
     client = WorkspaceClient(tmp_path, runner=runner)
-    for name in ("allocate", "bind", "finalize", "abandon", "reconcile"):
+    for name in ("allocate", "bind", "finalize", "abandon", "reconcile", "cleanup", "sync"):
         getattr(client, name)({"marker": name})
         assert runner.call_args.args[0][2] == name
         assert json.loads(runner.call_args.args[0][3]) == {"marker": name}
+
+
+def test_cleanup_forwards_payload_into_cli_argv(tmp_path: Path):
+    runner = Mock(return_value=completed('{"state":"cleaned"}\n'))
+    client = WorkspaceClient(tmp_path, runner=runner)
+    payload = {
+        "repository_path": "/repo",
+        "workspace_guid": "22222222-2222-4222-8222-222222222222",
+        "owner_session_id": "11111111-1111-4111-8111-111111111111",
+    }
+
+    assert client.cleanup(payload) == {"state": "cleaned"}
+    argv = runner.call_args.args[0]
+    assert argv[:3] == [
+        "node",
+        str(tmp_path / "mcp-servers/workspace-manager/dist/cli.js"),
+        "cleanup",
+    ]
+    assert json.loads(argv[3]) == payload
+
+
+def test_reap_forwards_payload_into_cli_argv(tmp_path: Path):
+    runner = Mock(return_value=completed('{"state":"released"}\n'))
+    client = WorkspaceClient(tmp_path, runner=runner)
+    payload = {
+        "repository_path": "/repo",
+        "workspace_guid": "22222222-2222-4222-8222-222222222222",
+    }
+
+    assert client.reap(payload) == {"state": "released"}
+    argv = runner.call_args.args[0]
+    assert argv[:3] == [
+        "node",
+        str(tmp_path / "mcp-servers/workspace-manager/dist/cli.js"),
+        "reap",
+    ]
+    assert json.loads(argv[3]) == payload
+
+
+def test_sync_forwards_payload_into_cli_argv(tmp_path: Path):
+    runner = Mock(return_value=completed('{"state":"fast-forwarded"}\n'))
+    client = WorkspaceClient(tmp_path, runner=runner)
+    payload = {
+        "repository_path": "/repo",
+        "workspace_guid": "22222222-2222-4222-8222-222222222222",
+        "owner_session_id": "11111111-1111-4111-8111-111111111111",
+    }
+
+    assert client.sync(payload) == {"state": "fast-forwarded"}
+    argv = runner.call_args.args[0]
+    assert argv[:3] == [
+        "node",
+        str(tmp_path / "mcp-servers/workspace-manager/dist/cli.js"),
+        "sync",
+    ]
+    assert json.loads(argv[3]) == payload
+
+
+def test_cleanup_remote_builds_ssh_argv_against_remote_plugin_root(tmp_path: Path):
+    ssh = Mock()
+    ssh.run_argv.return_value = completed('{"state":"cleaned"}\n')
+    client = WorkspaceClient(tmp_path, runner=Mock(), ssh_manager=ssh)
+    payload = {
+        "repository_path": "/srv/repo",
+        "workspace_guid": "22222222-2222-4222-8222-222222222222",
+        "owner_session_id": "11111111-1111-4111-8111-111111111111",
+    }
+
+    assert client.cleanup(
+        payload, ssh_host="worker-host", remote_plugin_root="/opt/iron claude",
+    ) == {"state": "cleaned"}
+    host, argv = ssh.run_argv.call_args.args
+    assert host == "worker-host"
+    assert argv[:3] == [
+        "node",
+        "/opt/iron claude/mcp-servers/workspace-manager/dist/cli.js",
+        "cleanup",
+    ]
+    assert json.loads(argv[3]) == payload
 
 
 def test_worktree_authority_workspace_client_calls_private_finalize_outside_ai_hook(

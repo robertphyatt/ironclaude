@@ -10,6 +10,85 @@
 > `vX.Y.Z`. Land changes under `## [Unreleased]` as you go, then rename that
 > heading to the new version at release time so the entry matches what shipped.
 
+## 1.1.6: human-controlled git lifecycle, never-lose-work worktree reaping, and probe-first daemon finalize-recovery
+
+- Human-controlled git lifecycle — commit, push, commit-and-push, and the new `/reconcile` verb.
+  The human-only authority surface gains an unassigned-primary-checkout commit lane, a `/push`
+  lane (ff-only, `--force-with-lease`, no worktree envelope required), and a `/commit-and-push`
+  lane (commit-then-push, ff-only); plus a new `/reconcile` verb that integrates a managed
+  worktree's current HEAD into local `main` and *keeps the worktree alive* for continued work — it
+  never pushes, since publishing stays the separate `/push`. Every lane mints single-use authority
+  from the operator's typed command: the model issues the call but cannot supply the authority
+  that makes it succeed.
+- The managed-worktree leak is closed with never-lose-work reaping. A reaper reclaims leaked
+  worktree assignments while preserving any reviewed work on a recovery ref, so a dead or stranded
+  worker's output is never silently dropped.
+- Professional-mode kill-switch invariants are enforced structurally: (A) a human is never
+  blocked, and (B) professional-mode-off means no enforcement — explicit operator instructions,
+  raw Git included, run as direct requests.
+- The plan-review budget is bound to the operator's effort, closing a retreat backdoor that could
+  launder a fresh review out of a mid-execution retreat.
+- Recipient-based communication profiles and overlap-safe finalization. Communication is selected
+  by destination (human-facing vs. AI-to-AI), and finalization is hardened against overlapping
+  primary checkouts.
+- Fixes. A stash-pop no longer un-stages prior tasks — cumulative `allowed_files` are re-staged at
+  `execution_complete`; the workspace-manager v2 migration is NULL-tolerant, so a legacy
+  NULL-guid `human_intents` row no longer crashes every CLI call; the Codex deactivate/commit hook
+  gates fire again after Codex Desktop's trailing HTML space-entities (`&#x20;`) are stripped in
+  `state-activator`; a bare `cd` is whitelisted in the read-only bash allowlist so cwd drift is
+  self-correctable at any stage; and `WORKER_DEAD` logs once per dead worker instead of every poll
+  cycle.
+
+- The Commander daemon's worktree auto-integration/recovery control flow is redesigned
+  probe-first, closing the recovery-hardening the v1.1.5 "known follow-up" deferred.
+  `_finalize_and_release_worker` runs the non-mutating status probe FIRST and routes by
+  lifecycle state, so the mint-capable finalize is structurally unreachable unless the worker
+  is active (`not-ready`): a frozen, drifted, paused-rebase, or already-integrated worktree is
+  recovered without ever re-entering the `isRepair` branch that used to mint an empty commit on
+  the integration target every cycle and then poison both recovery modes. A frozen-drift is
+  recovered by a plain reconcile — the daemon `rerebase` fallback is deleted; `rerebase` stays
+  operator-only via `recover_worker_integration`.
+- The daemon never strands the repo-wide integration lock. The interrupted-CAS state — a crash
+  between the target-ref update and the mark-integrated write, which returns "no new work"
+  without raising — is routed to the plain reconcile that releases the lock in its `finally`,
+  never to abandon-rescue. A fail-closed lifecycle guard in `_abandon_rescue_worker` refuses to
+  abandon anything but a `not-ready` worktree (any mid-finalization or probe-failed state is
+  preserved and surfaced, never removed), so no caller can strand the lock even if the router is
+  bypassed. A real-git regression test pins that a plain reconcile on the interrupted-CAS state
+  both integrates the work and deletes the lock row.
+- The daemon completes NOTHING; the orchestrator seam owns all completion. The three `main.py`
+  completed-flips are removed, and the session-died, stuck-kill, and idle finalize sites route
+  their outcome through one unified recovery driver that switches on the recovery mode (drift →
+  capped plain reconcile; conflict/repair → surface once; transient → leave the worker running to
+  retry). A managed worker is never completed on a transient authority/probe/None error — its
+  reviewed work stays preserved for a later retry rather than being marked done and stranded;
+  `kill_worker` completes nothing itself and uses a positive no-failure predicate; and
+  `worker_finished` fires only on an actual completion (a registry re-read), and the idle
+  (still-alive) outcome that was previously discarded is now captured and driven.
+- Never complete a LIVE worker. A shared `_complete_worker_if_session_dead` gate fronts every
+  "the work already landed" completion site — the probe router's integrated branch, the driven
+  paused-rebase `continue`, the drift-success seam, and the classifier's integrated branch —
+  completing a worker only when its tmux session is confirmed dead. A live idle worker whose work
+  integrated is left running under monitoring instead of being dropped as "completed" (the
+  zombie/stranded-work class this epic exists to close). A dead worker that never had a managed
+  worktree completes in the seam; the gate fails safe — a missing or ambiguous session never
+  completes.
+- The dead-session operator surface is accurate. The daemon no longer posts "Worker Completed"
+  for a worker it deliberately left uncompleted (drift/transient/held, work preserved); it posts
+  an explicit "work preserved, NOT completed — may need operator attention" message instead, and
+  a drift that stays unresolved past the retry cap now raises a one-time "held — needs operator
+  help" alert instead of holding silently.
+- Verification. The redesign landed through the professional-mode workflow with per-task review
+  gates across three fix lineages, each cleared by a blind tier-up plan review, and the full
+  staged diff was cleared by a blind Fable end-review that came back SOLID after two earlier
+  rounds caught and fixed a live-worker-completion Critical and a false-"completed"-surface
+  Important. Commander tests: `test_daemon` 261, `test_worker_finalize_release` 52,
+  `test_orchestrator_mcp` 690; workspace-manager integration 60 — all green on this tree.
+- Known follow-up. Two operator-invoked completion paths (`commit_worker`,
+  `recover_worker_integration`) that are never daemon-reachable are intentionally left outside
+  this release's live-worker gate; converging them onto the shared session-dead gate is tracked
+  for a later loop.
+
 ## 1.1.5: self-recovering managed worktrees, Opus 4.8 pinning, Codex grader diagnostics
 
 - Managed worktrees now recover themselves in-session — no external terminal, ever. Finalize

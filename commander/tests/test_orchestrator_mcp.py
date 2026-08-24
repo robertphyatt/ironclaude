@@ -33,6 +33,7 @@ from ironclaude.slack_interface import SlackBot
 from ironclaude.ollama_client import OllamaError
 from ironclaude.provider_router import ProviderHandle, NoCapabilityAvailable
 from ironclaude.workspace_client import WorkspaceClientError
+from ironclaude.communication_profiles import CommunicationProfileError, PROFILE_READY_MARKER
 
 _REAL_ENSURE_WORKER_INSTRUCTIONS = OrchestratorTools._ensure_worker_instructions
 _REAL_SET_PM = OrchestratorTools._set_pm_via_sqlite
@@ -109,6 +110,11 @@ def mock_tmux():
     tmux.capture_pane.return_value = ""
     tmux.get_log_path.return_value = "/tmp/ic-logs/ic-test.log"
     tmux.read_log_tail.return_value = "ironclaude v1.0.33\n"
+    # Interactive profile dispatch records an offset, then only accepts a
+    # marker appended after its own invocation. Unit defaults model that fresh
+    # append so unrelated lifecycle tests do not spend 30 seconds polling.
+    tmux.get_log_size.return_value = 128
+    tmux.read_log_since.return_value = f"{PROFILE_READY_MARKER}\n"
     tmux.list_pane_pid.return_value = None
     return tmux
 
@@ -507,7 +513,9 @@ class TestSingleWorkerManagedWorktree:
         )
 
         assert isinstance(result, str)
-        assert order == ["allocate", "spawn", "identity", "bind", "dispatch"]
+        assert order == [
+            "allocate", "spawn", "identity", "bind", "dispatch", "dispatch",
+        ]
         assignment = workspace.allocate.return_value
         spawned = mock_tmux.spawn_session.call_args
         assert spawned.kwargs["cwd"].startswith("/tmp/repo/.ironclaude/worktrees/")
@@ -536,7 +544,9 @@ class TestSingleWorkerManagedWorktree:
         elif phase == "bind":
             workspace.bind.side_effect = RuntimeError("bind failed")
         else:
-            mock_tmux.send_keys.return_value = False
+            # Profile delivery succeeds; only objective delivery fails after
+            # registry persistence, preserving this legacy failure contract.
+            mock_tmux.send_keys.side_effect = [True, False]
 
         result = tools.spawn_worker(
             worker_id=f"w-{phase}", worker_type="claude-sonnet",
@@ -1261,7 +1271,7 @@ class TestRemoteProviderLaunching:
         )
         tools._ensure_worker_instructions_remote = MagicMock(return_value=None)
         tools._ensure_worker_trusted_remote = MagicMock()
-        tools._wait_for_ready = MagicMock(side_effect=[False, True])
+        tools._wait_for_ready = MagicMock(side_effect=[False, True, True])
         tools._activate_pm_remote = MagicMock(return_value=_VALID_NATIVE_UUID)
         mock_tmux.has_session.return_value = False
         _mock_grader_approve(tools)
@@ -1286,8 +1296,9 @@ class TestRemoteProviderLaunching:
             ("claude-opus", machine),
         ]
         assert [call.kwargs["client"] for call in tools._wait_for_ready.call_args_list] == [
-            "claude", "codex",
+            "claude", "codex", "codex",
         ]
+        assert tools._wait_for_ready.call_args_list[-1].kwargs["marker"] == PROFILE_READY_MARKER
         tools._activate_pm_remote.assert_called_once_with(
             "ic-w-retry", "ssh-remote", client="codex",
         )
@@ -1332,12 +1343,17 @@ class TestRemoteProviderLaunching:
         sent = [call.args[1] for call in mock_tmux.send_keys.call_args_list]
         if client == "claude":
             assert sent == [
+                "/write-lossless-ai-messages",
                 "/advisor opus",
                 "/goal the assigned objective is complete and code review has passed",
                 "Only objective",
             ]
         else:
-            assert sent == [_CODEX_ADVISOR_INSTRUCTION, "Only objective"]
+            assert sent == [
+                "$ironclaude:write-lossless-ai-messages",
+                _CODEX_ADVISOR_INSTRUCTION,
+                "Only objective",
+            ]
             # The property this test exists to guard: no Claude slash command
             # reaches codex. The advisor text is not one.
             assert not any(message.startswith("/") for message in sent)
@@ -1367,7 +1383,7 @@ class TestRemoteProviderLaunching:
             )
 
         sent = [call.args[1] for call in mock_tmux.send_keys.call_args_list]
-        assert sent == ["Only objective"]
+        assert sent == ["$ironclaude:write-lossless-ai-messages", "Only objective"]
 
 
 class TestSpawnWorker:
@@ -1412,6 +1428,34 @@ class TestSpawnWorker:
                 repo="/tmp/repo",
                 objective="Do something",
             )
+
+    def test_missing_lossless_skill_cleans_single_worker_before_objective(
+        self, tools, registry, mock_tmux, monkeypatch,
+    ):
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle(
+            client="claude", model="sonnet",
+        ))
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        monkeypatch.setattr(
+            "ironclaude.orchestrator_mcp.skill_invocation",
+            MagicMock(side_effect=CommunicationProfileError("missing skill")),
+        )
+
+        result = tools.spawn_worker(
+            worker_id="w-profile-missing", worker_type="claude-sonnet",
+            repo="/tmp/repo", objective="must not dispatch",
+        )
+
+        assert result["failure_phase"] == "dispatch"
+        assert result["assignment_preserved"] is True
+        mock_tmux.kill_session.assert_called_once_with(
+            "ic-w-profile-missing", ssh_host=None,
+        )
+        assert "must not dispatch" not in [
+            call.args[1] for call in mock_tmux.send_keys.call_args_list
+        ]
+        assert registry.get_worker("w-profile-missing") is None
 
     def test_spawn_worker_ollama_singleton(self, tools, mock_tmux):
         """Second ollama worker is rejected when slot occupied."""
@@ -2333,7 +2377,7 @@ class TestFableAvailabilityIntegration:
         mock_tmux.has_session.return_value = False
         mock_tmux.read_log_tail.return_value = "fable binary crashed\n"
 
-        with patch.object(tools, "_wait_for_ready", side_effect=[False, True]):
+        with patch.object(tools, "_wait_for_ready", side_effect=[False, True, True]):
             result = tools.spawn_worker(
                 worker_id="w-fable-death",
                 worker_type="claude-fable",
@@ -2377,7 +2421,7 @@ class TestFableAvailabilityIntegration:
         mock_tmux.has_session.return_value = False
         mock_tmux.read_log_tail.return_value = "fable binary crashed\n"
 
-        with patch.object(tools, "_wait_for_ready", side_effect=[False, True, True]):
+        with patch.object(tools, "_wait_for_ready", side_effect=[False, True, True, True, True]):
             result1 = tools.spawn_worker(
                 worker_id="w-fable-death-1",
                 worker_type="claude-fable",
@@ -2459,7 +2503,7 @@ class TestFableAvailabilityIntegration:
         mock_tmux.has_session.return_value = False
         mock_tmux.read_log_tail.return_value = "fable binary crashed\n"
 
-        with patch.object(tools, "_wait_for_ready", side_effect=[False, True]):
+        with patch.object(tools, "_wait_for_ready", side_effect=[False, True, True]):
             result = tools.spawn_worker(
                 worker_id="w-fable-write-failed",
                 worker_type="claude-fable",
@@ -2606,7 +2650,7 @@ class TestFableAvailabilityIntegration:
         mock_tmux.has_session.return_value = False
         mock_tmux.read_log_tail.return_value = "fable binary crashed\n"
 
-        with patch.object(tools, "_wait_for_ready", side_effect=[False, True]):
+        with patch.object(tools, "_wait_for_ready", side_effect=[False, True, True]):
             result = tools.spawn_worker(
                 worker_id="w-fable-remote-death",
                 worker_type="claude-fable",
@@ -3038,6 +3082,10 @@ class TestKillWorker:
     def test_kill_worker_kills_session_and_updates_registry(self, tools, registry, mock_tmux):
         """kill_worker kills tmux session and marks worker completed."""
         registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        # kill_worker kills the session before the seam re-probes liveness; a
+        # faithful post-kill mock reports the session dead so the unmanaged
+        # worker completes.
+        mock_tmux.has_session.return_value = False
         _mock_grader_approve(tools)
         result = tools.kill_worker("w1")
         mock_tmux.kill_session.assert_called_once_with("ic-w1", ssh_host=None)
@@ -3187,6 +3235,9 @@ class TestInlineGraderEnforcement:
         of failing — a call with empty objective/evidence would hit the same no-op `else` branch
         regardless of whether the fast-path logic works, and could never catch a regression."""
         registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        # Faithful post-kill liveness: the session is dead once kill_worker has
+        # killed it, so the unmanaged worker completes via the seam.
+        mock_tmux.has_session.return_value = False
         cursor = db_conn.execute(
             "INSERT INTO directives (source_ts, source_text, interpretation, status) "
             "VALUES ('1.0', 'do work', 'Implement feature X', 'completed')"
@@ -3965,8 +4016,8 @@ class TestActivatePmViaSqliteRetry:
 class TestInitBrainSessionBackground:
     """Tests for the Brain session DB initialization background function."""
 
-    def test_init_brain_session_background_updates_existing_row(self, tmp_path):
-        """UPDATE overwrites undecided->off when session-init already created the row."""
+    def test_init_brain_session_background_preserves_existing_row(self, tmp_path):
+        """An existing session's professional_mode is NEVER overwritten at startup."""
         claude_dir = tmp_path / ".claude"
         claude_dir.mkdir()
 
@@ -3978,7 +4029,7 @@ class TestInitBrainSessionBackground:
         )
         conn.execute(
             "INSERT INTO sessions VALUES"
-            " ('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', 'undecided', NULL)"
+            " ('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', 'on', NULL)"
         )
         conn.commit()
         conn.close()
@@ -3993,7 +4044,37 @@ class TestInitBrainSessionBackground:
             "SELECT professional_mode FROM sessions WHERE terminal_session=?",
             ("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",),
         ).fetchone()
-        assert row[0] == "off"
+        assert row[0] == "on"
+
+    def test_init_brain_session_background_preserves_undecided_row(self, tmp_path):
+        """A Brain-host row session-init pre-created as 'undecided' is NOT forced 'off'."""
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+
+        db_path = claude_dir / "ironclaude.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE sessions (terminal_session TEXT PRIMARY KEY,"
+            " professional_mode TEXT, updated_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO sessions VALUES"
+            " ('cccccccc-dddd-eeee-ffff-000000000000', 'undecided', NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        (claude_dir / "ironclaude-session-44.id").write_text(
+            "cccccccc-dddd-eeee-ffff-000000000000"
+        )
+
+        _init_brain_session_background(ppid=44, timeout=5, _claude_dir=claude_dir)
+
+        row = sqlite3.connect(str(db_path)).execute(
+            "SELECT professional_mode FROM sessions WHERE terminal_session=?",
+            ("cccccccc-dddd-eeee-ffff-000000000000",),
+        ).fetchone()
+        assert row[0] == "undecided"
 
     def test_init_brain_session_background_inserts_when_no_row(self, tmp_path):
         """INSERT OR IGNORE creates row with 'off' when session-init has not run yet."""
@@ -6131,6 +6212,27 @@ class TestProviderAwareBatchLifecycle:
         assert result == [{"worker_id": "w1", "error": str(error)}]
         mock_tmux.spawn_session.assert_not_called()
 
+    def test_batch_missing_lossless_skill_cleans_before_objective(
+        self, tools, registry, mock_tmux, monkeypatch,
+    ):
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle(
+            client="claude", model="sonnet",
+        ))
+        monkeypatch.setattr(
+            "ironclaude.orchestrator_mcp.skill_invocation",
+            MagicMock(side_effect=CommunicationProfileError("missing skill")),
+        )
+
+        result = tools.spawn_workers([self._request()])
+
+        assert result[0]["failure_phase"] == "dispatch"
+        assert result[0]["assignment_preserved"] is True
+        assert "Objective w1" not in [
+            call.args[1] for call in mock_tmux.send_keys.call_args_list
+        ]
+        assert registry.get_worker("w1") is None
+        mock_tmux.kill_session.assert_called_once_with("ic-w1")
+
     @pytest.mark.parametrize(
         ("client", "message"),
         [
@@ -6167,8 +6269,13 @@ class TestProviderAwareBatchLifecycle:
 
         command = mock_tmux.spawn_session.call_args.args[1]
         assert "exec codex --model gpt-5.6-terra" in command
-        tools._wait_for_ready.assert_called_once_with(
+        assert tools._wait_for_ready.call_args_list[0] == call(
             "ic-w1", timeout=30, client="codex",
+        )
+        assert tools._wait_for_ready.call_args_list[1] == call(
+            "ic-w1", timeout=30, ssh_host=None, client="codex",
+            marker=PROFILE_READY_MARKER, log_offset=128,
+            remote_log_dir=None,
         )
         tools._activate_pm_via_sqlite.assert_called_once()
         assert tools._activate_pm_via_sqlite.call_args.args == ("ic-w1",)
@@ -6177,7 +6284,11 @@ class TestProviderAwareBatchLifecycle:
         assert tools._activate_pm_via_sqlite.call_args.kwargs["client"] == "codex"
         assert isinstance(tools._activate_pm_via_sqlite.call_args.kwargs["not_before"], float)
         messages = [call.args[1] for call in mock_tmux.send_keys.call_args_list]
-        assert messages == ["Objective w1"]
+        assert messages == [
+            "$ironclaude:write-lossless-ai-messages",
+            _CODEX_ADVISOR_INSTRUCTION,
+            "Objective w1",
+        ]
         worker = registry.get_worker("w1")
         assert worker["type"] == "claude-sonnet"
         assert worker["client"] == "codex"
@@ -6201,6 +6312,7 @@ class TestProviderAwareBatchLifecycle:
 
         messages = [call.args[1] for call in mock_tmux.send_keys.call_args_list]
         assert messages == [
+            "/write-lossless-ai-messages",
             "/advisor opus",
             "/goal the assigned objective is complete and code review has passed",
             "Objective w1",
@@ -6340,7 +6452,10 @@ class TestProviderAwareBatchLifecycle:
         self, tools, registry, mock_tmux,
     ):
         tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
-        tools._wait_for_ready.return_value = False
+        # Initial client readiness timeout may proceed while session remains
+        # alive; subsequent communication-profile activation still requires a
+        # fresh marker.
+        tools._wait_for_ready.side_effect = [False, True]
         mock_tmux.has_session.return_value = True
 
         result = tools.spawn_workers([self._request()])
@@ -6579,7 +6694,7 @@ class TestProviderAwareBatchLifecycle:
             model="claude-opus-4-6",
         )
         tools._resolve_worker_client = MagicMock(side_effect=[fable, opus])
-        tools._wait_for_ready.side_effect = [False, True]
+        tools._wait_for_ready.side_effect = [False, True, True]
         mock_tmux.has_session.return_value = False
         tools._advisor_cfg["enabled"] = True
         tools._advisor_model_for = MagicMock(return_value="opus")
@@ -9074,6 +9189,50 @@ class TestListClaudeSessions:
         assert session["pane_pid"] == "12345"
         assert session["confidence"] == "high"
 
+    def test_summarizer_loads_lossless_profile_before_ollama(
+        self, tools, mock_tmux, monkeypatch,
+    ):
+        mock_tmux.list_sessions.return_value = ["my-session"]
+        mock_tmux.list_pane_pid.return_value = "12345"
+        mock_tmux.pane_current_command.return_value = "node"
+        mock_tmux.capture_pane.return_value = "terminal content"
+        mock_client = _make_ollama_client_mock(post_generate_result="summary")
+        tools._get_ollama_client = MagicMock(return_value=mock_client)
+        profile = MagicMock(side_effect=lambda path, prompt: f"PROFILE\n{prompt}")
+        monkeypatch.setattr(
+            "ironclaude.orchestrator_mcp.apply_communication_profile", profile,
+        )
+
+        result = json.loads(tools.list_claude_sessions())
+
+        assert result[0]["summary"] == "summary"
+        profile.assert_called_once()
+        assert profile.call_args.args[0] == "session_summarizer"
+        assert mock_client.post_generate.call_args.args[0]["prompt"].startswith(
+            "PROFILE\n"
+        )
+
+    def test_missing_summarizer_profile_returns_bounded_error_without_ollama(
+        self, tools, mock_tmux, monkeypatch,
+    ):
+        mock_tmux.list_sessions.return_value = ["my-session"]
+        mock_tmux.list_pane_pid.return_value = "12345"
+        mock_tmux.pane_current_command.return_value = "node"
+        mock_tmux.capture_pane.return_value = "terminal content"
+        mock_client = _make_ollama_client_mock()
+        tools._get_ollama_client = MagicMock(return_value=mock_client)
+        monkeypatch.setattr(
+            "ironclaude.orchestrator_mcp.apply_communication_profile",
+            MagicMock(side_effect=CommunicationProfileError("missing skill")),
+        )
+
+        result = json.loads(tools.list_claude_sessions())
+
+        assert result[0]["summary"].startswith(
+            "ERROR: communication-profile infrastructure error"
+        )
+        mock_client.post_generate.assert_not_called()
+
     def test_ollama_unavailable_all_sessions_get_error(self, tools, mock_tmux):
         """When Ollama is unreachable at pre-check, all sessions get explicit error string."""
         mock_tmux.list_sessions.return_value = ["session-a", "session-b"]
@@ -9199,6 +9358,9 @@ class TestAdoptSession:
         assert "recent work output" in out["recent_output"]
         mock_tmux.rename_session.assert_called_once_with("test-session", "ic-d4")
         mock_tmux.setup_log_capture.assert_called_once_with("ic-d4")
+        assert [entry.args[1] for entry in mock_tmux.send_keys.call_args_list] == [
+            "/write-lossless-ai-messages",
+        ]
         w = registry.get_worker("d4")
         assert w is not None
         assert w["tmux_session"] == "ic-d4"
@@ -9472,8 +9634,13 @@ class TestResumeSession:
         for fragment in forbidden:
             assert fragment not in command
         tools._ensure_worker_instructions.assert_called_once_with("/r", client)
-        tools._wait_for_ready.assert_called_once_with(
+        assert tools._wait_for_ready.call_args_list[0] == call(
             "ic-d5", timeout=30, client=client,
+        )
+        assert tools._wait_for_ready.call_args_list[1] == call(
+            "ic-d5", timeout=30, ssh_host=None, client=client,
+            marker=PROFILE_READY_MARKER, log_offset=128,
+            remote_log_dir=None,
         )
         activation_kwargs = tools._activate_pm_via_sqlite.call_args.kwargs
         readback_kwargs = tools._read_pm_state_via_sqlite.call_args.kwargs
@@ -9902,6 +10069,81 @@ class TestCallGraderSubprocess:
         tools._ensure_role_capabilities = MagicMock()
         tools._provider_router = MagicMock(return_value=(router, None, None, None))
 
+    @staticmethod
+    def _canonical_lossless_skill():
+        return (
+            Path(__file__).resolve().parents[2]
+            / "worker" / "skills" / "write-lossless-ai-messages" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+
+    def test_claude_grader_loads_exact_skill_before_untrusted_input(self, tools):
+        captured = {}
+
+        def run(cmd, **kwargs):
+            system_path = cmd[cmd.index("--system-prompt-file") + 1]
+            captured["system"] = Path(system_path).read_text(encoding="utf-8")
+            captured["input"] = kwargs["input"]
+            return MagicMock(
+                returncode=0,
+                stdout=self._envelope({
+                    "grade": "A", "approved": True, "feedback": "PROTECTED_VALUE",
+                }),
+                stderr="",
+            )
+
+        with patch("ironclaude.main.ensure_brain_trusted"), patch(
+            "ironclaude.orchestrator_mcp.subprocess.run", side_effect=run
+        ):
+            result = tools._call_grader("TRUSTED_SYSTEM", "UNTRUSTED_USER")
+
+        canonical = self._canonical_lossless_skill()
+        assert canonical in captured["system"]
+        assert captured["system"].index(canonical) < captured["system"].index("TRUSTED_SYSTEM")
+        assert captured["input"] == "UNTRUSTED_USER"
+        assert result["feedback"] == "PROTECTED_VALUE"
+        assert PROFILE_READY_MARKER not in json.dumps(result)
+
+    def test_codex_grader_loads_exact_skill_before_untrusted_input(self, tools):
+        self._configure_codex_grader(tools)
+        verdict = {"grade": "A", "approved": True, "feedback": "PROTECTED_VALUE"}
+        event = json.dumps({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": json.dumps(verdict)},
+        })
+        with patch("ironclaude.main.ensure_brain_trusted"), patch(
+            "ironclaude.orchestrator_mcp.subprocess.run"
+        ) as run:
+            run.return_value = MagicMock(returncode=0, stdout=event, stderr="")
+            result = tools._call_grader("TRUSTED_SYSTEM", "UNTRUSTED_USER")
+
+        prompt = run.call_args.kwargs["input"]
+        canonical = self._canonical_lossless_skill()
+        assert canonical in prompt
+        assert prompt.index(canonical) < prompt.index("UNTRUSTED_USER")
+        assert result == verdict
+        assert PROFILE_READY_MARKER not in json.dumps(result)
+
+    @pytest.mark.parametrize(
+        ("client", "expected_path"),
+        [("claude", "claude_grader"), ("codex", "codex_grader")],
+    )
+    def test_provider_selects_declared_profile_before_subprocess(
+        self, tools, client, expected_path
+    ):
+        if client == "codex":
+            self._configure_codex_grader(tools)
+        with patch(
+            "ironclaude.orchestrator_mcp.apply_communication_profile",
+            side_effect=CommunicationProfileError("communication skill missing or unreadable"),
+        ) as profile, patch("ironclaude.orchestrator_mcp.subprocess.run") as run:
+            result = tools._call_grader("sys", "UNTRUSTED_USER")
+
+        profile.assert_called_once_with(expected_path, "sys")
+        run.assert_not_called()
+        assert result["infrastructure_error"] is True
+        assert "communication skill missing or unreadable" in result["error_detail"]
+        assert result["approved"] is False
+
     def test_codex_grader_nonzero_stdout_diagnostic_is_infrastructure_failure(self, tools):
         self._configure_codex_grader(tools)
         with patch("ironclaude.main.ensure_brain_trusted"), \
@@ -10314,6 +10556,7 @@ def _finalize_worker(**overrides):
         "machine": None,
         "repo": "/repo",
         "native_session_id": _FINALIZE_OWNER,
+        "tmux_session": "ic-w1",
         "workspace_guid": "22222222-2222-4222-8222-222222222222",
         "workspace_repository_identity": "machine:repo.git",
         "workspace_path": "/repo/.ironclaude/worktrees/2222",
@@ -10353,6 +10596,8 @@ def finalize_failure_tools():
     tools.registry = MagicMock()
     tools.registry.get_worker.return_value = _finalize_worker()
     tools.registry.update_worker_status = MagicMock()
+    tools.tmux = MagicMock()
+    tools.tmux.has_session.return_value = False
     tools._workspace_client = MagicMock()
     tools._workspace_client.discover_installed_plugin_root.return_value = "/installed/codex"
     tools._workspace_client.finalize.side_effect = WorkspaceClientError("finalize boom")
@@ -10521,6 +10766,137 @@ class TestCommitWorkerFinalizationRecovery:
             "worker-1", "completed",
         )
         assert tools._workspace_client.reconcile.call_count == 2
+
+    def test_clean_paused_rebase_ssh_worker_continue_uses_remote_transport(
+        self, finalize_failure_tools,
+    ):
+        # Same clean-paused-rebase auto-continue path as
+        # test_clean_paused_rebase_is_driven_to_transparent_integration, but for
+        # an ssh-hosted worker — pins that _classify_finalization_failure's
+        # transport (extracted into _probe_finalization_status /
+        # _drive_continue_recovery) is the resolved ssh transport, not a
+        # hardcoded local one. A dropped-transport regression (bare
+        # reconcile({...})) would yield kwargs == {}; a hardcoded-local
+        # regression would carry a 'plugin_root' key instead of the ssh shape.
+        tools = finalize_failure_tools
+        tools.registry.get_worker.return_value = _finalize_worker(
+            machine="worker-host", repo="/srv/repo",
+        )
+        tools._resolve_ssh_host.return_value = "remotehost"
+        remote_plugin_root = (
+            "/home/worker/.codex/plugins/cache/ironclaude/ironclaude/1.1.4"
+        )
+        tools._workspace_client.discover_installed_plugin_root.return_value = (
+            remote_plugin_root
+        )
+        integrated = {"state": "cleaned", "integratedCommit": "d" * 40}
+        tools._workspace_client.reconcile.side_effect = [
+            {"state": "rebase-paused-clean"},
+            integrated,
+        ]
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result == integrated
+        tools.registry.update_worker_status.assert_called_once_with(
+            "worker-1", "completed",
+        )
+        expected_transport = {
+            "ssh_host": "remotehost",
+            "remote_plugin_root": remote_plugin_root,
+        }
+        calls = tools._workspace_client.reconcile.call_args_list
+        assert len(calls) == 2
+        assert calls[0].args[0]["rebase_recovery"] == "status"
+        assert calls[1].args[0]["rebase_recovery"] == "continue"
+        assert calls[0].kwargs == expected_transport
+        assert calls[1].kwargs == expected_transport
+
+    def test_already_integrated_probe_live_session_never_completes(
+        self, finalize_failure_tools,
+    ):
+        # SAFETY GATE: the status probe shows the work already landed, but the
+        # worker's tmux session is STILL ALIVE. The worker must NOT be marked
+        # completed, but the deferred cleanup still runs and the probe status
+        # is still returned to the caller.
+        tools = finalize_failure_tools
+        tools.tmux.has_session.return_value = True
+        integrated_status = {"state": "integrated", "integratedCommit": "e" * 40}
+        tools._workspace_client.reconcile.side_effect = [
+            integrated_status,
+            {"state": "cleaned"},
+        ]
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result == integrated_status
+        tools.registry.update_worker_status.assert_not_called()
+        assert tools._workspace_client.reconcile.call_count == 2
+
+    def test_clean_paused_rebase_continue_live_session_never_completes(
+        self, finalize_failure_tools,
+    ):
+        # Same safety gate through the auto-continue path: the continue
+        # reaches a terminal integrated state ('cleaned'), but the session is
+        # still alive, so completion must not happen even though the result
+        # is still returned.
+        tools = finalize_failure_tools
+        tools.tmux.has_session.return_value = True
+        integrated = {"state": "cleaned", "integratedCommit": "d" * 40}
+        tools._workspace_client.reconcile.side_effect = [
+            {"state": "rebase-paused-clean"},
+            integrated,
+        ]
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result == integrated
+        tools.registry.update_worker_status.assert_not_called()
+
+
+def test_complete_worker_if_session_dead_missing_session_never_completes(
+    finalize_failure_tools,
+):
+    # No tmux_session key at all -> never confirmed dead -> never completed,
+    # and the liveness probe itself must never even run.
+    tools = finalize_failure_tools
+    worker_no_session = _finalize_worker()
+    del worker_no_session["tmux_session"]
+    tools.registry.get_worker.return_value = worker_no_session
+
+    result = tools._complete_worker_if_session_dead("worker-1", None)
+
+    assert result is False
+    tools.registry.update_worker_status.assert_not_called()
+    tools.tmux.has_session.assert_not_called()
+
+
+def test_complete_worker_if_session_dead_empty_session_never_completes(
+    finalize_failure_tools,
+):
+    tools = finalize_failure_tools
+    tools.registry.get_worker.return_value = _finalize_worker(tmux_session="")
+
+    result = tools._complete_worker_if_session_dead("worker-1", None)
+
+    assert result is False
+    tools.registry.update_worker_status.assert_not_called()
+    tools.tmux.has_session.assert_not_called()
+
+
+def test_complete_worker_if_session_dead_ambiguous_liveness_never_completes(
+    finalize_failure_tools,
+):
+    # has_session raising is an ambiguous liveness result, not a confirmed
+    # death -> must not escape to the MCP layer and must not complete.
+    tools = finalize_failure_tools
+    tools.registry.get_worker.return_value = _finalize_worker()
+    tools.tmux.has_session.side_effect = RuntimeError("boom")
+
+    result = tools._complete_worker_if_session_dead("worker-1", None)
+
+    assert result is False
+    tools.registry.update_worker_status.assert_not_called()
 
 
 @pytest.fixture

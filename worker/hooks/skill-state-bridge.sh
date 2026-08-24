@@ -69,6 +69,22 @@ case "$SKILL_NAME" in
     ;;
 esac
 
+# Effort-scoped review budget: this hook is the dominant live path into brainstorming/
+# debugging (it raw-UPDATEs workflow_stage before the skill runs, making a later
+# mark_brainstorming a no-op). Classify the effort from the FROM-stage so a retreat /
+# mid-effort re-entry inherits the effort's one blind review, while a genuine new effort
+# (from a terminal/fresh stage) mints a fresh budget. Mirrors inheritReviewOnDesignReentry.
+TARGET_FOR_BUDGET="${STAGE_CHANGE#workflow_stage=}"
+if [ "$TARGET_FOR_BUDGET" = "brainstorming" ] || [ "$TARGET_FOR_BUDGET" = "debugging" ]; then
+  case "$CURRENT_STAGE" in
+    idle|execution_complete)
+      UPDATES="${UPDATES}, inherit_review=0" ;;
+    design_ready|design_marked_for_use|plan_ready|plan_marked_for_use|final_plan_prep|executing|reviewing|plan_interrupted)
+      UPDATES="${UPDATES}, inherit_review=1" ;;
+    # brainstorming | debugging | empty/unknown -> leave inherit_review unchanged
+  esac
+fi
+
 # A repeated skill activation is not a workflow transition.  Leave the complete
 # session row and audit trail untouched so resume/retry behavior is idempotent.
 if [ -n "$STAGE_CHANGE" ] && [ -n "$CURRENT_STAGE" ]; then

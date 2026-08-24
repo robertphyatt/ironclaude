@@ -1,0 +1,86 @@
+{
+  "name": "Unassigned-primary human /push (Loop 1)",
+  "goal": "Add a human-only /push lane for an unassigned primary checkout - push the current branch to its own origin ref via force-with-lease, fast-forward-only, no review/integration envelope.",
+  "requirements_file": "docs/plans/2026-08-21-unassigned-primary-push-requirements.md",
+  "design_file": "docs/plans/2026-08-21-unassigned-primary-push-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Unassigned-primary push authority + mint route + revalidate branch (TDD)",
+      "description": "Build the authority + mint layer and make pushExactAuthorizedRef usable by the unassigned lane. hook-intent.ts:48-58 widen zero-assignment route to allow push. git-authority.ts: new exported assertFastForwardPush (isAncestor from ./git.js; null->ok else require ancestor-of-localOid else throw must-be-fast-forward) called LIVE inside observeUnassignedPushEvidence only; new observeUnassignedPushEvidence (PushEvidence: checkoutMode primary-unassigned, localRef=current branch, localOid, origin, remoteUrl==pushUrl else denyEvidence, destinationRef=localRef, expectedRemoteOldOid, then live assertFastForwardPush); relax !==commit guards :379/:411 to allow push (branch evidence on operation, operation:input.operation, freeze-then-usablePushAuthorizations.add on push); ADD a primary-unassigned branch to revalidateAuthorizedCommitState (:491-514) that re-proves via resolveUnassignedPrimaryCheckout (zero assignments + primary ownership + branch) instead of resolveEffectiveCheckout (which needs an assignment) - this is what makes reuse work; update comment :281-283 + resolveUnassignedPrimaryCheckout error strings commit->direct-Git. Managed lane untouched.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/hook-intent.ts",
+        "worker/mcp-servers/workspace-manager/src/git-authority.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/git-authority.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED. In git-authority.test.ts add: (a) positive push authority with NON-VACUOUS oracle - repository(true), unassignedDatabase, make a NEW local commit ahead of origin (localOid!=remote), issue+verify operation:'push', assert checkoutMode primary-unassigned + operation push + workspaceGuid startsWith primary:, PRE-assert ls-remote != local HEAD, pushExactAuthorizedRef(authority) plainly (any throw fails), POST-assert ls-remote moved to new HEAD; (b) ff non-ff refused (bare origin advanced past local -> issue throws must-be-fast-forward); (c) new-branch (null remote) issue+verify succeed; (d) revalidate-branch negatives: plant active assignment between verify and push -> throws 'zero active assignments'; plant foreign primary_checkout_owners row -> throws 'owned by another session'; (e) sentinel isolation: issue commit intent, verify push -> 'requires a matching human intent' (repository(true)); (f) wrong-channel + expired-intent negatives via createHumanIntent -> verify throws 'requires a matching human intent'; (g) hook mint: issueHumanIntentFromHook(hookArgs(root,'push')) -> {issued:true, operation:push}, UPDATE throw-loop :729-738 + its 'commit only' comment to drop 'push' (other three still throw 'exactly one active assignment'), do NOT weaken :746. Subagent-refusal moves to Task 2.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test",
+          "expected": "Non-zero (RED): push-authority/ff/revalidate/hook positives fail (unassigned lane commit-only; revalidate has no primary-unassigned branch; hook throws push); retained negatives pass."
+        },
+        {
+          "description": "GREEN. Per design Components 1-5: hook-intent.ts:48-58 widen to (commit||push), issue with operation. git-authority.ts: add isAncestor to ./git.js import; add exported assertFastForwardPush + observeUnassignedPushEvidence; relax issue :379 + verify :411 (branch evidence on operation, operation:input.operation, freeze-then-WeakSet-add on push); ADD the primary-unassigned branch to revalidateAuthorizedCommitState :491-514 (resolveUnassignedPrimaryCheckout, path check, then existing branch/localRef check on checkoutPath); update comment :281-283 + error strings. Exact code in design + human plan Task 1 Step 2.",
+          "command": "",
+          "expected": "hook-intent push route widened; git-authority has assertFastForwardPush + observeUnassignedPushEvidence + revalidate primary-unassigned branch, relaxed issue/verify, WeakSet add on push; managed lane unchanged."
+        },
+        {
+          "description": "GREEN verify.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test",
+          "expected": "0 fail. New push-authority/ff/revalidate-negative/hook-mint tests pass; retained negatives (three non-push zero-assignment ops throw; sentinel/channel/expiry isolation) pass; all pre-existing pass."
+        },
+        {
+          "description": "Stage the three Task-1 files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/hook-intent.ts worker/mcp-servers/workspace-manager/src/git-authority.ts worker/mcp-servers/workspace-manager/src/__tests__/git-authority.test.ts",
+          "expected": "Three files staged."
+        },
+        {
+          "description": "No-regression evidence: unfiltered staged diff.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --staged --name-only",
+          "expected": "Exactly the three Task-1 files and nothing else staged."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Unassigned-primary push finalizer + wiring (TDD)",
+      "description": "Add finalizePrimaryUnassignedPush (integration.ts) = guard primary-unassigned+push, pushExactAuthorizedRef (try/mutationError + afterRemoteMutationBeforeResult hook), remoteRefOid readback classification (pushed-only / has-not-proved / ambiguous). NO assertFastForwardPush call, NO PushEvidence/ff import (ff already proven at verify + assertRemoteEvidence). index.ts: branch dispatch :282-285 on operation (push->finalizePrimaryUnassignedPush else finalizePrimaryUnassignedCommit; import it) and push tool schema :126 required->['repository_path']. Managed finalizeDirectAuthority push branch NOT touched.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/integration.ts",
+        "worker/mcp-servers/workspace-manager/src/index.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/integration-core.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "RED. integration-core.test.ts: setupUnassignedPrimaryWithRemote (setupUnassignedPrimary + bare origin) + issueAndVerifyUnassigned(operation). Add (a) pushed-only -> state pushed-only + ls-remote equals local HEAD; (b) remote-advanced-after-verify -> throw message contains 'evidence changed or is malformed' (NOT 'must be fast-forward'); (c) ambiguous via afterRemoteMutationBeforeResult hook; (d) dispatch primary-unassigned+push->finalizePrimaryUnassignedPush, +commit->finalizePrimaryUnassignedCommit. tool-dispatch.test.ts: UPDATE the it-block :154-164 (push required->['repository_path'], commit_and_push unchanged, properties still exposes workspace_guid); add subagent-refuses-unassigned-push negative (extend :220-244 with omitted-guid {repository_path} -> provider-root refusal); keep :87-93/:123-128. integration-cases.ts: commander-never-pushes behavioral test (finalizeCommanderLocalCommit with a bare origin -> ls-remote before==after).",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test",
+          "expected": "Non-zero (RED): finalizePrimaryUnassignedPush undefined / push schema still requires workspace_guid / existing schema it-block now wrong."
+        },
+        {
+          "description": "GREEN. integration.ts: add finalizePrimaryUnassignedPush(authority, hooks?) (exact code in design Component 6 / human plan Task 2 Step 2) - guard, pushExactAuthorizedRef + hook, remoteRefOid readback classification; no ff import. index.ts: import finalizePrimaryUnassignedPush; branch dispatch :282-285 on operation; push schema :126 required->['repository_path'].",
+          "command": "",
+          "expected": "integration.ts exports finalizePrimaryUnassignedPush; index.ts dispatch branches on operation + push schema drops mandatory workspace_guid; managed push branch untouched."
+        },
+        {
+          "description": "GREEN verify.",
+          "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test",
+          "expected": "0 fail. Finalizer/dispatch/schema/commander-never-pushes tests pass; managed push + unassigned commit lanes byte-identical; full suite green."
+        },
+        {
+          "description": "Stage the five Task-2 files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/integration.ts worker/mcp-servers/workspace-manager/src/index.ts worker/mcp-servers/workspace-manager/src/__tests__/integration-core.test.ts worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts",
+          "expected": "Five files staged."
+        },
+        {
+          "description": "No-regression evidence: unfiltered staged diff (Task 1 + Task 2 files).",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --staged --name-only",
+          "expected": "Exactly the 3 Task-1 + 5 Task-2 source/test files = 8 paths, nothing else staged."
+        }
+      ]
+    }
+  ]
+}

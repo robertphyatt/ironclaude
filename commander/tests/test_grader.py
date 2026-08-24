@@ -1,8 +1,10 @@
 """Unit tests for LocalGrader."""
 import json
+from pathlib import Path
 import pytest
 from unittest.mock import MagicMock, patch
 
+from ironclaude.communication_profiles import CommunicationProfileError, PROFILE_READY_MARKER
 from ironclaude.grader import LocalGrader
 from ironclaude.ollama_client import OllamaConnectionError, OllamaTimeoutError
 
@@ -22,7 +24,27 @@ def _make_grader():
     return grader, mock_client
 
 
+def _canonical_lossless_skill() -> str:
+    return (
+        Path(__file__).resolve().parents[2]
+        / "worker" / "skills" / "write-lossless-ai-messages" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+
 class TestHappyPath:
+    def test_exact_lossless_skill_precedes_untrusted_input(self):
+        grader, mock_client = _make_grader()
+        mock_client.post_generate.return_value = '{"valid": true}'
+
+        result = grader.grade("TRUSTED_SYSTEM", "UNTRUSTED_USER", SIMPLE_SCHEMA)
+
+        prompt = mock_client.post_generate.call_args.args[0]["prompt"]
+        canonical = _canonical_lossless_skill()
+        assert canonical in prompt
+        assert prompt.index(canonical) < prompt.index("UNTRUSTED_USER")
+        assert result == {"valid": True}
+        assert PROFILE_READY_MARKER not in json.dumps(result)
+
     def test_valid_json_returned_as_dict(self):
         grader, mock_client = _make_grader()
         mock_client.post_generate.return_value = '{"valid": true}'
@@ -52,6 +74,20 @@ class TestHappyPath:
 
 
 class TestErrorPaths:
+    def test_missing_lossless_skill_is_infrastructure_failure_before_ollama(self):
+        grader, mock_client = _make_grader()
+        with patch(
+            "ironclaude.grader.apply_communication_profile",
+            side_effect=CommunicationProfileError("communication skill missing or unreadable"),
+        ):
+            result = grader.grade("sys", "untrusted", SIMPLE_SCHEMA)
+
+        assert result == {
+            "infrastructure_error": True,
+            "error_detail": "communication skill missing or unreadable",
+        }
+        mock_client.post_generate.assert_not_called()
+
     def test_ollama_connection_error_returns_infrastructure_error(self):
         grader, mock_client = _make_grader()
         mock_client.post_generate.side_effect = OllamaConnectionError("refused")

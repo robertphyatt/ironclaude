@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, patch
 from ironclaude.db import init_db
 
 from ironclaude import fable_availability as fa
+from ironclaude import main as main_module
+from ironclaude.communication_profiles import CommunicationProfileError
 from ironclaude.main import IroncladeDaemon, PROMPT_WAITING_CACHE_TTL
 
 
@@ -287,6 +289,32 @@ class TestSpawnWorkerAdvisorTiering:
             if call[0][1].startswith("/goal")
         ]
 
+    def test_missing_lossless_skill_kills_before_legacy_objective(
+        self, monkeypatch,
+    ):
+        daemon = self._spawn_daemon({
+            "effort_level": "high", "advisor": {"enabled": False},
+            "dispatch": {"use_goal": False},
+        })
+        monkeypatch.setattr(main_module, "ensure_worker_trusted", lambda _: None)
+        monkeypatch.setattr(
+            main_module, "skill_invocation",
+            MagicMock(side_effect=CommunicationProfileError("missing skill")),
+        )
+
+        daemon._handle_spawn_worker({
+            "worker_id": "w-missing", "type": "claude-sonnet",
+            "repo": "/tmp", "objective": "must not dispatch",
+        })
+
+        daemon.tmux.kill_session.assert_called_once_with("ic-w-missing")
+        sent = [call.args[1] for call in daemon.tmux.send_keys.call_args_list]
+        assert "must not dispatch" not in sent
+        assert any(
+            "communication profile" in call.args[0].lower()
+            for call in daemon.slack.post_message.call_args_list
+        )
+
     @patch("ironclaude.main.log_worker_event")
     @patch("ironclaude.main.format_worker_spawned", return_value="spawned")
     @patch("ironclaude.main.ensure_worker_trusted")
@@ -304,6 +332,8 @@ class TestSpawnWorkerAdvisorTiering:
         decision = {"worker_id": "w-sonnet", "type": "claude-sonnet", "repo": "/tmp", "objective": "task"}
         daemon._handle_spawn_worker(decision)
         assert self._advisor_sends(daemon) == ["/advisor opus"]
+        sent = [call.args[1] for call in daemon.tmux.send_keys.call_args_list]
+        assert sent.index("/write-lossless-ai-messages") < sent.index("/advisor opus") < sent.index("task")
 
     @patch("ironclaude.main.log_worker_event")
     @patch("ironclaude.main.format_worker_spawned", return_value="spawned")

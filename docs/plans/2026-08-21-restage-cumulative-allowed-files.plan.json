@@ -1,0 +1,70 @@
+{
+  "name": "Re-Stage Cumulative allowed_files at execution_complete",
+  "goal": "Make the end-of-loop commit capture the full intended file set even if a subagent's git stash pop dropped earlier tasks out of the index, by re-staging the union of every task's allowed_files at execution_complete in the executing-plans skill.",
+  "requirements_file": "docs/plans/2026-08-21-commit-restage-cumulative-allowed-files-requirements.md",
+  "design_file": "docs/plans/2026-08-21-commit-restage-cumulative-allowed-files-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Re-stage step in executing-plans Step 7 + governance test",
+      "description": "Add a re-stage step to executing-plans SKILL.md Step 7 (before the commit-message suggestion) that re-stages the deduped union of every task's allowed_files from the plan JSON (existing paths only, git add -- explicit paths, orchestrator-run after subagents). Add a governance test in commander/tests/test_executing_plans_skill.py asserting the step exists before the commit-message suggestion and references git stash pop + union. TDD: write the test (RED), edit the skill (GREEN), full regression (no build).",
+      "allowed_files": [
+        "worker/skills/executing-plans/SKILL.md",
+        "commander/tests/test_executing_plans_skill.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Add imports (json, re, subprocess) then append TWO governance tests to test_executing_plans_skill.py (module-level _read()): (1) test_execution_complete_restages_cumulative_allowed_files — assert 'Re-stage the cumulative allowed_files' in text, index Step 7, assert the re-stage precedes 'Suggest a commit message', assert 'git stash pop' and 'union' present; (2) test_execution_complete_restage_command_stages_from_non_root_cwd(tmp_path) — extract the Step 7 bash command via regex, fill <plan-json-path>/<repo-root>, run it from cwd=repo/commander in a temp git repo, assert returncode 0, a missing allowed_file tolerated, only worker/a.md staged and worker/outside.md left unstaged. Both RED pre-edit (text-presence fails first assert; behavioral errors on text.index ValueError).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_executing_plans_skill.py",
+          "expected": "FAIL: the new test fails at the first assert (SKILL.md lacks 'Re-stage the cumulative allowed_files')."
+        },
+        {
+          "description": "In SKILL.md Step 7, insert item 2 'Re-stage the cumulative allowed_files' (guards a subagent git stash pop; re-stage the deduped union of every task's allowed_files from the plan JSON via a python3 one-liner using t.get('allowed_files', []) piped into `while read f; if [ -e \"<repo-root>/$f\" ]; then git -C <repo-root> add -- \"$f\"; fi` — the existence test is repo-root-anchored so it works from cwd=commander/, and if..fi not && so a missing last path keeps exit 0) BEFORE the 'Suggest a commit message' item, renumbering it to 3. Full text in the human plan.",
+          "command": "",
+          "expected": "Step 7 has the re-stage step before the commit-message suggestion"
+        },
+        {
+          "description": "Run the skill test file to confirm GREEN.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_executing_plans_skill.py",
+          "expected": "all tests in the file pass (prior + new)."
+        },
+        {
+          "description": "state-manager vitest.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm test",
+          "expected": "all test files pass"
+        },
+        {
+          "description": "workspace-manager vitest.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test",
+          "expected": "Test Files 8 passed (8)"
+        },
+        {
+          "description": "Hook suites.",
+          "command": "for t in /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-*.sh; do echo \"== $t ==\"; bash \"$t\" || echo \"SUITE FAILED: $t\"; done",
+          "expected": "each 0 failed; no 'SUITE FAILED'"
+        },
+        {
+          "description": "Build commander pytest batch lists.",
+          "command": "rm -f /tmp/rcaf_tests.txt && ls /Users/roberthyatt/Code/ironclaude/commander/tests/test_*.py | sort > /tmp/rcaf_tests.txt && total=$(wc -l < /tmp/rcaf_tests.txt) && per=$(( (total + 3) / 4 )) && split -l \"$per\" /tmp/rcaf_tests.txt /tmp/rcaf_batch_ && wc -l /tmp/rcaf_tests.txt /tmp/rcaf_batch_aa /tmp/rcaf_batch_ab /tmp/rcaf_batch_ac /tmp/rcaf_batch_ad",
+          "expected": "4 batch files _aa.._ad"
+        },
+        {
+          "description": "Run commander pytest batches (repeat for _aa,_ab,_ac,_ad as separate Bash calls).",
+          "command": "test -s /tmp/rcaf_batch_aa || { echo \"FATAL: /tmp/rcaf_batch_aa missing/empty\"; exit 1; } && cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q -m \"not destructive\" $(tr '\\n' ' ' < /tmp/rcaf_batch_aa)",
+          "expected": "across the batches: all pass, 2 deselected, 0 failed (orchestrator memory-floor failures are the known environmental gap)"
+        },
+        {
+          "description": "Stage the two files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/skills/executing-plans/SKILL.md commander/tests/test_executing_plans_skill.py",
+          "expected": "both files staged"
+        },
+        {
+          "description": "Return shell cwd to repo root.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude",
+          "expected": "cwd is /Users/roberthyatt/Code/ironclaude"
+        }
+      ]
+    }
+  ]
+}

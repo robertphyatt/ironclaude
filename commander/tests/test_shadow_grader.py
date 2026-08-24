@@ -2,9 +2,11 @@
 import json
 import os
 import subprocess
+from pathlib import Path
 import pytest
 from unittest.mock import MagicMock, patch, mock_open
 
+from ironclaude.communication_profiles import CommunicationProfileError, PROFILE_READY_MARKER
 from ironclaude.shadow_grader import ShadowGrader
 from ironclaude.ollama_client import OllamaConnectionError, OllamaTimeoutError
 
@@ -18,7 +20,58 @@ def _make_shadow_grader():
     return grader, mock_client
 
 
+def _canonical_lossless_skill() -> str:
+    return (
+        Path(__file__).resolve().parents[2]
+        / "worker" / "skills" / "write-lossless-ai-messages" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+
 class TestGradeWithTools:
+    def test_exact_lossless_skill_precedes_untrusted_input(self):
+        grader, mock_client = _make_shadow_grader()
+        verdict = (
+            '{"grade": "A", "approved": true, "feedback": "protected feedback", '
+            '"confidence_in_disagreement": "high"}'
+        )
+        mock_client.post_chat.side_effect = [("analysis", []), (verdict, [])]
+
+        result = grader.grade_with_tools(
+            "TRUSTED_SYSTEM", "UNTRUSTED_USER", repo_path="/tmp"
+        )
+
+        payload = mock_client.post_chat.call_args_list[0].args[0]
+        system_content = payload["messages"][0]["content"]
+        canonical = _canonical_lossless_skill()
+        assert canonical in system_content
+        assert system_content.index(canonical) < system_content.index("TRUSTED_SYSTEM")
+        assert payload["messages"][1] == {"role": "user", "content": "UNTRUSTED_USER"}
+        assert result["feedback"] == "protected feedback"
+        assert PROFILE_READY_MARKER not in json.dumps(result)
+
+    def test_missing_lossless_skill_is_infrastructure_failure_before_ollama(self):
+        grader, mock_client = _make_shadow_grader()
+        with patch(
+            "ironclaude.shadow_grader.apply_communication_profile",
+            side_effect=CommunicationProfileError("communication skill missing or unreadable"),
+        ):
+            result = grader.grade_with_tools("sys", "untrusted", repo_path="/tmp")
+
+        assert result == {
+            "infrastructure_error": True,
+            "error_detail": "communication skill missing or unreadable",
+            "tool_calls": [],
+        }
+        mock_client.post_chat.assert_not_called()
+
+    def test_test_mode_does_not_load_profile_or_call_provider(self):
+        grader, mock_client = _make_shadow_grader()
+        with patch("ironclaude.shadow_grader.apply_communication_profile") as profile:
+            result = grader.grade_with_tools("sys", "user", test_mode=True)
+        assert result["feedback"] == "test_mode"
+        profile.assert_not_called()
+        mock_client.post_chat.assert_not_called()
+
     def test_no_tool_calls_parses_json_verdict(self):
         grader, mock_client = _make_shadow_grader()
         verdict_json = '{"grade": "B", "approved": true, "feedback": "looks good", "confidence_in_disagreement": "medium"}'

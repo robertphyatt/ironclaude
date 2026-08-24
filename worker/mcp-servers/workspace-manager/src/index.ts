@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { initDb } from './db.js';
 import { verifyDirectGitAuthority, type DirectGitOperation } from './git-authority.js';
 import { discoverRepository } from './git.js';
-import { finalizeDirectAuthority, reconcileFinalization } from './integration.js';
+import { finalizeDirectAuthority, finalizePrimaryUnassignedCommit, finalizePrimaryUnassignedPush, finalizePrimaryUnassignedCommitAndPush, finalizeReconcile, reconcileFinalization, syncWorktreeToTarget } from './integration.js';
 import { parseIronClaudeClient, resolveSessionIdentity } from './session-identity.js';
 import type { Assignment, SessionIdentity } from './types.js';
 import { WorkspaceService } from './workspace-service.js';
@@ -28,6 +28,8 @@ export interface PublicToolDependencies {
   listActiveAssignments: PublicSingleArgumentDependency;
   finalizeDirect: (operation: DirectGitOperation, args: Args) => unknown;
   reconcileFinalization: PublicSingleArgumentDependency;
+  syncWorktreeToTarget: PublicSingleArgumentDependency;
+  reconcileWorktree: PublicSingleArgumentDependency;
 }
 
 export const PUBLIC_TOOL_NAMES = [
@@ -40,6 +42,8 @@ export const PUBLIC_TOOL_NAMES = [
   'commit_and_push',
   'push',
   'reconcile_finalization',
+  'sync_worktree_to_target',
+  'reconcile_worktree',
 ] as const;
 
 const repositoryProperty = { type: 'string' as const, description: 'Path within the target Git repository.' };
@@ -122,8 +126,8 @@ export const publicToolDefinitions = [
         message: { type: 'string' as const },
       },
       required: name === 'push'
-        ? ['repository_path', 'workspace_guid']
-        : ['repository_path', 'workspace_guid', 'message'],
+        ? ['repository_path']
+        : ['repository_path', 'message'],
       additionalProperties: false,
     },
   })),
@@ -141,6 +145,29 @@ export const publicToolDefinitions = [
           description: 'Optional explicit rebase-recovery mode; omitted defaults to auto-complete-when-proven.',
         },
       },
+      required: ['repository_path', 'workspace_guid'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'sync_worktree_to_target',
+    description: 'Advance this managed worktree branch onto the current integration target in-session, gated to the provider-root session; refuses on a non-active lifecycle, a paused rebase, or a held integration lock.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        repository_path: repositoryProperty,
+        workspace_guid: workspaceProperty,
+      },
+      required: ['repository_path', 'workspace_guid'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'reconcile_worktree',
+    description: 'Integrate this managed worktree HEAD into local main and keep the worktree alive, gated to the provider-root session; never pushes.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: { repository_path: repositoryProperty, workspace_guid: workspaceProperty },
       required: ['repository_path', 'workspace_guid'],
       additionalProperties: false,
     },
@@ -181,6 +208,8 @@ export function dispatchPublicTool(name: string, args: Args, dependencies: Publi
     case 'commit_and_push': return dependencies.finalizeDirect('commit-and-push', args);
     case 'push': return dependencies.finalizeDirect('push', args);
     case 'reconcile_finalization': return dependencies.reconcileFinalization(args);
+    case 'sync_worktree_to_target': return dependencies.syncWorktreeToTarget(args);
+    case 'reconcile_worktree': return dependencies.reconcileWorktree(args);
     default: throw new Error(`Unknown public workspace tool: ${name}`);
   }
 }
@@ -255,12 +284,17 @@ export function createPublicToolDependencies(
       requireProviderRoot();
       const authority = verifyDirectGitAuthority(db, {
         repositoryPath: requiredString(args, 'repository_path'),
-        workspaceGuid: requiredString(args, 'workspace_guid'),
+        workspaceGuid: optionalString(args, 'workspace_guid'),
         providerRootSessionId: identity.sessionId,
         humanChannel,
         operation,
       });
       const message = operation === 'push' ? '' : requiredString(args, 'message');
+      if (authority.checkoutMode === 'primary-unassigned') {
+        if (authority.operation === 'push') return finalizePrimaryUnassignedPush(authority);
+        if (authority.operation === 'commit-and-push') return finalizePrimaryUnassignedCommitAndPush(authority, message);
+        return finalizePrimaryUnassignedCommit(authority, message);
+      }
       return finalizeDirectAuthority(db, authority, message);
     },
     reconcileFinalization: (args) => {
@@ -271,6 +305,25 @@ export function createPublicToolDependencies(
         providerRootSessionId: identity.sessionId,
         rebaseRecovery: optionalMode(args),
       });
+    },
+    syncWorktreeToTarget: (args) => {
+      requireProviderRoot();
+      return syncWorktreeToTarget(db, {
+        repositoryPath: requiredString(args, 'repository_path'),
+        workspaceGuid: requiredString(args, 'workspace_guid'),
+        providerRootSessionId: identity.sessionId,
+      });
+    },
+    reconcileWorktree: (args) => {
+      requireProviderRoot();
+      const authority = verifyDirectGitAuthority(db, {
+        repositoryPath: requiredString(args, 'repository_path'),
+        workspaceGuid: optionalString(args, 'workspace_guid'),
+        providerRootSessionId: identity.sessionId,
+        humanChannel,
+        operation: 'reconcile',
+      });
+      return finalizeReconcile(db, authority);
     },
   };
 }

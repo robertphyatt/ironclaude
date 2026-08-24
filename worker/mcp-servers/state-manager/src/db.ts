@@ -163,6 +163,7 @@ export function migrateSchema(db: Database.Database): void {
       { name: 'testing_theatre_checked', type: 'INTEGER NOT NULL', dflt: '0' },
       { name: 'review_block_count', type: 'INTEGER NOT NULL', dflt: '0' },
       { name: 'plan_lineage', type: 'INTEGER NOT NULL', dflt: '0' },
+      { name: 'inherit_review', type: 'INTEGER NOT NULL', dflt: '0' },
     ];
 
     const currentColumns = db.prepare(`PRAGMA table_info(sessions)`).all() as Array<{name: string}>;
@@ -251,6 +252,7 @@ export function initDb(dbPath?: string): Database.Database {
       review_pending INTEGER NOT NULL DEFAULT 0,
       review_block_count INTEGER NOT NULL DEFAULT 0,
       plan_lineage INTEGER NOT NULL DEFAULT 0,
+      inherit_review INTEGER NOT NULL DEFAULT 0,
       circuit_breaker INTEGER NOT NULL DEFAULT 0,
       memory_search_required INTEGER NOT NULL DEFAULT 0,
       testing_theatre_checked INTEGER NOT NULL DEFAULT 0,
@@ -758,7 +760,7 @@ export function hasAdvisorRemediatedAtHash(
         SELECT 1 FROM tier_up_reviews AS failed_review
         WHERE failed_review.terminal_session = remediation.terminal_session
           AND failed_review.plan_lineage = remediation.plan_lineage
-          AND failed_review.verdict = 'HAS-ISSUES'
+          AND failed_review.verdict IN ('SOLID', 'HAS-ISSUES', 'top-tier-self')
           AND failed_review.id < remediation.id
       )
     LIMIT 1
