@@ -1,0 +1,43 @@
+{
+  "name": "GBTW Continuation In-Flight Suppression (G1)",
+  "goal": "Make the GBTW Stop hook's continuation check honor a live in-flight Agent subagent (backlog G1), using the completion-aware signal the tasks-in-progress block and code-review gate already use, without ever false-silencing a genuine stall.",
+  "requirements_file": "docs/plans/2026-08-28-gbtw-continuation-inflight-suppression-requirements.md",
+  "design_file": "docs/plans/2026-08-28-gbtw-continuation-inflight-suppression-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Wire completion-aware in-flight detection into the continuation suppression",
+      "description": "The GBTW continuation-check suppression (get-back-to-work-impl.sh ~:924-950, the _BG_JOB_ACTIVE block) uses an ad-hoc last-3-turns check for named waiting tools + Bash run_in_background and does NOT consult the completion-aware _gbtw_extract_in_flight (which detects Agent async_launched). So a live Agent subagent gets its 'holding' turn graded D (G1). FIX: add a pure helper _gbtw_continuation_suppressed_by_inflight() = _gbtw_review_gate_suppress true AND NOT _gbtw_should_rearm_check; replace the _BG_JOB_ACTIVE stanza with a call to it. The decision logic is unit-tested via the GBTW_TEST_MODE=1 seam; the WIRING is guarded by a structural two-grep falsifier (reverting the stanza fails it). Completion-aware -> a finished/killed subagent still fires the check (no false-silence, S1). Fail-open (S2). Scope: ONLY get-back-to-work-impl.sh + a new test in worker/hooks/tests/; leave the tasks-in-progress block, the holding/waiting last-line stanza (:958-968), the LLM prompts, and the firing matrix unchanged.",
+      "allowed_files": [
+        "worker/hooks/get-back-to-work-impl.sh",
+        "worker/hooks/tests/test-gbtw-continuation-suppression.sh"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: create worker/hooks/tests/test-gbtw-continuation-suppression.sh, modeled on tests/test-gbtw-inflight.sh: resolve SCRIPT_DIR, HOOKS_DIR=\"$SCRIPT_DIR/..\", FIXTURES_DIR=\"$SCRIPT_DIR/fixtures\"; `GBTW_TEST_MODE=1 source \"$HOOKS_DIR/get-back-to-work-claude.sh\"` (the wrapper delegates to impl and exposes the _gbtw_* helpers). PART 1 (behavioral) — assert_eq over `_gbtw_continuation_suppressed_by_inflight <fixture> <stage> <context>`: f1-subagent-in-flight.jsonl,'executing','' -> 'true'; f5-bash-bg-in-flight.jsonl,'executing','' -> 'true'; w1-monitor-last-turn.jsonl,'executing','' -> 'true'; f2-subagent-completed.jsonl,'executing','' -> '' (S1 no false-silence); f7-all-terminal-statuses.jsonl,'executing','' -> '' (killed/failed/etc.); a minimal inline STALL fixture (2 plain assistant turns, no tool, no job) ,'executing','' -> ''; f1-subagent-in-flight.jsonl,'executing',<a checkpoint/query-offload proposal string that _ic_is_antipattern_proposal recognizes — verify against tests/test-antipattern-lexicon.sh> -> '' (re-armed). PART 2 (structural wiring falsifier): assert `grep -c '_gbtw_continuation_suppressed_by_inflight \"$TRANSCRIPT_PATH\"' \"$HOOKS_DIR/get-back-to-work-impl.sh\"` == 1 (the runtime call-site; distinct from the def which uses $1/$2/$3); assert `grep -c '_BG_JOB_ACTIVE' \"$HOOKS_DIR/get-back-to-work-impl.sh\"` == 0 (the removed block).",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-gbtw-continuation-suppression.sh",
+          "expected": "FAIL - _gbtw_continuation_suppressed_by_inflight undefined (behavioral cases fail), the call-site grep == 0 (helper not wired yet), and _BG_JOB_ACTIVE grep == 3 (old block still present)."
+        },
+        {
+          "description": "GREEN part A (helper): in get-back-to-work-impl.sh after _gbtw_should_rearm_check (~:140) / near _gbtw_review_gate_suppress (:215-226) and BEFORE the GBTW_TEST_MODE shim (:228), add: _gbtw_continuation_suppressed_by_inflight() { local transcript=\"$1\" stage=\"$2\" context=\"$3\"; [ \"$(_gbtw_review_gate_suppress \"$transcript\")\" = \"true\" ] || return 0; if [ \"$(_gbtw_should_rearm_check \"$stage\" \"$context\")\" = \"true\" ]; then return 0; fi; printf 'true'; return 0; }",
+          "expected": "helper defined; behavioral fixtures resolve; the call-site grep is still 0 until Step 3."
+        },
+        {
+          "description": "GREEN part B (wire): replace the FIRE_CONTINUATION _BG_JOB_ACTIVE block at ~:924-950 (the `if [ \"$FIRE_CONTINUATION\" = \"true\" ]; then _BG_RECENT_REQ_IDS=... _BG_JOB_ACTIVE=... <inner re-arm> fi`) with: if [ \"$FIRE_CONTINUATION\" = \"true\" ] && [ \"$(_gbtw_continuation_suppressed_by_inflight \"$TRANSCRIPT_PATH\" \"$WORKFLOW_STAGE\" \"$RECENT_CONTEXT\")\" = \"true\" ]; then FIRE_CONTINUATION=\"false\"; log_hook \"GET-BACK-TO-WORK\" \"Suppressed\" \"continuation check - live in-flight job / waiting tool (completion-aware)\"; fi. Leave the holding/waiting last-line stanza (:958-968) unchanged. This removes every _BG_JOB_ACTIVE occurrence.",
+          "expected": "reverting THIS wiring flips the structural assertions: the call-site grep goes 1->0 and _BG_JOB_ACTIVE reappears (grep 0->3). The behavioral cases stay green either way (they exercise the helper directly)."
+        },
+        {
+          "description": "Run the new test (behavioral + structural all PASS), the bg-detection smoke check (a self-contained replica — a no-harm 'did I break the file' check, NOT wiring coverage), and a syntax check.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-gbtw-continuation-suppression.sh && bash /Users/roberthyatt/Code/ironclaude/worker/hooks/test-bg-detection.sh && bash -n /Users/roberthyatt/Code/ironclaude/worker/hooks/get-back-to-work-impl.sh",
+          "expected": "new test: all PASS (0 failed), including grep call-site==1 and _BG_JOB_ACTIVE==0; test-bg-detection.sh: all PASS (unchanged replica); bash -n exit 0."
+        },
+        {
+          "description": "Stage the two files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/get-back-to-work-impl.sh worker/hooks/tests/test-gbtw-continuation-suppression.sh",
+          "expected": "two files staged."
+        }
+      ]
+    }
+  ]
+}

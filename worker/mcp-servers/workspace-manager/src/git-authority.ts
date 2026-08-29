@@ -4,7 +4,7 @@ import { consumeHumanIntent, consumeMatchingHumanIntent, getAssignment, issueHum
 import { discoverRepository, isAncestor, listWorktrees, runGit } from './git.js';
 import type { Assignment, HumanIntentReceipt } from './types.js';
 
-export type DirectGitOperation = 'commit' | 'commit-and-push' | 'push' | 'reconcile';
+export type DirectGitOperation = 'commit' | 'commit-and-push' | 'push' | 'reconcile' | 'close-out' | 'confirm-resolution';
 export type DirectGitCheckoutMode = 'managed' | 'primary' | 'primary-unassigned';
 
 interface BranchEvidence {
@@ -133,6 +133,23 @@ function reconcileEvidence(value: unknown, assignment: Assignment, checkoutMode:
   const headOid = oid(source.headOid)!;
   if (checkoutMode !== 'managed') denyEvidence();
   return { ...branch, checkoutMode: 'managed', headOid };
+}
+
+/**
+ * HEAD-INDEPENDENT intent-match key for close-out. Close-out's intent is minted at
+ * prompt time — possibly on a detached HEAD (a paused rebase) or an integrated row —
+ * so it observes NO commit/HEAD state. Both issuance and the verify-time consume use
+ * this exact value (headOid '' is a sentinel, never a real oid), so their canonicalJson
+ * match holds even though the verb's recovery deliberately moves HEAD before verify.
+ * The AUTHORITY's real commit is observed live at verify (see verifyDirectGitAuthority).
+ */
+function closeOutIntentEvidence(assignment: Assignment): ReconcileEvidence {
+  return {
+    checkoutMode: 'managed',
+    canonicalBranch: assignment.branch,
+    localRef: `refs/heads/${assignment.branch}`,
+    headOid: '',
+  };
 }
 
 function remoteEvidence(value: Record<string, unknown>, assignment: Assignment, checkoutMode: DirectGitCheckoutMode): RemoteEvidence {
@@ -421,7 +438,7 @@ function observeDirectEvidence(checkout: EffectiveCheckout, operation: DirectGit
     };
   }
 
-  if (operation === 'reconcile') {
+  if (operation === 'reconcile' || operation === 'close-out' || operation === 'confirm-resolution') {
     if (checkout.mode !== 'managed') denyEvidence();
     return {
       ...branch,
@@ -488,6 +505,18 @@ export function issueDirectGitHumanIntent(
   }
   const checkout = resolveEffectiveCheckout(db, input, input.workspaceGuid);
   const assignment = checkout.assignment;
+  if (input.operation === 'close-out') {
+    // Evidence-light: bind branch identity only, observe NO commit/HEAD state, so the
+    // intent mints even on a detached-HEAD (paused-rebase) or integrated row.
+    return issueHumanIntent(db, {
+      operation: input.operation,
+      humanChannel: input.humanChannel,
+      providerRootSessionId: input.providerRootSessionId,
+      repositoryIdentity: assignment.repository_identity,
+      workspaceGuid: assignment.workspace_guid,
+      expectedEvidence: closeOutIntentEvidence(assignment),
+    });
+  }
   const evidence = observeDirectEvidence(checkout, input.operation);
   return issueHumanIntent(db, {
     operation: input.operation,
@@ -524,7 +553,7 @@ export function verifyDirectGitAuthority(
       workspaceGuid: sentinel,
       expectedEvidence: evidence,
     });
-    if (!intent) throw new Error('Direct Git operation requires a matching human intent');
+    if (!intent) throw new Error('Direct Git operation requires a matching human intent — the operator must invoke the rendered git form (/commit, /commit-and-push, or /push) as their literal prompt; free-text prose does not mint intent');
     const authority: AuthorizedDirectGitOperation = {
       operation: input.operation,
       providerRootSessionId: input.providerRootSessionId,
@@ -557,23 +586,30 @@ export function verifyDirectGitAuthority(
   } else if (input.operation === 'push') {
     evidence = pushEvidence(input.expectedEvidence, assignment, checkout.mode);
     assertPushState(checkout.path, evidence);
-  } else if (input.operation === 'reconcile') {
+  } else if (input.operation === 'reconcile' || input.operation === 'close-out' || input.operation === 'confirm-resolution') {
     evidence = reconcileEvidence(input.expectedEvidence, assignment, checkout.mode);
   } else {
     throw new Error('Direct Git authority operation is not allowed');
   }
+  // Close-out's intent is EVIDENCE-LIGHT: it was minted with a HEAD-independent
+  // branch-only key (closeOutIntentEvidence). The authority binds the live commit
+  // observed above, but the intent must be consumed by the branch-only match key
+  // (the observe path's live headOid would never equal the '' issued at prompt time).
+  const matchEvidence = (input.operation === 'close-out' && !suppliedLegacyEvidence)
+    ? closeOutIntentEvidence(assignment)
+    : evidence;
   const intentInput = {
     operation: input.operation,
     humanChannel: input.humanChannel,
     providerRootSessionId: input.providerRootSessionId,
     repositoryIdentity: assignment.repository_identity,
     workspaceGuid: assignment.workspace_guid,
-    expectedEvidence: evidence,
+    expectedEvidence: matchEvidence,
   };
   const intent = suppliedLegacyEvidence
     ? consumeHumanIntent(db, { ...intentInput, nonce: input.nonce! })
     : consumeMatchingHumanIntent(db, intentInput);
-  if (!intent) throw new Error('Direct Git operation requires a matching human intent');
+  if (!intent) throw new Error('Direct Git operation requires a matching human intent — the operator must invoke the rendered git form (/commit, /commit-and-push, or /push) as their literal prompt; free-text prose does not mint intent');
   const authority: AuthorizedDirectGitOperation = {
     operation: input.operation,
     providerRootSessionId: input.providerRootSessionId,
@@ -586,7 +622,7 @@ export function verifyDirectGitAuthority(
   Object.freeze(evidence);
   Object.freeze(authority);
   authorityDatabases.set(authority, db);
-  if (input.operation !== 'commit' && input.operation !== 'reconcile') usablePushAuthorizations.add(authority);
+  if (input.operation !== 'commit' && input.operation !== 'reconcile' && input.operation !== 'close-out' && input.operation !== 'confirm-resolution') usablePushAuthorizations.add(authority);
   return authority;
 }
 

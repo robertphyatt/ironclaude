@@ -167,6 +167,85 @@ function migrateSchema(db) {
       `);
     })();
   }
+  if (!db.prepare("SELECT 1 FROM schema_migrations WHERE version = 3").get()) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE human_intents_v3 (
+          intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          operation TEXT NOT NULL CHECK (operation IN ('use-primary-checkout', 'return-to-managed-worktree', 'commit', 'commit-and-push', 'push', 'reconcile', 'close-out')),
+          human_channel TEXT NOT NULL,
+          provider_root_session_id TEXT NOT NULL,
+          repository_identity TEXT NOT NULL,
+          workspace_guid TEXT NOT NULL,
+          expected_evidence TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          nonce TEXT NOT NULL UNIQUE,
+          issued_at TEXT NOT NULL DEFAULT (datetime('now')),
+          consumed_at TEXT
+        );
+        INSERT INTO human_intents_v3 (intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at)
+          SELECT intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at FROM human_intents;
+        DROP TABLE human_intents;
+        ALTER TABLE human_intents_v3 RENAME TO human_intents;
+        CREATE INDEX IF NOT EXISTS human_intents_lookup_idx
+          ON human_intents(operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, nonce);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (3);
+      `);
+    })();
+  }
+  if (!db.prepare("SELECT 1 FROM schema_migrations WHERE version = 4").get()) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS preserved_work (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          workspace_guid TEXT NOT NULL,
+          repository_identity TEXT NOT NULL,
+          owner_session_id TEXT,
+          kind TEXT NOT NULL CHECK (kind IN ('pending-push', 'recovery')),
+          payload TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS preserved_work_repo_idx ON preserved_work(repository_identity);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (4);
+      `);
+    })();
+  }
+  if (!db.prepare("SELECT 1 FROM schema_migrations WHERE version = 5").get()) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE human_intents_v5 (
+          intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          operation TEXT NOT NULL CHECK (operation IN ('use-primary-checkout', 'return-to-managed-worktree', 'commit', 'commit-and-push', 'push', 'reconcile', 'close-out', 'confirm-resolution')),
+          human_channel TEXT NOT NULL,
+          provider_root_session_id TEXT NOT NULL,
+          repository_identity TEXT NOT NULL,
+          workspace_guid TEXT NOT NULL,
+          expected_evidence TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          nonce TEXT NOT NULL UNIQUE,
+          issued_at TEXT NOT NULL DEFAULT (datetime('now')),
+          consumed_at TEXT
+        );
+        INSERT INTO human_intents_v5 (intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at)
+          SELECT intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at FROM human_intents;
+        DROP TABLE human_intents;
+        ALTER TABLE human_intents_v5 RENAME TO human_intents;
+        CREATE INDEX IF NOT EXISTS human_intents_lookup_idx
+          ON human_intents(operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, nonce);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (5);
+      `);
+    })();
+  }
+}
+function insertPreservedWork(db, input) {
+  const existing = db.prepare(
+    "SELECT 1 FROM preserved_work WHERE workspace_guid = ? AND kind = ? AND payload = ? AND resolved_at IS NULL"
+  ).get(input.workspaceGuid, input.kind, input.payload);
+  if (existing) return;
+  db.prepare(
+    "INSERT INTO preserved_work (workspace_guid, repository_identity, owner_session_id, kind, payload) VALUES (?, ?, ?, ?, ?)"
+  ).run(input.workspaceGuid, input.repositoryIdentity, input.ownerSessionId, input.kind, input.payload);
 }
 function initDb(dbPath) {
   const resolvedPath = dbPath || getDbPath();
@@ -600,6 +679,14 @@ var OID = /^[0-9a-f]{40,64}$/i;
 function denyEvidence() {
   throw new Error("Direct Git authority evidence changed or is malformed");
 }
+function closeOutIntentEvidence(assignment) {
+  return {
+    checkoutMode: "managed",
+    canonicalBranch: assignment.branch,
+    localRef: `refs/heads/${assignment.branch}`,
+    headOid: ""
+  };
+}
 function remoteOldOid(worktreePath, remoteName, destinationRef) {
   const output = runGit(worktreePath, ["ls-remote", "--refs", remoteName, destinationRef]).trim();
   if (output === "") return null;
@@ -736,6 +823,14 @@ function observeDirectEvidence(checkout, operation) {
       parentOid: runGit(checkout.path, ["rev-parse", "--verify", "HEAD^{commit}"]).trim()
     };
   }
+  if (operation === "reconcile" || operation === "close-out" || operation === "confirm-resolution") {
+    if (checkout.mode !== "managed") denyEvidence();
+    return {
+      ...branch,
+      checkoutMode: "managed",
+      headOid: runGit(checkout.path, ["rev-parse", "--verify", "HEAD^{commit}"]).trim()
+    };
+  }
   const remoteName = "origin";
   const remoteUrl = runGit(checkout.path, ["remote", "get-url", remoteName]).trim();
   const pushUrl = runGit(checkout.path, ["remote", "get-url", "--push", remoteName]).trim();
@@ -784,6 +879,16 @@ function issueDirectGitHumanIntent(db, input) {
   }
   const checkout = resolveEffectiveCheckout(db, input, input.workspaceGuid);
   const assignment = checkout.assignment;
+  if (input.operation === "close-out") {
+    return issueHumanIntent(db, {
+      operation: input.operation,
+      humanChannel: input.humanChannel,
+      providerRootSessionId: input.providerRootSessionId,
+      repositoryIdentity: assignment.repository_identity,
+      workspaceGuid: assignment.workspace_guid,
+      expectedEvidence: closeOutIntentEvidence(assignment)
+    });
+  }
   const evidence = observeDirectEvidence(checkout, input.operation);
   return issueHumanIntent(db, {
     operation: input.operation,
@@ -799,6 +904,24 @@ function issueDirectGitHumanIntent(db, input) {
 import { randomUUID as randomUUID2 } from "node:crypto";
 import { existsSync as existsSync2 } from "node:fs";
 import path4 from "node:path";
+
+// src/integration.ts
+function decodePushDisposition(value) {
+  if (!value) return void 0;
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed.phase !== "push-pending" && parsed.phase !== "push-succeeded" && parsed.phase !== "push-failed" || typeof parsed.candidateCommit !== "string" || typeof parsed.frozenCommit !== "string" || typeof parsed.remoteName !== "string" || typeof parsed.remoteUrl !== "string" || typeof parsed.destinationRef !== "string" || parsed.expectedRemoteOldOid !== null && typeof parsed.expectedRemoteOldOid !== "string") return void 0;
+    return parsed;
+  } catch {
+    return void 0;
+  }
+}
+function pushPendingSummary(disposition) {
+  const decoded = decodePushDisposition(disposition);
+  return decoded && (decoded.phase === "push-pending" || decoded.phase === "push-failed") ? { candidateCommit: decoded.candidateCommit, remoteUrl: decoded.remoteUrl, destinationRef: decoded.destinationRef } : void 0;
+}
+
+// src/workspace-service.ts
 function managedWorktreePath(primaryCheckoutPath, workspaceGuid) {
   return path4.join(primaryCheckoutPath, ".ironclaude", "worktrees", workspaceGuid);
 }
@@ -1295,7 +1418,20 @@ var WorkspaceService = class {
     if (this.refResolves(repository.primaryCheckoutPath, `refs/heads/${assignment.branch}`)) {
       deleteTemporaryBranch(repository.primaryCheckoutPath, assignment.branch);
     }
-    return transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, "cleaned");
+    const carried = pushPendingSummary(assignment.disposition);
+    return this.db.transaction(() => {
+      const cleaned = transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, "cleaned");
+      if (carried) {
+        insertPreservedWork(this.db, {
+          workspaceGuid: assignment.workspace_guid,
+          repositoryIdentity: repository.repositoryIdentity,
+          ownerSessionId: assignment.owner_session_id,
+          kind: "pending-push",
+          payload: JSON.stringify(carried)
+        });
+      }
+      return cleaned;
+    })();
   }
   /**
    * Deletes only a terminal assignment whose recorded recovery/integration
@@ -1411,6 +1547,29 @@ function issueHumanIntentFromHook(db, args) {
   const repositoryPath = requiredString(args, "repository_path");
   const ownerSessionId = requiredString(args, "owner_session_id");
   const repository = discoverRepository(repositoryPath);
+  if (operation === "close-out") {
+    const closeable = db.prepare(`
+      SELECT * FROM assignments
+      WHERE repository_identity = ? AND owner_session_id = ?
+        AND lifecycle_status IN ('active', 'ready_for_integration', 'integrated')
+      ORDER BY created_at ASC
+    `).all(repository.repositoryIdentity, ownerSessionId);
+    if (closeable.length !== 1) {
+      throw new Error("Human intent issuance requires exactly one closeable assignment for provider root and repository");
+    }
+    const closeableAssignment = closeable[0];
+    const requestedCloseGuid = optionalString(args, "workspace_guid");
+    if (requestedCloseGuid !== void 0 && requestedCloseGuid !== closeableAssignment.workspace_guid) {
+      throw new Error("Human intent workspace binding does not match closeable assignment");
+    }
+    return issueDirectGitHumanIntent(db, {
+      repositoryPath,
+      workspaceGuid: closeableAssignment.workspace_guid,
+      providerRootSessionId: ownerSessionId,
+      humanChannel,
+      operation: "close-out"
+    });
+  }
   const assignments = db.prepare(`
     SELECT * FROM assignments
     WHERE repository_identity = ? AND owner_session_id = ?
@@ -1436,7 +1595,7 @@ function issueHumanIntentFromHook(db, args) {
   if (requestedGuid !== void 0 && requestedGuid !== assignment.workspace_guid) {
     throw new Error("Human intent workspace binding does not match active assignment");
   }
-  if (operation === "commit" || operation === "commit-and-push" || operation === "push") {
+  if (operation === "commit" || operation === "commit-and-push" || operation === "push" || operation === "reconcile" || operation === "confirm-resolution") {
     return issueDirectGitHumanIntent(db, {
       repositoryPath,
       workspaceGuid: assignment.workspace_guid,

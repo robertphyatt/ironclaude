@@ -40,5 +40,37 @@ committed, clean worktree (commit first with `/commit`).
 
 On failure, report the exact error and preserve the assignment for recovery. A
 conflicting target advance pauses mid-rebase (parity with `/commit`) rather than
-cleanly refusing; on such an error, direct the operator to `reconcile_finalization`
-to resolve, then re-run `/reconcile`.
+cleanly refusing.
+
+## Interactive conflict resolution
+
+When reconcile pauses mid-rebase on a conflict, first check whether this is an
+interactive operator session — not a headless, autonomous, or worker context.
+Without an interactive operator to answer questions, do NOT enter this loop:
+report the paused conflict as preserved and awaiting automated resolution (M7)
+and stop, same as before.
+
+With an interactive operator present, walk each ambiguous conflicted path to
+resolution, oldest-first, one path at a time:
+
+1. Present the plain-language two-sided summary the conflict classification
+   already provides ("your reviewed work has N line(s) here; the integration
+   target has M line(s)") via `AskUserQuestion`, offering keep-mine /
+   take-target / a prose description / abort. Never hand the operator a raw
+   conflict to edit by hand, and never tell them to "resolve it and re-run."
+2. Call workspace-manager `resolve_conflict_hunk` with `repository_path`,
+   `workspace_guid`, `path`, `choice`, and `content` only when `choice` is
+   `'prose'`. Show the returned staged hunk back to the operator; they confirm,
+   revise by calling again with a corrected choice or prose, or abort
+   (`choice: 'abort'` restores the frozen pre-rebase commit — nothing lands).
+3. A result carrying fresh `conflicts` with no `candidate` means a later commit
+   in the rebase re-conflicted; continue the loop on those paths.
+4. A result carrying a `candidate` means the rebase has genuinely completed.
+   Show the operator the complete cumulative resolved diff and instruct them to
+   type `/confirm-resolution` to authorize landing it. Do not call
+   `land_resolved_conflict` yourself and do not proceed until they type it —
+   that keystroke is a separate, non-forgeable authority the `confirm-resolution`
+   skill consumes.
+
+This loop never pushes; landing through `/confirm-resolution` integrates into
+LOCAL main only, exactly like `/reconcile` itself.

@@ -215,6 +215,115 @@ export function migrateSchema(db: Database.Database): void {
       `);
     })();
   }
+
+  if (!db.prepare('SELECT 1 FROM schema_migrations WHERE version = 4').get()) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS preserved_work (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          workspace_guid TEXT NOT NULL,
+          repository_identity TEXT NOT NULL,
+          owner_session_id TEXT,
+          kind TEXT NOT NULL CHECK (kind IN ('pending-push', 'recovery')),
+          payload TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS preserved_work_repo_idx ON preserved_work(repository_identity);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (4);
+      `);
+    })();
+  }
+
+  if (!db.prepare('SELECT 1 FROM schema_migrations WHERE version = 5').get()) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE human_intents_v5 (
+          intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          operation TEXT NOT NULL CHECK (operation IN ('use-primary-checkout', 'return-to-managed-worktree', 'commit', 'commit-and-push', 'push', 'reconcile', 'close-out', 'confirm-resolution')),
+          human_channel TEXT NOT NULL,
+          provider_root_session_id TEXT NOT NULL,
+          repository_identity TEXT NOT NULL,
+          workspace_guid TEXT NOT NULL,
+          expected_evidence TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          nonce TEXT NOT NULL UNIQUE,
+          issued_at TEXT NOT NULL DEFAULT (datetime('now')),
+          consumed_at TEXT
+        );
+        INSERT INTO human_intents_v5 (intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at)
+          SELECT intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at FROM human_intents;
+        DROP TABLE human_intents;
+        ALTER TABLE human_intents_v5 RENAME TO human_intents;
+        CREATE INDEX IF NOT EXISTS human_intents_lookup_idx
+          ON human_intents(operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, nonce);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (5);
+      `);
+    })();
+  }
+}
+
+export interface PreservedWorkRow {
+  id: number;
+  workspace_guid: string;
+  repository_identity: string;
+  owner_session_id: string | null;
+  kind: 'pending-push' | 'recovery';
+  payload: string;
+}
+
+/**
+ * Durably records a carried push obligation or a Case-B recovery snapshot in a table that
+ * survives `reuseTerminalAssignment` NULLing the assignments row (C2). Idempotent on an
+ * unresolved (workspace_guid, kind, payload) triple so a crash-retry never double-lists.
+ */
+export function insertPreservedWork(
+  db: Database.Database,
+  input: { workspaceGuid: string; repositoryIdentity: string; ownerSessionId: string | null; kind: 'pending-push' | 'recovery'; payload: string },
+): void {
+  const existing = db.prepare(
+    'SELECT 1 FROM preserved_work WHERE workspace_guid = ? AND kind = ? AND payload = ? AND resolved_at IS NULL',
+  ).get(input.workspaceGuid, input.kind, input.payload);
+  if (existing) return;
+  db.prepare(
+    'INSERT INTO preserved_work (workspace_guid, repository_identity, owner_session_id, kind, payload) VALUES (?, ?, ?, ?, ?)',
+  ).run(input.workspaceGuid, input.repositoryIdentity, input.ownerSessionId, input.kind, input.payload);
+}
+
+/** Unresolved preserved-work rows for a repository + owning session, oldest first. */
+export function listUnresolvedPreservedWork(
+  db: Database.Database,
+  repositoryIdentity: string,
+  ownerSessionId: string | null,
+): PreservedWorkRow[] {
+  return db.prepare(
+    'SELECT id, workspace_guid, repository_identity, owner_session_id, kind, payload FROM preserved_work'
+    + ' WHERE repository_identity = ? AND owner_session_id IS ? AND resolved_at IS NULL ORDER BY created_at ASC, id ASC',
+  ).all(repositoryIdentity, ownerSessionId) as PreservedWorkRow[];
+}
+
+/**
+ * Marks matching unresolved preserved-work rows resolved. Scoped by kind (and optionally
+ * workspace_guid); an optional predicate does the fine-grained match (e.g. remote + ancestor)
+ * so a drain resolves the durable table row directly, not only the assignments-row disposition.
+ */
+export function resolvePreservedWork(
+  db: Database.Database,
+  criteria: { workspaceGuid?: string; kind: 'pending-push' | 'recovery'; predicate?: (row: PreservedWorkRow) => boolean },
+): void {
+  const rows = (criteria.workspaceGuid
+    ? db.prepare(
+      'SELECT id, workspace_guid, repository_identity, owner_session_id, kind, payload FROM preserved_work'
+      + ' WHERE workspace_guid = ? AND kind = ? AND resolved_at IS NULL',
+    ).all(criteria.workspaceGuid, criteria.kind)
+    : db.prepare(
+      'SELECT id, workspace_guid, repository_identity, owner_session_id, kind, payload FROM preserved_work'
+      + ' WHERE kind = ? AND resolved_at IS NULL',
+    ).all(criteria.kind)) as PreservedWorkRow[];
+  const stmt = db.prepare("UPDATE preserved_work SET resolved_at = datetime('now') WHERE id = ?");
+  for (const row of rows) {
+    if (!criteria.predicate || criteria.predicate(row)) stmt.run(row.id);
+  }
 }
 
 export function initDb(dbPath?: string): Database.Database {

@@ -1,0 +1,43 @@
+{
+  "name": "M2 Live-Proof (/reconcile + /push, v1.1.7 deploy-proof)",
+  "goal": "Live-prove the v1.1.7 never-lose-work recovery chain (reconcile preserve -> unassigned /push publish -> reconcile_finalization clear) plus reconcile/push/tombstone lanes against the DEPLOYED dist, scratch-isolated, and record a findings doc.",
+  "requirements_file": "docs/plans/2026-08-25-m2-live-proof-requirements.md",
+  "design_file": "docs/plans/2026-08-25-m2-live-proof-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Author + run the M2 live-proof driver; write findings",
+      "description": "One B-Prime driver at an absolute scratchpad path builds an airtight scratch sandbox with TWO scratch repos (A,B) + bare origins under one session SID, allocates one managed worktree per repo via the deployed CLI, then runs 10 lanes mint->consume against the deployed dist/*.js. Repo A: R-1->R-2->T-1->P-2a->P-2b->P-2c (preserved-obligation chain). Repo B: R-3->P-1. D-1/N-1 repo-independent. Each lane asserts an exact grounded outcome. Findings doc records results; R6 is documented. No product code changes; the driver IS the falsifiable proof (no TDD). Guardrails: never run git between a lane's mint and consume (evidence must byte-match); each mint cwd inside the correct repo; mint adjacent to consume (intents expire 5min); count LANES not asserts.",
+      "allowed_files": [
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/m2-live-proof-driver.sh",
+        "docs/plans/2026-08-25-m2-live-proof-findings.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Read worker/hooks/tests/test-git-authority-activation.sh in full as the skeleton: scratch HOME/WORKSPACE_MANAGER_DB_PATH, hand-built state DB (sessions professional_mode='on', wave_tasks, audit_log), run_prompt() mint helper, node --input-type=module consume heredoc, git init/init --bare/allocate fixtures."
+        },
+        {
+          "description": "Write driver sandbox + TWO-repo fixtures: set -euo pipefail; WM=/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist; HOOK=.../worker/hooks/state-activator.sh; HOOK_INTENT=$WM/hook-intent.js; INDEX=$WM/index.js; CLI=$WM/cli.js. TMP_HOME=$(mktemp -d); scratch STATE_DB with ONE sessions row (SID, professional_mode='on'); scratch WORKSPACE_DB. Build repo A (git init -b main + commit + bare origin A + push -u) and repo B identically. Allocate one managed worktree per repo: node $CLI allocate {repository_path:repoA,workspace_guid:GUID1,owner_session_id:SID,integration_target:main} (capture WT_A); same repoB/GUID2 (capture WT_B). Define mint <op> <cwd> (run_prompt shape) and consume <op> <argsJSON> [threadId] (node heredoc: deps=createPublicToolDependencies(initCliDb(),{client:'claude',sessionId:SID,invocationThreadId:(threadId||SID),source:'ppid_file'}); push/commit-and-push->deps.finalizeDirect(op,args), reconcile->deps.reconcileWorktree(args), reconcile-finalization->deps.reconcileFinalization(args); print JSON or 'ERR:'+message). pass_lane/fail_lane tallies + literal-grep helper."
+        },
+        {
+          "description": "Write the lanes (fixed order; exact grounded asserts). REPO A: R-1 (commit in WT_A -> mint reconcile <WT_A> -> consume reconcile {repoA,GUID1} -> '\"state\":\"reconciled\"' AND repoA main==WT_A HEAD AND WT_A exists; R-1 recycle returns GUID1 to active). R-2 (stage change + create untracked in WT_A -> mint commit-and-push <WT_A> -> consume commit-and-push {repoA,GUID1,message:m2} -> ERR 'Managed worktree has uncommitted changes' AND DB lifecycle_status='active' + disposition phase 'integration-pending'; rm untracked; mint reconcile <WT_A> -> consume reconcile {repoA,GUID1} -> '\"state\":\"integrated-local\"' AND disposition phase 'push-pending' PRESERVED AND repoA main==candidate). T-1 (node $CLI cleanup {repoA,GUID1,SID} capturing stderr+exit -> nonzero exit AND stderr 'Refusing to tombstone a worktree with a push-pending obligation'). P-2a (mint push <repoA> NO guid -> consume push {repoA,workspace_guid:GUID1} -> ERR 'Direct Git operation requires a matching human intent' -- intent will not bind to the terminal integrated row). P-2b (mint push <repoA> NO guid; repoA only assignment is the integrated row -> zero active -> sentinel lane; consume push {repoA} NO guid -> '\"state\":\"pushed-only\"' AND originA refs/heads/main==candidate). P-2c (NO mint; consume reconcile-finalization {repoA,GUID1} -> '\"state\":\"cleaned\"' AND disposition NULL AND lifecycle_status='active' AND WT_A exists). REPO B: R-3 (uncommitted change in WT_B -> mint reconcile <WT_B> -> consume reconcile {repoB,GUID2} -> ERR 'Managed worktree has uncommitted changes' AND repoB main unchanged). P-1 (git add+commit in WT_B -> mint push <WT_B> -> consume push {repoB,GUID2} -> '\"state\":\"pushed-only\"' AND originB refs/heads/ironclaude/<GUID2>==WT_B HEAD). REPO-INDEPENDENT: D-1 (grep -c hasPushPendingObligation/finalizeReconcile/integrated-local/'Refusing to tombstone'/'Push-only authority does not designate active managed workspace' in $INDEX all >0). N-1 (consume reconcile {repoA,GUID1} with BAD_THREAD then consume push {repoA} with BAD_THREAD -> both ERR 'Direct human authority can be consumed only by the provider-root session'). Print 'M2: <lanes_passed> passed, <lanes_failed> failed' (10 lanes); exit 1 if any failed.",
+          "expected": "driver authored; all assert literals byte-match the grounded source strings."
+        },
+        {
+          "description": "Run the driver.",
+          "command": "bash /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/m2-live-proof-driver.sh",
+          "expected": "M2: 10 passed, 0 failed (exit 0). A lane failure is a real deploy defect -> record it, do NOT edit product to force green."
+        },
+        {
+          "description": "Write docs/plans/2026-08-25-m2-live-proof-findings.md (like 2026-08-22-loop3a-live-proof-findings.md): methodology (two-repo scratch isolation, mint->consume, B-Prime, real-CLI allocate), deploy-currency counts, lane-by-lane table from ACTUAL Step-4 output (not predicted), observed behaviors (P-2a's deployed defense is the intent-binding filter upstream of the :1003 guard), defect list (empty only if all pass), explicit statement that candidate resume-push + durable-anchor teardown are unshipped v1.1.7 non-goals (CHANGELOG:48-49) and P-2b/P-2c prove the shipped chain, the R6 operator-keystroke sequence, bottom line."
+        },
+        {
+          "description": "Stage the findings doc (docs/ gitignored; driver is scratchpad, not committed).",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-08-25-m2-live-proof-findings.md",
+          "expected": "staged (professional mode blocks commit)."
+        }
+      ]
+    }
+  ]
+}

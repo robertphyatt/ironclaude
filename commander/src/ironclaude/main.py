@@ -285,6 +285,19 @@ def _assignment_recently_active(assignment: dict, now: float, recent_minutes: in
     return (now - updated_ts) < (recent_minutes * 60)
 
 
+def _has_push_pending(disposition_json: str | None) -> bool:
+    """True when the row still owes a push (mirrors TS decodePushDisposition's phase set)."""
+    if not disposition_json:
+        return False
+    try:
+        parsed = json.loads(disposition_json)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(parsed, dict) and parsed.get("phase") in (
+        "push-pending", "push-succeeded", "push-failed"
+    )
+
+
 def _is_protected(
     assignment: dict,
     worker: dict | None,
@@ -301,6 +314,8 @@ def _is_protected(
         if _assignment_recently_active(assignment, now, recent_minutes):
             return True
         if assignment.get("workspace_guid") in locked_workspace_guids:
+            return True
+        if _has_push_pending(assignment.get("disposition")):
             return True
     except Exception as exc:  # noqa: BLE001 - fail-safe: any uncertainty protects
         logger.warning(
@@ -413,6 +428,7 @@ def _reap_leaked_worktrees(
     workspace_db_path: str | None = None,
     resolve_transport=None,
     ttl_hours: float = _WORKTREE_REAP_TTL_HOURS,
+    push_pending_alerted: set[str] | None = None,
 ) -> dict:
     """Periodic sweep: release LEAKED managed worktrees. Every maintenance pass
     re-evaluates every TTL-eligible row (no "seen" bookkeeping), so a backlog of
@@ -424,9 +440,12 @@ def _reap_leaked_worktrees(
     primary-checkout session (workspace-manager mints workspace_guid ==
     owner_session_id for that case) and is never touched here.
     """
-    counts = {"released": 0, "surfaced": 0, "protected": 0, "errors": 0}
+    counts = {"released": 0, "surfaced": 0, "protected": 0, "errors": 0, "push_pending": 0}
+    if push_pending_alerted is None:
+        push_pending_alerted = set()
     if resolve_transport is None:
         resolve_transport = lambda _worker: {}  # noqa: E731 - trivial local default
+    seen_push_pending: set[str] = set()
     now = time.time()
     commander_conn.row_factory = sqlite3.Row
     try:
@@ -479,7 +498,18 @@ def _reap_leaked_worktrees(
         if _is_protected(
             assignment, worker, tmux, locked_workspace_guids, now,
         ):
-            counts["protected"] += 1
+            if _has_push_pending(assignment.get("disposition")):
+                counts["push_pending"] += 1
+                seen_push_pending.add(guid)
+                if guid not in push_pending_alerted:
+                    logger.warning(
+                        "Worktree reaper: workspace=%s repo=%s is integrated with a pending "
+                        "push — preserved, not reaped; complete the push (e.g. /push) to release it",
+                        guid, assignment.get("repository_identity"),
+                    )
+                    push_pending_alerted.add(guid)
+            else:
+                counts["protected"] += 1
             continue
 
         if not owner or worker is None:
@@ -518,6 +548,9 @@ def _reap_leaked_worktrees(
             )
             counts["errors"] += 1
 
+    # Re-arm the one-time WARNING: drop guids no longer push-pending this sweep so a
+    # resolved-then-reused workspace_guid's next stuck episode warns again.
+    push_pending_alerted.intersection_update(seen_push_pending)
     return counts
 
 
@@ -1252,6 +1285,7 @@ class IroncladeDaemon:
         # Message aging state
         self._last_message_aging_check: float = 0.0
         self._message_aging_alerted: set[str] = set()
+        self._push_pending_alerted: set[str] = set()
         # /login account-switch relay (operator-triggered; SIGHUP-restart on verified success)
         self._auth_relay = AuthRelay()
         # Usage-limit surfacing: {reset-string: last-alert-epoch} for a per-window cooldown
@@ -1619,6 +1653,7 @@ class IroncladeDaemon:
                 counts = _reap_leaked_worktrees(
                     self._db, orchestrator._workspace_client, self.tmux,
                     resolve_transport=self._worktree_reap_transport,
+                    push_pending_alerted=self._push_pending_alerted,
                 )
                 if counts["released"] or counts["surfaced"] or counts["errors"]:
                     logger.info("Maintenance: worktree reaper %s", counts)

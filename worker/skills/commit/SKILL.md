@@ -1,6 +1,6 @@
 ---
 name: commit
-description: Consume exact direct-human authority to commit and locally integrate the reviewed staged assignment without pushing
+description: Consume exact direct-human authority to commit the reviewed staged assignment in place and STAY in the worktree (no integration, no push)
 ---
 
 # Commit
@@ -32,7 +32,13 @@ consuming the single-use intent.
    workspace-manager `commit` with `repository_path` and `message`, plus
    `workspace_guid` ONLY when a managed assignment exists; for a plain primary
    checkout with no assignment, omit `workspace_guid` entirely.
-3. Require successful local finalization/integration evidence. Never call push
-   and never reinterpret missing intent as permission.
+3. Require a successful result; never call push and never reinterpret missing
+   intent as permission. For a normal active assignment this is commit-and-stay
+   (state `committed`): the worktree stays active for continued work — many commits
+   may precede any push or reconcile, and integration into local main is the
+   separate `/reconcile` verb. A `ready_for_integration` repair assignment (a prior
+   integration that hit a conflict, routed back to fresh commit authority) instead
+   completes that integration via the internal repair path and returns
+   `cleaned`/`integrated-local` — that is also success, not a failure.
 
 On failure, report exact error and preserve assignment for recovery.

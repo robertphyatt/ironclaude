@@ -38,6 +38,32 @@ export function issueHumanIntentFromHook(db: Database.Database, args: Args): unk
   const repositoryPath = requiredString(args, 'repository_path');
   const ownerSessionId = requiredString(args, 'owner_session_id');
   const repository = discoverRepository(repositoryPath);
+  if (operation === 'close-out') {
+    // Close-out is lifecycle-TOLERANT: it must enter on active, ready-for-integration
+    // (incl. a detached mid-rebase), and integrated rows (the persistent Case A state).
+    // Scoped to close-out only — the other verbs keep the active-only query below.
+    const closeable = db.prepare(`
+      SELECT * FROM assignments
+      WHERE repository_identity = ? AND owner_session_id = ?
+        AND lifecycle_status IN ('active', 'ready_for_integration', 'integrated')
+      ORDER BY created_at ASC
+    `).all(repository.repositoryIdentity, ownerSessionId) as Assignment[];
+    if (closeable.length !== 1) {
+      throw new Error('Human intent issuance requires exactly one closeable assignment for provider root and repository');
+    }
+    const closeableAssignment = closeable[0];
+    const requestedCloseGuid = optionalString(args, 'workspace_guid');
+    if (requestedCloseGuid !== undefined && requestedCloseGuid !== closeableAssignment.workspace_guid) {
+      throw new Error('Human intent workspace binding does not match closeable assignment');
+    }
+    return issueDirectGitHumanIntent(db, {
+      repositoryPath,
+      workspaceGuid: closeableAssignment.workspace_guid,
+      providerRootSessionId: ownerSessionId,
+      humanChannel,
+      operation: 'close-out',
+    });
+  }
   const assignments = db.prepare(`
     SELECT * FROM assignments
     WHERE repository_identity = ? AND owner_session_id = ?
@@ -63,7 +89,7 @@ export function issueHumanIntentFromHook(db: Database.Database, args: Args): unk
   if (requestedGuid !== undefined && requestedGuid !== assignment.workspace_guid) {
     throw new Error('Human intent workspace binding does not match active assignment');
   }
-  if (operation === 'commit' || operation === 'commit-and-push' || operation === 'push' || operation === 'reconcile') {
+  if (operation === 'commit' || operation === 'commit-and-push' || operation === 'push' || operation === 'reconcile' || operation === 'confirm-resolution') {
     return issueDirectGitHumanIntent(db, {
       repositoryPath,
       workspaceGuid: assignment.workspace_guid,

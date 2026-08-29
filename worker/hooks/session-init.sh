@@ -198,17 +198,33 @@ fi
 log_hook "session-init" "Allowed" "Session registered"
 
 # ═══ Stable hook directory ═══
-# Copy hooks to version-independent location so existing sessions survive plugin upgrades.
+# Seed the version-independent hook location on first run only. Updates are owned by
+# `make deploy-hooks` and the daemon's _deploy_worker_hooks — session-init never
+# overwrites it, so an older/staler cached session cannot revert deployed guards.
 STABLE_DIR="$HOME/.claude/ironclaude-hooks"
 HOOK_SRC_DIR="$SCRIPT_DIR"
 
 if [ -d "$HOOK_SRC_DIR" ]; then
-  mkdir -p "$STABLE_DIR"
-  # Copy all .sh files (hooks + sourced helpers like hook-logger.sh, plan-validator.sh)
-  cp -f "$HOOK_SRC_DIR"/*.sh "$STABLE_DIR/" 2>/dev/null || true
-  # Preserve executable permissions
-  chmod +x "$STABLE_DIR"/*.sh 2>/dev/null || true
-  log_hook "session-init" "Stable" "hooks copied to $STABLE_DIR"
+  # Seed-only: bootstrap the stable dir when it has no hooks yet, but NEVER overwrite an
+  # existing one. `make deploy-hooks` and the daemon's _deploy_worker_hooks (every restart)
+  # are the sole authorities that UPDATE the stable dir. This prevents an older/staler
+  # plugin-cache session from silently reverting newer deployed guards
+  # (project_hook_stable_dir_revert).
+  if ! ls "$STABLE_DIR"/*.sh >/dev/null 2>&1; then
+    mkdir -p "$STABLE_DIR"
+    # No `2>/dev/null || true` on the copy: a seed failure must be visible (R3). The
+    # failure log uses decision "ERROR" — log_hook's verbose gate silences any decision
+    # other than Blocked/ERROR unless verbose_hook_logs is set, so decision "Stable"
+    # here would be swallowed under the default config.
+    if cp -f "$HOOK_SRC_DIR"/*.sh "$STABLE_DIR/"; then
+      chmod +x "$STABLE_DIR"/*.sh 2>/dev/null || true
+      log_hook "session-init" "Stable" "seeded empty stable dir from $HOOK_SRC_DIR"
+    else
+      log_hook "session-init" "ERROR" "failed to seed stable dir $STABLE_DIR from $HOOK_SRC_DIR"
+    fi
+  else
+    log_hook "session-init" "Stable" "stable dir present — not overwriting (deploys own updates)"
+  fi
 fi
 
 # ═══ Security-guidance plugin check ═══

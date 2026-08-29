@@ -15,6 +15,17 @@ You can use the Worker alone for single-session discipline, or add the Commander
 
 ---
 
+## What's New in v1.1.7
+
+- **Human worktree lifecycle verbs.** A managed `/commit` now commits and *stays* in the worktree for continued work (verb 1), and a new `/close-out` integrates a worktree's HEAD into local `main` and tears the worktree down in one step (verb 4) — the reconcile-and-close counterpart to `/reconcile`, which keeps the worktree alive. Landing stays on local `main`; publishing remains the separate, human-only `/push`.
+- **Conflicts become a plain-language conversation, never a dead end.** Merge and rebase conflicts are detected and surfaced in plain language, then resolved interactively — the operator confirms the resolution with a non-forgeable keystroke and the reviewed work lands with its resolved content pinned by provenance and hardened against path traversal. Conflicts are never handed back to the operator to fix by hand and re-run.
+- **Never-lose-work, completed across all three teardown paths.** `/reconcile`, `/commit`, and the reaper/`tombstone` cleanup path all now *preserve* an unfulfilled push obligation instead of recycling it away; a structural backstop makes discarding one impossible, and the daemon reaper surfaces a preserved obligation **once** rather than dropping it or spamming "release failed." A stuck push is a *dropped obligation*, never lost commits — those are already on local `main`, and a manual `/push` completes it. Proven against the deployed build.
+- **The Stop hook stops fighting legitimate work.** The get-back-to-work hook's continuation check is completion-aware — it honors a live in-flight subagent instead of nagging (G1); its execution-lifecycle blocks were retoned to end context anxiety and to defer on an in-flight review; and its professional-mode bypass check no longer false-flags the sanctioned `/deactivate` commit handoff, while a mixed-turn precedence rule keeps real circumvention blocked.
+- **Guards can't be silently reverted, and free-text git verbs don't dead-end.** `session-init` now seeds the shared stable hook dir only when it's empty — an older or staler cached session can no longer overwrite newer deployed guards — and a free-text "commit and push" is guided to the rendered command form instead of refusing. The GitHub Actions CI workflow is removed (local testing only).
+- See [CHANGELOG.md](CHANGELOG.md) for full details.
+
+---
+
 ## What's New in v1.1.6
 
 - **Human-controlled git, end to end.** New human-only lanes for an unassigned primary checkout — `/commit`, `/push` (ff-only, `--force-with-lease`), and `/commit-and-push` — plus a new `/reconcile` verb that integrates a managed worktree into local `main` and *keeps the worktree alive* for continued work (publishing stays the separate `/push`). Each lane mints single-use authority from your typed command; the model issues the call but can never supply the authority that makes it succeed.

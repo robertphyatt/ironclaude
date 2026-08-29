@@ -97,7 +97,8 @@ export type HumanIntentOperation =
   | 'commit-and-push'
   | 'push'
   | 'reconcile'
-  | 'close-out';
+  | 'close-out'
+  | 'confirm-resolution';
 
 export interface HumanIntent {
   intent_id: number;

@@ -31,6 +31,10 @@ const PUBLIC_TOOLS = [
   'reconcile_finalization',
   'sync_worktree_to_target',
   'reconcile_worktree',
+  'land_resolved_conflict',
+  'resolve_conflict_hunk',
+  'close_out_worktree',
+  'list_preserved_work',
 ] as const;
 
 const INTERNAL_COMMANDS = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile', 'cleanup', 'sync', 'reap'] as const;
@@ -46,6 +50,10 @@ function publicDependencies(): PublicToolDependencies {
     reconcileFinalization: vi.fn().mockReturnValue({ state: 'integrated-local' }),
     syncWorktreeToTarget: vi.fn().mockReturnValue({ state: 'fast-forwarded' }),
     reconcileWorktree: vi.fn().mockReturnValue({ state: 'reconciled' }),
+    landResolvedConflict: vi.fn().mockReturnValue({ state: 'reconciled' }),
+    resolveConflictHunk: vi.fn().mockReturnValue({ path: 'README.md', staged: '', remaining: 0, candidate: 'a'.repeat(40) }),
+    closeOutWorktree: vi.fn().mockReturnValue({ state: 'closed-out' }),
+    listPreservedWork: vi.fn().mockReturnValue([]),
   };
 }
 
@@ -84,6 +92,13 @@ describe('workspace-manager entrypoint surfaces', () => {
       expect(definition.inputSchema.properties).not.toHaveProperty('expected_evidence');
       expect(definition.inputSchema.properties).not.toHaveProperty('human_channel');
     }
+  });
+
+  it('the commit_and_push tool description tells the agent free-text does not carry intent and to render the form', () => {
+    const def = publicToolDefinitions.find((tool) => tool.name === 'commit_and_push');
+    // The dominant surface the free-text path reads: must teach the mint path + the on-prose response.
+    expect(def?.description).toContain('free-text prose does not carry it');
+    expect(def?.description).toContain('reply with the /commit-and-push form');
   });
 
   it('keeps hook issuance out of the general CLI and exposes no internal push command', () => {
@@ -199,6 +214,46 @@ describe('workspace-manager entrypoint surfaces', () => {
     const result = dispatchPublicTool('reconcile_worktree', { marker: 'reconcile_worktree' }, dependencies);
     expect(dependencies.reconcileWorktree).toHaveBeenCalledTimes(1);
     expect(dependencies.reconcileWorktree).toHaveBeenCalledWith({ marker: 'reconcile_worktree' });
+    expect(result).toBeDefined();
+  });
+
+  it('defines land_resolved_conflict as ownership-gated with required repository_path and workspace_guid, no message', () => {
+    expect(PUBLIC_TOOL_NAMES).toContain('land_resolved_conflict');
+    const definition = publicToolDefinitions.find((tool) => tool.name === 'land_resolved_conflict');
+    expect(definition?.inputSchema.required).toEqual(['repository_path', 'workspace_guid']);
+    expect(definition?.inputSchema.properties).toHaveProperty('repository_path');
+    expect(definition?.inputSchema.properties).toHaveProperty('workspace_guid');
+    expect(definition?.inputSchema.properties).not.toHaveProperty('message');
+    expect(definition?.inputSchema.additionalProperties).toBe(false);
+  });
+
+  it('dispatches land_resolved_conflict exactly once', () => {
+    const dependencies = publicDependencies();
+    const result = dispatchPublicTool('land_resolved_conflict', { marker: 'land_resolved_conflict' }, dependencies);
+    expect(dependencies.landResolvedConflict).toHaveBeenCalledTimes(1);
+    expect(dependencies.landResolvedConflict).toHaveBeenCalledWith({ marker: 'land_resolved_conflict' });
+    expect(result).toBeDefined();
+  });
+
+  it('defines resolve_conflict_hunk as ownership-gated with required repository_path, workspace_guid, path, choice', () => {
+    expect(PUBLIC_TOOL_NAMES).toContain('resolve_conflict_hunk');
+    const definition = publicToolDefinitions.find((tool) => tool.name === 'resolve_conflict_hunk');
+    expect(definition?.inputSchema.required).toEqual(['repository_path', 'workspace_guid', 'path', 'choice']);
+    expect(definition?.inputSchema.properties).toHaveProperty('repository_path');
+    expect(definition?.inputSchema.properties).toHaveProperty('workspace_guid');
+    expect(definition?.inputSchema.properties).toHaveProperty('path');
+    expect(definition?.inputSchema.properties).toHaveProperty('choice');
+    expect(definition?.inputSchema.properties).toHaveProperty('content');
+    expect((definition?.inputSchema.properties as { choice: { enum: readonly string[] } }).choice.enum)
+      .toEqual(['keep-mine', 'take-target', 'prose', 'abort']);
+    expect(definition?.inputSchema.additionalProperties).toBe(false);
+  });
+
+  it('dispatches resolve_conflict_hunk exactly once', () => {
+    const dependencies = publicDependencies();
+    const result = dispatchPublicTool('resolve_conflict_hunk', { marker: 'resolve_conflict_hunk' }, dependencies);
+    expect(dependencies.resolveConflictHunk).toHaveBeenCalledTimes(1);
+    expect(dependencies.resolveConflictHunk).toHaveBeenCalledWith({ marker: 'resolve_conflict_hunk' });
     expect(result).toBeDefined();
   });
 

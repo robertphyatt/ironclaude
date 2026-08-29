@@ -31,6 +31,17 @@ export function runGit(cwd: string, args: readonly string[]): string {
   return result.stdout || '';
 }
 
+/**
+ * runGit with an explicit environment (e.g. GIT_INDEX_FILE pointing at a scratch
+ * index outside the worktree). Same argv-only, no-shell contract as runGit.
+ */
+export function runGitEnv(cwd: string, args: readonly string[], env: NodeJS.ProcessEnv): string {
+  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', env });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw gitError(cwd, args, result.stderr || '');
+  return result.stdout || '';
+}
+
 function absoluteFrom(cwd: string, value: string): string {
   return path.resolve(cwd, value);
 }

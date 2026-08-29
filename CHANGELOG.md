@@ -10,6 +10,85 @@
 > `vX.Y.Z`. Land changes under `## [Unreleased]` as you go, then rename that
 > heading to the new version at release time so the entry matches what shipped.
 
+## 1.1.7: worktree lifecycle verbs, plain-language conflict resolution, never-lose-work completeness, and Stop-hook hardening
+
+- The two "active" finalizer branches no longer silently destroy a push-pending obligation.
+  `finalizeReconcile`'s active branch and `finalizeDirectAuthority`'s `/commit` branch used to call
+  `recycleFinalized` unconditionally after `finalizeLocalCommit`, nulling a `push-pending`
+  disposition that `markIntegrated` produces from a pre-existing `integration-pending` row (reachable
+  when a `commit-and-push` fails the dirty gate before it can integrate). Both branches now preserve
+  the obligation: the reconcile active branch mirrors its repair branch and returns
+  `integrated-local`, and `/commit` delegates to the vetted `finishLocalIntegration` helper.
+- A structural backstop makes never-lose-work an invariant, not a convention. `recycleFinalized` and
+  `releaseFinalized` now throw when the fresh row still carries a push-pending disposition. Every
+  correct caller nulls or guards the disposition before recycling, so the throw fires only on a
+  regression — including the Commander finalize path, where a `release` would otherwise delete the
+  worktree carrying the obligation.
+- `tombstoneTerminalAssignment` — the reaper/cleanup teardown primitive the backstop did not
+  reach — now refuses to remove an integrated worktree that still carries a push-pending obligation.
+  Its integrated-row branch throws before `removeWorktree`, preserving the worktree, branch, and row,
+  via a shared `hasPushPendingObligation` predicate exported from `integration.ts`.
+- The daemon worktree reaper recognizes a push-pending row and preserves it instead of reaping it,
+  surfacing it with a one-time per-guid WARNING ("integrated with a pending push — preserved, not
+  reaped; complete the push to release it") rather than the per-cycle "release failed" spam a bare
+  throw would produce. `_is_protected` treats a push-pending disposition as a protect condition, and
+  the sweep counts and warns on it separately. `_has_push_pending` is fail-closed against a malformed
+  (valid-JSON non-object) disposition, and the one-time WARNING re-arms each sweep so a
+  resolved-then-reused workspace GUID's next stuck-push episode warns again.
+- The Commander finalize lane (`finalizeCommanderLocalCommit`) handles a preserved obligation
+  gracefully — it returns `integrated-local` instead of hitting the backstop throw — while its
+  `dispose: 'release'` close-out teardown path is untouched when no obligation is present.
+- Accepted consequence: a preserved obligation leaves the worktree integrated-but-not-recycled, and a
+  later `/commit` refuses until `/push` or `reconcile_finalization` resolves it. Silent loss becomes a
+  temporarily-blocked worktree with a documented recovery path.
+- Framing: this preserves a push *obligation* (the record that a push is owed), not committed work;
+  the integrated commits are already safe on local main, and a manual `/push` still completes it.
+- Also corrected a stale source-line comment in the reconcile authority test and tightened two
+  reconcile refusal messages for clarity.
+- Known follow-up (non-goal for the never-lose-work sub-topic): anchoring a preserved obligation onto a
+  durable recovery ref plus a resume-push path so teardown can proceed rather than block — its own loop.
+- Human worktree lifecycle verbs. A managed `/commit` becomes commit-and-stay: it creates the reviewed
+  commit and leaves the session in its worktree for continued work (verb 1), rather than tearing down
+  after every commit. A new `/close-out` (verb 4) integrates a worktree's current HEAD into local `main`
+  and performs a full teardown in one operation — the reconcile-and-close counterpart to `/reconcile`,
+  which keeps the worktree alive. Together with commit-and-push and `/push`, the four human verbs cover
+  the lifecycle: commit-and-stay, push (own branch), reconcile-keep, and close-out. Landing stays on
+  local `main`; publishing remains the separate, human-only `/push`.
+- Merge and rebase conflicts become a plain-language conversation, never a hand-off. A managed
+  integration that hits conflicts now detects them and surfaces them in plain language instead of
+  failing opaquely, then resolves them interactively: the operator picks a resolution per hunk, confirms
+  the landing with a non-forgeable keystroke (`/confirm-resolution`, reusing the keystroke-authority
+  primitive), and the reviewed work lands with the resolved content pinned by candidate provenance.
+  Conflict-file writes are hardened against path traversal, and the rebase `--ours`/`--theirs` labels are
+  corrected so keep-mine/take-target resolve the intended side. Conflicts are never returned to the
+  operator to resolve by hand and re-run.
+- Free-text git verbs are guided, not dead-ended (QW-CAP). A free-text "commit and push" (rather than
+  the rendered `/commit-and-push` form) previously dead-ended at a refusal. The commit/commit-and-push/
+  push MCP tool descriptions and both refusal strings now render the correct command form as a remedy,
+  so the operator is guided to the authorized path. The intent-mint gate is unchanged: free text is
+  never promoted to authority — the model can issue a call but never supply the authority that makes it
+  succeed (a security invariant).
+- The get-back-to-work Stop hook stops fighting legitimate work. Three tunings. (1) The continuation
+  check is completion-aware: it honors a live in-flight subagent or background job via the same signal
+  the tasks-in-progress and code-review gates use, so it no longer nags while the session correctly
+  waits on dispatched work, without ever false-silencing a genuine stall (G1). (2) The six
+  execution-lifecycle block messages are retoned to end context anxiety — a calm durability footer
+  (on-disk artifacts ARE the checkpoint) replaces the "do NOT stop" pressure — and the code-review gate
+  defers on an in-flight review. (3) The professional-mode bypass check no longer F-grades the agent for
+  directing the operator to the sanctioned, human-only `/deactivate-professional-mode` (or `/activate`)
+  skill — the intended commit handoff — via a grade-A carve-out, while a mixed-turn precedence rule keeps
+  a turn that ALSO instructs real circumvention (delete the flag/guard hook/config, a
+  `set_professional_mode` workaround, deleting counters) graded D/F regardless of the sanctioned-skill
+  mention. The carve-out is verified by a deterministic structural test plus a skip-guarded live-LLM
+  behavioral test that reproduces the false-positive and proves the fix against the real grader.
+- An older or staler cached session can no longer silently revert deployed guards. `session-init` copied
+  its own plugin-cache hooks over the shared stable hook dir on every SessionStart, so a session
+  launched against an older or staler cache overwrote newer deployed guards. It now *seeds* the stable
+  dir only when it has no hooks yet and never overwrites — `make deploy-hooks` and the daemon's
+  `_deploy_worker_hooks` (every restart) are the sole update authorities. A seed-copy failure is logged
+  (decision `ERROR`, ungated by the verbose gate) rather than silenced.
+- CI removed. The GitHub Actions CI workflow is removed; testing is local (`make test`) only.
+
 ## 1.1.6: human-controlled git lifecycle, never-lose-work worktree reaping, and probe-first daemon finalize-recovery
 
 - Human-controlled git lifecycle — commit, push, commit-and-push, and the new `/reconcile` verb.

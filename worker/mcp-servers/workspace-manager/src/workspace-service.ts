@@ -9,12 +9,14 @@ import {
   consumeMatchingHumanIntent,
   createAssignment,
   getAssignment,
+  insertPreservedWork,
   issueHumanIntent,
   reapStalePrimaryOwner,
   releasePrimaryCheckoutOwnership,
   reuseTerminalAssignment,
   transitionAssignment,
 } from './db.js';
+import { pushPendingSummary } from './integration.js';
 import {
   addWorktree,
   deleteTemporaryBranch,
@@ -736,7 +738,24 @@ export class WorkspaceService {
     if (this.refResolves(repository.primaryCheckoutPath, `refs/heads/${assignment.branch}`)) {
       deleteTemporaryBranch(repository.primaryCheckoutPath, assignment.branch);
     }
-    return transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, 'cleaned');
+    // Never-lose-work: carry any outstanding push obligation into the durable preserved_work
+    // table (drained later by a human /push of local main) rather than refusing to reclaim. The
+    // transition and the carry are one transaction so a crash never lands the row cleaned with the
+    // obligation lost from both the row and the table. pushPendingSummary excludes push-succeeded.
+    const carried = pushPendingSummary(assignment.disposition);
+    return this.db.transaction(() => {
+      const cleaned = transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, 'cleaned');
+      if (carried) {
+        insertPreservedWork(this.db, {
+          workspaceGuid: assignment.workspace_guid,
+          repositoryIdentity: repository.repositoryIdentity,
+          ownerSessionId: assignment.owner_session_id,
+          kind: 'pending-push',
+          payload: JSON.stringify(carried),
+        });
+      }
+      return cleaned;
+    })();
   }
 
   /**

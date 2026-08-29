@@ -12926,6 +12926,101 @@ function migrateSchema(db) {
       `);
     })();
   }
+  if (!db.prepare("SELECT 1 FROM schema_migrations WHERE version = 3").get()) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE human_intents_v3 (
+          intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          operation TEXT NOT NULL CHECK (operation IN ('use-primary-checkout', 'return-to-managed-worktree', 'commit', 'commit-and-push', 'push', 'reconcile', 'close-out')),
+          human_channel TEXT NOT NULL,
+          provider_root_session_id TEXT NOT NULL,
+          repository_identity TEXT NOT NULL,
+          workspace_guid TEXT NOT NULL,
+          expected_evidence TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          nonce TEXT NOT NULL UNIQUE,
+          issued_at TEXT NOT NULL DEFAULT (datetime('now')),
+          consumed_at TEXT
+        );
+        INSERT INTO human_intents_v3 (intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at)
+          SELECT intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at FROM human_intents;
+        DROP TABLE human_intents;
+        ALTER TABLE human_intents_v3 RENAME TO human_intents;
+        CREATE INDEX IF NOT EXISTS human_intents_lookup_idx
+          ON human_intents(operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, nonce);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (3);
+      `);
+    })();
+  }
+  if (!db.prepare("SELECT 1 FROM schema_migrations WHERE version = 4").get()) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS preserved_work (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          workspace_guid TEXT NOT NULL,
+          repository_identity TEXT NOT NULL,
+          owner_session_id TEXT,
+          kind TEXT NOT NULL CHECK (kind IN ('pending-push', 'recovery')),
+          payload TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS preserved_work_repo_idx ON preserved_work(repository_identity);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (4);
+      `);
+    })();
+  }
+  if (!db.prepare("SELECT 1 FROM schema_migrations WHERE version = 5").get()) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE human_intents_v5 (
+          intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          operation TEXT NOT NULL CHECK (operation IN ('use-primary-checkout', 'return-to-managed-worktree', 'commit', 'commit-and-push', 'push', 'reconcile', 'close-out', 'confirm-resolution')),
+          human_channel TEXT NOT NULL,
+          provider_root_session_id TEXT NOT NULL,
+          repository_identity TEXT NOT NULL,
+          workspace_guid TEXT NOT NULL,
+          expected_evidence TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          nonce TEXT NOT NULL UNIQUE,
+          issued_at TEXT NOT NULL DEFAULT (datetime('now')),
+          consumed_at TEXT
+        );
+        INSERT INTO human_intents_v5 (intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at)
+          SELECT intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at FROM human_intents;
+        DROP TABLE human_intents;
+        ALTER TABLE human_intents_v5 RENAME TO human_intents;
+        CREATE INDEX IF NOT EXISTS human_intents_lookup_idx
+          ON human_intents(operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, nonce);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (5);
+      `);
+    })();
+  }
+}
+function insertPreservedWork(db, input) {
+  const existing = db.prepare(
+    "SELECT 1 FROM preserved_work WHERE workspace_guid = ? AND kind = ? AND payload = ? AND resolved_at IS NULL"
+  ).get(input.workspaceGuid, input.kind, input.payload);
+  if (existing) return;
+  db.prepare(
+    "INSERT INTO preserved_work (workspace_guid, repository_identity, owner_session_id, kind, payload) VALUES (?, ?, ?, ?, ?)"
+  ).run(input.workspaceGuid, input.repositoryIdentity, input.ownerSessionId, input.kind, input.payload);
+}
+function listUnresolvedPreservedWork(db, repositoryIdentity, ownerSessionId) {
+  return db.prepare(
+    "SELECT id, workspace_guid, repository_identity, owner_session_id, kind, payload FROM preserved_work WHERE repository_identity = ? AND owner_session_id IS ? AND resolved_at IS NULL ORDER BY created_at ASC, id ASC"
+  ).all(repositoryIdentity, ownerSessionId);
+}
+function resolvePreservedWork(db, criteria) {
+  const rows = criteria.workspaceGuid ? db.prepare(
+    "SELECT id, workspace_guid, repository_identity, owner_session_id, kind, payload FROM preserved_work WHERE workspace_guid = ? AND kind = ? AND resolved_at IS NULL"
+  ).all(criteria.workspaceGuid, criteria.kind) : db.prepare(
+    "SELECT id, workspace_guid, repository_identity, owner_session_id, kind, payload FROM preserved_work WHERE kind = ? AND resolved_at IS NULL"
+  ).all(criteria.kind);
+  const stmt = db.prepare("UPDATE preserved_work SET resolved_at = datetime('now') WHERE id = ?");
+  for (const row of rows) {
+    if (!criteria.predicate || criteria.predicate(row)) stmt.run(row.id);
+  }
 }
 function initDb(dbPath) {
   const resolvedPath = dbPath || getDbPath();
@@ -13227,6 +13322,12 @@ function runGit(cwd, args) {
   if (result2.status !== 0) throw gitError(cwd, args, result2.stderr || "");
   return result2.stdout || "";
 }
+function runGitEnv(cwd, args, env) {
+  const result2 = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", env });
+  if (result2.error) throw result2.error;
+  if (result2.status !== 0) throw gitError(cwd, args, result2.stderr || "");
+  return result2.stdout || "";
+}
 function absoluteFrom(cwd, value) {
   return path2.resolve(cwd, value);
 }
@@ -13441,6 +13542,23 @@ function commitEvidence(value, assignment, checkoutMode) {
   const parentOid = oid(source.parentOid);
   if (parentRef !== "HEAD") denyEvidence();
   return { ...branch, stagedTree, parentRef: "HEAD", parentOid };
+}
+function reconcileEvidence(value, assignment, checkoutMode) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) denyEvidence();
+  const source = value;
+  exactKeys(source, ["checkoutMode", "canonicalBranch", "localRef", "headOid"]);
+  const branch = branchEvidence(source, assignment, checkoutMode);
+  const headOid = oid(source.headOid);
+  if (checkoutMode !== "managed") denyEvidence();
+  return { ...branch, checkoutMode: "managed", headOid };
+}
+function closeOutIntentEvidence(assignment) {
+  return {
+    checkoutMode: "managed",
+    canonicalBranch: assignment.branch,
+    localRef: `refs/heads/${assignment.branch}`,
+    headOid: ""
+  };
 }
 function remoteEvidence(value, assignment, checkoutMode) {
   const branch = branchEvidence(value, assignment, checkoutMode);
@@ -13685,6 +13803,14 @@ function observeDirectEvidence(checkout, operation) {
       parentOid: runGit(checkout.path, ["rev-parse", "--verify", "HEAD^{commit}"]).trim()
     };
   }
+  if (operation === "reconcile" || operation === "close-out" || operation === "confirm-resolution") {
+    if (checkout.mode !== "managed") denyEvidence();
+    return {
+      ...branch,
+      checkoutMode: "managed",
+      headOid: runGit(checkout.path, ["rev-parse", "--verify", "HEAD^{commit}"]).trim()
+    };
+  }
   const remoteName = "origin";
   const remoteUrl = runGit(checkout.path, ["remote", "get-url", remoteName]).trim();
   const pushUrl = runGit(checkout.path, ["remote", "get-url", "--push", remoteName]).trim();
@@ -13731,7 +13857,7 @@ function verifyDirectGitAuthority(db, input) {
       workspaceGuid: sentinel,
       expectedEvidence: evidence2
     });
-    if (!intent2) throw new Error("Direct Git operation requires a matching human intent");
+    if (!intent2) throw new Error("Direct Git operation requires a matching human intent \u2014 the operator must invoke the rendered git form (/commit, /commit-and-push, or /push) as their literal prompt; free-text prose does not mint intent");
     const authority2 = {
       operation: input.operation,
       providerRootSessionId: input.providerRootSessionId,
@@ -13764,19 +13890,22 @@ function verifyDirectGitAuthority(db, input) {
   } else if (input.operation === "push") {
     evidence = pushEvidence(input.expectedEvidence, assignment, checkout.mode);
     assertPushState(checkout.path, evidence);
+  } else if (input.operation === "reconcile" || input.operation === "close-out" || input.operation === "confirm-resolution") {
+    evidence = reconcileEvidence(input.expectedEvidence, assignment, checkout.mode);
   } else {
     throw new Error("Direct Git authority operation is not allowed");
   }
+  const matchEvidence = input.operation === "close-out" && !suppliedLegacyEvidence ? closeOutIntentEvidence(assignment) : evidence;
   const intentInput = {
     operation: input.operation,
     humanChannel: input.humanChannel,
     providerRootSessionId: input.providerRootSessionId,
     repositoryIdentity: assignment.repository_identity,
     workspaceGuid: assignment.workspace_guid,
-    expectedEvidence: evidence
+    expectedEvidence: matchEvidence
   };
   const intent = suppliedLegacyEvidence ? consumeHumanIntent(db, { ...intentInput, nonce: input.nonce }) : consumeMatchingHumanIntent(db, intentInput);
-  if (!intent) throw new Error("Direct Git operation requires a matching human intent");
+  if (!intent) throw new Error("Direct Git operation requires a matching human intent \u2014 the operator must invoke the rendered git form (/commit, /commit-and-push, or /push) as their literal prompt; free-text prose does not mint intent");
   const authority = {
     operation: input.operation,
     providerRootSessionId: input.providerRootSessionId,
@@ -13789,7 +13918,7 @@ function verifyDirectGitAuthority(db, input) {
   Object.freeze(evidence);
   Object.freeze(authority);
   authorityDatabases.set(authority, db);
-  if (input.operation !== "commit") usablePushAuthorizations.add(authority);
+  if (input.operation !== "commit" && input.operation !== "reconcile" && input.operation !== "close-out" && input.operation !== "confirm-resolution") usablePushAuthorizations.add(authority);
   return authority;
 }
 function revalidateAuthorizedCommitState(authority) {
@@ -13883,9 +14012,12 @@ function pushExactAuthorizedIntegratedCandidate(authority, candidateOid, targetR
 }
 
 // src/integration.ts
-import { existsSync as existsSync2 } from "node:fs";
+import { existsSync as existsSync2, rmSync, writeFileSync as writeFileSync2 } from "node:fs";
+import { tmpdir } from "node:os";
 import path4 from "node:path";
 var usedDirectAuthorities = /* @__PURE__ */ new WeakSet();
+var usedReconcileAuthorities = /* @__PURE__ */ new WeakSet();
+var usedConfirmResolutionAuthorities = /* @__PURE__ */ new WeakSet();
 function encodePushDisposition(value) {
   return JSON.stringify(value);
 }
@@ -13921,12 +14053,43 @@ function candidateRef(workspaceGuid) {
 function setDisposition(db, workspaceGuid, disposition) {
   db.prepare("UPDATE assignments SET disposition = ?, updated_at = datetime('now') WHERE workspace_guid = ?").run(disposition, workspaceGuid);
 }
+function setCurrentHead(db, workspaceGuid, currentHead) {
+  db.prepare("UPDATE assignments SET current_head = ?, updated_at = datetime('now') WHERE workspace_guid = ?").run(currentHead, workspaceGuid);
+}
 function remoteRefOid(cwd, remoteUrl, destinationRef) {
   const output = runGit(cwd, ["ls-remote", "--refs", remoteUrl, destinationRef]).trim();
   if (output === "") return null;
   const [oid2, ref, ...extra] = output.split(/\s+/);
   if (extra.length !== 0 || ref !== destinationRef) throw new Error("Finalization remote proof is malformed");
   return oid2;
+}
+function drainCarriedObligations(db, repositoryIdentity, remoteUrl, destinationRef, pushedLocalOid, primaryCheckoutPath) {
+  const rows = db.prepare(
+    "SELECT workspace_guid, disposition FROM assignments WHERE repository_identity = ? AND lifecycle_status = 'cleaned' AND disposition IS NOT NULL"
+  ).all(repositoryIdentity);
+  for (const row of rows) {
+    const disposition = decodePushDisposition(row.disposition);
+    if (disposition && disposition.remoteUrl === remoteUrl && disposition.destinationRef === destinationRef && isAncestor(primaryCheckoutPath, disposition.candidateCommit, pushedLocalOid)) {
+      setDisposition(db, row.workspace_guid, null);
+    }
+  }
+  resolvePreservedWork(db, {
+    kind: "pending-push",
+    predicate: (row) => {
+      if (row.repository_identity !== repositoryIdentity) return false;
+      let payload;
+      try {
+        payload = JSON.parse(row.payload);
+      } catch {
+        return false;
+      }
+      return payload.remoteUrl === remoteUrl && payload.destinationRef === destinationRef && typeof payload.candidateCommit === "string" && isAncestor(primaryCheckoutPath, payload.candidateCommit, pushedLocalOid);
+    }
+  });
+}
+function pushPendingSummary(disposition) {
+  const decoded = decodePushDisposition(disposition);
+  return decoded && (decoded.phase === "push-pending" || decoded.phase === "push-failed") ? { candidateCommit: decoded.candidateCommit, remoteUrl: decoded.remoteUrl, destinationRef: decoded.destinationRef } : void 0;
 }
 function cumulativeBinaryEffect(cwd, base, head) {
   return runGit(cwd, ["diff", "--binary", "--full-index", base, head]);
@@ -14129,6 +14292,9 @@ function recycleFinalized(db, repositoryPath, assignment) {
   if (!current || current.lifecycle_status !== "integrated" || !current.integrated_commit) {
     throw new Error("Recycle requires a durable integrated assignment; preserving worktree");
   }
+  if (decodePushDisposition(current.disposition)) {
+    throw new Error("Refusing to discard a push-pending obligation; resolve or push it first");
+  }
   const integratedCommit = current.integrated_commit;
   if (!isAncestor(repositoryPath, integratedCommit, targetRef(current))) {
     throw new Error("Recycle integration proof is unreachable from the integration target; preserving worktree");
@@ -14329,7 +14495,7 @@ function finalizePrimaryUnassignedCommit(authority, message) {
   const commit = createExactCommit(authority.worktreePath, evidence, message);
   return { state: "committed", commit };
 }
-function finalizePrimaryUnassignedPush(authority, hooks) {
+function finalizePrimaryUnassignedPush(authority, hooks, db) {
   if (authority.checkoutMode !== "primary-unassigned") throw new Error("Not an unassigned-primary authority");
   if (authority.operation !== "push") throw new Error("Unassigned-primary push lane pushes only");
   const evidence = authority.evidence;
@@ -14347,7 +14513,13 @@ function finalizePrimaryUnassignedPush(authority, hooks) {
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`${mutationError ? `Push command failed: ${mutationError}. ` : ""}Unassigned-primary push remote readback failed: ${detail}`);
   }
-  if (remote === evidence.localOid) return { state: "pushed-only" };
+  if (remote === evidence.localOid) {
+    if (db) {
+      const repository = discoverRepository(authority.worktreePath);
+      drainCarriedObligations(db, repository.repositoryIdentity, evidence.remoteUrl, evidence.destinationRef, evidence.localOid, repository.primaryCheckoutPath);
+    }
+    return { state: "pushed-only" };
+  }
   if (remote === evidence.expectedRemoteOldOid || remote === null) {
     throw new Error(`${mutationError ? `Push command failed: ${mutationError}. ` : ""}Unassigned-primary push remote has not proved the exact authorized commit`);
   }
@@ -14400,7 +14572,10 @@ function finalizeDirectAuthority(db, authority, message, hooks) {
       const detail = error instanceof Error ? error.message : String(error);
       throw new Error(`${mutationError2 ? `Push command failed: ${mutationError2}. ` : ""}Push-only remote readback failed: ${detail}`);
     }
-    if (remote2 === evidence.localOid) return { state: "pushed-only" };
+    if (remote2 === evidence.localOid) {
+      drainCarriedObligations(db, exact2.assignment.repository_identity, evidence.remoteUrl, evidence.destinationRef, evidence.localOid, exact2.primaryCheckoutPath);
+      return { state: "pushed-only" };
+    }
     if (remote2 === evidence.expectedRemoteOldOid || remote2 === null) {
       throw new Error(`${mutationError2 ? `Push command failed: ${mutationError2}. ` : ""}Push-only remote has not proved the exact authorized commit`);
     }
@@ -14440,6 +14615,10 @@ function finalizeDirectAuthority(db, authority, message, hooks) {
     const local2 = finalizeAttestedCandidate(db, exact.primaryCheckoutPath, exact.assignment, candidate);
     return finishLocalIntegration(db, local2);
   }
+  if (authority.operation === "commit") {
+    setCurrentHead(db, exact.assignment.workspace_guid, committed);
+    return { state: "committed", commit: committed };
+  }
   if (authority.operation === "commit-and-push") {
     const pushEvidence2 = authority.evidence;
     const pending = {
@@ -14460,10 +14639,6 @@ function finalizeDirectAuthority(db, authority, message, hooks) {
     committed,
     hooks
   );
-  if (authority.operation === "commit") {
-    recycleFinalized(db, local.repositoryPath, local.assignment);
-    return { state: "cleaned", integratedCommit: local.integratedCommit };
-  }
   const disposition = decodePushDisposition(local.assignment.disposition);
   if (!disposition || disposition.candidateCommit !== local.candidateCommit || disposition.frozenCommit !== local.frozenCommit) {
     throw new Error("Integrated candidate lacks durable push-pending proof");
@@ -14508,6 +14683,219 @@ function finalizeDirectAuthority(db, authority, message, hooks) {
   recycleFinalized(db, local.repositoryPath, local.assignment);
   return { state: "pushed", integratedCommit: local.integratedCommit };
 }
+function finalizeReconcile(db, authority) {
+  if (authority.operation !== "reconcile") throw new Error("Reconcile finalization requires reconcile authority");
+  if (authority.checkoutMode !== "managed") throw new Error("Reconcile is only valid for a managed worktree; there is no primary or unassigned reconcile lane");
+  if (usedReconcileAuthorities.has(authority)) throw new Error("Direct Git reconcile authority is single-use");
+  usedReconcileAuthorities.add(authority);
+  revalidateAuthorizedCommitState(authority);
+  const exact = exactAssignment(db, authority.worktreePath, authority.workspaceGuid, authority.providerRootSessionId);
+  const headOid = authority.evidence.headOid;
+  if (worktreeHead(authority.worktreePath) !== headOid) throw new Error("Reconcile HEAD changed since issuance; re-run /reconcile");
+  if (exact.assignment.lifecycle_status === "active") {
+    const local = finalizeLocalCommit(db, exact.primaryCheckoutPath, exact.assignment, authority.worktreePath, headOid);
+    if (decodePushDisposition(local.assignment.disposition)) {
+      return { state: "integrated-local", integratedCommit: local.integratedCommit, pushError: "Remote has not proved the exact integrated candidate" };
+    }
+    recycleFinalized(db, local.repositoryPath, local.assignment);
+    return { state: "reconciled", integratedCommit: local.integratedCommit };
+  }
+  if (exact.assignment.lifecycle_status === "ready_for_integration") {
+    try {
+      runGit(exact.primaryCheckoutPath, ["rev-parse", "--verify", `${freezeRef(exact.assignment.workspace_guid)}^{commit}`]);
+    } catch {
+      throw new Error("Ready repair lacks durable frozen finalization state");
+    }
+    runGit(authority.worktreePath, ["update-ref", candidateRef(exact.assignment.workspace_guid), headOid]);
+    const local = finalizeAttestedCandidate(db, exact.primaryCheckoutPath, exact.assignment, headOid);
+    if (decodePushDisposition(local.assignment.disposition)) {
+      return { state: "integrated-local", integratedCommit: local.integratedCommit, pushError: "Remote has not proved the exact integrated candidate" };
+    }
+    recycleFinalized(db, local.repositoryPath, local.assignment);
+    return { state: "reconciled", integratedCommit: local.integratedCommit };
+  }
+  throw new Error("Reconcile needs an active or paused-for-integration managed assignment; if a prior finalize is frozen, run reconcile_finalization first, then re-run /reconcile");
+}
+function finalizeConfirmResolution(db, authority) {
+  if (authority.operation !== "confirm-resolution") throw new Error("Confirm-resolution finalization requires confirm-resolution authority");
+  if (authority.checkoutMode !== "managed") throw new Error("Confirm-resolution is only valid for a managed worktree");
+  if (usedConfirmResolutionAuthorities.has(authority)) throw new Error("Direct Git confirm-resolution authority is single-use");
+  usedConfirmResolutionAuthorities.add(authority);
+  revalidateAuthorizedCommitState(authority);
+  const exact = exactAssignment(db, authority.worktreePath, authority.workspaceGuid, authority.providerRootSessionId);
+  if (exact.assignment.lifecycle_status !== "ready_for_integration") throw new Error("Confirm-resolution needs a paused-for-integration managed assignment");
+  try {
+    runGit(exact.primaryCheckoutPath, ["rev-parse", "--verify", `${freezeRef(exact.assignment.workspace_guid)}^{commit}`]);
+  } catch {
+    throw new Error("Ready repair lacks durable frozen finalization state");
+  }
+  const headOid = authority.evidence.headOid;
+  let registered;
+  try {
+    registered = runGit(exact.primaryCheckoutPath, ["rev-parse", "--verify", `${candidateRef(exact.assignment.workspace_guid)}^{commit}`]).trim();
+  } catch {
+    throw new Error("No confirmed resolution candidate matches the authorized HEAD; nothing landed");
+  }
+  if (registered !== headOid) throw new Error("No confirmed resolution candidate matches the authorized HEAD; nothing landed");
+  if (worktreeHead(authority.worktreePath) !== headOid) throw new Error("Resolution HEAD changed since /confirm-resolution; re-run");
+  const local = finalizeAttestedCandidate(db, exact.primaryCheckoutPath, exact.assignment, headOid);
+  if (decodePushDisposition(local.assignment.disposition)) {
+    return { state: "integrated-local", integratedCommit: local.integratedCommit, pushError: "Remote has not proved the exact integrated candidate" };
+  }
+  recycleFinalized(db, local.repositoryPath, local.assignment);
+  return { state: "reconciled", integratedCommit: local.integratedCommit };
+}
+function closeOutRelease(db, repositoryPath, assignment, recovery) {
+  const current = getAssignment(db, assignment.workspace_guid);
+  if (!current || current.lifecycle_status !== "integrated" || !current.integrated_commit) {
+    throw new Error("Close-out release requires a durable integrated assignment; preserving worktree");
+  }
+  const candidate = runGit(repositoryPath, ["rev-parse", "--verify", `${candidateRef(current.workspace_guid)}^{commit}`]).trim();
+  if (candidate !== current.integrated_commit) {
+    throw new Error("Close-out candidate proof differs; preserving worktree");
+  }
+  let pendingPush;
+  const disposition = decodePushDisposition(current.disposition);
+  if (disposition) {
+    const frozenCommit = runGit(repositoryPath, ["rev-parse", "--verify", `${freezeRef(current.workspace_guid)}^{commit}`]).trim();
+    if (disposition.candidateCommit !== current.integrated_commit || frozenCommit !== disposition.frozenCommit) {
+      throw new Error("Close-out push refs differ; preserving worktree");
+    }
+  }
+  if (disposition && disposition.phase === "push-succeeded") {
+    setDisposition(db, current.workspace_guid, null);
+  } else if (disposition) {
+    let remote = null;
+    try {
+      remote = remoteRefOid(current.worktree_path, disposition.remoteUrl, disposition.destinationRef);
+    } catch {
+    }
+    if (remote === disposition.candidateCommit) {
+      setDisposition(db, current.workspace_guid, null);
+    } else {
+      pendingPush = {
+        candidateCommit: disposition.candidateCommit,
+        remoteUrl: disposition.remoteUrl,
+        destinationRef: disposition.destinationRef
+      };
+    }
+  }
+  const head0 = worktreeHead(current.worktree_path);
+  if (head0 !== current.integrated_commit && disposition && head0 === disposition.frozenCommit && worktreeIsClean(current.worktree_path)) {
+    runGit(current.worktree_path, ["reset", "--hard", current.integrated_commit]);
+  }
+  if (!worktreeIsClean(current.worktree_path)) {
+    throw new Error("Close-out release requires a clean worktree; preserving worktree");
+  }
+  const ref = targetRef(current);
+  const actualHead = worktreeHead(current.worktree_path);
+  const integration = db.prepare(`
+    SELECT target_ref, integrated_commit FROM integration_records
+    WHERE workspace_guid = ? AND repository_identity = ?
+  `).get(current.workspace_guid, current.repository_identity);
+  if (!integration || integration.target_ref !== ref || integration.integrated_commit !== current.integrated_commit || actualHead !== current.integrated_commit || !isAncestor(repositoryPath, current.integrated_commit, ref)) {
+    throw new Error("Close-out integration proof is unreachable from the integration target; preserving worktree");
+  }
+  removeWorktree(repositoryPath, current.worktree_path);
+  deleteTemporaryBranch(repositoryPath, current.branch);
+  db.transaction(() => {
+    transitionAssignment(db, current.workspace_guid, "integrated", "cleaned");
+    if (pendingPush) {
+      insertPreservedWork(db, {
+        workspaceGuid: current.workspace_guid,
+        repositoryIdentity: current.repository_identity,
+        ownerSessionId: current.owner_session_id,
+        kind: "pending-push",
+        payload: JSON.stringify(pendingPush)
+      });
+    }
+  })();
+  return {
+    state: "closed-out",
+    integratedCommit: current.integrated_commit,
+    ...pendingPush ? { pendingPush } : {},
+    ...recovery ? { recovery } : {}
+  };
+}
+function snapshotResidualIfDirty(db, exact) {
+  const worktree = exact.assignment.worktree_path;
+  if (worktreeIsClean(worktree)) return void 0;
+  const residualFiles = runGit(worktree, ["status", "--porcelain=v1", "--untracked-files=all"]).split("\n").filter((line) => line.trim() !== "").length;
+  const tmpIndex = path4.join(tmpdir(), `ironclaude-closeout-index-${exact.assignment.workspace_guid}-${process.pid}`);
+  const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
+  let snapshot;
+  try {
+    runGitEnv(worktree, ["read-tree", "HEAD"], env);
+    runGitEnv(worktree, ["add", "-A"], env);
+    const tree = runGitEnv(worktree, ["write-tree"], env).trim();
+    snapshot = runGitEnv(worktree, ["commit-tree", tree, "-p", "HEAD", "-m", "ironclaude: close-out residual snapshot"], env).trim();
+  } finally {
+    try {
+      rmSync(tmpIndex, { force: true });
+    } catch {
+    }
+  }
+  const recoveryRef = `refs/ironclaude/recovery/${exact.assignment.workspace_guid}-${snapshot}`;
+  try {
+    runGit(exact.primaryCheckoutPath, ["update-ref", recoveryRef, snapshot, ""]);
+  } catch (error) {
+    const existing = runGit(exact.primaryCheckoutPath, ["rev-parse", "--verify", `${recoveryRef}^{commit}`]).trim();
+    if (existing !== snapshot) throw error;
+  }
+  const payload = JSON.stringify({ ref: recoveryRef, residualFiles });
+  db.prepare("UPDATE assignments SET recovery_ref = ?, updated_at = datetime('now') WHERE workspace_guid = ?").run(recoveryRef, exact.assignment.workspace_guid);
+  insertPreservedWork(db, {
+    workspaceGuid: exact.assignment.workspace_guid,
+    repositoryIdentity: exact.assignment.repository_identity,
+    ownerSessionId: exact.assignment.owner_session_id,
+    kind: "recovery",
+    payload
+  });
+  runGit(exact.primaryCheckoutPath, ["rev-parse", "--verify", `${recoveryRef}^{commit}`]);
+  runGit(worktree, ["reset", "--hard", "HEAD"]);
+  runGit(worktree, ["clean", "-fd"]);
+  return { ref: recoveryRef, residualFiles };
+}
+var usedCloseOutAuthorities = /* @__PURE__ */ new WeakSet();
+function finalizeCloseOut(db, authority) {
+  if (authority.operation !== "close-out") throw new Error("Close-out finalization requires close-out authority");
+  if (authority.checkoutMode !== "managed") throw new Error("Close-out is only valid for a managed worktree; there is no primary or unassigned close-out lane");
+  if (usedCloseOutAuthorities.has(authority)) throw new Error("Direct Git close-out authority is single-use");
+  usedCloseOutAuthorities.add(authority);
+  revalidateAuthorizedCommitState(authority);
+  const exact = exactAssignment(db, authority.worktreePath, authority.workspaceGuid, authority.providerRootSessionId);
+  const headOid = authority.evidence.headOid;
+  if (worktreeHead(authority.worktreePath) !== headOid) throw new Error("Close-out HEAD changed since verification; re-run /close-out");
+  const recovery = snapshotResidualIfDirty(db, exact);
+  if (exact.assignment.lifecycle_status === "active") {
+    const local = finalizeLocalCommit(db, exact.primaryCheckoutPath, exact.assignment, authority.worktreePath, headOid);
+    return closeOutRelease(db, local.repositoryPath, local.assignment, recovery);
+  }
+  if (exact.assignment.lifecycle_status === "ready_for_integration") {
+    let frozen;
+    try {
+      frozen = runGit(exact.primaryCheckoutPath, ["rev-parse", "--verify", `${freezeRef(exact.assignment.workspace_guid)}^{commit}`]).trim();
+    } catch {
+      throw new Error("Close-out ready repair lacks durable frozen finalization state");
+    }
+    const target = targetRef(exact.assignment);
+    const expectedTarget = runGit(exact.primaryCheckoutPath, ["rev-parse", "--verify", `${target}^{commit}`]).trim();
+    const reviewedEffect = cumulativeBinaryEffect(authority.worktreePath, exact.assignment.base_commit, frozen);
+    if (!isAncestor(exact.primaryCheckoutPath, expectedTarget, headOid) || cumulativeBinaryEffect(authority.worktreePath, expectedTarget, headOid) !== reviewedEffect) {
+      return {
+        state: "rebase-recovery-repair-required",
+        detail: "Close-out: the rebase resolution changed the reviewed content (or HEAD is not a descendant of the integration target); preserved for automated resolution (M7). Not an operator task."
+      };
+    }
+    runGit(authority.worktreePath, ["update-ref", candidateRef(exact.assignment.workspace_guid), headOid]);
+    const local = finalizeAttestedCandidate(db, exact.primaryCheckoutPath, exact.assignment, headOid);
+    return closeOutRelease(db, local.repositoryPath, local.assignment, recovery);
+  }
+  if (exact.assignment.lifecycle_status === "integrated") {
+    return closeOutRelease(db, exact.primaryCheckoutPath, exact.assignment, recovery);
+  }
+  throw new Error("Close-out needs an active, ready, or integrated managed assignment");
+}
 function recoverRebaseInProgress(db, exact, mode) {
   const assignment = exact.assignment;
   const worktree = assignment.worktree_path;
@@ -14523,14 +14911,22 @@ function recoverRebaseInProgress(db, exact, mode) {
   }
   const unresolved = runGit(worktree, ["diff", "--name-only", "--diff-filter=U"]).trim();
   if (unresolved !== "") {
-    throw new Error(`Rebase recovery stopped: unresolved conflicts remain; preserving worktree. Unmerged paths: ${unresolved.split("\n").join(", ")}`);
+    return {
+      state: "rebase-paused-conflict",
+      conflicts: classifyRebaseConflicts(worktree),
+      detail: "Close-out/reconcile paused: unresolved conflicts remain; automated resolution pending (M7c). Worktree preserved; nothing integrated. Not an operator task."
+    };
   }
   try {
     runGit(worktree, ["-c", "core.editor=true", "rebase", "--continue"]);
   } catch (error) {
     const reconflict = runGit(worktree, ["diff", "--name-only", "--diff-filter=U"]).trim();
     if (reconflict !== "") {
-      throw new Error(`Rebase recovery stopped: continuing re-conflicted; preserving worktree. Unmerged paths: ${reconflict.split("\n").join(", ")}`);
+      return {
+        state: "rebase-paused-conflict",
+        conflicts: classifyRebaseConflicts(worktree),
+        detail: "Close-out/reconcile paused: continuing re-conflicted; automated resolution pending (M7c). Worktree preserved; nothing integrated. Not an operator task."
+      };
     }
     throw error;
   }
@@ -14551,6 +14947,99 @@ function recoverRebaseInProgress(db, exact, mode) {
   runGit(worktree, ["update-ref", candidateRef(assignment.workspace_guid), head]);
   const local = finalizeAttestedCandidate(db, primary, assignment, head);
   return finishLocalIntegration(db, local);
+}
+function classifyRebaseConflicts(worktree) {
+  const unmerged = runGit(worktree, ["diff", "--name-only", "--diff-filter=U"]).trim();
+  if (unmerged === "") return [];
+  return unmerged.split("\n").map((path7) => {
+    const xy = runGit(worktree, ["status", "--porcelain=v1", "--", path7]).slice(0, 2);
+    let binary = false;
+    try {
+      binary = /^-\t-/.test(runGit(worktree, ["diff", "--numstat", `:2:${path7}`, `:3:${path7}`]).trim());
+    } catch {
+      binary = false;
+    }
+    const conflictClass = binary ? "binary" : xy === "UU" ? "overlap" : xy === "AA" ? "add-add" : xy === "UD" || xy === "DU" ? "delete-modify" : "other";
+    const stageLines = (stage) => {
+      try {
+        return runGit(worktree, ["show", `:${stage}:${path7}`]).split("\n").length;
+      } catch {
+        return 0;
+      }
+    };
+    const ours = stageLines(2);
+    const theirs = stageLines(3);
+    const summary = `${path7}: your reviewed work has ${theirs} line(s) here; the integration target has ${ours} line(s) (${conflictClass}).`;
+    return { path: path7, conflictClass, summary };
+  });
+}
+function resolveConflictHunk(db, input) {
+  const exact = exactAssignment(db, input.repositoryPath, input.workspaceGuid, input.providerRootSessionId);
+  const assignment = exact.assignment;
+  if (assignment.lifecycle_status !== "ready_for_integration") {
+    throw new Error("Resolve-conflict-hunk needs a paused-for-integration managed assignment");
+  }
+  const worktree = assignment.worktree_path;
+  const rebaseDir = runGit(worktree, ["rev-parse", "--git-path", "rebase-merge"]).trim();
+  if (!existsSync2(path4.resolve(worktree, rebaseDir))) {
+    throw new Error("Resolve-conflict-hunk requires a paused rebase; preserving worktree");
+  }
+  if (input.choice === "abort") {
+    return recoverRebaseInProgress(db, exact, "abort");
+  }
+  const unmergedPaths = runGit(worktree, ["diff", "--name-only", "--diff-filter=U", "-z"]).split("\0").filter((entry) => entry !== "");
+  if (!unmergedPaths.includes(input.path)) {
+    throw new Error(`resolve_conflict_hunk only resolves a currently-conflicted path; '${input.path}' is not in the unmerged set`);
+  }
+  if (input.choice === "keep-mine" || input.choice === "take-target") {
+    const stageFlag = input.choice === "keep-mine" ? "--theirs" : "--ours";
+    try {
+      runGit(worktree, ["checkout", stageFlag, "--", input.path]);
+    } catch {
+      throw new Error(
+        `Cannot resolve ${input.path} with '${input.choice}': one side deleted this path (delete-modify conflict has no checkout stage for it); resolve it explicitly with choice 'prose', or abort to accept the deletion (preserve-and-defer).`
+      );
+    }
+  } else if (input.choice === "prose") {
+    if (input.content === void 0) throw new Error("choice 'prose' requires content");
+    writeFileSync2(path4.resolve(worktree, input.path), input.content);
+  } else {
+    throw new Error(`Unknown resolve-conflict-hunk choice: ${input.choice}`);
+  }
+  runGit(worktree, ["add", "--", input.path]);
+  const staged = runGit(worktree, ["diff", "--cached", "--", input.path]);
+  const unmergedAfterStage = runGit(worktree, ["diff", "--name-only", "--diff-filter=U"]).trim();
+  if (unmergedAfterStage !== "") {
+    return { path: input.path, staged, remaining: unmergedAfterStage.split("\n").filter((line) => line !== "").length };
+  }
+  try {
+    runGit(worktree, ["-c", "core.editor=true", "rebase", "--continue"]);
+  } catch {
+    const reconflict = runGit(worktree, ["diff", "--name-only", "--diff-filter=U"]).trim();
+    const remaining = reconflict === "" ? 0 : reconflict.split("\n").filter((line) => line !== "").length;
+    return { path: input.path, staged, remaining, conflicts: classifyRebaseConflicts(worktree) };
+  }
+  const stillRebaseDir = runGit(worktree, ["rev-parse", "--git-path", "rebase-merge"]).trim();
+  const rebaseStillInProgress = existsSync2(path4.resolve(worktree, stillRebaseDir));
+  let attachedHead = true;
+  try {
+    runGit(worktree, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+  } catch {
+    attachedHead = false;
+  }
+  if (rebaseStillInProgress || !attachedHead) {
+    const reconflict = runGit(worktree, ["diff", "--name-only", "--diff-filter=U"]).trim();
+    const remaining = reconflict === "" ? 0 : reconflict.split("\n").filter((line) => line !== "").length;
+    return {
+      path: input.path,
+      staged,
+      remaining,
+      ...reconflict !== "" ? { conflicts: classifyRebaseConflicts(worktree) } : {}
+    };
+  }
+  const head = worktreeHead(worktree);
+  runGit(worktree, ["update-ref", candidateRef(assignment.workspace_guid), head]);
+  return { path: input.path, staged, remaining: 0, candidate: head };
 }
 function classifyRebaseState(worktree) {
   const rebaseDir = runGit(worktree, ["rev-parse", "--git-path", "rebase-merge"]).trim();
@@ -15385,7 +15874,20 @@ var WorkspaceService = class {
     if (this.refResolves(repository.primaryCheckoutPath, `refs/heads/${assignment.branch}`)) {
       deleteTemporaryBranch(repository.primaryCheckoutPath, assignment.branch);
     }
-    return transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, "cleaned");
+    const carried = pushPendingSummary(assignment.disposition);
+    return this.db.transaction(() => {
+      const cleaned = transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, "cleaned");
+      if (carried) {
+        insertPreservedWork(this.db, {
+          workspaceGuid: assignment.workspace_guid,
+          repositoryIdentity: repository.repositoryIdentity,
+          ownerSessionId: assignment.owner_session_id,
+          kind: "pending-push",
+          payload: JSON.stringify(carried)
+        });
+      }
+      return cleaned;
+    })();
   }
   /**
    * Deletes only a terminal assignment whose recorded recovery/integration
@@ -15488,7 +15990,12 @@ var PUBLIC_TOOL_NAMES = [
   "commit_and_push",
   "push",
   "reconcile_finalization",
-  "sync_worktree_to_target"
+  "sync_worktree_to_target",
+  "reconcile_worktree",
+  "land_resolved_conflict",
+  "resolve_conflict_hunk",
+  "close_out_worktree",
+  "list_preserved_work"
 ];
 var repositoryProperty = { type: "string", description: "Path within the target Git repository." };
 var workspaceProperty = { type: "string", description: "Durable IronClaude workspace GUID." };
@@ -15560,7 +16067,7 @@ var publicToolDefinitions = [
   },
   ...["commit", "commit_and_push", "push"].map((name) => ({
     name,
-    description: `Consume exact human intent and perform direct ${name.replaceAll("_", "-")} authority.`,
+    description: `Consume exact human intent and perform direct ${name.replaceAll("_", "-")} authority. Intent exists ONLY when the operator typed /${name.replaceAll("_", "-")} as their literal prompt this turn; free-text prose does not carry it. On a prose request, reply with the /${name.replaceAll("_", "-")} form for the operator to type \u2014 do NOT call this tool (it refuses without intent). After the verb completes, carry forward any remaining instruction from the prose.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -15602,6 +16109,66 @@ var publicToolDefinitions = [
       required: ["repository_path", "workspace_guid"],
       additionalProperties: false
     }
+  },
+  {
+    name: "reconcile_worktree",
+    description: "Integrate this managed worktree HEAD into local main and keep the worktree alive, gated to the provider-root session; never pushes.",
+    inputSchema: {
+      type: "object",
+      properties: { repository_path: repositoryProperty, workspace_guid: workspaceProperty },
+      required: ["repository_path", "workspace_guid"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "land_resolved_conflict",
+    description: "Land an operator-confirmed conflict resolution into local main via the isRepair channel; consumes /confirm-resolution intent, requires the registered candidate to equal the authorized HEAD; keeps the worktree; never pushes.",
+    inputSchema: {
+      type: "object",
+      properties: { repository_path: repositoryProperty, workspace_guid: workspaceProperty },
+      required: ["repository_path", "workspace_guid"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "resolve_conflict_hunk",
+    description: "Turn one per-hunk operator choice into staged resolved bytes on a paused integration rebase, gated to the provider-root session; drives rebase --continue when the hunk was the last unresolved path. NEVER lands and NEVER pushes \u2014 landing a completed rebase is a separate tool (land_resolved_conflict).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repository_path: repositoryProperty,
+        workspace_guid: workspaceProperty,
+        path: { type: "string", description: "The single unmerged path this call resolves." },
+        choice: {
+          type: "string",
+          enum: ["keep-mine", "take-target", "prose", "abort"],
+          description: "'keep-mine' keeps the reviewed work; 'take-target' takes the drifted integration target; 'prose' writes the given content verbatim; 'abort' aborts the paused rebase, restoring the frozen pre-rebase commit."
+        },
+        content: { type: "string", description: "Required, and used only, when choice is 'prose'." }
+      },
+      required: ["repository_path", "workspace_guid", "path", "choice"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "close_out_worktree",
+    description: "Integrate this managed worktree HEAD into local main and FULLY tear the worktree down (remove worktree + temp branch), auto-resolving push-pending/dirty/recoverable-rebase; gated to the provider-root session; never pushes.",
+    inputSchema: {
+      type: "object",
+      properties: { repository_path: repositoryProperty, workspace_guid: workspaceProperty },
+      required: ["repository_path", "workspace_guid"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "list_preserved_work",
+    description: 'List work preserved on terminal rows for this repository and provider-root session: push obligations carried by a close-out (kind "pending-push") and residual snapshotted to a recovery ref (kind "recovery").',
+    inputSchema: {
+      type: "object",
+      properties: { repository_path: repositoryProperty },
+      required: ["repository_path"],
+      additionalProperties: false
+    }
   }
 ];
 function requiredString(args, key) {
@@ -15613,6 +16180,13 @@ function optionalString(args, key) {
   const value = args[key];
   if (value === void 0) return void 0;
   if (typeof value !== "string" || value.length === 0) throw new Error(`${key} must be a non-empty string`);
+  return value;
+}
+function requiredConflictHunkChoice(args) {
+  const value = args.choice;
+  if (value !== "keep-mine" && value !== "take-target" && value !== "prose" && value !== "abort") {
+    throw new Error("choice must be 'keep-mine', 'take-target', 'prose', or 'abort'");
+  }
   return value;
 }
 function optionalMode(args) {
@@ -15645,6 +16219,16 @@ function dispatchPublicTool(name, args, dependencies) {
       return dependencies.reconcileFinalization(args);
     case "sync_worktree_to_target":
       return dependencies.syncWorktreeToTarget(args);
+    case "reconcile_worktree":
+      return dependencies.reconcileWorktree(args);
+    case "land_resolved_conflict":
+      return dependencies.landResolvedConflict(args);
+    case "resolve_conflict_hunk":
+      return dependencies.resolveConflictHunk(args);
+    case "close_out_worktree":
+      return dependencies.closeOutWorktree(args);
+    case "list_preserved_work":
+      return dependencies.listPreservedWork(args);
     default:
       throw new Error(`Unknown public workspace tool: ${name}`);
   }
@@ -15718,7 +16302,7 @@ function createPublicToolDependencies(db, identity) {
       });
       const message = operation === "push" ? "" : requiredString(args, "message");
       if (authority.checkoutMode === "primary-unassigned") {
-        if (authority.operation === "push") return finalizePrimaryUnassignedPush(authority);
+        if (authority.operation === "push") return finalizePrimaryUnassignedPush(authority, void 0, db);
         if (authority.operation === "commit-and-push") return finalizePrimaryUnassignedCommitAndPush(authority, message);
         return finalizePrimaryUnassignedCommit(authority, message);
       }
@@ -15740,6 +16324,144 @@ function createPublicToolDependencies(db, identity) {
         workspaceGuid: requiredString(args, "workspace_guid"),
         providerRootSessionId: identity.sessionId
       });
+    },
+    reconcileWorktree: (args) => {
+      requireProviderRoot();
+      const authority = verifyDirectGitAuthority(db, {
+        repositoryPath: requiredString(args, "repository_path"),
+        workspaceGuid: optionalString(args, "workspace_guid"),
+        providerRootSessionId: identity.sessionId,
+        humanChannel,
+        operation: "reconcile"
+      });
+      return finalizeReconcile(db, authority);
+    },
+    landResolvedConflict: (args) => {
+      requireProviderRoot();
+      const authority = verifyDirectGitAuthority(db, {
+        repositoryPath: requiredString(args, "repository_path"),
+        workspaceGuid: optionalString(args, "workspace_guid"),
+        providerRootSessionId: identity.sessionId,
+        humanChannel,
+        operation: "confirm-resolution"
+      });
+      return finalizeConfirmResolution(db, authority);
+    },
+    resolveConflictHunk: (args) => {
+      requireProviderRoot();
+      return resolveConflictHunk(db, {
+        repositoryPath: requiredString(args, "repository_path"),
+        workspaceGuid: requiredString(args, "workspace_guid"),
+        providerRootSessionId: identity.sessionId,
+        path: requiredString(args, "path"),
+        choice: requiredConflictHunkChoice(args),
+        content: optionalString(args, "content")
+      });
+    },
+    closeOutWorktree: (args) => {
+      requireProviderRoot();
+      const repositoryPath = requiredString(args, "repository_path");
+      const workspaceGuid = requiredString(args, "workspace_guid");
+      const existing = getAssignment(db, workspaceGuid);
+      if (existing && existing.lifecycle_status === "integrated") {
+        const repo = discoverRepository(repositoryPath);
+        const present = fs2.existsSync(existing.worktree_path) && worktreeExists(repo.primaryCheckoutPath, existing.worktree_path);
+        if (!present) {
+          const carried = pushPendingSummary(existing.disposition);
+          const cleaned = service.cleanupWorkspace({ repositoryPath, workspaceGuid, ownerSessionId: identity.sessionId });
+          return {
+            state: "closed-out",
+            integratedCommit: cleaned.integrated_commit ?? existing.integrated_commit ?? void 0,
+            ...carried ? { pendingPush: carried } : {}
+          };
+        }
+      }
+      const status = reconcileFinalization(db, {
+        repositoryPath,
+        workspaceGuid,
+        providerRootSessionId: identity.sessionId,
+        rebaseRecovery: "status"
+      });
+      if (status.state === "rebase-paused-conflict") {
+        return {
+          state: "rebase-paused-conflict",
+          detail: "Close-out paused: a rebase conflict needs automated resolution (pending); worktree preserved. Not an operator task."
+        };
+      }
+      if (status.state === "rebase-paused-clean") {
+        try {
+          const cont = reconcileFinalization(db, {
+            repositoryPath,
+            workspaceGuid,
+            providerRootSessionId: identity.sessionId,
+            rebaseRecovery: "continue"
+          });
+          if (cont.state !== "cleaned" && cont.state !== "integrated-local") {
+            return cont;
+          }
+        } catch (error) {
+          const probe = reconcileFinalization(db, {
+            repositoryPath,
+            workspaceGuid,
+            providerRootSessionId: identity.sessionId,
+            rebaseRecovery: "status"
+          });
+          if (probe.state === "rebase-paused-conflict" || probe.state === "rebase-paused-clean") {
+            return {
+              state: probe.state,
+              detail: `Close-out paused: the rebase needs automated resolution (pending); worktree preserved. Not an operator task. (${error instanceof Error ? error.message : String(error)})`
+            };
+          }
+          throw error;
+        }
+      }
+      const authority = verifyDirectGitAuthority(db, {
+        repositoryPath,
+        workspaceGuid,
+        providerRootSessionId: identity.sessionId,
+        humanChannel,
+        operation: "close-out"
+      });
+      return finalizeCloseOut(db, authority);
+    },
+    listPreservedWork: (args) => {
+      const repository = discoverRepository(requiredString(args, "repository_path"));
+      const preserved = [];
+      const pendingPushGuids = /* @__PURE__ */ new Set();
+      const emittedRefs = /* @__PURE__ */ new Set();
+      for (const row of listUnresolvedPreservedWork(db, repository.repositoryIdentity, identity.sessionId)) {
+        let payload;
+        try {
+          payload = JSON.parse(row.payload);
+        } catch {
+          continue;
+        }
+        if (row.kind === "pending-push") {
+          preserved.push({ workspace_guid: row.workspace_guid, kind: "pending-push", destinationRef: payload.destinationRef });
+          pendingPushGuids.add(row.workspace_guid);
+        } else if (payload.ref) {
+          preserved.push({ workspace_guid: row.workspace_guid, kind: "recovery", ref: payload.ref });
+          emittedRefs.add(payload.ref);
+        }
+      }
+      const rows = db.prepare(`
+        SELECT workspace_guid, disposition, recovery_ref FROM assignments
+        WHERE repository_identity = ? AND owner_session_id = ?
+          AND lifecycle_status IN ('cleaned', 'abandoned')
+          AND (disposition IS NOT NULL OR recovery_ref IS NOT NULL)
+        ORDER BY created_at ASC
+      `).all(repository.repositoryIdentity, identity.sessionId);
+      for (const row of rows) {
+        const summary = pushPendingSummary(row.disposition);
+        if (summary && !pendingPushGuids.has(row.workspace_guid)) {
+          preserved.push({ workspace_guid: row.workspace_guid, kind: "pending-push", destinationRef: summary.destinationRef });
+        }
+        if (row.recovery_ref && !emittedRefs.has(row.recovery_ref)) {
+          preserved.push({ workspace_guid: row.workspace_guid, kind: "recovery", ref: row.recovery_ref });
+          emittedRefs.add(row.recovery_ref);
+        }
+      }
+      return preserved;
     }
   };
 }

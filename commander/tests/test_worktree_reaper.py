@@ -29,6 +29,7 @@ the `reap` call itself fails, the same treatment already specified for a
 stale `integration_locks` row.
 """
 
+import json
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -38,6 +39,7 @@ import pytest
 
 from ironclaude.main import (
     _find_leaked_worktrees,
+    _has_push_pending,
     _is_protected,
     _reap_leaked_worktrees,
     _sync_idle_worktrees,
@@ -48,6 +50,11 @@ from ironclaude.workspace_client import WorkspaceClient
 _W1 = "11111111-1111-4111-8111-111111111111"
 _W2 = "22222222-2222-4222-8222-222222222222"
 _OWNER = "33333333-3333-4333-8333-333333333333"
+_PP_DISPOSITION = json.dumps({
+    "phase": "push-pending", "candidateCommit": "abc123", "frozenCommit": "def456",
+    "remoteName": "origin", "remoteUrl": "https://example.invalid/r.git",
+    "destinationRef": "refs/heads/main", "expectedRemoteOldOid": "000",
+})
 
 
 def _make_commander_db(path):
@@ -135,20 +142,115 @@ def _insert_worker(conn, id_, *, status, finished_ago=None, workspace_guid=None,
 
 def _insert_assignment(conn, guid, *, repository_identity="repo-id", owner_session_id=None,
                         lifecycle_status="active", integration_target="main",
-                        current_head="abc123", updated_ago=None, worktree_path="/wt"):
+                        current_head="abc123", updated_ago=None, worktree_path="/wt",
+                        disposition=None):
     updated_sql = f"datetime('now', '-{updated_ago}')" if updated_ago else "datetime('now')"
     conn.execute(
         f"INSERT INTO assignments (workspace_guid, repository_identity, worktree_path, "
         f"branch, base_commit, current_head, owner_session_id, lifecycle_status, "
-        f"integration_target, updated_at) VALUES (?, ?, ?, 'ironclaude/x', 'abc123', "
-        f"?, ?, ?, ?, {updated_sql})",
+        f"integration_target, disposition, updated_at) VALUES (?, ?, ?, 'ironclaude/x', 'abc123', "
+        f"?, ?, ?, ?, ?, {updated_sql})",
         (guid, repository_identity, worktree_path, current_head, owner_session_id, lifecycle_status,
-         integration_target),
+         integration_target, disposition),
     )
     conn.commit()
 
 
 class TestReapLeakedWorktrees:
+    def test_push_pending_row_is_preserved_and_warned_exactly_once(self, tmp_path, caplog):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_worker(commander, "w1", status="completed", finished_ago="25 hours", workspace_guid=_W1)
+        _insert_assignment(ws_conn, _W1, owner_session_id=_OWNER, lifecycle_status="integrated",
+                           updated_ago="25 hours", disposition=_PP_DISPOSITION)
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+        tmux.has_session.return_value = False
+        alerted: set[str] = set()
+
+        with caplog.at_level("WARNING"):
+            counts1 = _reap_leaked_worktrees(commander, client, tmux,
+                                             workspace_db_path=str(ws), push_pending_alerted=alerted)
+        first = [r for r in caplog.records if "pending push" in r.getMessage()]
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            counts2 = _reap_leaked_worktrees(commander, client, tmux,
+                                             workspace_db_path=str(ws), push_pending_alerted=alerted)
+        second = [r for r in caplog.records if "pending push" in r.getMessage()]
+
+        assert len(first) == 1
+        assert second == []
+        client.cleanup.assert_not_called()
+        client.abandon.assert_not_called()
+        client.reap.assert_not_called()
+        assert counts1["push_pending"] == 1
+        assert counts2["push_pending"] == 1
+
+    def test_sweep_does_not_crash_on_valid_json_non_object_disposition(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_worker(commander, "w1", status="completed", finished_ago="25 hours", workspace_guid=_W1)
+        _insert_assignment(ws_conn, _W1, owner_session_id=_OWNER, lifecycle_status="integrated",
+                           updated_ago="25 hours", disposition="null")
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+        tmux.has_session.return_value = False
+        # Pre-fix: _has_push_pending("null") raises AttributeError out of the candidate
+        # loop; this call would propagate it. Post-fix the sweep completes.
+        counts = _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(ws))
+        assert counts["push_pending"] == 0
+
+    def test_reused_guid_rewarns_after_resolution(self, tmp_path, caplog):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_worker(commander, "w1", status="completed", finished_ago="25 hours", workspace_guid=_W1)
+        _insert_assignment(ws_conn, _W1, owner_session_id=_OWNER, lifecycle_status="integrated",
+                           updated_ago="25 hours", disposition=_PP_DISPOSITION)
+        ws_conn.close()
+        client = Mock()
+        tmux = Mock()
+        tmux.has_session.return_value = False
+        alerted: set[str] = set()
+
+        # Episode 1: push-pending → warns once, guid recorded in the shared set.
+        with caplog.at_level("WARNING"):
+            _reap_leaked_worktrees(commander, client, tmux,
+                                   workspace_db_path=str(ws), push_pending_alerted=alerted)
+        first = [r for r in caplog.records if "pending push" in r.getMessage()]
+
+        # Resolution: row is cleaned up → no longer a candidate → sweep prunes it from the set.
+        ws_conn2 = sqlite3.connect(str(ws))
+        ws_conn2.execute("UPDATE assignments SET lifecycle_status='cleaned' WHERE workspace_guid=?", (_W1,))
+        ws_conn2.commit()
+        ws_conn2.close()
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            _reap_leaked_worktrees(commander, client, tmux,
+                                   workspace_db_path=str(ws), push_pending_alerted=alerted)
+
+        # Re-stuck on the SAME guid → must warn again (pre-fix the guid stays in the set forever → silent).
+        ws_conn3 = sqlite3.connect(str(ws))
+        ws_conn3.execute(
+            "UPDATE assignments SET lifecycle_status='integrated', disposition=?, "
+            "updated_at=datetime('now', '-25 hours') WHERE workspace_guid=?",
+            (_PP_DISPOSITION, _W1),
+        )
+        ws_conn3.commit()
+        ws_conn3.close()
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            _reap_leaked_worktrees(commander, client, tmux,
+                                   workspace_db_path=str(ws), push_pending_alerted=alerted)
+        third = [r for r in caplog.records if "pending push" in r.getMessage()]
+
+        assert len(first) == 1
+        assert len(third) == 1
+
     def test_finished_worker_integrated_assignment_is_cleaned_up(self, tmp_path):
         commander = _make_commander_db(tmp_path / "commander.db")
         ws = tmp_path / "workspaces.db"
@@ -198,7 +300,7 @@ class TestReapLeakedWorktrees:
         client.cleanup.assert_called_once_with(
             {"repository_path": "/repo", "workspace_guid": _W1, "owner_session_id": _OWNER},
         )
-        assert counts == {"released": 1, "surfaced": 0, "protected": 0, "errors": 0}
+        assert counts == {"released": 1, "surfaced": 0, "protected": 0, "errors": 0, "push_pending": 0}
         owner = sqlite3.connect(str(ws)).execute(
             "SELECT workspace_guid, owner_session_id FROM primary_checkout_owners "
             "WHERE repository_identity = 'repo-id'"
@@ -300,7 +402,7 @@ class TestReapLeakedWorktrees:
 
         counts = _reap_leaked_worktrees(commander, client, tmux, workspace_db_path=str(workspace_db))
 
-        assert counts == {"released": 1, "surfaced": 0, "protected": 0, "errors": 0}
+        assert counts == {"released": 1, "surfaced": 0, "protected": 0, "errors": 0, "push_pending": 0}
         assert not w1_path.exists()
         assert git("branch", "--list", w1["branch"]) == ""
         check = sqlite3.connect(str(workspace_db))
@@ -579,6 +681,28 @@ class TestIsProtected:
         tmux = Mock()
         tmux.has_session.return_value = False
         assert _is_protected(assignment, None, tmux, set(), now=0.0) is False
+
+    def test_push_pending_disposition_protects(self):
+        assignment = {"workspace_guid": _W1, "repository_identity": "repo-id",
+                      "updated_at": None, "disposition": _PP_DISPOSITION}
+        tmux = Mock()
+        tmux.has_session.return_value = False
+        assert _is_protected(assignment, None, tmux, set(), now=0.0) is True
+
+
+class TestHasPushPending:
+    def test_true_for_push_phases(self):
+        for phase in ("push-pending", "push-succeeded", "push-failed"):
+            assert _has_push_pending(json.dumps({"phase": phase})) is True
+
+    def test_false_for_non_push(self):
+        for value in (None, "", "{}", json.dumps({"phase": "integration-pending"}), "not-json"):
+            assert _has_push_pending(value) is False
+
+    def test_false_for_valid_json_non_object(self):
+        # json.loads returns None/list/int for these — .get would raise AttributeError.
+        for value in ("null", "[1]", "3"):
+            assert _has_push_pending(value) is False
 
 
 class TestFindLeakedWorktrees:

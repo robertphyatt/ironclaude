@@ -167,6 +167,85 @@ function migrateSchema(db) {
       `);
     })();
   }
+  if (!db.prepare("SELECT 1 FROM schema_migrations WHERE version = 3").get()) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE human_intents_v3 (
+          intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          operation TEXT NOT NULL CHECK (operation IN ('use-primary-checkout', 'return-to-managed-worktree', 'commit', 'commit-and-push', 'push', 'reconcile', 'close-out')),
+          human_channel TEXT NOT NULL,
+          provider_root_session_id TEXT NOT NULL,
+          repository_identity TEXT NOT NULL,
+          workspace_guid TEXT NOT NULL,
+          expected_evidence TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          nonce TEXT NOT NULL UNIQUE,
+          issued_at TEXT NOT NULL DEFAULT (datetime('now')),
+          consumed_at TEXT
+        );
+        INSERT INTO human_intents_v3 (intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at)
+          SELECT intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at FROM human_intents;
+        DROP TABLE human_intents;
+        ALTER TABLE human_intents_v3 RENAME TO human_intents;
+        CREATE INDEX IF NOT EXISTS human_intents_lookup_idx
+          ON human_intents(operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, nonce);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (3);
+      `);
+    })();
+  }
+  if (!db.prepare("SELECT 1 FROM schema_migrations WHERE version = 4").get()) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS preserved_work (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          workspace_guid TEXT NOT NULL,
+          repository_identity TEXT NOT NULL,
+          owner_session_id TEXT,
+          kind TEXT NOT NULL CHECK (kind IN ('pending-push', 'recovery')),
+          payload TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS preserved_work_repo_idx ON preserved_work(repository_identity);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (4);
+      `);
+    })();
+  }
+  if (!db.prepare("SELECT 1 FROM schema_migrations WHERE version = 5").get()) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE human_intents_v5 (
+          intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          operation TEXT NOT NULL CHECK (operation IN ('use-primary-checkout', 'return-to-managed-worktree', 'commit', 'commit-and-push', 'push', 'reconcile', 'close-out', 'confirm-resolution')),
+          human_channel TEXT NOT NULL,
+          provider_root_session_id TEXT NOT NULL,
+          repository_identity TEXT NOT NULL,
+          workspace_guid TEXT NOT NULL,
+          expected_evidence TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          nonce TEXT NOT NULL UNIQUE,
+          issued_at TEXT NOT NULL DEFAULT (datetime('now')),
+          consumed_at TEXT
+        );
+        INSERT INTO human_intents_v5 (intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at)
+          SELECT intent_id, operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, issued_at, consumed_at FROM human_intents;
+        DROP TABLE human_intents;
+        ALTER TABLE human_intents_v5 RENAME TO human_intents;
+        CREATE INDEX IF NOT EXISTS human_intents_lookup_idx
+          ON human_intents(operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, nonce);
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (5);
+      `);
+    })();
+  }
+}
+function insertPreservedWork(db, input) {
+  const existing = db.prepare(
+    "SELECT 1 FROM preserved_work WHERE workspace_guid = ? AND kind = ? AND payload = ? AND resolved_at IS NULL"
+  ).get(input.workspaceGuid, input.kind, input.payload);
+  if (existing) return;
+  db.prepare(
+    "INSERT INTO preserved_work (workspace_guid, repository_identity, owner_session_id, kind, payload) VALUES (?, ?, ?, ?, ?)"
+  ).run(input.workspaceGuid, input.repositoryIdentity, input.ownerSessionId, input.kind, input.payload);
 }
 function initDb(dbPath) {
   const resolvedPath = dbPath || getDbPath();
@@ -451,7 +530,7 @@ function consumeMatchingHumanIntent(db, input, clock = () => /* @__PURE__ */ new
 }
 
 // src/integration.ts
-import { existsSync as existsSync2 } from "node:fs";
+import { existsSync as existsSync2, rmSync, writeFileSync as writeFileSync2 } from "node:fs";
 import path3 from "node:path";
 
 // src/git.ts
@@ -683,6 +762,10 @@ function remoteRefOid(cwd, remoteUrl, destinationRef) {
   if (extra.length !== 0 || ref !== destinationRef) throw new Error("Finalization remote proof is malformed");
   return oid;
 }
+function pushPendingSummary(disposition) {
+  const decoded = decodePushDisposition(disposition);
+  return decoded && (decoded.phase === "push-pending" || decoded.phase === "push-failed") ? { candidateCommit: decoded.candidateCommit, remoteUrl: decoded.remoteUrl, destinationRef: decoded.destinationRef } : void 0;
+}
 function cumulativeBinaryEffect(cwd, base, head) {
   return runGit(cwd, ["diff", "--binary", "--full-index", base, head]);
 }
@@ -895,6 +978,9 @@ function recycleFinalized(db, repositoryPath, assignment) {
   if (!current || current.lifecycle_status !== "integrated" || !current.integrated_commit) {
     throw new Error("Recycle requires a durable integrated assignment; preserving worktree");
   }
+  if (decodePushDisposition(current.disposition)) {
+    throw new Error("Refusing to discard a push-pending obligation; resolve or push it first");
+  }
   const integratedCommit = current.integrated_commit;
   if (!isAncestor(repositoryPath, integratedCommit, targetRef(current))) {
     throw new Error("Recycle integration proof is unreachable from the integration target; preserving worktree");
@@ -917,6 +1003,9 @@ function releaseFinalized(db, repositoryPath, assignment) {
   const current = getAssignment(db, assignment.workspace_guid);
   if (!current || current.lifecycle_status !== "integrated" || !current.integrated_commit) {
     throw new Error("Release requires a durable integrated assignment; preserving worktree");
+  }
+  if (decodePushDisposition(current.disposition)) {
+    throw new Error("Refusing to discard a push-pending obligation; resolve or push it first");
   }
   if (!worktreeIsClean(current.worktree_path)) {
     throw new Error("Release requires a clean worktree; preserving worktree");
@@ -1147,6 +1236,9 @@ function finalizeCommanderLocalCommit(db, input, hooks) {
     const candidate = committed;
     runGit(exact.assignment.worktree_path, ["update-ref", candidateRef(exact.assignment.workspace_guid), candidate]);
     const local2 = finalizeAttestedCandidate(db, exact.primaryCheckoutPath, exact.assignment, candidate);
+    if (decodePushDisposition(local2.assignment.disposition)) {
+      return { state: "integrated-local", integratedCommit: candidate, pushError: "Remote has not proved the exact integrated candidate" };
+    }
     disposeFinalized(db, local2.repositoryPath, local2.assignment, input.dispose);
     return { state: "cleaned", integratedCommit: candidate };
   }
@@ -1158,6 +1250,9 @@ function finalizeCommanderLocalCommit(db, input, hooks) {
     committed,
     hooks
   );
+  if (decodePushDisposition(local.assignment.disposition)) {
+    return { state: "integrated-local", integratedCommit: local.integratedCommit, pushError: "Remote has not proved the exact integrated candidate" };
+  }
   disposeFinalized(db, local.repositoryPath, local.assignment, input.dispose);
   return { state: "cleaned", integratedCommit: local.integratedCommit };
 }
@@ -1176,14 +1271,22 @@ function recoverRebaseInProgress(db, exact, mode) {
   }
   const unresolved = runGit(worktree, ["diff", "--name-only", "--diff-filter=U"]).trim();
   if (unresolved !== "") {
-    throw new Error(`Rebase recovery stopped: unresolved conflicts remain; preserving worktree. Unmerged paths: ${unresolved.split("\n").join(", ")}`);
+    return {
+      state: "rebase-paused-conflict",
+      conflicts: classifyRebaseConflicts(worktree),
+      detail: "Close-out/reconcile paused: unresolved conflicts remain; automated resolution pending (M7c). Worktree preserved; nothing integrated. Not an operator task."
+    };
   }
   try {
     runGit(worktree, ["-c", "core.editor=true", "rebase", "--continue"]);
   } catch (error) {
     const reconflict = runGit(worktree, ["diff", "--name-only", "--diff-filter=U"]).trim();
     if (reconflict !== "") {
-      throw new Error(`Rebase recovery stopped: continuing re-conflicted; preserving worktree. Unmerged paths: ${reconflict.split("\n").join(", ")}`);
+      return {
+        state: "rebase-paused-conflict",
+        conflicts: classifyRebaseConflicts(worktree),
+        detail: "Close-out/reconcile paused: continuing re-conflicted; automated resolution pending (M7c). Worktree preserved; nothing integrated. Not an operator task."
+      };
     }
     throw error;
   }
@@ -1204,6 +1307,31 @@ function recoverRebaseInProgress(db, exact, mode) {
   runGit(worktree, ["update-ref", candidateRef(assignment.workspace_guid), head]);
   const local = finalizeAttestedCandidate(db, primary, assignment, head);
   return finishLocalIntegration(db, local);
+}
+function classifyRebaseConflicts(worktree) {
+  const unmerged = runGit(worktree, ["diff", "--name-only", "--diff-filter=U"]).trim();
+  if (unmerged === "") return [];
+  return unmerged.split("\n").map((path6) => {
+    const xy = runGit(worktree, ["status", "--porcelain=v1", "--", path6]).slice(0, 2);
+    let binary = false;
+    try {
+      binary = /^-\t-/.test(runGit(worktree, ["diff", "--numstat", `:2:${path6}`, `:3:${path6}`]).trim());
+    } catch {
+      binary = false;
+    }
+    const conflictClass = binary ? "binary" : xy === "UU" ? "overlap" : xy === "AA" ? "add-add" : xy === "UD" || xy === "DU" ? "delete-modify" : "other";
+    const stageLines = (stage) => {
+      try {
+        return runGit(worktree, ["show", `:${stage}:${path6}`]).split("\n").length;
+      } catch {
+        return 0;
+      }
+    };
+    const ours = stageLines(2);
+    const theirs = stageLines(3);
+    const summary = `${path6}: your reviewed work has ${theirs} line(s) here; the integration target has ${ours} line(s) (${conflictClass}).`;
+    return { path: path6, conflictClass, summary };
+  });
 }
 function classifyRebaseState(worktree) {
   const rebaseDir = runGit(worktree, ["rev-parse", "--git-path", "rebase-merge"]).trim();
@@ -1953,7 +2081,20 @@ var WorkspaceService = class {
     if (this.refResolves(repository.primaryCheckoutPath, `refs/heads/${assignment.branch}`)) {
       deleteTemporaryBranch(repository.primaryCheckoutPath, assignment.branch);
     }
-    return transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, "cleaned");
+    const carried = pushPendingSummary(assignment.disposition);
+    return this.db.transaction(() => {
+      const cleaned = transitionAssignment(this.db, assignment.workspace_guid, assignment.lifecycle_status, "cleaned");
+      if (carried) {
+        insertPreservedWork(this.db, {
+          workspaceGuid: assignment.workspace_guid,
+          repositoryIdentity: repository.repositoryIdentity,
+          ownerSessionId: assignment.owner_session_id,
+          kind: "pending-push",
+          payload: JSON.stringify(carried)
+        });
+      }
+      return cleaned;
+    })();
   }
   /**
    * Deletes only a terminal assignment whose recorded recovery/integration

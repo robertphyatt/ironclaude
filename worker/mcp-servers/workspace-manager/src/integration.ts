@@ -1,11 +1,14 @@
 import type Database from 'better-sqlite3';
-import { existsSync } from 'node:fs';
+import { existsSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   acquireIntegrationLock,
   deleteIntegrationRecord,
   getAssignment,
+  insertPreservedWork,
   recordIntegration,
+  resolvePreservedWork,
   transitionAssignment,
 } from './db.js';
 import {
@@ -17,6 +20,7 @@ import {
   isAncestor,
   removeWorktree,
   runGit,
+  runGitEnv,
   worktreeHead,
   worktreeIsClean,
 } from './git.js';
@@ -34,11 +38,19 @@ export interface FinalizationResult {
     | 'rebase-aborted' | 'rebase-recovery-repair-required'
     | 'rebase-rerebased-ready-for-repair' | 'rebase-frozen-restored'
     | 'rebase-paused-conflict' | 'rebase-paused-clean' | 'frozen-no-rebase'
-    | 'integrated' | 'not-ready' | 'reconciled';
+    | 'integrated' | 'not-ready' | 'reconciled' | 'committed' | 'closed-out';
   integratedCommit?: string;
+  /** The new commit sha for a commit-and-stay (verb 1) result. */
+  commit?: string;
+  /** A push obligation carried onto a terminal close-out row (Case A). */
+  pendingPush?: { candidateCommit: string; remoteUrl: string; destinationRef: string };
+  /** Residual set aside on a recovery ref during close-out (Case B). */
+  recovery?: { ref: string; residualFiles: number };
   pushError?: string;
   /** Human-facing explanation for a managed rebase-recovery outcome that did not integrate. */
   detail?: string;
+  /** M7b: classified paused-rebase conflicts, surfaced in plain language (no apply — M7c). */
+  conflicts?: Array<{ path: string; conflictClass: 'overlap' | 'add-add' | 'delete-modify' | 'binary' | 'other'; summary: string }>;
 }
 
 export interface CommanderLocalCommitInput {
@@ -129,6 +141,7 @@ interface LocalFinalization {
 
 const usedDirectAuthorities = new WeakSet<object>();
 const usedReconcileAuthorities = new WeakSet<AuthorizedDirectGitOperation>();
+const usedConfirmResolutionAuthorities = new WeakSet<AuthorizedDirectGitOperation>();
 
 interface IntegrationPendingDisposition {
   phase: 'integration-pending';
@@ -168,6 +181,10 @@ function decodePushDisposition(value: string | null): PushDisposition | undefine
   } catch { return undefined; }
 }
 
+export function hasPushPendingObligation(disposition: string | null): boolean {
+  return decodePushDisposition(disposition) !== undefined;
+}
+
 function decodeIntegrationPendingDisposition(value: string | null): IntegrationPendingDisposition | undefined {
   if (!value) return undefined;
   try {
@@ -201,12 +218,77 @@ function setDisposition(db: Database.Database, workspaceGuid: string, dispositio
     .run(disposition, workspaceGuid);
 }
 
+function setCurrentHead(db: Database.Database, workspaceGuid: string, currentHead: string): void {
+  db.prepare("UPDATE assignments SET current_head = ?, updated_at = datetime('now') WHERE workspace_guid = ?")
+    .run(currentHead, workspaceGuid);
+}
+
 function remoteRefOid(cwd: string, remoteUrl: string, destinationRef: string): string | null {
   const output = runGit(cwd, ['ls-remote', '--refs', remoteUrl, destinationRef]).trim();
   if (output === '') return null;
   const [oid, ref, ...extra] = output.split(/\s+/);
   if (extra.length !== 0 || ref !== destinationRef) throw new Error('Finalization remote proof is malformed');
   return oid;
+}
+
+/**
+ * C6 (hygiene, not correctness): after a successful push, clear the now-stale push
+ * disposition on any terminal `cleaned` row (a close-out that carried an obligation)
+ * whose (remoteUrl, destinationRef) matches the just-pushed target AND whose carried
+ * candidate is contained in the pushed local oid. The carried commit is already in
+ * local main, so a normal /push publishes it regardless — this only tidies the record.
+ * The smallest possible touch on the proven push lanes (D5).
+ */
+export function drainCarriedObligations(
+  db: Database.Database,
+  repositoryIdentity: string,
+  remoteUrl: string,
+  destinationRef: string,
+  pushedLocalOid: string,
+  primaryCheckoutPath: string,
+): void {
+  const rows = db.prepare(
+    "SELECT workspace_guid, disposition FROM assignments WHERE repository_identity = ? AND lifecycle_status = 'cleaned' AND disposition IS NOT NULL",
+  ).all(repositoryIdentity) as { workspace_guid: string; disposition: string }[];
+  for (const row of rows) {
+    const disposition = decodePushDisposition(row.disposition);
+    if (disposition
+      && disposition.remoteUrl === remoteUrl
+      && disposition.destinationRef === destinationRef
+      && isAncestor(primaryCheckoutPath, disposition.candidateCommit, pushedLocalOid)) {
+      setDisposition(db, row.workspace_guid, null);
+    }
+  }
+  // I-2: the assignments-row disposition is wiped when a cleaned GUID is reused, so the row
+  // query above may find nothing. Resolve the durable preserved_work table rows directly too.
+  resolvePreservedWork(db, {
+    kind: 'pending-push',
+    predicate: (row) => {
+      if (row.repository_identity !== repositoryIdentity) return false;
+      let payload: { candidateCommit?: string; remoteUrl?: string; destinationRef?: string };
+      try { payload = JSON.parse(row.payload); } catch { return false; }
+      return payload.remoteUrl === remoteUrl
+        && payload.destinationRef === destinationRef
+        && typeof payload.candidateCommit === 'string'
+        && isAncestor(primaryCheckoutPath, payload.candidateCommit, pushedLocalOid);
+    },
+  });
+}
+
+/**
+ * C7 observability: a pure (no-DB) summary of a row's push-pending obligation, for
+ * surfacing carried obligations. Returns undefined when the disposition is not a valid
+ * push disposition.
+ */
+export function pushPendingSummary(
+  disposition: string | null,
+): { candidateCommit: string; remoteUrl: string; destinationRef: string } | undefined {
+  const decoded = decodePushDisposition(disposition);
+  // Only push-pending/push-failed are OUTSTANDING; a push-succeeded record is already published
+  // and is not a carried obligation to surface.
+  return decoded && (decoded.phase === 'push-pending' || decoded.phase === 'push-failed')
+    ? { candidateCommit: decoded.candidateCommit, remoteUrl: decoded.remoteUrl, destinationRef: decoded.destinationRef }
+    : undefined;
 }
 
 function cumulativeBinaryEffect(cwd: string, base: string, head: string): string {
@@ -574,6 +656,9 @@ export function recycleFinalized(db: Database.Database, repositoryPath: string, 
   if (!current || current.lifecycle_status !== 'integrated' || !current.integrated_commit) {
     throw new Error('Recycle requires a durable integrated assignment; preserving worktree');
   }
+  if (decodePushDisposition(current.disposition)) {
+    throw new Error('Refusing to discard a push-pending obligation; resolve or push it first');
+  }
   const integratedCommit = current.integrated_commit;
   // Reachability proof carried forward from cleanupWorkspace: the integrated commit
   // must be contained in the integration target (each site advanced/verified it first).
@@ -614,12 +699,15 @@ export function recycleFinalized(db: Database.Database, repositoryPath: string, 
  * integration_records row and finalization refs are left in place: 'cleaned'
  * is terminal (never reused), so there is nothing to make room for.
  */
-function releaseFinalized(db: Database.Database, repositoryPath: string, assignment: Assignment): void {
+export function releaseFinalized(db: Database.Database, repositoryPath: string, assignment: Assignment): void {
   // Re-read for the same reason recycleFinalized does: several call sites pass
   // an in-memory row whose fields may be stale relative to the DB.
   const current = getAssignment(db, assignment.workspace_guid);
   if (!current || current.lifecycle_status !== 'integrated' || !current.integrated_commit) {
     throw new Error('Release requires a durable integrated assignment; preserving worktree');
+  }
+  if (decodePushDisposition(current.disposition)) {
+    throw new Error('Refusing to discard a push-pending obligation; resolve or push it first');
   }
   if (!worktreeIsClean(current.worktree_path)) {
     throw new Error('Release requires a clean worktree; preserving worktree');
@@ -914,6 +1002,7 @@ export function finalizePrimaryUnassignedCommit(
 export function finalizePrimaryUnassignedPush(
   authority: AuthorizedDirectGitOperation,
   hooks?: FinalizationHooks,
+  db?: Database.Database,
 ): FinalizationResult {
   if (authority.checkoutMode !== 'primary-unassigned') throw new Error('Not an unassigned-primary authority');
   if (authority.operation !== 'push') throw new Error('Unassigned-primary push lane pushes only');
@@ -934,7 +1023,13 @@ export function finalizePrimaryUnassignedPush(
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`${mutationError ? `Push command failed: ${mutationError}. ` : ''}Unassigned-primary push remote readback failed: ${detail}`);
   }
-  if (remote === evidence.localOid) return { state: 'pushed-only' };
+  if (remote === evidence.localOid) {
+    if (db) {
+      const repository = discoverRepository(authority.worktreePath);
+      drainCarriedObligations(db, repository.repositoryIdentity, evidence.remoteUrl, evidence.destinationRef, evidence.localOid, repository.primaryCheckoutPath);
+    }
+    return { state: 'pushed-only' };
+  }
   if (remote === evidence.expectedRemoteOldOid || remote === null) {
     throw new Error(`${mutationError ? `Push command failed: ${mutationError}. ` : ''}Unassigned-primary push remote has not proved the exact authorized commit`);
   }
@@ -1009,7 +1104,10 @@ export function finalizeDirectAuthority(
       const detail = error instanceof Error ? error.message : String(error);
       throw new Error(`${mutationError ? `Push command failed: ${mutationError}. ` : ''}Push-only remote readback failed: ${detail}`);
     }
-    if (remote === evidence.localOid) return { state: 'pushed-only' };
+    if (remote === evidence.localOid) {
+      drainCarriedObligations(db, exact.assignment.repository_identity, evidence.remoteUrl, evidence.destinationRef, evidence.localOid, exact.primaryCheckoutPath);
+      return { state: 'pushed-only' };
+    }
     if (remote === evidence.expectedRemoteOldOid || remote === null) {
       throw new Error(`${mutationError ? `Push command failed: ${mutationError}. ` : ''}Push-only remote has not proved the exact authorized commit`);
     }
@@ -1049,6 +1147,14 @@ export function finalizeDirectAuthority(
     const local = finalizeAttestedCandidate(db, exact.primaryCheckoutPath, exact.assignment, candidate);
     return finishLocalIntegration(db, local);
   }
+  if (authority.operation === 'commit') {
+    // Verb 1 (commit-and-stay): create the commit and STOP. No integration into
+    // local main, no recycle; the worktree stays active for continued work.
+    // Integration/publishing are the separate /reconcile and /push verbs. This is
+    // fully decoupled — it touches no disposition or push/integration machinery.
+    setCurrentHead(db, exact.assignment.workspace_guid, committed);
+    return { state: 'committed', commit: committed };
+  }
   if (authority.operation === 'commit-and-push') {
     const pushEvidence = authority.evidence as {
       remoteName: string;
@@ -1067,10 +1173,6 @@ export function finalizeDirectAuthority(
   const local = finalizeLocalCommit(
     db, exact.primaryCheckoutPath, exact.assignment, authority.worktreePath, committed, hooks,
   );
-  if (authority.operation === 'commit') {
-    recycleFinalized(db, local.repositoryPath, local.assignment);
-    return { state: 'cleaned', integratedCommit: local.integratedCommit };
-  }
 
   // Candidate push is an internal one-use extension of Task 3 authority. The
   // source remains on the integrated candidate; no reset-to-frozen window.
@@ -1134,7 +1236,7 @@ export function finalizeReconcile(
   authority: AuthorizedDirectGitOperation,
 ): FinalizationResult {
   if (authority.operation !== 'reconcile') throw new Error('Reconcile finalization requires reconcile authority');
-  if (authority.checkoutMode !== 'managed') throw new Error('Reconcile is only valid for a managed worktree');
+  if (authority.checkoutMode !== 'managed') throw new Error('Reconcile is only valid for a managed worktree; there is no primary or unassigned reconcile lane');
   if (usedReconcileAuthorities.has(authority)) throw new Error('Direct Git reconcile authority is single-use');
   usedReconcileAuthorities.add(authority);
   revalidateAuthorizedCommitState(authority);
@@ -1143,6 +1245,9 @@ export function finalizeReconcile(
   if (worktreeHead(authority.worktreePath) !== headOid) throw new Error('Reconcile HEAD changed since issuance; re-run /reconcile');
   if (exact.assignment.lifecycle_status === 'active') {
     const local = finalizeLocalCommit(db, exact.primaryCheckoutPath, exact.assignment, authority.worktreePath, headOid);
+    if (decodePushDisposition(local.assignment.disposition)) {
+      return { state: 'integrated-local', integratedCommit: local.integratedCommit, pushError: 'Remote has not proved the exact integrated candidate' };
+    }
     recycleFinalized(db, local.repositoryPath, local.assignment);
     return { state: 'reconciled', integratedCommit: local.integratedCommit };
   }
@@ -1157,7 +1262,270 @@ export function finalizeReconcile(
     recycleFinalized(db, local.repositoryPath, local.assignment);
     return { state: 'reconciled', integratedCommit: local.integratedCommit };
   }
-  throw new Error('Reconcile requires an active or ready-for-integration managed assignment; run reconcile_finalization to recover');
+  throw new Error('Reconcile needs an active or paused-for-integration managed assignment; if a prior finalize is frozen, run reconcile_finalization first, then re-run /reconcile');
+}
+
+/**
+ * Lands an operator-confirmed conflict resolution: consumes a confirm-resolution
+ * authority whose live HEAD must equal the server-registered candidate ref, then
+ * routes through the shared isRepair channel (finalizeAttestedCandidate) exactly
+ * like finalizeReconcile's ready branch. It ONLY accepts a paused-for-integration
+ * managed assignment, KEEPS the worktree alive (reconcile-style), and never pushes.
+ * The content-pin (registered candidate === authorized HEAD) is what distinguishes
+ * this verb from /reconcile: the operator is attesting a specific resolved commit.
+ */
+export function finalizeConfirmResolution(
+  db: Database.Database,
+  authority: AuthorizedDirectGitOperation,
+): FinalizationResult {
+  if (authority.operation !== 'confirm-resolution') throw new Error('Confirm-resolution finalization requires confirm-resolution authority');
+  if (authority.checkoutMode !== 'managed') throw new Error('Confirm-resolution is only valid for a managed worktree');
+  if (usedConfirmResolutionAuthorities.has(authority)) throw new Error('Direct Git confirm-resolution authority is single-use');
+  usedConfirmResolutionAuthorities.add(authority);
+  revalidateAuthorizedCommitState(authority);
+  const exact = exactAssignment(db, authority.worktreePath, authority.workspaceGuid, authority.providerRootSessionId);
+  if (exact.assignment.lifecycle_status !== 'ready_for_integration') throw new Error('Confirm-resolution needs a paused-for-integration managed assignment');
+  try { runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${freezeRef(exact.assignment.workspace_guid)}^{commit}`]); }
+  catch { throw new Error('Ready repair lacks durable frozen finalization state'); }
+  const headOid = (authority.evidence as ReconcileEvidence).headOid;
+  let registered: string;
+  try { registered = runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${candidateRef(exact.assignment.workspace_guid)}^{commit}`]).trim(); }
+  catch { throw new Error('No confirmed resolution candidate matches the authorized HEAD; nothing landed'); }
+  if (registered !== headOid) throw new Error('No confirmed resolution candidate matches the authorized HEAD; nothing landed');
+  if (worktreeHead(authority.worktreePath) !== headOid) throw new Error('Resolution HEAD changed since /confirm-resolution; re-run');
+  const local = finalizeAttestedCandidate(db, exact.primaryCheckoutPath, exact.assignment, headOid);
+  if (decodePushDisposition(local.assignment.disposition)) {
+    return { state: 'integrated-local', integratedCommit: local.integratedCommit, pushError: 'Remote has not proved the exact integrated candidate' };
+  }
+  recycleFinalized(db, local.repositoryPath, local.assignment);
+  return { state: 'reconciled', integratedCommit: local.integratedCommit };
+}
+
+/**
+ * Terminal teardown for close-out (verb 4): a durably-integrated row is removed
+ * (worktree + temporary branch) and transitioned integrated→cleaned. Duplicates
+ * releaseFinalized's integrated-proof block deliberately, leaving releaseFinalized
+ * (and its push-pending throw, on which the Commander disposeFinalized caller
+ * depends) byte-untouched. Task 4 adds the push-pending self-heal + carry here.
+ */
+function closeOutRelease(
+  db: Database.Database,
+  repositoryPath: string,
+  assignment: Assignment,
+  recovery?: { ref: string; residualFiles: number },
+): FinalizationResult {
+  const current = getAssignment(db, assignment.workspace_guid);
+  if (!current || current.lifecycle_status !== 'integrated' || !current.integrated_commit) {
+    throw new Error('Close-out release requires a durable integrated assignment; preserving worktree');
+  }
+  // I2: the durable candidate ref must equal the recorded integrated commit; a divergence means
+  // the finalization record is inconsistent — refuse and preserve rather than heal to a wrong oid.
+  const candidate = runGit(repositoryPath, ['rev-parse', '--verify', `${candidateRef(current.workspace_guid)}^{commit}`]).trim();
+  if (candidate !== current.integrated_commit) {
+    throw new Error('Close-out candidate proof differs; preserving worktree');
+  }
+  // Case A: a push-pending obligation only exists on an integrated row whose commit is
+  // ALREADY in local main, so teardown discards zero publishable bytes. Opportunistically
+  // self-heal via a read-only ls-remote (never a push); otherwise carry the obligation
+  // forward on the terminal cleaned row (the integrated→cleaned transition preserves the
+  // disposition — db.ts:316 writes only lifecycle_status), drained by the next /push.
+  let pendingPush: { candidateCommit: string; remoteUrl: string; destinationRef: string } | undefined;
+  const disposition = decodePushDisposition(current.disposition);
+  if (disposition) {
+    // I2: bind the carried push refs to the integrated candidate + durable frozen ref before
+    // trusting them for the self-heal below.
+    const frozenCommit = runGit(repositoryPath, ['rev-parse', '--verify', `${freezeRef(current.workspace_guid)}^{commit}`]).trim();
+    if (disposition.candidateCommit !== current.integrated_commit || frozenCommit !== disposition.frozenCommit) {
+      throw new Error('Close-out push refs differ; preserving worktree');
+    }
+  }
+  if (disposition && disposition.phase === 'push-succeeded') {
+    // obs 2: a push-succeeded disposition is already published — clear it, never carry or record it.
+    setDisposition(db, current.workspace_guid, null);
+  } else if (disposition) {
+    let remote: string | null = null;
+    try {
+      remote = remoteRefOid(current.worktree_path, disposition.remoteUrl, disposition.destinationRef);
+    } catch { /* offline / malformed readback is non-fatal: carry the obligation */ }
+    if (remote === disposition.candidateCommit) {
+      setDisposition(db, current.workspace_guid, null); // remote already has it — resolved for free
+    } else {
+      pendingPush = {
+        candidateCommit: disposition.candidateCommit,
+        remoteUrl: disposition.remoteUrl,
+        destinationRef: disposition.destinationRef,
+      };
+    }
+  }
+  // I2 self-heal: a worktree HEAD drifted back to the frozen pre-integration commit (a
+  // reconcileFinalization-recoverable state) is reset forward to the integrated candidate so the
+  // integration proof below holds. A head mismatch WITHOUT a matching push disposition is NOT this
+  // shape and falls through to the existing refusal.
+  const head0 = worktreeHead(current.worktree_path);
+  if (head0 !== current.integrated_commit
+    && disposition
+    && head0 === disposition.frozenCommit
+    && worktreeIsClean(current.worktree_path)) {
+    runGit(current.worktree_path, ['reset', '--hard', current.integrated_commit]);
+  }
+  if (!worktreeIsClean(current.worktree_path)) {
+    throw new Error('Close-out release requires a clean worktree; preserving worktree');
+  }
+  const ref = targetRef(current);
+  const actualHead = worktreeHead(current.worktree_path);
+  const integration = db.prepare(`
+    SELECT target_ref, integrated_commit FROM integration_records
+    WHERE workspace_guid = ? AND repository_identity = ?
+  `).get(current.workspace_guid, current.repository_identity) as {
+    target_ref: string;
+    integrated_commit: string;
+  } | undefined;
+  if (!integration
+    || integration.target_ref !== ref
+    || integration.integrated_commit !== current.integrated_commit
+    || actualHead !== current.integrated_commit
+    || !isAncestor(repositoryPath, current.integrated_commit, ref)) {
+    throw new Error('Close-out integration proof is unreachable from the integration target; preserving worktree');
+  }
+  removeWorktree(repositoryPath, current.worktree_path);
+  deleteTemporaryBranch(repositoryPath, current.branch);
+  // I-4: the integrated->cleaned transition makes the GUID reuse-eligible (reuse NULLs the row
+  // disposition). Wrap the transition and the durable table insert in one transaction so a crash
+  // never lands the row cleaned with the obligation lost from both the row AND the table.
+  db.transaction(() => {
+    transitionAssignment(db, current.workspace_guid, 'integrated', 'cleaned');
+    if (pendingPush) {
+      insertPreservedWork(db, {
+        workspaceGuid: current.workspace_guid,
+        repositoryIdentity: current.repository_identity,
+        ownerSessionId: current.owner_session_id,
+        kind: 'pending-push',
+        payload: JSON.stringify(pendingPush),
+      });
+    }
+  })();
+  return {
+    state: 'closed-out',
+    integratedCommit: current.integrated_commit,
+    ...(pendingPush ? { pendingPush } : {}),
+    ...(recovery ? { recovery } : {}),
+  };
+}
+
+/**
+ * Case B: if the worktree is dirty, snapshot the FULL residual (tracked + untracked,
+ * add -A scope) to a durable refs/ironclaude/recovery/<guid> ref using a temporary
+ * index in a SCRATCH path OUTSIDE the worktree (so `add -A` does not capture the index
+ * file itself), WITHOUT moving HEAD/the real index/the working tree; then reset --hard
+ * + clean -fd. The recovery ref is minted AND re-verified to resolve BEFORE any reset,
+ * so a crash never loses the residual. Integration then lands only the reviewed HEAD.
+ * NOT rescueAbandon (which commits residual onto the branch — that would ride into main).
+ */
+function snapshotResidualIfDirty(
+  db: Database.Database,
+  exact: { assignment: Assignment; primaryCheckoutPath: string },
+): { ref: string; residualFiles: number } | undefined {
+  const worktree = exact.assignment.worktree_path;
+  if (worktreeIsClean(worktree)) return undefined;
+  const residualFiles = runGit(worktree, ['status', '--porcelain=v1', '--untracked-files=all'])
+    .split('\n').filter((line) => line.trim() !== '').length;
+  const tmpIndex = path.join(tmpdir(), `ironclaude-closeout-index-${exact.assignment.workspace_guid}-${process.pid}`);
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_INDEX_FILE: tmpIndex };
+  let snapshot: string;
+  try {
+    runGitEnv(worktree, ['read-tree', 'HEAD'], env);
+    runGitEnv(worktree, ['add', '-A'], env);
+    const tree = runGitEnv(worktree, ['write-tree'], env).trim();
+    snapshot = runGitEnv(worktree, ['commit-tree', tree, '-p', 'HEAD', '-m', 'ironclaude: close-out residual snapshot'], env).trim();
+  } finally {
+    try { rmSync(tmpIndex, { force: true }); } catch { /* best effort */ }
+  }
+  // Per-lifecycle content-addressed ref (C2/R11): a flat <guid> ref would clobber a prior
+  // snapshot when the same GUID is reused. Suffixing the snapshot oid makes each lifecycle's
+  // residual its own ref; identical residual content maps to the same ref (tolerate-same-oid).
+  const recoveryRef = `refs/ironclaude/recovery/${exact.assignment.workspace_guid}-${snapshot}`;
+  try {
+    // CREATE-ONLY: empty old-oid refuses to overwrite an existing ref.
+    runGit(exact.primaryCheckoutPath, ['update-ref', recoveryRef, snapshot, '']);
+  } catch (error) {
+    // TOLERATE-SAME-OID (I-3): a prior identical-content snapshot already minted this exact
+    // ref. Accept it only when the existing ref resolves to the same snapshot; else rethrow.
+    const existing = runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${recoveryRef}^{commit}`]).trim();
+    if (existing !== snapshot) throw error;
+  }
+  const payload = JSON.stringify({ ref: recoveryRef, residualFiles });
+  // I-4: durably record BOTH the assignments column AND the reuse-proof table row BEFORE the
+  // destructive reset, so a crash never orphans the residual (the flat column is wiped on reuse).
+  db.prepare("UPDATE assignments SET recovery_ref = ?, updated_at = datetime('now') WHERE workspace_guid = ?")
+    .run(recoveryRef, exact.assignment.workspace_guid);
+  insertPreservedWork(db, {
+    workspaceGuid: exact.assignment.workspace_guid,
+    repositoryIdentity: exact.assignment.repository_identity,
+    ownerSessionId: exact.assignment.owner_session_id,
+    kind: 'recovery',
+    payload,
+  });
+  // Re-verify the ref resolves BEFORE any destructive reset.
+  runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${recoveryRef}^{commit}`]);
+  runGit(worktree, ['reset', '--hard', 'HEAD']);
+  runGit(worktree, ['clean', '-fd']);
+  return { ref: recoveryRef, residualFiles };
+}
+
+const usedCloseOutAuthorities = new WeakSet<AuthorizedDirectGitOperation>();
+
+/**
+ * Finalizes a managed worktree's own close-out authority: integrates its current
+ * HEAD into local main (or completes an already-frozen/integrated finalization),
+ * then FULLY tears the worktree down via closeOutRelease. By the time this runs any
+ * paused rebase has already been continued (HEAD attached) or deferred by the
+ * close_out_worktree handler. Reuses finalizeLocalCommit/finalizeAttestedCandidate
+ * unmodified; never modifies finalizeReconcile/reconcileFinalization.
+ */
+export function finalizeCloseOut(db: Database.Database, authority: AuthorizedDirectGitOperation): FinalizationResult {
+  if (authority.operation !== 'close-out') throw new Error('Close-out finalization requires close-out authority');
+  if (authority.checkoutMode !== 'managed') throw new Error('Close-out is only valid for a managed worktree; there is no primary or unassigned close-out lane');
+  if (usedCloseOutAuthorities.has(authority)) throw new Error('Direct Git close-out authority is single-use');
+  usedCloseOutAuthorities.add(authority);
+  revalidateAuthorizedCommitState(authority);
+  const exact = exactAssignment(db, authority.worktreePath, authority.workspaceGuid, authority.providerRootSessionId);
+  const headOid = (authority.evidence as ReconcileEvidence).headOid;
+  if (worktreeHead(authority.worktreePath) !== headOid) throw new Error('Close-out HEAD changed since verification; re-run /close-out');
+  // Case B: set aside any dirty residual to a durable recovery ref BEFORE integrating,
+  // so only the reviewed HEAD lands on main. reset --hard HEAD keeps the commit, so the
+  // pin above still holds for the branches below.
+  const recovery = snapshotResidualIfDirty(db, exact);
+  if (exact.assignment.lifecycle_status === 'active') {
+    const local = finalizeLocalCommit(db, exact.primaryCheckoutPath, exact.assignment, authority.worktreePath, headOid);
+    return closeOutRelease(db, local.repositoryPath, local.assignment, recovery);
+  }
+  if (exact.assignment.lifecycle_status === 'ready_for_integration') {
+    let frozen: string;
+    try { frozen = runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${freezeRef(exact.assignment.workspace_guid)}^{commit}`]).trim(); }
+    catch { throw new Error('Close-out ready repair lacks durable frozen finalization state'); }
+    // Defense-in-depth (C1): close-out authority is evidence-light (the human attested no
+    // commit), so this equality proof is the ONLY review guarantee. finalizeAttestedCandidate
+    // proves only that headOid is a DESCENDANT of the target — an altered-content descendant
+    // passes it. Require cumulativeBinaryEffect equality (mirrors :1499-1501) before
+    // integrating; otherwise preserve-and-defer for automated resolution (M7).
+    const target = targetRef(exact.assignment);
+    const expectedTarget = runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${target}^{commit}`]).trim();
+    const reviewedEffect = cumulativeBinaryEffect(authority.worktreePath, exact.assignment.base_commit, frozen);
+    if (!isAncestor(exact.primaryCheckoutPath, expectedTarget, headOid)
+      || cumulativeBinaryEffect(authority.worktreePath, expectedTarget, headOid) !== reviewedEffect) {
+      return {
+        state: 'rebase-recovery-repair-required',
+        detail: 'Close-out: the rebase resolution changed the reviewed content (or HEAD is not a descendant of the integration target); preserved for automated resolution (M7). Not an operator task.',
+      };
+    }
+    runGit(authority.worktreePath, ['update-ref', candidateRef(exact.assignment.workspace_guid), headOid]);
+    const local = finalizeAttestedCandidate(db, exact.primaryCheckoutPath, exact.assignment, headOid);
+    return closeOutRelease(db, local.repositoryPath, local.assignment, recovery);
+  }
+  if (exact.assignment.lifecycle_status === 'integrated') {
+    return closeOutRelease(db, exact.primaryCheckoutPath, exact.assignment, recovery);
+  }
+  throw new Error('Close-out needs an active, ready, or integrated managed assignment');
 }
 
 /** Reviewed Brain/Commander work follows same local coordinator and never pushes. */
@@ -1195,12 +1563,18 @@ export function finalizeCommanderLocalCommit(
     const candidate = committed;
     runGit(exact.assignment.worktree_path, ['update-ref', candidateRef(exact.assignment.workspace_guid), candidate]);
     const local = finalizeAttestedCandidate(db, exact.primaryCheckoutPath, exact.assignment, candidate);
+    if (decodePushDisposition(local.assignment.disposition)) {
+      return { state: 'integrated-local', integratedCommit: candidate, pushError: 'Remote has not proved the exact integrated candidate' };
+    }
     disposeFinalized(db, local.repositoryPath, local.assignment, input.dispose);
     return { state: 'cleaned', integratedCommit: candidate };
   }
   const local = finalizeLocalCommit(
     db, exact.primaryCheckoutPath, exact.assignment, exact.assignment.worktree_path, committed, hooks,
   );
+  if (decodePushDisposition(local.assignment.disposition)) {
+    return { state: 'integrated-local', integratedCommit: local.integratedCommit, pushError: 'Remote has not proved the exact integrated candidate' };
+  }
   disposeFinalized(db, local.repositoryPath, local.assignment, input.dispose);
   return { state: 'cleaned', integratedCommit: local.integratedCommit };
 }
@@ -1236,7 +1610,13 @@ function recoverRebaseInProgress(
   // auto-resolve — surface the unmerged paths and stop without advancing.
   const unresolved = runGit(worktree, ['diff', '--name-only', '--diff-filter=U']).trim();
   if (unresolved !== '') {
-    throw new Error(`Rebase recovery stopped: unresolved conflicts remain; preserving worktree. Unmerged paths: ${unresolved.split('\n').join(', ')}`);
+    // M7b: surface the classified conflicts in plain language instead of a raw throw. Outcome
+    // unchanged — nothing integrates, the paused rebase is left in place (no apply; that is M7c).
+    return {
+      state: 'rebase-paused-conflict',
+      conflicts: classifyRebaseConflicts(worktree),
+      detail: 'Close-out/reconcile paused: unresolved conflicts remain; automated resolution pending (M7c). Worktree preserved; nothing integrated. Not an operator task.',
+    };
   }
   try {
     runGit(worktree, ['-c', 'core.editor=true', 'rebase', '--continue']);
@@ -1244,7 +1624,12 @@ function recoverRebaseInProgress(
     // A later step re-conflicted: surface the newly unmerged paths and stop.
     const reconflict = runGit(worktree, ['diff', '--name-only', '--diff-filter=U']).trim();
     if (reconflict !== '') {
-      throw new Error(`Rebase recovery stopped: continuing re-conflicted; preserving worktree. Unmerged paths: ${reconflict.split('\n').join(', ')}`);
+      // M7b: a later rebase step re-conflicted — surface it (distinct detail from the initial stop).
+      return {
+        state: 'rebase-paused-conflict',
+        conflicts: classifyRebaseConflicts(worktree),
+        detail: 'Close-out/reconcile paused: continuing re-conflicted; automated resolution pending (M7c). Worktree preserved; nothing integrated. Not an operator task.',
+      };
     }
     throw error;
   }
@@ -1278,6 +1663,179 @@ function recoverRebaseInProgress(
 }
 
 /** Classifies a ready worktree by whether a rebase is paused and, if so, conflicted. */
+/**
+ * M7b READ-ONLY: classify each unmerged path of a paused-conflict rebase into the M7a taxonomy
+ * with a plain-language two-sided summary. Never mutates the worktree. A merge stage is ABSENT
+ * when that side deleted the path (delete/modify): stageLines guards the stage read so a
+ * taxonomy-required class never crashes the classifier.
+ */
+export function classifyRebaseConflicts(worktree: string): NonNullable<FinalizationResult['conflicts']> {
+  const unmerged = runGit(worktree, ['diff', '--name-only', '--diff-filter=U']).trim();
+  if (unmerged === '') return [];
+  return unmerged.split('\n').map((path) => {
+    const xy = runGit(worktree, ['status', '--porcelain=v1', '--', path]).slice(0, 2);
+    // Binary detection on an unmerged path: diff the two conflict stage blobs directly
+    // (`:2:` ours vs `:3:` theirs); git reports a binary pair as `-\t-`. An absent stage
+    // (delete/modify) makes this throw — caught as non-binary, since delete-modify wins anyway.
+    let binary = false;
+    try { binary = /^-\t-/.test(runGit(worktree, ['diff', '--numstat', `:2:${path}`, `:3:${path}`]).trim()); }
+    catch { binary = false; }
+    const conflictClass: NonNullable<FinalizationResult['conflicts']>[number]['conflictClass'] = binary ? 'binary'
+      : xy === 'UU' ? 'overlap'
+      : xy === 'AA' ? 'add-add'
+      : (xy === 'UD' || xy === 'DU') ? 'delete-modify'
+      : 'other';
+    const stageLines = (stage: 2 | 3): number => {
+      try { return runGit(worktree, ['show', `:${stage}:${path}`]).split('\n').length; }
+      catch { return 0; }
+    };
+    const ours = stageLines(2);
+    const theirs = stageLines(3);
+    // M7c label fix: the integration rebase is `git rebase --onto target base`, replaying
+    // reviewed commits ONTO the target. During that replay git's stage :2:/--ours is the
+    // checked-out INTEGRATION TARGET being rebased onto, and stage :3:/--theirs is the
+    // REVIEWED WORK commit being applied — the reverse of a merge. `ours` therefore reads as
+    // "the integration target" and `theirs` as "your reviewed work".
+    const summary = `${path}: your reviewed work has ${theirs} line(s) here; the integration target has ${ours} line(s) (${conflictClass}).`;
+    return { path, conflictClass, summary };
+  });
+}
+
+export interface ResolveConflictHunkInput {
+  repositoryPath: string;
+  workspaceGuid: string;
+  providerRootSessionId: string;
+  /** The single unmerged path this call resolves. */
+  path: string;
+  choice: 'keep-mine' | 'take-target' | 'prose' | 'abort';
+  /** Required, and used only, when choice === 'prose'. */
+  content?: string;
+}
+
+export interface ResolveConflictHunkResult {
+  path: string;
+  /** The staged (index vs HEAD) diff of `path` after the choice was applied. */
+  staged: string;
+  /** Count of paths still unmerged in the worktree after this call. */
+  remaining: number;
+  /** Present only once the rebase has TRULY completed (no rebase-merge dir, attached HEAD). */
+  candidate?: string;
+  /** Fresh classification, present only when a NEW conflict surfaced (a later commit re-conflicted). */
+  conflicts?: NonNullable<FinalizationResult['conflicts']>;
+}
+
+/**
+ * M7c APPLY: turns one per-hunk operator choice into staged resolved bytes on a paused
+ * integration rebase. It NEVER lands (no finalizeAttestedCandidate/finalizeReconcile call)
+ * and NEVER pushes — landing a completed rebase is a separate tool (land_resolved_conflict).
+ *
+ * Choice mapping is the REVERSE of a merge, because the integration rebase replays the
+ * reviewed work ONTO the target (`git rebase --onto target base`): during that replay
+ * git's stage :2:/--ours is the checked-out target, stage :3:/--theirs is the reviewed
+ * commit being applied. So keep-mine (keep the reviewed work) takes stage 3 (--theirs),
+ * and take-target (take the drifted target) takes stage 2 (--ours).
+ *
+ * A multi-commit reviewed range can pause again immediately after `rebase --continue`
+ * resolves this commit's last conflict, because the NEXT replayed commit conflicts too.
+ * That is reported back (fresh conflicts, no candidate) rather than treated as failure —
+ * the caller re-invokes this tool per remaining hunk. Only once `rebase --continue`
+ * truly completes the rebase (rebase-merge dir gone AND HEAD reattached to a branch) is
+ * the candidate ref registered, exactly mirroring the manual hand-resolve + candidateRef
+ * seeding done by land_resolved_conflict's own tests.
+ */
+export function resolveConflictHunk(
+  db: Database.Database,
+  input: ResolveConflictHunkInput,
+): FinalizationResult | ResolveConflictHunkResult {
+  const exact = exactAssignment(db, input.repositoryPath, input.workspaceGuid, input.providerRootSessionId);
+  const assignment = exact.assignment;
+  if (assignment.lifecycle_status !== 'ready_for_integration') {
+    throw new Error('Resolve-conflict-hunk needs a paused-for-integration managed assignment');
+  }
+  const worktree = assignment.worktree_path;
+  const rebaseDir = runGit(worktree, ['rev-parse', '--git-path', 'rebase-merge']).trim();
+  if (!existsSync(path.resolve(worktree, rebaseDir))) {
+    throw new Error('Resolve-conflict-hunk requires a paused rebase; preserving worktree');
+  }
+
+  if (input.choice === 'abort') {
+    return recoverRebaseInProgress(db, exact, 'abort');
+  }
+
+  // C1: bound input.path to the CURRENT unmerged set BEFORE any filesystem effect. The tool is
+  // agent-callable (requireProviderRoot only, no human intent), so an unvalidated path would let
+  // 'prose' writeFileSync outside the worktree (absolute/../ traversal) or stage a non-conflicted
+  // file that rebase --continue folds into the operator-confirmed commit. git reports only
+  // repo-relative, in-tree, currently-conflicted paths, so an EXACT membership match refuses
+  // absolute/../ paths AND non-conflicted paths AND is the correct semantic. -z (NUL split)
+  // avoids core.quotePath escaping and any newline-in-path evasion.
+  const unmergedPaths = runGit(worktree, ['diff', '--name-only', '--diff-filter=U', '-z'])
+    .split('\0')
+    .filter((entry) => entry !== '');
+  if (!unmergedPaths.includes(input.path)) {
+    throw new Error(`resolve_conflict_hunk only resolves a currently-conflicted path; '${input.path}' is not in the unmerged set`);
+  }
+
+  if (input.choice === 'keep-mine' || input.choice === 'take-target') {
+    const stageFlag = input.choice === 'keep-mine' ? '--theirs' : '--ours';
+    try {
+      runGit(worktree, ['checkout', stageFlag, '--', input.path]);
+    } catch {
+      throw new Error(
+        `Cannot resolve ${input.path} with '${input.choice}': one side deleted this path (delete-modify `
+        + "conflict has no checkout stage for it); resolve it explicitly with choice 'prose', "
+        + 'or abort to accept the deletion (preserve-and-defer).',
+      );
+    }
+  } else if (input.choice === 'prose') {
+    if (input.content === undefined) throw new Error("choice 'prose' requires content");
+    writeFileSync(path.resolve(worktree, input.path), input.content);
+  } else {
+    throw new Error(`Unknown resolve-conflict-hunk choice: ${input.choice as string}`);
+  }
+  runGit(worktree, ['add', '--', input.path]);
+  const staged = runGit(worktree, ['diff', '--cached', '--', input.path]);
+
+  const unmergedAfterStage = runGit(worktree, ['diff', '--name-only', '--diff-filter=U']).trim();
+  if (unmergedAfterStage !== '') {
+    // Another path from the SAME conflicting commit is still unresolved — do not
+    // attempt to continue the rebase until every hunk of this commit is staged.
+    return { path: input.path, staged, remaining: unmergedAfterStage.split('\n').filter((line) => line !== '').length };
+  }
+
+  try {
+    runGit(worktree, ['-c', 'core.editor=true', 'rebase', '--continue']);
+  } catch {
+    // The next replayed commit conflicted immediately: surface it fresh, no candidate.
+    const reconflict = runGit(worktree, ['diff', '--name-only', '--diff-filter=U']).trim();
+    const remaining = reconflict === '' ? 0 : reconflict.split('\n').filter((line) => line !== '').length;
+    return { path: input.path, staged, remaining, conflicts: classifyRebaseConflicts(worktree) };
+  }
+
+  // `rebase --continue` reported success, but a later step (e.g. an `edit`/`break`
+  // stop) can still leave the rebase in progress without throwing. Verify TRUE
+  // completion before registering any candidate.
+  const stillRebaseDir = runGit(worktree, ['rev-parse', '--git-path', 'rebase-merge']).trim();
+  const rebaseStillInProgress = existsSync(path.resolve(worktree, stillRebaseDir));
+  let attachedHead = true;
+  try { runGit(worktree, ['symbolic-ref', '--quiet', '--short', 'HEAD']); }
+  catch { attachedHead = false; }
+  if (rebaseStillInProgress || !attachedHead) {
+    const reconflict = runGit(worktree, ['diff', '--name-only', '--diff-filter=U']).trim();
+    const remaining = reconflict === '' ? 0 : reconflict.split('\n').filter((line) => line !== '').length;
+    return {
+      path: input.path,
+      staged,
+      remaining,
+      ...(reconflict !== '' ? { conflicts: classifyRebaseConflicts(worktree) } : {}),
+    };
+  }
+
+  const head = worktreeHead(worktree);
+  runGit(worktree, ['update-ref', candidateRef(assignment.workspace_guid), head]);
+  return { path: input.path, staged, remaining: 0, candidate: head };
+}
+
 function classifyRebaseState(
   worktree: string,
 ): 'rebase-paused-conflict' | 'rebase-paused-clean' | 'frozen-no-rebase' {

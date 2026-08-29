@@ -51,7 +51,7 @@ HUMAN_OPERATION=""
 HUMAN_CHANNEL=""
 
 if [ "$HOOK_EVENT_NAME" = "UserPromptSubmit" ] && [ "$THREAD_SOURCE" != "subagent" ]; then
-  for operation in commit commit-and-push push use-primary-checkout return-to-managed-worktree reconcile; do
+  for operation in commit commit-and-push push use-primary-checkout return-to-managed-worktree reconcile close-out confirm-resolution; do
     if [ "$TRIMMED_PROMPT" = "/$operation" ] || [ "$TRIMMED_PROMPT" = "/ironclaude:$operation" ]; then
       HUMAN_OPERATION="$operation"
       HUMAN_CHANNEL="claude-user-prompt"

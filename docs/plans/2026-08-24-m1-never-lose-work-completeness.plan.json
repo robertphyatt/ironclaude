@@ -1,0 +1,90 @@
+{
+  "name": "M1 Never-Lose-Work Completeness",
+  "goal": "Close the tombstone teardown's push-pending gap (guard + reaper recognition) and make the Commander finalize lane graceful, shipping as v1.1.8.",
+  "requirements_file": "docs/plans/2026-08-24-m1-never-lose-work-completeness-requirements.md",
+  "design_file": "docs/plans/2026-08-24-m1-never-lose-work-completeness-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Export predicate + tombstone guard + TS test",
+      "description": "Export hasPushPendingObligation from integration.ts; guard tombstoneTerminalAssignment's integrated branch to throw-and-preserve on a push-pending disposition; falsifiable TS test.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/integration.ts",
+        "worker/mcp-servers/workspace-manager/src/workspace-service.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        { "description": "RED test in workspace-service.test.ts (model on tombstone test :1135 + integrated cleanup :683/:755): build an integrated assignment carrying a FULLY-VALID push-pending disposition (all of candidateCommit/frozenCommit/remoteName/remoteUrl/destinationRef, else decodePushDisposition returns undefined; model the JSON on seedIntegratedPushPending integration-cases.ts:146-169) via this file's initDb/recordIntegration/WorkspaceService + a direct UPDATE lifecycle_status='integrated', disposition=?; call cleanupWorkspace; assert toThrow('push-pending obligation') AND worktree/branch/row/disposition preserved." },
+        { "description": "Run RED; verify FAIL.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts -t \"push-pending obligation\"", "expected": "FAIL: no throw, worktree/branch removed." },
+        { "description": "Export in integration.ts after decodePushDisposition (~:169): `export function hasPushPendingObligation(disposition: string | null): boolean { return decodePushDisposition(disposition) !== undefined; }`." },
+        { "description": "Add tombstone guard in workspace-service.ts integrated else-branch after the integrated-evidence proof (~:721-728) before :729: `if (hasPushPendingObligation(assignment.disposition)) { throw new Error('Refusing to tombstone a worktree with a push-pending obligation; resolve or push it first'); }`. Import hasPushPendingObligation from '../integration.js'. Both callers pass a SELECT * row so assignment.disposition is populated." },
+        { "description": "Run the test; verify GREEN.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts -t \"push-pending obligation\"", "expected": "PASS: throws; preserved." },
+        { "description": "Full workspace-manager suite; no regression.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run", "expected": "All pass." },
+        { "description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/integration.ts worker/mcp-servers/workspace-manager/src/workspace-service.ts worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts", "expected": "Staged." }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "I-1 Commander graceful handling + test",
+      "description": "Guard finalizeCommanderLocalCommit's two disposeFinalized sites inline: return integrated-local on push-pending, else disposeFinalized(..., input.dispose) unchanged (preserves dispose:'release').",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/integration.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts"
+      ],
+      "depends_on": [1],
+      "steps": [
+        { "description": "RED test in integration-cases.ts core region (near finalizeCommanderLocalCommit tests ~:474/:492): seed an active row with an integration-pending disposition (markIntegrated converts to push-pending; mirror v1.1.7 ACTIVE /commit seed), call finalizeCommanderLocalCommit; assert state==='integrated-local' + row integrated + push-pending preserved + worktree present. Name so -t \"Commander\" matches." },
+        { "description": "Run RED; verify FAIL.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/integration-core.test.ts -t \"Commander\"", "expected": "FAIL: throws (backstop) or cleans, not integrated-local." },
+        { "description": "Add inline guards before EACH disposeFinalized in finalizeCommanderLocalCommit (~:1198 repair, ~:1204 main): `if (decodePushDisposition(local.assignment.disposition)) { return { state: 'integrated-local', integratedCommit: <candidate|local.integratedCommit>, pushError: 'Remote has not proved the exact integrated candidate' }; }`. Use candidate (repair) / local.integratedCommit (main), matching the existing cleaned returns at :1199/:1205. Do NOT replace disposeFinalized." },
+        { "description": "Run the test; verify GREEN.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/integration-core.test.ts -t \"Commander\"", "expected": "PASS: integrated-local, preserved." },
+        { "description": "Full suite; no regression.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run", "expected": "All pass." },
+        { "description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/integration.ts worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts", "expected": "Staged." }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Reaper recognition (protect + one-time WARNING) + Python test",
+      "description": "_has_push_pending helper; _is_protected recognizes push-pending; caller-owned push_pending_alerted set threaded into _reap_leaked_worktrees for a one-time per-guid WARNING (surface once, no spam, no silence); update exact-dict count assertions for the new push_pending key.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_worktree_reaper.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        { "description": "RED tests in test_worktree_reaper.py (schema has disposition TEXT :99; json imported): add _PP_DISPOSITION = json.dumps({phase:'push-pending',candidateCommit,frozenCommit,remoteName:'origin',remoteUrl,destinationRef:'refs/heads/main',expectedRemoteOldOid}). (a) _has_push_pending unit: True for push-pending/push-succeeded/push-failed; False for None/''/'{}'/'integration-pending'/'not-json'. (b) TestIsProtected ~:576: test_push_pending_disposition_protects -> _is_protected(assignment-with-disposition=_PP_DISPOSITION, None, dead-tmux, set(), now=0.0) is True. (c) sweep test_push_pending_row_is_preserved_and_warned_exactly_once (model ~:557/:569): _insert_worker completed 25h + _insert_assignment integrated 25h disposition=_PP_DISPOSITION; test-local alerted=set(); call _reap_leaked_worktrees(...,push_pending_alerted=alerted) twice under caplog WARNING (clear between); assert 'pending push' WARNING once on call 1, zero on call 2 (r.getMessage()), client.cleanup/abandon/reap not called, counts['push_pending']==1 both. Also extend _insert_assignment (~:136-148): add disposition=None kwarg + disposition column + ? placeholder." },
+        { "description": "Run RED; verify FAIL.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python -m pytest tests/test_worktree_reaper.py -q -k \"push_pending\"", "expected": "FAIL: _has_push_pending undefined; _is_protected False; sweep calls client.cleanup and counts has no push_pending key." },
+        { "description": "Add _has_push_pending(disposition_json) in main.py near reaper helpers: parse JSON, return phase in ('push-pending','push-succeeded','push-failed'); False on empty/parse-error." },
+        { "description": "Recognize push-pending in _is_protected (:288-311), inside the try after the lock check (:303-304) before return False: `if _has_push_pending(assignment.get(\"disposition\")): return True`." },
+        { "description": "Thread caller-owned alerted set + one-time WARNING: _reap_leaked_worktrees signature (~:408-416) gains keyword-only `push_pending_alerted: set[str] | None = None`; counts init (:427) gains `\"push_pending\": 0` and immediately after `if push_pending_alerted is None: push_pending_alerted = set()`; replace the protected branch (:479-483) with the differentiated block: if _is_protected -> if _has_push_pending(disposition): counts['push_pending']+=1; if guid not in push_pending_alerted: logger.warning('Worktree reaper: workspace=%s repo=%s is integrated with a pending push — preserved, not reaped; complete the push (e.g. /push) to release it', guid, assignment.get('repository_identity')); push_pending_alerted.add(guid); else counts['protected']+=1; continue. Daemon __init__ (~:1254 next to _message_aging_alerted): self._push_pending_alerted: set[str] = set(). Caller (:1619-1622): add push_pending_alerted=self._push_pending_alerted. Gate :1623 UNCHANGED." },
+        { "description": "Update the two exact-dict count assertions (~:201, ~:303) `assert counts == {released:..., surfaced:0, protected:0, errors:0}` to add `\"push_pending\": 0`." },
+        { "description": "Run the tests; verify GREEN.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python -m pytest tests/test_worktree_reaper.py -q", "expected": "All pass: push-pending row preserved + warned once; existing tests updated for the new count key." },
+        { "description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/tests/test_worktree_reaper.py", "expected": "Staged." }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Release v1.1.8",
+      "description": "Bump the 5 version sources to 1.1.8 (verified by test_version_consistency.py); add CHANGELOG and README entries.",
+      "allowed_files": [
+        "commander/pyproject.toml",
+        "worker/.claude-plugin/plugin.json",
+        "worker/.codex-plugin/plugin.json",
+        "worker/mcp-servers/workspace-manager/package.json",
+        ".claude-plugin/marketplace.json",
+        "CHANGELOG.md",
+        "README.md"
+      ],
+      "depends_on": [2, 3],
+      "steps": [
+        { "description": "No tests required for version edits (config); test_version_consistency.py verifies. CHANGELOG/README are docs." },
+        { "description": "Bump to 1.1.8: commander/pyproject.toml; worker/.claude-plugin/plugin.json; worker/.codex-plugin/plugin.json (\"1.1.8+codex.<fresh UTC YYYYMMDDHHMMSS>\", release part 1.1.8); worker/mcp-servers/workspace-manager/package.json; .claude-plugin/marketplace.json plugins[0].version." },
+        { "description": "Verify version consistency.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python -m pytest tests/test_version_consistency.py -q", "expected": "Passes." },
+        { "description": "Add `## 1.1.8: …` CHANGELOG.md above `## 1.1.7`: tombstone push-pending guard, reaper protect + one-time WARNING (no spam/silence), Commander graceful integrated-local; framing (dropped push OBLIGATION, commits safe) + named non-goal (recovery-ref anchor + resume-push)." },
+        { "description": "Add `## What's New in v1.1.8` README.md above the v1.1.7 one." },
+        { "description": "Full workspace-manager suite once more.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run", "expected": "All pass." },
+        { "description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/pyproject.toml worker/.claude-plugin/plugin.json worker/.codex-plugin/plugin.json worker/mcp-servers/workspace-manager/package.json .claude-plugin/marketplace.json CHANGELOG.md README.md", "expected": "Staged." }
+      ]
+    }
+  ]
+}

@@ -23,6 +23,7 @@ import {
   type DirectGitAuthorityEvidence,
   type DirectGitOperation,
   type PushEvidence,
+  type ReconcileEvidence,
 } from '../git-authority.js';
 import { issueHumanIntentFromHook } from '../hook-intent.js';
 import { WorkspaceService } from '../workspace-service.js';
@@ -207,6 +208,22 @@ describe('direct Git authority', () => {
     expect(authority.operation).toBe('commit');
     expect(() => verify(root, database, assignment, 'commit', expected, nonce)).toThrow('matching human intent');
     expect(() => pushExactAuthorizedRef(authority)).toThrow('does not authorize a push');
+  });
+
+  it('the missing-intent refusal names the remedy while preserving the matching-human-intent prefix', () => {
+    const { root, database, assignment } = setup(false);
+    const expected = commitEvidence(assignment);
+    const nonce = issue(database, assignment, 'commit', expected);
+    verify(root, database, assignment, 'commit', expected, nonce); // consumes the intent
+    let message = '';
+    try {
+      verify(root, database, assignment, 'commit', expected, nonce); // no matching intent now
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    // The append preserves the original substring (18 existing assertions rely on it) AND names the fix.
+    expect(message).toContain('matching human intent');
+    expect(message).toContain('does not mint intent');
   });
 
   it('issues and consumes direct authority with server-observed evidence and no public nonce', () => {
@@ -1111,11 +1128,12 @@ describe('direct Git authority', () => {
       });
 
       expect(authority.operation).toBe('reconcile');
-      // This exact message fires only at the single-use gate (:614) — it only
-      // reaches that branch when :613 does NOT special-case 'reconcile' AND the
-      // authority was excluded from usablePushAuthorizations at verify-time
-      // (:563). A bare .toThrow() would also pass if :613 threw its own,
-      // differently-worded error instead — pin the exact text to catch that.
+      // This exact message fires only at the single-use gate (:640) — a reconcile
+      // authority reaches it because the operation guard above (:639) rejects only
+      // 'commit' (it does NOT special-case 'reconcile') and the authority was
+      // excluded from usablePushAuthorizations at verify-time (:589). A bare
+      // .toThrow() would also pass if :639 threw its own, differently-worded error
+      // — pin the exact text to catch that.
       expect(() => pushExactAuthorizedRef(authority)).toThrow('Direct Git push authority is single-use');
     });
 
@@ -1137,6 +1155,62 @@ describe('direct Git authority', () => {
         humanChannel: 'codex-user-prompt',
         operation: 'reconcile',
       })).toThrow('requires a matching human intent');
+    });
+  });
+
+  describe('confirm-resolution direct-Git operation', () => {
+    it('a confirm-resolution intent mints and consumes, binding the live managed HEAD', () => {
+      const root = repository(true);
+      const databaseDirectory = mkdtempSync(join(tmpdir(), 'ironclaude-git-authority-db-'));
+      directories.push(databaseDirectory);
+      const database = initDb(join(databaseDirectory, 'authority.db'));
+      const assignment = new WorkspaceService(database).ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+      git(assignment.worktree_path, 'commit', '--allow-empty', '-m', 'confirm-resolution target');
+      const headOid = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+
+      issueDirectGitHumanIntent(database, {
+        repositoryPath: root,
+        workspaceGuid: assignment.workspace_guid,
+        providerRootSessionId: OWNER,
+        humanChannel: 'codex-user-prompt',
+        operation: 'confirm-resolution' as unknown as DirectGitOperation,
+      });
+      const authority = verifyDirectGitAuthority(database, {
+        repositoryPath: root,
+        workspaceGuid: assignment.workspace_guid,
+        providerRootSessionId: OWNER,
+        humanChannel: 'codex-user-prompt',
+        operation: 'confirm-resolution' as unknown as DirectGitOperation,
+      });
+
+      expect(authority.operation).toBe('confirm-resolution');
+      expect((authority.evidence as ReconcileEvidence).headOid).toBe(headOid);
+    });
+
+    it('authorizes confirm-resolution from live HEAD but structurally excludes it from push authority', () => {
+      const root = repository(true);
+      const databaseDirectory = mkdtempSync(join(tmpdir(), 'ironclaude-git-authority-db-'));
+      directories.push(databaseDirectory);
+      const database = initDb(join(databaseDirectory, 'authority.db'));
+      const assignment = new WorkspaceService(database).ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+      git(assignment.worktree_path, 'commit', '--allow-empty', '-m', 'confirm-resolution target');
+
+      issueDirectGitHumanIntent(database, {
+        repositoryPath: root,
+        workspaceGuid: assignment.workspace_guid,
+        providerRootSessionId: OWNER,
+        humanChannel: 'codex-user-prompt',
+        operation: 'confirm-resolution' as unknown as DirectGitOperation,
+      });
+      const authority = verifyDirectGitAuthority(database, {
+        repositoryPath: root,
+        workspaceGuid: assignment.workspace_guid,
+        providerRootSessionId: OWNER,
+        humanChannel: 'codex-user-prompt',
+        operation: 'confirm-resolution' as unknown as DirectGitOperation,
+      });
+
+      expect(() => pushExactAuthorizedRef(authority)).toThrow('Direct Git push authority is single-use');
     });
   });
 });

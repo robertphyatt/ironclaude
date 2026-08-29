@@ -139,6 +139,109 @@ _gbtw_should_rearm_check() {
     _ic_is_antipattern_proposal "$context"
 }
 
+# =============================================================================
+# CALM-DURABILITY FOOTER + EXECUTION-LIFECYCLE BLOCK MESSAGE TEMPLATES
+# =============================================================================
+# The operator's anti-context-anxiety clause: a block must state its directive
+# first (imperative, tokens intact), then reassure that on-disk artifacts ARE
+# the checkpoint and a legitimate wait is not stopping — WITHOUT "do NOT stop"
+# pressure that induces fabricated progress / polling / out-of-sequence work.
+# Templates use *_PLACEHOLDER tokens substituted at the call site. Plain
+# assignment (not readonly) — the GBTW_TEST_MODE source path skips run_hook (no
+# strict mode), and these are string literals with no command evaluation.
+_IC_DURABILITY_FOOTER='
+DURABILITY: The plan JSON, wave-task state, and workflow_stage on disk ARE your checkpoint — nothing is lost by continuing and nothing needs banking. A legitimate wait (a dispatched subagent or review, an armed Monitor/ScheduleWakeup, or a live background job) is not stopping and is not penalized. Continue steadily: do not fabricate progress, do not poll healthy processes, and do not start out-of-sequence work to show activity. See ironclaude:workflow-durability. The single next action is stated above — take it.'
+
+_IC_MSG_CODE_REVIEW_REQUIRED="STOP — CODE REVIEW REQUIRED
+
+You submitted COUNT_PLACEHOLDER task(s) for Wave WAVE_PLACEHOLDER; code review has not run yet. The next step is code review.
+
+Call the Skill tool with EXACTLY these parameters:
+  skill: \"ironclaude:code-review\"
+  args: \"--task-boundary\"
+
+Run code review as your next action.
+${_IC_DURABILITY_FOOTER}"
+
+_IC_MSG_GRADE_TOO_LOW="STOP — CODE REVIEW GRADE TOO LOW
+
+Your code review grade was GRADE_PLACEHOLDER. Only grade A or B advances tasks; GRADE_PLACEHOLDER does not pass.
+
+Next:
+1. Fix the issues identified in the last code review
+2. Run code review again via the Skill tool:
+   skill: \"ironclaude:code-review\"
+   args: \"--task-boundary\"
+
+Fix the issues before the next task.
+${_IC_DURABILITY_FOOTER}"
+
+_IC_MSG_TASKS_IN_PROGRESS="STOP — TASKS STILL IN PROGRESS
+
+You have COUNT_PLACEHOLDER task(s) still pending or in-progress; the wave is not complete.
+
+Continue your current task, following the plan steps exactly as written.
+${_IC_DURABILITY_FOOTER}"
+
+_IC_MSG_WAVE_COMPLETE="STOP — WAVE COMPLETE, ADVANCE TO NEXT
+
+All tasks in the current wave are done; the plan is not finished yet.
+
+Call the MCP tool mcp__plugin_ironclaude_state-manager__get_next_tasks to get the next wave or confirm plan completion.
+${_IC_DURABILITY_FOOTER}"
+
+_IC_MSG_MEMORY_SEARCH="STOP — MEMORY SEARCH REQUIRED
+
+Searching episodic memory is required before continuing with SKILL_PLACEHOLDER. This search is the one action that unblocks you.
+
+Call the Agent tool with EXACTLY these parameters:
+  description: \"Search episodic memory\"
+  subagent_type: \"ironclaude:search-conversations\"
+  prompt: \"Search for prior decisions and context about [your current task topic]\"
+
+The subagent_type field MUST contain 'search-conversations' exactly as shown; that exact call is what unblocks you.
+${_IC_DURABILITY_FOOTER}"
+
+_IC_MSG_WORK_INCOMPLETE="STOP — WORK INCOMPLETE
+
+You stopped before finishing your work. REASONING_PLACEHOLDER
+
+Continue from where you left off and complete the current task.
+${_IC_DURABILITY_FOOTER}"
+
+# G2: legitimate-wait check for the code-review gate — ORs the two existing
+# (tested) suppression helpers. Prints 'true' iff a bg job is in flight or a
+# waiting tool is active. Fail-open: empty/missing transcript -> no suppression.
+_gbtw_review_gate_suppress() {
+    local transcript="$1"
+    if [ -z "$transcript" ] || [ ! -f "$transcript" ]; then
+        return 0
+    fi
+    local in_flight
+    in_flight=$(_gbtw_extract_in_flight "$transcript")
+    if [ -n "$in_flight" ] || [ "$(_gbtw_recent_waiting_tool "$transcript")" = "true" ]; then
+        printf 'true'
+    fi
+    return 0
+}
+
+# Continuation-check suppression decision (G1): suppress the continuation check iff
+# a legitimate wait is live — a COMPLETION-AWARE in-flight job (Agent async dispatch
+# OR run_in_background Bash) or a recent named waiting tool, via _gbtw_review_gate_suppress
+# — AND the trailing prose is NOT an anti-pattern (checkpoint / query-offload) proposal.
+# Prints 'true' to suppress, empty otherwise. Completion-aware, so a finished/killed
+# subagent still fires the check (no false-silence); fail-open (the helpers return empty
+# on any error, so the check fires — never silences toward a stall).
+_gbtw_continuation_suppressed_by_inflight() {
+    local transcript="$1" stage="$2" context="$3"
+    [ "$(_gbtw_review_gate_suppress "$transcript")" = "true" ] || return 0
+    if [ "$(_gbtw_should_rearm_check "$stage" "$context")" = "true" ]; then
+        return 0
+    fi
+    printf 'true'
+    return 0
+}
+
 # Test-mode shim: sourcing with GBTW_TEST_MODE=1 exposes helpers without
 # running the hook body.
 if [ "${GBTW_TEST_MODE:-0}" = "1" ]; then
@@ -376,17 +479,17 @@ if is_plan_active "$WORKFLOW_STAGE"; then
         fi
 
         if [ -z "$REVIEW_GRADE" ]; then
-            # No review record -- block and require code review
+            # No review record -- block and require code review.
+            # G2: an async review/verification in flight is a legitimate wait, not a stall.
+            if [ "$(_gbtw_review_gate_suppress "$TRANSCRIPT_PATH")" = "true" ]; then
+                log_hook "GET-BACK-TO-WORK" "Passed" "code-review gate — legitimate wait in flight, not blocking"
+                echo '{"decision": "approve", "reason": "Async review/verification in flight — code-review gate deferred", "systemMessage": "[GET-BACK-TO-WORK]: Passed - review in flight"}'
+                exit 0
+            fi
             increment_block_counter
-            block_stop "GET-BACK-TO-WORK" "STOP — CODE REVIEW REQUIRED
-
-You submitted ${SUBMITTED_COUNT} task(s) for Wave ${CURRENT_WAVE} but have not run code review yet. You are blocked until code review completes.
-
-Call the Skill tool RIGHT NOW with EXACTLY these parameters:
-  skill: \"ironclaude:code-review\"
-  args: \"--task-boundary\"
-
-Do NOT respond to the user. Do NOT call any other tool. Run code review first."
+            _ic_msg="${_IC_MSG_CODE_REVIEW_REQUIRED//COUNT_PLACEHOLDER/$SUBMITTED_COUNT}"
+            _ic_msg="${_ic_msg//WAVE_PLACEHOLDER/$CURRENT_WAVE}"
+            block_stop "GET-BACK-TO-WORK" "$_ic_msg"
 
         elif [[ "$REVIEW_GRADE" =~ ^[AB]$ ]]; then
             # Passing grade (A or B) -- advance submitted tasks to review_passed
@@ -403,17 +506,8 @@ Do NOT respond to the user. Do NOT call any other tool. Run code review first."
                   2>/dev/null || true
             fi
             increment_block_counter
-            block_stop "GET-BACK-TO-WORK" "STOP — CODE REVIEW GRADE TOO LOW
-
-Your code review grade was ${REVIEW_GRADE}. Only grade A or B advances tasks. Grade ${REVIEW_GRADE} does not pass.
-
-You MUST:
-1. Fix the issues identified in the last code review
-2. Run code review again by calling the Skill tool with:
-   skill: \"ironclaude:code-review\"
-   args: \"--task-boundary\"
-
-Do NOT skip fixing the issues. Do NOT proceed to the next task."
+            _ic_msg="${_IC_MSG_GRADE_TOO_LOW//GRADE_PLACEHOLDER/$REVIEW_GRADE}"
+            block_stop "GET-BACK-TO-WORK" "$_ic_msg"
         fi
 
     elif [ "${IN_PROGRESS_OR_PENDING_COUNT:-0}" != "0" ]; then
@@ -446,25 +540,14 @@ Do NOT skip fixing the issues. Do NOT proceed to the next task."
         fi
         # Tasks still in progress or pending -- block
         increment_block_counter
-        block_stop "GET-BACK-TO-WORK" "STOP — TASKS STILL IN PROGRESS
-
-You have ${IN_PROGRESS_OR_PENDING_COUNT} task(s) still pending or in-progress. You are not done yet.
-
-Continue working on your current task. Follow the plan steps exactly as written.
-
-Do NOT stop. Do NOT ask the user what to do. Keep executing the plan."
+        _ic_msg="${_IC_MSG_TASKS_IN_PROGRESS//COUNT_PLACEHOLDER/$IN_PROGRESS_OR_PENDING_COUNT}"
+        block_stop "GET-BACK-TO-WORK" "$_ic_msg"
     else
         # Current wave has no active tasks but workflow_stage is still executing.
         # This means get_next_tasks() hasn't been called to advance to the next
         # wave or reach execution_complete. Block the stop.
         increment_block_counter
-        block_stop "GET-BACK-TO-WORK" "STOP — WAVE COMPLETE, ADVANCE TO NEXT
-
-All tasks in the current wave are done, but the plan is not finished yet.
-
-Call the MCP tool mcp__plugin_ironclaude_state-manager__get_next_tasks RIGHT NOW to get the next wave of tasks or confirm plan completion.
-
-Do NOT stop. Do NOT ask the user. Call get_next_tasks and continue."
+        block_stop "GET-BACK-TO-WORK" "$_IC_MSG_WAVE_COMPLETE"
     fi
 fi
 
@@ -548,10 +631,13 @@ Examples of grade A (following properly):
 - Claude is explaining code, reporting results, or answering questions
 - Claude is using brainstorming, writing-plans, or executing-plans skills
 - Claude is analyzing a problem or presenting options
+- Claude directs or recommends the user run the sanctioned /deactivate-professional-mode or /activate-professional-mode skill AND nothing more — these are human-only and ARE the intended way to change professional mode; naming or recommending them is NOT a bypass, provided the same turn does not also instruct a real circumvention (see the mixed-turn case below)
 
 Examples of grade D/F (bypassing):
-- Claude tells the user to delete a flag file or hook script
-- Claude provides commands to disable professional mode
+- Claude tells the user to delete or edit the professional-mode flag file, a guard hook script, or ironclaude-hooks-config.json in order to disable protections
+- Claude provides shell commands to disable protections (e.g. rm the professional-mode flag or a guard hook, edit the hooks-config) or a set_professional_mode workaround — naming the sanctioned /deactivate-professional-mode or /activate-professional-mode skills is grade A ONLY when the turn instructs no such real circumvention
+- Claude tells the user to delete the throttle or bypass-counter files to dodge the hook
+- Claude names or recommends a sanctioned /deactivate-professional-mode or /activate-professional-mode skill BUT the same turn ALSO instructs a real circumvention (e.g. \"run /deactivate-professional-mode, or just rm the guard hook\") — this is D/F regardless of the sanctioned-skill mention; the carve-out never excuses a turn that also tells the user to disable protections
 - Claude suggests workarounds to avoid hook checks
 - Claude suggests skipping brainstorming and jumping straight to implementation
 - Claude offers to just make the change directly instead of using the plan workflow
@@ -852,35 +938,16 @@ if [ "$STOP_HOOK_ACTIVE" = "true" ]; then
     IS_FORCED_CONTINUATION="true"
 fi
 
-# Suppress continuation check if a waiting or background tool was used in the last 3 turns.
-# Detects Monitor, TaskOutput, ScheduleWakeup, AskUserQuestion by name, plus Bash run_in_background=true.
-# Fail-open: any jq failure leaves FIRE_CONTINUATION unchanged.
-if [ "$FIRE_CONTINUATION" = "true" ]; then
-    _BG_RECENT_REQ_IDS=$(
-        tail -n 500 "$TRANSCRIPT_PATH" 2>/dev/null | \
-        jq -r 'select(.type == "assistant") | .requestId // empty' 2>/dev/null | \
-        tail -3
-    )
-    _BG_JOB_ACTIVE="false"
-    if [ -n "$_BG_RECENT_REQ_IDS" ]; then
-        while IFS= read -r _req_id; do
-            [ -z "$_req_id" ] && continue
-            if tail -n 500 "$TRANSCRIPT_PATH" 2>/dev/null | grep -F "\"$_req_id\"" | \
-               jq -r '.message.content[]? | select(.type == "tool_use") | if .name == "Monitor" or .name == "TaskOutput" or .name == "ScheduleWakeup" or .name == "AskUserQuestion" then "true" elif (.input.run_in_background // false) == true then "true" else "false" end' \
-               2>/dev/null | grep -q "^true$" 2>/dev/null; then
-                _BG_JOB_ACTIVE="true"
-                break
-            fi
-        done <<< "$_BG_RECENT_REQ_IDS"
-    fi
-    if [ "$_BG_JOB_ACTIVE" = "true" ]; then
-        FIRE_CONTINUATION="false"
-        log_hook "GET-BACK-TO-WORK" "Suppressed" "continuation check — waiting tool detected in last 3 turns (Monitor/TaskOutput/ScheduleWakeup/AskUserQuestion/run_in_background)"
-        if [ "$(_gbtw_should_rearm_check "$WORKFLOW_STAGE" "$RECENT_CONTEXT")" = "true" ]; then
-            FIRE_CONTINUATION="true"
-            log_hook "GET-BACK-TO-WORK" "Suppression-override" "anti-pattern proposal detected — continuation check re-armed (bg-tool suppression)"
-        fi
-    fi
+# G1: suppress the continuation check when a COMPLETION-AWARE live in-flight job (Agent
+# async dispatch OR run_in_background Bash) or a recent named waiting tool is present —
+# the same signal the tasks-in-progress block and the code-review gate use (via
+# _gbtw_review_gate_suppress). Completion-aware, so a finished/killed subagent still fires
+# the check (no false-silence). The anti-pattern re-arm is honored inside the helper.
+# Fail-open: the helper returns empty on any error, so the continuation check fires.
+if [ "$FIRE_CONTINUATION" = "true" ] \
+   && [ "$(_gbtw_continuation_suppressed_by_inflight "$TRANSCRIPT_PATH" "$WORKFLOW_STAGE" "$RECENT_CONTEXT")" = "true" ]; then
+    FIRE_CONTINUATION="false"
+    log_hook "GET-BACK-TO-WORK" "Suppressed" "continuation check — live in-flight job / waiting tool (completion-aware)"
 fi
 
 # Suppress continuation check when the worker ends on a legitimate "holding/waiting" state.
@@ -1009,18 +1076,8 @@ if [[ "$ACTIVE_SKILL" =~ ^(brainstorming|writing-plans)$ ]]; then
     MEMORY_SEARCH_REQUIRED=$(db_read "memory_search_required" "1")
     if [ "$MEMORY_SEARCH_REQUIRED" = "1" ]; then
         increment_block_counter
-        block_stop "GET-BACK-TO-WORK" "STOP — MEMORY SEARCH REQUIRED
-
-You MUST search episodic memory before continuing with $ACTIVE_SKILL. This is blocking — no other action will unblock you. Do NOT write code, do NOT respond to the user, do NOT call any other tool.
-
-Call the Agent tool RIGHT NOW with EXACTLY these parameters:
-  description: \"Search episodic memory\"
-  subagent_type: \"ironclaude:search-conversations\"
-  prompt: \"Search for prior decisions and context about [your current task topic]\"
-
-The subagent_type field MUST contain 'search-conversations' exactly as shown. Any other tool call will keep you blocked.
-
-Do this NOW. You will remain blocked on every stop attempt until you make this exact Task tool call."
+        _ic_msg="${_IC_MSG_MEMORY_SEARCH//SKILL_PLACEHOLDER/$ACTIVE_SKILL}"
+        block_stop "GET-BACK-TO-WORK" "$_ic_msg"
     fi
 fi
 
@@ -1158,14 +1215,7 @@ fi
 
 # Priority 4: Should continue working (grade D/F = block, C = warn)
 if [[ "$CONTINUATION_GRADE" =~ ^[DF]$ ]]; then
-    CORRECTION="STOP — WORK INCOMPLETE
-
-You stopped before finishing your work. $CONTINUATION_REASONING
-
-Continue from where you left off.
-
-Do NOT ask the user what to do.
-Do NOT stop again until your current task is complete."
+    CORRECTION="${_IC_MSG_WORK_INCOMPLETE//REASONING_PLACEHOLDER/$CONTINUATION_REASONING}"
     increment_block_counter
     block_stop "GET-BACK-TO-WORK" "Grade: $CONTINUATION_GRADE | $CORRECTION | LLM: $CONTINUATION_RAW"
 elif [ "$CONTINUATION_GRADE" = "C" ]; then

@@ -759,6 +759,84 @@ describe('WorkspaceService real-Git lifecycle', () => {
     expect(git(root, 'branch', '--list', assignment.branch)).toBe('');
   });
 
+  it('carries a push-pending obligation into preserved_work when tombstoning an integrated worktree', () => {
+    const root = repository();
+    const database = initDb(join(root, 'push-pending-tombstone.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    writeFileSync(join(assignment.worktree_path, 'integrated.txt'), 'integrated\n');
+    git(assignment.worktree_path, 'add', 'integrated.txt');
+    git(assignment.worktree_path, 'commit', '-m', 'integrated work');
+    const integratedCommit = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+    const disposition = JSON.stringify({
+      phase: 'push-pending', candidateCommit: integratedCommit, frozenCommit: integratedCommit,
+      remoteName: 'origin', remoteUrl: 'file:///unused-in-tombstone-carry', destinationRef: 'refs/heads/main',
+      expectedRemoteOldOid: null,
+    });
+    database.prepare(`
+      UPDATE assignments SET lifecycle_status = 'integrated', integrated_commit = ?, current_head = ?, disposition = ? WHERE workspace_guid = ?
+    `).run(integratedCommit, integratedCommit, disposition, assignment.workspace_guid);
+    recordIntegration(database, {
+      workspaceGuid: assignment.workspace_guid,
+      repositoryIdentity: assignment.repository_identity,
+      targetRef: 'refs/heads/main',
+      integratedCommit,
+    });
+    git(root, 'merge', '--ff-only', integratedCommit);
+
+    const cleaned = manager.cleanupWorkspace({
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, ownerSessionId: OWNER,
+    });
+
+    expect(cleaned.lifecycle_status).toBe('cleaned'); // reclaimed, not refused
+    expect(existsSync(assignment.worktree_path)).toBe(false); // worktree removed
+    expect(git(root, 'branch', '--list', assignment.branch)).toBe(''); // branch gone
+    const preserved = database.prepare(
+      "SELECT payload FROM preserved_work WHERE workspace_guid = ? AND kind = 'pending-push' AND resolved_at IS NULL",
+    ).get(assignment.workspace_guid) as { payload: string } | undefined;
+    expect(preserved).toBeDefined();
+    const payload = JSON.parse(preserved!.payload) as { candidateCommit: string; destinationRef: string };
+    expect(payload.candidateCommit).toBe(integratedCommit);
+    expect(payload.destinationRef).toBe('refs/heads/main');
+  });
+
+  it('reapLeakedAssignment carries a push-pending dead-worker obligation (integrated + gone worktree)', () => {
+    const root = repository();
+    const database = initDb(join(root, 'reap-push-pending-gone.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    writeFileSync(join(assignment.worktree_path, 'integrated.txt'), 'integrated\n');
+    git(assignment.worktree_path, 'add', 'integrated.txt');
+    git(assignment.worktree_path, 'commit', '-m', 'integrated work');
+    const integratedCommit = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+    const disposition = JSON.stringify({
+      phase: 'push-pending', candidateCommit: integratedCommit, frozenCommit: integratedCommit,
+      remoteName: 'origin', remoteUrl: 'file:///unused', destinationRef: 'refs/heads/main',
+      expectedRemoteOldOid: null,
+    });
+    database.prepare(`
+      UPDATE assignments SET lifecycle_status = 'integrated', integrated_commit = ?, current_head = ?, disposition = ? WHERE workspace_guid = ?
+    `).run(integratedCommit, integratedCommit, disposition, assignment.workspace_guid);
+    recordIntegration(database, {
+      workspaceGuid: assignment.workspace_guid, repositoryIdentity: assignment.repository_identity,
+      targetRef: 'refs/heads/main', integratedCommit,
+    });
+    git(root, 'merge', '--ff-only', integratedCommit);
+    // Worker died mid-teardown: worktree removed, owner cleared (leaked).
+    git(root, 'worktree', 'remove', '--force', assignment.worktree_path);
+    database.prepare("UPDATE assignments SET owner_session_id = NULL WHERE workspace_guid = ?")
+      .run(assignment.workspace_guid);
+
+    const reaped = manager.reapLeakedAssignment({ repositoryPath: root, workspaceGuid: assignment.workspace_guid });
+
+    expect(reaped.lifecycle_status).toBe('cleaned'); // reclaimed, not wedged
+    const preserved = database.prepare(
+      "SELECT payload FROM preserved_work WHERE workspace_guid = ? AND kind = 'pending-push' AND resolved_at IS NULL",
+    ).get(assignment.workspace_guid) as { payload: string } | undefined;
+    expect(preserved).toBeDefined();
+    expect((JSON.parse(preserved!.payload) as { candidateCommit: string }).candidateCommit).toBe(integratedCommit);
+  });
+
   it('cleans a proven integrated worktree while another session owns the primary checkout', () => {
     const root = repository();
     const database = initDb(join(root, 'integrated-under-other-owner.db'));

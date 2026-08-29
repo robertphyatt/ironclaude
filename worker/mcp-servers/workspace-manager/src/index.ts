@@ -9,10 +9,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { initDb } from './db.js';
+import { getAssignment, initDb, listUnresolvedPreservedWork } from './db.js';
 import { verifyDirectGitAuthority, type DirectGitOperation } from './git-authority.js';
-import { discoverRepository } from './git.js';
-import { finalizeDirectAuthority, finalizePrimaryUnassignedCommit, finalizePrimaryUnassignedPush, finalizePrimaryUnassignedCommitAndPush, finalizeReconcile, reconcileFinalization, syncWorktreeToTarget } from './integration.js';
+import { discoverRepository, worktreeExists } from './git.js';
+import { finalizeCloseOut, finalizeConfirmResolution, finalizeDirectAuthority, finalizePrimaryUnassignedCommit, finalizePrimaryUnassignedPush, finalizePrimaryUnassignedCommitAndPush, finalizeReconcile, pushPendingSummary, reconcileFinalization, resolveConflictHunk, syncWorktreeToTarget } from './integration.js';
 import { parseIronClaudeClient, resolveSessionIdentity } from './session-identity.js';
 import type { Assignment, SessionIdentity } from './types.js';
 import { WorkspaceService } from './workspace-service.js';
@@ -30,6 +30,10 @@ export interface PublicToolDependencies {
   reconcileFinalization: PublicSingleArgumentDependency;
   syncWorktreeToTarget: PublicSingleArgumentDependency;
   reconcileWorktree: PublicSingleArgumentDependency;
+  landResolvedConflict: PublicSingleArgumentDependency;
+  resolveConflictHunk: PublicSingleArgumentDependency;
+  closeOutWorktree: PublicSingleArgumentDependency;
+  listPreservedWork: PublicSingleArgumentDependency;
 }
 
 export const PUBLIC_TOOL_NAMES = [
@@ -44,6 +48,10 @@ export const PUBLIC_TOOL_NAMES = [
   'reconcile_finalization',
   'sync_worktree_to_target',
   'reconcile_worktree',
+  'land_resolved_conflict',
+  'resolve_conflict_hunk',
+  'close_out_worktree',
+  'list_preserved_work',
 ] as const;
 
 const repositoryProperty = { type: 'string' as const, description: 'Path within the target Git repository.' };
@@ -117,7 +125,7 @@ export const publicToolDefinitions = [
   },
   ...(['commit', 'commit_and_push', 'push'] as const).map((name) => ({
     name,
-    description: `Consume exact human intent and perform direct ${name.replaceAll('_', '-')} authority.`,
+    description: `Consume exact human intent and perform direct ${name.replaceAll('_', '-')} authority. Intent exists ONLY when the operator typed /${name.replaceAll('_', '-')} as their literal prompt this turn; free-text prose does not carry it. On a prose request, reply with the /${name.replaceAll('_', '-')} form for the operator to type — do NOT call this tool (it refuses without intent). After the verb completes, carry forward any remaining instruction from the prose.`,
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -172,6 +180,56 @@ export const publicToolDefinitions = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'land_resolved_conflict',
+    description: 'Land an operator-confirmed conflict resolution into local main via the isRepair channel; consumes /confirm-resolution intent, requires the registered candidate to equal the authorized HEAD; keeps the worktree; never pushes.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: { repository_path: repositoryProperty, workspace_guid: workspaceProperty },
+      required: ['repository_path', 'workspace_guid'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'resolve_conflict_hunk',
+    description: 'Turn one per-hunk operator choice into staged resolved bytes on a paused integration rebase, gated to the provider-root session; drives rebase --continue when the hunk was the last unresolved path. NEVER lands and NEVER pushes — landing a completed rebase is a separate tool (land_resolved_conflict).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        repository_path: repositoryProperty,
+        workspace_guid: workspaceProperty,
+        path: { type: 'string' as const, description: 'The single unmerged path this call resolves.' },
+        choice: {
+          type: 'string' as const,
+          enum: ['keep-mine', 'take-target', 'prose', 'abort'],
+          description: "'keep-mine' keeps the reviewed work; 'take-target' takes the drifted integration target; 'prose' writes the given content verbatim; 'abort' aborts the paused rebase, restoring the frozen pre-rebase commit.",
+        },
+        content: { type: 'string' as const, description: "Required, and used only, when choice is 'prose'." },
+      },
+      required: ['repository_path', 'workspace_guid', 'path', 'choice'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'close_out_worktree',
+    description: 'Integrate this managed worktree HEAD into local main and FULLY tear the worktree down (remove worktree + temp branch), auto-resolving push-pending/dirty/recoverable-rebase; gated to the provider-root session; never pushes.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: { repository_path: repositoryProperty, workspace_guid: workspaceProperty },
+      required: ['repository_path', 'workspace_guid'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'list_preserved_work',
+    description: 'List work preserved on terminal rows for this repository and provider-root session: push obligations carried by a close-out (kind "pending-push") and residual snapshotted to a recovery ref (kind "recovery").',
+    inputSchema: {
+      type: 'object' as const,
+      properties: { repository_path: repositoryProperty },
+      required: ['repository_path'],
+      additionalProperties: false,
+    },
+  },
 ] as const;
 
 function requiredString(args: Args, key: string): string {
@@ -184,6 +242,14 @@ function optionalString(args: Args, key: string): string | undefined {
   const value = args[key];
   if (value === undefined) return undefined;
   if (typeof value !== 'string' || value.length === 0) throw new Error(`${key} must be a non-empty string`);
+  return value;
+}
+
+function requiredConflictHunkChoice(args: Args): 'keep-mine' | 'take-target' | 'prose' | 'abort' {
+  const value = args.choice;
+  if (value !== 'keep-mine' && value !== 'take-target' && value !== 'prose' && value !== 'abort') {
+    throw new Error("choice must be 'keep-mine', 'take-target', 'prose', or 'abort'");
+  }
   return value;
 }
 
@@ -210,6 +276,10 @@ export function dispatchPublicTool(name: string, args: Args, dependencies: Publi
     case 'reconcile_finalization': return dependencies.reconcileFinalization(args);
     case 'sync_worktree_to_target': return dependencies.syncWorktreeToTarget(args);
     case 'reconcile_worktree': return dependencies.reconcileWorktree(args);
+    case 'land_resolved_conflict': return dependencies.landResolvedConflict(args);
+    case 'resolve_conflict_hunk': return dependencies.resolveConflictHunk(args);
+    case 'close_out_worktree': return dependencies.closeOutWorktree(args);
+    case 'list_preserved_work': return dependencies.listPreservedWork(args);
     default: throw new Error(`Unknown public workspace tool: ${name}`);
   }
 }
@@ -291,7 +361,7 @@ export function createPublicToolDependencies(
       });
       const message = operation === 'push' ? '' : requiredString(args, 'message');
       if (authority.checkoutMode === 'primary-unassigned') {
-        if (authority.operation === 'push') return finalizePrimaryUnassignedPush(authority);
+        if (authority.operation === 'push') return finalizePrimaryUnassignedPush(authority, undefined, db);
         if (authority.operation === 'commit-and-push') return finalizePrimaryUnassignedCommitAndPush(authority, message);
         return finalizePrimaryUnassignedCommit(authority, message);
       }
@@ -324,6 +394,141 @@ export function createPublicToolDependencies(
         operation: 'reconcile',
       });
       return finalizeReconcile(db, authority);
+    },
+    landResolvedConflict: (args) => {
+      requireProviderRoot();
+      const authority = verifyDirectGitAuthority(db, {
+        repositoryPath: requiredString(args, 'repository_path'),
+        workspaceGuid: optionalString(args, 'workspace_guid'),
+        providerRootSessionId: identity.sessionId,
+        humanChannel,
+        operation: 'confirm-resolution',
+      });
+      return finalizeConfirmResolution(db, authority);
+    },
+    resolveConflictHunk: (args) => {
+      requireProviderRoot();
+      return resolveConflictHunk(db, {
+        repositoryPath: requiredString(args, 'repository_path'),
+        workspaceGuid: requiredString(args, 'workspace_guid'),
+        providerRootSessionId: identity.sessionId,
+        path: requiredString(args, 'path'),
+        choice: requiredConflictHunkChoice(args),
+        content: optionalString(args, 'content'),
+      });
+    },
+    closeOutWorktree: (args) => {
+      requireProviderRoot();
+      const repositoryPath = requiredString(args, 'repository_path');
+      const workspaceGuid = requiredString(args, 'workspace_guid');
+      // R3: an integrated row whose managed worktree was already removed (crash mid-teardown)
+      // cannot mint authority — resolveEffectiveCheckout requires the worktree present, yielding a
+      // raw identity error. Complete DB-only via the owner-bound cleanupWorkspace (which now carries
+      // the obligation into preserved_work); no git op on the gone worktree, no push. A PRESENT
+      // worktree falls through to the normal status-probe -> authority -> finalizeCloseOut path.
+      const existing = getAssignment(db, workspaceGuid);
+      if (existing && existing.lifecycle_status === 'integrated') {
+        const repo = discoverRepository(repositoryPath);
+        const present = fs.existsSync(existing.worktree_path)
+          && worktreeExists(repo.primaryCheckoutPath, existing.worktree_path);
+        if (!present) {
+          const carried = pushPendingSummary(existing.disposition);
+          const cleaned = service.cleanupWorkspace({ repositoryPath, workspaceGuid, ownerSessionId: identity.sessionId });
+          return {
+            state: 'closed-out',
+            integratedCommit: cleaned.integrated_commit ?? existing.integrated_commit ?? undefined,
+            ...(carried ? { pendingPush: carried } : {}),
+          };
+        }
+      }
+      // Handler-orchestrated paused-rebase recovery BEFORE authority (a paused rebase
+      // detaches HEAD, so no close-out authority could be minted on it): auto-continue a
+      // clean paused rebase via the authority-free recovery tool, preserve-and-defer a
+      // conflict. reconcileFinalization is used UNMODIFIED (reconcile lane byte-untouched).
+      const status = reconcileFinalization(db, {
+        repositoryPath, workspaceGuid, providerRootSessionId: identity.sessionId, rebaseRecovery: 'status',
+      });
+      if (status.state === 'rebase-paused-conflict') {
+        return {
+          state: 'rebase-paused-conflict',
+          detail: 'Close-out paused: a rebase conflict needs automated resolution (pending); worktree preserved. Not an operator task.',
+        };
+      }
+      if (status.state === 'rebase-paused-clean') {
+        try {
+          const cont = reconcileFinalization(db, {
+            repositoryPath, workspaceGuid, providerRootSessionId: identity.sessionId, rebaseRecovery: 'continue',
+          });
+          // C1: only a clean-integrate continue may proceed to teardown. A content-changing
+          // resolution (rebase-recovery-repair-required) integrates NOTHING and is
+          // preserved-and-deferred here; it must never fall through to finalizeCloseOut.
+          if (cont.state !== 'cleaned' && cont.state !== 'integrated-local') {
+            return cont;
+          }
+        } catch (error) {
+          // continue re-conflicted or paused again: re-probe and preserve-and-defer with the
+          // probe's own paused state. Never surface as an operator action item.
+          const probe = reconcileFinalization(db, {
+            repositoryPath, workspaceGuid, providerRootSessionId: identity.sessionId, rebaseRecovery: 'status',
+          });
+          if (probe.state === 'rebase-paused-conflict' || probe.state === 'rebase-paused-clean') {
+            return {
+              state: probe.state,
+              detail: `Close-out paused: the rebase needs automated resolution (pending); worktree preserved. Not an operator task. (${error instanceof Error ? error.message : String(error)})`,
+            };
+          }
+          throw error;
+        }
+      }
+      const authority = verifyDirectGitAuthority(db, {
+        repositoryPath,
+        workspaceGuid,
+        providerRootSessionId: identity.sessionId,
+        humanChannel,
+        operation: 'close-out',
+      });
+      return finalizeCloseOut(db, authority);
+    },
+    listPreservedWork: (args) => {
+      const repository = discoverRepository(requiredString(args, 'repository_path'));
+      const preserved: Array<{ workspace_guid: string; kind: 'pending-push' | 'recovery'; destinationRef?: string; ref?: string }> = [];
+      // I-1: UNION the durable preserved_work table (which survives row reuse) with the existing
+      // assignments cleaned/abandoned query; NEVER replace it (a legacy row carrying recovery_ref
+      // with no table entry must stay listed). Dedupe: emit table rows first, then append an
+      // assignments leg only when the table has not already surfaced it.
+      const pendingPushGuids = new Set<string>();
+      const emittedRefs = new Set<string>();
+      for (const row of listUnresolvedPreservedWork(db, repository.repositoryIdentity, identity.sessionId)) {
+        let payload: { destinationRef?: string; ref?: string };
+        try { payload = JSON.parse(row.payload); } catch { continue; }
+        if (row.kind === 'pending-push') {
+          preserved.push({ workspace_guid: row.workspace_guid, kind: 'pending-push', destinationRef: payload.destinationRef });
+          pendingPushGuids.add(row.workspace_guid);
+        } else if (payload.ref) {
+          preserved.push({ workspace_guid: row.workspace_guid, kind: 'recovery', ref: payload.ref });
+          emittedRefs.add(payload.ref);
+        }
+      }
+      const rows = db.prepare(`
+        SELECT workspace_guid, disposition, recovery_ref FROM assignments
+        WHERE repository_identity = ? AND owner_session_id = ?
+          AND lifecycle_status IN ('cleaned', 'abandoned')
+          AND (disposition IS NOT NULL OR recovery_ref IS NOT NULL)
+        ORDER BY created_at ASC
+      `).all(repository.repositoryIdentity, identity.sessionId) as {
+        workspace_guid: string; disposition: string | null; recovery_ref: string | null;
+      }[];
+      for (const row of rows) {
+        const summary = pushPendingSummary(row.disposition);
+        if (summary && !pendingPushGuids.has(row.workspace_guid)) {
+          preserved.push({ workspace_guid: row.workspace_guid, kind: 'pending-push', destinationRef: summary.destinationRef });
+        }
+        if (row.recovery_ref && !emittedRefs.has(row.recovery_ref)) {
+          preserved.push({ workspace_guid: row.workspace_guid, kind: 'recovery', ref: row.recovery_ref });
+          emittedRefs.add(row.recovery_ref);
+        }
+      }
+      return preserved;
     },
   };
 }

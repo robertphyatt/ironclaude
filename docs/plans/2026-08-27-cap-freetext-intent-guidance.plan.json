@@ -1,0 +1,27 @@
+{
+  "name": "QW-CAP - free-text git-verb intent guidance",
+  "goal": "On the free-text git-verb path, steer the agent to the rendered /<verb> form and make the missing-intent refusal self-explaining, via the tool description + refusal string, with the intent-mint gate byte-unchanged.",
+  "requirements_file": "docs/plans/2026-08-27-cap-freetext-intent-guidance-requirements.md",
+  "design_file": "docs/plans/2026-08-27-cap-freetext-intent-guidance-design.md",
+  "estimated_memory_gb": 0.5,
+  "tasks": [
+    {
+      "id": 1,
+      "name": "enrich the tool description + append the refusal remedy",
+      "description": "Enrich the shared MCP tool-description template for commit/commit_and_push/push (index.ts:122-137) so the free-text path learns intent = the exact /<verb> keystroke, to reply with the form rather than call the tool, and to carry the compound-prompt tail forward. APPEND a remedy to both missing-intent refusal strings (git-authority.ts:556 and :612), preserving the 'matching human intent' prefix. state-activator.sh is NOT in allowed_files (HC1: mint gate untouched). No free-text promotion.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/index.ts",
+        "worker/mcp-servers/workspace-manager/src/git-authority.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/git-authority.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: In tool-dispatch.test.ts add 'the commit_and_push tool description tells the agent free-text does not carry intent and to render the form': const def = publicToolDefinitions.find((t) => t.name === 'commit_and_push'); expect(def?.description).toContain('free-text prose does not carry it'); expect(def?.description).toContain('reply with the /commit-and-push form'). (publicToolDefinitions already imported :10.) In git-authority.test.ts add 'the missing-intent refusal names the remedy while preserving the matching-human-intent prefix': mirror an existing missing-intent .toThrow('matching human intent') test (ground the exact seed by reading a current one), assert the thrown message .toContain('matching human intent') AND .toContain('does not mint intent').", "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test -- --testTimeout=30000 -t \"does not carry intent\"", "expected": "FAIL - current description is the thin 'Consume exact human intent...' and the refusal has no remedy clause."},
+        {"description": "GREEN: index.ts:124 replace the description template (v = name.replaceAll('_','-')): `Consume exact human intent and perform direct ${v} authority. Intent exists ONLY when the operator typed /${v} as their literal prompt this turn; free-text prose does not carry it. On a prose request, reply with the /${v} form for the operator to type — do NOT call this tool (it refuses without intent). After the verb completes, carry forward any remaining instruction from the prose.` (use name.replaceAll('_','-') inline for each ${v}). git-authority.ts:556 AND :612 APPEND to both refusal strings (identical): throw new Error('Direct Git operation requires a matching human intent — the operator must invoke the rendered git form (/commit, /commit-and-push, or /push) as their literal prompt; free-text prose does not mint intent').", "expected": "the two new assertions pass; the tool desc + refusal carry the guidance."},
+        {"description": "Run full suite (the 18 existing 'matching human intent' substring assertions must survive the append).", "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test -- --testTimeout=30000", "expected": "all pass (baseline 297 + 2 new; 15 git-authority.test.ts + 3 workspace-service.test.ts substring assertions stay green)."},
+        {"description": "Typecheck; verify state-activator.sh is UNCHANGED (HC1); stage the four files.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx tsc --noEmit && git -C /Users/roberthyatt/Code/ironclaude status --porcelain worker/hooks/state-activator.sh && git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/index.ts worker/mcp-servers/workspace-manager/src/git-authority.ts worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts worker/mcp-servers/workspace-manager/src/__tests__/git-authority.test.ts", "expected": "tsc exit 0; the state-activator.sh porcelain line is EMPTY (unchanged); four files staged."}
+      ]
+    }
+  ]
+}
