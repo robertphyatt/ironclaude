@@ -188,9 +188,54 @@ CREATE TABLE IF NOT EXISTS provider_capability_state (
     category TEXT,
     reason TEXT,
     observed_at TEXT,
+    capability_fingerprint TEXT,
+    notification_state TEXT NOT NULL DEFAULT 'pending',
+    last_probe_at REAL,
+    next_probe_at REAL,
+    probe_backoff_seconds REAL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (host, client, role, tier)
 );
+
+CREATE TABLE IF NOT EXISTS worker_prompt_incidents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    worker_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'superseded', 'resolved')),
+    first_observed_at REAL NOT NULL,
+    last_observed_at REAL NOT NULL,
+    resolved_at REAL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_prompt_one_active
+ON worker_prompt_incidents(worker_id) WHERE status = 'active';
+
+CREATE INDEX IF NOT EXISTS idx_worker_prompt_fingerprint_history
+ON worker_prompt_incidents(worker_id, fingerprint);
+
+CREATE TABLE IF NOT EXISTS worker_prompt_dispatches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id INTEGER NOT NULL REFERENCES worker_prompt_incidents(id),
+    generation INTEGER NOT NULL,
+    reason TEXT NOT NULL
+        CHECK (reason IN ('initial', 'capability_recovery', 'operator_guidance')),
+    identity TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending', 'claimed', 'delivered', 'failed', 'held')),
+    destination TEXT,
+    failure_category TEXT,
+    created_at REAL NOT NULL,
+    claimed_at REAL,
+    completed_at REAL,
+    UNIQUE (incident_id, generation),
+    UNIQUE (incident_id, reason, identity)
+);
+
+CREATE INDEX IF NOT EXISTS idx_worker_prompt_dispatch_state
+ON worker_prompt_dispatches(state, id);
 """
 
 # Indexes that depend on columns added by _DIRECTIVES_MIGRATION_COLUMNS.
@@ -214,6 +259,14 @@ _DIRECTIVES_MIGRATION_COLUMNS = [
     ("planned_use_goal_reason", "TEXT"),
     ("planned_prompt_reason", "TEXT"),
     ("superseded_by", "INTEGER REFERENCES directives(id)"),
+]
+
+_PROVIDER_CAPABILITY_MIGRATION_COLUMNS = [
+    ("capability_fingerprint", "TEXT"),
+    ("notification_state", "TEXT NOT NULL DEFAULT 'pending'"),
+    ("last_probe_at", "REAL"),
+    ("next_probe_at", "REAL"),
+    ("probe_backoff_seconds", "REAL"),
 ]
 
 
@@ -297,6 +350,22 @@ def init_db(db_path: str) -> sqlite3.Connection:
                 logger.debug(
                     "directives.%s already present, skipping migration: %s",
                     column_name, exc,
+                )
+            else:
+                raise
+    for column_name, column_def in _PROVIDER_CAPABILITY_MIGRATION_COLUMNS:
+        try:
+            conn.execute(
+                f"ALTER TABLE provider_capability_state ADD COLUMN "
+                f"{column_name} {column_def}"
+            )
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if "duplicate column name" in msg or "already has column" in msg:
+                logger.debug(
+                    "provider_capability_state.%s already present, skipping migration: %s",
+                    column_name,
+                    exc,
                 )
             else:
                 raise

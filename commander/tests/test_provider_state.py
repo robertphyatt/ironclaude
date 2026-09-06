@@ -87,6 +87,141 @@ def test_reason_round_trips(tmp_path):
     }
 
 
+def test_brain_capability_block_claims_one_notification_per_fingerprint(tmp_path):
+    state = make_state(tmp_path)
+    first = state.record_brain_capability_block(
+        tier="sonnet",
+        category="command_bridge",
+        reason="destination-conflict",
+        fingerprint="fp-a",
+        now=10.0,
+        initial_backoff=30.0,
+    )
+    assert first["notification_state"] == "pending"
+    assert first["next_probe_at"] == 40.0
+    assert state.claim_brain_capability_notification(
+        tier="sonnet", fingerprint="fp-a"
+    ) is True
+    assert state.claim_brain_capability_notification(
+        tier="sonnet", fingerprint="fp-a"
+    ) is False
+
+    repeated = state.record_brain_capability_block(
+        tier="sonnet",
+        category="command_bridge",
+        reason="destination-conflict",
+        fingerprint="fp-a",
+        now=20.0,
+        initial_backoff=30.0,
+    )
+    assert repeated["notification_state"] == "claimed"
+
+    changed = state.record_brain_capability_block(
+        tier="sonnet",
+        category="command_bridge",
+        reason="source-missing",
+        fingerprint="fp-b",
+        now=30.0,
+        initial_backoff=30.0,
+    )
+    assert changed["notification_state"] == "pending"
+    assert state.claim_brain_capability_notification(
+        tier="sonnet", fingerprint="fp-b"
+    ) is True
+
+
+def test_brain_capability_recheck_and_recovery_preserve_sticky_provider(tmp_path):
+    state = make_state(tmp_path)
+    state.set_current_client("brain", "codex")
+    state.record_brain_capability_block(
+        tier="opus",
+        category="command_bridge",
+        reason="destination-conflict",
+        fingerprint="fp-live",
+        now=100.0,
+        initial_backoff=15.0,
+    )
+    assert state.brain_capability_recheck_due(tier="opus", now=114.9) is False
+    assert state.brain_capability_recheck_due(tier="opus", now=115.0) is True
+
+    state.record_brain_capability_recovery(tier="opus")
+
+    assert state.get_current_client("brain") == "codex"
+    assert state.is_available("local", "codex", "brain", "opus") is True
+    row = state._conn.execute(
+        "SELECT capability_fingerprint, notification_state, next_probe_at "
+        "FROM provider_capability_state "
+        "WHERE host='local' AND client='codex' AND role='brain' AND tier='opus'"
+    ).fetchone()
+    assert tuple(row) == (None, "pending", None)
+
+
+def test_brain_capability_backoff_saturates_and_survives_reopen(tmp_path):
+    db_path = str(tmp_path / "bounded.db")
+    conn = init_db(db_path)
+    state = ProviderState(conn)
+    state.record_brain_capability_block(
+        tier="sonnet",
+        category="command_bridge",
+        reason="missing",
+        fingerprint="fp-bounded",
+        now=10.0,
+        initial_backoff=600.0,
+    )
+    saturated = state.record_brain_capability_block(
+        tier="sonnet",
+        category="command_bridge",
+        reason="missing",
+        fingerprint="fp-bounded",
+        now=20.0,
+        initial_backoff=600.0,
+    )
+    assert saturated["probe_backoff_seconds"] == 900.0
+    assert saturated["next_probe_at"] == 920.0
+    conn.close()
+
+    reopened = ProviderState(init_db(db_path))
+    persisted = reopened.record_brain_capability_block(
+        tier="sonnet",
+        category="command_bridge",
+        reason="missing",
+        fingerprint="fp-bounded",
+        now=30.0,
+        initial_backoff=600.0,
+    )
+    assert persisted["probe_backoff_seconds"] == 900.0
+    assert persisted["next_probe_at"] == 930.0
+
+
+def test_brain_capability_backoff_clamps_legacy_oversized_value(tmp_path):
+    state = make_state(tmp_path)
+    state.record_brain_capability_block(
+        tier="sonnet",
+        category="command_bridge",
+        reason="missing",
+        fingerprint="fp-legacy",
+        now=1.0,
+        initial_backoff=30.0,
+    )
+    state._conn.execute(
+        "UPDATE provider_capability_state SET probe_backoff_seconds=? "
+        "WHERE host='local' AND client='codex' AND role='brain' AND tier='sonnet'",
+        (1e30,),
+    )
+    state._conn.commit()
+
+    clamped = state.record_brain_capability_block(
+        tier="sonnet",
+        category="command_bridge",
+        reason="missing",
+        fingerprint="fp-legacy",
+        now=2.0,
+        initial_backoff=30.0,
+    )
+    assert clamped["probe_backoff_seconds"] == 900.0
+    assert clamped["next_probe_at"] == 902.0
+
+
 def test_capability_observation_preserves_quarantine_until_explicit_recovery(tmp_path):
     state = make_state(tmp_path)
     state.set_current_client("worker", "codex")

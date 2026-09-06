@@ -27,6 +27,8 @@ import json
 import logging
 import os
 import queue
+import re
+import selectors
 import subprocess
 import sys
 import threading
@@ -34,12 +36,12 @@ import time
 import uuid
 from pathlib import Path
 
-from ironclaude.config import DEFAULTS
+from ironclaude.config import DEFAULTS, effort_for_tier
 
 logger = logging.getLogger(__name__)
 
 # Codex tier->model map — single source of truth is config.DEFAULTS. A tier name
-# (haiku/sonnet/opus) resolves to its codex model; a value already in codex-model
+# (haiku/sonnet/opus/fable) resolves to its codex model; a value already in codex-model
 # form passes through, so BRAIN_MODEL may be a tier OR a literal codex model.
 _CODEX_TIER_MODELS = DEFAULTS["providers"]["clients"]["codex"]["models"]
 
@@ -87,6 +89,44 @@ _ORCHESTRATOR_REQUIRED_TOOLS = frozenset({
     "acknowledge_operator_message",
 })
 _ORCHESTRATOR_STARTUP_TIMEOUT = 120.0
+_RUNTIME_PREFLIGHT_TIMEOUT = 30.0
+_RUNTIME_PREFLIGHT_SCHEMA_VERSION = 1
+_RUNTIME_PREFLIGHT_OUTPUT_CAP = 65536
+_TOOL_EVENT_CAP = 100
+_TOOL_SERVERS = frozenset({"orchestrator", "research", "ollama", "episodic-memory"})
+_TOOL_STATUSES = frozenset({"started", "completed", "failed", "cancelled"})
+_TOOL_INVENTORY_SERVER_CAP = 64
+_TOOL_INVENTORY_PER_SERVER_CAP = 512
+_TOOL_IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
+_RUNTIME_PREFLIGHT_STATUSES = frozenset({"healthy", "repaired", "blocked", "repairable"})
+_RUNTIME_PREFLIGHT_ACTIONS = frozenset({"none", "create-symlink"})
+_RUNTIME_PREFLIGHT_REASONS = frozenset({
+    "unclassified",
+    "launcher-not-found",
+    "launcher-unresolvable",
+    "launcher-not-executable",
+    "source-missing",
+    "source-directory",
+    "source-non-regular",
+    "source-non-executable",
+    "source-is-destination",
+    "destination-missing",
+    "destination-equivalent",
+    "destination-conflict",
+    "repair-unsupported-platform",
+    "repair-create-failed",
+    "created-equivalent-symlink",
+    "unexpected-filesystem-error",
+    "helper-missing",
+    "executable-error",
+    "timeout",
+    "oversized-output",
+    "malformed-utf8",
+    "malformed-json",
+    "unsupported-schema",
+    "unsupported-status",
+    "status-exit-mismatch",
+})
 
 
 # Ported byte-for-byte from brain_client._tool_guard_logic (:357-374) + GIT_ALLOWED_COMMANDS
@@ -129,11 +169,13 @@ class CodexBrainClient:
         model: str = "gpt-5.6-terra",
         effort_level: str = "high",
         on_fable_unavailable_transition=None,
+        effort_levels: dict | None = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self._operator_name = operator_name
         self._model = model
         self._effort_level = effort_level
+        self._effort_levels = effort_levels or {}
         self._on_fable_unavailable_transition = on_fable_unavailable_transition
 
         # Restart bookkeeping — read directly by main.py's restart supervisor.
@@ -176,6 +218,25 @@ class CodexBrainClient:
         self._last_response_time = 0.0
         self._mcp_status_condition = threading.Condition()
         self._mcp_startup_status: dict[str, dict] = {}
+        self._runtime_capability_block: dict | None = None
+        self._tool_events: list[dict] = []
+        self._verified_tool_inventory: dict[str, frozenset[str]] = {}
+
+    @property
+    def client_name(self) -> str:
+        return "codex"
+
+    @property
+    def capability_tier(self) -> str:
+        return self._model
+
+    @property
+    def capability_block(self) -> dict | None:
+        return (
+            dict(self._runtime_capability_block)
+            if self._runtime_capability_block is not None
+            else None
+        )
 
     # ------------------------------------------------------------------
     # Protocol seams
@@ -188,7 +249,7 @@ class CodexBrainClient:
         return params
 
     def _resolve_model(self) -> str:
-        """Map a tier name (haiku/sonnet/opus) to its codex model; pass a value
+        """Map a tier name (haiku/sonnet/opus/fable) to its codex model; pass a value
         already in codex-model form through unchanged."""
         return _CODEX_TIER_MODELS.get(self._model, self._model)
 
@@ -198,12 +259,22 @@ class CodexBrainClient:
         pins the model so the codex Brain runs the operator-ruled tier rather than
         whatever ~/.codex/config.toml defaults to. `-c` is an app-server option
         (codex app-server --help); values are parsed as TOML strings."""
+        # TIER-FIRST reasoning-effort: self._model may be a tier name (a key in
+        # _CODEX_TIER_MODELS) or a concrete codex model (a value). Resolve its tier
+        # — direct when it is a key, inverse-mapped (value->tier) when concrete —
+        # then let effort_levels override the global effort_level per tier.
+        tier = (
+            self._model
+            if self._model in _CODEX_TIER_MODELS
+            else {v: k for k, v in _CODEX_TIER_MODELS.items()}.get(self._model, "")
+        )
+        effort = effort_for_tier(tier, self._effort_level, self._effort_levels)
         return [
             "codex", "app-server",
             "-c", 'sandbox_mode="read-only"',
             "-c", 'approval_policy="on-request"',
             "-c", f'model="{self._resolve_model()}"',
-            "-c", f'model_reasoning_effort="{self._effort_level}"',
+            "-c", f'model_reasoning_effort="{effort}"',
             *self._orchestrator_mcp_overrides(),
             *self._optional_mcp_overrides(),
             "--stdio",
@@ -318,6 +389,12 @@ class CodexBrainClient:
         if not isinstance(params, dict):
             params = {}
 
+        if method in ("item/started", "item/completed"):
+            item = params.get("item") or {}
+            if isinstance(item, dict) and item.get("type") == "mcpToolCall":
+                self._record_tool_event(method, item)
+                return
+
         if method == "mcpServer/startupStatus/updated":
             name = params.get("name")
             status = params.get("status")
@@ -380,6 +457,93 @@ class CodexBrainClient:
             return
 
         # Any other event: safely ignored.
+
+    @staticmethod
+    def _safe_tool_identifier(value, allowed: frozenset[str]) -> str:
+        if isinstance(value, str) and value in allowed:
+            return value
+        return "unknown"
+
+    @staticmethod
+    def _runtime_preflight_log_fields(observation: dict) -> dict:
+        schema_version = observation.get("schema_version")
+        return {
+            "schema_version": (
+                schema_version
+                if schema_version == _RUNTIME_PREFLIGHT_SCHEMA_VERSION
+                else "unknown"
+            ),
+            "status": CodexBrainClient._safe_tool_identifier(
+                observation.get("status"), _RUNTIME_PREFLIGHT_STATUSES
+            ),
+            "reason": CodexBrainClient._safe_tool_identifier(
+                observation.get("reason"), _RUNTIME_PREFLIGHT_REASONS
+            ),
+            "action": CodexBrainClient._safe_tool_identifier(
+                observation.get("action"), _RUNTIME_PREFLIGHT_ACTIONS
+            ),
+        }
+
+    def _safe_inventory_tool_identifier(self, server: str, value) -> str:
+        allowed = self._verified_tool_inventory.get(server, frozenset())
+        if not isinstance(value, str):
+            return "unknown"
+        if value in allowed:
+            return value
+        prefix = f"mcp__{server.replace('-', '_')}__"
+        if not value.startswith(prefix):
+            return "unknown"
+        normalized = value[len(prefix):]
+        return normalized if normalized in allowed else "unknown"
+
+    @staticmethod
+    def _tool_error_category(item: dict) -> str | None:
+        error = item.get("error")
+        if error is None:
+            return None
+        if isinstance(error, dict):
+            detail = " ".join(
+                str(error.get(key) or "") for key in ("code", "message")
+            )
+        else:
+            detail = str(error)
+        lowered = detail.lower()
+        if "code-mode host" in lowered or "command bridge" in lowered:
+            return "command_bridge"
+        if "blocked" in lowered or "denied" in lowered:
+            return "blocked"
+        return "tool_failure"
+
+    def _record_tool_event(self, method: str, item: dict) -> None:
+        server = self._safe_tool_identifier(
+            item.get("server") or item.get("serverName"), _TOOL_SERVERS
+        )
+        event = {
+            "server": server,
+            "tool": self._safe_inventory_tool_identifier(
+                server, item.get("tool") or item.get("toolName") or item.get("name")
+            ),
+            "status": self._safe_tool_identifier(
+                "started" if method == "item/started" else item.get("status") or "completed",
+                _TOOL_STATUSES,
+            ),
+            "error_category": (
+                None if method == "item/started" else self._tool_error_category(item)
+            ),
+        }
+        self._tool_events.append(event)
+        if len(self._tool_events) > _TOOL_EVENT_CAP:
+            del self._tool_events[: len(self._tool_events) - _TOOL_EVENT_CAP]
+        logger.info(
+            "Codex Brain tool event server=%s tool=%s status=%s error_category=%s",
+            event["server"],
+            event["tool"],
+            event["status"],
+            event["error_category"],
+        )
+
+    def get_tool_events(self) -> list[dict]:
+        return [dict(item) for item in self._tool_events]
 
     # ------------------------------------------------------------------
     # Server->client request handling (FAIL-CLOSED)
@@ -663,6 +827,8 @@ class CodexBrainClient:
                 if name in inventory:
                     return None, f"orchestrator MCP inventory duplicated server: {name}"
                 inventory[name] = server
+                if len(inventory) > _TOOL_INVENTORY_SERVER_CAP:
+                    return None, "orchestrator MCP inventory exceeds server cap"
 
             next_cursor = result.get("nextCursor")
             if next_cursor is None:
@@ -673,6 +839,27 @@ class CodexBrainClient:
                 return None, "orchestrator MCP inventory repeated cursor"
             seen_cursors.add(next_cursor)
             cursor = next_cursor
+
+    def _install_verified_tool_inventory(self, inventory: dict[str, dict]) -> str | None:
+        self._verified_tool_inventory = {}
+        verified: dict[str, frozenset[str]] = {}
+        for server_name in sorted(_TOOL_SERVERS & set(inventory)):
+            tools = inventory[server_name].get("tools")
+            if not isinstance(tools, dict):
+                return f"{server_name} MCP inventory malformed tools"
+            if len(tools) > _TOOL_INVENTORY_PER_SERVER_CAP:
+                return f"{server_name} MCP inventory exceeds tool cap"
+            safe_tools: set[str] = set()
+            for tool_name in tools:
+                if (
+                    not isinstance(tool_name, str)
+                    or _TOOL_IDENTIFIER_RE.fullmatch(tool_name) is None
+                ):
+                    return f"{server_name} MCP inventory has unsafe tool identifier"
+                safe_tools.add(tool_name)
+            verified[server_name] = frozenset(safe_tools)
+        self._verified_tool_inventory = verified
+        return None
 
     def _verify_orchestrator_mcp(self) -> str | None:
         ready_error = self._await_orchestrator_ready(
@@ -701,7 +888,7 @@ class CodexBrainClient:
         # in the inventory is the equivalent evidence to Claude's path glob.
         if "episodic-memory" not in inventory:
             return "episodic-memory MCP inventory missing server"
-        return None
+        return self._install_verified_tool_inventory(inventory)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -718,6 +905,128 @@ class CodexBrainClient:
             "IRONCLAUDE_CLIENT": "codex",
             "IRONCLAUDE_BRAIN_GATE_SESSION": self._brain_gate_session,
         }
+
+    def _runtime_preflight_path(self) -> Path:
+        return Path(__file__).parents[3] / "worker" / "scripts" / "codex-runtime-preflight.mjs"
+
+    @staticmethod
+    def _blocked_preflight(reason: str) -> dict:
+        return {
+            "schema_version": _RUNTIME_PREFLIGHT_SCHEMA_VERSION,
+            "mode": "repair",
+            "status": "blocked",
+            "invoked_launcher": "",
+            "resolved_launcher": "",
+            "source_companion": "",
+            "destination_companion": "",
+            "action": "none",
+            "reason": reason,
+        }
+
+    def _runtime_preflight(self) -> dict:
+        helper = self._runtime_preflight_path()
+        if not helper.is_file():
+            return self._blocked_preflight("helper-missing")
+        argv = ["node", str(helper), "--mode", "repair"]
+        returncode, stdout, process_error = self._run_runtime_preflight_process(argv)
+        if process_error is not None:
+            return self._blocked_preflight(process_error)
+        assert returncode is not None
+        assert stdout is not None
+        try:
+            observation = json.loads(stdout)
+        except (json.JSONDecodeError, TypeError):
+            return self._blocked_preflight("malformed-json")
+        required_strings = (
+            "mode",
+            "status",
+            "invoked_launcher",
+            "resolved_launcher",
+            "source_companion",
+            "destination_companion",
+            "action",
+            "reason",
+        )
+        if (
+            not isinstance(observation, dict)
+            or observation.get("schema_version") != _RUNTIME_PREFLIGHT_SCHEMA_VERSION
+            or any(not isinstance(observation.get(key), str) for key in required_strings)
+        ):
+            return self._blocked_preflight("unsupported-schema")
+        if observation["status"] not in ("healthy", "repaired", "blocked", "repairable"):
+            return self._blocked_preflight("unsupported-status")
+        if returncode == 0 and observation["status"] not in ("healthy", "repaired"):
+            return self._blocked_preflight("status-exit-mismatch")
+        if returncode != 0 and observation["status"] in ("healthy", "repaired"):
+            return self._blocked_preflight("status-exit-mismatch")
+        return {
+            key: (
+                value[:2048] if isinstance(value, str) else value
+            )
+            for key, value in observation.items()
+            if key in {"schema_version", *required_strings}
+        }
+
+    @staticmethod
+    def _run_runtime_preflight_process(
+        argv: list[str],
+    ) -> tuple[int | None, str | None, str | None]:
+        """Run helper with a live hard cap; never buffer or spool unbounded output."""
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            return None, None, "executable-error"
+
+        assert proc.stdout is not None
+        output = bytearray()
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + _RUNTIME_PREFLIGHT_TIMEOUT
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    proc.kill()
+                    proc.wait()
+                    return None, None, "timeout"
+                events = selector.select(timeout=min(remaining, 0.1))
+                if not events:
+                    continue
+                chunk = os.read(proc.stdout.fileno(), 4096)
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > _RUNTIME_PREFLIGHT_OUTPUT_CAP:
+                    proc.kill()
+                    proc.wait()
+                    return None, None, "oversized-output"
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                returncode = proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                return None, None, "timeout"
+        finally:
+            selector.close()
+            proc.stdout.close()
+        try:
+            stdout = output.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, None, "malformed-utf8"
+        return returncode, stdout, None
+
+    def probe_runtime_capability(self) -> dict:
+        observation = self._runtime_preflight()
+        if observation.get("status") in ("healthy", "repaired"):
+            self._runtime_capability_block = None
+        else:
+            self._runtime_capability_block = dict(observation)
+        return dict(observation)
 
     def _reset_brain_gate_startup_state(self) -> None:
         """Reset startup-only gates while retaining same-client memory/wiki arms."""
@@ -737,8 +1046,26 @@ class CodexBrainClient:
         self._stop_event.clear()
         self._restart_reason = ""
         self._reset_brain_gate_startup_state()
+        self._verified_tool_inventory = {}
         with self._mcp_status_condition:
             self._mcp_startup_status.clear()
+
+        runtime = self.probe_runtime_capability()
+        runtime_log = self._runtime_preflight_log_fields(runtime)
+        logger.info(
+            "Codex runtime preflight schema_version=%s status=%s reason=%s action=%s",
+            runtime_log["schema_version"],
+            runtime_log["status"],
+            runtime_log["reason"],
+            runtime_log["action"],
+        )
+        if runtime.get("status") not in ("healthy", "repaired"):
+            self._running = False
+            self._restart_reason = (
+                "Codex runtime capability blocked: " + runtime_log["reason"]
+            )
+            logger.error(self._restart_reason)
+            return
 
         preflight_error = self._preflight_orchestrator()
         if preflight_error is not None:
@@ -870,6 +1197,8 @@ class CodexBrainClient:
         return bool(self._running and self._proc is not None and self._proc.poll() is None)
 
     def needs_restart(self) -> bool:
+        if self._runtime_capability_block is not None:
+            return False
         if not self.is_alive():
             if not self._restart_reason:
                 self._restart_reason = "dead (codex app-server not running)"

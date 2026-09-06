@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import ctypes
+from dataclasses import dataclass
 import fcntl
+import hashlib
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -22,7 +24,8 @@ import psutil
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ironclaude.config import load_config, load_machines_config, DEFAULTS, make_opus_command
+from ironclaude.config import load_config, load_machines_config, DEFAULTS, make_opus_command, effort_for_tier
+from ironclaude.provider_config import _semantic_tier
 from ironclaude.auth_relay import AuthRelay
 from ironclaude.slack_interface import SlackBot, DIRECTIVE_STATUS_EMOJI, parse_reply_to_marker
 from ironclaude.slack_commands import SlackSocketHandler, format_help_text
@@ -31,7 +34,13 @@ from ironclaude.db import (
     init_db,
     persist_operator_message_acknowledgement,
 )
-from ironclaude.tmux_manager import TmuxManager, _strip_ansi
+from ironclaude.tmux_manager import (
+    PromptSignal,
+    TmuxManager,
+    _strip_ansi,
+    detect_ask_user_menu,
+    validate_prompt_candidate,
+)
 from ironclaude.brain_client import BrainClient, _NARRATION_PREFIX
 from ironclaude.worker_registry import WorkerRegistry
 from ironclaude.protocol import read_pending_decisions, read_task_ledger, write_decision
@@ -40,6 +49,7 @@ from ironclaude.notifications import (
     format_worker_session_ended_preserved,
     format_worker_idle, format_worker_checkin,
     format_heartbeat, format_brain_restarted, format_brain_compacted, format_brain_circuit_breaker,
+    format_brain_capability_blocked,
     format_objective_received,
     format_task_progress, format_plan_ready, format_blocked,
     format_worker_heartbeat_stuck_slack,
@@ -100,47 +110,86 @@ _NOT_AWAITING_RE = re.compile(
     re.IGNORECASE,
 )
 _AWAITING_OP_SYSTEM = (
-    "You classify a Brain status message. Determine whether the Brain is reporting that it is "
-    "WAITING ON THE OPERATOR (the human) to make a decision or judgment call before work can "
-    "continue — NOT merely narrating that some autonomous system condition (a test suite "
-    "finishing, a worker completing, a heartbeat label going idle, a timer elapsing) has not "
-    "yet resolved on its own.\n\n"
-    "Examples of awaiting_operator=true: \"holding for your approval on the migration\", "
+    "You classify a Brain status message into exactly one of three categories via the "
+    "`waiting_on` field:\n"
+    "- \"operator\": the Brain is waiting on THE HUMAN OPERATOR to make a decision or "
+    "judgment call before work can continue.\n"
+    "- \"brain\": the Brain (or a worker it orchestrates) is waiting on a BRAIN-SIDE "
+    "action or approval — e.g. the Brain approving/rejecting a worker's plan or "
+    "execution-mode menu, or a worker holding for the Brain's approve/reject decision. "
+    "The Brain itself is the actor, not the human.\n"
+    "- \"neither\": the message merely narrates an autonomous system condition that "
+    "resolves on its own (tests finishing, a worker completing, a build, a timer, a "
+    "subagent/review verdict).\n\n"
+    "Examples waiting_on=operator: \"holding for your approval on the migration\", "
     "\"waiting on your decision: ship now or wait for review?\", \"pinned decision needed from you\".\n"
-    "Examples of awaiting_operator=false (system state, not a human decision): "
-    "\"waiting for the heartbeat labels to become idle\", \"worker is waiting on tests to pass\", "
-    "\"holding until the build finishes\", \"holding for the Fable review result\", "
-    "\"waiting on subagent verdict\".\n\n"
-    "If yes, extract the worker id it is waiting about (e.g. d1267; use null if it is the Brain itself) "
-    "and a short paraphrase of what it is waiting for.\n\n"
-    'Respond ONLY with valid JSON: {"awaiting_operator": true|false, "worker_id": "..."|null, "question": "..."|null}'
+    "Examples waiting_on=brain: \"waiting for approval of the execution mode menu\", "
+    "\"holding to approve worker d5's plan\", \"worker is waiting for me to approve its menu\".\n"
+    "Examples waiting_on=neither: \"waiting for the heartbeat labels to become idle\", "
+    "\"worker is waiting on tests to pass\", \"holding until the build finishes\", "
+    "\"holding for the Fable review result\", \"waiting on subagent verdict\".\n\n"
+    "For operator or brain, extract the worker id it is about (e.g. d1267; use null if "
+    "it is the Brain itself) and a short paraphrase of what it is waiting for.\n\n"
+    "Respond ONLY with valid JSON: {\"waiting_on\": \"operator\"|\"brain\"|\"neither\", "
+    "\"worker_id\": \"...\"|null, \"question\": \"...\"|null}"
 )
 _AWAITING_OP_SCHEMA = {
     "type": "object",
     "properties": {
-        "awaiting_operator": {"type": "boolean"},
+        "waiting_on": {"type": "string", "enum": ["operator", "brain", "neither"]},
         "worker_id": {"type": ["string", "null"]},
         "question": {"type": ["string", "null"]},
     },
-    "required": ["awaiting_operator"],
+    "required": ["waiting_on"],
 }
 _OPERATOR_WAIT_TTL_SECONDS = 600    # backstop: drop a wait the Brain stopped re-affirming
 _OPERATOR_WAIT_MAX = 32            # bound the in-memory map
 
 _PROMPT_WAITING_SYSTEM = (
-    "You detect whether a worker process is waiting for user input based on its log tail.\n\n"
-    "Signs of waiting: AskUserQuestion UI, numbered option lists, 'Which approach', 'How would you like', etc.\n"
-    "Signs of working: editing files, running tests, reading code, thinking.\n\n"
-    'Respond ONLY with valid JSON: {"waiting": true} or {"waiting": false}'
+    "Extract only a current unresolved worker question, approval, or authority request "
+    "from the final terminal interaction block. Historical questions followed by an "
+    "answer, progress, command/test output, completion, or a newer interaction are not "
+    "current. Quoted questions in logs, plans, or reviews are not prompts. Return exact "
+    "source text without paraphrase. If no current prompt exists, use kind=none.\n\n"
+    "Return kind, the exact contiguous interaction_block, exact question, ordered option "
+    "value/label pairs, and exact authority_text."
 )
 _PROMPT_WAITING_SCHEMA = {
     "type": "object",
-    "properties": {"waiting": {"type": "boolean"}},
-    "required": ["waiting"],
+    "properties": {
+        "kind": {"enum": ["none", "question", "approval", "authority"]},
+        "interaction_block": {"type": ["string", "null"]},
+        "question": {"type": ["string", "null"]},
+        "options": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string"},
+                    "label": {"type": "string"},
+                },
+                "required": ["value", "label"],
+            },
+        },
+        "authority_text": {"type": ["string", "null"]},
+    },
+    "required": ["kind", "interaction_block", "question", "options", "authority_text"],
 }
 
 PROMPT_WAITING_CACHE_TTL = 120
 PROMPT_WAITING_CACHE_MAX = 512
+PROMPT_CAPTURE_LINES = 80
+PROMPT_CAPTURE_CHARS = 8192
+
+
+@dataclass(frozen=True)
+class PromptDetection:
+    signal: PromptSignal | None
+    conclusive: bool
+
+    @property
+    def waiting(self) -> bool:
+        return self.signal is not None
 # Canonical UUID: 8-4-4-4-12 hex groups.
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -688,8 +737,6 @@ OSCILLATION_CADENCE = 900
 
 STALENESS_ALERT_SECONDS = 1800
 STALENESS_KILL_SECONDS = 3600
-STALENESS_PROMPT_ALERT = 900
-STALENESS_PROMPT_KILL = 1800
 STALENESS_CHECK_INTERVAL = 60
 STALENESS_LIVENESS_EXTENSION = 900
 
@@ -755,6 +802,23 @@ def select_brain_class(config: dict, conn: sqlite3.Connection):
     return BrainClient
 
 
+def _log_brain_start_result(brain) -> bool:
+    """Log startup truthfully without changing Claude's established contract."""
+    if getattr(brain, "client_name", None) == "codex":
+        if brain.is_alive():
+            logger.info("Brain SDK client started client=codex")
+            return True
+        reason = (
+            "capability-blocked"
+            if getattr(brain, "capability_block", None) is not None
+            else "not-alive"
+        )
+        logger.error("Brain SDK client not started client=codex reason=%s", reason)
+        return False
+    logger.info("Brain SDK client started")
+    return True
+
+
 _daemon = None
 _pid_lock_fd: int | None = None
 _clean_shutdown = False
@@ -762,6 +826,24 @@ _sigterm_trusted: bool = True  # set False by _sigaction_cb for untrusted SIGTER
 _sigaction_callback = None  # GC anchor for ctypes CFUNCTYPE; must outlive sigaction syscall
 
 _PID_FILE = "/tmp/ic-daemon.pid"
+
+
+def _is_trusted_signal_sender(
+    sender_pid: int,
+    sender_uid: int,
+    *,
+    our_pid: int | None = None,
+    our_ppid: int | None = None,
+    effective_uid: int | None = None,
+) -> bool:
+    """Return whether siginfo identifies an authorized local shutdown sender."""
+    current_pid = os.getpid() if our_pid is None else our_pid
+    parent_pid = os.getppid() if our_ppid is None else our_ppid
+    current_uid = os.geteuid() if effective_uid is None else effective_uid
+    return (
+        sender_pid in (0, 1, current_pid, parent_pid)
+        or sender_uid in (0, current_uid)
+    )
 
 
 def _substitute_prompt(text: str, config: dict) -> str:
@@ -910,11 +992,16 @@ def _install_sigaction_handler() -> None:
             our_pid = os.getpid()
             our_ppid = os.getppid()
             global _sigterm_trusted
-            _sigterm_trusted = sender_pid in (0, 1, our_pid, our_ppid)
+            _sigterm_trusted = _is_trusted_signal_sender(
+                sender_pid,
+                sender_uid,
+                our_pid=our_pid,
+                our_ppid=our_ppid,
+            )
             if not _sigterm_trusted:
                 logger.warning(
-                    f"Rogue SIGTERM: sender_pid={sender_pid} ({sender_comm}) not in trusted set "
-                    f"{{0, 1, {our_pid}, {our_ppid}}} — respawner will fire"
+                    f"Rogue SIGTERM: sender_pid={sender_pid} sender_uid={sender_uid} "
+                    f"({sender_comm}) not in trusted pid/uid sets — respawner will fire"
                 )
         except Exception as e:
             logger.warning(f"Received signal {signum} (siginfo parse error: {e})")
@@ -1296,8 +1383,8 @@ class IroncladeDaemon:
         self._stuck_alert_sent: dict[str, bool] = {}
         self._stuck_kill_deferred: dict[str, float] = {}
         self._last_stuck_check: float = 0.0
-        self._grader = LocalGrader(timeout=15, keep_alive="30m")
-        self._prompt_waiting_cache: dict[int, tuple[float, bool]] = {}
+        self._grader = LocalGrader(keep_alive="30m")
+        self._prompt_waiting_cache: dict[int, tuple[float, PromptDetection]] = {}
         self._stuck_liveness_count: dict[str, int] = {}
         self._pm_gate_slack_sent: dict[str, bool] = {}
         self._stage_entered_at: dict[str, float] = {}
@@ -1319,6 +1406,8 @@ class IroncladeDaemon:
         # Awaiting-operator surfacing (in-memory; refreshed by Brain re-emission)
         self._operator_waits: dict[str, dict] = {}
         self._operator_wait_alerted: dict[str, str] = {}
+        self._brain_waits: dict[str, dict] = {}
+        self._prompt_dispatch_recovery_checked = False
         self._load_staleness_state()
 
     def shutdown(self):
@@ -1696,6 +1785,132 @@ class IroncladeDaemon:
             )
             return {}
 
+    def _route_operator_prompt_guidance(
+        self, text: str, source_ts: str
+    ) -> dict | None:
+        """Route trusted Slack guidance only when it names one active worker."""
+        store = self._prompt_store()
+        if store is None:
+            return None
+        try:
+            active = store.active_incidents()
+        except sqlite3.Error:
+            logger.exception(
+                "Prompt guidance inventory read failed; Brain dispatch held"
+            )
+            return {
+                "worker_id": None,
+                "replayed": False,
+                "delivered": False,
+                "held": True,
+            }
+        matches = []
+        for incident in active:
+            worker_id = incident["worker_id"]
+            token = re.compile(
+                rf"(?<![A-Za-z0-9_-]){re.escape(worker_id)}(?![A-Za-z0-9_-])"
+            )
+            if token.search(text):
+                matches.append(incident)
+        if len(matches) != 1:
+            return None
+        incident = matches[0]
+        try:
+            observation = store.rearm_from_operator_guidance(
+                incident["worker_id"], source_ts, now=time.time()
+            )
+        except ValueError:
+            logger.warning(
+                "Prompt guidance rejected: invalid authenticated Slack ts=%r", source_ts
+            )
+            return {
+                "worker_id": incident["worker_id"],
+                "replayed": False,
+                "delivered": False,
+                "held": True,
+            }
+        except sqlite3.Error:
+            logger.exception(
+                "Prompt guidance persistence failed for %s; Brain dispatch held",
+                incident["worker_id"],
+            )
+            return {
+                "worker_id": incident["worker_id"],
+                "replayed": False,
+                "delivered": False,
+                "held": True,
+            }
+        if observation is None:
+            return {
+                "worker_id": incident["worker_id"],
+                "replayed": True,
+                "delivered": False,
+            }
+        claimed_at = time.time()
+        try:
+            claimed = store.claim_dispatch(
+                observation.dispatch_id, destination="brain", now=claimed_at
+            )
+        except sqlite3.Error:
+            logger.exception(
+                "Prompt guidance claim failed for %s; Brain dispatch held",
+                incident["worker_id"],
+            )
+            return {
+                "worker_id": incident["worker_id"],
+                "replayed": False,
+                "delivered": False,
+                "held": True,
+            }
+        if not claimed:
+            return {
+                "worker_id": incident["worker_id"],
+                "replayed": True,
+                "delivered": False,
+            }
+        elapsed = max(0, int(claimed_at - float(incident["first_observed_at"])))
+        message = (
+            f"OPERATOR MESSAGE (ts={source_ts}): {text}\n"
+            f"[ACTIVE PROMPT] worker={incident['worker_id']} "
+            f"stage={incident['stage']} age={elapsed}s\n{incident['evidence']}"
+        )
+        try:
+            delivered = bool(self.brain.send_message(message))
+        except Exception:
+            logger.exception(
+                "Operator prompt-guidance Brain delivery raised for %s",
+                incident["worker_id"],
+            )
+            delivered = False
+        capability_block = getattr(self.brain, "capability_block", None)
+        failure_category = (
+            None
+            if delivered
+            else "capability_blocked"
+            if isinstance(capability_block, dict)
+            else "transport_failure"
+        )
+        delivery_unknown = False
+        try:
+            store.record_delivery(
+                observation.dispatch_id,
+                delivered=delivered,
+                failure_category=failure_category,
+            )
+        except (sqlite3.Error, RuntimeError):
+            logger.exception(
+                "Prompt guidance delivery outcome could not be persisted for %s; "
+                "claim remains delivery-unknown",
+                incident["worker_id"],
+            )
+            delivery_unknown = True
+        return {
+            "worker_id": incident["worker_id"],
+            "replayed": False,
+            "delivered": delivered,
+            "delivery_unknown": delivery_unknown,
+        }
+
     def poll_slack_commands(self):
         """Drain and process Slack commands."""
         if not self.socket_handler:
@@ -1761,10 +1976,44 @@ class IroncladeDaemon:
                 msg_ts = item.get("ts", "")
                 if msg_ts:
                     self.slack.add_reaction("eyes", msg_ts)
-                self.brain.send_message(
-                    f"OPERATOR MESSAGE (ts={msg_ts}): {text}"
-                )
-                self.slack.post_message(f"Forwarded to brain: {text}")
+                guidance = self._route_operator_prompt_guidance(text, msg_ts)
+                if guidance is None:
+                    self.brain.send_message(
+                        f"OPERATOR MESSAGE (ts={msg_ts}): {text}"
+                    )
+                    self.slack.post_message(
+                        f"Forwarded to brain: {text}", thread_ts=msg_ts or None
+                    )
+                elif guidance.get("held"):
+                    worker = guidance.get("worker_id")
+                    target = f" for `{worker}`" if worker else ""
+                    self.slack.post_message(
+                        f"Guidance routing{target} held: durable prompt state is "
+                        "unavailable; no Brain dispatch.",
+                        thread_ts=msg_ts or None,
+                    )
+                elif guidance["replayed"]:
+                    self.slack.post_message(
+                        f"Guidance for `{guidance['worker_id']}` was already recorded; "
+                        "no duplicate Brain dispatch.",
+                        thread_ts=msg_ts or None,
+                    )
+                elif guidance.get("delivery_unknown"):
+                    self.slack.post_message(
+                        f"Guidance for `{guidance['worker_id']}` reached the Brain, "
+                        "but durable delivery recording failed; automatic replay is held.",
+                        thread_ts=msg_ts or None,
+                    )
+                elif guidance["delivered"]:
+                    self.slack.post_message(
+                        f"Forwarded guidance for `{guidance['worker_id']}` to brain: {text}",
+                        thread_ts=msg_ts or None,
+                    )
+                else:
+                    self.slack.post_message(
+                        f"Guidance for `{guidance['worker_id']}` recorded; Brain delivery held.",
+                        thread_ts=msg_ts or None,
+                    )
             elif cmd_type == "detail":
                 self._handle_detail(parsed)
             elif cmd_type == "log":
@@ -2396,11 +2645,21 @@ class IroncladeDaemon:
             self._operator_waits.pop(wid, None)
             self._operator_wait_alerted.pop(wid, None)
 
+    def _prune_brain_waits(self, now: float) -> None:
+        """Drop brain-wait entries the Brain has stopped re-affirming (TTL backstop)."""
+        stale = [
+            wid for wid, info in self._brain_waits.items()
+            if now - info.get("updated_at", now) > _OPERATOR_WAIT_TTL_SECONDS
+        ]
+        for wid in stale:
+            self._brain_waits.pop(wid, None)
+
     def _maybe_capture_operator_wait(self, text: str) -> bool:
-        """If the Brain message reports it is waiting on the operator, record structured
-        state + post a one-time alert. Returns True when captured — the caller must then
-        NOT post it as a normal Brain message and NOT send CONTEXT_REQUIRED (preserving the
-        loop-break). Fail-safe: any classifier error/uncertainty -> not captured."""
+        """If the Brain message reports it is waiting on the operator or on the Brain
+        itself, record structured state + (for operator waits) post a one-time alert.
+        Returns True when captured — the caller must then NOT post it as a normal Brain
+        message and NOT send CONTEXT_REQUIRED (preserving the loop-break). Fail-safe: any
+        classifier error/uncertainty -> not captured."""
         if not _AWAITING_PHRASE_RE.search(text):
             return False
         if _NOT_AWAITING_RE.search(text):
@@ -2412,11 +2671,22 @@ class IroncladeDaemon:
         except Exception as e:
             logger.warning("awaiting-operator classify failed: %s — not capturing", e)
             return False
-        if (not isinstance(result, dict)) or result.get("infrastructure_error") or not result.get("awaiting_operator"):
+        if (not isinstance(result, dict)) or result.get("infrastructure_error"):
+            return False
+        waiting_on = result.get("waiting_on")
+        if waiting_on not in ("operator", "brain"):
             return False
         worker_id = (str(result.get("worker_id") or "").strip()) or "brain"
         question = str(result.get("question") or "").strip()
         now = time.time()
+        if waiting_on == "brain":
+            self._prune_brain_waits(now)
+            self._brain_waits[worker_id] = {"question": question, "updated_at": now}
+            if len(self._brain_waits) > _OPERATOR_WAIT_MAX:
+                oldest = min(self._brain_waits, key=lambda k: self._brain_waits[k]["updated_at"])
+                self._brain_waits.pop(oldest, None)
+            logger.info("brain_wait recorded for %s: %s", worker_id, question[:80])
+            return True
         self._prune_operator_waits(now)
         self._operator_waits[worker_id] = {"question": question, "updated_at": now}
         if len(self._operator_waits) > _OPERATOR_WAIT_MAX:
@@ -2680,6 +2950,8 @@ class IroncladeDaemon:
         """Check brain health, restart if needed."""
         if self._brain_paused:
             return
+        if self._reconcile_codex_brain_capability():
+            return
         # Check if compaction just completed — post notification
         if self.brain.check_compaction_complete():
             self.slack.post_message(format_brain_compacted())
@@ -2719,6 +2991,217 @@ class IroncladeDaemon:
             self.slack.post_message(format_brain_restarted(self.brain.restart_count, self.brain.restart_reason))
             logger.info(f"Brain restarted fresh ({self.brain.restart_reason})")
             logger.info(f"Brain new pid={self.brain._brain_pid}")
+
+    @staticmethod
+    def _brain_capability_fingerprint(observation: dict) -> str:
+        canonical = json.dumps(
+            {
+                key: observation.get(key)
+                for key in (
+                    "schema_version",
+                    "status",
+                    "reason",
+                    "source_companion",
+                    "destination_companion",
+                )
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _brain_capability_category(observation: dict) -> str:
+        reason = str(observation.get("reason") or "")
+        if reason.startswith(("helper-", "malformed-", "unsupported-", "executable-")):
+            return "installed_runtime_mismatch"
+        return "command_bridge"
+
+    def _notify_brain_capability_once(
+        self, state, *, tier: str, fingerprint: str, observation: dict
+    ) -> None:
+        if state.claim_brain_capability_notification(
+            tier=tier, fingerprint=fingerprint
+        ):
+            self.slack.post_message(format_brain_capability_blocked(observation))
+
+    def _recover_orphaned_prompt_dispatch_claims(self, *, now: float) -> None:
+        if self._db is None or self._prompt_dispatch_recovery_checked:
+            return
+        with self._db:
+            self._db.execute(
+                """
+                UPDATE worker_prompt_dispatches
+                SET state='failed', failure_category='delivery_unknown', completed_at=?
+                WHERE state='claimed'
+                """,
+                (now,),
+            )
+        self._prompt_dispatch_recovery_checked = True
+
+    def _drain_pending_capability_recovery_dispatches(self, *, now: float) -> None:
+        if self._db is None:
+            return
+        from ironclaude.prompt_incidents import PromptIncidentStore
+
+        store = PromptIncidentStore(self._db)
+        rows = self._db.execute(
+            """
+            SELECT dispatch.id, incident.evidence
+            FROM worker_prompt_dispatches AS dispatch
+            JOIN worker_prompt_incidents AS incident ON incident.id=dispatch.incident_id
+            WHERE dispatch.reason='capability_recovery'
+              AND dispatch.state='pending'
+              AND incident.status='active'
+            ORDER BY dispatch.id
+            """
+        ).fetchall()
+        for dispatch_id, evidence in rows:
+            if not store.claim_dispatch(
+                dispatch_id, destination="brain", now=now
+            ):
+                continue
+            delivered = self.brain.send_message(
+                "[CAPABILITY RECOVERY] Re-dispatch held worker prompt after verified "
+                f"Codex Brain readiness:\n{evidence}"
+            )
+            store.record_delivery(
+                dispatch_id,
+                delivered=bool(delivered),
+                failure_category=None if delivered else "transport_failure",
+            )
+
+    def _finish_brain_capability_recovery(
+        self, state, *, tier: str, fingerprint: str, now: float
+    ) -> None:
+        from ironclaude.prompt_incidents import PromptIncidentStore
+
+        # Durable outbox ordering: create idempotent recovery generations before
+        # clearing the capability hold. A crash before the clear repeats this
+        # safely; a crash after the clear leaves pending generations that every
+        # healthy reconstruction drains below.
+        PromptIncidentStore(self._db).rearm_capability_recovery(
+            fingerprint, now=now
+        )
+        state.record_brain_capability_recovery(tier=tier)
+        self._drain_pending_capability_recovery_dispatches(now=now)
+
+    def _reconcile_codex_brain_capability(self) -> bool:
+        """Hold/reprobe Codex runtime capability without model or restart churn.
+
+        Returns True when capability handling owns this health cycle.
+        """
+        if (
+            getattr(self, "_db", None) is None
+            or getattr(self.brain, "client_name", None) != "codex"
+        ):
+            return False
+        from ironclaude.provider_state import ProviderState
+
+        state = ProviderState(self._db)
+        tier = str(getattr(self.brain, "capability_tier", "brain"))
+        now = time.time()
+        self._recover_orphaned_prompt_dispatch_claims(now=now)
+        block = getattr(self.brain, "capability_block", None)
+        row = self._db.execute(
+            """
+            SELECT available, capability_fingerprint, next_probe_at
+            FROM provider_capability_state
+            WHERE host='local' AND client='codex' AND role='brain' AND tier=?
+            """,
+            (tier,),
+        ).fetchone()
+
+        if not isinstance(block, dict):
+            if (
+                row is not None
+                and not bool(row[0])
+                and row[1]
+                and self.brain.is_alive()
+            ):
+                self._finish_brain_capability_recovery(
+                    state, tier=tier, fingerprint=row[1], now=now
+                )
+            elif self.brain.is_alive():
+                self._drain_pending_capability_recovery_dispatches(now=now)
+            return False
+
+        fingerprint = self._brain_capability_fingerprint(block)
+        persisted_fingerprint = row[1] if row is not None else None
+        initial_backoff = float(
+            self.config.get("brain_capability_probe_seconds", 30.0)
+        )
+        if persisted_fingerprint != fingerprint:
+            state.record_brain_capability_block(
+                tier=tier,
+                category=self._brain_capability_category(block),
+                reason=str(block.get("reason") or "unknown")[:256],
+                fingerprint=fingerprint,
+                now=now,
+                initial_backoff=initial_backoff,
+            )
+            self._notify_brain_capability_once(
+                state,
+                tier=tier,
+                fingerprint=fingerprint,
+                observation=block,
+            )
+            return True
+
+        self._notify_brain_capability_once(
+            state,
+            tier=tier,
+            fingerprint=fingerprint,
+            observation=block,
+        )
+        if not state.brain_capability_recheck_due(tier=tier, now=now):
+            return True
+
+        fresh = self.brain.probe_runtime_capability()
+        if fresh.get("status") not in ("healthy", "repaired"):
+            fresh_fingerprint = self._brain_capability_fingerprint(fresh)
+            state.record_brain_capability_block(
+                tier=tier,
+                category=self._brain_capability_category(fresh),
+                reason=str(fresh.get("reason") or "unknown")[:256],
+                fingerprint=fresh_fingerprint,
+                now=now,
+                initial_backoff=initial_backoff,
+            )
+            self._notify_brain_capability_once(
+                state,
+                tier=tier,
+                fingerprint=fresh_fingerprint,
+                observation=fresh,
+            )
+            return True
+
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        brain_cwd = os.path.expanduser(
+            self.config.get("brain_cwd", "~/.ironclaude/brain")
+        )
+        os.makedirs(brain_cwd, exist_ok=True)
+        prompt_path = self.config.get("brain_prompt_path") or os.path.join(
+            repo_root, "src", "brain", "system_prompt.md"
+        )
+        try:
+            system_prompt = _render_brain_system_prompt(prompt_path, self.config)
+        except (FileNotFoundError, CommunicationProfileError) as exc:
+            logger.error("Brain capability recovered but prompt render failed: %s", exc)
+            return True
+        if not self.brain.restart(system_prompt, cwd=brain_cwd):
+            return True
+        self._finish_brain_capability_recovery(
+            state, tier=tier, fingerprint=fingerprint, now=now
+        )
+        self.slack.post_message(
+            format_brain_restarted(
+                self.brain.restart_count, "Codex runtime capability recovered"
+            )
+        )
+        return True
 
     def process_brain_decisions(self):
         """Read and act on brain decision files."""
@@ -2842,11 +3325,28 @@ class IroncladeDaemon:
                 _ollama_url = "http://localhost:11434"
             cmd = f"export CLAUDE_CODE_ATTRIBUTION_HEADER=0; export ANTHROPIC_BASE_URL={shlex.quote(_ollama_url)}; export ANTHROPIC_AUTH_TOKEN=ollama; export ANTHROPIC_API_KEY=; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
         elif worker_type == "claude-opus":
-            cmd = make_opus_command(self.config.get("default_opus_model", "claude-opus-4-8"), self.config.get("effort_level", "high"))
+            _default_opus_model = self.config.get("default_opus_model", "claude-opus-4-8")
+            cmd = make_opus_command(
+                _default_opus_model,
+                effort_for_tier(
+                    _semantic_tier(_default_opus_model, "default_opus_model", "opus"),
+                    self.config.get("effort_level", "high"),
+                    self.config.get("effort_levels", {}),
+                ),
+            )
         elif worker_type == "claude-fable":
-            cmd = make_opus_command("fable", self.config.get("effort_level", "high"))
+            cmd = make_opus_command(
+                "fable",
+                effort_for_tier("fable", self.config.get("effort_level", "high"), self.config.get("effort_levels", {})),
+            )
         elif worker_type in WORKER_COMMANDS:
-            cmd = WORKER_COMMANDS[worker_type]
+            # Byte-identical to WORKER_COMMANDS["claude-sonnet"] except the effort,
+            # which is now TIER-FIRST resolved (sonnet tier -> effort_levels override
+            # else global effort_level). Mirrors orchestrator_mcp.py's sonnet path.
+            _sonnet_effort = effort_for_tier(
+                "sonnet", self.config.get("effort_level", "high"), self.config.get("effort_levels", {})
+            )
+            cmd = f"export CLAUDE_CODE_EFFORT_LEVEL={_sonnet_effort}; exec claude --model 'sonnet' --dangerously-skip-permissions"
         else:
             # MP-04: drop claude-fable from the advertised list while Fable is
             # flagged unavailable — the daemon would silently redirect it to
@@ -3013,8 +3513,11 @@ class IroncladeDaemon:
         )
         return result if result else None
 
-    def _detect_prompt_waiting(self, log_tail: str) -> bool:
-        """Detect whether a worker is waiting for user input via LLM grading."""
+    def _detect_worker_prompt(self, log_tail: str) -> PromptDetection:
+        """Extract one validated current prompt; distinguish absence from outage."""
+        menu = detect_ask_user_menu(log_tail)
+        if menu["detected"]:
+            return PromptDetection(menu["signal"], True)
         cache_key = hash(log_tail)
         cached = self._prompt_waiting_cache.get(cache_key)
         if cached is not None:
@@ -3023,7 +3526,7 @@ class IroncladeDaemon:
                 return result
         result_dict = self._grader.grade(
             _PROMPT_WAITING_SYSTEM,
-            f"Worker log tail:\n{log_tail[-2000:]}",
+            f"Worker terminal context:\n{log_tail[-PROMPT_CAPTURE_CHARS:]}",
             _PROMPT_WAITING_SCHEMA,
         )
         if result_dict.get("infrastructure_error"):
@@ -3031,12 +3534,25 @@ class IroncladeDaemon:
                 "Prompt-waiting check unavailable: %s — defaulting to False",
                 result_dict.get("error_detail"),
             )
-            return False
-        waiting = bool(result_dict.get("waiting", False))
+            return PromptDetection(None, False)
+        if result_dict.get("kind") == "none":
+            detection = PromptDetection(None, True)
+        else:
+            capture_truncated = len(log_tail.splitlines()) >= PROMPT_CAPTURE_LINES
+            signal = validate_prompt_candidate(
+                log_tail,
+                result_dict,
+                capture_truncated=capture_truncated,
+            )
+            detection = PromptDetection(signal, signal is not None)
         now = time.time()
-        self._prompt_waiting_cache[cache_key] = (now, waiting)
+        self._prompt_waiting_cache[cache_key] = (now, detection)
         self._prune_prompt_waiting_cache(now)
-        return waiting
+        return detection
+
+    def _detect_prompt_waiting(self, log_tail: str) -> bool:
+        """Compatibility wrapper; incident routing uses `_detect_worker_prompt`."""
+        return self._detect_worker_prompt(log_tail).waiting
 
     def _prune_prompt_waiting_cache(self, now: float) -> None:
         """Drop expired entries and cap the cache to a bounded size."""
@@ -3152,15 +3668,18 @@ class IroncladeDaemon:
 
             duration = now - self._stuck_since[worker_id]
             stage = self._get_worker_workflow_stage(session_name, ssh_host=ssh_host)
-            prompt_waiting = self._detect_prompt_waiting(log_tail)
-
+            if self._routine_prompt_active(worker_id):
+                continue
+            detection = self._detect_worker_prompt(log_tail)
+            prompt_waiting = detection.waiting
             if prompt_waiting:
-                alert_threshold = STALENESS_PROMPT_ALERT
-                kill_threshold = STALENESS_PROMPT_KILL
-            else:
-                multiplier = STAGE_STALENESS_MULTIPLIER.get(stage, 1.0)
-                alert_threshold = STALENESS_ALERT_SECONDS * multiplier
-                kill_threshold = STALENESS_KILL_SECONDS * multiplier
+                # Durable prompt routing owns this episode. Staleness timers
+                # cannot create a second Brain dispatch, Slack alert, or kill.
+                continue
+
+            multiplier = STAGE_STALENESS_MULTIPLIER.get(stage, 1.0)
+            alert_threshold = STALENESS_ALERT_SECONDS * multiplier
+            kill_threshold = STALENESS_KILL_SECONDS * multiplier
 
             if duration >= kill_threshold:
                 deferred_until = self._stuck_kill_deferred.get(worker_id, 0)
@@ -3176,11 +3695,6 @@ class IroncladeDaemon:
                     f"[STUCK] Worker {worker_id} output unchanged for {minutes}min. "
                     f"{'Prompt waiting — respond or kill.' if prompt_waiting else 'Check worker status.'}"
                 )
-                if prompt_waiting:
-                    from ironclaude.notifications import format_worker_gate_stuck_slack
-                    self.slack.post_message(
-                        format_worker_gate_stuck_slack(worker_id, minutes, stage or "unknown")
-                    )
                 self._stuck_alert_sent[worker_id] = True
                 self._persist_staleness_state(worker_id)
 
@@ -3309,9 +3823,137 @@ class IroncladeDaemon:
         self._stuck_liveness_count.pop(worker_id, None)
         self._persist_staleness_state(worker_id)
 
+    def _prompt_store(self):
+        if self._db is None:
+            return None
+        from ironclaude.prompt_incidents import PromptIncidentStore
+
+        return PromptIncidentStore(self._db)
+
+    def _routine_prompt_active(self, worker_id: str) -> bool:
+        """Fail closed for direct alerting when prompt state is unreadable."""
+        store = self._prompt_store()
+        if store is None:
+            return False
+        try:
+            return store.active_for_worker(worker_id) is not None
+        except sqlite3.Error:
+            logger.exception(
+                "Prompt incident read failed for %s; suppressing direct stuck alert",
+                worker_id,
+            )
+            return True
+
+    @staticmethod
+    def _worker_elapsed_minutes(worker: dict) -> int:
+        spawned_at = worker.get("spawned_at", "")
+        try:
+            spawn_time = datetime.fromisoformat(spawned_at)
+            return int((datetime.utcnow() - spawn_time).total_seconds() / 60)
+        except (ValueError, TypeError):
+            return 0
+
+    def _resolve_worker_prompt(self, worker_id: str, *, now: float) -> None:
+        store = self._prompt_store()
+        if store is not None:
+            try:
+                store.resolve_worker(worker_id, now=now)
+            except sqlite3.Error:
+                logger.exception(
+                    "Prompt incident resolution failed for %s; retaining episode",
+                    worker_id,
+                )
+
+    def _handle_worker_prompt(
+        self,
+        worker: dict,
+        stage: str,
+        signal: PromptSignal,
+        *,
+        now: float,
+    ) -> bool:
+        """Persist and, only for a new episode, dispatch one waiting prompt."""
+        store = self._prompt_store()
+        if store is None:
+            return False
+        worker_id = worker["id"]
+        try:
+            observation = store.observe(worker_id, stage, signal, now=now)
+        except (sqlite3.Error, TypeError):
+            logger.exception(
+                "Prompt incident persistence failed for %s; dispatch held", worker_id
+            )
+            return True
+        dispatch_id = observation.dispatch_id
+        if observation.action == "hold":
+            try:
+                active = store.active_for_worker(worker_id)
+            except sqlite3.Error:
+                logger.exception(
+                    "Prompt incident recovery read failed for %s; dispatch held",
+                    worker_id,
+                )
+                return True
+            if not (
+                active is not None
+                and active.get("dispatch_state") == "pending"
+                and active.get("dispatch_reason") == "initial"
+            ):
+                return True
+            dispatch_id = active["dispatch_id"]
+        try:
+            claimed = store.claim_dispatch(
+                dispatch_id, destination="brain", now=now
+            )
+        except sqlite3.Error:
+            logger.exception(
+                "Prompt incident claim failed for worker=%s; dispatch held", worker_id
+            )
+            return True
+        if not claimed:
+            logger.warning(
+                "Prompt incident dispatch already claimed for worker=%s", worker_id
+            )
+            return True
+        message = format_worker_checkin(
+            worker_id,
+            self._worker_elapsed_minutes(worker),
+            stage,
+            signal.evidence,
+            True,
+        )
+        try:
+            delivered = bool(self.brain.send_message(message))
+        except Exception:
+            logger.exception("Prompt incident Brain delivery raised for %s", worker_id)
+            delivered = False
+        capability_block = getattr(self.brain, "capability_block", None)
+        failure_category = (
+            None
+            if delivered
+            else "capability_blocked"
+            if isinstance(capability_block, dict)
+            else "transport_failure"
+        )
+        try:
+            store.record_delivery(
+                dispatch_id,
+                delivered=delivered,
+                failure_category=failure_category,
+            )
+        except (sqlite3.Error, RuntimeError):
+            logger.exception(
+                "Prompt incident delivery outcome could not be persisted for %s; "
+                "claim remains delivery-unknown",
+                worker_id,
+            )
+        return True
+
     def check_workers(self):
         """Check running workers for completion signals."""
-        for worker in self.registry.get_running_workers():
+        running_workers = self.registry.get_running_workers()
+        running_ids = {worker["id"] for worker in running_workers}
+        for worker in running_workers:
             worker_id = worker["id"]
             session_name = worker["tmux_session"]
             ssh_host, remote_log_dir = self._resolve_worker_ssh(worker)
@@ -3326,6 +3968,7 @@ class IroncladeDaemon:
                 marker_exists = os.path.exists(marker_path)
 
             if marker_exists:
+                self._resolve_worker_prompt(worker_id, now=time.time())
                 log_worker_event("WORKER_IDLE", worker_id=worker_id)
                 self.slack.post_message(format_worker_idle(worker_id))
                 # Idle-but-alive worker: recycle its work in place when gates pass
@@ -3358,6 +4001,7 @@ class IroncladeDaemon:
 
             # Fallback: session died (crash, OOM, etc.)
             if not self.tmux.has_session(session_name, ssh_host=ssh_host):
+                self._resolve_worker_prompt(worker_id, now=time.time())
                 # Integrate (or rescue) the dead worker's reviewed work before the
                 # completed-flip. A recoverable finalization failure re-queues.
                 outcome = self._finalize_and_release_worker(
@@ -3393,7 +4037,13 @@ class IroncladeDaemon:
                         )
                         self.brain.send_message(
                             f"Worker {worker_id} session died (tmux gone); reviewed work "
-                            f"preserved, NOT completed — may need operator attention."
+                            f"preserved, NOT completed; finalization disposition={disposition}. "
+                            f'Call recover_worker_integration("{worker_id}", "status") and '
+                            "handle the assignment with Commander-owned recovery/finalization "
+                            "tools. Do not spawn a cleanup worker. Do not request "
+                            "primary-checkout or terminal commands. Ask one natural-language "
+                            "disposition question only if no durable directive or operator "
+                            "instruction already decides integrate versus abandon."
                         )
                     self._session_died_notified.add(worker_id)
                 continue
@@ -3403,6 +4053,48 @@ class IroncladeDaemon:
             stage = self._get_worker_workflow_stage(session_name, _claude_dir=claude_dir, ssh_host=ssh_host)
 
             cadence = CHECKIN_CADENCE.get(stage, DEFAULT_CADENCE) if stage else DEFAULT_CADENCE
+
+            # Active prompt episodes are observed every cycle so changed prompt
+            # content dispatches immediately and prompt disappearance resolves
+            # without waiting for ordinary check-in cadence.
+            store = self._prompt_store()
+            try:
+                active_prompt = (
+                    store.active_for_worker(worker_id) if store is not None else None
+                )
+            except sqlite3.Error:
+                logger.exception(
+                    "Prompt incident read failed for %s; holding proactive dispatch",
+                    worker_id,
+                )
+                continue
+            if active_prompt is not None:
+                try:
+                    active_tail = self.tmux.capture_pane(
+                        session_name, lines=PROMPT_CAPTURE_LINES, ssh_host=ssh_host
+                    )
+                except Exception:
+                    logger.exception(
+                        "Active prompt capture failed for %s; retaining episode",
+                        worker_id,
+                    )
+                    continue
+                active_detection = self._detect_worker_prompt(active_tail)
+                if active_detection.signal is not None:
+                    self._handle_worker_prompt(
+                        worker,
+                        stage or "unknown",
+                        active_detection.signal,
+                        now=time.time(),
+                    )
+                    self._last_checkin_stage[worker_id] = stage
+                    self._last_checkin_hash[worker_id] = hash(active_tail)
+                    continue
+                if active_detection.conclusive:
+                    self._resolve_worker_prompt(worker_id, now=time.time())
+                else:
+                    # Infrastructure/semantic ambiguity cannot prove resolution.
+                    continue
 
             # Check brain contact file (written by MCP server)
             contact_path = os.path.join(self.tmux.log_dir, f"{session_name}.brain_contact")
@@ -3445,41 +4137,61 @@ class IroncladeDaemon:
 
             # Cadence expired — send proactive notification
             try:
-                log_tail = self.tmux.capture_pane(session_name, lines=5, ssh_host=ssh_host)
+                log_tail = self.tmux.capture_pane(
+                    session_name, lines=PROMPT_CAPTURE_LINES, ssh_host=ssh_host
+                )
             except Exception:
                 log_tail = "(could not capture output)"
 
-            prompt_waiting = self._detect_prompt_waiting(log_tail)
+            detection = self._detect_worker_prompt(log_tail)
+            prompt_waiting = detection.waiting
 
             current_hash = hash(log_tail)
             if not stage_changed and current_hash == self._last_checkin_hash.get(worker_id):
                 if not prompt_waiting:
                     continue
 
-            spawned_at = worker.get("spawned_at", "")
-            try:
-                from datetime import datetime
-                spawn_time = datetime.fromisoformat(spawned_at)
-                elapsed = int((datetime.utcnow() - spawn_time).total_seconds() / 60)
-            except (ValueError, TypeError):
-                elapsed = 0
+            elapsed = self._worker_elapsed_minutes(worker)
 
-            brain_message = format_worker_checkin(worker_id, elapsed, stage or "unknown", log_tail, prompt_waiting)
-            self.brain.send_message(brain_message)
+            prompt_evidence = (
+                detection.signal.evidence if detection.signal is not None else log_tail
+            )
+            brain_message = format_worker_checkin(
+                worker_id,
+                elapsed,
+                stage or "unknown",
+                prompt_evidence,
+                prompt_waiting,
+            )
+            handled_prompt = False
+            if detection.signal is not None:
+                handled_prompt = self._handle_worker_prompt(
+                    worker,
+                    stage or "unknown",
+                    detection.signal,
+                    now=time.time(),
+                )
+            if not handled_prompt:
+                self.brain.send_message(brain_message)
             self._last_checkin_sent[worker_id] = time.time()
             self._last_checkin_stage[worker_id] = stage
             self._last_checkin_hash[worker_id] = current_hash
 
-            if prompt_waiting and stage in PM_GATE_STAGES:
-                entered_at = self._stage_entered_at.get(worker_id)
-                if entered_at:
-                    time_at_stage = time.time() - entered_at
-                    if time_at_stage >= PM_GATE_SLACK_SECONDS and not self._pm_gate_slack_sent.get(worker_id):
-                        from ironclaude.notifications import format_worker_gate_stuck_slack
-                        self.slack.post_message(
-                            format_worker_gate_stuck_slack(worker_id, int(time_at_stage / 60), stage)
-                        )
-                        self._pm_gate_slack_sent[worker_id] = True
+            # Routine prompt incidents never directly surface through the PM-gate
+            # Slack path. Brain-declared operator wait is the sole escalation.
+
+        store = self._prompt_store()
+        if store is not None:
+            try:
+                active_incidents = store.active_incidents()
+            except sqlite3.Error:
+                logger.exception(
+                    "Prompt incident inventory read failed; missing-worker cleanup held"
+                )
+                active_incidents = []
+            for incident in active_incidents:
+                if incident["worker_id"] not in running_ids:
+                    self._resolve_worker_prompt(incident["worker_id"], now=time.time())
 
     def check_confirmed_directives(self):
         """Send reminder to Brain for confirmed directives with no worker spawned within 5 minutes.
@@ -3815,6 +4527,19 @@ class IroncladeDaemon:
         self._last_heartbeat = now
 
         candidates = self.registry.get_recent_workers()
+        prompt_store = self._prompt_store()
+        try:
+            prompt_incidents = (
+                prompt_store.active_incidents() if prompt_store is not None else []
+            )
+        except sqlite3.Error:
+            logger.exception(
+                "Prompt incident inventory read failed; heartbeat omits prompt status"
+            )
+            prompt_incidents = []
+        active_prompts = {
+            incident["worker_id"]: incident for incident in prompt_incidents
+        }
         worker_details = []
         stage_map: dict[str, str] = {}
         for w in candidates:
@@ -3823,11 +4548,21 @@ class IroncladeDaemon:
                 continue
             stage = self._get_worker_workflow_stage(w["tmux_session"], ssh_host=ssh_host)
             stage_map[w["id"]] = stage or "unknown"
-            worker_details.append({
+            detail = {
                 "id": w["id"],
                 "description": w.get("description"),
                 "workflow_stage": stage,
-            })
+            }
+            active_prompt = active_prompts.get(w["id"])
+            if active_prompt is not None:
+                detail["prompt_incident"] = {
+                    "age_seconds": max(
+                        0.0, now - float(active_prompt["first_observed_at"])
+                    ),
+                    "dispatch_state": active_prompt.get("dispatch_state"),
+                    "failure_category": active_prompt.get("failure_category"),
+                }
+            worker_details.append(detail)
 
         brain_usage = self.brain.get_token_usage() if self.brain is not None else None
         blocked_directives = [
@@ -3835,20 +4570,27 @@ class IroncladeDaemon:
             if block["state"] == "blocked"
         ]
         self._prune_operator_waits(now)
+        self._prune_brain_waits(now)
         operator_name = self.config.get("operator_name", "Operator")
         # Deterministic signal is merged LAST so it wins over a same-id `_operator_waits`
         # entry — a stale/false-positive classifier entry must never mask a real
         # pending_confirmation directive sharing the same d{id} key.
         merged_waits = {**dict(self._operator_waits), **self._get_pending_confirmation_waits()}
         from ironclaude.ollama_client import ollama_degraded_urls
+        from ironclaude.notifications import resolve_degraded_backend_label
+        _hooks_cfg_path = os.environ.get("IC_OLLAMA_CONFIG_PATH") or os.path.expanduser(
+            "~/.claude/ironclaude-hooks-config.json"
+        )
         self._last_heartbeat_ts = self.slack.post_message(
             format_heartbeat(
                 worker_details,
                 brain_usage=brain_usage,
                 waits=merged_waits,
+                brain_waits=dict(self._brain_waits),
                 operator_name=operator_name,
                 ollama_degraded=bool(ollama_degraded_urls()),
                 blocked_directives=blocked_directives,
+                degraded_backend_label=resolve_degraded_backend_label(_hooks_cfg_path),
             )
         )
 
@@ -3892,6 +4634,11 @@ class IroncladeDaemon:
             if len(history) > 2:
                 history.pop(0)
             if len(history) >= 2 and history[-1] == history[-2]:
+                if worker_id in active_prompts:
+                    # Heartbeat already renders the durable held prompt. It must
+                    # never create a second Brain action for the same episode.
+                    self._heartbeat_stuck_notified.discard(worker_id)
+                    continue
                 if worker_id not in self._heartbeat_stuck_notified:
                     minutes = int(heartbeat_interval / 60) * 2
                     self.brain.send_message(
@@ -4089,6 +4836,7 @@ def main():
         operator_name=config.get("operator_name", "Operator"),
         model=config.get("brain_model", "claude-opus-4-8"),
         effort_level=config.get("effort_level", "high"),
+        effort_levels=config.get("effort_levels", {}),
     )
 
     # Start brain
@@ -4098,7 +4846,7 @@ def main():
         system_prompt = _render_brain_system_prompt(prompt_path, config)
         ensure_brain_trusted(brain_cwd)
         brain.start(system_prompt, cwd=brain_cwd)
-        logger.info("Brain SDK client started")
+        _log_brain_start_result(brain)
     except FileNotFoundError:
         logger.warning(f"Brain system prompt not found: {prompt_path} — brain will start on first check_brain()")
     except CommunicationProfileError as exc:

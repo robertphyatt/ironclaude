@@ -1,19 +1,19 @@
 ---
 name: advisor-fallback
-description: Client-aware manual tiered-up adversarial advisor (claude subagent / codex exec), fired at the natural discretionary advisor points
+description: Client-aware tiered-up adversarial advisor (Claude subagent / fixed-function Codex broker), fired at natural discretionary advisor points
 ---
 
 # Advisor Fallback (manual tiered-up advisor)
 
 ## Purpose
 
-The reliable advisor is a **manual tiered-up adversarial reviewer** you invoke yourself — not the
-`advisor` tool / `/advisor` slash command, which is flakey and, for codex, does not exist. This skill
+The reliable advisor is a **tiered-up adversarial reviewer** you invoke yourself — not the
+`advisor` tool / `/advisor` slash command, which is flaky and, for Codex, does not exist. This skill
 is the standard advisor path for **both** clients: at the moments you would normally consult an advisor,
 dispatch a fresh, blind, one-tier-up reviewer over the work and weigh its findings.
 
-This is the same role the `advisor` tool plays, delivered by a subagent (claude) or a `codex exec`
-review (codex) so it works regardless of which client you are.
+This is the same role the `advisor` tool plays, delivered by a subagent (Claude) or the fixed-function
+`run_codex_advisor_review` broker (Codex) so it works regardless of which client you are.
 
 ## When to fire it (discretionary — NOT every time)
 
@@ -51,43 +51,40 @@ treat Fable as available). This is the existing behavior — `model=fable`, else
 
 ### If you are a Codex session
 
-Run a one-tier-up `codex exec` adversarial review over the work. **Pass the code/diff to review INLINE in
-the prompt** — do not rely on the reviewer grepping the repo (see the gotchas). Command
-(live-validated 2026-07-22 — the grader `codex exec` family minus `--output-schema`):
+Call `run_codex_advisor_review` with exactly three fields:
 
-```bash
-codex exec --json --ephemeral --skip-git-repo-check -s read-only -m <ONE_TIER_UP_MODEL> -
-```
+- `requester_model`: your current full Codex model name: `gpt-5.6-luna`, `gpt-5.6-terra`,
+  `gpt-5.6-sol`, or `gpt-6-astra`. Do not pre-map it; the broker rejects any mismatch with
+  provider-authenticated `x-codex-turn-metadata.model`, then maps the reviewer exactly once.
+- `packet`: the complete inline, lossless review packet. Include the adversarial-review instruction,
+  task and decision, operator constraints, evidence, specific questions, and every code/diff or artifact
+  byte needed to review without repository reads. State whether blindness is required, and exclude prior
+  findings, verdicts, repair coaching, reviewer identities, and revision history when it is.
+- `review_tier: "one-up"` for normal advisor work. The selector is bounded to
+  `"same"` or `"one-up"`; omission defaults to `"one-up"` only for compatibility.
 
-- Deliver the adversarial-review instruction + the code/diff under review on **stdin** (trailing `-`).
-- Before constructing stdin, read `worker/skills/write-lossless-ai-messages/SKILL.md` and prepend its exact
-  complete skill content ahead of the adversarial-review instruction and inline code/diff. Programmatic
-  loading must not add `IC_LOSSLESS_AI_MESSAGES_ACTIVE` to the reviewer prompt or output. This grants no
-  new tools.
-- Read the findings from the **last** `item.completed` event whose `item.type == "agent_message"`, field
-  `.text` (the model may emit intermediate narration; take the last agent_message). Without `--json` the
-  response text is printed directly — either form works; `--json` + last-`agent_message` is the reliable
-  parse.
-- Auth is your ChatGPT subscription (`codex login status` → "Logged in using ChatGPT") — never an API key.
-- Ask the reviewer to follow the `ironclaude:adversarial-review` standard (verify findings with evidence,
-  report-only, severity-classified).
+Before constructing `packet`, read `worker/skills/write-lossless-ai-messages/SKILL.md` and prepend its
+exact complete skill content ahead of the adversarial-review instruction and inline evidence. Programmatic
+loading must not add `IC_LOSSLESS_AI_MESSAGES_ACTIVE` to the reviewer prompt or output. This grants no new
+tools. Ask the reviewer to follow `ironclaude:adversarial-review`: verify findings against supplied evidence,
+report only, and classify severity.
 
-**Codex tier ladder (one tier up):** `luna (haiku) → terra (sonnet) → sol (opus)`. Codex has **no `fable`
-tier**, so at the ceiling **`sol → sol`: run a same-tier BLIND pass** (a fresh blind review at the same
-model still catches defects — most advisor value is blindness, not tier). The reviewer model stays a
-codex model — codex is its own advisor peer; do not cross to a claude model.
+Do not run nested `codex exec` from the main agent for normal advisor work. Do not ask the operator to
+approve the broker or its fixed read-only review again: IronClaude's broker is the approved workflow
+surface. If the broker fails, report its bounded error and fail closed rather than bypassing it.
 
-## Codex gotchas (from the 2026-07-22 live probe)
+**Codex tier ladder (broker-owned, one mapping only):** `luna (haiku) → terra (sonnet) → sol (opus) → astra (fable)`
+(`gpt-5.6-luna → gpt-5.6-terra → gpt-5.6-sol → gpt-6-astra`). The broker maps
+**`gpt-5.6-sol` → `gpt-6-astra`**. At the Astra ceiling it runs
+**`gpt-6-astra` → `gpt-6-astra`**, a same-tier blind pass. The reviewer stays a Codex model;
+do not cross to a Claude model. Astra remains a Codex model and does not satisfy an actual Claude Fable request.
 
-- **The ephemeral `codex exec` reviewer fires the IronClaude hooks and lands in professional-mode
-  `undecided`, so its Bash is guard-blocked.** This is why you pass the review content INLINE: the
-  reviewer reasons over what you give it (and can still do non-bash file reads). Report-only review of
-  inline content is unaffected.
-- **Session litter:** `--ephemeral` is codex-session-ephemeral, not IronClaude-session-ephemeral. Each
-  invocation leaves an `undecided`/`idle` row in `~/.claude/ironclaude.db` (`sessions`) and an
-  `~/.claude/ironclaude-session-<pid>.id` file. These are inert to active workflows; be aware they
-  accumulate (a periodic undecided/idle sweep is a reasonable follow-up). The same applies to the codex
-  grader.
+## Codex broker guarantees
+
+The broker owns executable discovery, companion-helper preflight, fixed read-only argv, private cwd,
+sanitized environment, model mapping, bounded timeout/output, JSONL parsing, and cleanup. Callers cannot
+supply shell, argv, cwd, environment, or repository paths. Complete inline packets keep the reviewer
+independent of repository access and avoid creating a host-security approval question in the main task.
 
 ## Weigh, don't obey
 

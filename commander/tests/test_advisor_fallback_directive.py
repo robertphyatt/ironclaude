@@ -7,7 +7,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 MARKER = "Advisor Fallback"
 PRIMARY = "model=fable"   # preferred subagent tier
 FALLBACK = "model=opus"   # required fallback when Fable is unavailable
-CODEX_MARKER = "codex exec"   # the codex-native advisor branch (codex has no /advisor or Agent tool)
+CODEX_MARKER = "run_codex_advisor_review"
+CODEX_SEMANTIC_LADDER = "luna (haiku) → terra (sonnet) → sol (opus) → astra (fable)"
+CODEX_MODEL_LADDER = "gpt-5.6-luna → gpt-5.6-terra → gpt-5.6-sol → gpt-6-astra"
+ONE_UP_TIER = 'review_tier: "one-up"'
 
 
 def _read(rel: str) -> str:
@@ -30,11 +33,15 @@ def test_directive_in_brain_behavioral():
 
 def test_directive_in_agents_md():
     """Codex workers load AGENTS.md (root), NOT .claude/rules/behavioral.md. The advisor
-    directive must exist there AND name the codex-native path (codex exec), so a codex worker
+    directive must exist there AND name the fixed-function broker, so a codex worker
     is not left advisor-less and a future edit cannot silently drop codex advisor parity."""
     text = _read("AGENTS.md")
     assert MARKER in text
     assert CODEX_MARKER in text
+    assert "luna → terra → sol → astra" in text
+    assert CODEX_MODEL_LADDER in text
+    assert ONE_UP_TIER in text
+    assert "Never run nested `codex exec`" in text
 
 
 def test_directive_in_activation_skill():
@@ -55,3 +62,18 @@ def test_directive_in_activation_skill():
     assert "(12 principles)" in text
     assert "12-principle template" in text
     assert PRIMARY in text and FALLBACK in text                # tier-relative fallback named
+    assert text.count(CODEX_MARKER) >= 3
+    assert text.count("luna→terra→sol→astra") >= 2
+    assert "gpt-5.6-luna→gpt-5.6-terra→gpt-5.6-sol→gpt-6-astra" in text
+    assert text.count(ONE_UP_TIER) >= 3
+
+
+def test_codex_advisor_ladder_names_astra_requester_and_ceiling_without_claiming_fable():
+    text = _read("worker/skills/advisor-fallback/SKILL.md")
+    assert "`gpt-6-astra`" in text
+    assert CODEX_SEMANTIC_LADDER in text
+    assert CODEX_MODEL_LADDER in text
+    assert "`gpt-5.6-sol` → `gpt-6-astra`" in text
+    assert "`gpt-6-astra` → `gpt-6-astra`" in text
+    assert "Astra remains a Codex model and does not satisfy an actual Claude Fable request." in text
+    assert ONE_UP_TIER in text

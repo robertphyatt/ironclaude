@@ -143,7 +143,7 @@ block "diff a b > out"
 
 # ── bare cd is read-only; chained cd is not (cwd-drift deadlock cure) ──
 allow "cd /tmp"
-allow "cd /Users/roberthyatt/Code/ironclaude"
+allow "cd /Users/example/Code/ironclaude"
 allow "cd"
 rev_allow "cd /tmp"
 # Chained/compound cd stays BLOCKED (metacharacter check unchanged) — non-widening controls.

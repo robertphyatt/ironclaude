@@ -1,0 +1,141 @@
+[
+  {
+    "name": "legacy-validation_backend-ollama",
+    "config": {
+      "validation_backend": "ollama",
+      "ollama": {
+        "url": "http://localhost:11434",
+        "model": "llama3.2:1b"
+      }
+    },
+    "spot": "validation",
+    "expect": {
+      "backend": "ollama",
+      "model": "llama3.2:1b",
+      "url": "http://localhost:11434"
+    }
+  },
+  {
+    "name": "global-backend-openai-grader",
+    "config": {
+      "backend": "openai",
+      "openai": {
+        "base_url": "http://llm-host:8080/v1",
+        "model": "example-model-a",
+        "max_tokens": 1024
+      }
+    },
+    "spot": "grader",
+    "expect": {
+      "backend": "openai",
+      "model": "example-model-a",
+      "url": "http://llm-host:8080/v1"
+    }
+  },
+  {
+    "name": "per-spot-backend-override-shadow-ollama",
+    "config": {
+      "backend": "openai",
+      "openai": {
+        "base_url": "http://llm-host:8080/v1",
+        "model": "example-model-a",
+        "max_tokens": 1024
+      },
+      "ollama": {
+        "url": "http://localhost:11434",
+        "model": "gemma4:12b-it-qat"
+      },
+      "spots": {
+        "shadow": {
+          "backend": "ollama"
+        }
+      }
+    },
+    "spot": "shadow",
+    "expect": {
+      "backend": "ollama",
+      "model": "gemma4:12b-it-qat",
+      "url": "http://localhost:11434"
+    }
+  },
+  {
+    "name": "spots-shadow-model-wins-over-top-level-shadow_model",
+    "config": {
+      "backend": "openai",
+      "openai": {
+        "base_url": "http://llm-host:8080/v1",
+        "model": "example-model-a",
+        "max_tokens": 1024
+      },
+      "shadow_model": "other",
+      "spots": {
+        "shadow": {
+          "model": "example-model-b"
+        }
+      }
+    },
+    "spot": "shadow",
+    "expect": {
+      "backend": "openai",
+      "model": "example-model-b",
+      "url": "http://llm-host:8080/v1"
+    }
+  },
+  {
+    "name": "top-level-shadow_model-alias-no-spots-override",
+    "config": {
+      "backend": "openai",
+      "openai": {
+        "base_url": "http://llm-host:8080/v1",
+        "model": "example-model-a",
+        "max_tokens": 1024
+      },
+      "shadow_model": "example-model-b"
+    },
+    "spot": "shadow",
+    "expect": {
+      "backend": "openai",
+      "model": "example-model-b",
+      "url": "http://llm-host:8080/v1"
+    }
+  },
+  {
+    "name": "nested-ollama-summarization_model-alias",
+    "config": {
+      "backend": "ollama",
+      "ollama": {
+        "url": "http://localhost:11434",
+        "model": "gemma4:12b-it-qat",
+        "summarization_model": "gemma4:9b"
+      }
+    },
+    "spot": "summarization",
+    "expect": {
+      "backend": "ollama",
+      "model": "gemma4:9b",
+      "url": "http://localhost:11434"
+    }
+  },
+  {
+    "name": "spots-summarization-model-wins-over-nested-alias",
+    "config": {
+      "backend": "ollama",
+      "ollama": {
+        "url": "http://localhost:11434",
+        "model": "gemma4:12b-it-qat",
+        "summarization_model": "y"
+      },
+      "spots": {
+        "summarization": {
+          "model": "x"
+        }
+      }
+    },
+    "spot": "summarization",
+    "expect": {
+      "backend": "ollama",
+      "model": "x",
+      "url": "http://localhost:11434"
+    }
+  }
+]

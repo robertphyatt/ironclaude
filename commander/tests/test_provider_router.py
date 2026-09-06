@@ -266,20 +266,40 @@ def test_sticky_claude_fable_degrades_to_claude_opus(tmp_path, base_config):
     )
 
 
-def test_sticky_codex_fable_request_stays_codex_opus(tmp_path, base_config):
+def test_sticky_codex_fable_request_selects_astra(tmp_path, base_config):
     router, state, registry = setup_router(tmp_path, base_config, dual=True)
     state.set_current_client("worker", "codex")
     record(
         registry,
         cap("claude", "worker", "fable"),
         cap("claude", "worker", "opus"),
+        cap("codex", "worker", "fable"),
         cap("codex", "worker", "opus"),
+    )
+    handle = router.resolve("worker", "fable", ["local"])
+    assert (handle.client, handle.effective_tier, handle.model) == (
+        "codex", "fable", "gpt-6-astra"
+    )
+    assert state.get_current_client("worker") == "codex"
+
+
+def test_unavailable_codex_astra_falls_to_codex_sol_before_claude(tmp_path, base_config):
+    router, state, registry = setup_router(tmp_path, base_config, dual=True)
+    state.set_current_client("worker", "codex")
+    record(
+        registry,
+        cap("codex", "worker", "fable"),
+        cap("codex", "worker", "opus"),
+        cap("claude", "worker", "fable"),
+        cap("claude", "worker", "opus"),
+    )
+    state.mark_unavailable(
+        "local", "codex", "worker", "fable", "model_unavailable", "astra down"
     )
     handle = router.resolve("worker", "fable", ["local"])
     assert (handle.client, handle.effective_tier, handle.model) == (
         "codex", "opus", "gpt-5.6-sol"
     )
-    assert state.get_current_client("worker") == "codex"
 
 
 def test_stale_sticky_client_normalizes_to_configured_preference(tmp_path, base_config):
@@ -294,7 +314,7 @@ def test_stale_sticky_client_normalizes_to_configured_preference(tmp_path, base_
     assert state.get_current_client("worker") == "codex"
 
 
-def test_sticky_claude_fable_crosses_only_after_claude_opus_unavailable(
+def test_sticky_claude_fable_crosses_to_other_provider_fable_before_opus(
     tmp_path, base_config
 ):
     router, state, registry = setup_router(tmp_path, base_config, dual=True)
@@ -302,6 +322,7 @@ def test_sticky_claude_fable_crosses_only_after_claude_opus_unavailable(
         registry,
         cap("claude", "worker", "fable"),
         cap("claude", "worker", "opus"),
+        cap("codex", "worker", "fable"),
         cap("codex", "worker", "opus"),
     )
     state.mark_unavailable(
@@ -311,7 +332,9 @@ def test_sticky_claude_fable_crosses_only_after_claude_opus_unavailable(
         "local", "claude", "worker", "opus", "usage_limit", "opus limited"
     )
     handle = router.resolve("worker", "fable", ["local"])
-    assert (handle.client, handle.effective_tier) == ("codex", "opus")
+    assert (handle.client, handle.effective_tier, handle.model) == (
+        "codex", "fable", "gpt-6-astra"
+    )
 
 
 def test_capability_auth_failure_falls_through(tmp_path, base_config):

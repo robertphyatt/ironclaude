@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import Database from 'better-sqlite3';
 import { registerFinalizationTests } from './integration-cases.js';
 import { initDb } from '../db.js';
 import { issueDirectGitHumanIntent, verifyDirectGitAuthority } from '../git-authority.js';
@@ -15,10 +16,27 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }).trim();
 }
 
+// Seeds the state-manager DB (STATE_MANAGER_DB_PATH) with a session's plan
+// allowed_files so the unassigned commit / commit-and-push lanes can scope their
+// staged tree. NEVER assign process.env directly — vi.stubEnv is unwound by the
+// per-describe afterEach vi.unstubAllEnvs().
+function seedPlanScope(directories: string[], providerRootSessionId: string, files: string[]): void {
+  const dir = mkdtempSync(join(tmpdir(), 'ironclaude-plan-scope-'));
+  directories.push(dir);
+  const dbPath = join(dir, 'state.db');
+  const d = new Database(dbPath);
+  d.exec('CREATE TABLE wave_tasks (terminal_session TEXT, allowed_files TEXT)');
+  d.prepare('INSERT INTO wave_tasks (terminal_session, allowed_files) VALUES (?,?)')
+    .run(providerRootSessionId, JSON.stringify(files));
+  d.close();
+  vi.stubEnv('STATE_MANAGER_DB_PATH', dbPath);
+}
+
 describe('finalizePrimaryUnassignedCommit', () => {
   const directories: string[] = [];
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
   });
 
@@ -40,6 +58,7 @@ describe('finalizePrimaryUnassignedCommit', () => {
   }
 
   function issueAndVerifyUnassigned(state: ReturnType<typeof setupUnassignedPrimary>) {
+    seedPlanScope(directories, state.providerRootSessionId, ['work.txt']);
     issueDirectGitHumanIntent(state.database, {
       repositoryPath: state.root,
       workspaceGuid: undefined,
@@ -106,6 +125,7 @@ describe('finalizePrimaryUnassignedPush', () => {
   const directories: string[] = [];
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
   });
 
@@ -132,6 +152,8 @@ describe('finalizePrimaryUnassignedPush', () => {
     state: ReturnType<typeof setupUnassignedPrimaryWithRemote>,
     operation: 'commit' | 'push' | 'commit-and-push',
   ) {
+    // /push never reads plan scope; commit / commit-and-push do (fail-closed).
+    if (operation !== 'push') seedPlanScope(directories, state.providerRootSessionId, ['work.txt']);
     issueDirectGitHumanIntent(state.database, {
       repositoryPath: state.root,
       workspaceGuid: undefined,
@@ -274,5 +296,94 @@ describe('finalizePrimaryUnassignedPush', () => {
     git(stateB.root, 'add', 'work.txt');
     const capAuthority = issueAndVerifyUnassignedOp(stateB, 'commit-and-push');
     expect(() => finalizePrimaryUnassignedPush(capAuthority)).toThrow(/pushes only/);
+  });
+
+  // LOAD-BEARING: the committed tree carries ONLY the in-scope work.txt; a foreign
+  // staged file is excluded from the commit yet left in the index (never discarded).
+  it('scopes the commit-and-push tree to allowed_files, excluding a foreign staged file that survives in the index', () => {
+    const state = setupUnassignedPrimaryWithRemote();
+    const parentHead = git(state.root, 'rev-parse', 'HEAD');
+    writeFileSync(join(state.root, 'work.txt'), 'approved\n');
+    git(state.root, 'add', 'work.txt');
+    writeFileSync(join(state.root, 'foreign.txt'), 'not mine\n');
+    git(state.root, 'add', 'foreign.txt');
+
+    const authority = issueAndVerifyUnassignedOp(state, 'commit-and-push'); // seeds ['work.txt']
+    const result = finalizePrimaryUnassignedCommitAndPush(authority, 'scoped commit-and-push');
+
+    expect(result.state).toBe('pushed');
+    const newHead = git(state.root, 'rev-parse', 'HEAD');
+    expect(git(state.root, 'rev-parse', 'HEAD^')).toBe(parentHead);
+    const tree = git(state.root, 'ls-tree', '-r', '--name-only', 'HEAD');
+    expect(tree.split('\n')).toContain('work.txt');
+    expect(tree.split('\n')).not.toContain('foreign.txt');
+    // The remote moved to the exact scoped commit.
+    expect(git(state.root, 'ls-remote', '--refs', 'origin', 'refs/heads/main').split(/\s+/)[0]).toBe(newHead);
+    // foreign.txt was NOT discarded: it remains staged in the operator's index.
+    expect(git(state.root, 'ls-files', '--stage', 'foreign.txt').length).toBeGreaterThan(0);
+  });
+
+  // EMPTY-SCOPE: only a foreign file is staged, so the scoped tree equals the parent
+  // tree — the lane must refuse rather than mint a no-op commit.
+  it('refuses an unassigned commit-and-push when nothing within allowed_files is staged', () => {
+    const state = setupUnassignedPrimaryWithRemote();
+    writeFileSync(join(state.root, 'foreign.txt'), 'not mine\n');
+    git(state.root, 'add', 'foreign.txt');
+    // issueAndVerifyUnassignedOp seeds ['work.txt']; only foreign.txt is staged.
+    expect(() => issueAndVerifyUnassignedOp(state, 'commit-and-push')).toThrow(/[Nn]othing to commit/);
+  });
+
+  // FREEZE: the intent minted its evidence over the narrow scope. Widening the plan
+  // scope after issuance yields a different observed tree at verify, so the frozen
+  // intent no longer matches — the operator's commit stays bound to what they approved.
+  it('freezes the commit-and-push scope at mint: widening allowed_files after issuance breaks the intent match', () => {
+    const state = setupUnassignedPrimaryWithRemote();
+    writeFileSync(join(state.root, 'work.txt'), 'approved\n');
+    git(state.root, 'add', 'work.txt');
+    seedPlanScope(directories, state.providerRootSessionId, ['work.txt']);
+    issueDirectGitHumanIntent(state.database, {
+      repositoryPath: state.root,
+      workspaceGuid: undefined,
+      providerRootSessionId: state.providerRootSessionId,
+      humanChannel: 'codex-user-prompt',
+      operation: 'commit-and-push',
+    });
+    // Operator widens the plan scope AND stages the newly-in-scope foreign file.
+    writeFileSync(join(state.root, 'foreign.txt'), 'now in scope\n');
+    git(state.root, 'add', 'foreign.txt');
+    seedPlanScope(directories, state.providerRootSessionId, ['work.txt', 'foreign.txt']);
+
+    expect(() => verifyDirectGitAuthority(state.database, {
+      repositoryPath: state.root,
+      workspaceGuid: undefined,
+      providerRootSessionId: state.providerRootSessionId,
+      humanChannel: 'codex-user-prompt',
+      operation: 'commit-and-push',
+    })).toThrow(/requires a matching human intent/);
+  });
+
+  // VERIFY-SIDE FAIL-CLOSED: if the state DB becomes unreadable between issue and
+  // verify, verify refuses rather than falling back to the whole index.
+  it('fails closed at verify when the plan-scope DB is unreadable', () => {
+    const state = setupUnassignedPrimaryWithRemote();
+    writeFileSync(join(state.root, 'work.txt'), 'approved\n');
+    git(state.root, 'add', 'work.txt');
+    seedPlanScope(directories, state.providerRootSessionId, ['work.txt']);
+    issueDirectGitHumanIntent(state.database, {
+      repositoryPath: state.root,
+      workspaceGuid: undefined,
+      providerRootSessionId: state.providerRootSessionId,
+      humanChannel: 'codex-user-prompt',
+      operation: 'commit-and-push',
+    });
+    vi.stubEnv('STATE_MANAGER_DB_PATH', join(tmpdir(), `ironclaude-nonexistent-${randomUUID()}`, 'state.db'));
+
+    expect(() => verifyDirectGitAuthority(state.database, {
+      repositoryPath: state.root,
+      workspaceGuid: undefined,
+      providerRootSessionId: state.providerRootSessionId,
+      humanChannel: 'codex-user-prompt',
+      operation: 'commit-and-push',
+    })).toThrow();
   });
 });

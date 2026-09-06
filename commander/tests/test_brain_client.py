@@ -94,6 +94,23 @@ class TestBrainClient:
         assert client._effort_level == "medium"
 
 
+class TestBrainEffortByTier:
+    """TIER-FIRST reasoning-effort resolution: the brain model's semantic tier
+    selects a per-tier override from effort_levels, else falls back to the global
+    effort_level. _resolve_effort is the seam _build_options uses per model_str."""
+
+    def test_effort_levels_defaults_to_empty(self):
+        assert BrainClient()._effort_levels == {}
+
+    def test_fable_tier_resolves_per_tier_effort(self):
+        client = BrainClient(effort_level="high", effort_levels={"fable": "medium"})
+        assert client._resolve_effort("fable") == "medium"
+
+    def test_opus_tier_falls_back_to_global_effort(self):
+        client = BrainClient(effort_level="high", effort_levels={"fable": "medium"})
+        assert client._resolve_effort("claude-opus-4-8") == "high"
+
+
 class TestBrainToolRestrictions:
     def test_allowed_tools_includes_bash(self):
         """Brain's allowed tools must include Bash (git-only whitelist enforced in guard)."""

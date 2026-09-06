@@ -1,0 +1,3 @@
+_use_id":"toolu_cut14"}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01F14AAAAAAAAAAAAAAAAAAA","content":[{"type":"text","text":"Async agent launched successfully.\nagentId: dpf14000000000001"}]}]},"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"dpf14000000000001"}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01F14BBBBBBBBBBBBBBBBBBB","content":[{"type":"text","text":"final answer\nagentId: dpf14000000000001 (use SendMessage with to: 'dpf14000000000001' to continue this agent)\nsubagent_tokens: 111\ntool_uses: 1\nduration_ms: 100"}]}]}}

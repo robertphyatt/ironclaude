@@ -14,19 +14,19 @@
 # limitation ("a determined agent with arbitrary Bash in executing needs OS-level
 # sandboxing").
 #
-# Benign (operator-configurable) top-level keys: validation_backend, ollama,
-# timeout_seconds. Everything else — the guardrail keys (tier_up_review_policy,
-# debug_allow_config_writes) AND any unrecognized key — is protected (allowlist =>
-# fail-closed for unknowns).
+# Benign (operator-configurable) top-level keys: validation_backend, backend, ollama,
+# openai, spots, timeout_seconds. Everything else — the guardrail keys
+# (tier_up_review_policy, debug_allow_config_writes) AND any unrecognized key — is
+# protected (allowlist => fail-closed for unknowns).
 
 # config_write_verdict <current_json_str> <proposed_json_str> -> "allow"|"block"
 config_write_verdict() {
   local current="$1" proposed="$2"
   printf '%s' "$proposed" | jq -e 'type == "object"' >/dev/null 2>&1 || { echo "block"; return; }
   local prop_proj cur_proj
-  prop_proj=$(printf '%s' "$proposed" | jq -cS 'del(.validation_backend, .ollama, .timeout_seconds)' 2>/dev/null) || { echo "block"; return; }
+  prop_proj=$(printf '%s' "$proposed" | jq -cS 'del(.validation_backend, .backend, .ollama, .openai, .spots, .timeout_seconds)' 2>/dev/null) || { echo "block"; return; }
   if printf '%s' "$current" | jq -e 'type == "object"' >/dev/null 2>&1; then
-    cur_proj=$(printf '%s' "$current" | jq -cS 'del(.validation_backend, .ollama, .timeout_seconds)' 2>/dev/null) || cur_proj='{}'
+    cur_proj=$(printf '%s' "$current" | jq -cS 'del(.validation_backend, .backend, .ollama, .openai, .spots, .timeout_seconds)' 2>/dev/null) || cur_proj='{}'
   else
     cur_proj='{}'
   fi

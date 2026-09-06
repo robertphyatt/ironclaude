@@ -47,12 +47,21 @@ def test_codex_models_match_approved_tiers(base_config):
     assert cfg.model_for("codex", "haiku") == "gpt-5.6-luna"
     assert cfg.model_for("codex", "sonnet") == "gpt-5.6-terra"
     assert cfg.model_for("codex", "opus") == "gpt-5.6-sol"
+    assert cfg.model_for("codex", "fable") == "gpt-6-astra"
 
 
-def test_codex_has_no_fable_alias(base_config):
-    cfg = parse_provider_config(base_config())
-    with pytest.raises(ProviderConfigError, match="fable"):
-        cfg.model_for("codex", "fable")
+def test_codex_fable_tier_resolves_to_configured_model(base_config):
+    raw = base_config()
+    raw["clients"]["codex"]["models"]["fable"] = "gpt-6-astra"
+    cfg = parse_provider_config(raw)
+    assert cfg.model_for("codex", "fable") == "gpt-6-astra"
+
+
+def test_codex_models_missing_fable_is_rejected(base_config):
+    raw = base_config()
+    raw["clients"]["codex"]["models"].pop("fable", None)
+    with pytest.raises(ProviderConfigError):
+        parse_provider_config(raw)
 
 
 @pytest.mark.parametrize("role", ["brain", "worker", "grader", "advisor"])

@@ -7,11 +7,22 @@ IronClaude adds workflow discipline to Claude Code and OpenAI Codex, plus multi-
 - **Worker** -- A Claude Code and OpenAI Codex plugin that enforces disciplined development workflows (brainstorm, plan, execute) with review gates between every task
 - **Commander** -- A Python daemon that orchestrates multiple Worker sessions via Slack, with an autonomous Brain that decomposes objectives and assigns work
 
-> **Compatibility:** Direct Worker mode supports Claude Code and OpenAI Codex. Commander now runs Codex as **workers and grader** alongside Claude, and the Codex **Brain** runs the disciplined brainstorm → plan → execute workflow and episodic memory. Codex-Brain worker orchestration and Codex advisor wiring land in v1.1.1. See [CODEX_SETUP.md](CODEX_SETUP.md).
+> **Compatibility:** Direct Worker mode supports Claude Code and OpenAI Codex. Commander runs Codex as **workers and grader** alongside Claude, and the Codex **Brain** runs the disciplined brainstorm → plan → execute workflow, episodic memory, and brokered read-only advisor review. See [CODEX_SETUP.md](CODEX_SETUP.md).
 
 The key insight: discipline and orchestration reinforce each other. The Worker's professional mode hooks guarantee that every autonomous session follows the full workflow -- so the Commander can trust the quality of work happening without your direct supervision. And because the Commander runs through Slack, you can supervise and direct multi-session autonomous work from your phone, from anywhere, without being at your terminal. The Brain acts as your proxy at the keyboard.
 
 You can use the Worker alone for single-session discipline, or add the Commander for multi-session orchestration.
+
+---
+
+## What's New in v1.1.8
+
+- **Bring your own local-model endpoint.** Every spot where IronClaude runs a local model to shadow Claude — plan validation, conversation summarization, and Commander's grader / shadow-grader / session summarization — can now point at any OpenAI-compatible `/v1/chat/completions` server (llama.cpp, vLLM, a self-hosted box, …) alongside Ollama. Set a global default and override any single spot with `spots.<spot>.{backend,model}`; one shared resolution rule governs all three implementations (bash, TypeScript, Python).
+- **Fail-open by construction.** A broken or unreachable backend — a missing `openai` block, a wrong URL, a non-JSON 200 response — degrades through the existing error seams instead of crashing the caller, and per-spot model overrides work on both backends with zero change to existing Ollama request bytes. Block-level `timeout_seconds` is honored per backend, so slow local models don't time out early (and Commander's grader now honors that timeout too, instead of a hardcoded 15s).
+- **Reasoning effort is now per-tier.** Every worker / Brain / grader spawn resolves reasoning effort tier-first — a per-tier override else the global default — so you can dial one tier without touching the rest. An optional `effort_levels` map sits alongside the global `effort_level` (shipped default: global `high`, `fable` `medium`).
+- **GPT-6 Astra is the Codex Fable-tier peer.** `gpt-6-astra` joins the Codex model roster as the top-tier reviewer, giving Codex tier-up plan reviews and advisor consultations a ceiling that matches Claude's Fable.
+- **Reliability fixes.** The get-back-to-work Stop hook no longer misfires "STOP — TASKS STILL IN PROGRESS" on a live subagent when a large transcript's byte-tail cut a record mid-line; Commander's heartbeat routes Brain-owned waits to a distinct "WAITING ON Brain" section instead of mislabeling them as the operator; and PM-on `/commit` / `/commit-and-push` now work in an unassigned primary checkout, scoped to the session's `allowed_files` so a shared checkout's foreign staged files stay out.
+- See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ---
 
@@ -58,7 +69,7 @@ You can use the Worker alone for single-session discipline, or add the Commander
 
 ## What's New in v1.1.0
 
-- **Codex↔Claude parity for workers and grader.** A provider router lets those roles run on OpenAI Codex (`gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-5.6-sol`), selected per role in `config/ironclaude.json`. See [CODEX_SETUP.md](CODEX_SETUP.md).
+- **Codex↔Claude parity for workers and grader.** A provider router lets those roles run on OpenAI Codex (`gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-5.6-sol` / `gpt-6-astra`), selected per role in `config/ironclaude.json`. See [CODEX_SETUP.md](CODEX_SETUP.md).
 - **Codex Brain (workflow + memory).** The Brain can run as a persistent `codex app-server` (`BRAIN_CLIENT=codex`) with a read-only sandbox, on-request approval, and a git-command allowlist guard, driving the full brainstorm → plan → execute workflow and episodic memory. Worker-orchestration from the Codex Brain, Brain tool-gating, and Codex advisor wiring are v1.1.1.
 - **Reliability & hygiene.** A periodic session-artifact sweep prunes stale session rows and dead-PID id files; Brain narration is threaded into Slack without re-triggering the earlier restart loop; the Commander test suite runs warning-clean.
 - See [CHANGELOG.md](CHANGELOG.md) for full details.
@@ -150,9 +161,16 @@ The Worker enforces the brainstorm-plan-execute workflow on every code change in
 ### Install in Codex
 
 ```bash
+# From an IronClaude source checkout, use the preflight-gated install target.
 codex plugin marketplace add robertphyatt/ironclaude
-codex plugin add ironclaude@ironclaude
+make codex-plugin-install
 ```
+
+The preflight is idempotent and fail-closed: it creates only a missing equivalent
+`codex-code-mode-host` companion symlink and refuses to overwrite a file, directory,
+FIFO, dangling link, or link to different bytes. `make codex-plugin-release` is
+the supported source self-update target; it runs repair before cachebusting,
+building, validating, and reinstalling the plugin.
 
 After initial installation or any update, preserve the current native task ID,
 fully quit and relaunch Codex, then reopen the same task so Codex loads the
@@ -741,6 +759,6 @@ For the full Windows setup guide including path handling, bash environment confi
 
 ## About
 
-IronClaude was developed by [Robert Hyatt](https://www.linkedin.com/in/robert-hyatt/) while working on his solo indie dev side project, Artificial Adventures — a game approaching alpha testing. Inspired by [obra/superpowers](https://github.com/obra/superpowers).
+IronClaude was developed by [Robert Hyatt](https://www.linkedin.com/in/robert-hyatt/) while working on his solo indie dev side project, High Gate Campaigns — a game approaching alpha testing. Inspired by [obra/superpowers](https://github.com/obra/superpowers).
 
-If you're interested in IronClaude or want to talk about Artificial Adventures, [reach out on LinkedIn](https://www.linkedin.com/in/robert-hyatt/).
+If you're interested in IronClaude or want to talk about High Gate Campaigns, [reach out on LinkedIn](https://www.linkedin.com/in/robert-hyatt/).

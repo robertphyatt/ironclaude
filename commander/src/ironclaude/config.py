@@ -11,6 +11,7 @@ import re as _re
 import shlex
 
 from ironclaude.provider_config import (
+    TIER_NAMES,
     ProviderConfigError,
     normalize_machine_clients,
     provider_config_from_commander,
@@ -47,6 +48,7 @@ DEFAULTS = {
     "default_opus_model": "claude-opus-4-8",
     "grader_model": "claude-opus-4-8",
     "effort_level": "high",
+    "effort_levels": {"fable": "medium"},
     "advisor": {
         "enabled": True,
         "executor_model": "sonnet",  # CLI routing only — sets --model flag for sonnet workers; not a Brain model selection input
@@ -73,6 +75,7 @@ DEFAULTS = {
                     "haiku": "gpt-5.6-luna",
                     "sonnet": "gpt-5.6-terra",
                     "opus": "gpt-5.6-sol",
+                    "fable": "gpt-6-astra",
                 },
             },
         },
@@ -181,12 +184,34 @@ def load_config(config_path: str = "config/ironclaude.json") -> dict:
         )
         cfg["effort_level"] = DEFAULT_EFFORT_LEVEL
 
+    # Validate effort_levels (per-tier overrides) against TIER_NAMES and
+    # EFFORT_LEVELS, mirroring the effort_level validation above.
+    effort_levels = cfg.get("effort_levels")
+    if not isinstance(effort_levels, dict):
+        effort_levels = {}
+    filtered_effort_levels = {}
+    for key, value in effort_levels.items():
+        if key in TIER_NAMES and value in EFFORT_LEVELS:
+            filtered_effort_levels[key] = value
+        else:
+            logger.warning("effort_levels[%r]=%r invalid; dropping", key, value)
+    cfg["effort_levels"] = filtered_effort_levels
+
     # Validate provider configuration (raises ProviderConfigError on failure).
     # Later adapters call provider_config_from_commander(cfg) again to obtain
     # the immutable ProviderConfig with legacy role/tier model overrides.
     provider_config_from_commander(cfg)
 
     return cfg
+
+
+def effort_for_tier(tier: str | None, effort_level: str, effort_levels: dict) -> str:
+    """Resolve the effective effort level for a tier.
+
+    Returns effort_levels[tier] if present, else falls back to the global
+    effort_level. A falsy tier (None or "") always falls back to the global.
+    """
+    return effort_levels.get(tier or "", effort_level)
 
 
 def make_opus_command(model: str, effort: str) -> str:

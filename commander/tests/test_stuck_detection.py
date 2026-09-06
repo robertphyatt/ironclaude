@@ -12,8 +12,6 @@ from ironclaude.main import (
     IroncladeDaemon,
     STALENESS_ALERT_SECONDS,
     STALENESS_KILL_SECONDS,
-    STALENESS_PROMPT_ALERT,
-    STALENESS_PROMPT_KILL,
     STALENESS_CHECK_INTERVAL,
     STAGE_STALENESS_MULTIPLIER,
 )
@@ -158,39 +156,41 @@ class TestCheckStuckWorkers:
         daemon.check_stuck_workers()
         daemon.brain.send_message.assert_not_called()
 
-    def test_prompt_waiting_accelerated_alert(self, daemon):
+    def test_active_routine_prompt_suppresses_stuck_alert(self, daemon):
         worker = self._make_worker()
         daemon.registry.get_running_workers.return_value = [worker]
         daemon.tmux.has_session.return_value = True
         daemon.tmux.capture_pane.return_value = "AskUserQuestion some prompt"
         daemon._get_worker_workflow_stage = MagicMock(return_value="executing")
-        daemon._grader.grade = MagicMock(return_value={"waiting": True})
+        daemon._routine_prompt_active = MagicMock(return_value=True)
+        daemon._detect_worker_prompt = MagicMock()
 
         daemon.check_stuck_workers()
         daemon._last_stuck_check = 0.0
-        daemon._stuck_since["w1"] = time.time() - 901  # just over 15min
+        daemon._stuck_since["w1"] = time.time() - 3601
 
         daemon.check_stuck_workers()
-        daemon.brain.send_message.assert_called_once()
-        msg = daemon.brain.send_message.call_args[0][0]
-        assert "STUCK" in msg
+        daemon.brain.send_message.assert_not_called()
+        daemon._detect_worker_prompt.assert_not_called()
 
-    def test_prompt_waiting_accelerated_kill(self, daemon):
+    def test_active_routine_prompt_suppresses_stuck_kill(self, daemon):
         worker = self._make_worker()
         daemon.registry.get_running_workers.return_value = [worker]
         daemon.tmux.has_session.return_value = True
         daemon.tmux.capture_pane.return_value = "AskUserQuestion some prompt"
         daemon._get_worker_workflow_stage = MagicMock(return_value="executing")
         daemon._confirm_and_kill_stuck_worker = MagicMock()
-        daemon._grader.grade = MagicMock(return_value={"waiting": True})
+        daemon._routine_prompt_active = MagicMock(return_value=True)
+        daemon._detect_worker_prompt = MagicMock()
 
         daemon.check_stuck_workers()
         daemon._last_stuck_check = 0.0
-        daemon._stuck_since["w1"] = time.time() - 1801  # just over 30min
+        daemon._stuck_since["w1"] = time.time() - 7201
         daemon._stuck_alert_sent["w1"] = True
 
         daemon.check_stuck_workers()
-        daemon._confirm_and_kill_stuck_worker.assert_called_once()
+        daemon._confirm_and_kill_stuck_worker.assert_not_called()
+        daemon._detect_worker_prompt.assert_not_called()
 
     def test_no_prompt_uses_default_thresholds(self, daemon):
         worker = self._make_worker()

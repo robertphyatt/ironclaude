@@ -1,0 +1,3 @@
+_use_id":"toolu_cut13"}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01F13AAAAAAAAAAAAAAAAAAA","content":[{"type":"text","text":"Async agent launched successfully.\nagentId: cpf13000000000001"}]}]},"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"cpf13000000000001"}}
+{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>cpf13000000000001</task-id>\n<tool-use-id>toolu_01F13AAAAAAAAAAAAAAAAAAA</tool-use-id>\n<output-file>/private/tmp/tasks/cpf13000000000001.output</output-file>\n<status>completed</status>\n<summary>done</summary>\n<result>done</result>\n</task-notification>"},"origin":{"kind":"task-notification"},"promptSource":"system"}

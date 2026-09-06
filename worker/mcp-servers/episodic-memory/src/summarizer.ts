@@ -5,22 +5,71 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
+type BackendName = 'ollama' | 'openai' | 'haiku';
+
 interface HooksConfig {
-  validation_backend?: 'haiku' | 'ollama';
+  backend?: BackendName;
+  validation_backend?: BackendName;
   timeout_seconds?: number;
   ollama?: {
     url?: string;
     fallback_url?: string;
     model?: string;
+    summarization_model?: string;
   };
+  openai?: {
+    base_url?: string;
+    model?: string;
+    max_tokens?: number;
+    timeout_seconds?: number;
+    fallback_base_url?: string;
+  };
+  spots?: {
+    [spot: string]: {
+      backend?: BackendName;
+      model?: string;
+    };
+  };
+  shadow_model?: string;
+}
+
+type Spot = 'validation' | 'summarizer' | 'grader' | 'summarization' | 'shadow';
+
+interface ResolvedBackend {
+  backend: BackendName | undefined;
+  model: string | undefined;
+  url: string | undefined;
 }
 
 /**
- * Load hooks config from ~/.claude/ironclaude-hooks-config.json
+ * Resolve the backend/model/url for a given config spot per the shared
+ * resolution rule documented in worker/config-schema/llm-backend.md.
+ */
+export function resolveBackend(config: HooksConfig, spot: Spot): ResolvedBackend {
+  const spotConfig = config.spots?.[spot];
+  const backend = spotConfig?.backend ?? config.backend ?? config.validation_backend;
+
+  let legacyAlias: string | undefined;
+  if (spot === 'shadow') {
+    legacyAlias = config.shadow_model;
+  } else if (spot === 'summarization') {
+    legacyAlias = config.ollama?.summarization_model;
+  }
+
+  const backendBlock = backend === 'ollama' ? config.ollama : backend === 'openai' ? config.openai : undefined;
+  const model = spotConfig?.model ?? legacyAlias ?? backendBlock?.model;
+  const url = backend === 'ollama' ? config.ollama?.url : backend === 'openai' ? config.openai?.base_url : undefined;
+
+  return { backend, model, url };
+}
+
+/**
+ * Load hooks config from IC_OLLAMA_CONFIG_PATH, falling back to
+ * ~/.claude/ironclaude-hooks-config.json.
  * Returns null if file doesn't exist or is invalid
  */
 function loadHooksConfig(): HooksConfig | null {
-  const configPath = path.join(os.homedir(), '.claude', 'ironclaude-hooks-config.json');
+  const configPath = process.env.IC_OLLAMA_CONFIG_PATH ?? path.join(os.homedir(), '.claude', 'ironclaude-hooks-config.json');
   try {
     if (fs.existsSync(configPath)) {
       const content = fs.readFileSync(configPath, 'utf-8');
@@ -35,14 +84,14 @@ function loadHooksConfig(): HooksConfig | null {
 /**
  * Call Ollama API for summarization (with fallback support)
  */
-async function callOllama(prompt: string, config: HooksConfig): Promise<string> {
+async function callOllama(prompt: string, config: HooksConfig, model?: string): Promise<string> {
   const url = config.ollama?.url || 'http://localhost:11434';
   const fallbackUrl = config.ollama?.fallback_url;
-  const model = config.ollama?.model || 'llama3.2:1b';
+  const resolvedModel = model || 'llama3.2:1b';
   const timeoutMs = (config.timeout_seconds || 60) * 1000;
 
   const payload = {
-    model,
+    model: resolvedModel,
     prompt,
     stream: false,
     format: {
@@ -101,6 +150,71 @@ async function fetchOllama(url: string, payload: object, timeoutMs: number): Pro
 }
 
 /**
+ * Call an OpenAI-compatible chat/completions API for summarization.
+ */
+export async function callOpenAi(prompt: string, config: HooksConfig, model?: string): Promise<string> {
+  const baseUrl = config.openai?.base_url;
+  const maxTokens = config.openai?.max_tokens ?? 1024;
+  const timeoutMs = (config.openai?.timeout_seconds ?? config.timeout_seconds ?? 60) * 1000;
+
+  const payload = {
+    model,
+    messages: [{ role: 'user', content: prompt }],
+    max_tokens: maxTokens,
+    temperature: 0.1,
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        name: 'summary',
+        schema: {
+          type: 'object',
+          properties: {
+            summary: { type: 'string' }
+          },
+          required: ['summary']
+        }
+      }
+    }
+  };
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ollama'
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      throw new Error(`OpenAI-compatible API error: ${response.status}`);
+    }
+
+    const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+    const content = data.choices?.[0]?.message?.content;
+    if (content) {
+      try {
+        const parsed = JSON.parse(content);
+        return parsed.summary || content;
+      } catch {
+        return content;
+      }
+    }
+    return '';
+  } catch (error) {
+    clearTimeout(timeoutId);
+    throw error;
+  }
+}
+
+/**
  * Get API environment overrides for summarization calls.
  * Returns full env merged with process.env so subprocess inherits PATH, HOME, etc.
  *
@@ -144,15 +258,25 @@ function extractSummary(text: string): string {
   return text.trim();
 }
 
-async function callClaude(prompt: string, sessionId?: string, useFallback = false): Promise<string> {
-  // Check hooks config for Ollama backend
+export async function callClaude(prompt: string, sessionId?: string, useFallback = false): Promise<string> {
+  // Check hooks config for the summarizer spot's resolved backend
   const hooksConfig = loadHooksConfig();
-  if (hooksConfig?.validation_backend === 'ollama') {
-    try {
-      return await callOllama(prompt, hooksConfig);
-    } catch (error) {
-      console.error('Ollama call failed, falling back to Haiku:', error);
-      // Fall through to SDK
+  if (hooksConfig) {
+    const resolved = resolveBackend(hooksConfig, 'summarizer');
+    if (resolved.backend === 'ollama') {
+      try {
+        return await callOllama(prompt, hooksConfig, resolved.model);
+      } catch (error) {
+        console.error('Ollama call failed, falling back to Haiku:', error);
+        // Fall through to SDK
+      }
+    } else if (resolved.backend === 'openai') {
+      try {
+        return await callOpenAi(prompt, hooksConfig, resolved.model);
+      } catch (error) {
+        console.error('OpenAI-compatible call failed, falling back to Haiku:', error);
+        // Fall through to SDK
+      }
     }
   }
 

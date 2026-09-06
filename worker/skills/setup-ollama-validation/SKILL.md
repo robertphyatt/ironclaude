@@ -9,6 +9,11 @@ description: Configure Ollama as the validation backend for professional mode ho
 
 Configure Ollama as the validation backend for professional mode hooks. This replaces the slow Claude Haiku CLI calls (~12-15s) with near-instant local Ollama calls (~1s).
 
+Config schema and backend-resolution rule (backend/model resolution order, legacy
+aliases, per-spot overrides, and the `openai` backend) are documented authoritatively
+in `worker/config-schema/llm-backend.md`. This skill covers the Ollama setup flow;
+consult that doc for the full schema, including the `openai` alternative below.
+
 ## When to Use
 
 - When you want faster hook validation
@@ -177,6 +182,33 @@ Expected response time: <1 second (vs ~12-15 seconds with Haiku)
 
 To revert to Haiku: rm ~/.claude/ironclaude-hooks-config.json
 ```
+
+### Alternative: `openai` backend
+
+Instead of (or alongside) the `ollama` block, a spot can resolve to the `openai`
+backend — any OpenAI-chat-completions-compatible HTTP endpoint (e.g. a remote box
+serving larger models). No real API key is required (send a dummy
+`Authorization: Bearer <anything>`); plain `http://` is fine. Set:
+
+```json
+{
+  "backend": "openai",
+  "openai": {
+    "base_url": "http://HOST:PORT/v1",
+    "model": "MODEL_NAME",
+    "max_tokens": 800,
+    "timeout_seconds": 60
+  }
+}
+```
+
+Gotcha: **`max_tokens` must be ≥ 400.** Hidden reasoning tokens are consumed before
+visible content — a smaller `max_tokens` starves the response and returns empty
+content. `reasoning_effort` is not read; encode reasoning level in the model name
+suffix instead (e.g. `example-model-b:low`).
+
+See `worker/config-schema/llm-backend.md` for the full resolution rule, per-spot
+overrides (`spots.<spot>.backend` / `spots.<spot>.model`), and legacy aliases.
 
 ## Key Principles
 

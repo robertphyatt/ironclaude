@@ -14,7 +14,7 @@ def _tools(tmp_path):
                 "claude": {"enabled": True, "path": "claude",
                            "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "claude-opus-4-8", "fable": "fable"}},
                 "codex": {"enabled": False, "path": "codex",
-                          "models": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol"}},
+                          "models": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol", "fable": "gpt-6-astra"}},
             },
             "roles": {r: {"preferred": "claude", "clients": ["claude"]}
                       for r in ("brain", "worker", "grader", "advisor")},
@@ -58,17 +58,17 @@ def test_call_grader_claude_returns_verdict(tmp_path):
     assert called_argv[called_argv.index("--model") + 1] == "opus[1m]"
 
 
-def _codex_enabled_cfg(tmp_path, clients=("codex",)):
+def _codex_enabled_cfg(tmp_path, clients=("codex",), grader_model="opus"):
     conn = init_db(str(tmp_path / "commander.db"))
     cfg = {
-        "grader_model": "opus", "brain_model": "sonnet", "default_opus_model": "opus",
+        "grader_model": grader_model, "brain_model": "sonnet", "default_opus_model": "opus",
         "advisor": {"advisor_model": "opus", "advisor_models": {}},
         "providers": {
             "clients": {
                 "claude": {"enabled": True, "path": "claude",
                            "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "claude-opus-4-8", "fable": "fable"}},
                 "codex": {"enabled": True, "path": "codex",
-                          "models": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol"}},
+                          "models": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol", "fable": "gpt-6-astra"}},
             },
             "roles": {
                 "brain": {"preferred": "claude", "clients": ["claude"]},
@@ -78,7 +78,10 @@ def _codex_enabled_cfg(tmp_path, clients=("codex",)):
             },
         },
     }
-    return omcp.OrchestratorTools(registry=MagicMock(), tmux=MagicMock(), db_conn=conn, config=cfg)
+    return omcp.OrchestratorTools(
+        registry=MagicMock(), tmux=MagicMock(), db_conn=conn, config=cfg,
+        grader_model=grader_model,
+    )
 
 
 def test_legacy_config_without_providers_uses_claude(tmp_path):
@@ -209,6 +212,37 @@ def test_call_grader_codex_end_to_end(tmp_path, monkeypatch):
     assert run.call_args.args[0][0] == "codex"
 
 
+def test_fable_grader_uses_astra_and_fable_effort(tmp_path, monkeypatch):
+    tools = _codex_enabled_cfg(tmp_path, grader_model="fable")
+    tools._effort_levels = {"fable": "medium"}
+    _codex_avail(monkeypatch)
+    with patch.object(omcp.subprocess, "run", return_value=_codex_proc("codex_grader_verdict.jsonl")) as run:
+        assert tools._call_grader("sys", "user")["grade"] == "B"
+    argv = run.call_args.args[0]
+    assert argv[argv.index("-m") + 1] == "gpt-6-astra"
+    assert 'model_reasoning_effort="medium"' in argv
+
+
+def test_unavailable_astra_grader_uses_codex_sol_before_claude(tmp_path, monkeypatch):
+    tools = _codex_enabled_cfg(tmp_path, clients=("codex", "claude"), grader_model="fable")
+    from ironclaude.provider_capabilities import CapabilityProbe, ClientCapability
+
+    def fake_probe(self, cfg, client, role, tier):
+        return ClientCapability(
+            host="local", client=client, role=role, tier=tier, configured=True,
+            supported=True, installed=True, authenticated=True, available=not (
+                client == "codex" and tier == "fable"
+            ), reason="astra unavailable" if client == "codex" and tier == "fable" else None,
+        )
+
+    monkeypatch.setattr(CapabilityProbe, "probe_local", fake_probe)
+    with patch.object(omcp.subprocess, "run", return_value=_codex_proc("codex_grader_verdict.jsonl")) as run:
+        assert tools._call_grader("sys", "user")["grade"] == "B"
+    argv = run.call_args.args[0]
+    assert argv[0] == "codex"
+    assert argv[argv.index("-m") + 1] == "gpt-5.6-sol"
+
+
 def _codex_error_proc(returncode, stdout, stderr):
     proc = MagicMock()
     proc.returncode = returncode
@@ -310,7 +344,7 @@ def _codex_cfg_with_effort(tmp_path, effort):
                 "claude": {"enabled": True, "path": "claude",
                            "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "claude-opus-4-8", "fable": "fable"}},
                 "codex": {"enabled": True, "path": "codex",
-                          "models": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol"}},
+                          "models": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol", "fable": "gpt-6-astra"}},
             },
             "roles": {
                 "brain": {"preferred": "claude", "clients": ["claude"]},

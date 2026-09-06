@@ -34,7 +34,7 @@ import psutil
 import requests
 import shlex
 
-from ironclaude.config import make_opus_command
+from ironclaude.config import make_opus_command, effort_for_tier
 from ironclaude.db import (
     DIRECT_REPLY_FALLBACK_REASON,
     persist_operator_message_acknowledgement,
@@ -54,6 +54,7 @@ from ironclaude.provider_capabilities import CapabilityRegistry, CapabilityProbe
 from ironclaude.provider_router import ProviderRouter, NoCapabilityAvailable
 from ironclaude.notifications import format_directive_review, format_fable_unavailable, format_fable_recovered
 from ironclaude.shadow_grader import ShadowGrader
+from ironclaude.backend_resolver import make_client, resolve_backend
 from ironclaude.ollama_client import OllamaClient, OllamaError
 from ironclaude.ollama_playbook import OLLAMA_WORKER_PLAYBOOK
 from ironclaude.signal_forensics import _logged_kill
@@ -184,18 +185,20 @@ _WORKER_TYPE_TIER = {"claude-opus": "opus", "claude-fable": "fable", "claude-son
 # IRONCLAUDE_LLM_PATH: advisor
 # Codex's advisor channel. Claude workers are told their advisor with the
 # `/advisor <model>` slash command typed into their pane; codex cannot parse a
-# Claude slash command, so it gets the same directive as plain text over the same
-# send_keys channel. Wording tracks directive 9 of templates/worker_agents.md —
-# deliberately including its bare tier ladder and <one-tier-up-model> placeholder,
-# so the runtime path says exactly what the file path says and no more.
+# Claude slash command, so it gets the broker directive as plain text over the
+# same send_keys channel. Wording tracks directive 9 of
+# templates/worker_agents.md.
 # MUST stay a single line with no embedded newline: send_keys runs
 # `tmux send-keys -- <text>` without -l and then sends one Enter, so a newline
 # risks submitting the instruction in fragments.
 _CODEX_ADVISOR_INSTRUCTION = (
     "Advisor directive: fire the advisor at natural discretionary points - before "
-    "substantive work, when stuck, and before declaring done. Invoke a one-tier-up "
-    "report-only reviewer with `codex exec -m <one-tier-up-model>` using "
-    "luna -> terra -> sol; at the sol ceiling, run a same-tier blind sol pass. "
+    "substantive work, when stuck, and before declaring done. Call "
+    "`run_codex_advisor_review` with exactly `packet` containing complete inline review evidence, authenticated `requester_model`, "
+    "and `review_tier: \"one-up\"`; the broker rejects any mismatch with provider-authenticated "
+    "Codex turn metadata, maps the reviewer exactly once, and runs the "
+    "fixed report-only reviewer. Do not run nested Codex CLI commands or repeat "
+    "operator approval requests for this brokered read-only review. "
     "Reconcile the review with evidence; never proceed unreviewed because an "
     "advisor command is unavailable. Prepend the exact complete "
     "write-lossless-ai-messages skill content to every report-only reviewer prompt "
@@ -223,26 +226,6 @@ _MCP_CLEANUP_PATTERNS = [
     "ironclaude-state-manager",
     "ironclaude-episodic-memory",
 ]
-
-KEY_MAP: dict[str, str] = {
-    "Return": "return",
-    "space": "space",
-    "Tab": "tab",
-    "Escape": "escape",
-    "BackSpace": "delete",
-    "Up": "arrow-up",
-    "Down": "arrow-down",
-    "Left": "arrow-left",
-    "Right": "arrow-right",
-    "Shift_L": "shift",
-    "Shift_R": "shift",
-    "Control_L": "ctrl",
-    "Control_R": "ctrl",
-    "Alt_L": "alt",
-    "Alt_R": "alt",
-    "Meta_L": "cmd",
-    "Meta_R": "cmd",
-}
 
 
 def _load_avatar_skill() -> str:
@@ -489,7 +472,7 @@ class OrchestratorTools:
     # which raises ValueError on a negative maxlen.
     GRADER_LOG_MAX_LINES = _positive_int_env("GRADER_LOG_MAX_LINES", 500)
 
-    def __init__(self, registry, tmux, ledger_path: str = "", grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "claude-opus-4-8", opus_model: str = "claude-opus-4-8", effort_level: str = "high", ssh_manager=None, config: dict | None = None, ollama_inventory=None, dispatch_cfg: dict | None = None):
+    def __init__(self, registry, tmux, ledger_path: str = "", grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "claude-opus-4-8", opus_model: str = "claude-opus-4-8", effort_level: str = "high", effort_levels: dict | None = None, ssh_manager=None, config: dict | None = None, ollama_inventory=None, dispatch_cfg: dict | None = None):
         self.registry = registry
         self.tmux = tmux
         self.ledger_path = ledger_path
@@ -498,13 +481,13 @@ class OrchestratorTools:
         self._grader_model = grader_model
         self._opus_model = opus_model
         self._effort_level = effort_level
+        self._effort_levels = effort_levels if effort_levels is not None else (config or {}).get("effort_levels", {})
         self._slack = slack_bot
         self._db = db_conn
         self._operator_name = operator_name
         self._supabase_url = supabase_url
         self._supabase_anon_key = supabase_anon_key
         self._failed_worker_bases: set[str] = set()
-        self._game_pid: int | None = None
         self._advisor_cfg = advisor_cfg or {}
         self._dispatch_cfg = dispatch_cfg or {}
         self._ssh_manager = ssh_manager
@@ -584,11 +567,13 @@ class OrchestratorTools:
         None for: ollama (unrouted), unknown worker_type (so the legacy body still raises
         ValueError), or a config with no provider block (ProviderConfigError).
         Configured-provider exhaustion remains a hard NoCapabilityAvailable boundary.
-        Probes the requested tier AND, for a fable request, the 'opus' degrade target
-        (the router degrades fable->opus for non-claude clients)."""
+        Probes requested tier and, for fable, every provider's opus fallback."""
         if worker_type == "ollama":
             return None
-        tier = _WORKER_TYPE_TIER.get(_resolve_fable_worker_type(worker_type))
+        # Resolve the configured provider from the requested semantic tier before
+        # applying Claude-specific Fable quarantine.  A Codex Astra route is not a
+        # Claude Fable launch and must remain available when Claude Fable is down.
+        tier = _WORKER_TYPE_TIER.get(worker_type)
         if tier is None:
             return None
         try:
@@ -604,7 +589,10 @@ class OrchestratorTools:
         """Resolve one provider handle against the selected remote host."""
         if worker_type == "ollama" or not machine_cfg.clients:
             return None
-        tier = _WORKER_TYPE_TIER.get(_resolve_fable_worker_type(worker_type))
+        # As with local routing, preserve the requested tier while choosing a
+        # configured remote provider; only the legacy Claude path may quarantine
+        # a Claude Fable launch.
+        tier = _WORKER_TYPE_TIER.get(worker_type)
         if tier is None:
             return None
         try:
@@ -628,48 +616,64 @@ class OrchestratorTools:
             "worker", tier, [machine_cfg.host],
         )
 
+    def _effort_for_tier(self, tier) -> str:
+        """Reasoning effort for a tier: the per-tier override else the global level."""
+        return effort_for_tier(tier, self._effort_level, self._effort_levels)
+
+    def _effort_for_model(self, model, field, fallback) -> str:
+        """Reasoning effort resolved from a Claude model name via its semantic tier."""
+        return self._effort_for_tier(_semantic_tier(model, field, fallback))
+
     def _get_worker_command_for_handle(
         self, worker_type: str, model_name: str, worker_handle,
     ) -> str:
         """Build a worker command from one already-resolved provider handle."""
-        worker_type = _resolve_fable_worker_type(worker_type)
         if worker_handle is not None:
             if worker_handle.client == "codex":
                 return self._codex_worker_command(worker_handle.model)
             if worker_handle.client == "claude":
                 if worker_handle.effective_tier in ("opus", "fable"):
                     return make_opus_command(
-                        worker_handle.model, self._effort_level,
+                        worker_handle.model,
+                        self._effort_for_tier(worker_handle.effective_tier),
                     )
                 if worker_handle.effective_tier == "sonnet":
                     if worker_handle.model == "sonnet":
-                        return WORKER_COMMANDS["claude-sonnet"]
+                        return (
+                            f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_for_tier('sonnet')}; "
+                            "exec claude --model 'sonnet' --dangerously-skip-permissions"
+                        )
                     return (
-                        f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; "
+                        f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_for_tier(worker_handle.effective_tier)}; "
                         f"exec claude --model {shlex.quote(worker_handle.model)} "
                         "--dangerously-skip-permissions"
                     )
 
         # Legacy configuration and Ollama retain the existing command shapes.
+        # Claude Fable quarantine applies only here, after provider routing has
+        # already declined to supply a handle.
+        worker_type = _resolve_fable_worker_type(worker_type)
         advisor = self._advisor_cfg
         if worker_type == "ollama":
             self._get_ollama_client()  # populate _ollama_cfg_cache
             _ollama_url = self._ollama_cfg_cache.get("url", "http://localhost:11434")
             return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; export CLAUDE_CODE_ATTRIBUTION_HEADER=0; export ANTHROPIC_BASE_URL={shlex.quote(_ollama_url)}; export ANTHROPIC_AUTH_TOKEN=ollama; export ANTHROPIC_API_KEY=; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
         elif worker_type == "claude-opus":
-            return make_opus_command(self._opus_model, self._effort_level)
+            return make_opus_command(
+                self._opus_model,
+                self._effort_for_model(self._opus_model, "default_opus_model", "opus"),
+            )
         elif worker_type == "claude-fable":
-            return make_opus_command("fable", self._effort_level)
+            return make_opus_command("fable", self._effort_for_tier("fable"))
         elif worker_type in WORKER_COMMANDS:
             if advisor.get("enabled") and worker_type == "claude-sonnet":
                 model = advisor.get("executor_model", "sonnet")  # CLI routing only — not a model selection decision
-                return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model {shlex.quote(model)} --dangerously-skip-permissions"
-            return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; exec claude --model 'sonnet' --dangerously-skip-permissions"
+                return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_for_tier('sonnet')}; exec claude --model {shlex.quote(model)} --dangerously-skip-permissions"
+            return f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_for_tier('sonnet')}; exec claude --model 'sonnet' --dangerously-skip-permissions"
         raise ValueError(f"Invalid worker type '{worker_type}'")
 
     def _get_worker_command(self, worker_type: str, model_name: str = "") -> str:
         """Build worker command, resolving the provider once for direct callers."""
-        worker_type = _resolve_fable_worker_type(worker_type)
         handle = self._resolve_worker_client(worker_type)
         return self._get_worker_command_for_handle(
             worker_type, model_name, handle,
@@ -729,9 +733,7 @@ class OrchestratorTools:
             if executable is None:
                 raise NoCapabilityAvailable(
                     "worker",
-                    _WORKER_TYPE_TIER.get(
-                        _resolve_fable_worker_type(worker_type), worker_type,
-                    ),
+                    _WORKER_TYPE_TIER.get(worker_type, worker_type),
                     [machine_cfg.host],
                 )
             if executable == "~":
@@ -759,8 +761,13 @@ class OrchestratorTools:
                     "--dangerously-bypass-approvals-and-sandbox"
                 )
             else:
+                effort = (
+                    self._effort_for_tier(handle.effective_tier)
+                    if handle is not None
+                    else self._effort_for_model(model, "model", "")
+                )
                 cmd_parts.append(
-                    f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}"
+                    f"export CLAUDE_CODE_EFFORT_LEVEL={effort}"
                 )
                 cmd_parts.append(
                     f"exec {executable} --model {shlex.quote(model)} "
@@ -907,15 +914,15 @@ class OrchestratorTools:
         "CLAUDE_CODE_USE_VERTEX",
     )
 
-    def _grader_env(self) -> dict:
+    def _grader_env(self, effort: str | None = None) -> dict:
         """Env for the grader subprocess. Strips every provider/billing routing var
         (see _GRADER_ENV_STRIP) so grading always uses the Claude Max subscription and
         can never be misrouted to Ollama/Bedrock/Vertex or metered API billing. Pins
-        the reasoning-effort level."""
+        the reasoning-effort level (the resolved per-tier effort, else the global)."""
         env = dict(os.environ)
         for var in self._GRADER_ENV_STRIP:
             env.pop(var, None)
-        env["CLAUDE_CODE_EFFORT_LEVEL"] = self._effort_level
+        env["CLAUDE_CODE_EFFORT_LEVEL"] = effort if effort is not None else self._effort_level
         return env
 
     @staticmethod
@@ -1020,7 +1027,7 @@ class OrchestratorTools:
         _codex_grader_argv."""
         return dict(os.environ)
 
-    def _codex_grader_argv(self, schema_file: str, model: str) -> list:
+    def _codex_grader_argv(self, schema_file: str, model: str, effort: str | None = None) -> list:
         """``codex exec`` grader argv (validated by the codex-grader-exec live probe).
 
         --output-schema takes a FILE; --ephemeral (no session litter) and
@@ -1033,7 +1040,7 @@ class OrchestratorTools:
         )
         return [
             codex_path, "exec",
-            "-c", f'model_reasoning_effort="{self._effort_level}"',
+            "-c", f'model_reasoning_effort="{effort if effort is not None else self._effort_level}"',
             "--json", "--ephemeral", "--skip-git-repo-check",
             "--output-schema", schema_file, "-s", "read-only", "-m", model, "-",
         ]
@@ -1150,15 +1157,20 @@ class OrchestratorTools:
         try:
             tier = _semantic_tier(self._grader_model, "grader_model", "opus")
             self._ensure_role_capabilities("grader", tier)
+            if tier == "fable":
+                # Every provider has a fable peer plus an opus fallback.
+                self._ensure_role_capabilities("grader", "opus")
             router, _config, _state, _registry = self._provider_router()
             handle = router.resolve("grader", tier, ["local"])
             grader_client, grader_model = handle.client, handle.model
+            grader_effort = self._effort_for_tier(handle.effective_tier)
         except NoCapabilityAvailable as exc:
             logger.warning("No grader capability available: %s", exc)
             return self._grader_failure(batch, f"No grader capability available: {exc}")
         except ProviderConfigError:
             # No provider config -> legacy claude grader, byte-identical to pre-routing.
             grader_client, grader_model = "claude", self._grader_model
+            grader_effort = self._effort_for_tier(tier)
 
         try:
             construction_path = f"{grader_client}_grader"
@@ -1194,7 +1206,7 @@ class OrchestratorTools:
                             json.dump(schema, scf)
                             schema_file = scf.name
                         codex_proc = subprocess.run(
-                            self._codex_grader_argv(schema_file, grader_model),
+                            self._codex_grader_argv(schema_file, grader_model, grader_effort),
                             input=f"{profiled_system_prompt}\n\n{user_prompt}",
                             cwd=self._grader_home, env=self._codex_grader_env(),
                             capture_output=True, text=True, timeout=self.GRADER_TIMEOUT_SECONDS,
@@ -1227,7 +1239,7 @@ class OrchestratorTools:
                 # IRONCLAUDE_LLM_PATH: claude_grader
                 cmd = self._claude_grader_argv(schema, sysfile, grader_model)
                 proc = subprocess.run(
-                    cmd, input=user_prompt, cwd=self._grader_home, env=self._grader_env(),
+                    cmd, input=user_prompt, cwd=self._grader_home, env=self._grader_env(grader_effort),
                     capture_output=True, text=True, timeout=self.GRADER_TIMEOUT_SECONDS,
                 )
             except subprocess.TimeoutExpired:
@@ -5963,17 +5975,43 @@ Grading criteria:
         sample: last 200 chars of raw terminal output (backwards-compatible).
         summary: Ollama-generated 2-4 sentence description, or explicit ERROR string.
         """
-        # Check Ollama availability once before the session loop to avoid per-session
-        # timeout cascades when Ollama is down.
+        # Check backend availability once before the session loop to avoid
+        # per-session timeout cascades when the backend is down. The
+        # "summarization" spot may resolve to ollama (existing get_ps probe) or
+        # openai (a /v1/models reachability probe — get_ps is NOT invoked).
         ollama_available = False
         summarization_model = _DEFAULT_SUMMARIZATION_MODEL
+        summ_backend = "ollama"
+        summ_client = None
+        summ_max_tokens = None
         try:
-            client = self._get_ollama_client()
-            client.get_ps()
-            ollama_available = True
-            summarization_model = self._ollama_cfg_cache.get("summarization_model", _DEFAULT_SUMMARIZATION_MODEL)
-        except OllamaError as e:
-            logger.debug("Ollama unavailable for session summarization: %s", e)
+            with open(self._ollama_config_path) as _f:
+                _summ_cfg = json.load(_f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            _summ_cfg = {}
+        _summ_resolved = resolve_backend(_summ_cfg, "summarization")
+        summ_backend = _summ_resolved.backend
+        if summ_backend == "openai":
+            summ_max_tokens = _summ_resolved.max_tokens
+            try:
+                summ_client = make_client(
+                    _summ_resolved,
+                    timeout=_summ_resolved.timeout or 120,
+                )
+                summ_client.get_models()   # reachability probe (no get_ps)
+                ollama_available = True
+                summarization_model = _summ_resolved.model or _DEFAULT_SUMMARIZATION_MODEL
+            except OllamaError as e:
+                logger.debug("OpenAI backend unavailable for session summarization: %s", e)
+        else:
+            try:
+                client = self._get_ollama_client()
+                client.get_ps()
+                ollama_available = True
+                _summ_spot_model = ((_summ_cfg.get("spots") or {}).get("summarization") or {}).get("model")
+                summarization_model = _summ_spot_model or self._ollama_cfg_cache.get("summarization_model", _DEFAULT_SUMMARIZATION_MODEL)
+            except OllamaError as e:
+                logger.debug("Ollama unavailable for session summarization: %s", e)
 
         candidates = []
         for name in self.tmux.list_sessions(prefix=""):
@@ -6011,12 +6049,20 @@ Grading criteria:
                 try:
                     # IRONCLAUDE_LLM_PATH: session_summarizer
                     prompt = apply_communication_profile("session_summarizer", prompt)
-                    summary = self._get_ollama_client().post_generate({
-                        "model": summarization_model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {"num_predict": 200},
-                    })
+                    if summ_backend == "openai":
+                        summary = summ_client.post_generate({
+                            "model": summarization_model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": summ_max_tokens or 1024,
+                            "temperature": 0.1,
+                        })
+                    else:
+                        summary = self._get_ollama_client().post_generate({
+                            "model": summarization_model,
+                            "prompt": prompt,
+                            "stream": False,
+                            "options": {"num_predict": 200},
+                        })
                 except CommunicationProfileError as e:
                     summary = f"ERROR: communication-profile infrastructure error — {e}"
                 except OllamaError as e:
@@ -6111,7 +6157,7 @@ Grading criteria:
         if client == "claude":
             cmd = (
                 f"{env_prefix}"
-                f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_level}; "
+                f"export CLAUDE_CODE_EFFORT_LEVEL={self._effort_for_tier(_WORKER_TYPE_TIER.get(worker_type))}; "
                 f"exec claude --resume {shlex.quote(session_id)} "
                 f"--dangerously-skip-permissions"
             )
@@ -6516,69 +6562,6 @@ Has the worker genuinely completed its objective based on the evidence?
             "status_file": status_file,
         })
 
-    def game_launch(self, resolution: str = "1280x720") -> str:
-        """Launch GodotSteam with Artificial Adventures in windowed mode."""
-        godot_bin = os.environ.get("QE_LAUNCH_BIN", "")
-        game_path = os.environ.get("QE_LAUNCH_PATH", "")
-        if not godot_bin or not game_path:
-            return json.dumps({"error": "QE_LAUNCH_BIN and QE_LAUNCH_PATH environment variables are required"})
-        proc = subprocess.Popen(
-            [godot_bin, "--path", game_path, "--windowed", "--resolution", resolution],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        self._game_pid = proc.pid
-        for _ in range(30):
-            check = subprocess.run(["pgrep", "-f", "Godot"], capture_output=True)
-            if check.returncode == 0:
-                return json.dumps({"pid": self._game_pid, "status": "running"})
-            time.sleep(1)
-        return json.dumps({"error": "Godot failed to start within 30s"})
-
-    def game_screenshot(self) -> str:
-        """Take a screenshot of the game window. Returns file path to PNG."""
-        subprocess.run(
-            ["osascript", "-e",
-             'tell application "System Events" to tell process "Godot" to set frontmost to true'],
-            capture_output=True, timeout=5,
-        )
-        time.sleep(0.3)
-        timestamp = int(time.time() * 1000)
-        path = f"/tmp/game-screenshot-{timestamp}.png"
-        result = subprocess.run(
-            ["screencapture", "-x", path],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"screencapture failed: {result.stderr}")
-        subprocess.run(
-            ["sips", "--resampleWidth", "1280", "--resampleHeight", "720", path],
-            capture_output=True, timeout=10,
-        )
-        return json.dumps({"path": path})
-
-    def game_click(self, x: int, y: int) -> str:
-        """Click at screen coordinates (x, y) via cliclick."""
-        # capture_output keeps cliclick stdout off the stdio MCP JSON-RPC frame
-        result = subprocess.run(["cliclick", f"c:{x},{y}"], capture_output=True, timeout=10)
-        return json.dumps({"action": "click", "x": x, "y": y, "success": result.returncode == 0})
-
-    def game_type(self, text: str) -> str:
-        """Type text at current cursor position via cliclick."""
-        result = subprocess.run(["cliclick", f"t:{text}"], capture_output=True, timeout=10)
-        return json.dumps({"action": "type", "text": text, "success": result.returncode == 0})
-
-    def game_key(self, key: str) -> str:
-        """Press a key or key combination via cliclick. Examples: 'Return', 'Escape', 'space'."""
-        mapped = KEY_MAP.get(key, key.lower())
-        result = subprocess.run(["cliclick", f"kp:{mapped}"], capture_output=True, timeout=10)
-        return json.dumps({"action": "key", "key": key, "success": result.returncode == 0})
-
-    def game_kill(self) -> str:
-        """Kill the running Godot process."""
-        subprocess.run(["pkill", "-f", "Godot"], capture_output=True)
-        self._game_pid = None
-        return json.dumps({"status": "killed"})
-
     def _cleanup_zombie_mcp_processes(self) -> list[int]:
         """Find and kill orphaned MCP processes whose parent process is dead.
 
@@ -6905,7 +6888,7 @@ Does this message report a problem? If so, does it include an action already tak
         return posted_ts
 
 
-def _create_mcp_server(tools: OrchestratorTools):
+def _create_mcp_server(tools: OrchestratorTools, plugin_dirs: list[str] | None = None):
     """Create and configure the FastMCP server wrapping OrchestratorTools."""
     from mcp.server.fastmcp import FastMCP
 
@@ -7071,36 +7054,6 @@ def _create_mcp_server(tools: OrchestratorTools):
         The stdio pipe to Claude Code survives — os.execvp preserves open file descriptors.
         """
         return tools.restart_mcp()
-
-    @mcp.tool()
-    def game_launch(resolution: str = "1280x720") -> str:
-        """Launch GodotSteam with Artificial Adventures in windowed mode."""
-        return tools.game_launch(resolution)
-
-    @mcp.tool()
-    def game_screenshot() -> str:
-        """Take a screenshot of the game window. Returns JSON with file path to PNG."""
-        return tools.game_screenshot()
-
-    @mcp.tool()
-    def game_click(x: int, y: int) -> str:
-        """Click at screen coordinates (x, y) via cliclick."""
-        return tools.game_click(x, y)
-
-    @mcp.tool()
-    def game_type(text: str) -> str:
-        """Type text at current cursor position via cliclick."""
-        return tools.game_type(text)
-
-    @mcp.tool()
-    def game_key(key: str) -> str:
-        """Press a key or key combination via cliclick. Examples: 'Return', 'Escape', 'space', 'Up'."""
-        return tools.game_key(key)
-
-    @mcp.tool()
-    def game_kill() -> str:
-        """Kill the running Godot process."""
-        return tools.game_kill()
 
     @mcp.tool()
     def get_operator_messages(
@@ -7681,6 +7634,17 @@ def _create_mcp_server(tools: OrchestratorTools):
             return json.dumps(result)
         return result
 
+    # Let plugins contribute MCP tools onto this FastMCP server (game_*, etc.).
+    from ironclaude.plugins import PluginRegistry, discover_plugins
+
+    _plugin_registry = PluginRegistry()
+    discover_plugins(_plugin_registry, plugin_dirs)
+    for _provider in _plugin_registry.get_mcp_tool_providers():
+        try:
+            _provider(mcp, {"logger": logger})
+        except Exception:
+            logger.exception("MCP-tool provider registration failed")
+
     return mcp
 
 
@@ -7734,6 +7698,7 @@ def main():
         grader_model=cfg.get("grader_model", "claude-opus-4-8"),
         opus_model=cfg.get("default_opus_model", "claude-opus-4-8"),
         effort_level=cfg.get("effort_level", "high"),
+        effort_levels=cfg.get("effort_levels", {}),
         ssh_manager=ssh_manager,
         config=cfg,
         ollama_inventory=ollama_inv,

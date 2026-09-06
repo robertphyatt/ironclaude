@@ -21,6 +21,7 @@ class PluginRegistry:
         self._event_types: dict[str, Callable] = {}  # event_type -> handler
         self._lifecycle_hooks: dict[str, list[Callable]] = {"init": [], "shutdown": []}
         self._preprocessors: list[Callable] = []
+        self._mcp_tool_providers: list[Callable] = []
 
     def register_command(self, name: str, help_text: str, parser_fn: Callable, handler_fn: Callable):
         """Register a Slack command. parser_fn(text) -> dict|None, handler_fn(daemon, parsed)."""
@@ -41,6 +42,15 @@ class PluginRegistry:
     def register_preprocessor(self, preprocessor_fn: Callable):
         """Register an event preprocessor. preprocessor_fn(event, say, daemon) -> dict|None."""
         self._preprocessors.append(preprocessor_fn)
+
+    def register_mcp_tool_provider(self, provider_fn: Callable):
+        """Register an MCP-tool provider. provider_fn(mcp, context) adds @mcp.tool()s
+        onto the FastMCP server the MCP-server process passes in."""
+        self._mcp_tool_providers.append(provider_fn)
+
+    def get_mcp_tool_providers(self) -> list[Callable]:
+        """Return all registered MCP-tool providers (copy)."""
+        return list(self._mcp_tool_providers)
 
     def get_slash_commands(self) -> dict[str, str]:
         """Return {name: help_text} for all plugin commands."""

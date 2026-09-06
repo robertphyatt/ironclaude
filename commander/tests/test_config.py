@@ -244,6 +244,43 @@ class TestLoadConfig:
             cfg = load_config(str(config_file))
             assert cfg["effort_level"] == value
 
+    def test_defaults_include_effort_levels(self):
+        """effort_levels ships with a per-tier default overriding fable to medium."""
+        from ironclaude.config import DEFAULTS
+        assert DEFAULTS["effort_levels"] == {"fable": "medium"}
+
+    def test_effort_levels_drops_invalid_value_and_unknown_tier(self, tmp_path, monkeypatch):
+        """effort_levels keeps valid per-tier entries, drops bad values and unknown tiers."""
+        monkeypatch.delenv("EFFORT_LEVEL", raising=False)
+        config_file = tmp_path / "ironclaude.json"
+        config_file.write_text(json.dumps({
+            "effort_levels": {"fable": "medium", "opus": "bogus", "notatier": "low"},
+        }))
+        cfg = load_config(str(config_file))
+        assert cfg["effort_levels"] == {"fable": "medium"}
+
+
+class TestEffortForTier:
+    def test_tier_specific_override_wins(self):
+        from ironclaude.config import effort_for_tier
+        assert effort_for_tier("fable", "high", {"fable": "medium"}) == "medium"
+
+    def test_tier_without_override_falls_back_to_global(self):
+        from ironclaude.config import effort_for_tier
+        assert effort_for_tier("opus", "high", {"fable": "medium"}) == "high"
+
+    def test_empty_effort_levels_falls_back_to_global(self):
+        from ironclaude.config import effort_for_tier
+        assert effort_for_tier("opus", "high", {}) == "high"
+
+    def test_none_tier_falls_back_to_global(self):
+        from ironclaude.config import effort_for_tier
+        assert effort_for_tier(None, "high", {"fable": "medium"}) == "high"
+
+    def test_empty_string_tier_falls_back_to_global(self):
+        from ironclaude.config import effort_for_tier
+        assert effort_for_tier("", "high", {"fable": "medium"}) == "high"
+
 
 # ── machines.yaml tests ──────────────────────────────────────────────
 

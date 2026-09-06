@@ -17,10 +17,15 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 
-import { initDb } from './db.js';
+import { getSession, initDb } from './db.js';
 import { parseIronClaudeClient, resolveSessionIdentity } from './session-identity.js';
 import { dispatchTool } from './tool-dispatch.js';
 import { captureRuntimeFingerprint } from './runtime-fingerprint.js';
+import {
+  advisorReviewToolDefinition,
+  resolveTrustedCodexRequesterModel,
+  runCodexAdvisorReview,
+} from './tools/advisor-review.js';
 
 // Error sideband: write MCP tool errors to a file that hooks can surface
 const ERROR_LOG_PATH = path.join(os.homedir(), '.claude', 'ironclaude-errors.log');
@@ -114,6 +119,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       ...readToolDefinitions,
       ...writeToolDefinitions,
+      advisorReviewToolDefinition,
     ],
   };
 });
@@ -128,6 +134,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const identity = resolveSessionIdentity(client, request.params._meta, claudeSession);
     resolvedSessionId = identity.sessionId;
     const db = initDb();
+    if (name === advisorReviewToolDefinition.name) {
+      return await runCodexAdvisorReview(
+        (args ?? {}) as Record<string, unknown>,
+        identity,
+        getSession(db, identity.sessionId),
+        runtimeFingerprint,
+        { trustedRequesterModel: resolveTrustedCodexRequesterModel(request.params._meta) },
+      );
+    }
     return dispatchTool(name, (args ?? {}) as Record<string, unknown>, db, identity, runtimeFingerprint);
   } catch (error) {
     const errorMsg = handleError(error);

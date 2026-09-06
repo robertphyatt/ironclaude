@@ -67,11 +67,12 @@ class TestValidateBrainMessage:
 
 
 class TestDetectPromptWaiting:
-    def test_waiting_true_returned(self):
+    def test_boolean_only_waiting_is_inconclusive(self):
         daemon = _make_daemon()
         daemon._grader.grade.return_value = {"waiting": True}
-        result = daemon._detect_prompt_waiting("AskUserQuestion\nsome log output")
-        assert result is True
+        detection = daemon._detect_worker_prompt("AskUserQuestion\nsome log output")
+        assert detection.signal is None
+        assert detection.conclusive is False
 
     def test_waiting_false_returned(self):
         daemon = _make_daemon()
@@ -110,15 +111,15 @@ class TestDetectPromptWaiting:
         daemon._detect_prompt_waiting(log_tail)
         assert daemon._grader.grade.call_count == 1
 
-    def test_log_tail_truncated_to_2000_chars(self):
+    def test_log_tail_truncated_to_8192_chars(self):
         daemon = _make_daemon()
         daemon._grader.grade.return_value = {"waiting": False}
-        long_tail = "x" * 3000
+        long_tail = "discarded-prefix" + "x" * 9000
         daemon._detect_prompt_waiting(long_tail)
         call_args = daemon._grader.grade.call_args
         user_prompt = call_args[0][1]
-        assert "x" * 2001 not in user_prompt
-        assert len(user_prompt) <= 2020
+        assert user_prompt == "Worker terminal context:\n" + "x" * 8192
+        assert "discarded-prefix" not in user_prompt
 
 
 class TestSpawnWorkerClaudeFable:
@@ -434,6 +435,7 @@ def _make_poll_daemon():
     d.brain = MagicMock()
     d._operator_waits = {}
     d._operator_wait_alerted = {}
+    d._brain_waits = {}
     d.config = {}
     d._heartbeat_state_history = {}
     d._heartbeat_stuck_notified = set()
@@ -453,7 +455,7 @@ class TestOperatorWaits:
     def test_awaiting_operator_message_captures_and_alerts(self):
         d = _make_poll_daemon()
         d.brain.get_pending_responses.return_value = ["Still holding. Awaiting Robert's Slack response."]
-        d._grader.grade.return_value = {"awaiting_operator": True, "worker_id": "d1267", "question": "approve the migration?"}
+        d._grader.grade.return_value = {"waiting_on": "operator", "worker_id": "d1267", "question": "approve the migration?"}
         d.poll_brain_responses()
         assert "d1267" in d._operator_waits
         assert d._operator_waits["d1267"]["question"] == "approve the migration?"
@@ -580,7 +582,7 @@ class TestOperatorWaits:
     def test_awaiting_phrase_but_grader_says_no_falls_through(self):
         d = _make_poll_daemon()
         d.brain.get_pending_responses.return_value = ["#1267 done waiting for tests to finish, all green"]
-        d._grader.grade.return_value = {"awaiting_operator": False, "worker_id": None, "question": None}
+        d._grader.grade.return_value = {"waiting_on": "neither", "worker_id": None, "question": None}
         d.poll_brain_responses()
         assert d._operator_waits == {}
         # has a directive ref (#1267) so it validates+posts normally
@@ -596,7 +598,7 @@ class TestOperatorWaits:
         d.brain.get_pending_responses.return_value = [
             "#1362 heartbeat two-section labels shipped, waiting for the heartbeat labels to become idle"
         ]
-        d._grader.grade.return_value = {"awaiting_operator": False, "worker_id": None, "question": None}
+        d._grader.grade.return_value = {"waiting_on": "neither", "worker_id": None, "question": None}
         d.poll_brain_responses()
         assert d._operator_waits == {}
         assert "*Brain:*" in _posts(d)
@@ -656,7 +658,7 @@ class TestOperatorWaits:
 
     def test_alert_deduped_for_same_question(self):
         d = _make_poll_daemon()
-        d._grader.grade.return_value = {"awaiting_operator": True, "worker_id": "d1267", "question": "approve?"}
+        d._grader.grade.return_value = {"waiting_on": "operator", "worker_id": "d1267", "question": "approve?"}
         d.brain.get_pending_responses.return_value = ["holding, awaiting your decision"]
         d.poll_brain_responses()
         d.brain.get_pending_responses.return_value = ["still holding, awaiting your decision"]
@@ -727,7 +729,7 @@ class TestOperatorWaits:
 
     def test_not_awaiting_fast_path_does_not_exclude_genuine_operator_wait(self):
         d = _make_poll_daemon()
-        d._grader.grade.return_value = {"awaiting_operator": True, "worker_id": "d1267", "question": "approve the migration?"}
+        d._grader.grade.return_value = {"waiting_on": "operator", "worker_id": "d1267", "question": "approve the migration?"}
         d.brain.get_pending_responses.return_value = ["holding for your approval on the migration"]
         d.poll_brain_responses()
         assert "d1267" in d._operator_waits

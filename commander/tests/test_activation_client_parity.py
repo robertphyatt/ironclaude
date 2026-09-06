@@ -91,13 +91,20 @@ CANONICAL_CLAUDE_SEARCH_BODY = """6. **Search Before Guessing**
 
 CANONICAL_CODEX_ADVISOR_BODY = """9. **Advisor Fallback (advisor unavailable ≠ skip the advisor)**
    - Fire the advisor at natural discretionary points: before substantive work, when stuck, and before declaring done
-   - Invoke a one-tier-up report-only reviewer with `codex exec -m <one-tier-up-model>` using `luna → terra → sol`; at the `sol` ceiling, run a same-tier blind `sol` pass
+   - Call `run_codex_advisor_review` with the complete inline review packet, current `requester_model`, and `review_tier: \"one-up\"`; omission remains compatibility-only. The broker rejects any mismatch with provider-authenticated Codex turn metadata and applies its fixed `luna → terra → sol → astra` mapping (`gpt-5.6-luna → gpt-5.6-terra → gpt-5.6-sol → gpt-6-astra`) exactly once.
+   - Never run nested `codex exec` for normal advisor work or repeat an operator approval request for this brokered read-only review
    - Reconcile the review with evidence; never proceed unreviewed because an advisor command is unavailable"""
+
+CANONICAL_CODEX_FABLE_BODY = """13. **Actual Claude Fable from Codex**
+   - When a Codex user explicitly requests an actual Claude Fable subagent, load and follow `ironclaude:use-fable-subagent`
+   - Native Codex subagents cannot satisfy an actual-Fable request; do not substitute Codex, Astra, Opus, Sonnet, or Haiku
+   - Keep orchestration, workflow-state changes, staging, commits, and task sequencing in the parent Codex session
+   - Accept the report only after the launcher verifies effective Fable identity; independently verify material findings against repository evidence"""
 
 CANONICAL_CLAUDE_ADVISOR_BODY = """9. **Advisor Fallback**
    - When the `advisor` tool returns unavailable, do NOT skip the advisor step or just reason it through yourself
    - Spawn a top-tier subagent via the `Agent` tool (`model=fable` if Fable is available, else `model=opus`) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
-   - Client-aware: that is the Claude path; a Codex session has no `Agent` tool, so it invokes a one-tier-up `codex exec -m <one-up>` review instead (`luna→terra→sol`, `sol` ceiling = same-tier blind) — see the `ironclaude:advisor-fallback` skill
+   - Client-aware: that is the Claude path; a Codex session calls `run_codex_advisor_review` with a complete inline packet, its current `requester_model`, and `review_tier: \"one-up\"` (omission is compatibility-only); the broker rejects any mismatch with provider-authenticated Codex turn metadata and owns the one-time `luna→terra→sol→astra` mapping (`gpt-5.6-luna→gpt-5.6-terra→gpt-5.6-sol→gpt-6-astra`) — see the `ironclaude:advisor-fallback` skill
    - Weight its findings as you would the advisor's; "no advisor" means "use a subagent for the same effect," never "proceed unreviewed\""""
 
 
@@ -280,6 +287,8 @@ def test_activation_contains_full_independent_canonical_bodies():
     assert CANONICAL_CLAUDE_SEARCH_BODY in claude
     assert CANONICAL_CODEX_ADVISOR_BODY in codex
     assert CANONICAL_CLAUDE_ADVISOR_BODY in claude
+    assert CANONICAL_CODEX_FABLE_BODY in codex
+    assert "Actual Claude Fable from Codex" not in claude
 
 
 def test_activation_binds_state_checks_to_exact_root_session():
@@ -379,8 +388,12 @@ def test_activation_uses_provider_native_state_manager_names_and_advisors():
     assert "mcp__plugin_ironclaude_state-manager__set_professional_mode" in text
     assert "Codex `state-manager` `get_professional_mode`" in text
     assert "Codex `state-manager` `set_professional_mode`" in text
-    assert "`codex exec -m <one-tier-up-model>`" in codex
-    assert "`luna → terra → sol`" in codex
+    assert "`run_codex_advisor_review`" in codex
+    assert "`requester_model`" in codex
+    assert 'review_tier: "one-up"' in codex
+    assert "`luna → terra → sol → astra`" in codex
+    assert "`gpt-5.6-luna → gpt-5.6-terra → gpt-5.6-sol → gpt-6-astra`" in codex
+    assert "nested `codex exec`" in codex
     assert "`Agent` tool" in claude
     assert "`model=fable`" in claude
     assert "`model=opus`" in claude
@@ -421,6 +434,7 @@ CONCEPT_NAMES = (
     "No Workflow Avoidance Under Stage/Context Restrictions",
     "Boy Scout Rule",
     "Recipient-Based Communication Profiles",
+    "Actual Claude Fable from Codex",
 )
 
 
@@ -432,7 +446,7 @@ def test_activation_source_requires_exact_verify_only_diagnostics():
     assert all(f"- {concept}" in contract for concept in CONCEPT_NAMES)
     assert "enumerated name set must equal the uncovered concept set exactly" in contract
     assert "Do not\nsubstitute a numeric range" in contract
-    assert "concepts 1–12" in contract
+    assert "concepts 1–13" in contract
     assert "behavioral concepts" in contract
 
 

@@ -9,6 +9,7 @@ def _make_daemon():
     daemon._grader = MagicMock()
     daemon._operator_wait_alerted = {}
     daemon._operator_waits = {}
+    daemon._brain_waits = {}
     daemon._last_brain_context = None
     daemon.config = {"operator_name": "Robert"}
     daemon.slack = MagicMock()
@@ -17,7 +18,7 @@ def _make_daemon():
 
 def _grade_awaiting(worker_id="d1267", question="Should I use approach A or B?"):
     return {
-        "awaiting_operator": True,
+        "waiting_on": "operator",
         "worker_id": worker_id,
         "question": question,
     }
@@ -124,3 +125,35 @@ class TestPostBrainMessageTracksLastTs:
 
         assert result is None
         assert daemon._last_brain_context == ("old-ts", "Decision context for d1267")
+
+
+def _grade_brain(worker_id="d5", question="Waiting for approval of the execution mode menu"):
+    return {"waiting_on": "brain", "worker_id": worker_id, "question": question}
+
+
+class TestBrainWaitRouting:
+    def test_brain_wait_routes_to_brain_waits_no_alert(self):
+        daemon = _make_daemon()
+        daemon._grader.grade.return_value = _grade_brain()
+        captured = daemon._maybe_capture_operator_wait("Still holding, waiting for approval of the execution mode menu")
+        assert captured is True
+        assert "d5" in daemon._brain_waits
+        assert daemon._brain_waits["d5"]["question"] == "Waiting for approval of the execution mode menu"
+        assert daemon._operator_waits == {}
+        daemon.slack.post_message.assert_not_called()
+
+    def test_operator_wait_still_routes_to_operator_waits(self):
+        daemon = _make_daemon()
+        daemon._grader.grade.return_value = {"waiting_on": "operator", "worker_id": "d1267", "question": "A or B?"}
+        captured = daemon._maybe_capture_operator_wait("Still holding, awaiting your decision")
+        assert captured is True
+        assert "d1267" in daemon._operator_waits
+        assert daemon._brain_waits == {}
+
+    def test_neither_captures_nothing(self):
+        daemon = _make_daemon()
+        daemon._grader.grade.return_value = {"waiting_on": "neither", "worker_id": None, "question": None}
+        captured = daemon._maybe_capture_operator_wait("holding until the build finishes")
+        assert captured is False
+        assert daemon._operator_waits == {}
+        assert daemon._brain_waits == {}

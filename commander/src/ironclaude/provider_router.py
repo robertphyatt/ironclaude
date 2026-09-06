@@ -52,12 +52,10 @@ class ProviderRouter:
             current = role_config.preferred
         other_clients = [c for c in role_config.clients if c != current]
 
-        if tier == "fable" and current == "claude":
-            attempts = [("claude", "fable"), ("claude", "opus")]
-            attempts.extend((client, "opus") for client in other_clients)
-        elif tier == "fable":
-            attempts = [(current, "opus")]
-            attempts.extend((client, "opus") for client in other_clients)
+        if tier == "fable":
+            attempts = [(current, "fable"), (current, "opus")]
+            for client in other_clients:
+                attempts.extend(((client, "fable"), (client, "opus")))
         else:
             attempts = [(current, tier)]
             attempts.extend((client, tier) for client in other_clients)

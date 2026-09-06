@@ -293,6 +293,7 @@ def base_config():
                         "haiku": "gpt-5.6-luna",
                         "sonnet": "gpt-5.6-terra",
                         "opus": "gpt-5.6-sol",
+                        "fable": "gpt-6-astra",
                     },
                 },
             },

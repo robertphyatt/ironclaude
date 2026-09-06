@@ -226,10 +226,15 @@ its exact name from this list:
 - No Workflow Avoidance Under Stage/Context Restrictions
 - Boy Scout Rule
 - Recipient-Based Communication Profiles
+- Actual Claude Fable from Codex
 
 The enumerated name set must equal the uncovered concept set exactly. Do not
-substitute a numeric range, a count, “concepts 1–12,” “behavioral concepts,” or
+substitute a numeric range, a count, “concepts 1–13,” “behavioral concepts,” or
 another generic summary for the names. Do not list a covered concept.
+
+`Actual Claude Fable from Codex` applies only to Codex instruction surfaces.
+Claude surfaces require the preceding twelve concepts and must not be reported
+incomplete for lacking this Codex-only concept.
 
 Preserve all unrelated project guidance and append only genuinely missing
 concepts. In `verify-only` mode, list every exact uncovered concept, write nothing, and do not call `set_professional_mode`.
@@ -244,7 +249,7 @@ Call `<READ_INSTRUCTION_FILE>` for root `AGENTS.md` to perform its existence che
 
 - In `update` mode, if it is absent, create it only through the exact write
   operation below.
-- If it exists, semantically check the workflow requirement and all twelve
+- If it exists, semantically check the workflow requirement and all thirteen
   concepts across the whole file. Do not require matching headings or wording.
 - When classification is uncertain, treat the concept as uncovered.
 - In `update` mode, compute a full result that appends only missing canonical
@@ -308,7 +313,8 @@ Call `<WRITE_INSTRUCTION_FILE>` for root `AGENTS.md` with the complete canonical
 
 9. **Advisor Fallback (advisor unavailable ≠ skip the advisor)**
    - Fire the advisor at natural discretionary points: before substantive work, when stuck, and before declaring done
-   - Invoke a one-tier-up report-only reviewer with `codex exec -m <one-tier-up-model>` using `luna → terra → sol`; at the `sol` ceiling, run a same-tier blind `sol` pass
+   - Call `run_codex_advisor_review` with the complete inline review packet, current `requester_model`, and `review_tier: "one-up"`; omission remains compatibility-only. The broker rejects any mismatch with provider-authenticated Codex turn metadata and applies its fixed `luna → terra → sol → astra` mapping (`gpt-5.6-luna → gpt-5.6-terra → gpt-5.6-sol → gpt-6-astra`) exactly once.
+   - Never run nested `codex exec` for normal advisor work or repeat an operator approval request for this brokered read-only review
    - Reconcile the review with evidence; never proceed unreviewed because an advisor command is unavailable
 
 10. **No Workflow Avoidance Under Stage/Context Restrictions**
@@ -327,17 +333,25 @@ Call `<WRITE_INSTRUCTION_FILE>` for root `AGENTS.md` with the complete canonical
    - Before first substantive human-facing response, load and apply `ironclaude:elements-of-style`
    - For AI-directed natural language, load and apply `ironclaude:write-lossless-ai-messages`
    - Select by destination, not model; preserve machine schemas and protected technical content exactly
+
+13. **Actual Claude Fable from Codex**
+   - When a Codex user explicitly requests an actual Claude Fable subagent, load and follow `ironclaude:use-fable-subagent`
+   - Native Codex subagents cannot satisfy an actual-Fable request; do not substitute Codex, Astra, Opus, Sonnet, or Haiku
+   - Keep orchestration, workflow-state changes, staging, commits, and task sequencing in the parent Codex session
+   - Accept the report only after the launcher verifies effective Fable identity; independently verify material findings against repository evidence
 ```
 
-For an existing file, use the same twelve-concept semantic meanings as the
-Claude table below, except Advisor Fallback is covered only by a Codex-native
-one-tier-up `codex exec` review. Append the corresponding complete body from
-the canonical Codex template above for any missing concept.
+For an existing file, use the same first twelve semantic meanings as the Claude
+table below, except Advisor Fallback is covered only by the Codex-native
+`run_codex_advisor_review` broker. Concept 13 is covered only by affirmative
+actual-Fable routing, no-substitution, parent-authority, effective-identity, and
+independent-verification semantics. Append the corresponding complete body
+from the canonical Codex template above for any missing concept.
 
 Call `<WRITE_INSTRUCTION_FILE>` for root `AGENTS.md` with the full computed result after any append or prepend.
 
 Call `<READ_INSTRUCTION_FILE>` for root `AGENTS.md` as the read-back gate.
-Verify the workflow requirement and all twelve concepts from that returned
+Verify the workflow requirement and all thirteen concepts from that returned
 content.
 
 #### Claude Code: `CLAUDE.md` and `.claude/rules/behavioral.md`
@@ -432,7 +446,7 @@ Call `<WRITE_INSTRUCTION_FILE>` for `.claude/rules/behavioral.md` with the compl
 9. **Advisor Fallback**
    - When the `advisor` tool returns unavailable, do NOT skip the advisor step or just reason it through yourself
    - Spawn a top-tier subagent via the `Agent` tool (`model=fable` if Fable is available, else `model=opus`) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
-   - Client-aware: that is the Claude path; a Codex session has no `Agent` tool, so it invokes a one-tier-up `codex exec -m <one-up>` review instead (`luna→terra→sol`, `sol` ceiling = same-tier blind) — see the `ironclaude:advisor-fallback` skill
+   - Client-aware: that is the Claude path; a Codex session calls `run_codex_advisor_review` with a complete inline packet, its current `requester_model`, and `review_tier: "one-up"` (omission is compatibility-only); the broker rejects any mismatch with provider-authenticated Codex turn metadata and owns the one-time `luna→terra→sol→astra` mapping (`gpt-5.6-luna→gpt-5.6-terra→gpt-5.6-sol→gpt-6-astra`) — see the `ironclaude:advisor-fallback` skill
    - Weight its findings as you would the advisor's; "no advisor" means "use a subagent for the same effect," never "proceed unreviewed"
 
 10. **No Workflow Avoidance Under Stage/Context Restrictions**
@@ -490,7 +504,7 @@ Concept 9 (Advisor Fallback):
 N. **Advisor Fallback**
    - When the `advisor` tool returns unavailable, do NOT skip the advisor step or just reason it through yourself
    - Spawn a top-tier subagent via the `Agent` tool (`model=fable` if Fable is available, else `model=opus`) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
-   - Client-aware: that is the Claude path; a Codex session has no `Agent` tool, so it invokes a one-tier-up `codex exec -m <one-up>` review instead (`luna→terra→sol`, `sol` ceiling = same-tier blind) — see the `ironclaude:advisor-fallback` skill
+   - Client-aware: that is the Claude path; a Codex session calls `run_codex_advisor_review` with a complete inline packet, its current `requester_model`, and `review_tier: "one-up"` (omission is compatibility-only); the broker rejects any mismatch with provider-authenticated Codex turn metadata and owns the one-time `luna→terra→sol→astra` mapping (`gpt-5.6-luna→gpt-5.6-terra→gpt-5.6-sol→gpt-6-astra`) — see the `ironclaude:advisor-fallback` skill
    - Weight its findings as you would the advisor's; "no advisor" means "use a subagent for the same effect," never "proceed unreviewed"
 ```
 
@@ -527,15 +541,16 @@ The full rule set has 12 concepts. New projects receive the compact index plus
 full rules `(12 principles)`. Existing projects use the same 12-principle template as the canonical source.
 
 Call `<READ_INSTRUCTION_FILE>` for each existing Claude-owned instruction file as the read-back gate.
-Verify the workflow requirement and all twelve concepts from the returned
-content.
+Verify the workflow requirement and all concepts required for the active
+client from returned content: thirteen for Codex, twelve for Claude.
 
 **Read-back verification gate**
 
 Use the active branch's exact `<READ_INSTRUCTION_FILE>` read-back operation
 after all setup edits.
-Confirm the workflow requirement and all twelve concepts are semantically
-covered. Confirm no inactive-client surface was written during this activation.
+Confirm the workflow requirement and all concepts required for the active
+client are semantically covered: thirteen for Codex, twelve for Claude. Confirm
+no inactive-client surface was written during this activation.
 
 Do not continue after a required-surface write or verification failure. Report
 the exact target, operation, and missing concept or tool error. Leave professional mode in its prior state. Do not call `set_professional_mode` after any setup failure.

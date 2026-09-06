@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import collections
+from dataclasses import dataclass
 import logging
 import os
 import re
@@ -21,18 +22,68 @@ _SPINNER_RE = re.compile(r'^\s*[^\w\s]{0,3}\w[\w\s]{0,28}\u2026\s*$', re.MULTILI
 _MENU_FOOTER_RE = re.compile(r'Enter to select|\u2191/\u2193 to navigate', re.MULTILINE)
 _MENU_OPTION_RE = re.compile(r'([\u276f\s])\s*(\d+)\.\s+(.+)')
 _FREE_TEXT_RE = re.compile(r'(?i)^(other|type\s+something)')
+_MENU_HEADER_RE = re.compile(r'^\s*[☐☑]\s+')
+_DIVIDER_RE = re.compile(r'^\s*[─━═_-]{3,}\s*$', re.MULTILINE)
+_PROMPT_CHROME_RE = re.compile(
+    r'^(?:\s*|\s*[❯>$]\s*.*|\s*[─━═_-]{3,}\s*|'
+    r'\s*(?:Claude Code|ironclaude)\b.*|\s*/goal\b.*|'
+    r'\s*(?:context\s+left\b.*|context\s*[:|].*|'
+    r'professional mode\s*[:|].*|status\s*[:|].*)|'
+    r'\s*(?:esc to interrupt|shift\+tab to cycle mode|⏵⏵).*)$',
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class PromptSignal:
+    """Validated semantic identity for one current unresolved interaction."""
+
+    kind: str
+    question: str
+    options: tuple[tuple[str, str], ...]
+    authority_text: str
+    source_spans: tuple[tuple[str, int, int], ...]
+    evidence: str
+
+
+def _no_menu_result() -> dict:
+    return {
+        "detected": False,
+        "options": [],
+        "free_text_option": None,
+        "current_selection": None,
+        "question": None,
+        "source_spans": [],
+        "signal": None,
+    }
 
 
 def detect_ask_user_menu(pane_text: str) -> dict:
     """Detect an AskUserQuestion menu in capture_pane output."""
-    if not _MENU_FOOTER_RE.search(pane_text):
-        return {"detected": False, "options": [], "free_text_option": None, "current_selection": None}
+    cleaned = _strip_ansi(pane_text)
+    footers = list(_MENU_FOOTER_RE.finditer(cleaned))
+    if not footers:
+        return _no_menu_result()
+    footer = footers[-1]
+    footer_line_start = cleaned.rfind("\n", 0, footer.start()) + 1
+    footer_line_end = cleaned.find("\n", footer.end())
+    if footer_line_end < 0:
+        footer_line_end = len(cleaned)
+    if not _suffix_is_prompt_chrome(cleaned[footer_line_end:]):
+        return _no_menu_result()
+    preceding_dividers = list(_DIVIDER_RE.finditer(cleaned[:footer.start()]))
+    prior_footer_lines = [item for item in footers[:-1] if item.end() <= footer_line_start]
+    block_start = preceding_dividers[-1].start() if preceding_dividers else (
+        prior_footer_lines[-1].end() if prior_footer_lines else 0
+    )
+    menu_block = cleaned[block_start:footer_line_end]
 
     options = []
     current_selection = None
     free_text_option = None
 
-    for match in _MENU_OPTION_RE.finditer(pane_text):
+    matches = list(_MENU_OPTION_RE.finditer(menu_block))
+    for match in matches:
         cursor_char, num_str, label = match.group(1), match.group(2), match.group(3).strip()
         num = int(num_str)
         options.append((num, label))
@@ -42,13 +93,48 @@ def detect_ask_user_menu(pane_text: str) -> dict:
             free_text_option = num
 
     if not options:
-        return {"detected": False, "options": [], "free_text_option": None, "current_selection": None}
+        return _no_menu_result()
+
+    option_start = matches[0].start()
+    question = None
+    question_span = None
+    cursor = 0
+    for line in menu_block[:option_start].splitlines(keepends=True):
+        text = line.strip()
+        if text and not _DIVIDER_RE.match(text) and not _MENU_HEADER_RE.match(text):
+            start = block_start + cursor + line.index(text)
+            question = text
+            question_span = ("question", start, start + len(text))
+        cursor += len(line)
+    if not question or question_span is None:
+        return _no_menu_result()
+
+    spans = [question_span]
+    semantic_options = []
+    for match, (number, label) in zip(matches, options):
+        value_start = block_start + match.start(2)
+        label_start = block_start + match.start(3)
+        spans.append((f"option-value:{number}", value_start, value_start + len(str(number))))
+        spans.append((f"option-label:{number}", label_start, label_start + len(label)))
+        semantic_options.append((str(number), label))
+
+    signal = PromptSignal(
+        kind="menu",
+        question=question,
+        options=tuple(semantic_options),
+        authority_text="",
+        source_spans=tuple(spans),
+        evidence=cleaned.strip()[-8192:],
+    )
 
     return {
         "detected": True,
         "options": options,
         "free_text_option": free_text_option,
         "current_selection": current_selection,
+        "question": question,
+        "source_spans": spans,
+        "signal": signal,
     }
 
 
@@ -58,6 +144,123 @@ def _strip_ansi(text: str) -> str:
     cleaned = _SPINNER_RE.sub('', cleaned)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned
+
+
+def _parse_candidate_options(raw_options) -> tuple[tuple[str, str], ...] | None:
+    if raw_options in (None, []):
+        return ()
+    if not isinstance(raw_options, list) or len(raw_options) > 16:
+        return None
+    parsed = []
+    for item in raw_options:
+        if not isinstance(item, dict):
+            return None
+        value = item.get("value")
+        label = item.get("label")
+        if not isinstance(value, str) or not isinstance(label, str):
+            return None
+        value = value.strip()
+        label = label.strip()
+        if not value or not label or len(value) > 128 or len(label) > 512:
+            return None
+        parsed.append((value, label))
+    return tuple(parsed)
+
+
+def _suffix_is_prompt_chrome(suffix: str) -> bool:
+    return all(_PROMPT_CHROME_RE.fullmatch(line) for line in suffix.splitlines())
+
+
+def validate_prompt_candidate(
+    pane_text: str,
+    candidate: dict,
+    *,
+    capture_truncated: bool = False,
+) -> PromptSignal | None:
+    """Validate a grader candidate against the current final interaction block.
+
+    Exact occurrence establishes provenance. Requiring one final block with only
+    prompt chrome after it establishes currentness; pane history cannot qualify.
+    """
+    if not isinstance(candidate, dict):
+        return None
+    kind = candidate.get("kind")
+    question = candidate.get("question")
+    interaction_block = candidate.get("interaction_block")
+    authority_text = candidate.get("authority_text", "")
+    if kind not in {"question", "approval", "authority"}:
+        return None
+    if not isinstance(question, str) or not isinstance(interaction_block, str):
+        return None
+    if not isinstance(authority_text, str):
+        return None
+    question = question.strip()
+    interaction_block = interaction_block.strip()
+    authority_text = authority_text.strip()
+    if (
+        not question
+        or not interaction_block
+        or len(question) > 2048
+        or len(interaction_block) > 4096
+        or len(authority_text) > 2048
+    ):
+        return None
+    options = _parse_candidate_options(candidate.get("options", []))
+    if options is None:
+        return None
+
+    cleaned = _strip_ansi(pane_text)
+    starts = [match.start() for match in re.finditer(re.escape(interaction_block), cleaned)]
+    if len(starts) != 1:
+        return None
+    block_start = starts[0]
+    block_end = block_start + len(interaction_block)
+    if capture_truncated and block_start == 0:
+        return None
+    line_start = cleaned.rfind("\n", 0, block_start) + 1
+    if cleaned[line_start:block_start].strip():
+        return None
+    if not _suffix_is_prompt_chrome(cleaned[block_end:]):
+        return None
+
+    fields = [("question", question)]
+    if authority_text:
+        fields.append(("authority", authority_text))
+    spans = []
+    for name, value in fields:
+        relative = [
+            match.start()
+            for match in re.finditer(re.escape(value), interaction_block)
+        ]
+        if len(relative) != 1:
+            return None
+        start = block_start + relative[0]
+        spans.append((name, start, start + len(value)))
+
+    last_option_span = -1
+    for value, label in options:
+        pair_re = re.compile(
+            rf"(?P<value>{re.escape(value)})[\s.)\]:=\-]{{1,16}}"
+            rf"(?P<label>{re.escape(label)})"
+        )
+        pair_matches = list(pair_re.finditer(interaction_block))
+        if len(pair_matches) != 1 or pair_matches[0].start() <= last_option_span:
+            return None
+        pair = pair_matches[0]
+        value_start = block_start + pair.start("value")
+        label_start = block_start + pair.start("label")
+        spans.append((f"option-value:{value}", value_start, value_start + len(value)))
+        spans.append((f"option-label:{value}", label_start, label_start + len(label)))
+        last_option_span = pair.start()
+
+    return PromptSignal(
+        kind=kind,
+        question=question,
+        options=options,
+        authority_text=authority_text,
+        source_spans=tuple(spans),
+        evidence=cleaned.strip()[-8192:],
+    )
 
 
 class TmuxManager:

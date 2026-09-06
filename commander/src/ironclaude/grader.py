@@ -16,6 +16,7 @@ from ironclaude.communication_profiles import (
     CommunicationProfileError,
     apply_communication_profile,
 )
+from ironclaude.backend_resolver import make_client, resolve_backend
 from ironclaude.ollama_client import OllamaClient, OllamaError
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,13 @@ class LocalGrader:
         self._timeout_override = timeout
         self._keep_alive = keep_alive     # message-path graders set "30m"; grader path leaves None
         self._client_mtime: float | None = None
+        # Resolved backend for the "grader" spot. Defaults to ollama so a cached
+        # client injected by tests (which never triggers a rebuild) keeps the
+        # ollama payload path.
+        self._backend: str = "ollama"
+        self._openai_model: str | None = None
+        self._openai_max_tokens: int | None = None
+        self._spot_model: str | None = None
 
     @staticmethod
     def _build_infrastructure_error(detail: str) -> dict:
@@ -64,14 +72,30 @@ class LocalGrader:
             except (FileNotFoundError, json.JSONDecodeError) as e:
                 logger.warning("Ollama config unavailable (%s): using localhost defaults", e)
                 cfg = {}
-            ollama_cfg = cfg.get("ollama", {})
-            self._cfg = ollama_cfg
-            self._client = OllamaClient(
-                url=ollama_cfg.get("url", "http://localhost:11434"),
-                fallback_url=ollama_cfg.get("fallback_url"),
-                timeout=self._timeout_override if self._timeout_override is not None
-                        else cfg.get("timeout_seconds", 120),
+            resolved = resolve_backend(cfg, "grader")
+            self._spot_model = ((cfg.get("spots") or {}).get("grader") or {}).get("model")
+            timeout = (
+                self._timeout_override if self._timeout_override is not None
+                else (resolved.timeout if resolved.timeout is not None else 120)
             )
+            if resolved.backend == "openai":
+                self._backend = "openai"
+                self._openai_model = resolved.model
+                self._openai_max_tokens = resolved.max_tokens
+                self._cfg = cfg.get("openai", {})
+                self._client = make_client(resolved, timeout=timeout)
+            else:
+                # Ollama path — construct OllamaClient directly (by name) so the
+                # existing test seams that patch `grader.OllamaClient` and inject
+                # `self._cfg` stay intact.
+                self._backend = "ollama"
+                ollama_cfg = cfg.get("ollama", {})
+                self._cfg = ollama_cfg
+                self._client = OllamaClient(
+                    url=ollama_cfg.get("url", "http://localhost:11434"),
+                    fallback_url=ollama_cfg.get("fallback_url"),
+                    timeout=timeout,
+                )
             self._client_mtime = mtime
         return self._client
 
@@ -89,18 +113,37 @@ class LocalGrader:
         except CommunicationProfileError as exc:
             return self._build_infrastructure_error(str(exc))
 
-        client = self._get_client()
-        model = self._cfg.get("model", _DEFAULT_MODEL)
-        payload: dict = {
-            "model": model,
-            "prompt": f"{profiled_system_prompt}\n\n{user_prompt}",
-            "stream": False,
-            "options": {"temperature": 0.1, "num_predict": -1},
-        }
-        if self._keep_alive is not None:
-            payload["keep_alive"] = self._keep_alive
-        if schema is not None:
-            payload["format"] = schema
+        try:
+            client = self._get_client()
+        except OllamaError as e:
+            return self._build_infrastructure_error(str(e))
+        if self._backend == "openai":
+            model = self._openai_model or _DEFAULT_MODEL
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "user", "content": f"{profiled_system_prompt}\n\n{user_prompt}"}
+                ],
+                "max_tokens": self._openai_max_tokens or 1024,
+                "temperature": 0.1,
+            }
+            if schema is not None:
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {"name": "verdict", "schema": schema},
+                }
+        else:
+            model = self._spot_model or self._cfg.get("model", _DEFAULT_MODEL)
+            payload = {
+                "model": model,
+                "prompt": f"{profiled_system_prompt}\n\n{user_prompt}",
+                "stream": False,
+                "options": {"temperature": 0.1, "num_predict": -1},
+            }
+            if self._keep_alive is not None:
+                payload["keep_alive"] = self._keep_alive
+            if schema is not None:
+                payload["format"] = schema
 
         try:
             result_text = client.post_generate(payload)

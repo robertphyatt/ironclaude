@@ -60,35 +60,9 @@ else
 fi
 echo ""
 
-# 5. Write QE tool paths to ironclaude's commander/.env
-echo "Writing QE tool paths to commander/.env..."
-TRON_MCP="${2:-$HOME/Code/claude-tron/commander/src/tron/orchestrator_mcp.py}"
-IC_ENV="$IRONCLAUDE_DIR/commander/.env"
-
-if [ -f "$TRON_MCP" ]; then
-  DETECTED_LAUNCH_BIN=$(grep -m1 'godot_bin\s*=' "$TRON_MCP" | grep -o '"[^"]*"' | tr -d '"')
-  DETECTED_LAUNCH_PATH=$(grep -m1 'game_path\s*=' "$TRON_MCP" | grep -o '"[^"]*"' | tr -d '"')
-
-  if [ -n "$DETECTED_LAUNCH_BIN" ] && [ -n "$DETECTED_LAUNCH_PATH" ]; then
-    if grep -q "QE_LAUNCH_BIN" "$IC_ENV" 2>/dev/null; then
-      echo "  - QE tool paths already present in $IC_ENV, skipped"
-    else
-      printf '\n# QE Tools\nQE_LAUNCH_BIN=%s\nQE_LAUNCH_PATH=%s\n' \
-        "$DETECTED_LAUNCH_BIN" "$DETECTED_LAUNCH_PATH" >> "$IC_ENV"
-      echo "  ✓ QE tool paths written to $IC_ENV"
-    fi
-  else
-    echo "  - Could not detect QE tool paths from tron source, skipped"
-  fi
-else
-  echo "  - Tron orchestrator not found at $TRON_MCP, skipped"
-fi
-echo ""
-
 echo "=== Migration complete ==="
 echo ""
 echo "Verify with:"
 echo "  sqlite3 $IC_DB .tables"
 echo "  ls -la ~/.ironclaude/brain/"
 echo "  ls -la ~/.ironclaude/grader/"
-echo "  grep QE_LAUNCH_BIN $IRONCLAUDE_DIR/commander/.env"

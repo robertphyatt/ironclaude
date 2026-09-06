@@ -406,11 +406,11 @@ var require_codegen = __commonJS({
         const rhs = this.rhs === void 0 ? "" : ` = ${this.rhs}`;
         return `${varKind} ${this.name}${rhs};` + _n;
       }
-      optimizeNames(names, constants) {
+      optimizeNames(names, constants2) {
         if (!names[this.name.str])
           return;
         if (this.rhs)
-          this.rhs = optimizeExpr(this.rhs, names, constants);
+          this.rhs = optimizeExpr(this.rhs, names, constants2);
         return this;
       }
       get names() {
@@ -427,10 +427,10 @@ var require_codegen = __commonJS({
       render({ _n }) {
         return `${this.lhs} = ${this.rhs};` + _n;
       }
-      optimizeNames(names, constants) {
+      optimizeNames(names, constants2) {
         if (this.lhs instanceof code_1.Name && !names[this.lhs.str] && !this.sideEffects)
           return;
-        this.rhs = optimizeExpr(this.rhs, names, constants);
+        this.rhs = optimizeExpr(this.rhs, names, constants2);
         return this;
       }
       get names() {
@@ -491,8 +491,8 @@ var require_codegen = __commonJS({
       optimizeNodes() {
         return `${this.code}` ? this : void 0;
       }
-      optimizeNames(names, constants) {
-        this.code = optimizeExpr(this.code, names, constants);
+      optimizeNames(names, constants2) {
+        this.code = optimizeExpr(this.code, names, constants2);
         return this;
       }
       get names() {
@@ -521,12 +521,12 @@ var require_codegen = __commonJS({
         }
         return nodes.length > 0 ? this : void 0;
       }
-      optimizeNames(names, constants) {
+      optimizeNames(names, constants2) {
         const { nodes } = this;
         let i = nodes.length;
         while (i--) {
           const n = nodes[i];
-          if (n.optimizeNames(names, constants))
+          if (n.optimizeNames(names, constants2))
             continue;
           subtractNames(names, n.names);
           nodes.splice(i, 1);
@@ -579,12 +579,12 @@ var require_codegen = __commonJS({
           return void 0;
         return this;
       }
-      optimizeNames(names, constants) {
+      optimizeNames(names, constants2) {
         var _a;
-        this.else = (_a = this.else) === null || _a === void 0 ? void 0 : _a.optimizeNames(names, constants);
-        if (!(super.optimizeNames(names, constants) || this.else))
+        this.else = (_a = this.else) === null || _a === void 0 ? void 0 : _a.optimizeNames(names, constants2);
+        if (!(super.optimizeNames(names, constants2) || this.else))
           return;
-        this.condition = optimizeExpr(this.condition, names, constants);
+        this.condition = optimizeExpr(this.condition, names, constants2);
         return this;
       }
       get names() {
@@ -607,10 +607,10 @@ var require_codegen = __commonJS({
       render(opts) {
         return `for(${this.iteration})` + super.render(opts);
       }
-      optimizeNames(names, constants) {
-        if (!super.optimizeNames(names, constants))
+      optimizeNames(names, constants2) {
+        if (!super.optimizeNames(names, constants2))
           return;
-        this.iteration = optimizeExpr(this.iteration, names, constants);
+        this.iteration = optimizeExpr(this.iteration, names, constants2);
         return this;
       }
       get names() {
@@ -646,10 +646,10 @@ var require_codegen = __commonJS({
       render(opts) {
         return `for(${this.varKind} ${this.name} ${this.loop} ${this.iterable})` + super.render(opts);
       }
-      optimizeNames(names, constants) {
-        if (!super.optimizeNames(names, constants))
+      optimizeNames(names, constants2) {
+        if (!super.optimizeNames(names, constants2))
           return;
-        this.iterable = optimizeExpr(this.iterable, names, constants);
+        this.iterable = optimizeExpr(this.iterable, names, constants2);
         return this;
       }
       get names() {
@@ -691,11 +691,11 @@ var require_codegen = __commonJS({
         (_b = this.finally) === null || _b === void 0 ? void 0 : _b.optimizeNodes();
         return this;
       }
-      optimizeNames(names, constants) {
+      optimizeNames(names, constants2) {
         var _a, _b;
-        super.optimizeNames(names, constants);
-        (_a = this.catch) === null || _a === void 0 ? void 0 : _a.optimizeNames(names, constants);
-        (_b = this.finally) === null || _b === void 0 ? void 0 : _b.optimizeNames(names, constants);
+        super.optimizeNames(names, constants2);
+        (_a = this.catch) === null || _a === void 0 ? void 0 : _a.optimizeNames(names, constants2);
+        (_b = this.finally) === null || _b === void 0 ? void 0 : _b.optimizeNames(names, constants2);
         return this;
       }
       get names() {
@@ -996,7 +996,7 @@ var require_codegen = __commonJS({
     function addExprNames(names, from) {
       return from instanceof code_1._CodeOrName ? addNames(names, from.names) : names;
     }
-    function optimizeExpr(expr, names, constants) {
+    function optimizeExpr(expr, names, constants2) {
       if (expr instanceof code_1.Name)
         return replaceName(expr);
       if (!canOptimize(expr))
@@ -1011,14 +1011,14 @@ var require_codegen = __commonJS({
         return items;
       }, []));
       function replaceName(n) {
-        const c = constants[n.str];
+        const c = constants2[n.str];
         if (c === void 0 || names[n.str] !== 1)
           return n;
         delete names[n.str];
         return c;
       }
       function canOptimize(e) {
-        return e instanceof code_1._Code && e._items.some((c) => c instanceof code_1.Name && names[c.str] === 1 && constants[c.str] !== void 0);
+        return e instanceof code_1._Code && e._items.some((c) => c instanceof code_1.Name && names[c.str] === 1 && constants2[c.str] !== void 0);
       }
     }
     function subtractNames(names, from) {
@@ -1921,10 +1921,10 @@ var require_keyword = __commonJS({
       if (def.async && !schemaEnv.$async)
         throw new Error("async keyword in sync schema");
     }
-    function useKeyword(gen, keyword, result) {
-      if (result === void 0)
+    function useKeyword(gen, keyword, result2) {
+      if (result2 === void 0)
         throw new Error(`keyword "${keyword}" failed to compile`);
-      return gen.scopeValue("keyword", typeof result == "function" ? { ref: result } : { ref: result, code: (0, codegen_1.stringify)(result) });
+      return gen.scopeValue("keyword", typeof result2 == "function" ? { ref: result2 } : { ref: result2, code: (0, codegen_1.stringify)(result2) });
     }
     function validSchemaType(schema, schemaType, allowUndefined = false) {
       return !schemaType.length || schemaType.some((st) => st === "array" ? Array.isArray(schema) : st === "object" ? schema && typeof schema == "object" && !Array.isArray(schema) : typeof schema == st || allowUndefined && typeof schema == "undefined");
@@ -3222,8 +3222,8 @@ var require_utils = __commonJS({
       }
       return ind;
     }
-    function removeDotSegments(path6) {
-      let input = path6;
+    function removeDotSegments(path7) {
+      let input = path7;
       const output = [];
       let nextSlash = -1;
       let len = 0;
@@ -3422,8 +3422,8 @@ var require_schemes = __commonJS({
         wsComponent.secure = void 0;
       }
       if (wsComponent.resourceName) {
-        const [path6, query] = wsComponent.resourceName.split("?");
-        wsComponent.path = path6 && path6 !== "/" ? path6 : void 0;
+        const [path7, query] = wsComponent.resourceName.split("?");
+        wsComponent.path = path7 && path7 !== "/" ? path7 : void 0;
         wsComponent.query = query;
         wsComponent.resourceName = void 0;
       }
@@ -7276,8 +7276,8 @@ function getErrorMap() {
 
 // node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue = (params) => {
-  const { data, path: path6, errorMaps, issueData } = params;
-  const fullPath = [...path6, ...issueData.path || []];
+  const { data, path: path7, errorMaps, issueData } = params;
+  const fullPath = [...path7, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -7393,11 +7393,11 @@ var errorUtil;
 
 // node_modules/zod/v3/types.js
 var ParseInputLazyPath = class {
-  constructor(parent, value, path6, key) {
+  constructor(parent, value, path7, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path6;
+    this._path = path7;
     this._key = key;
   }
   get path() {
@@ -7411,9 +7411,9 @@ var ParseInputLazyPath = class {
     return this._cachedPath;
   }
 };
-var handleResult = (ctx, result) => {
-  if (isValid(result)) {
-    return { success: true, data: result.value };
+var handleResult = (ctx, result2) => {
+  if (isValid(result2)) {
+    return { success: true, data: result2.value };
   } else {
     if (!ctx.common.issues.length) {
       throw new Error("Validation failed but no issues detected.");
@@ -7484,21 +7484,21 @@ var ZodType = class {
     };
   }
   _parseSync(input) {
-    const result = this._parse(input);
-    if (isAsync(result)) {
+    const result2 = this._parse(input);
+    if (isAsync(result2)) {
       throw new Error("Synchronous parse encountered promise.");
     }
-    return result;
+    return result2;
   }
   _parseAsync(input) {
-    const result = this._parse(input);
-    return Promise.resolve(result);
+    const result2 = this._parse(input);
+    return Promise.resolve(result2);
   }
   parse(data, params) {
-    const result = this.safeParse(data, params);
-    if (result.success)
-      return result.data;
-    throw result.error;
+    const result2 = this.safeParse(data, params);
+    if (result2.success)
+      return result2.data;
+    throw result2.error;
   }
   safeParse(data, params) {
     const ctx = {
@@ -7513,8 +7513,8 @@ var ZodType = class {
       data,
       parsedType: getParsedType(data)
     };
-    const result = this._parseSync({ data, path: ctx.path, parent: ctx });
-    return handleResult(ctx, result);
+    const result2 = this._parseSync({ data, path: ctx.path, parent: ctx });
+    return handleResult(ctx, result2);
   }
   "~validate"(data) {
     const ctx = {
@@ -7530,9 +7530,9 @@ var ZodType = class {
     };
     if (!this["~standard"].async) {
       try {
-        const result = this._parseSync({ data, path: [], parent: ctx });
-        return isValid(result) ? {
-          value: result.value
+        const result2 = this._parseSync({ data, path: [], parent: ctx });
+        return isValid(result2) ? {
+          value: result2.value
         } : {
           issues: ctx.common.issues
         };
@@ -7546,17 +7546,17 @@ var ZodType = class {
         };
       }
     }
-    return this._parseAsync({ data, path: [], parent: ctx }).then((result) => isValid(result) ? {
-      value: result.value
+    return this._parseAsync({ data, path: [], parent: ctx }).then((result2) => isValid(result2) ? {
+      value: result2.value
     } : {
       issues: ctx.common.issues
     });
   }
   async parseAsync(data, params) {
-    const result = await this.safeParseAsync(data, params);
-    if (result.success)
-      return result.data;
-    throw result.error;
+    const result2 = await this.safeParseAsync(data, params);
+    if (result2.success)
+      return result2.data;
+    throw result2.error;
   }
   async safeParseAsync(data, params) {
     const ctx = {
@@ -7572,8 +7572,8 @@ var ZodType = class {
       parsedType: getParsedType(data)
     };
     const maybeAsyncResult = this._parse({ data, path: ctx.path, parent: ctx });
-    const result = await (isAsync(maybeAsyncResult) ? maybeAsyncResult : Promise.resolve(maybeAsyncResult));
-    return handleResult(ctx, result);
+    const result2 = await (isAsync(maybeAsyncResult) ? maybeAsyncResult : Promise.resolve(maybeAsyncResult));
+    return handleResult(ctx, result2);
   }
   refine(check, message) {
     const getIssueProperties = (val) => {
@@ -7586,13 +7586,13 @@ var ZodType = class {
       }
     };
     return this._refinement((val, ctx) => {
-      const result = check(val);
+      const result2 = check(val);
       const setError = () => ctx.addIssue({
         code: ZodIssueCode.custom,
         ...getIssueProperties(val)
       });
-      if (typeof Promise !== "undefined" && result instanceof Promise) {
-        return result.then((data) => {
+      if (typeof Promise !== "undefined" && result2 instanceof Promise) {
+        return result2.then((data) => {
           if (!data) {
             setError();
             return false;
@@ -7601,7 +7601,7 @@ var ZodType = class {
           }
         });
       }
-      if (!result) {
+      if (!result2) {
         setError();
         return false;
       } else {
@@ -9096,14 +9096,14 @@ var ZodArray = class _ZodArray extends ZodType {
     if (ctx.common.async) {
       return Promise.all([...ctx.data].map((item, i) => {
         return def.type._parseAsync(new ParseInputLazyPath(ctx, item, ctx.path, i));
-      })).then((result2) => {
-        return ParseStatus.mergeArray(status, result2);
+      })).then((result3) => {
+        return ParseStatus.mergeArray(status, result3);
       });
     }
-    const result = [...ctx.data].map((item, i) => {
+    const result2 = [...ctx.data].map((item, i) => {
       return def.type._parseSync(new ParseInputLazyPath(ctx, item, ctx.path, i));
     });
-    return ParseStatus.mergeArray(status, result);
+    return ParseStatus.mergeArray(status, result2);
   }
   get element() {
     return this._def.type;
@@ -9509,18 +9509,18 @@ var ZodUnion = class extends ZodType {
     const { ctx } = this._processInputParams(input);
     const options = this._def.options;
     function handleResults(results) {
-      for (const result of results) {
-        if (result.result.status === "valid") {
-          return result.result;
+      for (const result2 of results) {
+        if (result2.result.status === "valid") {
+          return result2.result;
         }
       }
-      for (const result of results) {
-        if (result.result.status === "dirty") {
-          ctx.common.issues.push(...result.ctx.common.issues);
-          return result.result;
+      for (const result2 of results) {
+        if (result2.result.status === "dirty") {
+          ctx.common.issues.push(...result2.ctx.common.issues);
+          return result2.result;
         }
       }
-      const unionErrors = results.map((result) => new ZodError(result.ctx.common.issues));
+      const unionErrors = results.map((result2) => new ZodError(result2.ctx.common.issues));
       addIssueToContext(ctx, {
         code: ZodIssueCode.invalid_union,
         unionErrors
@@ -9558,15 +9558,15 @@ var ZodUnion = class extends ZodType {
           },
           parent: null
         };
-        const result = option._parseSync({
+        const result2 = option._parseSync({
           data: ctx.data,
           path: ctx.path,
           parent: childCtx
         });
-        if (result.status === "valid") {
-          return result;
-        } else if (result.status === "dirty" && !dirty) {
-          dirty = { result, ctx: childCtx };
+        if (result2.status === "valid") {
+          return result2;
+        } else if (result2.status === "dirty" && !dirty) {
+          dirty = { result: result2, ctx: childCtx };
         }
         if (childCtx.common.issues.length) {
           issues.push(childCtx.common.issues);
@@ -10111,9 +10111,9 @@ var ZodFunction = class _ZodFunction extends ZodType {
           error.addIssue(makeArgsIssue(args, e));
           throw error;
         });
-        const result = await Reflect.apply(fn, this, parsedArgs);
-        const parsedReturns = await me._def.returns._def.type.parseAsync(result, params).catch((e) => {
-          error.addIssue(makeReturnsIssue(result, e));
+        const result2 = await Reflect.apply(fn, this, parsedArgs);
+        const parsedReturns = await me._def.returns._def.type.parseAsync(result2, params).catch((e) => {
+          error.addIssue(makeReturnsIssue(result2, e));
           throw error;
         });
         return parsedReturns;
@@ -10125,10 +10125,10 @@ var ZodFunction = class _ZodFunction extends ZodType {
         if (!parsedArgs.success) {
           throw new ZodError([makeArgsIssue(args, parsedArgs.error)]);
         }
-        const result = Reflect.apply(fn, this, parsedArgs.data);
-        const parsedReturns = me._def.returns.safeParse(result, params);
+        const result2 = Reflect.apply(fn, this, parsedArgs.data);
+        const parsedReturns = me._def.returns.safeParse(result2, params);
         if (!parsedReturns.success) {
-          throw new ZodError([makeReturnsIssue(result, parsedReturns.error)]);
+          throw new ZodError([makeReturnsIssue(result2, parsedReturns.error)]);
         }
         return parsedReturns.data;
       });
@@ -10380,43 +10380,43 @@ var ZodEffects = class extends ZodType {
         return Promise.resolve(processed).then(async (processed2) => {
           if (status.value === "aborted")
             return INVALID;
-          const result = await this._def.schema._parseAsync({
+          const result2 = await this._def.schema._parseAsync({
             data: processed2,
             path: ctx.path,
             parent: ctx
           });
-          if (result.status === "aborted")
+          if (result2.status === "aborted")
             return INVALID;
-          if (result.status === "dirty")
-            return DIRTY(result.value);
+          if (result2.status === "dirty")
+            return DIRTY(result2.value);
           if (status.value === "dirty")
-            return DIRTY(result.value);
-          return result;
+            return DIRTY(result2.value);
+          return result2;
         });
       } else {
         if (status.value === "aborted")
           return INVALID;
-        const result = this._def.schema._parseSync({
+        const result2 = this._def.schema._parseSync({
           data: processed,
           path: ctx.path,
           parent: ctx
         });
-        if (result.status === "aborted")
+        if (result2.status === "aborted")
           return INVALID;
-        if (result.status === "dirty")
-          return DIRTY(result.value);
+        if (result2.status === "dirty")
+          return DIRTY(result2.value);
         if (status.value === "dirty")
-          return DIRTY(result.value);
-        return result;
+          return DIRTY(result2.value);
+        return result2;
       }
     }
     if (effect.type === "refinement") {
       const executeRefinement = (acc) => {
-        const result = effect.refinement(acc, checkCtx);
+        const result2 = effect.refinement(acc, checkCtx);
         if (ctx.common.async) {
-          return Promise.resolve(result);
+          return Promise.resolve(result2);
         }
-        if (result instanceof Promise) {
+        if (result2 instanceof Promise) {
           throw new Error("Async refinement encountered during synchronous parse operation. Use .parseAsync instead.");
         }
         return acc;
@@ -10454,18 +10454,18 @@ var ZodEffects = class extends ZodType {
         });
         if (!isValid(base))
           return INVALID;
-        const result = effect.transform(base.value, checkCtx);
-        if (result instanceof Promise) {
+        const result2 = effect.transform(base.value, checkCtx);
+        if (result2 instanceof Promise) {
           throw new Error(`Asynchronous transform encountered during synchronous parse operation. Use .parseAsync instead.`);
         }
-        return { status: status.value, value: result };
+        return { status: status.value, value: result2 };
       } else {
         return this._def.schema._parseAsync({ data: ctx.data, path: ctx.path, parent: ctx }).then((base) => {
           if (!isValid(base))
             return INVALID;
-          return Promise.resolve(effect.transform(base.value, checkCtx)).then((result) => ({
+          return Promise.resolve(effect.transform(base.value, checkCtx)).then((result2) => ({
             status: status.value,
-            value: result
+            value: result2
           }));
         });
       }
@@ -10562,18 +10562,18 @@ var ZodCatch = class extends ZodType {
         issues: []
       }
     };
-    const result = this._def.innerType._parse({
+    const result2 = this._def.innerType._parse({
       data: newCtx.data,
       path: newCtx.path,
       parent: {
         ...newCtx
       }
     });
-    if (isAsync(result)) {
-      return result.then((result2) => {
+    if (isAsync(result2)) {
+      return result2.then((result3) => {
         return {
           status: "valid",
-          value: result2.status === "valid" ? result2.value : this._def.catchValue({
+          value: result3.status === "valid" ? result3.value : this._def.catchValue({
             get error() {
               return new ZodError(newCtx.common.issues);
             },
@@ -10584,7 +10584,7 @@ var ZodCatch = class extends ZodType {
     } else {
       return {
         status: "valid",
-        value: result.status === "valid" ? result.value : this._def.catchValue({
+        value: result2.status === "valid" ? result2.value : this._def.catchValue({
           get error() {
             return new ZodError(newCtx.common.issues);
           },
@@ -10698,14 +10698,14 @@ var ZodPipeline = class _ZodPipeline extends ZodType {
 };
 var ZodReadonly = class extends ZodType {
   _parse(input) {
-    const result = this._def.innerType._parse(input);
+    const result2 = this._def.innerType._parse(input);
     const freeze = (data) => {
       if (isValid(data)) {
         data.value = Object.freeze(data.value);
       }
       return data;
     };
-    return isAsync(result) ? result.then((data) => freeze(data)) : freeze(result);
+    return isAsync(result2) ? result2.then((data) => freeze(data)) : freeze(result2);
   }
   unwrap() {
     return this._def.innerType;
@@ -12013,12 +12013,12 @@ var Protocol = class {
       requestId: request.id,
       requestInfo: extra === null || extra === void 0 ? void 0 : extra.requestInfo
     };
-    Promise.resolve().then(() => handler(request, fullExtra)).then((result) => {
+    Promise.resolve().then(() => handler(request, fullExtra)).then((result2) => {
       if (abortController.signal.aborted) {
         return;
       }
       return capturedTransport === null || capturedTransport === void 0 ? void 0 : capturedTransport.send({
-        result,
+        result: result2,
         jsonrpc: "2.0",
         id: request.id
       });
@@ -12143,8 +12143,8 @@ var Protocol = class {
           return reject(response);
         }
         try {
-          const result = resultSchema.parse(response.result);
-          resolve(result);
+          const result2 = resultSchema.parse(response.result);
+          resolve(result2);
         } catch (error) {
           reject(error);
         }
@@ -12243,20 +12243,20 @@ function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function mergeCapabilities(base, additional) {
-  const result = { ...base };
+  const result2 = { ...base };
   for (const key in additional) {
     const k = key;
     const addValue = additional[k];
     if (addValue === void 0)
       continue;
-    const baseValue = result[k];
+    const baseValue = result2[k];
     if (isPlainObject(baseValue) && isPlainObject(addValue)) {
-      result[k] = { ...baseValue, ...addValue };
+      result2[k] = { ...baseValue, ...addValue };
     } else {
-      result[k] = addValue;
+      result2[k] = addValue;
     }
   }
-  return result;
+  return result2;
 }
 
 // node_modules/@modelcontextprotocol/sdk/dist/esm/validation/ajv-provider.js
@@ -12496,11 +12496,11 @@ var Server = class extends Protocol {
     return this.request({ method: "sampling/createMessage", params }, CreateMessageResultSchema, options);
   }
   async elicitInput(params, options) {
-    const result = await this.request({ method: "elicitation/create", params }, ElicitResultSchema, options);
-    if (result.action === "accept" && result.content && params.requestedSchema) {
+    const result2 = await this.request({ method: "elicitation/create", params }, ElicitResultSchema, options);
+    if (result2.action === "accept" && result2.content && params.requestedSchema) {
       try {
         const validator = this._jsonSchemaValidator.getValidator(params.requestedSchema);
-        const validationResult = validator(result.content);
+        const validationResult = validator(result2.content);
         if (!validationResult.valid) {
           throw new McpError(ErrorCode.InvalidParams, `Elicitation response content does not match requested schema: ${validationResult.errorMessage}`);
         }
@@ -12511,7 +12511,7 @@ var Server = class extends Protocol {
         throw new McpError(ErrorCode.InternalError, `Error validating elicitation response: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
-    return result;
+    return result2;
   }
   async listRoots(params, options) {
     return this.request({ method: "roots/list", params }, ListRootsResultSchema, options);
@@ -12645,9 +12645,9 @@ var StdioServerTransport = class {
 };
 
 // src/index.ts
-import path5 from "path";
+import path6 from "path";
 import fs4 from "fs";
-import os4 from "os";
+import os5 from "os";
 
 // src/db.ts
 import Database from "better-sqlite3";
@@ -13927,7 +13927,7 @@ function handleReadTool(name, args, db, sessionId, identity, runtimeFingerprint2
       const pendingTasks = allTasks.filter(
         (t) => t.status !== "review_passed"
       );
-      const result = {
+      const result2 = {
         plan_name: session.plan_name,
         current_wave: session.current_wave,
         workflow_stage: session.workflow_stage,
@@ -13948,7 +13948,7 @@ function handleReadTool(name, args, db, sessionId, identity, runtimeFingerprint2
         session_id: resolvedId
       };
       return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        content: [{ type: "text", text: JSON.stringify(result2, null, 2) }]
       };
     }
     // ----- get_professional_mode -----
@@ -14173,7 +14173,7 @@ function handleReadTool(name, args, db, sessionId, identity, runtimeFingerprint2
         };
       }
       const history = getPlanHistory(db, designFile);
-      const result = {
+      const result2 = {
         design_file: designFile,
         attempts: history.map((h) => ({
           plan_name: h.plan_name,
@@ -14185,7 +14185,7 @@ function handleReadTool(name, args, db, sessionId, identity, runtimeFingerprint2
         total_attempts: history.length
       };
       return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        content: [{ type: "text", text: JSON.stringify(result2, null, 2) }]
       };
     }
     // ----- run_diagnostics -----
@@ -14366,7 +14366,7 @@ ${JSON.stringify({
         canonical_hash_matches_current: canonicalReview ? canonicalReview.plan_hash === currentPlanHash : null,
         current_hash_advisor_remediated: currentPlanHash ? hasAdvisorRemediatedAtHash(db, resolvedId, session.plan_lineage, currentPlanHash) : false
       };
-      const result = {
+      const result2 = {
         workflow_stage: session.workflow_stage,
         professional_mode: session.professional_mode,
         plan_name: session.plan_name ?? null,
@@ -14383,7 +14383,7 @@ ${JSON.stringify({
         session_id: resolvedId
       };
       return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+        content: [{ type: "text", text: JSON.stringify(result2, null, 2) }]
       };
     }
     // ----- get_testing_theatre_status -----
@@ -15288,7 +15288,7 @@ function handleWriteTool(name, args, db, sessionId) {
       const outcome = executeWorkflowTransition(db, resolvedId, "design_ready", {
         action: "mark_design_ready",
         auditContext: file ? `Brainstorming complete, design ready (auto-registered: ${file})` : "Brainstorming complete, design ready",
-        validate: ({ from }, result) => result.valid ? result : {
+        validate: ({ from }, result2) => result2.valid ? result2 : {
           valid: false,
           reason: `Cannot mark design ready: workflow_stage must be 'brainstorming', got '${from}'`
         },
@@ -15310,7 +15310,7 @@ function handleWriteTool(name, args, db, sessionId) {
       const outcome = executeWorkflowTransition(db, resolvedId, "plan_ready", {
         action: "mark_plan_ready",
         auditContext: "Plan files written to disk",
-        validate: ({ from }, result) => result.valid ? result : {
+        validate: ({ from }, result2) => result2.valid ? result2 : {
           valid: false,
           reason: `Cannot mark plan ready: workflow_stage must be 'design_ready' or 'design_marked_for_use', got '${from}'`
         }
@@ -15322,7 +15322,7 @@ function handleWriteTool(name, args, db, sessionId) {
       const outcome = executeWorkflowTransition(db, resolvedId, "brainstorming", {
         action: "mark_brainstorming",
         auditContext: ({ from }) => `Transitioning to brainstorming from ${from}`,
-        validate: ({ from }, result) => result.valid ? result : { valid: false, reason: `Cannot mark brainstorming: invalid transition from '${from}'` }
+        validate: ({ from }, result2) => result2.valid ? result2 : { valid: false, reason: `Cannot mark brainstorming: invalid transition from '${from}'` }
       });
       return workflowTransitionResult(outcome, { workflow_stage: "brainstorming" });
     }
@@ -15331,7 +15331,7 @@ function handleWriteTool(name, args, db, sessionId) {
       const outcome = executeWorkflowTransition(db, resolvedId, "debugging", {
         action: "mark_debugging",
         auditContext: ({ from }) => `Transitioning to debugging from ${from}`,
-        validate: ({ from }, result) => result.valid ? result : { valid: false, reason: `Cannot mark debugging: invalid transition from '${from}'` }
+        validate: ({ from }, result2) => result2.valid ? result2 : { valid: false, reason: `Cannot mark debugging: invalid transition from '${from}'` }
       });
       return workflowTransitionResult(outcome, { workflow_stage: "debugging" });
     }
@@ -15343,8 +15343,8 @@ function handleWriteTool(name, args, db, sessionId) {
         action: () => recovered ? "workflow_stage_recovery" : "mark_executing",
         actor: () => recovered ? "system:state-correction" : "claude",
         auditContext: ({ from }) => recovered ? `Force-corrected workflow_stage from '${from}' to 'executing' \u2014 ${activeTaskCount} active wave_tasks prove execution is in progress` : "Code review complete, returning to executing",
-        validate: ({ from }, result) => {
-          if (result.valid) return result;
+        validate: ({ from }, result2) => {
+          if (result2.valid) return result2;
           activeTaskCount = db.prepare(
             `SELECT COUNT(*) as count FROM wave_tasks
              WHERE terminal_session = ? AND status IN ('pending', 'in_progress', 'submitted')`
@@ -15388,7 +15388,7 @@ function handleWriteTool(name, args, db, sessionId) {
         action: "retreat",
         actor: "system",
         auditContext: reason,
-        validate: ({ from }, result) => result.valid ? result : { valid: false, reason: `Cannot retreat from '${from}' to '${to}': transition not allowed` },
+        validate: ({ from }, result2) => result2.valid ? result2 : { valid: false, reason: `Cannot retreat from '${from}' to '${to}': transition not allowed` },
         applyArtifacts: ({ session, from }) => prepareRetreatArtifacts(db, resolvedId, session, from, reason)
       });
       return workflowTransitionResult(outcome, { reason });
@@ -15625,8 +15625,441 @@ function dispatchTool(name, args, db, identity, runtimeFingerprint2) {
   throw new Error(`Unknown tool: ${name}`);
 }
 
+// src/tools/advisor-review.ts
+import { access as fsAccess, mkdtemp as fsMkdtemp, rm as fsRm } from "node:fs/promises";
+import { constants } from "node:fs";
+import { spawn as nodeSpawn } from "node:child_process";
+import os4 from "node:os";
+import path5 from "node:path";
+var MAX_PACKET_BYTES = 1024 * 1024;
+var MAX_STDOUT_BYTES = 2 * 1024 * 1024;
+var MAX_STDERR_BYTES = 64 * 1024;
+var DEFAULT_REVIEW_TIMEOUT_MS = 15 * 60 * 1e3;
+var PREFLIGHT_TIMEOUT_MS = 15 * 1e3;
+var TERMINATION_GRACE_MS = 1e3;
+var DIAGNOSTIC_LIMIT = 512;
+var REQUESTER_MODELS = [
+  "gpt-5.6-luna",
+  "gpt-5.6-terra",
+  "gpt-5.6-sol",
+  "gpt-6-astra"
+];
+var REVIEW_TIERS = ["same", "one-up"];
+var REVIEWER_BY_REQUESTER = {
+  "gpt-5.6-luna": "gpt-5.6-terra",
+  "gpt-5.6-terra": "gpt-5.6-sol",
+  "gpt-5.6-sol": "gpt-6-astra",
+  "gpt-6-astra": "gpt-6-astra"
+};
+var ALLOWED_ENV = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "TMPDIR",
+  "LANG",
+  "LC_ALL",
+  "TERM",
+  "COLORTERM",
+  "CODEX_HOME",
+  "OPENAI_API_KEY",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy"
+];
+var DEFAULT_DEPS = {
+  spawn: nodeSpawn,
+  mkdtemp: fsMkdtemp,
+  rm: fsRm,
+  access: fsAccess,
+  env: process.env,
+  tmpdir: os4.tmpdir(),
+  now: Date.now,
+  platform: process.platform,
+  killProcessGroup: (pid, signal) => process.kill(-pid, signal),
+  isProcessGroupAlive: (pid) => {
+    try {
+      process.kill(-pid, 0);
+      return true;
+    } catch (error) {
+      return error.code !== "ESRCH";
+    }
+  }
+};
+var advisorReviewToolDefinition = {
+  name: "run_codex_advisor_review",
+  description: "Run one bounded, fixed-function, report-only Codex advisor review using a complete inline packet. The broker owns reviewer-tier mapping and exposes no shell, argv, environment, cwd, or repository-path input.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      packet: {
+        type: "string",
+        minLength: 1,
+        maxLength: MAX_PACKET_BYTES,
+        description: "Complete inline lossless review packet."
+      },
+      requester_model: {
+        type: "string",
+        enum: [...REQUESTER_MODELS],
+        description: "Current Codex requester model; the broker maps the reviewer exactly once."
+      },
+      review_tier: {
+        type: "string",
+        enum: [...REVIEW_TIERS],
+        description: "Reviewer tier selection; defaults to one-up when omitted."
+      }
+    },
+    required: ["packet", "requester_model"],
+    additionalProperties: false
+  },
+  annotations: {
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: true
+  }
+};
+function result(body, isError = false) {
+  return {
+    content: [{ type: "text", text: JSON.stringify(body) }],
+    ...isError ? { isError: true } : {}
+  };
+}
+function failure(reason, extra = {}) {
+  return result({ success: false, reason, ...extra }, true);
+}
+function diagnostic(value) {
+  return value.replace(/\s+/g, " ").trim().slice(-DIAGNOSTIC_LIMIT);
+}
+function resolveTrustedCodexRequesterModel(requestMeta) {
+  if (!requestMeta || typeof requestMeta !== "object" || Array.isArray(requestMeta)) return null;
+  const turn = requestMeta["x-codex-turn-metadata"];
+  if (!turn || typeof turn !== "object" || Array.isArray(turn)) return null;
+  const model = turn.model;
+  return typeof model === "string" && model.length > 0 ? model : null;
+}
+function sanitizedEnv(source) {
+  const clean = {};
+  for (const key of ALLOWED_ENV) {
+    const value = source[key];
+    if (typeof value === "string") clean[key] = value;
+  }
+  return clean;
+}
+async function resolveCodexExecutable(deps) {
+  for (const directory of (deps.env.PATH ?? "").split(path5.delimiter)) {
+    if (!directory) continue;
+    const candidate = path5.resolve(directory, process.platform === "win32" ? "codex.exe" : "codex");
+    try {
+      await deps.access(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+    }
+  }
+  return null;
+}
+async function runFixedProcess(executable, argv, cwd, env, input, timeoutMs, deps) {
+  return await new Promise((resolve) => {
+    let child;
+    try {
+      child = deps.spawn(executable, argv, {
+        cwd,
+        env,
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: deps.platform !== "win32"
+      });
+    } catch (error) {
+      resolve({
+        exitCode: null,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        outputOverflow: false,
+        spawnError: error instanceof Error ? error.message : String(error)
+      });
+      return;
+    }
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let timedOut = false;
+    let outputOverflow = false;
+    let settled = false;
+    let forceTimer;
+    let pollTimer;
+    let verificationTimer;
+    let terminating = false;
+    const finish = (exitCode, spawnError = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (forceTimer) clearTimeout(forceTimer);
+      if (pollTimer) clearTimeout(pollTimer);
+      if (verificationTimer) clearTimeout(verificationTimer);
+      resolve({
+        exitCode,
+        stdout: Buffer.concat(stdoutChunks, stdoutBytes).toString("utf8"),
+        stderr: Buffer.concat(stderrChunks, stderrBytes).toString("utf8"),
+        timedOut,
+        outputOverflow,
+        spawnError
+      });
+    };
+    const terminate = () => {
+      if (settled || terminating) return;
+      terminating = true;
+      if (deps.platform === "win32" || typeof child.pid !== "number") {
+        finish(null, "bounded process-group termination unavailable");
+        return;
+      }
+      const pid = child.pid;
+      try {
+        deps.killProcessGroup(pid, "SIGTERM");
+      } catch (error) {
+        finish(null, `process-group SIGTERM failed: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+      const poll = () => {
+        if (settled) return;
+        if (!deps.isProcessGroupAlive(pid)) {
+          finish(null);
+          return;
+        }
+        pollTimer = setTimeout(poll, 10);
+      };
+      pollTimer = setTimeout(poll, 10);
+      forceTimer = setTimeout(() => {
+        if (settled) return;
+        try {
+          deps.killProcessGroup(pid, "SIGKILL");
+        } catch (error) {
+          finish(null, `process-group SIGKILL failed: ${error instanceof Error ? error.message : String(error)}`);
+          return;
+        }
+        verificationTimer = setTimeout(() => {
+          if (settled) return;
+          if (deps.isProcessGroupAlive(pid)) {
+            finish(null, "process-group survived SIGKILL");
+          } else {
+            finish(null);
+          }
+        }, deps.terminationGraceMs ?? TERMINATION_GRACE_MS);
+      }, deps.terminationGraceMs ?? TERMINATION_GRACE_MS);
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      terminate();
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => {
+      if (outputOverflow) return;
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = Math.max(0, MAX_STDOUT_BYTES - stdoutBytes);
+      if (remaining > 0) {
+        const retained = bytes.subarray(0, remaining);
+        stdoutChunks.push(retained);
+        stdoutBytes += retained.byteLength;
+      }
+      if (bytes.byteLength > remaining) {
+        outputOverflow = true;
+        terminate();
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = Math.max(0, MAX_STDERR_BYTES - stderrBytes);
+      if (remaining > 0) {
+        const retained = bytes.subarray(0, remaining);
+        stderrChunks.push(retained);
+        stderrBytes += retained.byteLength;
+      }
+    });
+    child.once("error", (error) => finish(null, error.message));
+    child.once("close", (code) => {
+      if (!terminating) finish(code);
+    });
+    child.stdin.once("error", () => void 0);
+    child.stdin.end(input);
+  });
+}
+function parseLastAgentMessage(stdout) {
+  let report = null;
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!event || typeof event !== "object" || Array.isArray(event)) continue;
+    const record2 = event;
+    if (record2.type !== "item.completed") continue;
+    const item = record2.item;
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const itemRecord = item;
+    if (itemRecord.type === "agent_message" && typeof itemRecord.text === "string" && itemRecord.text.trim()) {
+      report = itemRecord.text;
+    }
+  }
+  return report;
+}
+function validateArgs(args) {
+  const keys = Object.keys(args);
+  if (keys.some((key) => key !== "packet" && key !== "requester_model" && key !== "review_tier")) {
+    return { ok: false, reason: "unexpected-input-field" };
+  }
+  if (typeof args.packet !== "string" || args.packet.trim().length === 0) {
+    return { ok: false, reason: "packet-empty" };
+  }
+  if (Buffer.byteLength(args.packet, "utf8") > MAX_PACKET_BYTES) {
+    return { ok: false, reason: "packet-too-large" };
+  }
+  if (!REQUESTER_MODELS.includes(args.requester_model)) {
+    return { ok: false, reason: "invalid-requester-model" };
+  }
+  if (args.review_tier !== void 0 && !REVIEW_TIERS.includes(args.review_tier)) {
+    return { ok: false, reason: "invalid-review-tier" };
+  }
+  return {
+    ok: true,
+    packet: args.packet,
+    requesterModel: args.requester_model,
+    reviewTier: args.review_tier ?? "one-up"
+  };
+}
+async function runCodexAdvisorReview(args, identity, session, runtime, overrides = {}) {
+  const deps = { ...DEFAULT_DEPS, ...overrides };
+  const validated = validateArgs(args);
+  if (!validated.ok) return failure(validated.reason);
+  if (identity.client !== "codex" || identity.source !== "codex_meta" || identity.invocationThreadId !== identity.sessionId) {
+    return failure("trusted-codex-root-required");
+  }
+  if (!session) return failure("session-not-found");
+  if (session.terminal_session !== identity.sessionId) return failure("session-identity-mismatch");
+  if (session.professional_mode !== "on") return failure("professional-mode-required");
+  if (!runtime?.ok) return failure("runtime-fingerprint-invalid");
+  if (runtime.runtime.client !== "codex") return failure("runtime-client-mismatch");
+  if (deps.platform === "win32") return failure("advisor-process-group-unsupported");
+  if (deps.trustedRequesterModel !== validated.requesterModel) {
+    return failure("requester-model-mismatch", {
+      trusted_requester_model: deps.trustedRequesterModel ?? null
+    });
+  }
+  const codexExecutable = await resolveCodexExecutable(deps);
+  if (!codexExecutable) return failure("codex-executable-not-found");
+  const helper = path5.join(runtime.runtime.plugin_root, "scripts", "codex-runtime-preflight.mjs");
+  const env = sanitizedEnv(deps.env);
+  const preflight = await runFixedProcess(
+    process.execPath,
+    [helper, "--mode", "check", "--codex-path", codexExecutable],
+    runtime.runtime.plugin_root,
+    env,
+    "",
+    PREFLIGHT_TIMEOUT_MS,
+    deps
+  );
+  let preflightPayload = null;
+  try {
+    const parsed = JSON.parse(preflight.stdout);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      preflightPayload = parsed;
+    }
+  } catch {
+  }
+  const resolvedLauncher = preflightPayload?.resolved_launcher;
+  const preflightValid = preflight.exitCode === 0 && preflightPayload?.schema_version === 1 && preflightPayload?.mode === "check" && preflightPayload?.status === "healthy" && preflightPayload?.invoked_launcher === codexExecutable && typeof resolvedLauncher === "string" && resolvedLauncher.length > 0 && preflightPayload?.source_companion === `${resolvedLauncher}-code-mode-host` && preflightPayload?.destination_companion === `${codexExecutable}-code-mode-host` && preflightPayload?.action === "none" && typeof preflightPayload?.reason === "string";
+  if (!preflightValid) {
+    return failure("codex-runtime-incomplete", {
+      diagnostic: diagnostic(preflight.stderr || preflight.stdout || preflight.spawnError || "preflight failed")
+    });
+  }
+  const reviewerModel = validated.reviewTier === "same" ? validated.requesterModel : REVIEWER_BY_REQUESTER[validated.requesterModel];
+  const startedAt = deps.now();
+  let privateCwd = null;
+  let outcome;
+  try {
+    privateCwd = await deps.mkdtemp(path5.join(deps.tmpdir, "ironclaude-advisor-"));
+    const review = await runFixedProcess(
+      codexExecutable,
+      [
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--skip-git-repo-check",
+        "-s",
+        "read-only",
+        "-m",
+        reviewerModel,
+        "-"
+      ],
+      privateCwd,
+      env,
+      validated.packet,
+      deps.reviewTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS,
+      deps
+    );
+    const provenance = {
+      requester_model: validated.requesterModel,
+      reviewer_model: reviewerModel,
+      review_tier: validated.reviewTier,
+      transport: "codex-exec-read-only",
+      attempt_count: 1,
+      timed_out: review.timedOut,
+      packet_bytes: Buffer.byteLength(validated.packet, "utf8"),
+      duration_ms: Math.max(0, deps.now() - startedAt),
+      plugin_version: runtime.runtime.plugin_version,
+      plugin_root: runtime.runtime.plugin_root
+    };
+    if (review.timedOut) {
+      outcome = failure("reviewer-timeout", provenance);
+    } else if (review.outputOverflow) {
+      outcome = failure("reviewer-output-too-large", provenance);
+    } else if (review.spawnError) {
+      outcome = failure("reviewer-spawn-failed", {
+        ...provenance,
+        diagnostic: diagnostic(review.spawnError)
+      });
+    } else if (review.exitCode !== 0) {
+      outcome = failure("reviewer-nonzero", {
+        ...provenance,
+        diagnostic: diagnostic(review.stderr || review.stdout || `exit ${String(review.exitCode)}`)
+      });
+    } else {
+      const report = parseLastAgentMessage(review.stdout);
+      outcome = report ? result({ success: true, report, ...provenance }) : failure("reviewer-output-invalid", {
+        ...provenance,
+        diagnostic: diagnostic(review.stderr || review.stdout || "no completed agent_message")
+      });
+    }
+  } catch (error) {
+    outcome = failure("advisor-broker-failed", {
+      diagnostic: diagnostic(error instanceof Error ? error.message : String(error))
+    });
+  }
+  if (privateCwd) {
+    try {
+      await deps.rm(privateCwd, { recursive: true, force: true });
+    } catch (error) {
+      return failure("advisor-cleanup-failed", {
+        diagnostic: diagnostic(error instanceof Error ? error.message : String(error))
+      });
+    }
+  }
+  return outcome;
+}
+
 // src/index.ts
-var ERROR_LOG_PATH = path5.join(os4.homedir(), ".claude", "ironclaude-errors.log");
+var ERROR_LOG_PATH = path6.join(os5.homedir(), ".claude", "ironclaude-errors.log");
 function appendErrorLog(tool, sessionId, error) {
   try {
     const ts = (/* @__PURE__ */ new Date()).toISOString();
@@ -15691,7 +16124,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       ...readToolDefinitions,
-      ...writeToolDefinitions
+      ...writeToolDefinitions,
+      advisorReviewToolDefinition
     ]
   };
 });
@@ -15703,6 +16137,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const identity = resolveSessionIdentity(client, request.params._meta, claudeSession);
     resolvedSessionId = identity.sessionId;
     const db = initDb();
+    if (name === advisorReviewToolDefinition.name) {
+      return await runCodexAdvisorReview(
+        args ?? {},
+        identity,
+        getSession(db, identity.sessionId),
+        runtimeFingerprint,
+        { trustedRequesterModel: resolveTrustedCodexRequesterModel(request.params._meta) }
+      );
+    }
     return dispatchTool(name, args ?? {}, db, identity, runtimeFingerprint);
   } catch (error) {
     const errorMsg = handleError(error);
@@ -15720,7 +16163,7 @@ async function main() {
   if (client === "claude") {
     const claudePpid = process.env.CLAUDE_PPID;
     if (claudePpid) {
-      _ppidFilePath = path5.join(os4.homedir(), ".claude", `ironclaude-session-${claudePpid}.id`);
+      _ppidFilePath = path6.join(os5.homedir(), ".claude", `ironclaude-session-${claudePpid}.id`);
       console.error(`Will resolve Claude session via PPID file on each tool call: ${_ppidFilePath}`);
     } else {
       console.error("CRITICAL: CLAUDE_PPID not set. Claude session resolution will fail.");

@@ -62,7 +62,7 @@ class TestWorkerClaudeMdTemplate:
         assert AGENTS_TEMPLATE_PATH.read_text() == canonical
 
     def test_worker_templates_have_semantic_concept_parity(self):
-        """Both provider templates carry one workflow and the same 12 concepts."""
+        """Claude keeps native rules; Codex adds actual-Fable routing."""
         claude = TEMPLATE_PATH.read_text()
         codex = AGENTS_TEMPLATE_PATH.read_text()
         workflow = (
@@ -85,8 +85,16 @@ class TestWorkerClaudeMdTemplate:
             "Recipient-Based Communication Profiles",
         ]
         assert _concept_headings(claude) == expected
-        assert _concept_headings(codex) == expected
+        assert _concept_headings(codex) == expected + [
+            "Actual Claude Fable from Codex"
+        ]
         assert "`Agent` tool (`model=fable`" in claude
         assert "`model=opus`" in claude
-        assert "`codex exec -m <one-tier-up-model>`" in codex
-        assert "`luna → terra → sol`" in codex
+        assert "`run_codex_advisor_review`" in codex
+        assert "`requester_model`" in codex
+        assert 'review_tier: "one-up"' in codex
+        assert "`luna → terra → sol → astra`" in codex
+        assert "`gpt-5.6-luna → gpt-5.6-terra → gpt-5.6-sol → gpt-6-astra`" in codex
+        assert "nested `codex exec`" in codex
+        assert "ironclaude:use-fable-subagent" in codex
+        assert "Native Codex subagents cannot satisfy" in codex

@@ -18,6 +18,7 @@ CONSTRUCTION_PROFILES = {
     "shadow_grader": "ai",
     "session_summarizer": "ai",
     "hook_validator": "machine",
+    "actual_fable_subagent": "ai",
 }
 
 _PROFILE_SKILLS = {

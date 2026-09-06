@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from ironclaude.db import init_db
+from ironclaude.ollama_client import OllamaError
 from ironclaude.worker_registry import WorkerRegistry
 from ironclaude.orchestrator_mcp import OrchestratorTools
 
@@ -669,6 +670,150 @@ class TestSendKeysContentGate:
         assert "sent" in result.lower()
 
 
+def test_grade_openai_backend_returns_verdict(tmp_path):
+    """LocalGrader routes the grader spot to the OpenAI chat-completions backend
+    when config resolves backend=openai, and returns the parsed verdict."""
+    from ironclaude.grader import LocalGrader
+    cfg = tmp_path / "openai-config.json"
+    cfg.write_text(json.dumps({
+        "backend": "openai",
+        "openai": {"base_url": "http://h/v1", "model": "example-model-a", "max_tokens": 1024},
+    }))
+    grader = LocalGrader(config_path=str(cfg))
+    resp = MagicMock()
+    resp.json.return_value = {
+        "choices": [
+            {"message": {"content": '{"grade": "A", "approved": true, "feedback": "ok"}'}}
+        ]
+    }
+    resp.raise_for_status = MagicMock()
+    with patch("requests.post", return_value=resp) as mock_post:
+        result = grader.grade("system prompt", "user prompt", GRADE_SCHEMA)
+    assert result["grade"] == "A"
+    assert result["approved"] is True
+    assert result["feedback"] == "ok"
+    assert mock_post.call_args[0][0] == "http://h/v1/chat/completions"
+
+
+def _openai_summ_config(tmp_path, base_url="http://llm-host/v1"):
+    p = tmp_path / f"openai-summ-{base_url.split('//')[-1].split('/')[0]}.json"
+    p.write_text(json.dumps({
+        "backend": "openai",
+        "openai": {"base_url": base_url, "model": "example-model-a", "max_tokens": 1024},
+    }))
+    return str(p)
+
+
+def _openai_post_response(content):
+    resp = MagicMock()
+    resp.json.return_value = {"choices": [{"message": {"content": content}}]}
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
+def _openai_models_response():
+    resp = MagicMock()
+    resp.json.return_value = {"data": []}
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
+class TestSummarizationOpenAiBackend:
+    """list_claude_sessions summarization routed to the OpenAI backend."""
+
+    def _setup_tmux(self, mock_tmux):
+        mock_tmux.list_sessions.return_value = ["my-session"]
+        mock_tmux.list_pane_pid.return_value = "1"
+        mock_tmux.pane_current_command.return_value = "node"
+        mock_tmux.capture_pane.return_value = "Claude Code active in /repo\n" * 5
+
+    def test_openai_summarization_produces_summary_without_get_ps(
+        self, tools, mock_tmux, tmp_path,
+    ):
+        self._setup_tmux(mock_tmux)
+        tools._ollama_config_path = _openai_summ_config(tmp_path)
+        # Prove the openai path never falls back to the ollama get_ps probe.
+        ollama_mock = MagicMock()
+        ollama_mock.get_ps.side_effect = OllamaError("get_ps must not be called")
+        tools._get_ollama_client = MagicMock(return_value=ollama_mock)
+        with patch("requests.get", return_value=_openai_models_response()), \
+             patch("requests.post", return_value=_openai_post_response("A concise summary.")), \
+             patch(
+                 "ironclaude.orchestrator_mcp.apply_communication_profile",
+                 side_effect=lambda spot, prompt: prompt,
+             ):
+            result = json.loads(tools.list_claude_sessions())
+        assert result[0]["summary"] == "A concise summary."
+        ollama_mock.get_ps.assert_not_called()
+
+    def test_openai_unreachable_degrades_to_error_string(
+        self, tools, mock_tmux, tmp_path,
+    ):
+        self._setup_tmux(mock_tmux)
+        tools._ollama_config_path = _openai_summ_config(tmp_path, base_url="http://llm-host-down/v1")
+        import requests as req_mod
+        with patch("requests.get", side_effect=req_mod.ConnectionError("refused")), \
+             patch(
+                 "ironclaude.orchestrator_mcp.apply_communication_profile",
+                 side_effect=lambda spot, prompt: prompt,
+             ):
+            result = json.loads(tools.list_claude_sessions())
+        assert result[0]["summary"].startswith("ERROR")
+
+
+def test_grade_broken_openai_config_degrades_to_infrastructure_error(tmp_path):
+    """A backend=openai config with NO openai block must degrade to an
+    infrastructure_error dict, not raise/crash grade()."""
+    from ironclaude.grader import LocalGrader
+    cfg = tmp_path / "broken-openai-config.json"
+    cfg.write_text(json.dumps({"backend": "openai"}))
+    grader = LocalGrader(config_path=str(cfg))
+    result = grader.grade("system prompt", "user prompt", GRADE_SCHEMA)
+    assert result["infrastructure_error"] is True
+
+
+def test_grade_spot_model_override_honored_on_ollama_payload(tmp_path):
+    """spots.grader.model must override the ollama payload's model field."""
+    from ironclaude.grader import LocalGrader
+    cfg = tmp_path / "spot-override-config.json"
+    cfg.write_text(json.dumps({
+        "backend": "ollama",
+        "ollama": {"url": "http://x", "model": "m"},
+        "spots": {"grader": {"model": "custom-x"}},
+    }))
+    grader = LocalGrader(config_path=str(cfg))
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "response": '{"grade": "A", "approved": true, "feedback": "ok"}'
+    }
+    mock_response.raise_for_status = MagicMock()
+    with patch("requests.post", return_value=mock_response) as mock_post:
+        grader.grade("system prompt", "user prompt", GRADE_SCHEMA)
+    payload = mock_post.call_args[1]["json"]
+    assert payload["model"] == "custom-x"
+
+
+def test_grade_no_spot_override_keeps_config_model_byte_identical(tmp_path):
+    """No spots.grader override must leave the ollama payload model unchanged
+    (byte-identity with the pre-existing config-model resolution)."""
+    from ironclaude.grader import LocalGrader
+    cfg = tmp_path / "no-spot-override-config.json"
+    cfg.write_text(json.dumps({
+        "backend": "ollama",
+        "ollama": {"model": "cfg-m"},
+    }))
+    grader = LocalGrader(config_path=str(cfg))
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "response": '{"grade": "A", "approved": true, "feedback": "ok"}'
+    }
+    mock_response.raise_for_status = MagicMock()
+    with patch("requests.post", return_value=mock_response) as mock_post:
+        grader.grade("system prompt", "user prompt", GRADE_SCHEMA)
+    payload = mock_post.call_args[1]["json"]
+    assert payload["model"] == "cfg-m"
+
+
 def test_grade_strips_leaked_special_tokens(tmp_path):
     """A leaked <|tool_response> control token after valid JSON must not break parsing."""
     from ironclaude.grader import LocalGrader
@@ -681,3 +826,29 @@ def test_grade_strips_leaked_special_tokens(tmp_path):
 
     assert result == {"waiting": True}
     assert "infrastructure_error" not in result
+
+
+def test_message_path_graders_drop_hardcoded_timeout_override():
+    """The two message-path grader construction sites must not hardcode timeout=15;
+    they honor the resolved config timeout instead (LocalGrader(keep_alive="30m"))."""
+    src = Path(__file__).resolve().parents[1] / "src" / "ironclaude"
+    brain_client = (src / "brain_client.py").read_text()
+    main = (src / "main.py").read_text()
+    assert "LocalGrader(timeout=15" not in brain_client
+    assert "LocalGrader(timeout=15" not in main
+    assert 'LocalGrader(keep_alive="30m")' in brain_client
+    assert 'LocalGrader(keep_alive="30m")' in main
+
+
+def test_grader_no_override_honors_config_timeout(tmp_path):
+    """A LocalGrader with no timeout override builds its client with the config
+    timeout_seconds (not the pre-existing 15s override, not the 120s default)."""
+    from ironclaude.grader import LocalGrader
+    cfg = tmp_path / "timeout-config.json"
+    cfg.write_text(json.dumps({
+        "validation_backend": "ollama",
+        "ollama": {"url": "http://x"},
+        "timeout_seconds": 300,
+    }))
+    grader = LocalGrader(config_path=str(cfg), keep_alive="30m")
+    assert grader._get_client()._timeout == 300

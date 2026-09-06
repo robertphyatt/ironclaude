@@ -3,10 +3,12 @@ import os
 import signal
 import subprocess
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import ironclaude.cli as cli_module
 from ironclaude.cli import main
 
 
@@ -122,3 +124,235 @@ def test_restart_e2e_real_sighup(pid_file, monkeypatch, capsys):
             proc.wait()
         if proc.stdout:
             proc.stdout.close()
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "+1", "1.5", "abc", "１２３"])
+def test_stop_refuses_non_positive_or_non_ascii_decimal_pid(
+    pid_file, raw, capsys
+):
+    pid_file.write_text(raw)
+    with patch("os.kill") as mock_kill:
+        rc = main(["stop"])
+    assert rc == 1
+    mock_kill.assert_not_called()
+    assert "PID file corrupt" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("cmdline", "expected"),
+    [
+        ("/usr/bin/python3 -u -m ironclaude.main --no-respawn", True),
+        ("/usr/bin/notpython -m ironclaude.main", False),
+        ("/usr/bin/python3 -m ironclaude.main.evil", False),
+        ("/usr/bin/python3 worker.py --label ironclaude.main", False),
+        ("/usr/bin/python3 worker.py -m ironclaude.main", False),
+        ("/usr/bin/python3 -c pass -m ironclaude.main", False),
+        ("/usr/bin/python3 -m evil -m ironclaude.main", False),
+    ],
+)
+def test_daemon_identity_uses_exact_executable_and_module_tokens(
+    cmdline, expected
+):
+    with patch("subprocess.run", return_value=_fake_ps(cmdline)):
+        assert cli_module._pid_is_daemon(4242) is expected
+
+
+def test_stop_refuses_stale_or_reused_pid_before_signal(pid_file, capsys):
+    pid_file.write_text("4242")
+    with patch("ironclaude.cli._pid_is_daemon", return_value=False), \
+            patch("os.kill") as mock_kill:
+        rc = main(["stop"])
+    assert rc == 1
+    mock_kill.assert_not_called()
+    assert "no longer belongs to ironclaude" in capsys.readouterr().out
+
+
+def test_stop_revalidates_identity_immediately_before_signal(pid_file, capsys):
+    pid_file.write_text("4242")
+    with patch("ironclaude.cli._pid_is_daemon", side_effect=[True, False]), \
+            patch("os.kill") as mock_kill:
+        rc = main(["stop"])
+    assert rc == 1
+    mock_kill.assert_not_called()
+    assert "changed identity before signal" in capsys.readouterr().out
+
+
+def test_stop_permission_error_is_nonzero(pid_file, capsys):
+    pid_file.write_text("4242")
+    with patch("ironclaude.cli._pid_is_daemon", return_value=True), \
+            patch("os.kill", side_effect=PermissionError) as mock_kill:
+        rc = main(["stop"])
+    assert rc == 1
+    mock_kill.assert_called_once_with(4242, signal.SIGTERM)
+    assert "No permission" in capsys.readouterr().out
+
+
+def test_stop_success_requires_pid_to_stop_identifying_as_daemon(pid_file, capsys):
+    pid_file.write_text("4242")
+    with patch(
+        "ironclaude.cli._pid_is_daemon", side_effect=[True, True, False]
+    ), patch("os.kill") as mock_kill:
+        rc = main(["stop"])
+    assert rc == 0
+    mock_kill.assert_called_once_with(4242, signal.SIGTERM)
+    assert "stopped" in capsys.readouterr().out
+
+
+def test_stop_timeout_is_nonzero_and_never_claims_success(pid_file, capsys):
+    pid_file.write_text("4242")
+    with patch("ironclaude.cli._pid_is_daemon", return_value=True), \
+            patch("os.kill") as mock_kill:
+        rc = cli_module._cmd_stop(timeout_seconds=0)
+    assert rc == 1
+    mock_kill.assert_called_once_with(4242, signal.SIGTERM)
+    out = capsys.readouterr().out
+    assert "still running" in out
+    assert "stopped" not in out
+
+
+def test_stop_checks_identity_once_more_at_deadline(pid_file, capsys):
+    pid_file.write_text("4242")
+    with patch(
+        "ironclaude.cli._pid_is_daemon", side_effect=[True, True, False]
+    ), patch("os.kill") as mock_kill:
+        rc = cli_module._cmd_stop(timeout_seconds=0)
+    assert rc == 0
+    mock_kill.assert_called_once_with(4242, signal.SIGTERM)
+    assert "stopped" in capsys.readouterr().out
+
+
+def test_canonical_stop_allows_local_shutdown_beyond_five_seconds(
+    pid_file, capsys
+):
+    pid_file.write_text("4242")
+    with patch(
+        "ironclaude.cli._pid_is_daemon",
+        side_effect=[True, True, True, True, False],
+    ), patch("ironclaude.cli.time.monotonic", side_effect=[0.0, 0.0, 6.0, 7.0]), \
+            patch("ironclaude.cli.time.sleep"), patch("os.kill") as mock_kill:
+        rc = main(["stop"])
+    assert rc == 0
+    mock_kill.assert_called_once_with(4242, signal.SIGTERM)
+    assert "stopped" in capsys.readouterr().out
+
+
+def test_canonical_stop_times_out_at_local_120_second_bound(
+    pid_file, capsys
+):
+    pid_file.write_text("4242")
+    with patch("ironclaude.cli._pid_is_daemon", return_value=True), \
+            patch("ironclaude.cli.time.monotonic", side_effect=[0.0, 0.0, 120.0]), \
+            patch("ironclaude.cli.time.sleep"), patch("os.kill") as mock_kill:
+        rc = main(["stop"])
+    assert rc == 1
+    mock_kill.assert_called_once_with(4242, signal.SIGTERM)
+    assert mock_kill.call_args_list == [((4242, signal.SIGTERM),)]
+    out = capsys.readouterr().out
+    assert "still running" in out
+    assert "stopped" not in out
+
+
+def test_stop_e2e_real_same_uid_sigterm(pid_file, monkeypatch, capsys):
+    monkeypatch.setattr(os, "kill", _real_os_kill)
+    script = (
+        "import signal, sys, os, time\n"
+        "signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))\n"
+        "print(os.getpid(), flush=True)\n"
+        "time.sleep(5)\n"
+        "sys.exit(1)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        pid = int(proc.stdout.readline().strip())
+        pid_file.write_text(str(pid))
+
+        def still_target(candidate):
+            assert candidate == pid
+            return proc.poll() is None
+
+        with patch("ironclaude.cli._pid_is_daemon", side_effect=still_target):
+            rc = main(["stop"])
+
+        assert rc == 0
+        assert proc.wait(timeout=2) == 0
+        assert "stopped" in capsys.readouterr().out
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if proc.stdout:
+            proc.stdout.close()
+
+
+def test_stop_real_siginfo_handler_suppresses_respawn(
+    pid_file, tmp_path, monkeypatch, capsys
+):
+    """A real same-UID SIGTERM must reach the SA_SIGINFO clean-shutdown path."""
+    monkeypatch.setattr(os, "kill", _real_os_kill)
+    respawn_marker = tmp_path / "respawned"
+    script = (
+        "import os, sys, time\n"
+        "from pathlib import Path\n"
+        "import ironclaude.main as daemon_main\n"
+        "daemon_main._daemon = None\n"
+        "daemon_main._clean_shutdown = False\n"
+        "daemon_main._sigterm_trusted = False\n"
+        f"marker = Path({str(respawn_marker)!r})\n"
+        "daemon_main._spawn_respawner = lambda: marker.write_text('respawned')\n"
+        "daemon_main._install_sigaction_handler()\n"
+        "print(os.getpid(), flush=True)\n"
+        "deadline = time.monotonic() + 5\n"
+        "while not daemon_main._clean_shutdown and time.monotonic() < deadline:\n"
+        "    time.sleep(0.01)\n"
+        "if not daemon_main._clean_shutdown:\n"
+        "    daemon_main._spawn_respawner()\n"
+        "print(f'clean={daemon_main._clean_shutdown}', flush=True)\n"
+        "sys.exit(0 if daemon_main._clean_shutdown else 2)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        pid = int(proc.stdout.readline().strip())
+        pid_file.write_text(str(pid))
+
+        def still_target(candidate):
+            assert candidate == pid
+            return proc.poll() is None
+
+        with patch("ironclaude.cli._pid_is_daemon", side_effect=still_target):
+            rc = main(["stop"])
+
+        stdout, stderr = proc.communicate(timeout=2)
+        assert rc == 0
+        assert proc.returncode == 0, stderr
+        assert "clean=True" in stdout
+        assert not respawn_marker.exists()
+        assert "stopped" in capsys.readouterr().out
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if proc.stdout:
+            proc.stdout.close()
+        if proc.stderr:
+            proc.stderr.close()
+
+
+def test_make_stop_delegates_without_pid_kill_or_sleep_logic():
+    makefile = Path(__file__).resolve().parents[1] / "Makefile"
+    text = makefile.read_text()
+    stop_recipe = text.split("\nstop:\n", 1)[1].split("\nfollow-run:\n", 1)[0]
+    assert "$(PYTHON) -m ironclaude.cli stop" in stop_recipe
+    assert "kill" not in stop_recipe
+    assert "sleep" not in stop_recipe
+    assert "PID_FILE" not in stop_recipe

@@ -109,18 +109,19 @@ def format_heartbeat(
     workers: list[dict],
     brain_usage: dict | None = None,
     waits: dict | None = None,
-    commander_waits: dict | None = None,
+    brain_waits: dict | None = None,
     operator_name: str = "Operator",
     ollama_degraded: bool = False,
     blocked_directives: list[dict] | None = None,
+    degraded_backend_label: str = "Ollama",
 ) -> str:
     waits = waits or {}
-    commander_waits = commander_waits or {}
+    brain_waits = brain_waits or {}
     blocked_directives = blocked_directives or []
-    if not workers and not waits and not commander_waits and not blocked_directives:
+    if not workers and not waits and not brain_waits and not blocked_directives:
         base = "*Heartbeat* | No active workers"
         if ollama_degraded:
-            base += "\n⚠️ validator degraded (Ollama endpoint(s) down — see logs)"
+            base += f"\n⚠️ validator degraded ({degraded_backend_label} endpoint(s) down — see logs)"
         return base
     lines = ["*Heartbeat*"]
     if blocked_directives:
@@ -131,13 +132,13 @@ def format_heartbeat(
                 f"  • #{block['directive_id']} — {capabilities} "
                 f"({block['denial_scope']}): {_escape_mrkdwn(block.get('reason') or '')}"
             )
-    if waits or commander_waits:
-        # commander_waits is currently unwired by every caller (a future task must
-        # define what "waiting on commander" means) — only render its section when
-        # it actually has entries, instead of an always-empty "there is nothing" line.
-        if commander_waits:
-            lines.append("⏳ *WAITING ON COMMANDER:*")
-            for wid, info in commander_waits.items():
+    if waits or brain_waits:
+        # brain_waits is populated by the brain-wait classifier — only render its
+        # section when it actually has entries, instead of an always-empty
+        # "there is nothing" line.
+        if brain_waits:
+            lines.append("⏳ *WAITING ON Brain:*")
+            for wid, info in brain_waits.items():
                 question = _escape_mrkdwn(str((info or {}).get("question") or "").strip()) or "(awaiting reply)"
                 lines.append(f"  • `{wid}` — {question}")
         lines.append(f"⏳ *WAITING ON {operator_name}:*")
@@ -155,12 +156,21 @@ def format_heartbeat(
         if len(desc) > 60:
             desc = desc[:60] + "..."
         stage = w.get("workflow_stage") or "unknown"
-        if w["id"] in commander_waits:
-            tag = " — ⏳ waiting on commander"
+        if w["id"] in brain_waits:
+            tag = " — ⏳ waiting on brain"
         elif w["id"] in waits:
             tag = f" — ⏳ waiting on {operator_name}"
         else:
             tag = ""
+        prompt = w.get("prompt_incident")
+        if isinstance(prompt, dict):
+            age = _fmt_duration(float(prompt.get("age_seconds") or 0))
+            dispatch = str(prompt.get("dispatch_state") or "unknown")
+            failure = prompt.get("failure_category")
+            prompt_tag = f" — ⚠ prompt active {age}, dispatch {dispatch}"
+            if failure:
+                prompt_tag += f" ({_escape_mrkdwn(str(failure))})"
+            tag += prompt_tag
         lines.append(f'• {w["id"]} — "{desc}" ({stage}{tag})')
     if brain_usage is not None:
         inp = brain_usage.get("input_tokens", 0)
@@ -173,8 +183,28 @@ def format_heartbeat(
                 line += f" — turn in progress (last activity {_fmt_duration(age)} ago)"
         lines.append(line)
     if ollama_degraded:
-        lines.append("⚠️ validator degraded (Ollama endpoint(s) down — see logs)")
+        lines.append(f"⚠️ validator degraded ({degraded_backend_label} endpoint(s) down — see logs)")
     return "\n".join(lines)
+
+
+def resolve_degraded_backend_label(config_path: str) -> str:
+    """Display name of the resolved validator backend (for the degraded heartbeat).
+
+    Fail-safe: a missing/unparseable config resolves to the ollama default -> 'Ollama'.
+    """
+    import json
+
+    from ironclaude.backend_resolver import resolve_backend
+
+    try:
+        with open(config_path) as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        cfg = {}
+    backend = resolve_backend(cfg, "grader").backend
+    return {"openai": "OpenAI", "ollama": "Ollama"}.get(
+        backend, backend.capitalize() if backend else "Ollama"
+    )
 
 
 def format_brain_restarted(restart_count: int, reason: str = "unknown") -> str:
@@ -196,6 +226,25 @@ def format_brain_circuit_breaker(restart_count: int, max_restarts: int, window_s
         f"*Brain Circuit Breaker Tripped*\n"
         f"{restart_count} restarts detected (limit: {max_restarts} per {window_seconds // 60} min).\n"
         f"Brain paused. Manual restart required."
+    )
+
+
+def format_brain_capability_blocked(observation: dict) -> str:
+    reason = _escape_mrkdwn(str(observation.get("reason") or "unknown")[:256])
+    source = _escape_backticks(
+        _escape_mrkdwn(str(observation.get("source_companion") or "(missing)")[:2048])
+    )
+    destination = _escape_backticks(_escape_mrkdwn(
+        str(observation.get("destination_companion") or "(missing)")[:2048]
+    ))
+    return (
+        "*Codex Brain capability blocked*\n"
+        f"Reason: `{reason}`\n"
+        f"Source: `{source}`\n"
+        f"Destination: `{destination}`\n"
+        "Existing destination preserved. Commander is holding without provider "
+        "fallback, model calls, or repeated alerts; local preflight will recheck "
+        "on bounded backoff."
     )
 
 

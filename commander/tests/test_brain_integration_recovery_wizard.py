@@ -19,7 +19,91 @@ WORKFLOW_PATH = (
     Path(__file__).resolve().parents[1] / "src" / "brain" / "rules" / "workflow.md"
 )
 
-SECTION_HEADING = "### 6c. Guided Integration-Recovery Wizard"
+DEAD_WORKER_HEADING = "### 6c. Dead-Worker Cleanup"
+DEAD_WORKER_TABLE_START = "<!-- DEAD_WORKER_DISPOSITION_TABLE_START -->"
+DEAD_WORKER_TABLE_END = "<!-- DEAD_WORKER_DISPOSITION_TABLE_END -->"
+
+
+def _read_dead_worker_section() -> str:
+    text = WORKFLOW_PATH.read_text()
+    start = text.find(DEAD_WORKER_HEADING)
+    assert start != -1, f"{DEAD_WORKER_HEADING!r} heading not found in workflow.md"
+    end = text.find("\n### ", start + len(DEAD_WORKER_HEADING))
+    return text[start:end if end != -1 else len(text)]
+
+
+def _dead_worker_rows() -> dict[str, tuple[str, str]]:
+    section = _read_dead_worker_section()
+    start = section.index(DEAD_WORKER_TABLE_START)
+    end = section.index(DEAD_WORKER_TABLE_END, start)
+    rows = {}
+    for line in section[start:end].splitlines():
+        columns = [column.strip() for column in line.strip().strip("|").split("|")]
+        if len(columns) == 3 and columns[0] not in {"State", "---"}:
+            rows[columns[0]] = (columns[1], columns[2])
+    return rows
+
+
+EXPECTED_DEAD_WORKER_ROWS = {
+    "authorized abandonment / paused rebase": (
+        "status -> abort -> kill_worker -> verify returned state", "none",
+    ),
+    "authorized abandonment / no paused rebase": (
+        "status -> kill_worker -> verify returned state", "none",
+    ),
+    "integration intended": ("status -> section 6d", "section 6d governs"),
+    "disposition absent": (
+        "status -> ask once -> execute selected Commander operations",
+        "one natural-language disposition question",
+    ),
+    "infrastructure error": (
+        "preserve assignment -> report exact error once", "none",
+    ),
+}
+
+
+@pytest.fixture(scope="module")
+def dead_worker_section() -> str:
+    return _read_dead_worker_section()
+
+
+def test_dead_worker_decision_table_is_exact():
+    assert _dead_worker_rows() == EXPECTED_DEAD_WORKER_ROWS
+
+
+def test_dead_worker_classifies_before_disposition_table(dead_worker_section):
+    assert dead_worker_section.index(
+        'recover_worker_integration(worker_id, "status")'
+    ) < dead_worker_section.index(DEAD_WORKER_TABLE_START)
+
+
+def test_dead_worker_existing_authority_prevents_reprompt(dead_worker_section):
+    normalized = " ".join(dead_worker_section.split())
+    assert "already integrated, superseded, or should be abandoned" in normalized
+    assert "do not ask again" in normalized
+
+
+def test_dead_worker_ambiguity_question_discloses_effects(dead_worker_section):
+    assert "one natural-language disposition question" in dead_worker_section
+    assert "recommended choice" in dead_worker_section
+    assert "reasons" in dead_worker_section
+    assert "exact Commander operations and effects" in dead_worker_section
+
+
+def test_dead_worker_infrastructure_failure_is_exact_once(dead_worker_section):
+    assert "preserve the assignment" in dead_worker_section
+    assert dead_worker_section.count("report the exact error exactly once") == 1
+
+
+def test_dead_worker_prohibits_delegation_and_operator_handback(dead_worker_section):
+    lowered = dead_worker_section.lower()
+    assert "never spawn another worker to clean up" in lowered
+    assert "/ironclaude:use-primary-checkout" in dead_worker_section
+    assert "never ask the operator to attach to tmux" in lowered
+    assert "operator-run git/worktree commands" in lowered
+
+
+SECTION_HEADING = "### 6d. Guided Integration-Recovery Wizard"
 
 
 def _read_wizard_section() -> str:

@@ -23,6 +23,7 @@ def test_closed_inventory_has_every_approved_path():
         "shadow_grader": "ai",
         "session_summarizer": "ai",
         "hook_validator": "machine",
+        "actual_fable_subagent": "ai",
     }
 
 

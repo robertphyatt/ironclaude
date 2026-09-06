@@ -54,9 +54,9 @@ _gbtw_extract_in_flight() {
     # input.run_in_background==true whose tool_result carries
     # 'Command running in background with ID: <id>'.
     launched_agent=$(printf '%s\n' "$tail_data" | \
-        jq -r 'select(.toolUseResult.status == "async_launched") | .toolUseResult.agentId // empty' 2>/dev/null || true)
+        jq -R -r 'fromjson? | select(.toolUseResult.status == "async_launched") | .toolUseResult.agentId // empty' 2>/dev/null || true)
     launched_bash=$(printf '%s\n' "$tail_data" | \
-        jq -r 'select(.type == "user") | .message.content[]? | select(.type == "tool_result") | .content[]?.text? // empty' 2>/dev/null | \
+        jq -R -r 'fromjson? | select(.type == "user") | .message.content[]? | select(.type == "tool_result") | .content[]?.text? // empty' 2>/dev/null | \
         sed -nE 's/.*Command running in background with ID:[[:space:]]*([A-Za-z0-9_-]+).*/\1/p' || true)
     launched_all=$(printf '%s\n%s\n' "$launched_agent" "$launched_bash" | sed '/^$/d' | LC_ALL=C sort -u)
 
@@ -71,7 +71,7 @@ _gbtw_extract_in_flight() {
     # so the whole string is examined per input record.
     local completed_notif completed_plain
     completed_notif=$(printf '%s\n' "$tail_data" | \
-        jq -r 'select(.origin.kind == "task-notification")
+        jq -R -r 'fromjson? | select(.origin.kind == "task-notification")
                | (.message.content // "") | tostring
                | select(test("<status>(completed|failed|killed|stopped)</status>"))
                | (capture("<task-id>(?<id>[^<]+)</task-id>") | .id)' 2>/dev/null || true)
@@ -79,7 +79,7 @@ _gbtw_extract_in_flight() {
     # text contains BOTH 'agentId: <id>' and 'subagent_tokens:'. Same
     # in-jq-string approach so the whole text is examined per record.
     completed_plain=$(printf '%s\n' "$tail_data" | \
-        jq -r 'select(.type == "user")
+        jq -R -r 'fromjson? | select(.type == "user")
                | .message.content[]? | select(.type == "tool_result")
                | .content[]?.text? // empty
                | select(test("subagent_tokens:") and test("agentId:"))

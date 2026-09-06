@@ -3225,8 +3225,8 @@ var require_utils = __commonJS({
       }
       return ind;
     }
-    function removeDotSegments(path7) {
-      let input = path7;
+    function removeDotSegments(path9) {
+      let input = path9;
       const output = [];
       let nextSlash = -1;
       let len = 0;
@@ -3478,8 +3478,8 @@ var require_schemes = __commonJS({
         wsComponent.secure = void 0;
       }
       if (wsComponent.resourceName) {
-        const [path7, query] = wsComponent.resourceName.split("?");
-        wsComponent.path = path7 && path7 !== "/" ? path7 : void 0;
+        const [path9, query] = wsComponent.resourceName.split("?");
+        wsComponent.path = path9 && path9 !== "/" ? path9 : void 0;
         wsComponent.query = query;
         wsComponent.resourceName = void 0;
       }
@@ -7389,8 +7389,8 @@ function getErrorMap() {
 
 // node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue = (params) => {
-  const { data, path: path7, errorMaps, issueData } = params;
-  const fullPath = [...path7, ...issueData.path || []];
+  const { data, path: path9, errorMaps, issueData } = params;
+  const fullPath = [...path9, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -7506,11 +7506,11 @@ var errorUtil;
 
 // node_modules/zod/v3/types.js
 var ParseInputLazyPath = class {
-  constructor(parent, value, path7, key) {
+  constructor(parent, value, path9, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path7;
+    this._path = path9;
     this._key = key;
   }
   get path() {
@@ -12759,8 +12759,8 @@ var StdioServerTransport = class {
 
 // src/index.ts
 import fs2 from "node:fs";
-import os2 from "node:os";
-import path6 from "node:path";
+import os4 from "node:os";
+import path8 from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/db.ts
@@ -13305,7 +13305,7 @@ function consumeMatchingHumanIntent(db, input, clock = () => /* @__PURE__ */ new
 }
 
 // src/git-authority.ts
-import path3 from "node:path";
+import path5 from "node:path";
 
 // src/git.ts
 import { spawnSync } from "node:child_process";
@@ -13499,6 +13499,84 @@ function isAncestor(cwd, ancestor, descendant) {
   throw gitError(cwd, ["merge-base", "--is-ancestor", ancestor, descendant], result2.stderr || "");
 }
 
+// src/scoped-tree.ts
+import { rmSync } from "node:fs";
+import os2 from "node:os";
+import path3 from "node:path";
+function buildScopedStagedTree(repoPath, parentOid, allowedFiles) {
+  const raw = runGit(repoPath, ["ls-files", "--stage", "-z"]);
+  const index = /* @__PURE__ */ new Map();
+  for (const record2 of raw.split("\0")) {
+    if (record2.length === 0) continue;
+    const tab = record2.indexOf("	");
+    if (tab === -1) continue;
+    const [mode, oid2, stage] = record2.slice(0, tab).split(/\s+/);
+    const p = record2.slice(tab + 1);
+    const list = index.get(p) ?? [];
+    list.push({ mode, oid: oid2, stage });
+    index.set(p, list);
+  }
+  const tmpIndex = path3.join(os2.tmpdir(), `ironclaude-scoped-index-${process.pid}-${Date.now()}`);
+  const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
+  try {
+    runGitEnv(repoPath, ["read-tree", parentOid], env);
+    for (const rel of allowedFiles) {
+      if (rel === "" || rel.endsWith("/") || path3.posix.isAbsolute(rel) || rel !== path3.posix.normalize(rel)) {
+        throw new Error(`Cannot scope commit: allowed_files entry '${rel}' is not a canonical repo-relative path (no leading ./, no .., no //, no absolute path, no trailing slash)`);
+      }
+      const entries = index.get(rel);
+      if (entries && entries.some((e) => e.stage !== "0")) {
+        throw new Error(`Cannot scope commit: '${rel}' has an unresolved merge conflict (unmerged index entry); resolve it before committing`);
+      }
+      const staged = entries?.find((e) => e.stage === "0");
+      if (staged) {
+        runGitEnv(repoPath, ["update-index", "--add", "--cacheinfo", `${staged.mode},${staged.oid},${rel}`], env);
+      } else {
+        runGitEnv(repoPath, ["update-index", "--force-remove", "--", rel], env);
+      }
+    }
+    return runGitEnv(repoPath, ["write-tree"], env).trim();
+  } finally {
+    try {
+      rmSync(tmpIndex, { force: true });
+    } catch {
+    }
+  }
+}
+
+// src/plan-scope.ts
+import Database2 from "better-sqlite3";
+import os3 from "node:os";
+import path4 from "node:path";
+function stateDbPath() {
+  return process.env.STATE_MANAGER_DB_PATH ?? path4.join(os3.homedir(), ".claude", "ironclaude.db");
+}
+function readSessionAllowedFiles(providerRootSessionId) {
+  let sdb;
+  try {
+    sdb = new Database2(stateDbPath(), { readonly: true, fileMustExist: true, timeout: 1e4 });
+  } catch (e) {
+    throw new Error(`Cannot read plan scope: state DB unreadable (${e.message})`);
+  }
+  try {
+    const rows = sdb.prepare("SELECT allowed_files FROM wave_tasks WHERE terminal_session = ?").all(providerRootSessionId);
+    const set = /* @__PURE__ */ new Set();
+    for (const r of rows) {
+      if (!r.allowed_files) continue;
+      const arr = JSON.parse(r.allowed_files);
+      if (Array.isArray(arr)) {
+        for (const f of arr) if (typeof f === "string" && f.length > 0) set.add(f);
+      }
+    }
+    if (set.size === 0) {
+      throw new Error("Cannot read plan scope: no allowed_files for this session (no active plan)");
+    }
+    return [...set].sort();
+  } finally {
+    sdb.close();
+  }
+}
+
 // src/git-authority.ts
 var OID = /^[0-9a-f]{40,64}$/i;
 var REMOTE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -13685,7 +13763,7 @@ function resolveEffectiveCheckout(db, input, workspaceGuid) {
   if (!assignment || assignment.repository_identity !== repository.repositoryIdentity || assignment.owner_session_id !== input.providerRootSessionId) {
     throw new Error("Direct Git authority provider root, repository, or workspace binding does not match");
   }
-  const expectedPath = path3.join(repository.primaryCheckoutPath, ".ironclaude", "worktrees", assignment.workspace_guid);
+  const expectedPath = path5.join(repository.primaryCheckoutPath, ".ironclaude", "worktrees", assignment.workspace_guid);
   if (assignment.worktree_path !== expectedPath || assignment.branch !== `ironclaude/${assignment.workspace_guid}`) {
     throw new Error("Direct Git authority managed workspace identity does not match");
   }
@@ -13726,16 +13804,22 @@ function resolveUnassignedPrimaryCheckout(db, repositoryPath, providerRootSessio
   if (branch.length === 0) throw new Error("Unassigned-primary direct-Git requires a checked-out branch (HEAD is detached)");
   return { mode: "primary-unassigned", path: repository.primaryCheckoutPath };
 }
-function observeUnassignedCommitEvidence(path7) {
-  const canonicalBranch = runGit(path7, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
+function observeUnassignedCommitEvidence(path9, allowedFiles) {
+  const canonicalBranch = runGit(path9, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
   const localRef = `refs/heads/${canonicalBranch}`;
+  const parentOid = runGit(path9, ["rev-parse", "--verify", "HEAD^{commit}"]).trim();
+  const stagedTree = buildScopedStagedTree(path9, parentOid, allowedFiles);
+  if (stagedTree === runGit(path9, ["rev-parse", "--verify", `${parentOid}^{tree}`]).trim()) {
+    throw new Error("Nothing to commit within this session's allowed_files (only foreign or unchanged files are staged)");
+  }
   return {
     checkoutMode: "primary-unassigned",
     canonicalBranch,
     localRef,
-    stagedTree: runGit(path7, ["write-tree"]).trim(),
+    stagedTree,
     parentRef: "HEAD",
-    parentOid: runGit(path7, ["rev-parse", "--verify", "HEAD^{commit}"]).trim()
+    parentOid,
+    allowedFiles
   };
 }
 function assertFastForwardPush(worktreePath, evidence) {
@@ -13744,49 +13828,54 @@ function assertFastForwardPush(worktreePath, evidence) {
     throw new Error("Unassigned-primary push must be fast-forward; non-fast-forward to a shared branch is refused");
   }
 }
-function observeUnassignedPushEvidence(path7) {
-  const canonicalBranch = runGit(path7, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
+function observeUnassignedPushEvidence(path9) {
+  const canonicalBranch = runGit(path9, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
   const localRef = `refs/heads/${canonicalBranch}`;
   const remoteName = "origin";
-  const remoteUrl = runGit(path7, ["remote", "get-url", remoteName]).trim();
-  const pushUrl = runGit(path7, ["remote", "get-url", "--push", remoteName]).trim();
+  const remoteUrl = runGit(path9, ["remote", "get-url", remoteName]).trim();
+  const pushUrl = runGit(path9, ["remote", "get-url", "--push", remoteName]).trim();
   if (remoteUrl !== pushUrl) denyEvidence();
   const evidence = {
     checkoutMode: "primary-unassigned",
     canonicalBranch,
     localRef,
-    localOid: runGit(path7, ["rev-parse", "--verify", `${localRef}^{commit}`]).trim(),
+    localOid: runGit(path9, ["rev-parse", "--verify", `${localRef}^{commit}`]).trim(),
     remoteName,
     remoteUrl,
     destinationRef: localRef,
-    expectedRemoteOldOid: remoteOldOid(path7, remoteName, localRef)
+    expectedRemoteOldOid: remoteOldOid(path9, remoteName, localRef)
   };
-  assertFastForwardPush(path7, evidence);
+  assertFastForwardPush(path9, evidence);
   return evidence;
 }
-function observeUnassignedCommitAndPushEvidence(path7) {
-  const canonicalBranch = runGit(path7, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
+function observeUnassignedCommitAndPushEvidence(path9, allowedFiles) {
+  const canonicalBranch = runGit(path9, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
   const localRef = `refs/heads/${canonicalBranch}`;
   const remoteName = "origin";
-  const remoteUrl = runGit(path7, ["remote", "get-url", remoteName]).trim();
-  const pushUrl = runGit(path7, ["remote", "get-url", "--push", remoteName]).trim();
+  const remoteUrl = runGit(path9, ["remote", "get-url", remoteName]).trim();
+  const pushUrl = runGit(path9, ["remote", "get-url", "--push", remoteName]).trim();
   if (remoteUrl !== pushUrl) denyEvidence();
-  const parentOid = runGit(path7, ["rev-parse", "--verify", "HEAD^{commit}"]).trim();
-  const expectedRemoteOldOid = remoteOldOid(path7, remoteName, localRef);
-  if (expectedRemoteOldOid !== null && !isAncestor(path7, expectedRemoteOldOid, parentOid)) {
+  const parentOid = runGit(path9, ["rev-parse", "--verify", "HEAD^{commit}"]).trim();
+  const expectedRemoteOldOid = remoteOldOid(path9, remoteName, localRef);
+  if (expectedRemoteOldOid !== null && !isAncestor(path9, expectedRemoteOldOid, parentOid)) {
     throw new Error("Unassigned-primary push must be fast-forward; non-fast-forward to a shared branch is refused");
+  }
+  const stagedTree = buildScopedStagedTree(path9, parentOid, allowedFiles);
+  if (stagedTree === runGit(path9, ["rev-parse", "--verify", `${parentOid}^{tree}`]).trim()) {
+    throw new Error("Nothing to commit within this session's allowed_files (only foreign or unchanged files are staged)");
   }
   return {
     checkoutMode: "primary-unassigned",
     canonicalBranch,
     localRef,
-    stagedTree: runGit(path7, ["write-tree"]).trim(),
+    stagedTree,
     parentRef: "HEAD",
     parentOid,
     remoteName,
     remoteUrl,
     destinationRef: localRef,
-    expectedRemoteOldOid
+    expectedRemoteOldOid,
+    allowedFiles
   };
 }
 function observeDirectEvidence(checkout, operation) {
@@ -13847,7 +13936,8 @@ function verifyDirectGitAuthority(db, input) {
     }
     const repository = discoverRepository(input.repositoryPath);
     const unassigned = resolveUnassignedPrimaryCheckout(db, input.repositoryPath, input.providerRootSessionId);
-    const evidence2 = input.operation === "commit" ? observeUnassignedCommitEvidence(unassigned.path) : input.operation === "push" ? observeUnassignedPushEvidence(unassigned.path) : observeUnassignedCommitAndPushEvidence(unassigned.path);
+    const allowedFiles = input.operation === "push" ? void 0 : readSessionAllowedFiles(input.providerRootSessionId);
+    const evidence2 = input.operation === "commit" ? observeUnassignedCommitEvidence(unassigned.path, allowedFiles) : input.operation === "push" ? observeUnassignedPushEvidence(unassigned.path) : observeUnassignedCommitAndPushEvidence(unassigned.path, allowedFiles);
     const sentinel = `primary:${repository.repositoryIdentity}`;
     const intent2 = consumeMatchingHumanIntent(db, {
       operation: input.operation,
@@ -14012,9 +14102,9 @@ function pushExactAuthorizedIntegratedCandidate(authority, candidateOid, targetR
 }
 
 // src/integration.ts
-import { existsSync as existsSync2, rmSync, writeFileSync as writeFileSync2 } from "node:fs";
+import { existsSync as existsSync2, rmSync as rmSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { tmpdir } from "node:os";
-import path4 from "node:path";
+import path6 from "node:path";
 var usedDirectAuthorities = /* @__PURE__ */ new WeakSet();
 var usedReconcileAuthorities = /* @__PURE__ */ new WeakSet();
 var usedConfirmResolutionAuthorities = /* @__PURE__ */ new WeakSet();
@@ -14132,7 +14222,8 @@ function exactCommitEvidence(authority) {
 }
 function validateExactCommitState(sourcePath, evidence) {
   const branch = runGit(sourcePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
-  const tree = runGit(sourcePath, ["write-tree"]).trim();
+  const scoped = evidence;
+  const tree = scoped.checkoutMode === "primary-unassigned" && Array.isArray(scoped.allowedFiles) ? buildScopedStagedTree(sourcePath, scoped.parentOid, scoped.allowedFiles) : runGit(sourcePath, ["write-tree"]).trim();
   const parent = runGit(sourcePath, ["rev-parse", "--verify", "HEAD^{commit}"]).trim();
   const local = runGit(sourcePath, ["rev-parse", "--verify", `${evidence.localRef}^{commit}`]).trim();
   if (branch !== evidence.canonicalBranch || tree !== evidence.stagedTree || parent !== evidence.parentOid || local !== parent) {
@@ -14821,7 +14912,7 @@ function snapshotResidualIfDirty(db, exact) {
   const worktree = exact.assignment.worktree_path;
   if (worktreeIsClean(worktree)) return void 0;
   const residualFiles = runGit(worktree, ["status", "--porcelain=v1", "--untracked-files=all"]).split("\n").filter((line) => line.trim() !== "").length;
-  const tmpIndex = path4.join(tmpdir(), `ironclaude-closeout-index-${exact.assignment.workspace_guid}-${process.pid}`);
+  const tmpIndex = path6.join(tmpdir(), `ironclaude-closeout-index-${exact.assignment.workspace_guid}-${process.pid}`);
   const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
   let snapshot;
   try {
@@ -14831,7 +14922,7 @@ function snapshotResidualIfDirty(db, exact) {
     snapshot = runGitEnv(worktree, ["commit-tree", tree, "-p", "HEAD", "-m", "ironclaude: close-out residual snapshot"], env).trim();
   } finally {
     try {
-      rmSync(tmpIndex, { force: true });
+      rmSync2(tmpIndex, { force: true });
     } catch {
     }
   }
@@ -14931,7 +15022,7 @@ function recoverRebaseInProgress(db, exact, mode) {
     throw error;
   }
   const stillRebaseDir = runGit(worktree, ["rev-parse", "--git-path", "rebase-merge"]).trim();
-  if (existsSync2(path4.resolve(worktree, stillRebaseDir))) {
+  if (existsSync2(path6.resolve(worktree, stillRebaseDir))) {
     const reconflict = runGit(worktree, ["diff", "--name-only", "--diff-filter=U"]).trim();
     throw new Error(`Rebase recovery stopped: rebase still in progress after continue; preserving worktree.${reconflict ? ` Unmerged paths: ${reconflict.split("\n").join(", ")}` : ""}`);
   }
@@ -14951,26 +15042,26 @@ function recoverRebaseInProgress(db, exact, mode) {
 function classifyRebaseConflicts(worktree) {
   const unmerged = runGit(worktree, ["diff", "--name-only", "--diff-filter=U"]).trim();
   if (unmerged === "") return [];
-  return unmerged.split("\n").map((path7) => {
-    const xy = runGit(worktree, ["status", "--porcelain=v1", "--", path7]).slice(0, 2);
+  return unmerged.split("\n").map((path9) => {
+    const xy = runGit(worktree, ["status", "--porcelain=v1", "--", path9]).slice(0, 2);
     let binary = false;
     try {
-      binary = /^-\t-/.test(runGit(worktree, ["diff", "--numstat", `:2:${path7}`, `:3:${path7}`]).trim());
+      binary = /^-\t-/.test(runGit(worktree, ["diff", "--numstat", `:2:${path9}`, `:3:${path9}`]).trim());
     } catch {
       binary = false;
     }
     const conflictClass = binary ? "binary" : xy === "UU" ? "overlap" : xy === "AA" ? "add-add" : xy === "UD" || xy === "DU" ? "delete-modify" : "other";
     const stageLines = (stage) => {
       try {
-        return runGit(worktree, ["show", `:${stage}:${path7}`]).split("\n").length;
+        return runGit(worktree, ["show", `:${stage}:${path9}`]).split("\n").length;
       } catch {
         return 0;
       }
     };
     const ours = stageLines(2);
     const theirs = stageLines(3);
-    const summary = `${path7}: your reviewed work has ${theirs} line(s) here; the integration target has ${ours} line(s) (${conflictClass}).`;
-    return { path: path7, conflictClass, summary };
+    const summary = `${path9}: your reviewed work has ${theirs} line(s) here; the integration target has ${ours} line(s) (${conflictClass}).`;
+    return { path: path9, conflictClass, summary };
   });
 }
 function resolveConflictHunk(db, input) {
@@ -14981,7 +15072,7 @@ function resolveConflictHunk(db, input) {
   }
   const worktree = assignment.worktree_path;
   const rebaseDir = runGit(worktree, ["rev-parse", "--git-path", "rebase-merge"]).trim();
-  if (!existsSync2(path4.resolve(worktree, rebaseDir))) {
+  if (!existsSync2(path6.resolve(worktree, rebaseDir))) {
     throw new Error("Resolve-conflict-hunk requires a paused rebase; preserving worktree");
   }
   if (input.choice === "abort") {
@@ -15002,7 +15093,7 @@ function resolveConflictHunk(db, input) {
     }
   } else if (input.choice === "prose") {
     if (input.content === void 0) throw new Error("choice 'prose' requires content");
-    writeFileSync2(path4.resolve(worktree, input.path), input.content);
+    writeFileSync2(path6.resolve(worktree, input.path), input.content);
   } else {
     throw new Error(`Unknown resolve-conflict-hunk choice: ${input.choice}`);
   }
@@ -15020,7 +15111,7 @@ function resolveConflictHunk(db, input) {
     return { path: input.path, staged, remaining, conflicts: classifyRebaseConflicts(worktree) };
   }
   const stillRebaseDir = runGit(worktree, ["rev-parse", "--git-path", "rebase-merge"]).trim();
-  const rebaseStillInProgress = existsSync2(path4.resolve(worktree, stillRebaseDir));
+  const rebaseStillInProgress = existsSync2(path6.resolve(worktree, stillRebaseDir));
   let attachedHead = true;
   try {
     runGit(worktree, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
@@ -15043,7 +15134,7 @@ function resolveConflictHunk(db, input) {
 }
 function classifyRebaseState(worktree) {
   const rebaseDir = runGit(worktree, ["rev-parse", "--git-path", "rebase-merge"]).trim();
-  if (!existsSync2(path4.resolve(worktree, rebaseDir))) return "frozen-no-rebase";
+  if (!existsSync2(path6.resolve(worktree, rebaseDir))) return "frozen-no-rebase";
   const unmerged = runGit(worktree, ["diff", "--name-only", "--diff-filter=U"]).trim();
   return unmerged !== "" ? "rebase-paused-conflict" : "rebase-paused-clean";
 }
@@ -15139,7 +15230,7 @@ function reconcileFinalization(db, input) {
   }
   if (input.rebaseRecovery) {
     const rebaseInProgressDir = runGit(assignment.worktree_path, ["rev-parse", "--git-path", "rebase-merge"]).trim();
-    if (!existsSync2(path4.resolve(assignment.worktree_path, rebaseInProgressDir))) {
+    if (!existsSync2(path6.resolve(assignment.worktree_path, rebaseInProgressDir))) {
       throw new Error("Rebase recovery requested but no rebase is in progress; preserving worktree");
     }
   }
@@ -15187,7 +15278,7 @@ function reconcileFinalization(db, input) {
       throw new Error("Crash reconciliation candidate and source HEAD differ; preserving worktree");
     }
     const rebaseDirectory = runGit(assignment.worktree_path, ["rev-parse", "--git-path", "rebase-merge"]).trim();
-    if (existsSync2(path4.resolve(assignment.worktree_path, rebaseDirectory))) {
+    if (existsSync2(path6.resolve(assignment.worktree_path, rebaseDirectory))) {
       if (input.rebaseRecovery) {
         return recoverRebaseInProgress(db, exact, input.rebaseRecovery === "abort" ? "abort" : "continue");
       }
@@ -15377,9 +15468,9 @@ function resolveSessionIdentity(client, requestMeta, claudePpidSession) {
 // src/workspace-service.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
 import { existsSync as existsSync3 } from "node:fs";
-import path5 from "node:path";
+import path7 from "node:path";
 function managedWorktreePath(primaryCheckoutPath, workspaceGuid) {
-  return path5.join(primaryCheckoutPath, ".ironclaude", "worktrees", workspaceGuid);
+  return path7.join(primaryCheckoutPath, ".ironclaude", "worktrees", workspaceGuid);
 }
 function managedBranch(workspaceGuid) {
   return `ironclaude/${workspaceGuid}`;
@@ -15967,13 +16058,13 @@ var WorkspaceService = class {
     `).all(repository.repositoryIdentity);
     const observed = listWorktrees(repository.primaryCheckoutPath);
     const observedPaths = new Set(observed.map((worktree) => worktree.path));
-    const knownPaths = new Set(assignments.map((assignment) => path5.resolve(assignment.worktree_path)));
-    const managedRoot = path5.join(repository.primaryCheckoutPath, ".ironclaude", "worktrees") + path5.sep;
+    const knownPaths = new Set(assignments.map((assignment) => path7.resolve(assignment.worktree_path)));
+    const managedRoot = path7.join(repository.primaryCheckoutPath, ".ironclaude", "worktrees") + path7.sep;
     const ambiguousWorktreePaths = observed.filter((worktree) => worktree.path.startsWith(managedRoot) && worktree.branch?.startsWith("refs/heads/ironclaude/") && !knownPaths.has(worktree.path)).map((worktree) => worktree.path).sort();
     return {
       repositoryIdentity: repository.repositoryIdentity,
-      knownWorktreePaths: assignments.map((assignment) => path5.resolve(assignment.worktree_path)).filter((worktreePath) => observedPaths.has(worktreePath)).sort(),
-      missingWorktreePaths: assignments.map((assignment) => path5.resolve(assignment.worktree_path)).filter((worktreePath) => !observedPaths.has(worktreePath)).sort(),
+      knownWorktreePaths: assignments.map((assignment) => path7.resolve(assignment.worktree_path)).filter((worktreePath) => observedPaths.has(worktreePath)).sort(),
+      missingWorktreePaths: assignments.map((assignment) => path7.resolve(assignment.worktree_path)).filter((worktreePath) => !observedPaths.has(worktreePath)).sort(),
       ambiguousWorktreePaths
     };
   }
@@ -16471,7 +16562,7 @@ function result(value) {
 async function readClaudeSessionId() {
   const ppid = process.env.CLAUDE_PPID;
   if (!ppid) return null;
-  const sessionFile = path6.join(os2.homedir(), ".claude", `ironclaude-session-${ppid}.id`);
+  const sessionFile = path8.join(os4.homedir(), ".claude", `ironclaude-session-${ppid}.id`);
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
       const value = fs2.readFileSync(sessionFile, "utf8").trim();
@@ -16508,7 +16599,7 @@ async function startWorkspaceManagerServer() {
   });
   await server.connect(new StdioServerTransport());
 }
-var invokedPath = process.argv[1] ? path6.resolve(process.argv[1]) : null;
+var invokedPath = process.argv[1] ? path8.resolve(process.argv[1]) : null;
 if (invokedPath === fileURLToPath(import.meta.url)) {
   startWorkspaceManagerServer().catch((error) => {
     console.error("Workspace-manager server error:", error);

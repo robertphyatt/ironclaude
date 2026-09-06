@@ -2,6 +2,8 @@ import type Database from 'better-sqlite3';
 import path from 'node:path';
 import { consumeHumanIntent, consumeMatchingHumanIntent, getAssignment, issueHumanIntent } from './db.js';
 import { discoverRepository, isAncestor, listWorktrees, runGit } from './git.js';
+import { buildScopedStagedTree } from './scoped-tree.js';
+import { readSessionAllowedFiles } from './plan-scope.js';
 import type { Assignment, HumanIntentReceipt } from './types.js';
 
 export type DirectGitOperation = 'commit' | 'commit-and-push' | 'push' | 'reconcile' | 'close-out' | 'confirm-resolution';
@@ -17,6 +19,7 @@ export interface CommitEvidence extends BranchEvidence {
   stagedTree: string;
   parentRef: 'HEAD';
   parentOid: string;
+  allowedFiles?: readonly string[];
 }
 
 interface RemoteEvidence extends BranchEvidence {
@@ -344,16 +347,22 @@ export function resolveUnassignedPrimaryCheckout(
   return { mode: 'primary-unassigned', path: repository.primaryCheckoutPath };
 }
 
-function observeUnassignedCommitEvidence(path: string): DirectGitAuthorityEvidence {
+function observeUnassignedCommitEvidence(path: string, allowedFiles: readonly string[]): DirectGitAuthorityEvidence {
   const canonicalBranch = runGit(path, ['symbolic-ref', '--quiet', '--short', 'HEAD']).trim();
   const localRef = `refs/heads/${canonicalBranch}`;
+  const parentOid = runGit(path, ['rev-parse', '--verify', 'HEAD^{commit}']).trim();
+  const stagedTree = buildScopedStagedTree(path, parentOid, allowedFiles);
+  if (stagedTree === runGit(path, ['rev-parse', '--verify', `${parentOid}^{tree}`]).trim()) {
+    throw new Error("Nothing to commit within this session's allowed_files (only foreign or unchanged files are staged)");
+  }
   return {
     checkoutMode: 'primary-unassigned',
     canonicalBranch,
     localRef,
-    stagedTree: runGit(path, ['write-tree']).trim(),
+    stagedTree,
     parentRef: 'HEAD',
-    parentOid: runGit(path, ['rev-parse', '--verify', 'HEAD^{commit}']).trim(),
+    parentOid,
+    allowedFiles,
   };
 }
 
@@ -392,7 +401,7 @@ function observeUnassignedPushEvidence(path: string): PushEvidence {
   return evidence;
 }
 
-function observeUnassignedCommitAndPushEvidence(path: string): CommitAndPushEvidence {
+function observeUnassignedCommitAndPushEvidence(path: string, allowedFiles: readonly string[]): CommitAndPushEvidence {
   const canonicalBranch = runGit(path, ['symbolic-ref', '--quiet', '--short', 'HEAD']).trim();
   const localRef = `refs/heads/${canonicalBranch}`;
   const remoteName = 'origin';
@@ -408,17 +417,22 @@ function observeUnassignedCommitAndPushEvidence(path: string): CommitAndPushEvid
   if (expectedRemoteOldOid !== null && !isAncestor(path, expectedRemoteOldOid, parentOid)) {
     throw new Error('Unassigned-primary push must be fast-forward; non-fast-forward to a shared branch is refused');
   }
+  const stagedTree = buildScopedStagedTree(path, parentOid, allowedFiles);
+  if (stagedTree === runGit(path, ['rev-parse', '--verify', `${parentOid}^{tree}`]).trim()) {
+    throw new Error("Nothing to commit within this session's allowed_files (only foreign or unchanged files are staged)");
+  }
   return {
     checkoutMode: 'primary-unassigned',
     canonicalBranch,
     localRef,
-    stagedTree: runGit(path, ['write-tree']).trim(),
+    stagedTree,
     parentRef: 'HEAD',
     parentOid,
     remoteName,
     remoteUrl,
     destinationRef: localRef,
     expectedRemoteOldOid,
+    allowedFiles,
   };
 }
 
@@ -489,11 +503,14 @@ export function issueDirectGitHumanIntent(
     }
     const repository = discoverRepository(input.repositoryPath);
     const unassigned = resolveUnassignedPrimaryCheckout(db, input.repositoryPath, input.providerRootSessionId);
+    const allowedFiles = input.operation === 'push'
+      ? undefined
+      : readSessionAllowedFiles(input.providerRootSessionId);
     const evidence = input.operation === 'commit'
-      ? observeUnassignedCommitEvidence(unassigned.path)
+      ? observeUnassignedCommitEvidence(unassigned.path, allowedFiles!)
       : input.operation === 'push'
         ? observeUnassignedPushEvidence(unassigned.path)
-        : observeUnassignedCommitAndPushEvidence(unassigned.path);
+        : observeUnassignedCommitAndPushEvidence(unassigned.path, allowedFiles!);
     return issueHumanIntent(db, {
       operation: input.operation,
       humanChannel: input.humanChannel,
@@ -539,11 +556,14 @@ export function verifyDirectGitAuthority(
     }
     const repository = discoverRepository(input.repositoryPath);
     const unassigned = resolveUnassignedPrimaryCheckout(db, input.repositoryPath, input.providerRootSessionId);
+    const allowedFiles = input.operation === 'push'
+      ? undefined
+      : readSessionAllowedFiles(input.providerRootSessionId);
     const evidence = input.operation === 'commit'
-      ? observeUnassignedCommitEvidence(unassigned.path)
+      ? observeUnassignedCommitEvidence(unassigned.path, allowedFiles!)
       : input.operation === 'push'
         ? observeUnassignedPushEvidence(unassigned.path)
-        : observeUnassignedCommitAndPushEvidence(unassigned.path);
+        : observeUnassignedCommitAndPushEvidence(unassigned.path, allowedFiles!);
     const sentinel = `primary:${repository.repositoryIdentity}`;
     const intent = consumeMatchingHumanIntent(db, {
       operation: input.operation,

@@ -10,6 +10,84 @@
 > `vX.Y.Z`. Land changes under `## [Unreleased]` as you go, then rename that
 > heading to the new version at release time so the entry matches what shipped.
 
+## 1.1.8: opt-in OpenAI-compatible LLM backend, per-tier reasoning effort, GPT-6 Astra, Commander plugin architecture, and reliability fixes
+
+- Every place IronClaude shadows Claude with a local model — shell plan validation, the
+  episodic-memory summarizer, and Commander's grader, shadow-grader, and session
+  summarization — can now target an OpenAI-compatible `/v1/chat/completions` endpoint
+  alongside the existing Ollama backend. Selection follows one shared resolution rule
+  implemented identically in bash, TypeScript, and Python (pinned by a conformance
+  fixture): backend = `spots.<spot>.backend ?? backend ?? validation_backend ?? <per-consumer
+  default>`, model = `spots.<spot>.model ?? <legacy alias> ?? <resolved-block>.model ??
+  <default>`. A global default plus per-spot `spots.<spot>.{backend,model}` overrides let
+  each spot point wherever the operator wants.
+- Fail-open — never crash on a bad backend. The OpenAI transport raises the same `Ollama*`
+  error types, so every existing `except OllamaError` seam catches a failure from either
+  backend. A missing/empty `openai` block, an unreachable endpoint, and a reachable endpoint
+  that answers 200 with a non-JSON body all degrade through those seams (grader →
+  `infrastructure_error`, summarization → ERROR string, shell/TS → default fall-through)
+  instead of raising.
+- Per-spot model overrides work on both backends without changing the Ollama request bytes
+  for existing configs — each ollama dispatch prepends the raw spot override to its unchanged
+  model expression — and the block-level `timeout_seconds` is honored at every OpenAI dispatch
+  site (so slow local models don't time out early). `config-guard` bounds the new
+  `backend`/`openai`/`spots` keys as benign; the Ollama worker-lifecycle paths are untouched.
+- Per-tier reasoning effort. Reasoning effort now resolves tier-first (per-tier override else
+  global default) at every worker/Brain/grader spawn site: provider-routed sites key on the
+  handle's effective tier, literal-tier sites on their own tier, and legacy Claude model-only
+  sites via the model's semantic tier (never a Codex model name). Config gains an optional
+  `effort_levels` map alongside the global `effort_level` (shipped default: global `high`,
+  `fable` `medium`), validated per entry. Also fixes the `claude-sonnet` worker command that
+  hardcoded `CLAUDE_CODE_EFFORT_LEVEL=high`.
+- GPT-6 Astra joins the Codex model roster as the Fable-tier peer (`gpt-6-astra`), so Codex
+  tier-up plan reviews and advisor consultations have a top-tier reviewer matching Claude's
+  Fable ceiling. Includes a runtime-preflight symlink-entry repair; astra-affected suites
+  verified green.
+- Grader message paths honor the config `timeout_seconds` instead of a hardcoded 15s, so a
+  slow local or self-hosted grader is no longer cut off early.
+- Heartbeat "WAITING ON Brain". A 3-way narration classifier (operator/Brain/neither) replaces
+  the binary awaiting-operator check. A Brain-owned wait — the Brain approving or awaiting a
+  worker's execution-mode menu or plan — now renders under a new "WAITING ON Brain" heartbeat
+  section instead of mislabeling as "WAITING ON <operator>"; the operator section shows "there
+  is nothing" in that case, and Brain waits skip the one-time operator Slack alert. Fail-safe:
+  neither/error captures nothing.
+- Fixed the get-back-to-work in-flight detector aborting on a mid-record tail cut.
+  `_gbtw_extract_in_flight`'s `tail -c 8M` byte-tail can slice a large transcript mid-record;
+  the partial first line is invalid JSON, so each of the four jq sub-queries aborted the whole
+  stream and emitted nothing (silenced by `2>/dev/null`) — the in-flight set came back empty
+  and the hook fired "STOP — TASKS STILL IN PROGRESS" despite a live dispatched subagent. The
+  four sub-queries are now per-line tolerant (`jq -R 'fromjson?'`) so a malformed/partial line
+  is skipped instead of aborting; failure modes degrade toward a false-STOP, never toward the
+  hook wrongly staying silent. Adds F11–F14 regression fixtures isolating each edited jq line.
+- Commander reliability and Codex runtime integration: verified actual-Fable consultations,
+  release preflight and restart support, and Commander prompt and worktree recovery
+  improvements, with tests and workflow documentation.
+- Scoped unassigned-primary commit. PM-on `/commit` and `/commit-and-push` now work in an
+  unassigned primary checkout without weakening the human-authority model: the commit tree is
+  scoped to the session's plan `allowed_files` (read from the state DB, frozen into the
+  single-use human intent) and built from the staged index by exact path, so a shared
+  checkout's foreign staged files are structurally excluded. Fail closed on unmerged or
+  non-canonical entries; `/push` is unchanged.
+- Commander plugin architecture for MCP tools. `discover_plugins` gained an MCP-tool provider
+  channel (`register_mcp_tool_provider`/`get_mcp_tool_providers`), and `_create_mcp_server` now
+  runs plugin discovery and lets each discovered plugin register tools against the live
+  `FastMCP` server (fail-soft — a plugin that raises is logged and skipped, never crashing the
+  orchestrator). Operator-specific automation tooling that previously lived inside the core
+  orchestrator now loads as an out-of-tree plugin from a discovered plugin directory, so the
+  shipped repo carries the plugin seam rather than operator-specific tools. Registration is
+  covered by a gate test that asserts the plugin's tools appear on a real server with no
+  duplicate registration.
+- Commander Slack threading fix. Operator-message responses from the daemon — the "Forwarded to
+  brain" acknowledgment and the guidance-branch replies — posted top-level while the Brain's
+  substantive answer threaded under the question, splitting the receipt from the answer. The six
+  `post_message` calls in the message handler now pass `thread_ts=msg_ts or None`, so the
+  acknowledgment and the answer co-locate in one thread under the operator's message; an empty
+  `ts` still falls back to top-level. Heartbeat cadence and the Brain reply-to path are unchanged.
+- Shadow-grader empty-verdict retry. `ShadowGrader.grade_with_tools()` now retries once with a
+  corrective nudge when the local model returns empty content, and raises
+  `ShadowGraderEmptyResponseError` on exhausted retries instead of silently returning an
+  `infrastructure_error` dict, so an empty verdict is surfaced rather than masked.
+
 ## 1.1.7: worktree lifecycle verbs, plain-language conflict resolution, never-lose-work completeness, and Stop-hook hardening
 
 - The two "active" finalizer branches no longer silently destroy a push-pending obligation.

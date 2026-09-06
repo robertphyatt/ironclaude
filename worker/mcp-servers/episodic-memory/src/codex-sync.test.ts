@@ -47,7 +47,7 @@ describe('syncCodexConversations end-to-end', () => {
     expect(hits.length).toBeGreaterThan(0);
     expect(hits.some(h => h.exchange.userMessage.includes('ZEBRA_MARKER_ingest_test'))).toBe(true);
     // Grouped under the munged cwd from the fixture's session_meta.
-    expect(hits.some(h => h.exchange.project === '-Users-roberthyatt-Code-ironclaude')).toBe(true);
+    expect(hits.some(h => h.exchange.project === '-Users-example-Code-ironclaude')).toBe(true);
   }, 120000);
 });
 

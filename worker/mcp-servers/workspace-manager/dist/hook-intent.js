@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // src/hook-intent.ts
-import path5 from "node:path";
+import path7 from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/db.ts
@@ -501,7 +501,7 @@ function consumeMatchingHumanIntent(db, input, clock = () => /* @__PURE__ */ new
 }
 
 // src/git-authority.ts
-import path3 from "node:path";
+import path5 from "node:path";
 
 // src/git.ts
 import { spawnSync } from "node:child_process";
@@ -514,6 +514,12 @@ function gitError(cwd, args, stderr) {
 }
 function runGit(cwd, args) {
   const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw gitError(cwd, args, result.stderr || "");
+  return result.stdout || "";
+}
+function runGitEnv(cwd, args, env) {
+  const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", env });
   if (result.error) throw result.error;
   if (result.status !== 0) throw gitError(cwd, args, result.stderr || "");
   return result.stdout || "";
@@ -674,6 +680,84 @@ function isAncestor(cwd, ancestor, descendant) {
   throw gitError(cwd, ["merge-base", "--is-ancestor", ancestor, descendant], result.stderr || "");
 }
 
+// src/scoped-tree.ts
+import { rmSync } from "node:fs";
+import os2 from "node:os";
+import path3 from "node:path";
+function buildScopedStagedTree(repoPath, parentOid, allowedFiles) {
+  const raw = runGit(repoPath, ["ls-files", "--stage", "-z"]);
+  const index = /* @__PURE__ */ new Map();
+  for (const record of raw.split("\0")) {
+    if (record.length === 0) continue;
+    const tab = record.indexOf("	");
+    if (tab === -1) continue;
+    const [mode, oid, stage] = record.slice(0, tab).split(/\s+/);
+    const p = record.slice(tab + 1);
+    const list = index.get(p) ?? [];
+    list.push({ mode, oid, stage });
+    index.set(p, list);
+  }
+  const tmpIndex = path3.join(os2.tmpdir(), `ironclaude-scoped-index-${process.pid}-${Date.now()}`);
+  const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
+  try {
+    runGitEnv(repoPath, ["read-tree", parentOid], env);
+    for (const rel of allowedFiles) {
+      if (rel === "" || rel.endsWith("/") || path3.posix.isAbsolute(rel) || rel !== path3.posix.normalize(rel)) {
+        throw new Error(`Cannot scope commit: allowed_files entry '${rel}' is not a canonical repo-relative path (no leading ./, no .., no //, no absolute path, no trailing slash)`);
+      }
+      const entries = index.get(rel);
+      if (entries && entries.some((e) => e.stage !== "0")) {
+        throw new Error(`Cannot scope commit: '${rel}' has an unresolved merge conflict (unmerged index entry); resolve it before committing`);
+      }
+      const staged = entries?.find((e) => e.stage === "0");
+      if (staged) {
+        runGitEnv(repoPath, ["update-index", "--add", "--cacheinfo", `${staged.mode},${staged.oid},${rel}`], env);
+      } else {
+        runGitEnv(repoPath, ["update-index", "--force-remove", "--", rel], env);
+      }
+    }
+    return runGitEnv(repoPath, ["write-tree"], env).trim();
+  } finally {
+    try {
+      rmSync(tmpIndex, { force: true });
+    } catch {
+    }
+  }
+}
+
+// src/plan-scope.ts
+import Database2 from "better-sqlite3";
+import os3 from "node:os";
+import path4 from "node:path";
+function stateDbPath() {
+  return process.env.STATE_MANAGER_DB_PATH ?? path4.join(os3.homedir(), ".claude", "ironclaude.db");
+}
+function readSessionAllowedFiles(providerRootSessionId) {
+  let sdb;
+  try {
+    sdb = new Database2(stateDbPath(), { readonly: true, fileMustExist: true, timeout: 1e4 });
+  } catch (e) {
+    throw new Error(`Cannot read plan scope: state DB unreadable (${e.message})`);
+  }
+  try {
+    const rows = sdb.prepare("SELECT allowed_files FROM wave_tasks WHERE terminal_session = ?").all(providerRootSessionId);
+    const set = /* @__PURE__ */ new Set();
+    for (const r of rows) {
+      if (!r.allowed_files) continue;
+      const arr = JSON.parse(r.allowed_files);
+      if (Array.isArray(arr)) {
+        for (const f of arr) if (typeof f === "string" && f.length > 0) set.add(f);
+      }
+    }
+    if (set.size === 0) {
+      throw new Error("Cannot read plan scope: no allowed_files for this session (no active plan)");
+    }
+    return [...set].sort();
+  } finally {
+    sdb.close();
+  }
+}
+
 // src/git-authority.ts
 var OID = /^[0-9a-f]{40,64}$/i;
 function denyEvidence() {
@@ -705,7 +789,7 @@ function resolveEffectiveCheckout(db, input, workspaceGuid) {
   if (!assignment || assignment.repository_identity !== repository.repositoryIdentity || assignment.owner_session_id !== input.providerRootSessionId) {
     throw new Error("Direct Git authority provider root, repository, or workspace binding does not match");
   }
-  const expectedPath = path3.join(repository.primaryCheckoutPath, ".ironclaude", "worktrees", assignment.workspace_guid);
+  const expectedPath = path5.join(repository.primaryCheckoutPath, ".ironclaude", "worktrees", assignment.workspace_guid);
   if (assignment.worktree_path !== expectedPath || assignment.branch !== `ironclaude/${assignment.workspace_guid}`) {
     throw new Error("Direct Git authority managed workspace identity does not match");
   }
@@ -746,16 +830,22 @@ function resolveUnassignedPrimaryCheckout(db, repositoryPath, providerRootSessio
   if (branch.length === 0) throw new Error("Unassigned-primary direct-Git requires a checked-out branch (HEAD is detached)");
   return { mode: "primary-unassigned", path: repository.primaryCheckoutPath };
 }
-function observeUnassignedCommitEvidence(path6) {
-  const canonicalBranch = runGit(path6, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
+function observeUnassignedCommitEvidence(path8, allowedFiles) {
+  const canonicalBranch = runGit(path8, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
   const localRef = `refs/heads/${canonicalBranch}`;
+  const parentOid = runGit(path8, ["rev-parse", "--verify", "HEAD^{commit}"]).trim();
+  const stagedTree = buildScopedStagedTree(path8, parentOid, allowedFiles);
+  if (stagedTree === runGit(path8, ["rev-parse", "--verify", `${parentOid}^{tree}`]).trim()) {
+    throw new Error("Nothing to commit within this session's allowed_files (only foreign or unchanged files are staged)");
+  }
   return {
     checkoutMode: "primary-unassigned",
     canonicalBranch,
     localRef,
-    stagedTree: runGit(path6, ["write-tree"]).trim(),
+    stagedTree,
     parentRef: "HEAD",
-    parentOid: runGit(path6, ["rev-parse", "--verify", "HEAD^{commit}"]).trim()
+    parentOid,
+    allowedFiles
   };
 }
 function assertFastForwardPush(worktreePath, evidence) {
@@ -764,49 +854,54 @@ function assertFastForwardPush(worktreePath, evidence) {
     throw new Error("Unassigned-primary push must be fast-forward; non-fast-forward to a shared branch is refused");
   }
 }
-function observeUnassignedPushEvidence(path6) {
-  const canonicalBranch = runGit(path6, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
+function observeUnassignedPushEvidence(path8) {
+  const canonicalBranch = runGit(path8, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
   const localRef = `refs/heads/${canonicalBranch}`;
   const remoteName = "origin";
-  const remoteUrl = runGit(path6, ["remote", "get-url", remoteName]).trim();
-  const pushUrl = runGit(path6, ["remote", "get-url", "--push", remoteName]).trim();
+  const remoteUrl = runGit(path8, ["remote", "get-url", remoteName]).trim();
+  const pushUrl = runGit(path8, ["remote", "get-url", "--push", remoteName]).trim();
   if (remoteUrl !== pushUrl) denyEvidence();
   const evidence = {
     checkoutMode: "primary-unassigned",
     canonicalBranch,
     localRef,
-    localOid: runGit(path6, ["rev-parse", "--verify", `${localRef}^{commit}`]).trim(),
+    localOid: runGit(path8, ["rev-parse", "--verify", `${localRef}^{commit}`]).trim(),
     remoteName,
     remoteUrl,
     destinationRef: localRef,
-    expectedRemoteOldOid: remoteOldOid(path6, remoteName, localRef)
+    expectedRemoteOldOid: remoteOldOid(path8, remoteName, localRef)
   };
-  assertFastForwardPush(path6, evidence);
+  assertFastForwardPush(path8, evidence);
   return evidence;
 }
-function observeUnassignedCommitAndPushEvidence(path6) {
-  const canonicalBranch = runGit(path6, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
+function observeUnassignedCommitAndPushEvidence(path8, allowedFiles) {
+  const canonicalBranch = runGit(path8, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
   const localRef = `refs/heads/${canonicalBranch}`;
   const remoteName = "origin";
-  const remoteUrl = runGit(path6, ["remote", "get-url", remoteName]).trim();
-  const pushUrl = runGit(path6, ["remote", "get-url", "--push", remoteName]).trim();
+  const remoteUrl = runGit(path8, ["remote", "get-url", remoteName]).trim();
+  const pushUrl = runGit(path8, ["remote", "get-url", "--push", remoteName]).trim();
   if (remoteUrl !== pushUrl) denyEvidence();
-  const parentOid = runGit(path6, ["rev-parse", "--verify", "HEAD^{commit}"]).trim();
-  const expectedRemoteOldOid = remoteOldOid(path6, remoteName, localRef);
-  if (expectedRemoteOldOid !== null && !isAncestor(path6, expectedRemoteOldOid, parentOid)) {
+  const parentOid = runGit(path8, ["rev-parse", "--verify", "HEAD^{commit}"]).trim();
+  const expectedRemoteOldOid = remoteOldOid(path8, remoteName, localRef);
+  if (expectedRemoteOldOid !== null && !isAncestor(path8, expectedRemoteOldOid, parentOid)) {
     throw new Error("Unassigned-primary push must be fast-forward; non-fast-forward to a shared branch is refused");
+  }
+  const stagedTree = buildScopedStagedTree(path8, parentOid, allowedFiles);
+  if (stagedTree === runGit(path8, ["rev-parse", "--verify", `${parentOid}^{tree}`]).trim()) {
+    throw new Error("Nothing to commit within this session's allowed_files (only foreign or unchanged files are staged)");
   }
   return {
     checkoutMode: "primary-unassigned",
     canonicalBranch,
     localRef,
-    stagedTree: runGit(path6, ["write-tree"]).trim(),
+    stagedTree,
     parentRef: "HEAD",
     parentOid,
     remoteName,
     remoteUrl,
     destinationRef: localRef,
-    expectedRemoteOldOid
+    expectedRemoteOldOid,
+    allowedFiles
   };
 }
 function observeDirectEvidence(checkout, operation) {
@@ -867,7 +962,8 @@ function issueDirectGitHumanIntent(db, input) {
     }
     const repository = discoverRepository(input.repositoryPath);
     const unassigned = resolveUnassignedPrimaryCheckout(db, input.repositoryPath, input.providerRootSessionId);
-    const evidence2 = input.operation === "commit" ? observeUnassignedCommitEvidence(unassigned.path) : input.operation === "push" ? observeUnassignedPushEvidence(unassigned.path) : observeUnassignedCommitAndPushEvidence(unassigned.path);
+    const allowedFiles = input.operation === "push" ? void 0 : readSessionAllowedFiles(input.providerRootSessionId);
+    const evidence2 = input.operation === "commit" ? observeUnassignedCommitEvidence(unassigned.path, allowedFiles) : input.operation === "push" ? observeUnassignedPushEvidence(unassigned.path) : observeUnassignedCommitAndPushEvidence(unassigned.path, allowedFiles);
     return issueHumanIntent(db, {
       operation: input.operation,
       humanChannel: input.humanChannel,
@@ -903,7 +999,7 @@ function issueDirectGitHumanIntent(db, input) {
 // src/workspace-service.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
 import { existsSync as existsSync2 } from "node:fs";
-import path4 from "node:path";
+import path6 from "node:path";
 
 // src/integration.ts
 function decodePushDisposition(value) {
@@ -923,7 +1019,7 @@ function pushPendingSummary(disposition) {
 
 // src/workspace-service.ts
 function managedWorktreePath(primaryCheckoutPath, workspaceGuid) {
-  return path4.join(primaryCheckoutPath, ".ironclaude", "worktrees", workspaceGuid);
+  return path6.join(primaryCheckoutPath, ".ironclaude", "worktrees", workspaceGuid);
 }
 function managedBranch(workspaceGuid) {
   return `ironclaude/${workspaceGuid}`;
@@ -1511,13 +1607,13 @@ var WorkspaceService = class {
     `).all(repository.repositoryIdentity);
     const observed = listWorktrees(repository.primaryCheckoutPath);
     const observedPaths = new Set(observed.map((worktree) => worktree.path));
-    const knownPaths = new Set(assignments.map((assignment) => path4.resolve(assignment.worktree_path)));
-    const managedRoot = path4.join(repository.primaryCheckoutPath, ".ironclaude", "worktrees") + path4.sep;
+    const knownPaths = new Set(assignments.map((assignment) => path6.resolve(assignment.worktree_path)));
+    const managedRoot = path6.join(repository.primaryCheckoutPath, ".ironclaude", "worktrees") + path6.sep;
     const ambiguousWorktreePaths = observed.filter((worktree) => worktree.path.startsWith(managedRoot) && worktree.branch?.startsWith("refs/heads/ironclaude/") && !knownPaths.has(worktree.path)).map((worktree) => worktree.path).sort();
     return {
       repositoryIdentity: repository.repositoryIdentity,
-      knownWorktreePaths: assignments.map((assignment) => path4.resolve(assignment.worktree_path)).filter((worktreePath) => observedPaths.has(worktreePath)).sort(),
-      missingWorktreePaths: assignments.map((assignment) => path4.resolve(assignment.worktree_path)).filter((worktreePath) => !observedPaths.has(worktreePath)).sort(),
+      knownWorktreePaths: assignments.map((assignment) => path6.resolve(assignment.worktree_path)).filter((worktreePath) => observedPaths.has(worktreePath)).sort(),
+      missingWorktreePaths: assignments.map((assignment) => path6.resolve(assignment.worktree_path)).filter((worktreePath) => !observedPaths.has(worktreePath)).sort(),
       ambiguousWorktreePaths
     };
   }
@@ -1628,7 +1724,7 @@ function runHookIntent(argv = process.argv.slice(2), db = initDb()) {
   }
   return issueHumanIntentFromHook(db, args);
 }
-var invokedPath = process.argv[1] ? path5.resolve(process.argv[1]) : null;
+var invokedPath = process.argv[1] ? path7.resolve(process.argv[1]) : null;
 if (invokedPath === fileURLToPath(import.meta.url)) {
   try {
     process.stdout.write(`${JSON.stringify(runHookIntent())}

@@ -15,8 +15,22 @@ import psutil
 import pytest
 from unittest.mock import MagicMock, patch
 
-from ironclaude.main import CHECKIN_CADENCE, FINALIZE_DRIFT_RETRY_CAP, PM_GATE_STAGES, PM_GATE_SLACK_SECONDS, IroncladeDaemon, ensure_brain_trusted
+from ironclaude.main import CHECKIN_CADENCE, FINALIZE_DRIFT_RETRY_CAP, PM_GATE_STAGES, PM_GATE_SLACK_SECONDS, IroncladeDaemon, PromptDetection, ensure_brain_trusted
 from ironclaude.orchestrator_mcp import OrchestratorTools
+from ironclaude.prompt_incidents import PromptIncidentStore
+from ironclaude.provider_state import ProviderState
+from ironclaude.tmux_manager import PromptSignal
+
+
+def _semantic_prompt(question="Which action should run?", *, options=(("1", "Continue"),), evidence=None):
+    return PromptSignal(
+        kind="question",
+        question=question,
+        options=tuple(options),
+        authority_text="",
+        source_spans=(("question", 0, len(question)),),
+        evidence=evidence or question,
+    )
 
 
 def _brain_instruction_surfaces() -> list[str]:
@@ -56,6 +70,50 @@ def test_brain_blocked_capability_contract_startup_exemption_preserves_resources
         assert "resource-blocked work remains unchanged" in text
 
 
+class TestBrainStartupLogging:
+    def test_codex_success_requires_alive_process(self, caplog):
+        import ironclaude.main as main_module
+
+        brain = MagicMock()
+        brain.client_name = "codex"
+        brain.is_alive.return_value = False
+        brain.capability_block = {"status": "blocked", "reason": "destination-conflict"}
+
+        with caplog.at_level("INFO"):
+            started = main_module._log_brain_start_result(brain)
+
+        assert started is False
+        assert "Brain SDK client started" not in caplog.text
+        assert "Brain SDK client not started client=codex reason=capability-blocked" in caplog.text
+
+    def test_codex_alive_process_logs_success(self, caplog):
+        import ironclaude.main as main_module
+
+        brain = MagicMock()
+        brain.client_name = "codex"
+        brain.is_alive.return_value = True
+
+        with caplog.at_level("INFO"):
+            started = main_module._log_brain_start_result(brain)
+
+        assert started is True
+        assert "Brain SDK client started client=codex" in caplog.text
+
+    def test_claude_preserves_nonraising_start_success_semantics(self, caplog):
+        import ironclaude.main as main_module
+
+        brain = MagicMock()
+        brain.client_name = "claude"
+        brain.is_alive.side_effect = AssertionError("Claude startup must not use Codex gate")
+
+        with caplog.at_level("INFO"):
+            started = main_module._log_brain_start_result(brain)
+
+        assert started is True
+        assert "Brain SDK client started" in caplog.text
+        brain.is_alive.assert_not_called()
+
+
 def test_brain_direct_reply_requires_acknowledgement_before_threaded_reply():
     for text in _brain_instruction_surfaces():
         assert "acknowledge_operator_message(source_ts, reason)" in text
@@ -81,6 +139,228 @@ def daemon(tmp_path):
     d = IroncladeDaemon(config, slack, None, registry, tmux, brain)
     d._state_manager_db_path = str(tmp_path / "state-manager.db")
     return d
+
+
+class TestCodexBrainCapabilityContainment:
+    @staticmethod
+    def _codex_brain(block=None, *, alive=False):
+        brain = MagicMock()
+        brain.client_name = "codex"
+        brain.capability_tier = "sonnet"
+        brain.capability_block = block
+        brain.is_alive.return_value = alive
+        brain.needs_restart.return_value = False
+        brain.check_compaction_complete.return_value = False
+        brain.send_message.return_value = True
+        return brain
+
+    @staticmethod
+    def _daemon(tmp_path, conn, brain):
+        slack = MagicMock()
+        registry = MagicMock()
+        registry.get_running_workers.return_value = []
+        tmux = MagicMock()
+        tmux.log_dir = str(tmp_path / "logs")
+        os.makedirs(tmux.log_dir, exist_ok=True)
+        return IroncladeDaemon(
+            {"tmp_dir": str(tmp_path), "brain_capability_probe_seconds": 30},
+            slack, None, registry, tmux, brain, db_conn=conn,
+        )
+
+    def test_blocked_capability_alerts_once_and_does_not_restart_early(self, tmp_path):
+        conn = init_db(str(tmp_path / "blocked.db"))
+        block = {
+            "schema_version": 1,
+            "status": "blocked",
+            "reason": "destination-conflict",
+            "source_companion": "/source/host",
+            "destination_companion": "/destination/host",
+        }
+        brain = self._codex_brain(block)
+        daemon = self._daemon(tmp_path, conn, brain)
+
+        daemon.check_brain()
+        daemon.check_brain()
+
+        assert daemon.slack.post_message.call_count == 1
+        brain.restart.assert_not_called()
+        brain.probe_runtime_capability.assert_not_called()
+        assert ProviderState(conn).get_current_client("brain") is None
+
+    def test_healthy_reconstruction_redispatches_held_generation_once(self, tmp_path):
+        db_path = str(tmp_path / "recovery.db")
+        conn = init_db(db_path)
+        provider = ProviderState(conn)
+        provider.set_current_client("brain", "codex")
+        provider.record_brain_capability_block(
+            tier="sonnet", category="command_bridge", reason="destination-conflict",
+            fingerprint="capability-1", now=0.0, initial_backoff=1.0,
+        )
+        prompts = PromptIncidentStore(conn)
+        observation = prompts.observe(
+            "worker-1", "plan_ready", _semantic_prompt(), now=1.0
+        )
+        assert prompts.claim_dispatch(observation.dispatch_id, destination="brain", now=2.0)
+        prompts.record_delivery(
+            observation.dispatch_id, delivered=False,
+            failure_category="capability_blocked",
+        )
+
+        first_brain = self._codex_brain(None, alive=True)
+        first = self._daemon(tmp_path, conn, first_brain)
+        first.check_brain()
+        assert first_brain.send_message.call_count == 1
+
+        conn.close()
+        reopened = init_db(db_path)
+        second_brain = self._codex_brain(None, alive=True)
+        second = self._daemon(tmp_path, reopened, second_brain)
+        second.check_brain()
+        second_brain.send_message.assert_not_called()
+
+    def test_due_blocked_probe_holds_without_restart_or_duplicate_alert(
+        self, tmp_path, monkeypatch
+    ):
+        import ironclaude.main as main_module
+
+        conn = init_db(str(tmp_path / "due-blocked.db"))
+        block = {
+            "schema_version": 1,
+            "status": "blocked",
+            "reason": "destination-conflict",
+            "source_companion": "/source/host",
+            "destination_companion": "/destination/host",
+        }
+        brain = self._codex_brain(block)
+        daemon = self._daemon(tmp_path, conn, brain)
+        monkeypatch.setattr(main_module.time, "time", lambda: 100.0)
+        daemon.check_brain()
+        assert daemon.slack.post_message.call_count == 1
+
+        monkeypatch.setattr(main_module.time, "time", lambda: 131.0)
+        brain.probe_runtime_capability.return_value = block
+        daemon.check_brain()
+        brain.probe_runtime_capability.assert_called_once_with()
+        brain.restart.assert_not_called()
+        assert daemon.slack.post_message.call_count == 1
+
+    def test_fresh_healthy_probe_starts_brain_once_and_marks_available(
+        self, tmp_path, monkeypatch
+    ):
+        import ironclaude.main as main_module
+
+        conn = init_db(str(tmp_path / "due-healthy.db"))
+        block = {
+            "schema_version": 1,
+            "status": "blocked",
+            "reason": "destination-conflict",
+            "source_companion": "/source/host",
+            "destination_companion": "/destination/host",
+        }
+        healthy = {**block, "status": "healthy", "reason": "destination-equivalent"}
+        brain = self._codex_brain(block)
+        brain.restart.return_value = True
+        brain.restart_count = 1
+
+        def recover():
+            brain.capability_block = None
+            return healthy
+
+        brain.probe_runtime_capability.side_effect = recover
+        daemon = self._daemon(tmp_path, conn, brain)
+        monkeypatch.setattr(main_module, "_render_brain_system_prompt", lambda *_: "prompt")
+        monkeypatch.setattr(main_module.time, "time", lambda: 100.0)
+        daemon.check_brain()
+
+        monkeypatch.setattr(main_module.time, "time", lambda: 131.0)
+        daemon.check_brain()
+        daemon.check_brain()
+
+        brain.restart.assert_called_once()
+        assert ProviderState(conn).is_available(
+            "local", "codex", "brain", "sonnet"
+        ) is True
+
+    @staticmethod
+    def _seed_pending_recovery(conn, capability_fingerprint="capability-1"):
+        provider = ProviderState(conn)
+        provider.set_current_client("brain", "codex")
+        provider.record_brain_capability_block(
+            tier="sonnet", category="command_bridge", reason="destination-conflict",
+            fingerprint=capability_fingerprint, now=0.0, initial_backoff=1.0,
+        )
+        prompts = PromptIncidentStore(conn)
+        initial = prompts.observe(
+            "worker-crash", "plan_ready", _semantic_prompt("Recover?"), now=1.0
+        )
+        assert prompts.claim_dispatch(initial.dispatch_id, destination="brain", now=2.0)
+        prompts.record_delivery(
+            initial.dispatch_id, delivered=False,
+            failure_category="capability_blocked",
+        )
+        recovery = prompts.rearm_capability_recovery(
+            capability_fingerprint, now=3.0
+        )
+        assert len(recovery) == 1
+        return provider, prompts, recovery[0]
+
+    def test_reconstruction_drains_generation_created_before_capability_clear(
+        self, tmp_path
+    ):
+        db_path = str(tmp_path / "before-clear.db")
+        conn = init_db(db_path)
+        self._seed_pending_recovery(conn)
+        conn.close()
+
+        reopened = init_db(db_path)
+        brain = self._codex_brain(None, alive=True)
+        daemon = self._daemon(tmp_path, reopened, brain)
+        daemon.check_brain()
+
+        brain.send_message.assert_called_once()
+        assert ProviderState(reopened).is_available(
+            "local", "codex", "brain", "sonnet"
+        ) is True
+
+    def test_reconstruction_drains_pending_generation_after_capability_clear(
+        self, tmp_path
+    ):
+        db_path = str(tmp_path / "after-clear.db")
+        conn = init_db(db_path)
+        provider, _prompts, _recovery = self._seed_pending_recovery(conn)
+        provider.record_brain_capability_recovery(tier="sonnet")
+        conn.close()
+
+        reopened = init_db(db_path)
+        brain = self._codex_brain(None, alive=True)
+        daemon = self._daemon(tmp_path, reopened, brain)
+        daemon.check_brain()
+
+        brain.send_message.assert_called_once()
+
+    def test_reconstruction_marks_claimed_generation_unknown_without_duplicate(
+        self, tmp_path
+    ):
+        db_path = str(tmp_path / "claimed-crash.db")
+        conn = init_db(db_path)
+        provider, prompts, recovery = self._seed_pending_recovery(conn)
+        provider.record_brain_capability_recovery(tier="sonnet")
+        assert prompts.claim_dispatch(
+            recovery.dispatch_id, destination="brain", now=4.0
+        )
+        conn.close()
+
+        reopened = init_db(db_path)
+        brain = self._codex_brain(None, alive=True)
+        daemon = self._daemon(tmp_path, reopened, brain)
+        daemon.check_brain()
+
+        brain.send_message.assert_not_called()
+        state = reopened.execute(
+            "SELECT state, failure_category FROM worker_prompt_dispatches WHERE id=?",
+            (recovery.dispatch_id,),
+        ).fetchone()
+        assert tuple(state) == ("failed", "delivery_unknown")
 
 
 class TestBrainNarrationThreading:
@@ -329,36 +609,75 @@ class TestGetWorkerWorkflowStage:
 
 class TestDetectPromptWaiting:
     def test_detects_ask_user_question(self, daemon):
-        daemon._grader.grade = MagicMock(return_value={"waiting": True})
-        assert daemon._detect_prompt_waiting("Tool use: AskUserQuestion\nWhat do you want?") is True
+        daemon._grader.grade = MagicMock()
+        pane = """Which action should run?\n❯ 1. Continue\n  2. Stop\nEnter to select · ↑/↓ to navigate"""
+        result = daemon._detect_worker_prompt(pane)
+        assert result.conclusive is True
+        assert result.signal.question == "Which action should run?"
+        daemon._grader.grade.assert_not_called()
 
     def test_detects_submit_answers(self, daemon):
-        daemon._grader.grade = MagicMock(return_value={"waiting": True})
-        assert daemon._detect_prompt_waiting("Submit answers to continue") is True
+        pane = "Inspection complete.\n\nSubmit answers to continue?\n❯ "
+        daemon._grader.grade = MagicMock(return_value={
+            "kind": "question",
+            "interaction_block": "Submit answers to continue?",
+            "question": "Submit answers to continue?",
+            "options": [],
+            "authority_text": "",
+        })
+        result = daemon._detect_worker_prompt(pane)
+        assert result.signal.question == "Submit answers to continue?"
 
-    def test_detects_options_menu(self, daemon):
-        daemon._grader.grade = MagicMock(return_value={"waiting": True})
-        assert daemon._detect_prompt_waiting("options:\n1. Fix now\n2. Skip") is True
+    def test_rejects_historical_question_followed_by_progress(self, daemon):
+        pane = "Which action should run?\nAnswer: Continue\nRunning tests...\n12 passed\n❯ "
+        daemon._grader.grade = MagicMock(return_value={
+            "kind": "question",
+            "interaction_block": "Which action should run?",
+            "question": "Which action should run?",
+            "options": [],
+            "authority_text": "",
+        })
+        result = daemon._detect_worker_prompt(pane)
+        assert result.signal is None
+        assert result.conclusive is False
 
-    def test_detects_which_approach(self, daemon):
-        daemon._grader.grade = MagicMock(return_value={"waiting": True})
-        assert daemon._detect_prompt_waiting("Which approach would you prefer?") is True
+    def test_rejects_stale_ask_user_menu_followed_by_completion(self, daemon):
+        pane = """Which action should run?
+❯ 1. Continue
+  2. Stop
+Enter to select · ↑/↓ to navigate
+Completed task successfully.
+❯ """
+        daemon._grader.grade = MagicMock(return_value={
+            "kind": "none", "interaction_block": None, "question": None,
+            "options": [], "authority_text": None,
+        })
+        result = daemon._detect_worker_prompt(pane)
+        assert result.signal is None
+        assert result.conclusive is True
 
-    def test_detects_how_would_you_like(self, daemon):
+    def test_boolean_only_result_cannot_mint_prompt(self, daemon):
         daemon._grader.grade = MagicMock(return_value={"waiting": True})
-        assert daemon._detect_prompt_waiting("How would you like to proceed?") is True
-
-    def test_detects_numbered_menu(self, daemon):
-        daemon._grader.grade = MagicMock(return_value={"waiting": True})
-        assert daemon._detect_prompt_waiting("  1. Option A\n  2. Option B") is True
+        result = daemon._detect_worker_prompt("Which approach would you prefer?\n❯ ")
+        assert result.signal is None
+        assert result.conclusive is False
 
     def test_no_false_positive_normal_output(self, daemon):
-        daemon._grader.grade = MagicMock(return_value={"waiting": False})
-        assert daemon._detect_prompt_waiting("Running tests...\nAll 5 passed") is False
+        daemon._grader.grade = MagicMock(return_value={
+            "kind": "none", "interaction_block": None, "question": None,
+            "options": [], "authority_text": None,
+        })
+        result = daemon._detect_worker_prompt("Running tests...\nAll 5 passed")
+        assert result.signal is None
+        assert result.conclusive is True
 
-    def test_no_false_positive_empty(self, daemon):
-        daemon._grader.grade = MagicMock(return_value={"waiting": False})
-        assert daemon._detect_prompt_waiting("") is False
+    def test_infrastructure_failure_is_inconclusive(self, daemon):
+        daemon._grader.grade = MagicMock(return_value={
+            "infrastructure_error": True, "error_detail": "offline"
+        })
+        result = daemon._detect_worker_prompt("")
+        assert result.signal is None
+        assert result.conclusive is False
 
 
 class TestProactiveCheckin:
@@ -2425,6 +2744,21 @@ class TestPostHeartbeat:
         daemon.post_heartbeat()
         daemon.slack.post_message.assert_not_called()
 
+    def test_post_heartbeat_degraded_label_names_resolved_openai_backend(
+        self, daemon, tmp_path, monkeypatch
+    ):
+        """The degraded heartbeat names the resolved validator backend (OpenAI),
+        guarding the main.py resolve_degraded_backend_label wiring."""
+        cfg = tmp_path / "hooks.json"
+        cfg.write_text('{"backend": "openai", "openai": {"base_url": "http://h/v1", "model": "m"}}')
+        monkeypatch.setenv("IC_OLLAMA_CONFIG_PATH", str(cfg))
+        daemon._last_heartbeat = 0
+        with patch("ironclaude.ollama_client.ollama_degraded_urls", return_value=["http://h/v1"]):
+            daemon.post_heartbeat()
+        msg = daemon.slack.post_message.call_args[0][0]
+        assert "OpenAI endpoint(s) down" in msg
+        assert "Ollama endpoint(s) down" not in msg
+
 
 class TestGetRecentWorkers:
     def _make_registry(self, tmp_path):
@@ -2488,8 +2822,8 @@ class TestGetRecentWorkers:
 
 
 class TestHashDedupBypassPromptWaiting:
-    def test_prompt_waiting_bypasses_hash_dedup(self, daemon, tmp_path):
-        """Check-in fires for prompt-waiting worker even when hash is unchanged."""
+    def test_semantic_prompt_bypasses_hash_dedup_once(self, daemon, tmp_path):
+        """A validated prompt bypasses pane hash dedup through durable routing."""
         worker = {
             "id": "w1", "tmux_session": "ic-w1",
             "spawned_at": "2026-03-08 00:00:00",
@@ -2503,13 +2837,16 @@ class TestHashDedupBypassPromptWaiting:
         claude_dir.mkdir()
         _setup_ironclaude_db(claude_dir, "12345", "abcdef01-2345-6789-abcd-ef0123456789", "plan_ready")
         daemon._claude_dir = claude_dir
+        daemon._db = init_db(str(tmp_path / "hash-prompt.db"))
         daemon.brain.send_message.return_value = True
 
         daemon._last_checkin_hash["w1"] = hash("1. Sequential\n2. Parallel\n3. Inline")
         daemon._last_checkin_sent["w1"] = time.time() - 1000
         daemon._last_checkin_stage["w1"] = "plan_ready"
 
-        daemon._grader.grade = MagicMock(return_value={"waiting": True})
+        daemon._detect_worker_prompt = MagicMock(
+            return_value=PromptDetection(_semantic_prompt(), True)
+        )
 
         daemon.check_workers()
         daemon.brain.send_message.assert_called_once()
@@ -2536,13 +2873,324 @@ class TestHashDedupBypassPromptWaiting:
         daemon._last_checkin_sent["w1"] = time.time() - 1000
         daemon._last_checkin_stage["w1"] = "executing"
 
-        daemon._grader.grade = MagicMock(return_value={"waiting": False})
+        daemon._detect_worker_prompt = MagicMock(
+            return_value=PromptDetection(None, True)
+        )
 
         daemon.check_workers()
         daemon.brain.send_message.assert_not_called()
 
-    def test_pm_gate_slack_fires_at_threshold(self, daemon, tmp_path):
-        """Slack notification fires when prompt-waiting at PM gate stage for >30 min."""
+
+class TestDurablePromptRouting:
+    @staticmethod
+    def _worker(worker_id="worker-1"):
+        return {
+            "id": worker_id,
+            "tmux_session": f"ic-{worker_id}",
+            "spawned_at": "2026-03-08 00:00:00",
+            "description": "waiting task",
+            "machine": None,
+        }
+
+    def _configure(self, daemon, tmp_path, db_name="prompt-routing.db"):
+        daemon._db = init_db(str(tmp_path / db_name))
+        worker = self._worker()
+        daemon.registry.get_running_workers.return_value = [worker]
+        daemon.registry.get_recent_workers.return_value = [worker]
+        daemon.tmux.has_session.return_value = True
+        daemon.tmux.capture_pane.return_value = "Which action should run?\n1. Continue\n❯ "
+        daemon._get_worker_workflow_stage = MagicMock(return_value="plan_ready")
+        daemon._detect_worker_prompt = MagicMock(
+            return_value=PromptDetection(_semantic_prompt(), True)
+        )
+        daemon.brain.send_message.return_value = True
+        daemon.brain.capability_block = None
+        return worker
+
+    def test_twenty_three_unchanged_checks_send_one_brain_action(self, daemon, tmp_path):
+        self._configure(daemon, tmp_path)
+        for _ in range(23):
+            daemon.check_workers()
+        assert daemon.brain.send_message.call_count == 1
+        assert daemon.slack.post_message.call_count == 0
+        row = PromptIncidentStore(daemon._db).active_for_worker("worker-1")
+        assert row["dispatch_state"] == "delivered"
+
+    def test_reconstruction_holds_same_prompt_and_changed_prompt_dispatches(self, daemon, tmp_path):
+        worker = self._configure(daemon, tmp_path, "reconstruct-prompt.db")
+        daemon.check_workers()
+        db_path = str(tmp_path / "reconstruct-prompt.db")
+        daemon._db.close()
+
+        conn = init_db(db_path)
+        second = IroncladeDaemon(
+            {"tmp_dir": str(tmp_path)}, MagicMock(), None,
+            daemon.registry, daemon.tmux, MagicMock(), db_conn=conn,
+        )
+        second.registry.get_running_workers.return_value = [worker]
+        second.tmux.has_session.return_value = True
+        second.tmux.capture_pane.return_value = "Which action should run?\n1. Continue\n❯ "
+        second._get_worker_workflow_stage = MagicMock(return_value="plan_ready")
+        second._detect_worker_prompt = MagicMock(
+            return_value=PromptDetection(_semantic_prompt(), True)
+        )
+        second.brain.send_message.return_value = True
+        second.brain.capability_block = None
+
+        second.check_workers()
+        second.brain.send_message.assert_not_called()
+        second.tmux.capture_pane.return_value = "Which action should run?\n1. Retry\n❯ "
+        second._detect_worker_prompt.return_value = PromptDetection(
+            _semantic_prompt(options=(("1", "Retry"),)), True
+        )
+        second.check_workers()
+        second.brain.send_message.assert_called_once()
+
+    def test_reconstruction_claims_pending_initial_dispatch(self, daemon, tmp_path):
+        worker = self._configure(daemon, tmp_path, "pending-initial.db")
+        store = PromptIncidentStore(daemon._db)
+        pending = store.observe(
+            worker["id"], "plan_ready", _semantic_prompt(), now=1.0
+        )
+
+        daemon.check_workers()
+
+        daemon.brain.send_message.assert_called_once()
+        row = daemon._db.execute(
+            "SELECT state FROM worker_prompt_dispatches WHERE id=?",
+            (pending.dispatch_id,),
+        ).fetchone()
+        assert row[0] == "delivered"
+
+    def test_transient_capture_failure_does_not_resolve_active_prompt(self, daemon, tmp_path):
+        self._configure(daemon, tmp_path)
+        daemon.check_workers()
+        daemon.tmux.capture_pane.side_effect = RuntimeError("tmux unavailable")
+
+        daemon.check_workers()
+
+        assert PromptIncidentStore(daemon._db).active_for_worker("worker-1") is not None
+        assert daemon.brain.send_message.call_count == 1
+
+    def test_prompt_disappearance_and_missing_worker_resolve_episode(self, daemon, tmp_path):
+        self._configure(daemon, tmp_path)
+        daemon.check_workers()
+        daemon.tmux.capture_pane.return_value = "All tests passed"
+        daemon._detect_worker_prompt.return_value = PromptDetection(None, True)
+        daemon.check_workers()
+        assert PromptIncidentStore(daemon._db).active_for_worker("worker-1") is None
+
+        daemon.tmux.capture_pane.return_value = "Which action should run?\n1. Continue\n❯ "
+        daemon._detect_worker_prompt.return_value = PromptDetection(_semantic_prompt(), True)
+        daemon._last_checkin_sent.clear()
+        daemon.check_workers()
+        assert PromptIncidentStore(daemon._db).active_for_worker("worker-1") is not None
+        daemon.registry.get_running_workers.return_value = []
+        daemon.check_workers()
+        assert PromptIncidentStore(daemon._db).active_for_worker("worker-1") is None
+
+    def test_active_prompt_coalesces_heartbeat_stuck_action(self, daemon, tmp_path):
+        worker = self._configure(daemon, tmp_path)
+        daemon.check_workers()
+        daemon.brain.reset_mock()
+        daemon.slack.reset_mock()
+        log_path = os.path.join(daemon.tmux.log_dir, f"{worker['tmux_session']}.log")
+        with open(log_path, "w") as stream:
+            stream.write("x" * 100)
+
+        daemon.post_heartbeat(now=1000.0)
+        daemon.post_heartbeat(now=2000.0)
+
+        daemon.brain.send_message.assert_not_called()
+        rendered = "\n".join(call.args[0] for call in daemon.slack.post_message.call_args_list)
+        assert "prompt active" in rendered
+        assert "Worker worker-1 unchanged" not in rendered
+
+    def test_inconclusive_recheck_retains_active_prompt(self, daemon, tmp_path):
+        self._configure(daemon, tmp_path)
+        daemon.check_workers()
+        daemon._detect_worker_prompt.return_value = PromptDetection(None, False)
+        daemon.tmux.capture_pane.return_value = "grader unavailable"
+
+        daemon.check_workers()
+
+        assert PromptIncidentStore(daemon._db).active_for_worker("worker-1") is not None
+        assert daemon.brain.send_message.call_count == 1
+
+    def test_stale_resolved_history_cannot_supersede_active_incident(self, daemon, tmp_path):
+        self._configure(daemon, tmp_path)
+        daemon.check_workers()
+        original = PromptIncidentStore(daemon._db).active_for_worker("worker-1")
+        daemon._detect_worker_prompt = IroncladeDaemon._detect_worker_prompt.__get__(daemon)
+        daemon.tmux.capture_pane.return_value = (
+            "Which action should run?\nAnswer: Continue\n"
+            "Running tests...\n12 passed\n❯ "
+        )
+        daemon._grader.grade = MagicMock(return_value={
+            "kind": "question",
+            "interaction_block": "Which action should run?",
+            "question": "Which action should run?",
+            "options": [],
+            "authority_text": "",
+        })
+
+        daemon.check_workers()
+
+        retained = PromptIncidentStore(daemon._db).active_for_worker("worker-1")
+        assert retained["id"] == original["id"]
+        assert daemon.brain.send_message.call_count == 1
+        daemon.slack.post_message.assert_not_called()
+
+    def test_telemetry_and_stage_changes_do_not_redispatch_or_alert(self, daemon, tmp_path):
+        self._configure(daemon, tmp_path)
+        daemon.check_workers()
+        daemon._get_worker_workflow_stage.return_value = "executing"
+        daemon.tmux.capture_pane.return_value = (
+            "Which action should run?\n1. Continue\n❯ \n"
+            "reviewer 45s · 50.5k tokens\n/goal active (3h)"
+        )
+        daemon._detect_worker_prompt.return_value = PromptDetection(
+            _semantic_prompt(evidence=daemon.tmux.capture_pane.return_value), True
+        )
+
+        daemon.check_workers()
+
+        assert daemon.brain.send_message.call_count == 1
+        daemon.slack.post_message.assert_not_called()
+
+    def _seed_guidance(self, daemon, tmp_path):
+        self._configure(daemon, tmp_path, "guidance.db")
+        daemon.check_workers()
+        daemon.brain.reset_mock()
+        daemon.slack.reset_mock()
+        daemon.socket_handler = MagicMock()
+
+    @staticmethod
+    def _message(text, ts):
+        return {
+            "parsed": {"type": "message", "text": text},
+            "original_text": text,
+            "ts": ts,
+        }
+
+    def test_exact_worker_operator_guidance_rearms_once_with_elapsed_context(
+        self, daemon, tmp_path
+    ):
+        self._seed_guidance(daemon, tmp_path)
+        item = self._message("worker-1 proceed with option 1", "1700000000.000100")
+        daemon.socket_handler.drain.return_value = [item]
+        daemon.poll_slack_commands()
+
+        daemon.brain.send_message.assert_called_once()
+        message = daemon.brain.send_message.call_args.args[0]
+        assert "OPERATOR MESSAGE" in message
+        assert "[ACTIVE PROMPT] worker=worker-1" in message
+        assert "age=" in message
+        daemon.slack.add_reaction.assert_called_once_with(
+            "eyes", "1700000000.000100"
+        )
+
+        daemon.socket_handler.drain.return_value = [item]
+        daemon.poll_slack_commands()
+        assert daemon.brain.send_message.call_count == 1
+        assert "already recorded" in daemon.slack.post_message.call_args.args[0]
+
+    def test_pending_operator_guidance_is_retried_only_by_same_slack_event(
+        self, daemon, tmp_path
+    ):
+        self._seed_guidance(daemon, tmp_path)
+        store = PromptIncidentStore(daemon._db)
+        pending = store.rearm_from_operator_guidance(
+            "worker-1", "1700000000.000100", now=1.0
+        )
+        assert pending is not None
+
+        item = self._message("worker-1 proceed with option 1", "1700000000.000100")
+        daemon.socket_handler.drain.return_value = [item]
+        daemon.poll_slack_commands()
+
+        daemon.brain.send_message.assert_called_once()
+        row = daemon._db.execute(
+            "SELECT state FROM worker_prompt_dispatches WHERE id=?",
+            (pending.dispatch_id,),
+        ).fetchone()
+        assert row[0] == "delivered"
+
+    def test_exact_worker_guidance_with_invalid_source_identity_fails_closed(
+        self, daemon, tmp_path
+    ):
+        self._seed_guidance(daemon, tmp_path)
+        daemon.socket_handler.drain.return_value = [
+            self._message("worker-1 proceed", "not-a-slack-ts")
+        ]
+
+        daemon.poll_slack_commands()
+
+        daemon.brain.send_message.assert_not_called()
+        assert "held" in daemon.slack.post_message.call_args.args[0]
+
+    def test_prompt_store_claim_failure_holds_guidance_without_generic_forward(
+        self, daemon, tmp_path, monkeypatch
+    ):
+        self._seed_guidance(daemon, tmp_path)
+
+        def fail_claim(*args, **kwargs):
+            raise sqlite3.OperationalError("database unavailable")
+
+        monkeypatch.setattr(PromptIncidentStore, "claim_dispatch", fail_claim)
+        daemon.socket_handler.drain.return_value = [
+            self._message("worker-1 proceed", "1700000000.000100")
+        ]
+
+        daemon.poll_slack_commands()
+
+        daemon.brain.send_message.assert_not_called()
+        assert "held" in daemon.slack.post_message.call_args.args[0]
+
+    def test_unrelated_or_ambiguous_operator_text_stays_generic(self, daemon, tmp_path):
+        self._seed_guidance(daemon, tmp_path)
+        store = PromptIncidentStore(daemon._db)
+        other = store.observe("worker-2", "plan_ready", _semantic_prompt("Choose B?"), now=1.0)
+        assert store.claim_dispatch(other.dispatch_id, destination="brain", now=2.0)
+        store.record_delivery(other.dispatch_id, delivered=True)
+
+        unrelated = self._message("please summarize", "1700000001.000100")
+        ambiguous = self._message(
+            "worker-1 and worker-2 should continue", "1700000002.000100"
+        )
+        daemon.socket_handler.drain.return_value = [unrelated, ambiguous]
+        daemon.poll_slack_commands()
+
+        assert daemon.brain.send_message.call_count == 2
+        sent = [call.args[0] for call in daemon.brain.send_message.call_args_list]
+        assert all("[ACTIVE PROMPT]" not in message for message in sent)
+        count = daemon._db.execute(
+            "SELECT COUNT(*) FROM worker_prompt_dispatches "
+            "WHERE reason='operator_guidance'"
+        ).fetchone()[0]
+        assert count == 0
+
+    def test_generic_forward_ack_threads_under_operator_message(
+        self, daemon, tmp_path
+    ):
+        """The 'Forwarded to brain' ack threads under the operator's message ts,
+        co-located with the Brain's reply-to answer, instead of posting top-level."""
+        self._seed_guidance(daemon, tmp_path)
+        item = self._message("ping", "T123")
+        daemon.socket_handler.drain.return_value = [item]
+
+        daemon.poll_slack_commands()
+
+        call = next(
+            c for c in daemon.slack.post_message.call_args_list
+            if "Forwarded to brain" in c.args[0]
+        )
+        assert call.kwargs.get("thread_ts") == "T123"
+
+
+class TestPromptWaitingPmGateSlack:
+    def test_active_prompt_suppresses_pm_gate_slack_at_threshold(self, daemon, tmp_path):
+        """A durable routine prompt never becomes a direct PM-gate operator alert."""
         worker = {
             "id": "w1", "tmux_session": "ic-w1",
             "spawned_at": "2026-03-08 00:00:00",
@@ -2556,6 +3204,7 @@ class TestHashDedupBypassPromptWaiting:
         claude_dir.mkdir()
         _setup_ironclaude_db(claude_dir, "12345", "abcdef01-2345-6789-abcd-ef0123456789", "plan_ready")
         daemon._claude_dir = claude_dir
+        daemon._db = init_db(str(tmp_path / "pm-gate.db"))
         daemon.brain.send_message.return_value = True
 
         daemon._last_checkin_sent["w1"] = time.time() - 2000
@@ -2564,13 +3213,13 @@ class TestHashDedupBypassPromptWaiting:
         daemon._stage_entered_at["w1"] = time.time() - 1860
         daemon._last_stage_seen["w1"] = "plan_ready"
 
-        daemon._grader.grade = MagicMock(return_value={"waiting": True})
+        daemon._detect_worker_prompt = MagicMock(
+            return_value=PromptDetection(_semantic_prompt(), True)
+        )
 
         daemon.check_workers()
-        daemon.slack.post_message.assert_called_once()
-        msg = daemon.slack.post_message.call_args[0][0]
-        assert "[ALERT]" in msg
-        assert "plan_ready" in msg
+        daemon.slack.post_message.assert_not_called()
+        assert PromptIncidentStore(daemon._db).active_for_worker("w1") is not None
 
     def test_pm_gate_slack_deduped(self, daemon, tmp_path):
         """PM gate Slack notification only fires once per worker per stage."""
@@ -2595,15 +3244,17 @@ class TestHashDedupBypassPromptWaiting:
         daemon._last_stage_seen["w1"] = "plan_ready"
         daemon._pm_gate_slack_sent["w1"] = True
 
-        daemon._grader.grade = MagicMock(return_value={"waiting": True})
+        daemon._detect_worker_prompt = MagicMock(
+            return_value=PromptDetection(_semantic_prompt(), True)
+        )
 
         daemon.check_workers()
         daemon.slack.post_message.assert_not_called()
 
 
 class TestStuckWorkerSlackAlert:
-    def test_slack_fires_for_prompt_waiting_stuck_alert(self, daemon):
-        """Slack notification fires alongside Brain message when prompt_waiting at stuck alert."""
+    def test_active_prompt_suppresses_general_stuck_alert(self, daemon, tmp_path):
+        """Routine prompt state suppresses both Brain and Slack stuck duplicates."""
         worker = {"id": "w1", "tmux_session": "ic-w1"}
         daemon.registry.get_running_workers.return_value = [worker]
         daemon.tmux.has_session.return_value = True
@@ -2613,15 +3264,20 @@ class TestStuckWorkerSlackAlert:
         daemon._stuck_since["w1"] = time.time() - 960
         daemon._stuck_alert_sent["w1"] = False
 
-        daemon._grader.grade = MagicMock(return_value={"waiting": True})
+        daemon._db = init_db(str(tmp_path / "stuck-prompt.db"))
+        initial = PromptIncidentStore(daemon._db).observe(
+            "w1", "plan_ready", _semantic_prompt(), now=1.0
+        )
+        assert initial.action == "dispatch"
+        daemon._detect_worker_prompt = MagicMock(
+            return_value=PromptDetection(_semantic_prompt(), True)
+        )
         daemon._last_stuck_check = 0
 
         daemon.check_stuck_workers()
 
-        daemon.brain.send_message.assert_called_once()
-        assert "[STUCK]" in daemon.brain.send_message.call_args[0][0]
-        daemon.slack.post_message.assert_called_once()
-        assert "[ALERT]" in daemon.slack.post_message.call_args[0][0]
+        daemon.brain.send_message.assert_not_called()
+        daemon.slack.post_message.assert_not_called()
 
     def test_no_slack_for_non_prompt_waiting_stuck_alert(self, daemon):
         """Slack notification does NOT fire when prompt_waiting is False at stuck alert."""
@@ -2634,7 +3290,9 @@ class TestStuckWorkerSlackAlert:
         daemon._stuck_since["w1"] = time.time() - 1900
         daemon._stuck_alert_sent["w1"] = False
 
-        daemon._grader.grade = MagicMock(return_value={"waiting": False})
+        daemon._detect_worker_prompt = MagicMock(
+            return_value=PromptDetection(None, True)
+        )
         daemon._last_stuck_check = 0
 
         daemon.check_stuck_workers()
@@ -3930,6 +4588,9 @@ class TestDeadSessionAccurateSurface:
             assert "not completed" in posted.lower()
             brain_msg = daemon.brain.send_message.call_args[0][0]
             assert "preserved" in brain_msg.lower()
+            assert 'recover_worker_integration("w1", "status")' in brain_msg
+            assert "Do not spawn a cleanup worker" in brain_msg
+            assert "Do not request primary-checkout or terminal commands" in brain_msg
             # Second cycle: the once-per-worker gate suppresses a repeat post.
             daemon.check_workers()
             assert daemon.slack.post_message.call_count == 1

@@ -112,12 +112,12 @@ def ollama_degraded_urls() -> list[str]:
     return _BREAKERS.open_urls()
 
 
-def _http_error(url: str, err: "requests.HTTPError", verb: str = "request") -> OllamaHTTPError:
+def _http_error(url: str, err: "requests.HTTPError", verb: str = "request", backend: str = "Ollama") -> OllamaHTTPError:
     """Build an OllamaHTTPError carrying the response status code (if available)."""
     status = getattr(getattr(err, "response", None), "status_code", None)
     status_txt = status if status is not None else "?"
     return OllamaHTTPError(
-        f"Ollama {verb} returned HTTP {status_txt} at {url}: {err}",
+        f"{backend} {verb} returned HTTP {status_txt} at {url}: {err}",
         status_code=status,
     )
 

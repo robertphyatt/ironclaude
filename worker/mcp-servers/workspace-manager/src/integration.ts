@@ -24,6 +24,7 @@ import {
   worktreeHead,
   worktreeIsClean,
 } from './git.js';
+import { buildScopedStagedTree } from './scoped-tree.js';
 import {
   pushExactAuthorizedRef,
   pushExactAuthorizedIntegratedCandidate,
@@ -389,7 +390,10 @@ function exactCommitEvidence(authority: AuthorizedDirectGitOperation): ExactComm
 
 function validateExactCommitState(sourcePath: string, evidence: ExactCommitEvidence): void {
   const branch = runGit(sourcePath, ['symbolic-ref', '--quiet', '--short', 'HEAD']).trim();
-  const tree = runGit(sourcePath, ['write-tree']).trim();
+  const scoped = evidence as ExactCommitEvidence & { checkoutMode?: string; allowedFiles?: readonly string[] };
+  const tree = (scoped.checkoutMode === 'primary-unassigned' && Array.isArray(scoped.allowedFiles))
+    ? buildScopedStagedTree(sourcePath, scoped.parentOid, scoped.allowedFiles)
+    : runGit(sourcePath, ['write-tree']).trim();
   const parent = runGit(sourcePath, ['rev-parse', '--verify', 'HEAD^{commit}']).trim();
   const local = runGit(sourcePath, ['rev-parse', '--verify', `${evidence.localRef}^{commit}`]).trim();
   if (branch !== evidence.canonicalBranch

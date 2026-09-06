@@ -26,6 +26,12 @@ assert_eq "corrupt current + benign-only proposed" "allow" \
   "$(config_write_verdict 'not json' '{"validation_backend":"ollama","ollama":{"url":"http://b"}}')"
 assert_eq "nested guardrail-named key under benign (inert)" "allow" \
   "$(config_write_verdict '{}' '{"ollama":{"tier_up_review_policy":"off"}}')"
+assert_eq "add openai block (benign)" "allow" \
+  "$(config_write_verdict '{"ollama":{"url":"http://a"}}' '{"ollama":{"url":"http://a"},"openai":{"base_url":"http://h/v1","model":"example-model-a"}}')"
+assert_eq "change backend (benign)" "allow" \
+  "$(config_write_verdict '{"backend":"ollama"}' '{"backend":"openai"}')"
+assert_eq "add spots block (benign)" "allow" \
+  "$(config_write_verdict '{}' '{"spots":{"shadow":{"model":"example-model-b"}}}')"
 
 echo "=== config_write_verdict: guardrail/unknown BLOCKED ==="
 assert_eq "change tier_up_review_policy value" "block" \
@@ -42,6 +48,8 @@ assert_eq "add unknown non-benign key" "block" \
   "$(config_write_verdict '{}' '{"foo":1}')"
 assert_eq "malformed proposed JSON" "block" "$(config_write_verdict '{}' 'not json')"
 assert_eq "non-object proposed (array)" "block" "$(config_write_verdict '{}' '[1,2,3]')"
+assert_eq "still blocks unknown key alongside openai" "block" \
+  "$(config_write_verdict '{}' '{"openai":{"model":"x"},"foo":1}')"
 
 echo "=== is_config_path: routing (CASE-INSENSITIVE for APFS) ==="
 assert_eq "canonical config path" "yes" "$(is_config_path "$HOME/.claude/ironclaude-hooks-config.json")"

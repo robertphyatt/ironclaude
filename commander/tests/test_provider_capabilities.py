@@ -43,8 +43,8 @@ def test_role_and_tier_must_be_explicitly_supported(base_config):
     cfg = dual_config(base_config)
     brain = probe.probe_local(cfg, "codex", "brain", "sonnet")
     assert (brain.configured, brain.supported) == (False, True)
-    fable = probe.probe_local(cfg, "codex", "worker", "fable")
-    assert (fable.configured, fable.supported) == (True, False)
+    unsupported = probe.probe_local(cfg, "codex", "worker", "nonexistent")
+    assert (unsupported.configured, unsupported.supported) == (True, False)
 
 
 def test_missing_executable_is_unusable(base_config):

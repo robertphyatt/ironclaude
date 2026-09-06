@@ -15,7 +15,7 @@ def _tools(tmp_path, providers_overrides=None):
                 "claude": {"enabled": True, "path": "claude",
                            "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "claude-opus-4-8", "fable": "fable"}},
                 "codex": {"enabled": False, "path": "codex",
-                          "models": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol"}},
+                          "models": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol", "fable": "gpt-6-astra"}},
             },
             "roles": {
                 "brain": {"preferred": "claude", "clients": ["claude"]},
@@ -50,3 +50,17 @@ def test_ensure_grader_capabilities_never_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(CapabilityProbe, "probe_local",
                         MagicMock(side_effect=RuntimeError("boom")))
     tools._ensure_role_capabilities("grader", "opus")       # must not raise
+
+
+def test_fable_grader_observes_fable_and_opus_before_routing(tmp_path, monkeypatch):
+    tools = _tools(tmp_path)
+    tools._grader_model = "fable"
+    from ironclaude.provider_capabilities import CapabilityProbe, ClientCapability
+    monkeypatch.setattr(CapabilityProbe, "probe_local", lambda self, cfg, client, role, tier: ClientCapability(
+        host="local", client=client, role=role, tier=tier, configured=True,
+        supported=True, installed=False, authenticated=False, available=False,
+        reason="unavailable"))
+    tools._call_grader("sys", "user")
+    _router, _config, state, _registry = tools._provider_router()
+    assert state.capability_observation("local", "claude", "grader", "fable") is not None
+    assert state.capability_observation("local", "claude", "grader", "opus") is not None

@@ -13,6 +13,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL = REPO_ROOT / "worker" / "skills" / "executing-plans" / "SKILL.md"
 README = REPO_ROOT / "README.md"
+CODEX_SETUP = REPO_ROOT / "CODEX_SETUP.md"
+MAKEFILE = REPO_ROOT / "Makefile"
 ROADMAP = REPO_ROOT / "docs" / "plans" / "2026-07-20-v1-1-overall-roadmap.md"
 
 
@@ -127,10 +129,41 @@ def test_plan_review_dispatch_is_provider_native_with_shared_contract():
     normalized = " ".join(text.split())
     assert "get_professional_mode" in text
     assert "Claude Code" in text and "`Agent`" in text
-    assert "Codex" in text and "`codex exec" in text
+    assert "Codex" in text and "run_codex_advisor_review" in text
+    assert "requester_model" in text
+    assert "broker rejects any mismatch with provider-authenticated codex turn metadata" in normalized.lower()
+    assert "maps the reviewer exactly once" in normalized
+    assert "do not run `codex exec`" in normalized.lower()
     assert "complete current artifact contents inline" in normalized
     assert "same authority order" in normalized
     assert "same materiality" in normalized
+    assert "Luna→`gpt-5.6-terra`, Terra→`gpt-5.6-sol`, Sol→`gpt-6-astra`, and Astra→`gpt-6-astra`" in text
+    assert "`gpt-6-astra`" in text
+    assert 'review_tier: "same"' in text
+    assert 'review_tier: "one-up"' in text
+
+
+def test_fix_advisor_uses_complete_codex_ladder_and_astra_ceiling():
+    text = _read()
+    assert (
+        "Luna→`gpt-5.6-terra`, Terra→`gpt-5.6-sol`, Sol→`gpt-6-astra`, "
+        "Astra ceiling→same-tier Astra"
+    ) in text
+    assert "Sol ceiling→same-tier Sol" not in text
+
+
+def test_actual_fable_consultation_is_distinct_from_native_subagents_and_advisors():
+    text = _read()
+    normalized = " ".join(text.split())
+    assert "Actual Claude Fable from Codex" in text
+    assert "ironclaude:use-fable-subagent" in text
+    assert "native Codex subagent" in normalized
+    assert "Claude Code" in text and "Agent" in text and "model=fable" in text
+    assert "run_codex_advisor_review" in text
+    assert "Commander" in text and "claude-fable" in text
+    assert "must not substitute" in normalized.lower()
+    assert "parent" in normalized.lower() and "orchestration" in normalized.lower()
+    assert "Astra remains a Codex model and does not satisfy an actual Claude Fable request." in text
 
 
 def test_plan_review_hunts_semantic_frame_drift_before_executability():
@@ -194,6 +227,9 @@ def test_self_update_boundary_requires_same_task_runtime_and_behavioral_proof():
     for concept in (
         "installs or updates its own codex plugin",
         "cachebuster before the final build",
+        "make codex-plugin-release",
+        "exit `0`",
+        "`healthy` or `repaired`",
         "fully quit and relaunch codex",
         "reopen the same native task",
         "run_diagnostics.runtime",
@@ -216,6 +252,42 @@ def test_self_update_boundary_requires_same_task_runtime_and_behavioral_proof():
         "missing runtime fields, any fingerprint/identity mismatch, or a failed "
         "behavioral transition must fail closed"
     ) in section
+
+
+def test_codex_install_and_release_use_runtime_preflight_before_plugin_install():
+    readme = _normalized(README.read_text())
+    setup = _normalized(CODEX_SETUP.read_text())
+    makefile = MAKEFILE.read_text()
+    for text in (readme, setup):
+        assert "make codex-plugin-install" in text
+    assert "codex-runtime-preflight:" in makefile
+    assert "worker/scripts/codex-runtime-preflight.mjs --mode repair" in makefile
+    install = subprocess.run(
+        ["make", "-n", "codex-plugin-install"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert install.index("codex-runtime-preflight.mjs --mode repair") < install.index(
+        "codex plugin add ironclaude@ironclaude --json"
+    )
+    release = subprocess.run(
+        ["make", "-n", "codex-plugin-release"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    ordered = (
+        "codex-runtime-preflight.mjs --mode repair",
+        "update_plugin_cachebuster.py worker",
+        "npm run bundle",
+        "validate_plugin.py worker",
+        "codex plugin add ironclaude@ironclaude --json",
+    )
+    positions = [release.index(token) for token in ordered]
+    assert positions == sorted(positions)
 
 
 def test_self_update_boundary_rejects_installation_only_evidence_and_limits_recovery():

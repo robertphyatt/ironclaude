@@ -1,0 +1,2 @@
+_use_id":"toolu_cut12"}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01F12AAAAAAAAAAAAAAAAAAA","content":[{"type":"text","text":"Command running in background with ID: bpf12000000001. Output is being written to: /private/tmp/tasks/bpf12000000001.output."}]}]}}

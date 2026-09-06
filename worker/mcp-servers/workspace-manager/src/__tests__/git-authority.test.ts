@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import Database from 'better-sqlite3';
 import {
   acquirePrimaryCheckoutOwnership,
   createHumanIntent,
@@ -36,10 +37,27 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }).trim();
 }
 
+// Seeds the state-manager DB (STATE_MANAGER_DB_PATH) with a session's plan
+// allowed_files so the unassigned commit / commit-and-push lanes can scope their
+// staged tree. NEVER assign process.env directly — vi.stubEnv is unwound by the
+// afterEach vi.unstubAllEnvs().
+function seedPlanScope(directories: string[], providerRootSessionId: string, files: string[]): void {
+  const dir = mkdtempSync(join(tmpdir(), 'ironclaude-plan-scope-'));
+  directories.push(dir);
+  const dbPath = join(dir, 'state.db');
+  const d = new Database(dbPath);
+  d.exec('CREATE TABLE wave_tasks (terminal_session TEXT, allowed_files TEXT)');
+  d.prepare('INSERT INTO wave_tasks (terminal_session, allowed_files) VALUES (?,?)')
+    .run(providerRootSessionId, JSON.stringify(files));
+  d.close();
+  vi.stubEnv('STATE_MANAGER_DB_PATH', dbPath);
+}
+
 describe('direct Git authority', () => {
   const directories: string[] = [];
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
   });
 
@@ -641,6 +659,7 @@ describe('direct Git authority', () => {
     const database = unassignedDatabase();
     writeFileSync(join(root, 'unassigned.txt'), 'staged\n');
     git(root, 'add', 'unassigned.txt');
+    seedPlanScope(directories, OWNER, ['unassigned.txt']);
 
     issueUnassigned(database, root);
     const authority = verifyUnassigned(database, root);
@@ -657,6 +676,7 @@ describe('direct Git authority', () => {
     const database = unassignedDatabase();
     writeFileSync(join(root, 'unassigned.txt'), 'staged\n');
     git(root, 'add', 'unassigned.txt');
+    seedPlanScope(directories, OWNER, ['unassigned.txt']);
 
     issueUnassigned(database, root);
     const authority = verifyUnassigned(database, root); // consumes the sentinel intent
@@ -710,6 +730,13 @@ describe('direct Git authority', () => {
     const rootX = repository(false);
     const rootY = repository(false);
     const database = unassignedDatabase();
+    // Both repos stage the in-scope file so evidence is observed (not empty-scope);
+    // the isolation is proved by the intent mismatch, not by a scope refusal.
+    writeFileSync(join(rootX, 'unassigned.txt'), 'staged\n');
+    git(rootX, 'add', 'unassigned.txt');
+    writeFileSync(join(rootY, 'unassigned.txt'), 'staged\n');
+    git(rootY, 'add', 'unassigned.txt');
+    seedPlanScope(directories, OWNER, ['unassigned.txt']);
 
     issueUnassigned(database, rootX);
 
@@ -833,6 +860,11 @@ describe('direct Git authority', () => {
     writeFileSync(join(root, 'ahead.txt'), 'ahead\n');
     git(root, 'add', 'ahead.txt');
     git(root, 'commit', '-m', 'local ahead');
+    // The commit issue reads plan scope; stage an in-scope file so it observes
+    // evidence rather than refusing on empty scope, isolating the op-mismatch proof.
+    writeFileSync(join(root, 'staged.txt'), 'staged\n');
+    git(root, 'add', 'staged.txt');
+    seedPlanScope(directories, OWNER, ['staged.txt']);
     issueUnassigned(database, root); // operation: 'commit'
     expect(() => verifyUnassignedPush(database, root)).toThrow('requires a matching human intent');
   });
@@ -857,6 +889,24 @@ describe('direct Git authority', () => {
     issueUnassignedPush(database, root);
     database.prepare("UPDATE human_intents SET expires_at = '2000-01-01T00:00:00.000Z'").run();
     expect(() => verifyUnassignedPush(database, root)).toThrow('requires a matching human intent');
+  });
+
+  it('pushes an unassigned-primary push with NO plan scope even when the state DB is missing (push never reads scope)', () => {
+    const root = repository(true);
+    const database = unassignedDatabase();
+    writeFileSync(join(root, 'ahead.txt'), 'ahead\n');
+    git(root, 'add', 'ahead.txt');
+    git(root, 'commit', '-m', 'local ahead');
+    const localHead = git(root, 'rev-parse', 'HEAD');
+    // Point plan-scope at a DB that does not exist. A commit/cap lane would fail
+    // closed here; the push lane must not read scope at all.
+    vi.stubEnv('STATE_MANAGER_DB_PATH', join(tmpdir(), `ironclaude-nonexistent-${randomUUID()}`, 'state.db'));
+
+    issueUnassignedPush(database, root);
+    const authority = verifyUnassignedPush(database, root);
+    pushExactAuthorizedRef(authority); // any throw fails the test
+
+    expect(git(root, 'ls-remote', '--refs', 'origin', 'refs/heads/main').split(/\s+/)[0]).toBe(localHead);
   });
 
   function issueUnassignedCap(database: ReturnType<typeof initDb>, root: string, humanChannel = 'codex-user-prompt') {
@@ -884,6 +934,7 @@ describe('direct Git authority', () => {
     const database = unassignedDatabase();
     writeFileSync(join(root, 'staged.txt'), 'staged\n');
     git(root, 'add', 'staged.txt');
+    seedPlanScope(directories, OWNER, ['staged.txt']);
 
     issueUnassignedCap(database, root);
     const authority = verifyUnassignedCap(database, root);
@@ -906,6 +957,7 @@ describe('direct Git authority', () => {
     git(root, 'reset', '--hard', c0);
     writeFileSync(join(root, 'staged.txt'), 'staged\n');
     git(root, 'add', 'staged.txt');
+    seedPlanScope(directories, OWNER, ['staged.txt']);
 
     expect(() => issueUnassignedCap(database, root)).toThrow(/fast-forward/);
   });
@@ -916,6 +968,7 @@ describe('direct Git authority', () => {
     git(root, 'checkout', '-b', 'feature');
     writeFileSync(join(root, 'staged.txt'), 'staged\n');
     git(root, 'add', 'staged.txt');
+    seedPlanScope(directories, OWNER, ['staged.txt']);
 
     issueUnassignedCap(database, root);
     const authority = verifyUnassignedCap(database, root);
@@ -930,6 +983,7 @@ describe('direct Git authority', () => {
     const dbA = unassignedDatabase();
     writeFileSync(join(rootA, 'staged.txt'), 'staged\n');
     git(rootA, 'add', 'staged.txt');
+    seedPlanScope(directories, OWNER, ['staged.txt']);
     issueUnassigned(dbA, rootA); // operation 'commit'
     expect(() => verifyUnassignedCap(dbA, rootA)).toThrow('requires a matching human intent');
 
@@ -938,6 +992,10 @@ describe('direct Git authority', () => {
     writeFileSync(join(rootB, 'ahead.txt'), 'ahead\n');
     git(rootB, 'add', 'ahead.txt');
     git(rootB, 'commit', '-m', 'local ahead');
+    // Stage the in-scope file so the cap verify observes evidence and fails on the
+    // op mismatch (push intent vs cap verify), not on empty scope.
+    writeFileSync(join(rootB, 'staged.txt'), 'staged\n');
+    git(rootB, 'add', 'staged.txt');
     issueUnassignedPush(dbB, rootB); // operation 'push'
     expect(() => verifyUnassignedCap(dbB, rootB)).toThrow('requires a matching human intent');
   });
@@ -947,6 +1005,7 @@ describe('direct Git authority', () => {
     const dbA = unassignedDatabase();
     writeFileSync(join(rootA, 'staged.txt'), 'staged\n');
     git(rootA, 'add', 'staged.txt');
+    seedPlanScope(directories, OWNER, ['staged.txt']);
     issueUnassignedCap(dbA, rootA); // operation 'commit-and-push'
     expect(() => verifyUnassigned(dbA, rootA)).toThrow('requires a matching human intent'); // verify as 'commit'
 
@@ -975,6 +1034,11 @@ describe('direct Git authority', () => {
   it('issues an unassigned commit intent from the hook when the session holds zero assignments', () => {
     const root = repository(false);
     const database = unassignedDatabase();
+    // Commit evidence now scopes to allowed_files; stage an in-scope file so the
+    // hook issue observes evidence rather than refusing on empty scope.
+    writeFileSync(join(root, 'staged.txt'), 'staged\n');
+    git(root, 'add', 'staged.txt');
+    seedPlanScope(directories, OWNER, ['staged.txt']);
 
     const receipt = issueHumanIntentFromHook(database, hookArgs(root, 'commit'));
 
@@ -997,6 +1061,7 @@ describe('direct Git authority', () => {
     const database = unassignedDatabase();
     writeFileSync(join(root, 'staged.txt'), 'staged\n');
     git(root, 'add', 'staged.txt');
+    seedPlanScope(directories, OWNER, ['staged.txt']);
 
     const receipt = issueHumanIntentFromHook(database, hookArgs(root, 'commit-and-push'));
 

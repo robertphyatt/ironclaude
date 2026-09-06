@@ -1,4 +1,4 @@
-.PHONY: tailscale-serve-setup deploy-hooks test test-hooks test-commander test-workspace-manager
+.PHONY: codex-runtime-preflight codex-plugin-install codex-plugin-release tailscale-serve-setup deploy-hooks test test-hooks test-commander test-workspace-manager
 
 PLUGIN_CACHE_BASE := $(HOME)/.claude/plugins/cache/ironclaude/ironclaude
 # Derive the latest installed plugin-cache version dir at runtime instead of
@@ -8,6 +8,24 @@ PLUGIN_CACHE_BASE := $(HOME)/.claude/plugins/cache/ironclaude/ironclaude
 PLUGIN_CACHE_VERSION := $(shell ls -1 "$(PLUGIN_CACHE_BASE)" 2>/dev/null | sort -V | tail -1)
 PLUGIN_CACHE_HOOK_DIR := $(PLUGIN_CACHE_BASE)/$(PLUGIN_CACHE_VERSION)/hooks
 STABLE_HOOK_DIR := $(HOME)/.claude/ironclaude-hooks
+
+
+# Repair Codex's launcher companion before plugin installation or self-update.
+# The helper is idempotent and refuses to overwrite any non-equivalent path.
+codex-runtime-preflight:
+	node worker/scripts/codex-runtime-preflight.mjs --mode repair
+
+# Supported Codex setup entry point. The companion repair cannot be omitted.
+codex-plugin-install: codex-runtime-preflight
+	codex plugin add ironclaude@ironclaude --json
+
+# Supported source self-update entry point. Ordering is intentional: repair the
+# host companion, cachebust, build, validate, then install the same bytes.
+codex-plugin-release: codex-runtime-preflight
+	python3 $(HOME)/.codex/skills/.system/plugin-creator/scripts/update_plugin_cachebuster.py worker
+	cd worker/mcp-servers/state-manager && npm exec -- tsc --noEmit && npm run bundle
+	python3 $(HOME)/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py worker
+	codex plugin add ironclaude@ironclaude --json
 
 
 # ─── Tests ───

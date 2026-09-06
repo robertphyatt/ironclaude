@@ -23,6 +23,8 @@ from glob import glob
 from pathlib import Path
 from typing import Callable, Optional
 from ironclaude import paths
+from ironclaude.config import effort_for_tier
+from ironclaude.provider_config import _semantic_tier
 from ironclaude.grader import LocalGrader
 from ironclaude.signal_forensics import _logged_kill
 from ironclaude.fable_availability import mark_fable_unavailable as _mark_fable_unavailable
@@ -207,11 +209,13 @@ class BrainClient:
         model: str = "sonnet",
         effort_level: str = "high",
         on_fable_unavailable_transition: Optional[Callable[[str], None]] = None,
+        effort_levels: dict | None = None,
     ):
         self.timeout_seconds = timeout_seconds
         self._operator_name = operator_name
         self._model = model
         self._effort_level = effort_level
+        self._effort_levels = effort_levels or {}
         self._on_fable_unavailable_transition = on_fable_unavailable_transition
         self.restart_count = 0
         self._response_queue: queue.Queue[str] = queue.Queue()
@@ -253,7 +257,19 @@ class BrainClient:
         self._session_log_path: str | None = None
         self._session_log_lock = threading.Lock()
         self._previous_session_context: str | None = None
-        self._grader = LocalGrader(timeout=15, keep_alive="30m")
+        self._grader = LocalGrader(keep_alive="30m")
+
+    def _resolve_effort(self, model_str: str) -> str:
+        """TIER-FIRST reasoning-effort for a concrete brain model: the model's
+        semantic tier selects a per-tier override from self._effort_levels, else
+        falls back to the global self._effort_level. Used by _build_options per
+        model_str so the opus-outage fallback (which re-enters with
+        claude-opus-4-8) resolves the opus-tier effort, not the original tier's."""
+        return effort_for_tier(
+            _semantic_tier(model_str, "brain_model", ""),
+            self._effort_level,
+            self._effort_levels,
+        )
 
     def start(self, system_prompt: str, cwd: str | None = None) -> None:
         """Start the brain SDK client in a background thread."""
@@ -736,7 +752,7 @@ class BrainClient:
                 cwd=cwd,
                 max_buffer_size=self.MAX_BUFFER_SIZE,
                 mcp_servers=mcp_servers,
-                effort=self._effort_level,
+                effort=self._resolve_effort(model_str),
                 setting_sources=["project", "local"],
             )
             if _model_needs_1m_beta(model_str):

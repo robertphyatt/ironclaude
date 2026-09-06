@@ -25,10 +25,14 @@ consuming the single-use intent.
 
 1. Read professional mode and workspace status through active client's
    provider-native state-manager and workspace-manager. Require professional
-   mode on, provider-root identity, one matching assignment, reviewed staged
-   changes, and configured remote.
+   mode on, provider-root identity, EITHER one matching managed assignment OR
+   zero assignments (a plain primary checkout — the
+   unassigned-primary commit-and-push lane), reviewed staged changes, and
+   configured remote.
 2. Choose concise commit `message`. Call workspace-manager `commit_and_push`
-   with only `repository_path`, `workspace_guid`, and `message`.
+   with `repository_path` and `message`, plus `workspace_guid` ONLY when a
+   managed assignment exists; for a plain primary checkout with no assignment,
+   omit `workspace_guid` entirely.
 3. Report returned local integration and remote result exactly. If local commit
    and integration succeed but push fails, say that local work remains
    integrated and report push failure; never claim rollback.

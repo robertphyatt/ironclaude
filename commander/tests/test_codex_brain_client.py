@@ -469,6 +469,11 @@ class TestModelWiring:
     def test_opus_tier_resolves_to_sol(self):
         assert CodexBrainClient(model="opus")._resolve_model() == "gpt-5.6-sol"
 
+    def test_fable_tier_resolves_to_astra(self):
+        client = CodexBrainClient(model="fable")
+        assert client._resolve_model() == "gpt-6-astra"
+        assert 'model="gpt-6-astra"' in client._app_server_argv()
+
     def test_haiku_tier_resolves_to_luna(self):
         assert CodexBrainClient(model="haiku")._resolve_model() == "gpt-5.6-luna"
 
@@ -605,6 +610,10 @@ class TestBrainRoleDiscriminator:
 
         monkeypatch.setattr(m.subprocess, "Popen", fake_popen)
         c = CodexBrainClient()
+        monkeypatch.setattr(c, "_runtime_preflight", lambda: {
+            "schema_version": 1, "status": "healthy", "reason": "destination-equivalent",
+            "source_companion": "/source", "destination_companion": "/destination",
+        })
         monkeypatch.setattr(c, "_preflight_orchestrator", lambda: None)
         monkeypatch.setattr(c, "_reader_loop", lambda: None)
         monkeypatch.setattr(c, "_stderr_loop", lambda: None)
@@ -768,6 +777,10 @@ class TestOrchestratorMcpWiring:
         import ironclaude.codex_brain_client as module
 
         client = CodexBrainClient()
+        monkeypatch.setattr(client, "_runtime_preflight", lambda: {
+            "schema_version": 1, "status": "healthy", "reason": "destination-equivalent",
+            "source_companion": "/source", "destination_companion": "/destination",
+        })
         monkeypatch.setattr(
             client, "_orchestrator_source_path", lambda: tmp_path / "missing.py"
         )
@@ -1047,6 +1060,10 @@ class TestOrchestratorStartupReadiness:
         )
 
         assert client._verify_orchestrator_mcp() is None
+        assert client._verified_tool_inventory == {
+            "orchestrator": frozenset(orchestrator),
+            "episodic-memory": frozenset(),
+        }
 
     def test_start_failure_occurs_after_thread_start_before_first_turn(self, monkeypatch):
         import ironclaude.codex_brain_client as module
@@ -1070,6 +1087,10 @@ class TestOrchestratorStartupReadiness:
                 return 0
 
         client = CodexBrainClient()
+        monkeypatch.setattr(client, "_runtime_preflight", lambda: {
+            "schema_version": 1, "status": "healthy", "reason": "destination-equivalent",
+            "source_companion": "/source", "destination_companion": "/destination",
+        })
         sent = []
         responses = [
             {"result": {}},
@@ -1107,6 +1128,325 @@ def test_app_server_argv_pins_configured_reasoning_effort():
     """A non-default effort proves _effort_level is read rather than hardcoded."""
     c = CodexBrainClient(effort_level="low")
     assert 'model_reasoning_effort="low"' in c._app_server_argv()
+
+
+class TestCodexEffortByTier:
+    """TIER-FIRST reasoning-effort: the codex model's tier (direct tier name, or
+    inverse-mapped from a concrete codex model) selects a per-tier override from
+    effort_levels, else falls back to the global effort_level."""
+
+    def test_effort_levels_defaults_to_empty(self):
+        assert CodexBrainClient()._effort_levels == {}
+
+    def test_fable_codex_model_resolves_per_tier_effort(self):
+        c = CodexBrainClient(
+            model="gpt-6-astra", effort_level="high", effort_levels={"fable": "medium"}
+        )
+        assert 'model_reasoning_effort="medium"' in c._app_server_argv()
+
+    def test_sol_codex_model_falls_back_to_global_effort(self):
+        c = CodexBrainClient(
+            model="gpt-5.6-sol", effort_level="high", effort_levels={"fable": "medium"}
+        )
+        assert 'model_reasoning_effort="high"' in c._app_server_argv()
+
+
+class TestRuntimeCapabilityPreflight:
+    HEALTHY = {
+        "schema_version": 1,
+        "mode": "repair",
+        "status": "healthy",
+        "invoked_launcher": "/usr/local/bin/codex",
+        "resolved_launcher": "/Applications/Codex/codex",
+        "source_companion": "/Applications/Codex/codex-code-mode-host",
+        "destination_companion": "/usr/local/bin/codex-code-mode-host",
+        "action": "none",
+        "reason": "destination-equivalent",
+    }
+
+    def test_preflight_uses_node_argv_without_shell(self, monkeypatch):
+        captured = {}
+        client = CodexBrainClient()
+
+        def fake_run(argv):
+            captured["argv"] = argv
+            return 0, json.dumps(self.HEALTHY) + "\n", None
+
+        monkeypatch.setattr(client, "_run_runtime_preflight_process", fake_run)
+        result = client._runtime_preflight()
+        assert result == self.HEALTHY
+        assert captured["argv"][0] == "node"
+        assert captured["argv"][-2:] == ["--mode", "repair"]
+
+    @pytest.mark.parametrize("failure", ["malformed", "timeout"])
+    def test_malformed_or_timeout_is_blocked(self, monkeypatch, failure):
+        client = CodexBrainClient()
+        if failure == "timeout":
+            def fake_run(_argv):
+                return None, None, "timeout"
+        else:
+            def fake_run(_argv):
+                return 0, "not-json", None
+        monkeypatch.setattr(client, "_run_runtime_preflight_process", fake_run)
+        result = client._runtime_preflight()
+        assert result["status"] == "blocked"
+        assert failure in result["reason"]
+
+    def test_live_output_cap_kills_helper_before_accepting_oversized_output(
+        self, monkeypatch
+    ):
+        import ironclaude.codex_brain_client as module
+
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"x" * 9)
+        os.close(write_fd)
+
+        class FakeProc:
+            def __init__(self):
+                self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+                self.killed = False
+
+            def poll(self):
+                return None if not self.killed else -9
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self, timeout=None):
+                return -9 if self.killed else 0
+
+        proc = FakeProc()
+        monkeypatch.setattr(module, "_RUNTIME_PREFLIGHT_OUTPUT_CAP", 8)
+        monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: proc)
+        returncode, stdout, failure = CodexBrainClient()._run_runtime_preflight_process(
+            ["node", "helper.mjs"]
+        )
+        assert returncode is None
+        assert stdout is None
+        assert failure == "oversized-output"
+        assert proc.killed is True
+
+    def test_blocked_preflight_prevents_popen_and_restart_churn(self, monkeypatch):
+        import ironclaude.codex_brain_client as module
+
+        client = CodexBrainClient()
+        blocked = {
+            **self.HEALTHY,
+            "status": "blocked",
+            "reason": "destination-conflict",
+        }
+        monkeypatch.setattr(client, "_runtime_preflight", lambda: blocked)
+        popen = MagicMock()
+        monkeypatch.setattr(module.subprocess, "Popen", popen)
+
+        client.start("prompt")
+
+        popen.assert_not_called()
+        assert client.capability_block == blocked
+        assert client.needs_restart() is False
+
+    def test_bounded_success_record_precedes_orchestrator_preflight_and_popen(
+        self, monkeypatch
+    ):
+        import ironclaude.codex_brain_client as module
+
+        events = []
+        client = CodexBrainClient()
+        monkeypatch.setattr(client, "_runtime_preflight", lambda: dict(self.HEALTHY))
+        monkeypatch.setattr(
+            client,
+            "_preflight_orchestrator",
+            lambda: events.append("orchestrator-preflight") or None,
+        )
+
+        original_info = module.logger.info
+
+        def record_info(message, *args, **kwargs):
+            if message.startswith("Codex runtime preflight"):
+                events.append("runtime-preflight-record")
+            return original_info(message, *args, **kwargs)
+
+        def fail_popen(*_args, **_kwargs):
+            events.append("popen")
+            raise OSError("intentional test stop")
+
+        monkeypatch.setattr(module.logger, "info", record_info)
+        monkeypatch.setattr(module.subprocess, "Popen", fail_popen)
+
+        client.start("")
+
+        assert events == [
+            "runtime-preflight-record",
+            "orchestrator-preflight",
+            "popen",
+        ]
+
+    def test_runtime_preflight_record_redacts_unknown_values(self, monkeypatch, caplog):
+        client = CodexBrainClient()
+        secret = "SUPER-SECRET-RUNTIME-DETAIL"
+        monkeypatch.setattr(
+            client,
+            "_runtime_preflight",
+            lambda: {
+                "schema_version": secret,
+                "status": secret,
+                "reason": secret,
+                "action": secret,
+            },
+        )
+
+        with caplog.at_level("INFO"):
+            client.start("")
+
+        assert "Codex runtime preflight" in caplog.text
+        assert secret not in caplog.text
+
+    def test_start_clears_verified_tool_inventory_before_blocked_probe(
+        self, monkeypatch
+    ):
+        client = CodexBrainClient()
+        client._verified_tool_inventory = {
+            "orchestrator": frozenset({"get_worker_status"})
+        }
+        monkeypatch.setattr(
+            client,
+            "_runtime_preflight",
+            lambda: {**self.HEALTHY, "status": "blocked"},
+        )
+
+        client.start("")
+
+        assert client._verified_tool_inventory == {}
+
+
+class TestBoundedMcpToolEvidence:
+    def test_tool_events_retain_only_bounded_sanitized_status(self, caplog):
+        client = CodexBrainClient()
+        client._verified_tool_inventory = {
+            "orchestrator": frozenset({"send_to_worker"})
+        }
+        secret = "SUPER-SECRET-TOKEN"
+        with caplog.at_level("INFO"):
+            client._handle_event({
+                "method": "item/started",
+                "params": {"item": {
+                    "type": "mcpToolCall", "server": "orchestrator",
+                    "tool": "send_to_worker", "arguments": {"token": secret},
+                }},
+            })
+            client._handle_event({
+                "method": "item/completed",
+                "params": {"item": {
+                    "type": "mcpToolCall", "server": "orchestrator",
+                    "tool": "send_to_worker", "status": "failed",
+                    "error": {"message": "failed to spawn code-mode host"},
+                    "result": secret * 500,
+                }},
+            })
+        events = client.get_tool_events()
+        assert events == [
+            {"server": "orchestrator", "tool": "send_to_worker", "status": "started", "error_category": None},
+            {"server": "orchestrator", "tool": "send_to_worker", "status": "failed", "error_category": "command_bridge"},
+        ]
+        assert secret not in caplog.text
+
+    def test_verified_inventory_accepts_bare_and_exact_codex_namespace(self):
+        client = CodexBrainClient()
+        client._verified_tool_inventory = {
+            "orchestrator": frozenset({"get_worker_status"})
+        }
+
+        for tool in (
+            "get_worker_status",
+            "mcp__orchestrator__get_worker_status",
+        ):
+            client._handle_event({
+                "method": "item/completed",
+                "params": {"item": {
+                    "type": "mcpToolCall",
+                    "server": "orchestrator",
+                    "tool": tool,
+                    "status": "completed",
+                }},
+            })
+
+        assert [event["tool"] for event in client.get_tool_events()] == [
+            "get_worker_status",
+            "get_worker_status",
+        ]
+
+    @pytest.mark.parametrize(
+        ("server", "tool"),
+        [
+            ("research", "mcp__orchestrator__get_worker_status"),
+            ("orchestrator", "mcp__research__get_worker_status"),
+            ("orchestrator", "mcp__orchestrator__missing_tool"),
+            ("orchestrator", "mcp__orchestrator_get_worker_status"),
+        ],
+    )
+    def test_namespace_or_inventory_mismatch_remains_unknown(self, server, tool):
+        client = CodexBrainClient()
+        client._verified_tool_inventory = {
+            "orchestrator": frozenset({"get_worker_status"}),
+            "research": frozenset(),
+        }
+
+        client._handle_event({
+            "method": "item/completed",
+            "params": {"item": {
+                "type": "mcpToolCall",
+                "server": server,
+                "tool": tool,
+                "status": "completed",
+            }},
+        })
+
+        assert client.get_tool_events()[0]["tool"] == "unknown"
+
+    def test_inventory_bounds_and_identifier_grammar_fail_verification(self):
+        client = CodexBrainClient()
+        required = {
+            name: {"name": name}
+            for name in TestOrchestratorStartupReadiness.REQUIRED
+        }
+        oversized = {
+            f"tool_{index}": {"name": f"tool_{index}"}
+            for index in range(513)
+        }
+
+        error = client._install_verified_tool_inventory({
+            "orchestrator": {"tools": {**required, **oversized}},
+            "episodic-memory": {"tools": {}},
+        })
+
+        assert error == "orchestrator MCP inventory exceeds tool cap"
+        assert client._verified_tool_inventory == {}
+
+        error = client._install_verified_tool_inventory({
+            "orchestrator": {"tools": {**required, "bad tool": {}}},
+            "episodic-memory": {"tools": {}},
+        })
+
+        assert error == "orchestrator MCP inventory has unsafe tool identifier"
+        assert client._verified_tool_inventory == {}
+
+    def test_unrecognized_identifier_values_are_hashed_not_logged(self, caplog):
+        client = CodexBrainClient()
+        secret = "SECRETTHATLOOKSLIKEANIDENTIFIER"
+        with caplog.at_level("INFO"):
+            client._handle_event({
+                "method": "item/completed",
+                "params": {"item": {
+                    "type": "mcpToolCall", "server": secret,
+                    "tool": secret, "status": secret,
+                }},
+            })
+        event = client.get_tool_events()[0]
+        assert event["server"] == "unknown"
+        assert event["tool"] == "unknown"
+        assert event["status"] == "unknown"
+        assert secret not in json.dumps(event)
+        assert secret not in caplog.text
 
 
 def test_optional_mcp_overrides_registers_research_and_ollama():

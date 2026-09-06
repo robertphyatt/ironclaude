@@ -20,7 +20,7 @@ describe('parseCodexConversation', () => {
     expect(e.assistantMessage).not.toContain('opaque');
 
     expect(e.sessionId).toBe('019f7742-abd8-7c62-af7b-fe07189f1ffd'); // from session_meta
-    expect(e.cwd).toBe('/Users/roberthyatt/Code/ironclaude');         // from session_meta
+    expect(e.cwd).toBe('/Users/example/Code/ironclaude');         // from session_meta
     expect(e.claudeVersion).toBe('0.145.0-alpha.18');                 // cli_version
     expect(e.gitBranch).toBeUndefined();                              // absent in Codex
     expect(e.project).toBe('proj');

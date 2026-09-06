@@ -21,6 +21,8 @@ class TestInitDb:
         assert "provider_role_state" in tables
         assert "provider_capability_state" in tables
         assert "directive_capability_blocks" in tables
+        assert "worker_prompt_incidents" in tables
+        assert "worker_prompt_dispatches" in tables
         conn.close()
 
     def test_directive_capability_block_survives_reopen(self, tmp_path):
@@ -111,6 +113,40 @@ class TestInitDb:
             "workspace_base_commit",
             "workspace_integration_target",
         } <= columns
+        conn.close()
+
+    def test_migrates_legacy_provider_capability_incident_columns(self, tmp_path):
+        db_path = str(tmp_path / "legacy-provider.db")
+        legacy = sqlite3.connect(db_path)
+        legacy.execute(
+            "CREATE TABLE provider_capability_state ("
+            "host TEXT, client TEXT, role TEXT, tier TEXT, "
+            "available INTEGER DEFAULT 0, PRIMARY KEY(host, client, role, tier))"
+        )
+        legacy.commit()
+        legacy.close()
+
+        conn = init_db(db_path)
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(provider_capability_state)")
+        }
+        assert {
+            "capability_fingerprint",
+            "notification_state",
+            "last_probe_at",
+            "next_probe_at",
+            "probe_backoff_seconds",
+        } <= columns
+        conn.close()
+
+    def test_prompt_incident_partial_and_history_indexes_exist(self, tmp_path):
+        conn = init_db(str(tmp_path / "indexes.db"))
+        indexes = {
+            row[1]: row[2]
+            for row in conn.execute("PRAGMA index_list(worker_prompt_incidents)")
+        }
+        assert indexes["idx_worker_prompt_one_active"] == 1
+        assert indexes["idx_worker_prompt_fingerprint_history"] == 0
         conn.close()
 
 

@@ -548,7 +548,11 @@ class TestFileOperations:
 
 # --- Menu detection fixtures and tests ---
 
-from ironclaude.tmux_manager import detect_ask_user_menu
+from ironclaude.tmux_manager import (
+    PromptSignal,
+    detect_ask_user_menu,
+    validate_prompt_candidate,
+)
 
 
 MENU_WITH_OTHER = """\
@@ -628,6 +632,13 @@ class TestDetectAskUserMenu:
         assert result["free_text_option"] == 3
         assert result["current_selection"] == 1
         assert len(result["options"]) == 3
+        assert result["question"] == "Which approach fits your needs?"
+        assert isinstance(result["signal"], PromptSignal)
+        assert result["signal"].options == (
+            ("1", "Event-driven"),
+            ("2", "Direct calls"),
+            ("3", "Other"),
+        )
 
     def test_detects_menu_with_type_something(self):
         """Detects menu and identifies 'Type something.' as the free-text option."""
@@ -656,6 +667,12 @@ class TestDetectAskUserMenu:
         result = detect_ask_user_menu(MENU_CURSOR_ON_OPTION_2)
         assert result["current_selection"] == 2
 
+    def test_stale_menu_followed_by_completion_is_not_current(self):
+        result = detect_ask_user_menu(
+            MENU_WITH_OTHER + "\nCompleted task successfully.\n❯ "
+        )
+        assert result["detected"] is False
+
     def test_parses_option_labels(self):
         """All option labels are correctly extracted."""
         result = detect_ask_user_menu(MENU_WITH_OTHER)
@@ -663,6 +680,104 @@ class TestDetectAskUserMenu:
         assert "Event-driven" in labels
         assert "Direct calls" in labels
         assert "Other" in labels
+
+
+class TestValidatePromptCandidate:
+    def candidate(self, block, question="Which recovery should run?", **overrides):
+        result = {
+            "kind": "question",
+            "interaction_block": block,
+            "question": question,
+            "options": [],
+            "authority_text": "",
+        }
+        result.update(overrides)
+        return result
+
+    def test_accepts_exact_final_interaction_block(self):
+        pane = (
+            "Completed inspection.\n\nWhich recovery should run?\n❯ \n"
+            "Context left until auto-compact: 16%\n"
+            "⏵⏵ bypass permissions on (shift+tab to cycle)"
+        )
+        signal = validate_prompt_candidate(
+            pane,
+            self.candidate("Which recovery should run?"),
+        )
+        assert signal is not None
+        assert signal.question == "Which recovery should run?"
+        assert signal.source_spans
+
+    @pytest.mark.parametrize(
+        "pane,block",
+        [
+            (
+                "Which recovery should run?\n❯ bounded\nRunning tests...\nAll 5 passed\n❯ ",
+                "Which recovery should run?",
+            ),
+            (
+                "Approve the Git operation?\nCommand: pytest -q\n12 passed\n❯ ",
+                "Approve the Git operation?",
+            ),
+            (
+                "Which old path?\nAnswer: A\nWorking...\nWhich final path?\n❯ ",
+                "Which old path?",
+            ),
+            (
+                "Review text: `Which recovery should run?`\nContinuing analysis...\n❯ ",
+                "Which recovery should run?",
+            ),
+            (
+                "Which option?\n1. A\n2. B\nEnter to select\nCompleted task\n❯ ",
+                "Which option?\n1. A\n2. B",
+            ),
+        ],
+    )
+    def test_rejects_stale_or_quoted_interaction(self, pane, block):
+        assert validate_prompt_candidate(
+            pane,
+            self.candidate(block, question=block.splitlines()[0]),
+        ) is None
+
+    def test_only_final_question_can_qualify(self):
+        pane = "Which old path?\nAnswer: A\n\nWhich final path?\n❯ "
+        old = self.candidate("Which old path?", question="Which old path?")
+        current = self.candidate("Which final path?", question="Which final path?")
+        assert validate_prompt_candidate(pane, old) is None
+        assert validate_prompt_candidate(pane, current).question == "Which final path?"
+
+    def test_rejects_ambiguous_truncated_block(self):
+        pane = "Which recovery should run?\n❯ "
+        candidate = self.candidate("Which recovery should run?")
+        assert validate_prompt_candidate(pane, candidate, capture_truncated=True) is None
+
+    def test_rejects_boolean_without_exact_content(self):
+        assert validate_prompt_candidate("❯ keep going", {"waiting": True}) is None
+
+    def test_rejects_option_value_not_present_in_source(self):
+        pane = "Choose a path?\n1. Alpha\n❯ "
+        candidate = self.candidate(
+            "Choose a path?\n1. Alpha",
+            question="Choose a path?",
+            options=[{"value": "99", "label": "Alpha"}],
+        )
+        assert validate_prompt_candidate(pane, candidate) is None
+
+    def test_preserves_exact_option_value_and_label_spans(self):
+        pane = "Choose 1 of these paths?\n1. Alpha\n2. Beta\n❯ "
+        candidate = self.candidate(
+            "Choose 1 of these paths?\n1. Alpha\n2. Beta",
+            question="Choose 1 of these paths?",
+            options=[
+                {"value": "1", "label": "Alpha"},
+                {"value": "2", "label": "Beta"},
+            ],
+        )
+        signal = validate_prompt_candidate(pane, candidate)
+        assert signal.options == (("1", "Alpha"), ("2", "Beta"))
+        assert {name for name, _, _ in signal.source_spans} >= {
+            "option-value:1", "option-label:1", "option-value:2", "option-label:2"
+        }
 
 
 class TestAdoptionHelpers:

@@ -300,6 +300,20 @@ class TestProviderAwareWorkerCommand:
         assert "--model claude-opus-4-6" in cmd
         assert "--model fable" not in cmd
 
+    def test_codex_fable_handle_launches_astra_without_claude_fable_state(self, tools):
+        handle = _provider_handle(
+            client="codex", requested="fable", effective="fable", model="gpt-6-astra",
+        )
+        tools._resolve_worker_client = MagicMock(return_value=handle)
+
+        cmd, returned = tools._build_worker_launch_cmd(
+            "claude-fable", "", "w1", None,
+        )
+
+        assert returned is handle
+        assert "exec codex --model gpt-6-astra" in cmd
+        assert tools._launch_used_claude_fable("claude-fable", handle) is False
+
     def test_worker_templates_declared_as_package_data(self):
         pyproject = Path(__file__).parents[1] / "pyproject.toml"
         config = tomllib.loads(pyproject.read_text())
@@ -899,6 +913,62 @@ class TestRemoteProviderLaunching:
         assert handle.host == "ssh-remote"
         assert state.get_current_client("worker") == "codex"
         assert all(call.args[0] == "ssh-remote" for call in ssh.run_argv.call_args_list)
+
+    def test_remote_codex_fable_resolution_survives_claude_fable_quarantine(
+        self, registry, mock_tmux, tmp_path, db_conn, monkeypatch,
+    ):
+        """Claude Fable quarantine must not rewrite a configured Codex Astra route."""
+        from ironclaude import fable_availability
+
+        monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "fable_state.json")
+        fable_availability.mark_fable_unavailable("Claude Fable quarantined for test")
+        config = copy.deepcopy(DEFAULTS)
+        config["providers"]["clients"]["codex"]["enabled"] = True
+        config["providers"]["roles"]["worker"] = {
+            "preferred": "codex",
+            "clients": ["codex"],
+        }
+        tools = OrchestratorTools(
+            registry, mock_tmux, str(tmp_path / "ledger.json"),
+            db_conn=db_conn, config=config,
+        )
+        machine = self._machine({
+            "codex": {"enabled": True, "path": "/opt/codex"},
+        })
+        ssh = self._attach_remote(tools, machine)
+
+        def run_argv(_host, argv):
+            if tuple(argv) == ("/opt/codex", "login", "status"):
+                return ProbeResult(0, "Logged in using ChatGPT\n", "")
+            return ProbeResult(0, "version\n", "")
+
+        ssh.run_argv.side_effect = run_argv
+        handle = tools._resolve_remote_worker_client("claude-fable", machine)
+
+        assert (handle.client, handle.requested_tier, handle.effective_tier, handle.model) == (
+            "codex", "fable", "fable", "gpt-6-astra",
+        )
+        assert ("/opt/codex", "login", "status") in [
+            tuple(call.args[1]) for call in ssh.run_argv.call_args_list
+        ]
+        state = ProviderState(db_conn)
+        assert state.capability_observation(
+            "ssh-remote", "codex", "worker", "fable",
+        )["available"] is True
+        assert state.capability_observation(
+            "ssh-remote", "codex", "worker", "opus",
+        )["available"] is True
+
+    def test_legacy_fable_quarantine_still_falls_back_to_claude_opus(
+        self, tools, tmp_path, monkeypatch,
+    ):
+        """Without provider routing, the legacy Claude Fable fallback remains intact."""
+        from ironclaude import fable_availability
+
+        monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "fable_state.json")
+        fable_availability.mark_fable_unavailable("Claude Fable quarantined for test")
+
+        assert tools._get_worker_command("claude-fable") == tools._get_worker_command("claude-opus")
 
     def test_remote_worker_capability_recovery_probes_after_explicit_cutover(
         self, registry, mock_tmux, tmp_path, db_conn,
@@ -2298,6 +2368,87 @@ class TestEffortLevel:
         cmd = t._get_worker_command("claude-fable")
         assert "CLAUDE_CODE_EFFORT_LEVEL=medium" in cmd
         assert "--model fable" in cmd
+
+    def test_primary_fable_effort_tier_override(self, registry, mock_tmux, tmp_path, db_conn):
+        """PRIMARY provider-routed fable worker uses the per-tier effort override."""
+        ledger_path = str(tmp_path / "ledger.json")
+        t = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            effort_level="high", effort_levels={"fable": "medium"},
+        )
+        cmd = t._get_worker_command_for_handle(
+            "claude-fable", "",
+            _provider_handle(client="claude", requested="fable",
+                             effective="fable", model="fable"),
+        )
+        assert "CLAUDE_CODE_EFFORT_LEVEL=medium" in cmd
+        assert "--model fable" in cmd
+
+    def test_primary_opus_effort_falls_back_to_global(self, registry, mock_tmux, tmp_path, db_conn):
+        """PRIMARY opus worker falls back to the global effort (no opus override)."""
+        ledger_path = str(tmp_path / "ledger.json")
+        t = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            effort_level="high", effort_levels={"fable": "medium"},
+        )
+        cmd = t._get_worker_command_for_handle(
+            "claude-opus", "",
+            _provider_handle(client="claude", requested="opus",
+                             effective="opus", model="claude-opus-4-8"),
+        )
+        assert "CLAUDE_CODE_EFFORT_LEVEL=high" in cmd
+
+    def test_primary_degraded_effort_follows_effective_tier(self, registry, mock_tmux, tmp_path, db_conn):
+        """A fable REQUEST degraded to opus uses the EFFECTIVE (opus) tier effort."""
+        ledger_path = str(tmp_path / "ledger.json")
+        t = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            effort_level="high", effort_levels={"fable": "medium"},
+        )
+        cmd = t._get_worker_command_for_handle(
+            "claude-fable", "",
+            _provider_handle(client="claude", requested="fable",
+                             effective="opus", model="claude-opus-4-8"),
+        )
+        assert "CLAUDE_CODE_EFFORT_LEVEL=high" in cmd
+
+    def test_primary_sonnet_default_model_effort_tier_override(self, registry, mock_tmux, tmp_path, db_conn):
+        """PRIMARY sonnet default-model path uses the resolved sonnet effort, not the
+        hardcoded WORKER_COMMANDS =high."""
+        ledger_path = str(tmp_path / "ledger.json")
+        t = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            effort_level="high", effort_levels={"sonnet": "low"},
+        )
+        cmd = t._get_worker_command_for_handle(
+            "claude-sonnet", "",
+            _provider_handle(client="claude", requested="sonnet",
+                             effective="sonnet", model="sonnet"),
+        )
+        assert "CLAUDE_CODE_EFFORT_LEVEL=low" in cmd
+
+    def test_legacy_fable_effort_tier_override(self, registry, mock_tmux, tmp_path, db_conn, monkeypatch):
+        """LEGACY (worker_handle=None) fable path uses the per-tier effort override."""
+        from ironclaude import fable_availability as fa
+        monkeypatch.setattr(fa, "_STATE_PATH", tmp_path / "fable_state.json")
+        ledger_path = str(tmp_path / "ledger.json")
+        t = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            effort_level="high", effort_levels={"fable": "medium"},
+        )
+        cmd = t._get_worker_command_for_handle("claude-fable", "", None)
+        assert "CLAUDE_CODE_EFFORT_LEVEL=medium" in cmd
+        assert "--model fable" in cmd
+
+    def test_codex_grader_argv_threads_resolved_effort(self, registry, mock_tmux, tmp_path, db_conn):
+        """_codex_grader_argv threads the resolved grader effort into model_reasoning_effort."""
+        ledger_path = str(tmp_path / "ledger.json")
+        t = OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            effort_level="high", effort_levels={"fable": "medium"},
+        )
+        argv = t._codex_grader_argv("/tmp/schema.json", "gpt-5.6-terra", "medium")
+        assert 'model_reasoning_effort="medium"' in argv
 
 
 
@@ -9327,6 +9478,123 @@ class TestListClaudeSessions:
             assert "pane_pid" in session
             assert "confidence" in session
 
+    def test_ollama_summarization_honors_spot_override(self, tools, mock_tmux, tmp_path):
+        """spots.summarization.model takes precedence over ollama.summarization_model."""
+        cfg_path = tmp_path / "ollama_spot.json"
+        cfg_path.write_text(json.dumps({
+            "ollama": {"model": "m", "summarization_model": "legacy"},
+            "spots": {"summarization": {"model": "spot-x"}},
+        }))
+        tools._ollama_config_path = str(cfg_path)
+
+        mock_tmux.list_sessions.return_value = ["my-session"]
+        mock_tmux.list_pane_pid.return_value = "1"
+        mock_tmux.pane_current_command.return_value = "node"
+        mock_tmux.capture_pane.return_value = "terminal content"
+
+        mock_client = _make_ollama_client_mock(post_generate_result="summary")
+        tools._get_ollama_client = MagicMock(return_value=mock_client)
+
+        result = json.loads(tools.list_claude_sessions())
+        assert result[0]["summary"] == "summary"
+        assert mock_client.post_generate.call_args.args[0]["model"] == "spot-x"
+
+    def test_ollama_summarization_default_model_byte_identical_without_spot(
+        self, tools, mock_tmux, tmp_path,
+    ):
+        """No spot override and no summarization_model: falls back to the
+        historical default model literal, NOT ollama.model (byte-identity
+        guard against silently promoting ollama.model as the default)."""
+        cfg_path = tmp_path / "ollama_no_spot.json"
+        cfg_path.write_text(json.dumps({"ollama": {"model": "X"}}))
+        tools._ollama_config_path = str(cfg_path)
+
+        mock_tmux.list_sessions.return_value = ["my-session"]
+        mock_tmux.list_pane_pid.return_value = "1"
+        mock_tmux.pane_current_command.return_value = "node"
+        mock_tmux.capture_pane.return_value = "terminal content"
+
+        mock_client = _make_ollama_client_mock(post_generate_result="summary")
+        tools._get_ollama_client = MagicMock(return_value=mock_client)
+
+        result = json.loads(tools.list_claude_sessions())
+        assert result[0]["summary"] == "summary"
+        assert mock_client.post_generate.call_args.args[0]["model"] == "gemma4:9b"
+
+    def test_openai_backend_missing_config_degrades_without_raising(
+        self, tools, mock_tmux, tmp_path,
+    ):
+        """backend=openai with no openai block degrades to the ERROR summary
+        instead of raising (make_client raises OllamaConnectionError on empty
+        base_url, caught by the existing OllamaError guard)."""
+        cfg_path = tmp_path / "ollama_openai_missing.json"
+        cfg_path.write_text(json.dumps({"backend": "openai"}))
+        tools._ollama_config_path = str(cfg_path)
+
+        mock_tmux.list_sessions.return_value = ["my-session"]
+        mock_tmux.list_pane_pid.return_value = "1"
+        mock_tmux.pane_current_command.return_value = "node"
+        mock_tmux.capture_pane.return_value = "terminal content"
+
+        result = json.loads(tools.list_claude_sessions())
+        assert len(result) == 1
+        assert "ERROR" in result[0]["summary"]
+
+    def test_openai_summarization_honors_block_timeout_seconds(
+        self, tools, mock_tmux, monkeypatch, tmp_path,
+    ):
+        """openai.timeout_seconds (block-level, resolved via ResolvedBackend.timeout)
+        is passed to make_client, not silently dropped by a flat top-level
+        _summ_cfg.get('timeout_seconds')."""
+        cfg_path = tmp_path / "openai_timeout.json"
+        cfg_path.write_text(json.dumps({
+            "backend": "openai",
+            "openai": {"base_url": "http://h/v1", "model": "a", "timeout_seconds": 300},
+        }))
+        tools._ollama_config_path = str(cfg_path)
+
+        mock_tmux.list_sessions.return_value = ["s"]
+        mock_tmux.list_pane_pid.return_value = "1"
+        mock_tmux.pane_current_command.return_value = "node"
+        mock_tmux.capture_pane.return_value = "content"
+
+        mock_make_client = MagicMock()
+        mock_make_client.return_value.get_models.return_value = {"data": []}
+        mock_make_client.return_value.post_generate.return_value = "a summary"
+        monkeypatch.setattr("ironclaude.orchestrator_mcp.make_client", mock_make_client)
+
+        result = json.loads(tools.list_claude_sessions())
+
+        assert result[0]["summary"] == "a summary"
+        assert mock_make_client.call_args.kwargs["timeout"] == 300
+
+    def test_openai_summarization_default_timeout_byte_identical_without_block_timeout(
+        self, tools, mock_tmux, monkeypatch, tmp_path,
+    ):
+        """No openai.timeout_seconds and no top-level timeout_seconds: make_client
+        still receives the historical default of 120 (byte-identity guard)."""
+        cfg_path = tmp_path / "openai_no_timeout.json"
+        cfg_path.write_text(json.dumps({
+            "backend": "openai",
+            "openai": {"base_url": "http://h/v1", "model": "a"},
+        }))
+        tools._ollama_config_path = str(cfg_path)
+
+        mock_tmux.list_sessions.return_value = ["s"]
+        mock_tmux.list_pane_pid.return_value = "1"
+        mock_tmux.pane_current_command.return_value = "node"
+        mock_tmux.capture_pane.return_value = "content"
+
+        mock_make_client = MagicMock()
+        mock_make_client.return_value.get_models.return_value = {"data": []}
+        mock_make_client.return_value.post_generate.return_value = "a summary"
+        monkeypatch.setattr("ironclaude.orchestrator_mcp.make_client", mock_make_client)
+
+        result = json.loads(tools.list_claude_sessions())
+
+        assert result[0]["summary"] == "a summary"
+        assert mock_make_client.call_args.kwargs["timeout"] == 120
+
 
 class TestAdoptSession:
     def test_rejects_existing_worker_id(self, tools, registry, mock_tmux):
@@ -9387,6 +9655,41 @@ class TestResumeSession:
         state = ProviderState(tools._db)
         state.set_current_client("worker", "codex")
         return state
+
+    def _resume_effort_tools(self, registry, mock_tmux, tmp_path, db_conn):
+        ledger_path = str(tmp_path / "ledger.json")
+        return OrchestratorTools(
+            registry, mock_tmux, ledger_path, db_conn=db_conn,
+            effort_level="high", effort_levels={"fable": "medium"},
+        )
+
+    def test_resume_claude_fable_uses_per_tier_effort(
+        self, registry, mock_tmux, tmp_path, db_conn,
+    ):
+        """A resumed claude-fable worker exports the fable per-tier effort (medium),
+        not the global effort_level (high)."""
+        t = self._resume_effort_tools(registry, mock_tmux, tmp_path, db_conn)
+        self._prepare_success(t, mock_tmux, "claude")
+        t.resume_session(
+            self.UUID, "claude", "d-fable", repo="/r",
+            worker_type="claude-fable",
+        )
+        command = mock_tmux.spawn_session.call_args.args[1]
+        assert "CLAUDE_CODE_EFFORT_LEVEL=medium" in command
+
+    def test_resume_claude_opus_falls_back_to_global_effort(
+        self, registry, mock_tmux, tmp_path, db_conn,
+    ):
+        """A resumed claude-opus worker (tier not in effort_levels) falls back to the
+        global effort_level (high) — guards R2 against over-correction."""
+        t = self._resume_effort_tools(registry, mock_tmux, tmp_path, db_conn)
+        self._prepare_success(t, mock_tmux, "claude")
+        t.resume_session(
+            self.UUID, "claude", "d-opus", repo="/r",
+            worker_type="claude-opus",
+        )
+        command = mock_tmux.spawn_session.call_args.args[1]
+        assert "CLAUDE_CODE_EFFORT_LEVEL=high" in command
 
     def test_client_is_required(self, tools):
         with pytest.raises(TypeError):
@@ -9914,37 +10217,6 @@ class TestFailedWorkerBasesBounded:
         for i in range(_MAX_FAILED_WORKER_BASES * 3):
             tools._track_failed_base(f"base{i}")
         assert len(tools._failed_worker_bases) <= _MAX_FAILED_WORKER_BASES
-
-
-class TestGameSubprocessCapture:
-    """game_* actions must capture subprocess output + set a timeout.
-
-    Uncaptured cliclick stdout can corrupt the stdio MCP JSON-RPC frame.
-    """
-
-    def test_game_click_captures_and_times_out(self, tools):
-        with patch("ironclaude.orchestrator_mcp.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-            tools.game_click(10, 20)
-        _, kwargs = mock_run.call_args
-        assert kwargs.get("capture_output") is True
-        assert "timeout" in kwargs and kwargs["timeout"]
-
-    def test_game_type_captures_and_times_out(self, tools):
-        with patch("ironclaude.orchestrator_mcp.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-            tools.game_type("hello")
-        _, kwargs = mock_run.call_args
-        assert kwargs.get("capture_output") is True
-        assert "timeout" in kwargs and kwargs["timeout"]
-
-    def test_game_key_captures_and_times_out(self, tools):
-        with patch("ironclaude.orchestrator_mcp.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-            tools.game_key("Return")
-        _, kwargs = mock_run.call_args
-        assert kwargs.get("capture_output") is True
-        assert "timeout" in kwargs and kwargs["timeout"]
 
 
 class TestRestartWatchdogForkSafety:
@@ -10476,10 +10748,14 @@ class TestCodexAdvisorInstructionConstant:
         # The whole reason codex was skipped: it cannot parse Claude slash commands.
         assert not _CODEX_ADVISOR_INSTRUCTION.startswith("/")
 
-    def test_names_the_advisor_mechanism_and_ladder(self):
-        # Asserting only "codex exec" would pass against an invented ladder.
-        assert "codex exec" in _CODEX_ADVISOR_INSTRUCTION
-        assert "luna -> terra -> sol" in _CODEX_ADVISOR_INSTRUCTION
+    def test_names_the_fixed_function_advisor_broker(self):
+        assert "run_codex_advisor_review" in _CODEX_ADVISOR_INSTRUCTION
+        assert "requester_model" in _CODEX_ADVISOR_INSTRUCTION
+        assert "review_tier: \"one-up\"" in _CODEX_ADVISOR_INSTRUCTION
+        assert "complete inline" in _CODEX_ADVISOR_INSTRUCTION
+        assert "broker rejects any mismatch with provider-authenticated" in _CODEX_ADVISOR_INSTRUCTION
+        assert "maps the reviewer exactly once" in _CODEX_ADVISOR_INSTRUCTION
+        assert "codex exec" not in _CODEX_ADVISOR_INSTRUCTION
 
 
 class TestAcknowledgeOperatorMessage:

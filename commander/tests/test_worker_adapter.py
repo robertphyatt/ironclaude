@@ -4,7 +4,7 @@ from ironclaude.db import init_db
 from ironclaude.tmux_manager import _strip_ansi
 
 CLAUDE_MODELS = {"haiku": "haiku", "sonnet": "sonnet", "opus": "claude-opus-4-8", "fable": "fable"}
-CODEX_MODELS = {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol"}
+CODEX_MODELS = {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol", "fable": "gpt-6-astra"}
 
 
 def _cfg(worker_pref="claude", worker_clients=("claude",), codex_enabled=False):
@@ -60,13 +60,19 @@ def test_codex_worker_command(tmp_path, monkeypatch):
     assert "[1m]" not in cmd and "ANTHROPIC" not in cmd
 
 
-def test_codex_fable_degrades_to_opus(tmp_path, monkeypatch):
-    """fable-tier codex must degrade to codex opus (M1), not fall back to claude."""
+def test_codex_fable_worker_command_uses_astra_and_is_not_claude_fable(tmp_path, monkeypatch):
+    """A healthy Codex fable worker launches Astra without Claude-Fable state effects."""
+    from ironclaude import fable_availability
+
+    monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "fable_state.json")
+    fable_availability.mark_fable_unavailable("Claude Fable quarantined for test")
     tools = _tools(tmp_path, _cfg(worker_pref="codex", worker_clients=("codex",), codex_enabled=True))
     _codex_avail(monkeypatch)
-    monkeypatch.setattr(omcp, "_resolve_fable_worker_type", lambda wt: wt)  # keep claude-fable
     cmd = tools._get_worker_command("claude-fable", "")
-    assert "codex" in cmd and "gpt-5.6-sol" in cmd
+    assert "codex" in cmd and "gpt-6-astra" in cmd
+    handle = tools._resolve_worker_client("claude-fable")
+    assert (handle.effective_tier, handle.model) == ("fable", "gpt-6-astra")
+    assert tools._launch_used_claude_fable("claude-fable", handle) is False
 
 
 def test_invalid_worker_type_still_raises_under_codex_cfg(tmp_path, monkeypatch):

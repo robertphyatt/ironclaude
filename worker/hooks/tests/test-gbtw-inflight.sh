@@ -116,6 +116,38 @@ assert_ids "F10 launch-beyond-horizon" \
     "bf10horizon" \
     "$FIXTURES_DIR/f10-launch-beyond-horizon.jsonl"
 
+# F11: malformed FIRST line (mid-record byte-cut fragment) then a valid Agent
+# dispatch — jq must skip the bad line, not abort. Isolates line 57 (launched_agent):
+# reverting that edit re-fails this case. Distinct from F8 (malformed ADJACENT line,
+# valid dispatch parsed first). Regression witness for the 2026-09-06 partial-first-line
+# jq-abort misfire.
+assert_ids "F11 partial-first-line" \
+    "pfl00000000000001" \
+    "$FIXTURES_DIR/f11-partial-first-line.jsonl"
+
+# F12: malformed FIRST line + a background-Bash launch (no toolUseResult) — isolates
+# line 59 (launched_bash): only that query can extract the id, so reverting only that
+# edit re-fails this case where F11 stays green.
+assert_ids "F12 partial-first-line-bash" \
+    "bpf12000000001" \
+    "$FIXTURES_DIR/f12-partial-first-line-bash.jsonl"
+
+# F13: malformed FIRST line + Agent launch + task-notification completion -> empty.
+# Falsifiability witness for line 74 (completed_notif): reverting only it keeps the
+# launch but drops the completion -> non-empty -> FAIL. NOTE: passes VACUOUSLY in the
+# RED baseline (both launch and completion abort -> empty == expected); its target is a
+# post-merge single revert, not the original bug.
+assert_ids "F13 partial-first-line-notif-completion" \
+    "" \
+    "$FIXTURES_DIR/f13-partial-first-line-notif-completion.jsonl"
+
+# F14: malformed FIRST line + Agent launch + SendMessage-resume plaintext completion
+# -> empty. Same single-revert semantics as F13, for line 82 (completed_plain). Also
+# passes VACUOUSLY in the RED baseline.
+assert_ids "F14 partial-first-line-plain-completion" \
+    "" \
+    "$FIXTURES_DIR/f14-partial-first-line-plain-completion.jsonl"
+
 echo
 echo "results: $pass pass, $fail fail"
 [ "$fail" -eq 0 ] || exit 1

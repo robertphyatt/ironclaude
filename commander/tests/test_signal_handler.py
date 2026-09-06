@@ -50,6 +50,37 @@ class TestFallbackOnSigactionFailure:
         )
 
 
+class TestSignalSenderClassifier:
+    @pytest.mark.parametrize("sender_pid", [0, 1, 100, 99])
+    def test_special_self_and_parent_pids_are_trusted(self, sender_pid):
+        assert main_module._is_trusted_signal_sender(
+            sender_pid,
+            999,
+            our_pid=100,
+            our_ppid=99,
+            effective_uid=501,
+        ) is True
+
+    @pytest.mark.parametrize("sender_uid", [0, 501])
+    def test_root_and_same_effective_uid_are_trusted(self, sender_uid):
+        assert main_module._is_trusted_signal_sender(
+            4242,
+            sender_uid,
+            our_pid=100,
+            our_ppid=99,
+            effective_uid=501,
+        ) is True
+
+    def test_different_nonroot_uid_is_untrusted(self):
+        assert main_module._is_trusted_signal_sender(
+            4242,
+            502,
+            our_pid=100,
+            our_ppid=99,
+            effective_uid=501,
+        ) is False
+
+
 class TestRogueSigtermRespawner:
     """_handle_shutdown must respect _sigterm_trusted when setting _clean_shutdown."""
 

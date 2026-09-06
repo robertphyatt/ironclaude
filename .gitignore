@@ -9,6 +9,7 @@ node_modules/
 __pycache__/
 *.pyc
 commander/src/ironclaude/plugins/scan/
+commander/src/ironclaude/plugins/game
 commander/.env
 config/machines.yaml
 commander/data/db/*.db

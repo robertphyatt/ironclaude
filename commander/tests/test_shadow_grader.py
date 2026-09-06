@@ -7,7 +7,7 @@ import pytest
 from unittest.mock import MagicMock, patch, mock_open
 
 from ironclaude.communication_profiles import CommunicationProfileError, PROFILE_READY_MARKER
-from ironclaude.shadow_grader import ShadowGrader
+from ironclaude.shadow_grader import ShadowGrader, ShadowGraderEmptyResponseError
 from ironclaude.ollama_client import OllamaConnectionError, OllamaTimeoutError
 
 
@@ -195,6 +195,33 @@ class TestGradeWithTools:
         assert "format" in second_call_payload
         assert "tools" not in second_call_payload
 
+    def test_verdict_empty_response_retries_with_nudge_then_recovers(self):
+        grader, mock_client = _make_shadow_grader()
+        valid_json = '{"grade": "B", "approved": true, "feedback": "ok", "confidence_in_disagreement": "low"}'
+        mock_client.post_chat.side_effect = [
+            ("some analysis", []),   # loop: no tool calls -> break
+            ("", []),                 # verdict attempt 1: empty
+            (valid_json, []),         # verdict attempt 2 (after nudge): recovers
+        ]
+        result = grader.grade_with_tools("sys", "user", repo_path="/tmp")
+        assert result["grade"] == "B"
+        assert result["approved"] is True
+        assert mock_client.post_chat.call_count == 3
+        retry_payload = mock_client.post_chat.call_args_list[2][0][0]
+        user_msgs = [m["content"] for m in retry_payload["messages"] if m["role"] == "user"]
+        assert any("Previous response was empty" in c for c in user_msgs)
+
+    def test_verdict_empty_response_exhausted_raises(self):
+        grader, mock_client = _make_shadow_grader()
+        mock_client.post_chat.side_effect = [
+            ("some analysis", []),   # loop: no tool calls -> break
+            ("", []),                 # verdict attempt 1: empty
+            ("", []),                 # verdict attempt 2: empty -> exhausted
+        ]
+        with pytest.raises(ShadowGraderEmptyResponseError):
+            grader.grade_with_tools("sys", "user", repo_path="/tmp")
+        assert mock_client.post_chat.call_count == 3
+
     def test_string_arguments_parsed_to_dict(self):
         grader, mock_client = _make_shadow_grader()
         tool_call = [{"name": "read_file", "arguments": '{"path": "/tmp/test.txt"}'}]
@@ -291,6 +318,84 @@ class TestGradeWithTools:
         assert result["grade"] == "A"
         assert result["approved"] is True
         assert result["feedback"] == "verdict"
+
+
+class TestOpenAiBackend:
+    def test_openai_backend_uses_openai_shaped_transcript_and_response_format(self, tmp_path):
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({
+            "backend": "openai",
+            "openai": {"base_url": "http://h/v1", "model": "example-model-a", "max_tokens": 1024},
+            "spots": {"shadow": {"model": "example-model-b"}},
+        }))
+        target = tmp_path / "x"
+        target.write_text("file body")
+
+        grader = ShadowGrader(config_path=str(config))
+
+        resp_tool = MagicMock()
+        resp_tool.raise_for_status.return_value = None
+        resp_tool.json.return_value = {
+            "choices": [{"message": {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": json.dumps({"path": str(target)})},
+                }],
+            }}]
+        }
+        resp_verdict = MagicMock()
+        resp_verdict.raise_for_status.return_value = None
+        resp_verdict.json.return_value = {
+            "choices": [{"message": {
+                "content": '{"grade": "B", "approved": true, "feedback": "ok", '
+                           '"confidence_in_disagreement": "low"}',
+            }}]
+        }
+
+        with patch(
+            "ironclaude.openai_client.requests.post",
+            side_effect=[resp_tool, resp_verdict, resp_verdict],
+        ) as mock_post:
+            result = grader.grade_with_tools("sys", "user", repo_path=str(tmp_path))
+
+        # (a) verdict parsed
+        assert result["grade"] == "B"
+        assert result["approved"] is True
+
+        # model comes from spots.shadow.model, not openai.model
+        first_body = mock_post.call_args_list[0].kwargs["json"]
+        assert first_body["model"] == "example-model-b"
+        # initial/loop payload carries OpenAI tool-calling fields, not Ollama options
+        assert first_body["tool_choice"] == "auto"
+        assert first_body["tools"]
+        assert first_body["max_tokens"] == 1024
+        assert first_body["temperature"] == 0.1
+        assert "options" not in first_body
+        assert "format" not in first_body
+
+        # (b) OpenAI-shaped assistant tool-call turn + tool-result turn present
+        verdict_body = mock_post.call_args_list[-1].kwargs["json"]
+        msgs = verdict_body["messages"]
+        assistant = [m for m in msgs if m.get("role") == "assistant" and m.get("tool_calls")]
+        assert assistant, msgs
+        tc0 = assistant[0]["tool_calls"][0]
+        assert tc0["id"] == "call_1"
+        assert tc0["type"] == "function"
+        assert isinstance(tc0["function"]["arguments"], str)
+        tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+        assert any(m.get("tool_call_id") == "call_1" for m in tool_msgs), tool_msgs
+
+        # (c) verdict call uses OpenAI response_format, not Ollama `format`
+        assert "response_format" in verdict_body
+        assert verdict_body["response_format"]["type"] == "json_schema"
+        assert (
+            verdict_body["response_format"]["json_schema"]["schema"]
+            == __import__("ironclaude.shadow_grader", fromlist=["GRADER_VERDICT_SCHEMA"]).GRADER_VERDICT_SCHEMA
+        )
+        assert "format" not in verdict_body
+        assert "tools" not in verdict_body
 
 
 class TestExecuteTool:
@@ -450,6 +555,15 @@ class TestGetClient:
             mock_cls.return_value = MagicMock()
             grader._get_client()
         assert mock_cls.call_args.kwargs["timeout"] == 600
+
+    def test_ollama_arm_honors_block_timeout(self, tmp_path):
+        cfg = tmp_path / "hooks.json"
+        cfg.write_text('{"ollama": {"timeout_seconds": 300}}')
+        grader = ShadowGrader(config_path=str(cfg))
+        with patch("ironclaude.shadow_grader.OllamaClient") as mock_cls:
+            mock_cls.return_value = MagicMock()
+            grader._get_client()
+        assert mock_cls.call_args.kwargs["timeout"] == 300
 
 
 class TestNumCtx:

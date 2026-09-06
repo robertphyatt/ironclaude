@@ -193,8 +193,7 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    Resolve the reviewer model on the trusted client's ladder:
    - Claude Code: Haiku→`sonnet`, Sonnet→`opus`, Opus→`fable` unless Fable is
      unavailable→`opus`; Fable is the ceiling.
-   - Codex: Luna→`gpt-5.6-terra`, Terra→`gpt-5.6-sol`; Sol is the ceiling and
-     uses a fresh same-tier `gpt-5.6-sol` reviewer.
+   - Codex: Luna→`gpt-5.6-terra`, Terra→`gpt-5.6-sol`, Sol→`gpt-6-astra`, and Astra→`gpt-6-astra`; Astra is the ceiling and uses a fresh same-tier `gpt-6-astra` reviewer.
 
    **Same-tier** means the current model on that same client; never cross clients
    for reviewer tiering. To check Claude Fable availability, read the state flag at
@@ -247,11 +246,17 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    - **Claude Code:** use a fresh `Agent`
      (`subagent_type="general-purpose"`, `model=<resolved model>`). Put the complete
      provenance packet inline and provide current artifact/source paths.
-   - **Codex:** run a fresh report-only, read-only
-     `codex exec --json --ephemeral --skip-git-repo-check -s read-only -m
-     <resolved-codex-model> -`. Put the complete provenance packet and complete
-     current artifact contents inline on stdin; path-only review is insufficient
-     because the ephemeral reviewer may be hook-blocked from shell reads.
+   - **Codex:** call `run_codex_advisor_review` with the current full Codex model
+     in `requester_model`, the already-selected `review_tier: "same"` or
+     `review_tier: "one-up"`, and the complete provenance packet plus complete current
+     artifact contents inline in `packet`. Do not pre-map the requester: the broker
+     rejects any mismatch with provider-authenticated Codex turn metadata, then
+     maps the reviewer exactly once. Do not run `codex exec` from the main agent or
+     repeat an operator approval request for this brokered read-only review.
+
+   Use `review_tier: "same"` only for the selected same-tier blind plan-review
+   decision. Use `review_tier: "one-up"` for selected tier-up plan review, fix-advisor,
+   and end-of-work review. Omission is compatibility-only, never preferred new usage.
 
    For plan review, **blind** means blind to prior reviewer findings, verdicts,
    repair coaching, reviewer identities, diffs, fix rationale, and
@@ -367,7 +372,8 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    The advisor exists to make this response correct the first time.
    - **Tier:** one above your current model on the trusted client's ladder (Claude:
      Opus→`fable`, Fable unavailable→`opus`, Fable ceiling→same-tier Fable; Codex:
-     Terra→`gpt-5.6-sol`, Sol ceiling→same-tier Sol). Always a **subagent** — never swap
+     Luna→`gpt-5.6-terra`, Terra→`gpt-5.6-sol`, Sol→`gpt-6-astra`, Astra ceiling→same-tier Astra).
+     Always a **subagent** — never swap
      the main-loop model, because prompt caches are model-scoped and a swap re-establishes
      the entire context before producing a single token.
    - **It is NOT blind.** Give it the complete operator provenance packet, all four
@@ -434,7 +440,7 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
     boundary, so a defect the advisor missed surfaces there rather than in a second plan
     review — later, cheaper, and against real code instead of a document.
 
-**Top-tier note:** Claude Fable and Codex Sol have no higher model on their own
+**Top-tier note:** Claude Fable and Codex Astra have no higher model on their own
 client ladder. They still run a fresh same-tier review when the client supports the
 provider-native branch above. If a genuinely separate reviewer cannot be produced,
 display the exact ceiling and unavailability. Under `enforced`, perform the complete
@@ -618,6 +624,30 @@ If user appears to be changing topic or requesting different work during executi
 2. Invoke the `plan-interruption` skill
 3. Follow that skill's process to handle the state transition
 
+### Actual Claude Fable from Codex
+
+Keep four model paths distinct during execution:
+
+- **Claude Code native subagent:** `Agent` with `model=fable` is native Claude
+  delegation.
+- **Codex native subagent:** collaboration tools create OpenAI Codex agents;
+  native Codex subagent selection cannot satisfy an actual-Fable request.
+- **Codex advisor:** `run_codex_advisor_review` remains Codex-native and follows
+  broker-owned Luna → Terra → Sol → Astra mapping. Ordinary advisor work must not cross
+  providers.
+- **Commander worker:** `claude-fable` is a managed, write-capable Commander
+  worker type and is not a bounded report-only subagent consultation.
+
+When operator explicitly requests an actual Claude Fable subagent from Codex,
+load `ironclaude:use-fable-subagent`. You must not substitute another path or model.
+Astra remains a Codex model and does not satisfy an actual Claude Fable request.
+Parent Codex session retains orchestration, state transitions, staging, commits,
+and task sequencing. Independently verify consultation findings before using
+them.
+
+A report-only Fable consultation does not replace required task execution,
+task-boundary code review, tier-up plan review, or normal advisor broker.
+
 ### IronClaude self-update boundary
 
 A self-update means IronClaude installs or updates its own Codex plugin while an
@@ -628,11 +658,13 @@ subagent.
 For an IronClaude self-update:
 
 1. Finish all planned source tests and plugin validation.
-2. Apply the plugin-creator cachebuster before the final build, then build the
-   cachebusted source. A pre-cachebuster bundle cannot certify the installed
-   runtime.
-3. Reinstall through the confirmed local marketplace and preserve the current
-   native task ID plus its task/goal state.
+2. Run `make codex-plugin-release`. Its first step is the idempotent launcher
+   repair; require exit `0` and preflight `status` equal to `healthy` or
+   `repaired`. The target then applies the plugin-creator cachebuster before the
+   final build, validates the cachebusted source, and reinstalls through the
+   confirmed local marketplace. A pre-cachebuster bundle cannot certify the
+   installed runtime.
+3. Preserve the current native task ID plus its task/goal state.
 4. Fully quit and relaunch Codex. Compaction or reinstall alone is insufficient.
 5. Reopen the same native task before submitting the self-update task. Require
    `get_resume_state.session_id` to equal the preserved native task ID.

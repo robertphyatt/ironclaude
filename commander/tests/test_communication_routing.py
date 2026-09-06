@@ -47,6 +47,34 @@ def test_brain_restart_profiles_substituted_prompt_without_marker(tmp_path, monk
     assert PROFILE_READY_MARKER not in rendered
 
 
+def test_brain_restart_treats_missing_database_as_unavailable(tmp_path, monkeypatch):
+    prompt = tmp_path / "brain.md"
+    prompt.write_text("Brain")
+    daemon = IroncladeDaemon.__new__(IroncladeDaemon)
+    daemon._brain_paused = False
+    daemon.config = {"brain_prompt_path": str(prompt)}
+    daemon.brain = MagicMock()
+    daemon.brain.client_name = "codex"
+    daemon.brain.check_compaction_complete.return_value = False
+    daemon.brain.needs_restart.return_value = True
+    daemon.brain.circuit_breaker_tripped.return_value = False
+    daemon.brain.restart_count = 1
+    daemon.brain.restart_reason = "timeout"
+    daemon.slack = MagicMock()
+    monkeypatch.setattr(
+        main_module, "apply_communication_profile",
+        lambda construction, text: f"profile:{construction}\n{text}",
+    )
+
+    daemon.check_brain()
+
+    daemon.brain.restart.assert_called_once()
+    assert daemon.brain.restart.call_args.args[0] == "profile:commander_brain\nBrain"
+    assert daemon.brain.restart.call_args.kwargs["cwd"].endswith(
+        "/.ironclaude/brain"
+    )
+
+
 def test_brain_restart_fails_closed_when_mixed_profile_is_unavailable(tmp_path, monkeypatch, caplog):
     prompt = tmp_path / "brain.md"
     prompt.write_text("Brain")

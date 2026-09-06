@@ -16,10 +16,60 @@
 #   - error_exit() — consistent error handling
 
 # =============================================================================
+# CONFIG SPOT RESOLUTION (shared rule — see worker/config-schema/llm-backend.md)
+# =============================================================================
+
+# Pure helper: resolve backend/model/url for a given config spot.
+# Args: $1 = config JSON (content, not a path), $2 = spot name (e.g. "validation")
+# Output: "<backend> <model> <url>" (model/url may be empty strings)
+# Implements the resolution rule verbatim:
+#   backend = spots.<spot>.backend // .backend // .validation_backend // "haiku"
+#   model   = spots.<spot>.model // <legacy alias> // <resolved-backend-block>.model
+#   url     = <resolved-backend-block>'s connection field (ollama.url / openai.base_url)
+# Legacy aliases (backend-agnostic, outranked by spots.<spot>.model):
+#   shadow_model (top-level, spot=shadow); ollama.summarization_model (nested, spot=summarization)
+_resolve_spot() {
+  local config_json="$1"
+  local spot="$2"
+  local backend model url
+
+  backend=$(printf '%s' "$config_json" | jq -r --arg spot "$spot" \
+    '.spots[$spot].backend // .backend // .validation_backend // "haiku"' 2>/dev/null) || backend="haiku"
+  [ -n "$backend" ] && [ "$backend" != "null" ] || backend="haiku"
+
+  case "$backend" in
+    ollama)
+      model=$(printf '%s' "$config_json" | jq -r --arg spot "$spot" '
+        .spots[$spot].model
+        // (if $spot == "shadow" then .shadow_model else null end)
+        // (if $spot == "summarization" then .ollama.summarization_model else null end)
+        // .ollama.model
+        // empty' 2>/dev/null)
+      url=$(printf '%s' "$config_json" | jq -r '.ollama.url // empty' 2>/dev/null)
+      ;;
+    openai)
+      model=$(printf '%s' "$config_json" | jq -r --arg spot "$spot" '
+        .spots[$spot].model
+        // (if $spot == "shadow" then .shadow_model else null end)
+        // (if $spot == "summarization" then .ollama.summarization_model else null end)
+        // .openai.model
+        // empty' 2>/dev/null)
+      url=$(printf '%s' "$config_json" | jq -r '.openai.base_url // empty' 2>/dev/null)
+      ;;
+    *)
+      model=$(printf '%s' "$config_json" | jq -r --arg spot "$spot" '.spots[$spot].model // empty' 2>/dev/null)
+      url=""
+      ;;
+  esac
+
+  echo "$backend $model $url"
+}
+
+# =============================================================================
 # CENTRALIZED LLM VALIDATION
 # =============================================================================
 
-# Call validation LLM (Ollama or Haiku based on config)
+# Call validation LLM (Ollama, OpenAI-compatible, or Haiku based on config)
 # Args: $1 = prompt to send, $2 = JSON schema string (standard JSON Schema format)
 # Output: JSON response string
 # Sets: VALIDATION_LLM_BACKEND (global) = backend name used
@@ -29,7 +79,7 @@
 call_validation_llm() {
   local prompt="$1"
   local schema="${2:-}"
-  local config="$HOME/.claude/ironclaude-hooks-config.json"
+  local config="${IC_OLLAMA_CONFIG_PATH:-$HOME/.claude/ironclaude-hooks-config.json}"
   local timeout_sec=60
   local backend="haiku"
 
@@ -39,7 +89,10 @@ call_validation_llm() {
 
   # Load config if exists
   if [ -f "$config" ]; then
-    backend=$(jq -r '.validation_backend // "haiku"' "$config" 2>/dev/null) || backend="haiku"
+    local resolved
+    resolved=$(_resolve_spot "$(cat "$config" 2>/dev/null)" "validation")
+    backend=$(printf '%s' "$resolved" | awk '{print $1}')
+    [ -n "$backend" ] || backend="haiku"
     timeout_sec=$(jq -r '.timeout_seconds // 60' "$config" 2>/dev/null) || timeout_sec=60
   fi
 
@@ -47,8 +100,10 @@ call_validation_llm() {
     "ollama")
       local url model fallback_url
       url=$(jq -r '.ollama.url // "http://localhost:11434"' "$config" 2>/dev/null)
-      model=$(jq -r '.ollama.model // "llama3.2:1b"' "$config" 2>/dev/null)
+      model=$(jq -r '.spots.validation.model // .ollama.model // "llama3.2:1b"' "$config" 2>/dev/null)
       fallback_url=$(jq -r '.ollama.fallback_url // empty' "$config" 2>/dev/null) || true
+      # Honor block-level ollama.timeout_seconds (mirrors the openai arm), else top-level.
+      timeout_sec=$(jq -r '.ollama.timeout_seconds // .timeout_seconds // 60' "$config" 2>/dev/null) || timeout_sec=60
 
       # Set backend for logging
       export VALIDATION_LLM_BACKEND="ollama:${model}"
@@ -83,6 +138,40 @@ call_validation_llm() {
       fi
 
       # Strip think tags — gemma4/other thinking models may prefix JSON with <think>...</think>
+      if [ -n "$result" ]; then
+        result=$(printf '%s' "$result" | python3 -c "import sys, re; print(re.sub(r'<think>.*?</think>', '', sys.stdin.read(), flags=re.DOTALL).strip())" 2>/dev/null) || true
+      fi
+
+      export VALIDATION_LLM_RESPONSE="$result"
+      echo "$result"
+      ;;
+
+    "openai")
+      local base_url model_o maxtok
+      base_url=$(jq -r '.openai.base_url // empty' "$config" 2>/dev/null)
+      model_o=$(jq -r '.spots.validation.model // .openai.model // empty' "$config" 2>/dev/null)
+      maxtok=$(jq -r '.openai.max_tokens // 1024' "$config" 2>/dev/null)
+      timeout_sec=$(jq -r '.openai.timeout_seconds // .timeout_seconds // 60' "$config" 2>/dev/null) || timeout_sec=60
+
+      # Set backend for logging
+      export VALIDATION_LLM_BACKEND="openai:${model_o}"
+
+      local payload
+      if [ -n "$schema" ] && [ "$schema" != "{}" ]; then
+        payload=$(jq -nc --arg m "$model_o" --arg p "$prompt" --argjson mt "$maxtok" --argjson sc "$schema" \
+          '{model:$m, messages:[{role:"user",content:$p}], max_tokens:$mt, temperature:0.1, response_format:{type:"json_schema",json_schema:{name:"verdict",schema:$sc}}}')
+      else
+        payload=$(jq -nc --arg m "$model_o" --arg p "$prompt" --argjson mt "$maxtok" \
+          '{model:$m, messages:[{role:"user",content:$p}], max_tokens:$mt, temperature:0.1}')
+      fi
+
+      local result
+      local connect_timeout="$timeout_sec"
+      result=$(curl -s --connect-timeout "$connect_timeout" --max-time "$timeout_sec" \
+        -H "Authorization: Bearer ollama" -H "Content-Type: application/json" \
+        "$base_url/chat/completions" -d "$payload" 2>/dev/null | jq -r '.choices[0].message.content // empty' 2>/dev/null) || true
+
+      # Strip think tags — same reasoning-model prefix handling as the ollama arm
       if [ -n "$result" ]; then
         result=$(printf '%s' "$result" | python3 -c "import sys, re; print(re.sub(r'<think>.*?</think>', '', sys.stdin.read(), flags=re.DOTALL).strip())" 2>/dev/null) || true
       fi

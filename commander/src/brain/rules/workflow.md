@@ -488,7 +488,43 @@ When the staged diff contains only `.md` or documentation files with no code cha
 - Summarize without reading the document first (the summary must reflect actual findings)
 - Use the section 6 commit checklist for research-only directives (no diff review, no contamination check — the doc is the deliverable)
 
-### 6c. Guided Integration-Recovery Wizard
+### 6c. Dead-Worker Cleanup
+
+When the daemon reports that a worker's tmux session is absent and its reviewed work is preserved but
+not completed, Commander owns the lifecycle recovery. First call
+`recover_worker_integration(worker_id, "status")`; classify before choosing any disposition.
+
+Use this exact decision table:
+
+<!-- DEAD_WORKER_DISPOSITION_TABLE_START -->
+| State | Commander action | Operator interaction |
+|---|---|---|
+| authorized abandonment / paused rebase | status -> abort -> kill_worker -> verify returned state | none |
+| authorized abandonment / no paused rebase | status -> kill_worker -> verify returned state | none |
+| integration intended | status -> section 6d | section 6d governs |
+| disposition absent | status -> ask once -> execute selected Commander operations | one natural-language disposition question |
+| infrastructure error | preserve assignment -> report exact error once | none |
+<!-- DEAD_WORKER_DISPOSITION_TABLE_END -->
+
+- A durable directive or explicit operator instruction saying work is already integrated, superseded,
+  or should be abandoned decides disposition. Reuse that authority and do not ask again.
+- For authorized abandonment of a paused rebase, call
+  `recover_worker_integration(worker_id, "abort")` before `kill_worker`, then verify the returned state.
+  Aborting this temporary integration attempt restores the preserved worker branch; it does not resolve
+  or integrate semantic conflict content.
+- If work remains intended for integration, follow section 6d. Its conflict and drift approval gates
+  still govern.
+- If disposition is absent, ask one natural-language disposition question containing a recommended choice,
+  reasons, and the exact Commander operations and effects. Execute the selected Commander operations.
+- On infrastructure failure, preserve the assignment and report the exact error exactly once. Do not
+  translate it into work for the operator.
+
+Never spawn another worker to clean up, remove, abandon, reap, repair, or switch this worker's managed
+assignment. Never request `/ironclaude:use-primary-checkout`; never ask the operator to attach to tmux;
+never hand back shell commands or operator-run Git/worktree commands. Commander must perform its own
+authenticated lifecycle operations.
+
+### 6d. Guided Integration-Recovery Wizard
 
 When `commit_worker` fails and returns a `recovery` object with `recovery.reconcile.mode`, the worker's managed rebase drifted or paused on unmerged paths. This is a human decision point — the Brain NEVER auto-resolves a semantic conflict and NEVER integrates drifted work without {OPERATOR_NAME}'s explicit approval. Walk {OPERATOR_NAME} through recovery one step at a time; do not skip ahead.
 

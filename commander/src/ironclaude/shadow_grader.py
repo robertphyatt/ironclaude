@@ -13,6 +13,7 @@ from ironclaude.communication_profiles import (
     CommunicationProfileError,
     apply_communication_profile,
 )
+from ironclaude.backend_resolver import make_client, resolve_backend
 from ironclaude.ollama_client import OllamaClient, OllamaError
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,11 @@ SHADOW_TOOLS = [
 
 MAX_TOOL_STEPS = 5
 
+# One retry (2 total attempts) before hard-failing on an empty verdict response —
+# matches historical precedent (directive d1195: one automatic retry before
+# infrastructure_error).
+MAX_EMPTY_VERDICT_ATTEMPTS = 2
+
 GEMMA4_SYSTEM_PROMPT = """\
 You are a code review grader with tool-calling capability.
 
@@ -101,44 +107,67 @@ GRADER_VERDICT_SCHEMA = {
 }
 
 
+class ShadowGraderEmptyResponseError(RuntimeError):
+    """Raised when the verdict call returns an empty response after exhausting
+    MAX_EMPTY_VERDICT_ATTEMPTS retries.
+
+    Unlike every other grade_with_tools() failure (which returns an
+    infrastructure_error dict), this is raised so an empty-response exhaustion
+    is never mistaken for a legitimate — if degraded — grading result.
+    """
+
+
 class ShadowGrader:
     """Ollama chat-based grader with tool-calling support for shadow comparison.
 
     Runs gemma4 with the same system/user prompts Opus receives, plus read-only
     tool access. Records which tools were called for concordance comparison.
-    Never raises — returns infrastructure_error dict on any failure.
+    Never raises for handled error cases — returns infrastructure_error dict on
+    any failure — except ShadowGraderEmptyResponseError, raised only when the
+    verdict call returns an empty response after exhausting retries.
     """
 
     def __init__(self, config_path: str | None = None) -> None:
         self._config_path = config_path or paths.hooks_config()
-        self._client: OllamaClient | None = None
+        self._client = None
         self._model: str = _DEFAULT_SHADOW_MODEL
+        self._backend: str = "ollama"
         self._num_ctx: int = 32768
+        self._max_tokens: int = 1024
 
     @staticmethod
     def _build_error(detail: str, tool_calls: list | None = None) -> dict:
         return {"infrastructure_error": True, "error_detail": detail, "tool_calls": tool_calls or []}
 
-    def _get_client(self) -> OllamaClient:
+    def _get_client(self):
         if self._client is None:
             try:
                 with open(self._config_path) as f:
                     cfg = json.load(f)
             except (FileNotFoundError, json.JSONDecodeError) as e:
-                logger.warning("Ollama config unavailable (%s): using localhost defaults", e)
+                logger.warning("Shadow config unavailable (%s): using localhost defaults", e)
                 cfg = {}
-            ollama_cfg = cfg.get("ollama", {})
-            self._model = cfg.get("shadow_model") or ollama_cfg.get("model", _DEFAULT_SHADOW_MODEL)
-            # Default 4096 (Ollama's built-in default) truncates the grading
-            # conversation oldest-first, i.e. the grading instructions go
-            # first — same root cause as the 2026-06-18 worker num_ctx
-            # finding; 32768 matches ollama_worker_num_ctx.
-            self._num_ctx = int(cfg.get("shadow_num_ctx", 32768))
-            self._client = OllamaClient(
-                url=ollama_cfg.get("url", "http://localhost:11434"),
-                fallback_url=ollama_cfg.get("fallback_url"),
-                timeout=cfg.get("timeout_seconds", 600),
-            )
+            resolved = resolve_backend(cfg, "shadow")
+            self._backend = resolved.backend
+            self._model = resolved.model or _DEFAULT_SHADOW_MODEL
+            if self._backend == "openai":
+                self._max_tokens = resolved.max_tokens or 1024
+                self._client = make_client(
+                    resolved,
+                    timeout=resolved.timeout or cfg.get("timeout_seconds", 600),
+                )
+            else:
+                # Ollama construction stays byte-identical to the pre-openai path:
+                # direct module-level OllamaClient (patched in tests) with the
+                # 600s default, and num_ctx to stop oldest-first truncation of the
+                # grading instructions (matches ollama_worker_num_ctx).
+                ollama_cfg = cfg.get("ollama", {})
+                self._num_ctx = int(cfg.get("shadow_num_ctx", 32768))
+                self._client = OllamaClient(
+                    url=ollama_cfg.get("url", "http://localhost:11434"),
+                    fallback_url=ollama_cfg.get("fallback_url"),
+                    timeout=ollama_cfg.get("timeout_seconds") or cfg.get("timeout_seconds", 600),
+                )
         return self._client
 
     def _validate_path(self, path: str, repo_path: str | None) -> None:
@@ -187,6 +216,47 @@ class ShadowGrader:
             logger.warning("Tool %s execution failed: %s", name, e)
             return json.dumps({"error": str(e)})
 
+    def _assistant_tool_call_msg(self, content: str, tool_calls: list) -> dict:
+        """Assistant turn carrying tool calls, shaped per backend.
+
+        Ollama shape is byte-identical to the pre-openai path. OpenAI requires
+        id/type on each call and arguments as a JSON *string*.
+        """
+        if self._backend == "openai":
+            return {
+                "role": "assistant",
+                "content": content or "",
+                "tool_calls": [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": (
+                                tc["arguments"]
+                                if isinstance(tc["arguments"], str)
+                                else json.dumps(tc["arguments"])
+                            ),
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            }
+        return {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [
+                {"function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                for tc in tool_calls
+            ],
+        }
+
+    def _tool_result_msg(self, tc: dict, tool_result: str) -> dict:
+        """Tool-result turn shaped per backend (OpenAI requires tool_call_id)."""
+        if self._backend == "openai":
+            return {"role": "tool", "tool_call_id": tc["id"], "content": tool_result}
+        return {"role": "tool", "content": tool_result}
+
     def grade_with_tools(
         self,
         system_prompt: str,
@@ -198,6 +268,9 @@ class ShadowGrader:
 
         Returns {"grade", "approved", "feedback", "tool_calls": [...]} on success,
         or {"infrastructure_error": True, "error_detail": str, "tool_calls": []} on failure.
+
+        Raises ShadowGraderEmptyResponseError if the verdict call returns an
+        empty response after MAX_EMPTY_VERDICT_ATTEMPTS attempts.
         """
         if test_mode:
             return {
@@ -231,13 +304,23 @@ class ShadowGrader:
             },
             {"role": "user", "content": user_prompt},
         ]
-        payload = {
-            "model": self._model,
-            "messages": messages,
-            "stream": False,
-            "options": {"temperature": 0.1, "num_ctx": self._num_ctx, "repeat_penalty": 1.3},
-            "tools": SHADOW_TOOLS,
-        }
+        if self._backend == "openai":
+            payload = {
+                "model": self._model,
+                "messages": messages,
+                "tools": SHADOW_TOOLS,
+                "tool_choice": "auto",
+                "max_tokens": self._max_tokens,
+                "temperature": 0.1,
+            }
+        else:
+            payload = {
+                "model": self._model,
+                "messages": messages,
+                "stream": False,
+                "options": {"temperature": 0.1, "num_ctx": self._num_ctx, "repeat_penalty": 1.3},
+                "tools": SHADOW_TOOLS,
+            }
 
         recorded_tool_calls = []
         max_steps_reached = False
@@ -249,14 +332,7 @@ class ShadowGrader:
                 return self._build_error(str(e), recorded_tool_calls)
 
             if tool_calls:
-                messages.append({
-                    "role": "assistant",
-                    "content": content,
-                    "tool_calls": [
-                        {"function": {"name": tc["name"], "arguments": tc["arguments"]}}
-                        for tc in tool_calls
-                    ],
-                })
+                messages.append(self._assistant_tool_call_msg(content, tool_calls))
                 for tc in tool_calls:
                     args = tc["arguments"]
                     if isinstance(args, str):
@@ -266,7 +342,7 @@ class ShadowGrader:
                             args = {}
                     recorded_tool_calls.append({"name": tc["name"], "args": args})
                     tool_result = self._execute_tool(tc["name"], args, repo_path)
-                    messages.append({"role": "tool", "content": tool_result})
+                    messages.append(self._tool_result_msg(tc, tool_result))
                 payload = {**payload, "messages": messages}
 
                 if step >= MAX_TOOL_STEPS:
@@ -298,29 +374,62 @@ class ShadowGrader:
                 ),
             })
 
-        verdict_payload = {
-            "model": self._model,
-            "messages": messages,
-            "stream": False,
-            "options": {"temperature": 0.1, "num_ctx": self._num_ctx, "repeat_penalty": 1.3},
-            "format": GRADER_VERDICT_SCHEMA,
-        }
+        if self._backend == "openai":
+            verdict_payload = {
+                "model": self._model,
+                "messages": messages,
+                "max_tokens": self._max_tokens,
+                "temperature": 0.1,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "verdict", "schema": GRADER_VERDICT_SCHEMA},
+                },
+            }
+        else:
+            verdict_payload = {
+                "model": self._model,
+                "messages": messages,
+                "stream": False,
+                "options": {"temperature": 0.1, "num_ctx": self._num_ctx, "repeat_penalty": 1.3},
+                "format": GRADER_VERDICT_SCHEMA,
+            }
         logger.debug(
             "shadow_grader verdict call: format_enforced=True msg_count=%d",
             len(messages),
         )
-        try:
-            content, _ = client.post_chat(verdict_payload)
-        except OllamaError as e:
-            return self._build_error(str(e), recorded_tool_calls)
+        for attempt in range(1, MAX_EMPTY_VERDICT_ATTEMPTS + 1):
+            try:
+                content, _ = client.post_chat(verdict_payload)
+            except OllamaError as e:
+                return self._build_error(str(e), recorded_tool_calls)
 
-        logger.debug("shadow_grader verdict raw: %r", content[:200])
+            logger.debug("shadow_grader verdict raw: %r", content[:200])
 
-        content = _THINK_TAG_RE.sub("", content)
-        content = _SPECIAL_TOKEN_RE.sub("", content).strip()
-        fence_matches = _MARKDOWN_FENCE_RE.findall(content)
-        if fence_matches:
-            content = fence_matches[-1]
+            content = _THINK_TAG_RE.sub("", content)
+            content = _SPECIAL_TOKEN_RE.sub("", content).strip()
+            fence_matches = _MARKDOWN_FENCE_RE.findall(content)
+            if fence_matches:
+                content = fence_matches[-1]
+
+            if content:
+                break
+
+            if attempt >= MAX_EMPTY_VERDICT_ATTEMPTS:
+                raise ShadowGraderEmptyResponseError(
+                    f"gemma4 verdict call returned empty response after "
+                    f"{MAX_EMPTY_VERDICT_ATTEMPTS} attempts"
+                )
+
+            logger.warning(
+                "shadow_grader verdict call returned empty response "
+                "(attempt %d/%d), retrying with corrective nudge",
+                attempt, MAX_EMPTY_VERDICT_ATTEMPTS,
+            )
+            messages.append({
+                "role": "user",
+                "content": "Previous response was empty. Respond with ONLY the JSON verdict.",
+            })
+
         try:
             parsed = json.loads(content)
         except json.JSONDecodeError:

@@ -33,6 +33,9 @@ EXPECTED_DECLARATIONS = {
     "worker/skills/activate-professional-mode/SKILL.md": Counter({
         "direct_professional_session": 1,
     }),
+    "worker/skills/use-fable-subagent/scripts/run_fable_subagent.py": Counter({
+        "actual_fable_subagent": 1,
+    }),
     "worker/hooks/plan-validator.sh": Counter({"hook_validator": 1}),
 }
 

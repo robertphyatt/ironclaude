@@ -63,7 +63,8 @@
 11. **Advisor Fallback (advisor unavailable ≠ skip the advisor)**
     - The reliable advisor is a manual tiered-up adversarial reviewer you invoke yourself — codex has no `/advisor` command, so this is your ONLY advisor path. Do NOT skip the advisor step or just reason it through yourself.
     - Fire it at the natural, discretionary points a normal advisor would be consulted (agent judgment — before substantive work, when stuck, before declaring done). NOT every task, NOT every review gate.
-    - Invoke a one-tier-up reviewer with `codex exec -m <one-tier-up-model>` over the work (pass the code/diff to review inline). Tier ladder: `luna (haiku) → terra (sonnet) → sol (opus)`; codex has no `fable`, so at the `sol` ceiling run a same-tier BLIND pass (`sol → sol`). Keep the reviewer a codex model — codex is its own advisor peer. See the `ironclaude:advisor-fallback` skill for the exact command and gotchas.
+    - Call `run_codex_advisor_review` with the complete inline review packet, current `requester_model`, and `review_tier: "one-up"`; omission remains compatibility-only. The broker rejects any mismatch with provider-authenticated Codex turn metadata and applies its fixed `luna → terra → sol → astra` mapping (`gpt-5.6-luna → gpt-5.6-terra → gpt-5.6-sol → gpt-6-astra`) exactly once. Keep the reviewer a Codex model — Codex is its own advisor peer.
+    - Never run nested `codex exec` for normal advisor work or repeat an operator approval request for this brokered read-only review. See the `ironclaude:advisor-fallback` skill for the packet contract.
     - Report-only: weigh the findings as an adversary's evidence, reconcile conflicts with evidence; "no advisor" means "run this manual reviewer instead," never "proceed unreviewed."
 
 ## Plan Mode Replacement
@@ -91,3 +92,9 @@ Work WITH this system, not against it. The brainstorming skill IS your planning 
     - Before first substantive human-facing response, load and apply `ironclaude:elements-of-style`
     - For AI-directed natural language, load and apply `ironclaude:write-lossless-ai-messages`
     - Select by destination, not model; preserve machine schemas and protected technical content exactly
+
+14. **Actual Claude Fable from Codex**
+    - When a Codex user explicitly requests an actual Claude Fable subagent, load and follow `ironclaude:use-fable-subagent`
+    - Native Codex subagents cannot satisfy an actual-Fable request; do not substitute Codex, Astra, Opus, Sonnet, or Haiku
+    - Keep orchestration, workflow-state changes, staging, commits, and task sequencing in the parent Codex session
+    - Accept the report only after the launcher verifies effective Fable identity; independently verify material findings against repository evidence

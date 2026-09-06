@@ -10,6 +10,7 @@ from ironclaude.notifications import (
     format_heartbeat,
     format_brain_restarted,
     format_brain_circuit_breaker,
+    format_brain_capability_blocked,
     format_objective_received,
     format_task_progress,
     format_plan_ready,
@@ -21,6 +22,18 @@ from ironclaude.notifications import (
     format_fable_recovered,
     format_directive_review,
 )
+
+
+def test_brain_capability_blocked_reports_exact_bounded_paths():
+    msg = format_brain_capability_blocked({
+        "reason": "destination-conflict",
+        "source_companion": "/Applications/Codex/codex-code-mode-host",
+        "destination_companion": "/Users/operator/.local/bin/codex-code-mode-host",
+    })
+    assert "destination-conflict" in msg
+    assert "/Applications/Codex/codex-code-mode-host" in msg
+    assert "/Users/operator/.local/bin/codex-code-mode-host" in msg
+    assert "preserved" in msg.lower()
 
 
 class TestWorkerNotifications:
@@ -55,6 +68,23 @@ class TestSystemNotifications:
         assert "worker-def" in msg
         assert "Fix CSS layout" in msg
         assert "brainstorming" in msg
+
+    def test_heartbeat_renders_active_prompt_as_status_not_new_request(self):
+        workers = [{
+            "id": "worker-abc",
+            "description": "Wait for operator",
+            "workflow_stage": "plan_ready",
+            "prompt_incident": {
+                "age_seconds": 125,
+                "dispatch_state": "held",
+                "failure_category": "capability_blocked",
+            },
+        }]
+        msg = format_heartbeat(workers)
+        assert "prompt active 2m" in msg
+        assert "dispatch held" in msg
+        assert "capability_blocked" in msg
+        assert "ACTION REQUIRED" not in msg
 
     def test_heartbeat_no_workers(self):
         msg = format_heartbeat([])
@@ -374,15 +404,15 @@ class TestFmtDuration:
 
 
 class TestHeartbeatWaits:
-    """format_heartbeat surfaces 'waiting on commander'/'waiting on operator' state
+    """format_heartbeat surfaces 'waiting on brain'/'waiting on operator' state
     in every heartbeat, as two always-paired labeled sections."""
 
     def test_waits_shows_both_sections_and_tags_worker(self):
         workers = [{"id": "d1267", "description": "Your task: Fix band collapse", "workflow_stage": "executing"}]
         waits = {"d1267": {"question": "approve the migration?"}}
-        commander_waits = {"d1268": {"question": "deploy approved?"}}
-        msg = format_heartbeat(workers, waits=waits, commander_waits=commander_waits, operator_name="Robert")
-        assert "⏳ *WAITING ON COMMANDER:*" in msg
+        brain_waits = {"d1268": {"question": "deploy approved?"}}
+        msg = format_heartbeat(workers, waits=waits, brain_waits=brain_waits, operator_name="Robert")
+        assert "⏳ *WAITING ON Brain:*" in msg
         assert "⏳ *WAITING ON Robert:*" in msg
         assert "d1267" in msg
         assert "approve the migration?" in msg
@@ -390,30 +420,30 @@ class TestHeartbeatWaits:
         worker_line = next(ln for ln in msg.splitlines() if ln.startswith("•") and "d1267" in ln)
         assert "waiting on robert" in worker_line.lower()
 
-    def test_commander_section_omitted_when_empty(self):
+    def test_brain_section_omitted_when_empty(self):
         """Regression guard for the confirmed d1389 bug: format_heartbeat always
-        rendered an empty '⏳ WAITING ON COMMANDER: / there is nothing' block
+        rendered an empty '⏳ WAITING ON Brain: / there is nothing' block
         whenever any real operator wait existed, because no caller ever passes
-        commander_waits. The section must now be omitted entirely when empty."""
+        brain_waits. The section must now be omitted entirely when empty."""
         workers = [{"id": "d1267", "description": "Your task: Fix band collapse", "workflow_stage": "executing"}]
         waits = {"d1267": {"question": "approve the migration?"}}
         msg = format_heartbeat(workers, waits=waits, operator_name="Robert")
-        assert "⏳ *WAITING ON COMMANDER:*" not in msg
+        assert "⏳ *WAITING ON Brain:*" not in msg
         assert "there is nothing" not in msg
 
-    def test_operator_section_says_there_is_nothing_when_only_commander_populated(self):
+    def test_operator_section_says_there_is_nothing_when_only_brain_populated(self):
         """Symmetric fallback, exercised directly even though main.py never produces
-        this combination today (commander_waits is never populated by any caller)."""
+        this combination today (brain_waits is never populated by any caller)."""
         workers = [{"id": "d1267", "description": "Your task: Fix band collapse", "workflow_stage": "executing"}]
-        commander_waits = {"d1267": {"question": "deploy approved?"}}
-        msg = format_heartbeat(workers, waits={}, commander_waits=commander_waits, operator_name="Robert")
-        assert "⏳ *WAITING ON COMMANDER:*" in msg
+        brain_waits = {"d1267": {"question": "deploy approved?"}}
+        msg = format_heartbeat(workers, waits={}, brain_waits=brain_waits, operator_name="Robert")
+        assert "⏳ *WAITING ON Brain:*" in msg
         assert "deploy approved?" in msg
         lines = msg.splitlines()
         idx = lines.index("⏳ *WAITING ON Robert:*")
         assert lines[idx + 1].strip() == "there is nothing"
         worker_line = next(ln for ln in msg.splitlines() if ln.startswith("•") and "d1267" in ln)
-        assert "waiting on commander" in worker_line.lower()
+        assert "waiting on brain" in worker_line.lower()
 
     def test_waits_none_is_unchanged(self):
         workers = [{"id": "w1", "description": "Your task: Do stuff", "workflow_stage": "executing"}]
@@ -427,10 +457,15 @@ class TestHeartbeatWaits:
     def test_waits_shown_even_with_no_active_workers(self):
         """A held wait must surface even if the worker session is no longer listed."""
         msg = format_heartbeat([], waits={"d1267": {"question": "approve?"}})
-        assert "WAITING ON COMMANDER" not in msg
+        assert "WAITING ON Brain" not in msg
         assert "WAITING ON Operator" in msg
         assert "d1267" in msg
         assert "approve?" in msg
+
+    def test_per_worker_tag_waiting_on_brain(self):
+        workers = [{"id": "d5", "description": "Task: x", "workflow_stage": "executing"}]
+        msg = format_heartbeat(workers, brain_waits={"d5": {"question": "approve menu"}}, operator_name="Robert")
+        assert "⏳ waiting on brain" in msg
 
     def test_operator_name_defaults_to_operator(self):
         msg = format_heartbeat([], waits={"d1267": {"question": "approve?"}})
@@ -766,3 +801,28 @@ def test_heartbeat_shows_marker_in_idle_no_workers_case():
     from ironclaude.notifications import format_heartbeat
     out = format_heartbeat([], ollama_degraded=True)   # no workers/waits -> early-return path
     assert "validator degraded" in out.lower()
+
+
+def test_heartbeat_degraded_label_names_backend():
+    from ironclaude.notifications import format_heartbeat
+    out = format_heartbeat([], ollama_degraded=True, degraded_backend_label="OpenAI")
+    assert "OpenAI endpoint(s) down" in out
+    assert "Ollama endpoint(s) down" not in out
+
+
+def test_heartbeat_degraded_label_defaults_to_ollama():
+    from ironclaude.notifications import format_heartbeat
+    out = format_heartbeat([], ollama_degraded=True)
+    assert "Ollama endpoint(s) down" in out
+
+
+def test_resolve_degraded_backend_label_openai(tmp_path):
+    from ironclaude.notifications import resolve_degraded_backend_label
+    cfg = tmp_path / "hooks.json"
+    cfg.write_text('{"backend": "openai", "openai": {"base_url": "http://h/v1", "model": "m"}}')
+    assert resolve_degraded_backend_label(str(cfg)) == "OpenAI"
+
+
+def test_resolve_degraded_backend_label_missing_config_defaults_ollama(tmp_path):
+    from ironclaude.notifications import resolve_degraded_backend_label
+    assert resolve_degraded_backend_label(str(tmp_path / "nope.json")) == "Ollama"
