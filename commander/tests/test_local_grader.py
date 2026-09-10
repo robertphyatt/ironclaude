@@ -695,6 +695,25 @@ def test_grade_openai_backend_returns_verdict(tmp_path):
     assert mock_post.call_args[0][0] == "http://h/v1/chat/completions"
 
 
+def test_grade_openai_strict_endpoint_400_degrades_to_infrastructure_error(tmp_path):
+    """A strict OpenAI-compatible endpoint that rejects chat_template_kwargs with a
+    400 must degrade to infrastructure_error, never raise. Falsifiability: without
+    grader's `except OllamaError` seam the HTTPError would propagate and this fails."""
+    from ironclaude.grader import LocalGrader
+    import requests as req_mod
+    cfg = tmp_path / "openai-strict.json"
+    cfg.write_text(json.dumps({
+        "backend": "openai",
+        "openai": {"base_url": "http://strict/v1", "model": "example-model-a", "max_tokens": 1024},
+    }))
+    grader = LocalGrader(config_path=str(cfg))
+    error_resp = MagicMock()
+    error_resp.raise_for_status.side_effect = req_mod.HTTPError("400 Bad Request")
+    with patch("requests.post", return_value=error_resp):
+        result = grader.grade("system prompt", "user prompt", GRADE_SCHEMA)
+    assert result.get("infrastructure_error") is True
+
+
 def _openai_summ_config(tmp_path, base_url="http://llm-host/v1"):
     p = tmp_path / f"openai-summ-{base_url.split('//')[-1].split('/')[0]}.json"
     p.write_text(json.dumps({
@@ -852,3 +871,90 @@ def test_grader_no_override_honors_config_timeout(tmp_path):
     }))
     grader = LocalGrader(config_path=str(cfg), keep_alive="30m")
     assert grader._get_client()._timeout == 300
+
+
+def test_grade_openai_default_thinking_off_injects_suppression(tmp_path):
+    """Default (no spots.grader.thinking) on the openai backend suppresses model
+    reasoning so content is not eaten by the reasoning budget."""
+    from ironclaude.grader import LocalGrader
+    cfg = tmp_path / "openai-thinking-default.json"
+    cfg.write_text(json.dumps({
+        "backend": "openai",
+        "openai": {"base_url": "http://h/v1", "model": "example-model-a", "max_tokens": 1024},
+    }))
+    grader = LocalGrader(config_path=str(cfg))
+    with patch("requests.post",
+               return_value=_openai_post_response('{"grade": "A", "approved": true, "feedback": "ok"}')) as mock_post:
+        grader.grade("system prompt", "user prompt", GRADE_SCHEMA)
+    sent = mock_post.call_args[1]["json"]
+    assert sent["reasoning_effort"] == "none"
+    assert sent["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_grade_openai_thinking_true_omits_suppression(tmp_path):
+    """spots.grader.thinking=true restores today's exact wire shape (real-OpenAI
+    safe): NEITHER suppression field is sent, and the core payload is intact."""
+    from ironclaude.grader import LocalGrader
+    cfg = tmp_path / "openai-thinking-true.json"
+    cfg.write_text(json.dumps({
+        "backend": "openai",
+        "openai": {"base_url": "http://h/v1", "model": "example-model-a", "max_tokens": 1024},
+        "spots": {"grader": {"thinking": True}},
+    }))
+    grader = LocalGrader(config_path=str(cfg))
+    with patch("requests.post",
+               return_value=_openai_post_response('{"grade": "A", "approved": true, "feedback": "ok"}')) as mock_post:
+        grader.grade("system prompt", "user prompt", GRADE_SCHEMA)
+    sent = mock_post.call_args[1]["json"]
+    assert "reasoning_effort" not in sent
+    assert "chat_template_kwargs" not in sent
+    # design item 5 on-case: suppression fields are additive; core fields intact.
+    assert sent["model"] == "example-model-a"
+    assert sent["max_tokens"] == 1024
+    assert sent["temperature"] == 0.1
+    assert sent["response_format"]["type"] == "json_schema"
+
+
+def test_grade_openai_thinking_off_preserves_core_payload_fields(tmp_path):
+    """Suppression fields are additive: default-off leaves the core payload fields
+    unchanged."""
+    from ironclaude.grader import LocalGrader
+    cfg = tmp_path / "openai-core-fields.json"
+    cfg.write_text(json.dumps({
+        "backend": "openai",
+        "openai": {"base_url": "http://h/v1", "model": "example-model-a", "max_tokens": 1024},
+    }))
+    grader = LocalGrader(config_path=str(cfg))
+    with patch("requests.post",
+               return_value=_openai_post_response('{"grade": "A", "approved": true, "feedback": "ok"}')) as mock_post:
+        grader.grade("system prompt", "user prompt", GRADE_SCHEMA)
+    sent = mock_post.call_args[1]["json"]
+    assert sent["model"] == "example-model-a"
+    assert sent["max_tokens"] == 1024
+    assert sent["temperature"] == 0.1
+    assert sent["response_format"]["type"] == "json_schema"
+    # system prompt is profiled; only the raw user_prompt tail is asserted.
+    assert sent["messages"][0]["content"].endswith("user prompt")
+
+
+def test_grade_ollama_backend_ignores_thinking_flag(tmp_path):
+    """The ollama path never receives openai suppression fields, regardless of
+    spots.grader.thinking."""
+    from ironclaude.grader import LocalGrader
+    cfg = tmp_path / "ollama-thinking.json"
+    cfg.write_text(json.dumps({
+        "backend": "ollama",
+        "ollama": {"url": "http://x", "model": "m"},
+        "spots": {"grader": {"thinking": False}},
+    }))
+    grader = LocalGrader(config_path=str(cfg))
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "response": '{"grade": "A", "approved": true, "feedback": "ok"}'
+    }
+    mock_response.raise_for_status = MagicMock()
+    with patch("requests.post", return_value=mock_response) as mock_post:
+        grader.grade("system prompt", "user prompt", GRADE_SCHEMA)
+    payload = mock_post.call_args[1]["json"]
+    assert "reasoning_effort" not in payload
+    assert "chat_template_kwargs" not in payload

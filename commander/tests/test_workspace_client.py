@@ -59,6 +59,16 @@ def test_surfaces_nonzero_and_stderr_without_parsing(tmp_path: Path):
         client.allocate({})
 
 
+def test_list_shared_resources_decode_rejects_array_response(tmp_path: Path):
+    # The real cli.js list path serializes readSharedResourceConfig — a JSON ARRAY.
+    # _decode requires an object, so a bare-array return would make list_shared_resources
+    # error on every real call. This is the exact boundary the N1 {entries} wrapper fixes:
+    # if listSharedResources ever regresses to a bare array, this test fails.
+    client = WorkspaceClient(tmp_path, runner=Mock(return_value=completed('["data/x"]\n')))
+    with pytest.raises(WorkspaceClientError, match="must be an object"):
+        client.list_shared_resources({"repository_path": "/r"})
+
+
 def test_exposes_only_no_push_lifecycle_methods(tmp_path: Path):
     client = WorkspaceClient(tmp_path, runner=Mock(return_value=completed()))
     assert {
@@ -70,6 +80,12 @@ def test_exposes_only_no_push_lifecycle_methods(tmp_path: Path):
         client._invoke("push", {})
 
 
+def test_exposes_shared_resource_methods(tmp_path: Path):
+    client = WorkspaceClient(tmp_path, runner=Mock(return_value=completed()))
+    assert hasattr(client, "configure_shared_resources")
+    assert hasattr(client, "list_shared_resources")
+
+
 def test_each_public_method_uses_its_exact_internal_command(tmp_path: Path):
     runner = Mock(return_value=completed())
     client = WorkspaceClient(tmp_path, runner=runner)
@@ -77,6 +93,18 @@ def test_each_public_method_uses_its_exact_internal_command(tmp_path: Path):
         getattr(client, name)({"marker": name})
         assert runner.call_args.args[0][2] == name
         assert json.loads(runner.call_args.args[0][3]) == {"marker": name}
+
+
+def test_shared_resource_methods_forward_hyphenated_internal_commands(tmp_path: Path):
+    runner = Mock(return_value=completed())
+    client = WorkspaceClient(tmp_path, runner=runner)
+    for method, command in (
+        ("configure_shared_resources", "configure-shared-resources"),
+        ("list_shared_resources", "list-shared-resources"),
+    ):
+        getattr(client, method)({"marker": method})
+        assert runner.call_args.args[0][2] == command
+        assert json.loads(runner.call_args.args[0][3]) == {"marker": method}
 
 
 def test_cleanup_forwards_payload_into_cli_argv(tmp_path: Path):

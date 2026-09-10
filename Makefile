@@ -38,7 +38,7 @@ test: test-hooks test-workspace-manager test-commander
 # guard could regress with `make test-hooks` still green. Each suite exits
 # non-zero on failure, so `set -e` semantics come free from make.
 test-hooks:
-	@for suite in worker/hooks/test-*.sh worker/hooks/tests/test-*.sh; do \
+	@for suite in worker/hooks/test-*.sh worker/hooks/tests/test-*.sh commander/hooks/tests/test-*.sh; do \
 	  printf '\n--- %s ---\n' "$$suite"; \
 	  bash "$$suite" || exit 1; \
 	done

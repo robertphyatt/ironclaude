@@ -25,9 +25,11 @@ export interface InternalCommandDependencies {
   cleanup: InternalDependency;
   sync: InternalDependency;
   reap: InternalDependency;
+  configureSharedResources: InternalDependency;
+  listSharedResources: InternalDependency;
 }
 
-export const INTERNAL_COMMAND_NAMES = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile', 'cleanup', 'sync', 'reap'] as const;
+export const INTERNAL_COMMAND_NAMES = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile', 'cleanup', 'sync', 'reap', 'configure-shared-resources', 'list-shared-resources'] as const;
 
 function waitForCliDatabase(milliseconds: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
@@ -88,6 +90,14 @@ function requiredRecord(args: Args, key: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function requiredStringArray(args: Args, key: string): string[] {
+  const value = args[key];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+    throw new Error(`${key} must be an array of strings`);
+  }
+  return value as string[];
+}
+
 export function dispatchInternalCommand(
   name: string,
   args: Args,
@@ -102,6 +112,8 @@ export function dispatchInternalCommand(
     case 'cleanup': return dependencies.cleanup(args);
     case 'sync': return dependencies.sync(args);
     case 'reap': return dependencies.reap(args);
+    case 'configure-shared-resources': return dependencies.configureSharedResources(args);
+    case 'list-shared-resources': return dependencies.listSharedResources(args);
     default: throw new Error(`Unknown internal workspace command: ${name}`);
   }
 }
@@ -196,6 +208,14 @@ export function createInternalCommandDependencies(
     reap: (args) => service.reapLeakedAssignment({
       repositoryPath: requiredString(args, 'repository_path'),
       workspaceGuid: requiredString(args, 'workspace_guid'),
+    }),
+    configureSharedResources: (args) => service.configureSharedResources({
+      repositoryPath: requiredString(args, 'repository_path'),
+      entries: requiredStringArray(args, 'entries'),
+      allowSecretEntries: args.allow_secret_entries === true,
+    }),
+    listSharedResources: (args) => service.listSharedResources({
+      repositoryPath: requiredString(args, 'repository_path'),
     }),
   };
 }

@@ -1,0 +1,60 @@
+{
+  "name": "v1.1.9 6th-Review Fixes",
+  "goal": "Fix the five 6th-Fable-review items: Codex-Brain gate fail-open-on-missing-logger (a), an undocumented CHANGELOG tightening (b), a template command-form guard (c), a weak workflow-lookback guard (d), and a mojibake-corrupted design doc (e).",
+  "requirements_file": "docs/plans/2026-09-08-v119-review6-fixes-design.md",
+  "design_file": "docs/plans/2026-09-08-v119-review6-fixes-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Codex-Brain gate selective fail-closed (a)",
+      "description": "Guard the unguarded `source hook-logger.sh` in worker/hooks/codex-brain-gated-actions.sh (:5) so a missing logger fails CLOSED selectively: block only the Codex-Brain gated set (the action+game cases) when IC_ROLE=brain && IRONCLAUDE_CLIENT=codex; allow arm/read/other and non-codex-brain sessions. Extend test-codex-brain-gated-actions.sh with missing-logger cases. Codex twin of obs-3.",
+      "allowed_files": [
+        "worker/hooks/codex-brain-gated-actions.sh",
+        "worker/hooks/test-codex-brain-gated-actions.sh"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "In worker/hooks/test-codex-brain-gated-actions.sh, before the pass/fail summary, add missing-logger cases: copy $HOOK to $TMP_DIR/nolog (no hook-logger.sh), define run_nolog(TOOL [CLIENT] [ROLE]) that runs the logger-less hook with IC_ROLE/IRONCLAUDE_CLIENT/IRONCLAUDE_BRAIN_GATE_SESSION env and returns rc, then assert_rc 'no-logger: gated action blocked (codex brain)' 2 run_nolog mcp__plugin_ironclaude_orchestrator__spawn_worker; assert_rc 'no-logger: arm tool allowed (codex brain)' 0 run_nolog mcp__plugin_ironclaude_episodic-memory__search; assert_rc 'no-logger: gated action allowed (non-codex-brain)' 0 run_nolog mcp__plugin_ironclaude_orchestrator__spawn_worker claude brain. Snippet in human plan Task 1 Step 1."},
+        {"description": "Run the suite — verify RED.", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/test-codex-brain-gated-actions.sh", "expected": "FAIL on 'no-logger: gated action blocked (codex brain)' (expected rc=2, actual rc=0) — current unguarded source fails open so a gated action exits 0; the other two new cases already pass."},
+        {"description": "In worker/hooks/codex-brain-gated-actions.sh replace lines 4-6 (SCRIPT_DIR + unguarded `source hook-logger.sh` + run_hook) with the guarded form from human plan Task 1 Step 3: on source failure, exit 0 unless IC_ROLE=brain && IRONCLAUDE_CLIENT=codex; else read stdin, jq tool_name, and `case` the full action+game gated set (both mcp__plugin_ironclaude_orchestrator__* and mcp__orchestrator__*/mcp__ollama__* variants) -> echo loud stderr + exit 2; *) exit 0. Keep run_hook after the guard. The gated case list must be token-for-token the hook's own action+game cases."},
+        {"description": "Run the suite — verify GREEN.", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/test-codex-brain-gated-actions.sh", "expected": "all pass (three new cases + every pre-existing case); exits 0."},
+        {"description": "Stage changes.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/codex-brain-gated-actions.sh worker/hooks/test-codex-brain-gated-actions.sh", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Doc + test hardening (b, c, d)",
+      "description": "(b) CHANGELOG clause naming the AskUserQuestion gating activated by the memory-search deploy. (c) test_daemon.py template guard asserts every PreToolUse command uses $HOME/ (not ~). (d) test_brain_doc_guards.py workflow guard anchors on the :760 line. (c)/(d) are guard-strengthenings over already-correct source (no RED — falsifiability is future regression).",
+      "allowed_files": [
+        "CHANGELOG.md",
+        "commander/tests/test_daemon.py",
+        "commander/tests/test_brain_doc_guards.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "(c) In commander/tests/test_daemon.py test_brain_settings_hooks_template_lists_all_three_gates, after the three existing asserts add a loop asserting every PreToolUse hook command startswith 'bash $HOME/.claude/ironclaude-hooks/'. (d) In commander/tests/test_brain_doc_guards.py replace test_directive_workflow_read_arms_gate body to assert 'hours_back=24' not in WF text AND the full ':760' line '`get_operator_messages(limit=20, hours_back=72)` to read raw Slack messages.' in text. Snippets in human plan Task 2 Step 1."},
+        {"description": "Run both guards — verify they pass on current source (stricter guards, not RED).", "command": "PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_daemon.py::test_brain_settings_hooks_template_lists_all_three_gates tests/test_brain_doc_guards.py::test_directive_workflow_read_arms_gate -q", "expected": "2 passed — template already uses $HOME form and workflow.md:760 already reads hours_back=72 (both from the prior loop); these are stricter guards over correct source (falsifiability: $HOME->~ or :760 72->other now fails)."},
+        {"description": "(b) In CHANGELOG.md ## 1.1.9 'Post-review hardening' bullet, insert (before the 'Brain advisor-fallback (rule 23)' sentence) a sentence: 'Deploying memory-search-enforcer through the settings-sync also activates its `AskUserQuestion` gating on the Brain in production (previously the stale deployed copy did not gate it).' No test — human-facing prose."},
+        {"description": "Verify the CHANGELOG clause landed.", "command": "grep -n \"activates its\" /Users/roberthyatt/Code/ironclaude/CHANGELOG.md", "expected": "one match within the 1.1.9 section (below line 13, above ## 1.1.8)."},
+        {"description": "Stage changes.", "command": "git -C /Users/roberthyatt/Code/ironclaude add CHANGELOG.md commander/tests/test_daemon.py commander/tests/test_brain_doc_guards.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Repair corrupted design doc control bytes (e)",
+      "description": "docs/plans/2026-09-07-shared-entry-validator-hardening-design.md line 25 has three raw ASCII control bytes (NUL 0x00, 0x1F, 0x7F) inside a regex span where the readable intended text is [\\x00-\\x1f\\x7f]; git flags it binary via the NUL-in-first-8000-bytes heuristic (the file decodes fine; the em-dashes/arrows are valid UTF-8). Fix by a byte-level rb->wb replace of exactly those three control bytes with their escaped ASCII text (b'[\\x00-\\x1f\\x7f]' -> b'[\\\\x00-\\\\x1f\\\\x7f]'); NOT a whole-file rewrite, and do NOT transcribe cat -v's [^@-^_^?] literally. Then run the definitive full commander suite + make test-hooks gate.",
+      "allowed_files": [
+        "docs/plans/2026-09-07-shared-entry-validator-hardening-design.md"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {"description": "Confirm the corruption (RED): the file contains a raw NUL byte so git treats it binary. This is a byte-level defect, NOT a UnicodeDecodeError — the file decodes fine today.", "command": "grep -a -c -P \"\\x00\" /Users/roberthyatt/Code/ironclaude/docs/plans/2026-09-07-shared-entry-validator-hardening-design.md", "expected": "1 (one line contains a raw NUL byte)."},
+        {"description": "Byte-level replace the three control bytes with their escaped ASCII text (rb->wb; leave the valid em-dashes/arrows untouched; do NOT whole-file-rewrite; do NOT transcribe cat -v's [^@-^_^?] literally).", "command": "PYTHONUNBUFFERED=1 .venv/bin/python -c \"p='/Users/roberthyatt/Code/ironclaude/docs/plans/2026-09-07-shared-entry-validator-hardening-design.md'; b=open(p,'rb').read(); n=b.replace(b'[\\x00-\\x1f\\x7f]', b'[\\\\x00-\\\\x1f\\\\x7f]'); assert n!=b and b'\\x00' not in n; open(p,'wb').write(n); print('replaced', len(b), '->', len(n))\"", "expected": "prints 'replaced <M> -> <N>' (exactly one span replaced; no NUL remains); no AssertionError."},
+        {"description": "Verify GREEN: no NUL + literal escaped regex present + content intact.", "command": "grep -a -c -F '/[\\x00-\\x1f\\x7f]/.test(entry)' /Users/roberthyatt/Code/ironclaude/docs/plans/2026-09-07-shared-entry-validator-hardening-design.md", "expected": "1 (the literal escaped regex /[\\x00-\\x1f\\x7f]/.test(entry) is now present). Follow with: PYTHONUNBUFFERED=1 .venv/bin/python -c \"d=open('/Users/roberthyatt/Code/ironclaude/docs/plans/2026-09-07-shared-entry-validator-hardening-design.md',encoding='utf-8').read(); assert '\\x00' not in d and 'isSafeSharedEntry' in d; print('clean', len(d))\" -> prints 'clean <N>'."},
+        {"description": "Definitive gate: full commander suite.", "command": "PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "0 failed — including Task 2's tightened guards."},
+        {"description": "Definitive gate: hook suites.", "command": "make -C /Users/roberthyatt/Code/ironclaude test-hooks", "expected": "exit 0 — including Task 1's updated test-codex-brain-gated-actions.sh."},
+        {"description": "Stage changes.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-09-07-shared-entry-validator-hardening-design.md", "expected": "Staged (docs/ gitignored -> -f)."}
+      ]
+    }
+  ]
+}

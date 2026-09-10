@@ -156,9 +156,7 @@ _IC_MSG_CODE_REVIEW_REQUIRED="STOP — CODE REVIEW REQUIRED
 
 You submitted COUNT_PLACEHOLDER task(s) for Wave WAVE_PLACEHOLDER; code review has not run yet. The next step is code review.
 
-Call the Skill tool with EXACTLY these parameters:
-  skill: \"ironclaude:code-review\"
-  args: \"--task-boundary\"
+Invoke: $(ic_skill_ref "ironclaude:code-review" "--task-boundary")
 
 Run code review as your next action.
 ${_IC_DURABILITY_FOOTER}"
@@ -169,9 +167,7 @@ Your code review grade was GRADE_PLACEHOLDER. Only grade A or B advances tasks; 
 
 Next:
 1. Fix the issues identified in the last code review
-2. Run code review again via the Skill tool:
-   skill: \"ironclaude:code-review\"
-   args: \"--task-boundary\"
+2. Run code review again: $(ic_skill_ref "ironclaude:code-review" "--task-boundary")
 
 Fix the issues before the next task.
 ${_IC_DURABILITY_FOOTER}"
@@ -1100,9 +1096,9 @@ if [[ "$BYPASS_GRADE" =~ ^[DF]$ ]]; then
 You attempted to bypass professional mode protections. This is blocked.
 
 You MUST use the proper workflow:
-1. Call Skill tool with skill: \"ironclaude:brainstorming\" to design your approach
-2. Call Skill tool with skill: \"ironclaude:writing-plans\" to create an implementation plan
-3. Call Skill tool with skill: \"ironclaude:executing-plans\" to execute with proper permissions
+1. $(ic_skill_ref "ironclaude:brainstorming" "") to design your approach
+2. $(ic_skill_ref "ironclaude:writing-plans" "") to create an implementation plan
+3. $(ic_skill_ref "ironclaude:executing-plans" "") to execute with proper permissions
 
 Do NOT delete flag files or run commands to disable protections.
 Do NOT suggest workarounds to the user.

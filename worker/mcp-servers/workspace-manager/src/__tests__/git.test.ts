@@ -1,9 +1,16 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { carryForwardFastForward, changedPaths, dirtyAndUntrackedPaths } from '../git.js';
+import {
+  addSharedResourceEntries,
+  carryForwardFastForward,
+  changedPaths,
+  dirtyAndUntrackedPaths,
+  linkSharedResources,
+  readSharedResourceConfig,
+} from '../git.js';
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }).trim();
@@ -136,6 +143,101 @@ describe('git.ts pure helpers', () => {
       // A genuine git refusal leaves the local modification untouched, rather
       // than silently applying the incoming change or corrupting the file.
       expect(readFileSync(join(wt, 'fileA.txt'), 'utf8')).toBe('locally different A\n');
+    });
+  });
+
+  describe('shared-resource config', () => {
+    // A repositoryIdentity is a git-common-dir; the config lives under its info/ subdir.
+    function identity(): string {
+      const root = mkdtempSync(join(tmpdir(), 'ironclaude-git-shared-'));
+      mkdirSync(join(root, 'info'), { recursive: true });
+      return root;
+    }
+
+    it('appends valid entries and reports them as added', () => {
+      const id = identity();
+      const result = addSharedResourceEntries(id, ['data/models', 'caches/vision']);
+      expect(result.added).toEqual(['data/models', 'caches/vision']);
+      expect(result.rejected).toEqual([]);
+      expect(readSharedResourceConfig(id)).toEqual(['data/models', 'caches/vision']);
+    });
+
+    it('creates the config file when absent', () => {
+      const id = identity();
+      expect(existsSync(join(id, 'info', 'worktree-shared-resources'))).toBe(false);
+      addSharedResourceEntries(id, ['data/models']);
+      expect(existsSync(join(id, 'info', 'worktree-shared-resources'))).toBe(true);
+    });
+
+    it('dedupes an already-present entry', () => {
+      const id = identity();
+      addSharedResourceEntries(id, ['data/models']);
+      const result = addSharedResourceEntries(id, ['data/models', 'caches/vision']);
+      expect(result.added).toEqual(['caches/vision']);
+      expect(result.skipped).toEqual(['data/models']);
+      expect(readSharedResourceConfig(id)).toEqual(['data/models', 'caches/vision']);
+    });
+
+    it('rejects unsafe entries and never writes them', () => {
+      const id = identity();
+      const bad = ['../escape', '/abs', 'a*', 'trailing/', '!neg', '#comment', 'ok\nescape', 'a\rb', ' models', 'models ', '.', './data', 'models/.', 'a//b'];
+      const result = addSharedResourceEntries(id, bad);
+      expect(result.rejected).toEqual(bad);
+      expect(result.added).toEqual([]);
+      expect(readSharedResourceConfig(id)).toEqual([]);
+    });
+
+    it('blocks well-known secret entries by default, writing nothing', () => {
+      const id = identity();
+      const result = addSharedResourceEntries(id, ['.env', '.aws/credentials', '.ssh/id_rsa', 'key.pem']);
+      expect(result.secretBlocked).toEqual(['.env', '.aws/credentials', '.ssh/id_rsa', 'key.pem']);
+      expect(result.added).toEqual([]);
+      expect(readSharedResourceConfig(id)).toEqual([]);
+    });
+
+    it('still accepts legitimate entries alongside the secret deny-list', () => {
+      const id = identity();
+      const result = addSharedResourceEntries(id, ['data/models', '.venv', 'caches/vision']);
+      expect(result.added).toEqual(['data/models', '.venv', 'caches/vision']);
+      expect(result.secretBlocked).toEqual([]);
+    });
+
+    it('accepts secret entries when the operator explicitly overrides via allowSecretEntries', () => {
+      const id = identity();
+      const result = addSharedResourceEntries(id, ['.env', '.aws/credentials'], true);
+      expect(result.added).toEqual(['.env', '.aws/credentials']);
+      expect(result.secretBlocked).toEqual([]);
+    });
+
+    it('still hard-rejects unsafe entries even with allowSecretEntries set', () => {
+      const id = identity();
+      const result = addSharedResourceEntries(id, ['../escape'], true);
+      expect(result.rejected).toEqual(['../escape']);
+      expect(result.added).toEqual([]);
+      expect(result.secretBlocked).toEqual([]);
+    });
+  });
+
+  describe('linkSharedResources returns the planted set', () => {
+    function primaryWithWorktree(): { primary: string; worktree: string; identity: string } {
+      const root = mkdtempSync(join(tmpdir(), 'ironclaude-git-link-'));
+      const primary = join(root, 'primary');
+      const worktree = join(root, 'worktree');
+      const identityDir = join(root, 'common');
+      mkdirSync(primary, { recursive: true });
+      mkdirSync(worktree, { recursive: true });
+      mkdirSync(join(identityDir, 'info'), { recursive: true });
+      return { primary, worktree, identity: identityDir };
+    }
+
+    it('returns entries actually planted and omits a source-absent entry', () => {
+      const { primary, worktree, identity } = primaryWithWorktree();
+      // present source
+      mkdirSync(join(primary, 'data'), { recursive: true });
+      const planted = linkSharedResources(primary, worktree, identity, ['data', 'absent_dir']);
+      expect(planted).toEqual(['data']);
+      expect(lstatSync(join(worktree, 'data')).isSymbolicLink()).toBe(true);
+      expect(existsSync(join(worktree, 'absent_dir'))).toBe(false);
     });
   });
 });

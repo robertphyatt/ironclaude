@@ -1,6 +1,7 @@
 """Tests for IroncladeDaemon._validate_brain_message and _detect_prompt_waiting."""
 import logging
 import sqlite3
+import threading
 import time
 import pytest
 from unittest.mock import MagicMock, patch
@@ -16,6 +17,11 @@ from ironclaude.main import IroncladeDaemon, PROMPT_WAITING_CACHE_TTL
 def _make_daemon():
     daemon = IroncladeDaemon.__new__(IroncladeDaemon)
     daemon._grader = MagicMock()
+    # FIX 2 (in-flight bounded-grade cap): __new__ skips __init__, so mirror the
+    # attributes _grade_bounded dereferences (the operator-wait path calls it).
+    daemon._grade_state_lock = threading.Lock()
+    daemon._grade_in_flight = False
+    daemon.config = {}
     daemon._prompt_waiting_cache = {}
     return daemon
 
@@ -437,6 +443,8 @@ def _make_poll_daemon():
     d._operator_wait_alerted = {}
     d._brain_waits = {}
     d.config = {}
+    d._grade_state_lock = threading.Lock()
+    d._grade_in_flight = False
     d._heartbeat_state_history = {}
     d._heartbeat_stuck_notified = set()
     d._last_heartbeat_ts = None

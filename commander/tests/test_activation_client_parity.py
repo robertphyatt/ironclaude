@@ -377,7 +377,7 @@ def test_claude_checks_combined_semantics_before_creating_absent_rules_file():
         "Do not create `.claude/rules/behavioral.md` solely because it is absent."
     ) in claude
     assert (
-        "If `CLAUDE.md` alone covers the workflow requirement and all twelve "
+        "If `CLAUDE.md` alone covers the workflow requirement and all thirteen "
         "concepts, leave the rules file absent."
     ) in claude
 

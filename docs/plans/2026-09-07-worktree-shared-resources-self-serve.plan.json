@@ -1,0 +1,124 @@
+{
+  "name": "Worktree Shared-Resources Self-Serve",
+  "goal": "Give the Brain a self-serve ORCHESTRATOR MCP tool (configure_shared_resources / list_shared_resources) proxying via WorkspaceClient -> cli.js internal command -> git.ts shared-resource primitives, relinking new entries into live managed worktrees, documenting the mechanism (brain rules + worker templates), plus a distinct generalized never-fake-past-a-gate guardrail.",
+  "requirements_file": "docs/plans/2026-09-07-worktree-shared-resources-self-serve-design.md",
+  "design_file": "docs/plans/2026-09-07-worktree-shared-resources-self-serve-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "git.ts addSharedResourceEntries helper + linkSharedResources returns planted set",
+      "description": "RE-RUN NOTE: this task's code (git.ts + git.test.ts) is ALREADY STAGED from a prior execution (this plan re-runs after an execution-order retreat); its RED step is verification-only — run the test command and expect PASS (not FAIL), then stage. No new code changes here. Original intent: Add addSharedResourceEntries(repositoryIdentity, entries)->{added,skipped,rejected,entries} to workspace-manager git.ts reusing the module-private isSafeSharedEntry/SHARED_RESOURCE_CONFIG (helper lives IN git.ts); validate+dedupe against readSharedResourceConfig, append new valid entries only when added.length>0. Change linkSharedResources to RETURN the string[] it already accumulates instead of void (non-breaking) so the relink handler can report planted entries. TDD in git.test.ts.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/git.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/git.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: git.test.ts import addSharedResourceEntries+readSharedResourceConfig+linkSharedResources; assert valid appended (added), re-add dedupes (skipped), invalid (../x,/abs,a*,x/,!x,#x) rejected+not written, absent config created; and linkSharedResources RETURNS planted string[] (linked entry present, source-absent entry absent). tmp git-common-dir with info/ for config; tmp primary+worktree pair for link."},
+        {"description": "Verify (code staged from prior run — verification-only, NOT RED).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test -- git.test", "expected": "PASS: git.test suite green (addSharedResourceEntries + linkSharedResources planted-set tests already implemented)."},
+        {"description": "GREEN: add addSharedResourceEntries near readSharedResourceConfig (reuse isSafeSharedEntry+SHARED_RESOURCE_CONFIG+existing fs imports; write only when added.length>0, preserve trailing-newline). Change linkSharedResources signature to :string[] and `return linked;` at end."},
+        {"description": "Run GREEN.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test -- git.test", "expected": "passed"},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/git.ts worker/mcp-servers/workspace-manager/src/__tests__/git.test.ts", "expected": "staged"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "cli.ts internal commands + WorkspaceService handlers + bundle",
+      "description": "WorkspaceService.configureSharedResources({repository_path,entries}) -> discoverRepository -> addSharedResourceEntries -> enumerate live MANAGED worktrees from assignments DB (SELECT worktree_path FROM assignments WHERE repository_identity=? AND lifecycle_status NOT IN ('integrated','abandoned','cleaned'), keep on-disk) -> linkSharedResources capturing planted set -> return {added,skipped,rejected,entries,relinked:{worktreePath:planted}}. listSharedResources -> readSharedResourceConfig. cli.ts: add configure-shared-resources+list-shared-resources to INTERNAL_COMMAND_NAMES + dispatchInternalCommand + InternalCommandDependencies/createInternalCommandDependencies. tool-dispatch.test.ts: add to INTERNAL_COMMANDS(:40)+internalDependencies()(:60-71). Rebuild bundle (Brain runtime loads cli.js from plugin cache -> pickup needs cache refresh, not build alone). NOT the public dispatchPublicTool surface.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/cli.ts",
+        "worker/mcp-servers/workspace-manager/src/workspace-service.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/cli.test.ts",
+        "worker/mcp-servers/workspace-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "RED: workspace-service.test.ts (real git init + ensureSessionWorktree harness) assert configureSharedResources appends+returns {added,skipped,rejected,entries,relinked}; live managed worktree gets symlink + /entry exclude + appears in relinked with planted entry (source EXISTS); source-ABSENT entry written to config but NOT in relinked; negative bounding — operator worktree outside .ironclaude/worktrees/ and orphaned managed dir with no live assignments row NOT relinked. N1: listSharedResources returns an OBJECT {entries: string[]} (NOT a bare array) — the Commander's WorkspaceClient._decode rejects any non-object JSON (workspace_client.py:58), so a bare-array return makes the orchestrator list tool error 100% of the time; assert the handler returns {entries:[...]} matching the config. N3 (discriminating): a MANAGED assignments row UPDATEd to lifecycle_status='integrated' (harness already does direct UPDATE) with worktree_path still on disk is ABSENT from relinked and gets NO symlink — this is the ONLY test that fails if the `lifecycle_status NOT IN ('integrated','abandoned','cleaned')` clause is deleted. tool-dispatch.test.ts: add configure-shared-resources+list-shared-resources to INTERNAL_COMMANDS(:40) + internalDependencies()(:60-71) mock keys (configureSharedResources returns an object, listSharedResources returns {entries:[]}). ALSO add the same two mock keys to cli.test.ts's hardcoded internalDependencies()(~:19-30) (listSharedResources -> {entries:[]}) or tsc fails at build."},
+        {"description": "Run RED.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test -- workspace-service tool-dispatch", "expected": "FAIL: handlers/internal commands not defined; INTERNAL_COMMAND_NAMES != updated INTERNAL_COMMANDS."},
+        {"description": "GREEN workspace-service.ts: implement configureSharedResources (assignments-DB live managed enumeration + linkSharedResources planted-set capture) and listSharedResources RETURNING an object {entries: readSharedResourceConfig(...)} (type {entries: string[]}) — NOT a bare array, so WorkspaceClient._decode (requires object) accepts it. Ensure the lifecycle_status NOT IN ('integrated','abandoned','cleaned') clause is present (N3 test guards it)."},
+        {"description": "GREEN cli.ts: add the two commands to INTERNAL_COMMAND_NAMES(:30) + dispatchInternalCommand(:97-104) + InternalCommandDependencies type + createInternalCommandDependencies(:109)."},
+        {"description": "Run GREEN.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test -- workspace-service tool-dispatch", "expected": "passed"},
+        {"description": "Build bundle.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build", "expected": "tsc clean + 3 dist bundles written; no errors"},
+        {"description": "Full TS suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test", "expected": "0 failed"},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/cli.ts worker/mcp-servers/workspace-manager/src/workspace-service.ts worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts worker/mcp-servers/workspace-manager/src/__tests__/cli.test.ts worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/hook-intent.js", "expected": "staged"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Python bridge (WorkspaceClient) + orchestrator MCP tools",
+      "description": "RE-RUN NOTE: the main code (workspace_client.py + orchestrator_mcp.py) and its tests are ALREADY STAGED from a prior execution; those RED steps are verification-only (tests already pass). The ONE genuinely new addition here is a WorkspaceClient._decode negative test (see Step 1). workspace_client.py: configure-shared-resources+list-shared-resources are in _COMMANDS + two thin methods calling _invoke. orchestrator_mcp.py: configure_shared_resources(repository_path, entries, worker_id=None) + list_shared_resources(repository_path, worker_id=None) methods + @mcp.tool() wrappers modeled on recover_worker_integration (method ~:4027, wrapper ~:7280 in the staged tree): ssh_host from registry when worker_id else local (_shared_resources_transport helper), discover_installed_plugin_root, _workspace_transport, call _workspace_client, return structured dict never raise. Brain tool guard already admits mcp__orchestrator__* (no GATED_TOOLS entry). TDD in test_workspace_client.py + test_orchestrator_mcp.py.",
+      "allowed_files": [
+        "commander/src/ironclaude/workspace_client.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_workspace_client.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {"description": "workspace_client tests: two SEPARATE functions are already staged — test_exposes_shared_resource_methods (hasattr both) and test_shared_resource_methods_forward_hyphenated_internal_commands (each forwards its hyphenated command + payload). NEW work (would have caught N1): add a negative _decode test — a completed() result whose stdout is a JSON ARRAY (e.g. completed('[\"data/x\"]\\n')) passed through a list-style command makes WorkspaceClient raise WorkspaceClientError('... JSON response must be an object'); this proves the boundary the real cli.js list path crosses (why listSharedResources MUST return an object, not a bare array)."},
+        {"description": "orchestrator tests already staged (verify): test_orchestrator_mcp.py class TestConfigureSharedResources = 5 tests — registration (_tool_manager.get_tool('configure_shared_resources').fn / list_shared_resources), local configure/list forward exact payload + installed transport, never-raise on WorkspaceClientError, worker-not-found does-not-discover. No new change."},
+        {"description": "Verify workspace_client tests (staged code passes; new _decode negative test also passes since _decode already rejects arrays — this is verification, not RED).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_workspace_client.py -k \"shared_resource or exact_internal or lifecycle_methods or decode\" -q", "expected": "PASS: shared-resource method tests + exact-internal-command + no-push-lifecycle + _decode negative test all green."},
+        {"description": "workspace_client.py already staged: both commands in _COMMANDS + two thin methods calling self._invoke('configure-shared-resources'|'list-shared-resources', payload, **transport). Verify present; no new change."},
+        {"description": "orchestrator_mcp.py already staged: configure_shared_resources/list_shared_resources methods (+ _shared_resources_transport helper) near ~:3927-4025 and @mcp.tool() wrappers near ~:7295-7339, modeled on recover_worker_integration (staged ~:4027/:7280). Verify present; no new change."},
+        {"description": "Run GREEN (workspace_client).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_workspace_client.py -q", "expected": "0 failed"},
+        {"description": "Verify orchestrator tests (staged; class TestConfigureSharedResources = 5 tests).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -k \"ConfigureSharedResources\" -q", "expected": "PASS: 5 passed (registration + local configure/list payload+transport + never-raise + worker-not-found)."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/workspace_client.py commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_workspace_client.py commander/tests/test_orchestrator_mcp.py", "expected": "staged"}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Discoverability docs",
+      "description": "README subsection (mechanism, self-serve via the ORCHESTRATOR configure_shared_resources tool, never hand-symlink/never ask operator, explicit-entries-only security, write-through-symlink caution, plugin-cache-refresh deploy note); brain/rules/workflow.md rule (call configure_shared_resources; never ln -s or ask operator to touch a worktree); use-managed-worktree skill; CHANGELOG. No tests required: docs-only (grep markers).",
+      "allowed_files": [
+        "README.md",
+        "commander/src/brain/rules/workflow.md",
+        "worker/skills/use-managed-worktree/SKILL.md",
+        "CHANGELOG.md"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {"description": "README.md: 'Managed-worktree shared resources' subsection (mechanism, self-serve orchestrator configure_shared_resources tool, never hand-symlink/never ask operator, explicit-entries-only security, write-through-symlink caution, plugin-cache-refresh deploy note)."},
+        {"description": "commander/src/brain/rules/workflow.md: rule — worker needs gitignored project data absent from worktree -> call configure_shared_resources; NEVER hand ln -s or ask operator to touch a worktree."},
+        {"description": "worker/skills/use-managed-worktree/SKILL.md: document configuring shared resources via the tool as part of setup."},
+        {"description": "CHANGELOG.md: Unreleased/next entry (orchestrator self-serve tool + live relink + discoverability)."},
+        {"description": "Verify markers.", "command": "grep -rn \"configure_shared_resources\" /Users/roberthyatt/Code/ironclaude/README.md /Users/roberthyatt/Code/ironclaude/commander/src/brain/rules/workflow.md /Users/roberthyatt/Code/ironclaude/worker/skills/use-managed-worktree/SKILL.md", "expected": "at least one match in each of the three files"},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add README.md commander/src/brain/rules/workflow.md worker/skills/use-managed-worktree/SKILL.md CHANGELOG.md", "expected": "staged"}
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Worker templates (R5 audience)",
+      "description": "In BOTH worker templates add: gitignored project data your task needs is absent from your worktree -> report the exact path to the Brain as a blocker so it provisions it (configure_shared_resources); NEVER hand-write ln -s or fiddle with the worktree. No tests required: template docs (grep markers). Both currently have 0 worktree mentions (verified).",
+      "allowed_files": [
+        "commander/src/ironclaude/templates/worker_agents.md",
+        "commander/src/ironclaude/templates/worker_claude_md.md"
+      ],
+      "depends_on": [4],
+      "steps": [
+        {"description": "Add the worker-side text to BOTH templates (report missing worktree data to the Brain -> configure_shared_resources; never hand ln -s / fiddle with the worktree)."},
+        {"description": "Verify markers.", "command": "grep -rn \"configure_shared_resources\" /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude/templates/worker_agents.md /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude/templates/worker_claude_md.md", "expected": "at least one match in each file"},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/templates/worker_agents.md commander/src/ironclaude/templates/worker_claude_md.md", "expected": "staged"}
+      ]
+    },
+    {
+      "id": 6,
+      "name": "Never-fake-past-a-gate guardrail (distinct)",
+      "description": "Generalized behavioral guardrail: declared input absent -> surface a real blocker or produce it via the workflow; NEVER skip/override/rationalize past the gate to fake green; detection cue = a required-input check that 'passes' only because it was disabled/skipped. Add to brain/rules/workflow.md + executing-plans SKILL.md. Kept distinct so it reviews/reverts independently; ordered after Tasks 4/5 to avoid a workflow.md edit collision. No tests required: rule text (grep markers).",
+      "allowed_files": [
+        "commander/src/brain/rules/workflow.md",
+        "worker/skills/executing-plans/SKILL.md"
+      ],
+      "depends_on": [5],
+      "steps": [
+        {"description": "commander/src/brain/rules/workflow.md: generalized guardrail — declared input absent -> surface a real blocker or produce it via the workflow; never skip/override/rationalize past the gate to fake green; detection cue included."},
+        {"description": "worker/skills/executing-plans/SKILL.md: same discipline at the execution boundary — a task whose declared input is missing must fail/escalate, not be silently satisfied."},
+        {"description": "Verify markers.", "command": "grep -rn \"surface a real blocker\" /Users/roberthyatt/Code/ironclaude/commander/src/brain/rules/workflow.md /Users/roberthyatt/Code/ironclaude/worker/skills/executing-plans/SKILL.md", "expected": "at least one match in each file"},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/brain/rules/workflow.md worker/skills/executing-plans/SKILL.md", "expected": "staged"}
+      ]
+    }
+  ]
+}

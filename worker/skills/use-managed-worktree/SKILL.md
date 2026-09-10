@@ -68,9 +68,28 @@ What this changes:
   primary checkout. `git status` in the primary checkout will not show them.
 • Any uncommitted work already in your primary checkout is untouched.
 • Reads are never redirected away from you.
+• Gitignored project data (model weights, assets, local caches) that lives only in
+  the primary checkout is NOT copied into the worktree. Configured shared resources
+  are symlinked in automatically on allocation; anything not configured is absent.
 
 To go back to the primary checkout: /use-primary-checkout
 ```
+
+## Shared resources (gitignored project data)
+
+If your task needs gitignored data that is present in the primary checkout but
+absent from this worktree, do NOT hand-write an `ln -s` and do NOT ask the operator
+to touch the worktree. The data is provisioned through an explicit per-repository
+allowlist at `<git-common-dir>/info/worktree-shared-resources` (one relative path
+per line), symlinked in on every allocation and kept out of `git status` via
+`info/exclude`. To add an entry self-serve:
+
+- **Commander mode:** report the exact missing relative path(s) to the Brain as a
+  blocker; the Brain calls the orchestrator `configure_shared_resources` tool, which
+  appends the entries and relinks them into your live worktree — no respawn needed.
+- Entries are explicit relative paths only (no globs, `..`, absolute paths, trailing
+  slashes, or `!`/`#` prefixes). Shared paths are write-through symlinks into the
+  primary checkout — treat them as shared state.
 
 ## Key Principles
 
@@ -78,3 +97,6 @@ To go back to the primary checkout: /use-primary-checkout
 - **Never destructive**: a dirty checkout stops the command, it does not get cleaned
 - **Verified**: allocation is proven by an independent read-back before disclosure
 - **Reversible**: `/use-primary-checkout` returns the session to the real checkout
+- **Operator-free provisioning**: missing gitignored data is added via
+  `configure_shared_resources` — never by hand-symlinking or asking the operator to
+  touch a worktree

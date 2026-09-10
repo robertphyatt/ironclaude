@@ -226,6 +226,7 @@ its exact name from this list:
 - No Workflow Avoidance Under Stage/Context Restrictions
 - Boy Scout Rule
 - Recipient-Based Communication Profiles
+- Managed Worktree — Missing Shared Data Is a Blocker to Report, Never to Hand-Fix
 - Actual Claude Fable from Codex
 
 The enumerated name set must equal the uncovered concept set exactly. Do not
@@ -233,7 +234,7 @@ substitute a numeric range, a count, “concepts 1–13,” “behavioral concep
 another generic summary for the names. Do not list a covered concept.
 
 `Actual Claude Fable from Codex` applies only to Codex instruction surfaces.
-Claude surfaces require the preceding twelve concepts and must not be reported
+Claude surfaces require the preceding thirteen concepts and must not be reported
 incomplete for lacking this Codex-only concept.
 
 Preserve all unrelated project guidance and append only genuinely missing
@@ -249,7 +250,7 @@ Call `<READ_INSTRUCTION_FILE>` for root `AGENTS.md` to perform its existence che
 
 - In `update` mode, if it is absent, create it only through the exact write
   operation below.
-- If it exists, semantically check the workflow requirement and all thirteen
+- If it exists, semantically check the workflow requirement and all fourteen
   concepts across the whole file. Do not require matching headings or wording.
 - When classification is uncertain, treat the concept as uncovered.
 - In `update` mode, compute a full result that appends only missing canonical
@@ -339,11 +340,16 @@ Call `<WRITE_INSTRUCTION_FILE>` for root `AGENTS.md` with the complete canonical
    - Native Codex subagents cannot satisfy an actual-Fable request; do not substitute Codex, Astra, Opus, Sonnet, or Haiku
    - Keep orchestration, workflow-state changes, staging, commits, and task sequencing in the parent Codex session
    - Accept the report only after the launcher verifies effective Fable identity; independently verify material findings against repository evidence
+
+14. **Managed Worktree — Missing Shared Data Is a Blocker to Report, Never to Hand-Fix**
+   - If your task needs gitignored project data (model weights, assets, local caches) that is present in the primary checkout but ABSENT from your managed worktree, report the exact missing relative path(s) to the Brain as a blocker so it provisions them via the orchestrator `configure_shared_resources` tool (which relinks them into your live worktree — no respawn needed)
+   - NEVER hand-write an `ln -s`, copy the data in, or otherwise fiddle with the worktree yourself; NEVER stall waiting for the operator to touch a worktree — operators never fiddle with worktrees
+   - Do not fake or skip past the missing data (no empty/placeholder output): surface the real blocker until the data is provisioned
 ```
 
-For an existing file, use the same first twelve semantic meanings as the Claude
+For an existing file, use the same thirteen semantic meanings as the Claude
 table below, except Advisor Fallback is covered only by the Codex-native
-`run_codex_advisor_review` broker. Concept 13 is covered only by affirmative
+`run_codex_advisor_review` broker. The Codex-only Actual Claude Fable concept is covered only by affirmative
 actual-Fable routing, no-substitution, parent-authority, effective-identity, and
 independent-verification semantics. Append the corresponding complete body
 from the canonical Codex template above for any missing concept.
@@ -351,7 +357,7 @@ from the canonical Codex template above for any missing concept.
 Call `<WRITE_INSTRUCTION_FILE>` for root `AGENTS.md` with the full computed result after any append or prepend.
 
 Call `<READ_INSTRUCTION_FILE>` for root `AGENTS.md` as the read-back gate.
-Verify the workflow requirement and all thirteen concepts from that returned
+Verify the workflow requirement and all fourteen concepts from that returned
 content.
 
 #### Claude Code: `CLAUDE.md` and `.claude/rules/behavioral.md`
@@ -387,7 +393,7 @@ Full behavioral rules: [`.claude/rules/behavioral.md`](.claude/rules/behavioral.
 ```
 
 First semantically evaluate the existing `CLAUDE.md` together with
-`.claude/rules/behavioral.md` when the rules file exists. Do not create `.claude/rules/behavioral.md` solely because it is absent. If `CLAUDE.md` alone covers the workflow requirement and all twelve concepts, leave the rules file absent.
+`.claude/rules/behavioral.md` when the rules file exists. Do not create `.claude/rules/behavioral.md` solely because it is absent. If `CLAUDE.md` alone covers the workflow requirement and all thirteen concepts, leave the rules file absent.
 
 Only if that evaluation finds missing concepts and
 `.claude/rules/behavioral.md` is absent in `update` mode, create it with the
@@ -465,6 +471,11 @@ Call `<WRITE_INSTRUCTION_FILE>` for `.claude/rules/behavioral.md` with the compl
    - Before first substantive human-facing response, load and apply `ironclaude:elements-of-style`
    - For AI-directed natural language, load and apply `ironclaude:write-lossless-ai-messages`
    - Select by destination, not model; preserve machine schemas and protected technical content exactly
+
+13. **Managed Worktree — Missing Shared Data Is a Blocker to Report, Never to Hand-Fix**
+   - If your task needs gitignored project data (model weights, assets, local caches) that is present in the primary checkout but ABSENT from your managed worktree, report the exact missing relative path(s) to the Brain as a blocker so it provisions them via the orchestrator `configure_shared_resources` tool (which relinks them into your live worktree — no respawn needed)
+   - NEVER hand-write an `ln -s`, copy the data in, or otherwise fiddle with the worktree yourself; NEVER stall waiting for the operator to touch a worktree — operators never fiddle with worktrees
+   - Do not fake or skip past the missing data (no empty/placeholder output): surface the real blocker until the data is provisioned
 ```
 
 For existing Claude files, semantically check both files together:
@@ -483,9 +494,10 @@ For existing Claude files, semantically check both files together:
 | 10 | No Workflow Avoidance Under Stage/Context Restrictions | Instructions not to self-checkpoint or hand stage-blocked read-only work to the operator; open an investigation PM loop |
 | 11 | Boy Scout Rule | Instructions not to ignore evidence-backed pre-existing or adjacent defects; clean them up when within authorized task scope, ask permission before scope expansion, destructive action, or external-system effects after presenting finding/evidence/scope/risk, and record blocked or unsafe findings instead of suppressing them |
 | 12 | Recipient-Based Communication Profiles | Instructions to load `ironclaude:elements-of-style` for human-facing prose, load `ironclaude:write-lossless-ai-messages` for AI-directed natural language, select by destination rather than model, and preserve machine schemas and protected technical content exactly |
+| 13 | Managed Worktree — Missing Shared Data Is a Blocker to Report, Never to Hand-Fix | Instructions to report missing gitignored worktree data to the Brain as a blocker (never hand-symlink, copy in, fiddle with the worktree, or stall for the operator) and to surface the real blocker rather than fake or skip past it |
 
 Also semantically check the workflow requirement across both files. If all
-twelve concepts and the workflow requirement are covered, make no changes.
+thirteen concepts and the workflow requirement are covered, make no changes.
 When classification is uncertain, treat the concept as uncovered.
 
 In `update` mode, if a concept is missing, append its corresponding complete
@@ -537,19 +549,19 @@ N. **Recipient-Based Communication Profiles**
    - Select by destination, not model; preserve machine schemas and protected technical content exactly
 ```
 
-The full rule set has 12 concepts. New projects receive the compact index plus
-full rules `(12 principles)`. Existing projects use the same 12-principle template as the canonical source.
+The full rule set has 13 concepts. New projects receive the compact index plus
+full rules `(13 principles)`. Existing projects use the same 13-principle template as the canonical source.
 
 Call `<READ_INSTRUCTION_FILE>` for each existing Claude-owned instruction file as the read-back gate.
 Verify the workflow requirement and all concepts required for the active
-client from returned content: thirteen for Codex, twelve for Claude.
+client from returned content: fourteen for Codex, thirteen for Claude.
 
 **Read-back verification gate**
 
 Use the active branch's exact `<READ_INSTRUCTION_FILE>` read-back operation
 after all setup edits.
 Confirm the workflow requirement and all concepts required for the active
-client are semantically covered: thirteen for Codex, twelve for Claude. Confirm
+client are semantically covered: fourteen for Codex, thirteen for Claude. Confirm
 no inactive-client surface was written during this activation.
 
 Do not continue after a required-surface write or verification failure. Report

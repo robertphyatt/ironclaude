@@ -16,7 +16,7 @@ Why `threadSource` MUST be `"user"`
 `thread/start` takes a `threadSource` parameter. If it is missing (or is any value
 other than `"user"`), the codex Brain still starts, but EVERY MCP tool call it
 makes fails with `Missing or invalid Codex thread_source`. Since the IronClaude
-Brain is essentially an MCP-driven orchestrator (state-manager, episodic-memory,
+Brain is essentially an MCP-driven orchestrator (orchestrator, episodic-memory,
 research, ollama), a Brain without `threadSource="user"` is dead on arrival while
 looking superficially healthy. It is a hard constant (`THREAD_SOURCE`), never a
 caller-supplied option, and a failing `thread/start` is never retried without it.
@@ -216,6 +216,12 @@ class CodexBrainClient:
         # Hang detection: a turn is "in flight" when _last_message_time > _last_response_time.
         self._last_message_time = 0.0
         self._last_response_time = 0.0
+        # Read by main.py's R4 operator-priority gate (check_idle_enforcement,
+        # post_heartbeat grader-check, stuck-notify). Claude's BrainClient flips this
+        # True during a turn; Codex does not track it, so R4 nudge-suppression is inert
+        # here (nudges fire on their other conditions). Turn-in-flight IS available as
+        # _last_message_time > _last_response_time if R4 is wired for Codex later.
+        self._executing_tool: bool = False
         self._mcp_status_condition = threading.Condition()
         self._mcp_startup_status: dict[str, dict] = {}
         self._runtime_capability_block: dict | None = None
@@ -553,7 +559,7 @@ class CodexBrainClient:
     # the request boundary. codex app-server asks the client to approve command
     # execution / patch application / permission grants over this same channel that
     # also carries MCP server-trust elicitation. We ACCEPT only elicitation (needed
-    # for the Brain to reach state-manager) and DECLINE every approval — and every
+    # for the Brain to reach its MCP servers) and DECLINE every approval — and every
     # unrecognised method (default-deny: a future codex version may add approval
     # types we have not seen). A read-and-reason Brain is safe; an
     # execute-and-patch Brain via auto-approve is exactly the hole #175 closed.

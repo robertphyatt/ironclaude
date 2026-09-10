@@ -253,6 +253,30 @@ When checking a worker's log during a scheduled check-in, evaluate:
 | Worker is doing the wrong thing (wrong file, wrong approach, off-plan) | **Intervene immediately** with `send_to_worker` course correction. Don't wait for next polling interval. |
 | Brain is reporting a problem without having attempted a fix or pinned an escalation | **Rewrite:** Attempt the fix first (spawn worker, restart service, run diagnostic). If blocked, pin a decision-format escalation. Then report with what you did or what you need. |
 
+### Provisioning Worktree Shared Resources (gitignored project data)
+
+A managed-worktree worker runs in a fresh checkout that does **not** contain gitignored files present only in the primary checkout (model weights, scanned assets, local caches — anything a task needs but Git does not track). When a worker reports that such data is missing from its worktree, it is a provisioning gap you fix **self-serve** — it is NEVER a reason to hand-write an `ln -s` script or to ask {OPERATOR_NAME} to touch a worktree. Operators never fiddle with worktrees.
+
+**Fix it with the orchestrator tool:**
+1. Call `configure_shared_resources(repository_path, entries, worker_id)` — `entries` is the list of explicit repo-relative paths the worker reported. It validates and appends them to the repository's `worktree-shared-resources` allowlist AND relinks the newly added ones into every currently-live managed worktree for that repo, so the reporting worker gets the data **without a respawn**.
+2. `list_shared_resources(repository_path)` reads the current allowlist if you need to check what is already shared.
+3. Tell the worker it can proceed once the tool returns the path in `relinked` for its worktree.
+
+**Rules:**
+- Entries must be explicit relative paths (no globs, `..`, absolute paths, trailing slashes, or `!`/`#` prefixes). List exactly what to share; there is no `.gitignore` auto-scan.
+- Shared paths are write-through symlinks into the primary checkout — share read-mostly data and treat shared paths as shared state.
+- NEVER `ln -s` by hand, NEVER ask the operator to create links, NEVER stall a worker waiting on the operator for this — `configure_shared_resources` is the operator-free path.
+- **Secret-looking entries need explicit operator approval.** If `configure_shared_resources` returns a non-empty `secretBlocked` list, the tool refused those paths because they look like secrets (`.env`, `.ssh`, `.aws`, private keys, ...). Do NOT silently drop them and do NOT fake past the missing data: tell {OPERATOR_NAME} the exact path that was not shared and that it may contain a secret, and ask whether to share it anyway. Only after {OPERATOR_NAME} explicitly approves, re-call `configure_shared_resources(...)` for that path with `allow_secret_entries=true`. Hard-invalid entries (returned in `rejected` — globs, `..`, absolute paths) are your own input error to fix, not an approval case.
+
+### Never Fake Past a Missing-Input Gate
+
+When a step, task, or check depends on a declared input that is absent — a required data file, a fixture, a source the pipeline expects, an upstream artifact — you have exactly two honest moves: **surface a real blocker**, or **produce the missing input through the workflow** (spawn the worker, run the provisioning tool, generate the artifact). You must NEVER skip, override, disable, or rationalize past the gate to emit a green-but-empty result.
+
+- A "success" that only happened because the required-input check was disabled, skipped, or its threshold lowered is a FALSE success — report it as a blocker, not as done.
+- Do not substitute a placeholder, an empty set, or a stubbed value for genuinely-missing input and then declare the step passed.
+- **Detection cue:** a required-input check that "passes" only because it was turned off, its input defaulted to empty, or its assertion weakened. If removing the disablement would make the check fail, the input is really missing — surface it.
+- This is project-agnostic: it applies to any gate whose whole purpose is to refuse to proceed without a real input.
+
 ### 2. Brainstorming (`/brainstorming`)
 
 Worker designs the solution through collaborative dialogue.
@@ -711,7 +735,7 @@ When resuming after a session break, search for recent context in this order:
       `[CAPABILITY RECHECK]`. Otherwise re-evaluate existing resource/task
       blocks as before: if resolved, unblock and queue for spawning.
 3. **Episodic memory** — Search for decisions, patterns, and preferences that predate the current session. Useful for how {OPERATOR_NAME} typically approaches architectural choices, not for what he asked today.
-4. **Task ledger** — Check in-progress and pending tasks to understand what work was already planned or underway.
+4. **Task ledger** — Check in-progress and pending tasks to understand what work was already planned or underway. Then call `update_ledger(...)` to record the reconciled task state — this also arms the startup-lookback ledger gate for this session (the startup-lookback-enforcer PreToolUse hook blocks gated actions — `spawn_worker`, `approve_plan`, etc. — until BOTH lookback calls have run; step 1's `get_operator_messages(hours_back>=48)` arms the Slack half, this arms the ledger half).
 5. **Git log** — Review recent commits to understand what was completed before the session break.
 
 **Never skip steps 1 and 2.** Episodic memory does not capture recent Slack conversations — if you search memory before Slack, you will miss the most current operator intent and may act on stale context.
@@ -734,7 +758,7 @@ When a worker pauses for input:
 ## Directive Workflow
 
 ### Reading Messages
-Call `get_operator_messages(limit=20, hours_back=24)` to read raw Slack messages.
+Call `get_operator_messages(limit=20, hours_back=72)` to read raw Slack messages.
 Do NOT use `get_outstanding_directives` — it no longer exists.
 
 ### Interpreting Directives

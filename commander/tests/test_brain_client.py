@@ -469,14 +469,70 @@ class TestBrainLivenessTimeout:
         assert "hung" in client.restart_reason
         client._stop_event.set()
 
-    def test_absolute_inactivity_timeout_fires(self):
-        """If no SDK messages for 1800s (flag cleared), needs_restart fires."""
+    def test_idle_1800s_sends_ping_instead_of_restart(self):
+        """R1: idle >1800s with no ping outstanding sends a [PING] probe and does
+        NOT restart (a restart wipes cache/context; only pay it if the ping goes
+        unanswered)."""
         client = self._make_alive_client(timeout_seconds=300)
         client._executing_tool = False
         client._last_response_time = time.time() - 1801
         client._last_message_time = time.time() - 2000
+        sent = []
+        client.send_message = lambda text: (sent.append(text), True)[1]
+        assert client.needs_restart() is False
+        assert "[PING]" in sent
+        assert client._ping_sent_at > 0
+        client._stop_event.set()
+
+    def test_unanswered_ping_fires_restart_even_while_executing(self):
+        """R1: a ping with no SDK activity within timeout_seconds restarts — and the
+        check runs BEFORE the _executing_tool short-circuit (realistic post-ping
+        state pins _executing_tool=True)."""
+        client = self._make_alive_client(timeout_seconds=300)
+        client._executing_tool = True  # realistic post-ping state — MUST be pinned
+        client._ping_sent_at = time.time() - 400  # > timeout_seconds ago
+        client._last_response_time = client._ping_sent_at - 10  # no response since ping
+        client._last_message_time = client._ping_sent_at
         assert client.needs_restart() is True
-        assert "no SDK activity" in client.restart_reason
+        assert "PING" in client.restart_reason
+        client._stop_event.set()
+
+    def test_answered_ping_does_not_restart(self):
+        """R1: a ping answered by later SDK activity does not restart."""
+        client = self._make_alive_client(timeout_seconds=300)
+        client._executing_tool = False
+        client._ping_sent_at = time.time() - 400
+        client._last_response_time = time.time() - 5  # response came after the ping
+        client._last_message_time = time.time() - 410
+        assert client.needs_restart() is False
+        client._stop_event.set()
+
+    def test_note_sdk_activity_resets_ping(self):
+        """R1: _note_sdk_activity advances _last_response_time and clears the ping so
+        a stale _ping_sent_at cannot permanently disable the idle probe/restart."""
+        client = BrainClient()
+        client._ping_sent_at = time.time() - 100
+        before = time.time()
+        client._note_sdk_activity()
+        assert client._ping_sent_at == 0.0
+        assert client._last_response_time >= before
+
+    def test_restart_resets_ping_sent_at(self):
+        """R1: restart() clears _ping_sent_at (restart zeroes _last_response_time; a
+        stale ping would else fire the unanswered-ping check immediately)."""
+        client = self._make_alive_client(timeout_seconds=300)
+        client._ping_sent_at = time.time() - 400
+
+        def fake_start(*a, **kw):
+            new_stop = threading.Event()
+            client._running = True
+            client._thread = threading.Thread(target=new_stop.wait, daemon=True)
+            client._thread.start()
+            client._stop_event = new_stop
+        client.start = fake_start
+        client._kill_brain_subprocess = lambda: None
+        client.restart("test prompt")
+        assert client._ping_sent_at == 0.0
         client._stop_event.set()
 
     def test_normal_timeout_fires_without_executing_tool(self):

@@ -233,6 +233,10 @@ class BrainClient:
         self._restart_reason: str = ""
         self._last_response_time = 0.0
         self._last_message_time: float = 0.0
+        # R1: timestamp of an outstanding idle [PING] health probe (0.0 = none).
+        # Set when the idle Brain is probed instead of restarted; cleared on any
+        # SDK activity and on restart(). See needs_restart().
+        self._ping_sent_at: float = 0.0
         self._last_restart_time = 0.0
         self._memory_armed: bool = False
         self._wiki_queried: bool = False
@@ -807,7 +811,7 @@ class BrainClient:
             pid_task = asyncio.create_task(_discover_and_write_pid())
             try:
                 async for message in query(prompt=message_generator(), options=opts):
-                    self._last_response_time = time.time()
+                    self._note_sdk_activity()
                     if isinstance(message, ResultMessage):
                         self._session_id = message.session_id
                         self._executing_tool = False
@@ -909,6 +913,13 @@ class BrainClient:
         """Check if the brain subprocess is running."""
         return self._running and self._thread is not None and self._thread.is_alive()
 
+    def _note_sdk_activity(self) -> None:
+        """Record SDK activity: refresh liveness and clear any outstanding [PING]
+        probe. Clearing here is load-bearing — a stale _ping_sent_at would else
+        make the idle block below refuse to re-probe AND never restart (R1)."""
+        self._last_response_time = time.time()
+        self._ping_sent_at = 0.0
+
     def needs_restart(self) -> bool:
         """Check if brain needs restart (dead or unresponsive)."""
         if self._compacting:
@@ -944,20 +955,42 @@ class BrainClient:
                 f"after message sent at {self._last_message_time:.0f}"
             )
             return True
+        # R1: Unanswered [PING] probe — sent but no SDK activity since, past
+        # timeout_seconds. Placed BEFORE the _executing_tool short-circuit below so
+        # a ping issued while a (possibly wedged) turn is in flight is still
+        # enforced (send_message sets _executing_tool=True, so the realistic
+        # post-ping state has the flag set).
+        if (
+            self._ping_sent_at
+            and self._last_response_time < self._ping_sent_at
+            and time.time() - self._ping_sent_at > self.timeout_seconds
+        ):
+            elapsed = time.time() - self._ping_sent_at
+            self._restart_reason = f"timeout (no response to [PING] in {elapsed:.0f}s)"
+            logger.warning(
+                f"Brain ping timeout: no SDK activity {elapsed:.0f}s after [PING]"
+            )
+            return True
         # Skip 600s check while a request is in-flight
         if self._executing_tool:
             return False
-        # Absolute inactivity: no SDK messages for 1800s regardless of flag state
+        # R1: Absolute inactivity (idle 1800s). Probe with a lightweight [PING]
+        # before restarting — a restart wipes the prompt cache/context and forces
+        # MCP schema re-discovery, so only pay it if the Brain fails to answer the
+        # ping within timeout_seconds (enforced by the unanswered-ping check above
+        # on a later sweep). The ping costs one permission-seeking grade per ~30
+        # min, far cheaper than a restart. Only probe when none is outstanding.
         if (
             self._last_response_time > 0
             and time.time() - self._last_response_time > 1800
+            and not self._ping_sent_at
         ):
-            elapsed = time.time() - self._last_response_time
-            self._restart_reason = f"timeout (no SDK activity for {elapsed:.0f}s)"
-            logger.warning(
-                f"Brain absolute inactivity timeout: no SDK messages for {elapsed:.0f}s"
+            self._ping_sent_at = time.time()
+            self.send_message("[PING]")
+            logger.info(
+                "Brain idle >1800s; sent [PING] health probe (restart only if unanswered)"
             )
-            return True
+            return False
         # Normal timeout: message sent but no SDK activity since
         if (
             self._last_message_time > self._last_response_time
@@ -1012,6 +1045,7 @@ class BrainClient:
         self._last_message_time = 0.0
         self._last_response_time = 0.0
         self._executing_tool = False
+        self._ping_sent_at = 0.0
         self.start(system_prompt, cwd)
         if self.is_alive():
             self.restart_count += 1

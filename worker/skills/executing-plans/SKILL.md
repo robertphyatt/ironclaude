@@ -550,6 +550,8 @@ When dispatching tasks via the Task tool, follow these rules to prevent context 
 
    Do NOT call `mcp__plugin_ironclaude_state-manager__submit_task` until verification evidence is visible in the current response. Claiming work is complete without fresh verification is dishonesty, not efficiency.
 
+   **Never fake past a missing declared input.** If a step depends on a declared input that is absent (a data file, a fixture, an upstream artifact the plan names), you have two honest moves: **surface a real blocker** (report it per Step 6 and stop), or produce the input through the workflow. NEVER skip, disable, or weaken the gate — or substitute a placeholder/empty value — to make the step "pass". A green result that only happened because a required-input check was turned off, defaulted to empty, or had its threshold lowered is a FALSE success; treat it as a blocker, not as done. Detection cue: if removing the disablement would make the check fail, the input is really missing.
+
    If verification fails, fix the issue before submitting. If it cannot be fixed, report the failure per Step 6 (Handle failures).
 
 5. **After completing the task, call the MCP `mcp__plugin_ironclaude_state-manager__submit_task` tool with task_id:**

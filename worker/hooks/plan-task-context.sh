@@ -49,9 +49,7 @@ if [ "$REVIEW_PENDING" = "1" ]; then
 
 You must run code review before continuing with the next task.
 
-Call the Skill tool with:
-  skill: \"ironclaude:code-review\"
-  args: \"--task-boundary\"
+Invoke: $(ic_skill_ref "ironclaude:code-review" "--task-boundary")
 
 Do NOT proceed to the next task without running code review."
       ;;

@@ -1,12 +1,18 @@
 """Presence guard: the Advisor Fallback directive must exist in every IronClaude
 behavioral surface, spelling out the TIER-RELATIVE fallback (Fable if available, else
-Opus) — so a future edit cannot silently drop it or reintroduce a hard-coded model."""
+Opus) — so a future edit cannot silently drop it or reintroduce a hard-coded model.
+
+The daemon Brain surface is the ONE exception: it has no `advisor` tool and
+brain-task-gate.sh bans every Agent/Task subagent except ironclaude:search-conversations,
+so its rule 23 pins a blind report-only `spawn_worker` reviewer instead of the
+worker-side tier-relative Agent-tool fallback (see test_directive_in_brain_behavioral)."""
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MARKER = "Advisor Fallback"
 PRIMARY = "model=fable"   # preferred subagent tier
 FALLBACK = "model=opus"   # required fallback when Fable is unavailable
+BRAIN_MARKER = "Independent Review (no advisor tool, no subagents)"
 CODEX_MARKER = "run_codex_advisor_review"
 CODEX_SEMANTIC_LADDER = "luna (haiku) → terra (sonnet) → sol (opus) → astra (fable)"
 CODEX_MODEL_LADDER = "gpt-5.6-luna → gpt-5.6-terra → gpt-5.6-sol → gpt-6-astra"
@@ -26,9 +32,20 @@ def test_directive_in_canonical_behavioral():
 
 
 def test_directive_in_brain_behavioral():
+    """Brain has no `advisor` tool and brain-task-gate.sh bans every Agent/Task
+    subagent except ironclaude:search-conversations — rule 23 routes the review
+    obligation through a blind report-only reviewer WORKER, never the worker-side
+    Agent-tool fallback."""
     text = _read("commander/src/brain/rules/behavioral.md")
-    assert MARKER in text
-    assert PRIMARY in text and FALLBACK in text
+    assert BRAIN_MARKER in text
+    assert "spawn_worker" in text
+    assert "worker_type=claude-opus" in text
+    assert "report-only" in text
+    assert "just reason it through" in text  # no-self-review obligation retained
+    # the worker-side tier-relative Agent fallback must NOT leak into the Brain surface
+    assert MARKER not in text
+    assert PRIMARY not in text and FALLBACK not in text
+    assert "Spawn a top-tier subagent via the `Agent` tool" not in text
 
 
 def test_directive_in_agents_md():
@@ -58,9 +75,9 @@ def test_directive_in_activation_skill():
     # Communication Profiles adds a 12th concept after Boy Scout Rule. Count
     # strings track the whole rule set, not Advisor Fallback specifically.
     # Keep these pins so future concept additions must update every count.
-    assert "12 concepts" in text
-    assert "(12 principles)" in text
-    assert "12-principle template" in text
+    assert "13 concepts" in text
+    assert "(13 principles)" in text
+    assert "13-principle template" in text
     assert PRIMARY in text and FALLBACK in text                # tier-relative fallback named
     assert text.count(CODEX_MARKER) >= 3
     assert text.count("luna→terra→sol→astra") >= 2

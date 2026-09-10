@@ -1,0 +1,31 @@
+{
+  "name": "Shared-Entry Validator Hardening",
+  "goal": "Make workspace-manager git.ts isSafeSharedEntry reject entries with a newline, carriage return, or leading/trailing whitespace, and add a bounding test, so addSharedResourceEntries cannot persist a smuggled multi-line or padded config entry.",
+  "requirements_file": "docs/plans/2026-09-07-shared-entry-validator-hardening-design.md",
+  "design_file": "docs/plans/2026-09-07-shared-entry-validator-hardening-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Harden isSafeSharedEntry (reject control chars + surrounding whitespace)",
+      "description": "In git.ts isSafeSharedEntry (:236-245) add two pure clauses before the final `return true;`: `if (entry !== entry.trim()) return false;` (leading/trailing ASCII whitespace) and `if (/[\\x00-\\x1f]/.test(entry)) return false;` (any ASCII control char incl. interior \\n/\\r/tab). No other change; the validator is the single gate for both the config write (addSharedResourceEntries) and the read-time relink (linkSharedResources). TDD: extend the reject test in git.test.ts (:181-188) bad array to add 'ok\\nescape','a\\rb',' models','models '; the existing clean-accept test (:157) is the over-rejection positive control. Rebuild the 3 dist bundles (validator is compiled in).",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/git.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/git.test.ts",
+        "worker/mcp-servers/workspace-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: in git.test.ts extend the 'rejects unsafe entries and never writes them' test (:183) bad array to ['../escape','/abs','a*','trailing/','!neg','#comment','ok\\nescape','a\\rb',' models','models ']. Existing assertions (result.rejected==bad, result.added==[], readSharedResourceConfig(id)==[]) bound the fix; the 'appends valid entries' test (:157) with clean ['data/models','caches/vision'] is the positive control against over-rejection."},
+        {"description": "Run RED.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test -- git.test", "expected": "FAIL: current validator admits 'ok\\nescape'/'a\\rb'/' models'/'models ' -> they land in added not rejected; 'ok\\nescape' writes two lines so readSharedResourceConfig is not [] and rejected != bad."},
+        {"description": "GREEN: in git.ts isSafeSharedEntry, before `return true;`(:244), add `if (entry !== entry.trim()) return false;` then `if (/[\\x00-\\x1f]/.test(entry)) return false;`."},
+        {"description": "Run GREEN.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test -- git.test", "expected": "passed"},
+        {"description": "Build bundle.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build", "expected": "tsc clean + 3 dist bundles written; no errors"},
+        {"description": "Full TS suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm test", "expected": "0 failed (a [vitest-worker] onTaskUpdate timeout reporter line may appear under load and is not a test failure)"},
+        {"description": "Stage src + tests.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/git.ts worker/mcp-servers/workspace-manager/src/__tests__/git.test.ts", "expected": "staged"},
+        {"description": "Stage bundles (dist gitignored -> -f; tracked).", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/hook-intent.js", "expected": "staged"}
+      ]
+    }
+  ]
+}

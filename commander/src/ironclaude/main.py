@@ -18,6 +18,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 import psutil
@@ -109,6 +110,18 @@ _NOT_AWAITING_RE = re.compile(
     r"(?:subagent|sub-agent|worker|reviewer|fable|blind\s+review|tier[- ]?up|advisor)\b",
     re.IGNORECASE,
 )
+# R6: extract the directive id a Brain status refers to — `dN` (word-bounded) or
+# `#N`. Used to de-duplicate operator_wait alerts per directive rather than per
+# paraphrased question.
+_DIRECTIVE_ID_RE = re.compile(r"\bd(\d+)\b|#(\d+)")
+
+
+def _extract_directive_id(text: str) -> int | None:
+    """Return the first directive id referenced in text (dN or #N), else None."""
+    m = _DIRECTIVE_ID_RE.search(text)
+    if not m:
+        return None
+    return int(m.group(1) or m.group(2))
 _AWAITING_OP_SYSTEM = (
     "You classify a Brain status message into exactly one of three categories via the "
     "`waiting_on` field:\n"
@@ -1384,6 +1397,12 @@ class IroncladeDaemon:
         self._stuck_kill_deferred: dict[str, float] = {}
         self._last_stuck_check: float = 0.0
         self._grader = LocalGrader(keep_alive="30m")
+        # FIX 2: cap concurrent bounded grades at one. _grade_bounded sets this flag
+        # before offloading; a stalled grade that is abandoned keeps the flag set
+        # (cleared only by the worker's finally) so later calls fail fast to None
+        # instead of piling up daemon threads against a stalled grader.
+        self._grade_state_lock = threading.Lock()
+        self._grade_in_flight = False
         self._prompt_waiting_cache: dict[int, tuple[float, PromptDetection]] = {}
         self._stuck_liveness_count: dict[str, int] = {}
         self._pm_gate_slack_sent: dict[str, bool] = {}
@@ -1405,7 +1424,9 @@ class IroncladeDaemon:
         self._finalize_recovery_alerted: set[str] = set()
         # Awaiting-operator surfacing (in-memory; refreshed by Brain re-emission)
         self._operator_waits: dict[str, dict] = {}
-        self._operator_wait_alerted: dict[str, str] = {}
+        # R6: worker_id -> (worker_id, directive_id, directive_status) of the last
+        # alert fired, so one operator_wait alert lands per pending directive.
+        self._operator_wait_alerted: dict[str, tuple] = {}
         self._brain_waits: dict[str, dict] = {}
         self._prompt_dispatch_recovery_checked = False
         self._load_staleness_state()
@@ -1918,10 +1939,20 @@ class IroncladeDaemon:
         items = self.socket_handler.drain()
         # Operator re-engaged: clear any "waiting on you" state. If the Brain is still
         # genuinely holding, it re-emits next cycle and re-sets it (self-healing).
-        if items and self._operator_waits:
+        # R6: this clear stays — it is the one place the retained alert markers are
+        # released. It is no longer an alert-spam source: R1 removed the ~30-min
+        # restart loop that re-fired the alert 21x, and the marker now survives the
+        # TTL prune, so a still-pending directive alerts exactly once until the
+        # operator re-engages here.
+        if items:
+            # I2: clear on ANY operator input, even if a TTL prune already emptied
+            # _operator_waits — otherwise the retained alert marker suppresses a
+            # legitimate re-alert after re-engagement. Clearing empty dicts is a no-op.
+            had_state = bool(self._operator_waits or self._operator_wait_alerted)
             self._operator_waits.clear()
             self._operator_wait_alerted.clear()
-            logger.info("operator_waits cleared — operator re-engaged via Slack")
+            if had_state:
+                logger.info("operator_waits cleared — operator re-engaged via Slack")
         for item in items:
             # Check for directive confirmation before command parsing
             raw_text = item.get("original_text", "").strip()
@@ -2643,7 +2674,10 @@ class IroncladeDaemon:
         ]
         for wid in stale:
             self._operator_waits.pop(wid, None)
-            self._operator_wait_alerted.pop(wid, None)
+            # R6: retain the alerted marker across the TTL prune. Dropping it here
+            # let a still-pending directive re-alert once its wait entry aged out;
+            # the marker is bounded by worker count and cleared on operator
+            # re-engagement (poll_slack_commands) and on overflow.
 
     def _prune_brain_waits(self, now: float) -> None:
         """Drop brain-wait entries the Brain has stopped re-affirming (TTL backstop)."""
@@ -2653,6 +2687,54 @@ class IroncladeDaemon:
         ]
         for wid in stale:
             self._brain_waits.pop(wid, None)
+
+    def _grade_bounded(self, system: str, user: str, schema, timeout: float | None = None):
+        """R3: run a classifier grade off the poll thread with a hard wall-clock
+        bound so an empty-Ollama stall (up to 339s observed) cannot block the
+        operator fast lane. LocalGrader exposes no per-call timeout, so offload +
+        join is the mechanism. Returns the grade dict, or None on timeout/error
+        (the caller treats None as 'do not capture'). A grade that overruns the
+        bound is abandoned to its daemon thread and discarded when it finishes."""
+        if timeout is None:
+            timeout = self.config.get("fast_lane_grade_timeout_seconds", 5)
+        # FIX 2: only one bounded grade may be in flight. If a prior grade is still
+        # running (including one abandoned past its timeout), fail fast to None
+        # rather than spawn another daemon thread against the shared grader.
+        with self._grade_state_lock:
+            if self._grade_in_flight:
+                logger.warning("bounded grade skipped: a prior grade is still in flight")
+                return None
+            self._grade_in_flight = True
+        box: dict = {}
+
+        def _worker():
+            try:
+                box["r"] = self._grader.grade(system, user, schema)
+            except Exception as e:  # noqa: BLE001 — surfaced as None, matches prior catch
+                box["e"] = e
+            finally:
+                with self._grade_state_lock:
+                    self._grade_in_flight = False
+
+        t = threading.Thread(target=_worker, daemon=True)
+        try:
+            t.start()
+        except Exception as e:  # noqa: BLE001 — thread creation failed; do not leak the flag
+            with self._grade_state_lock:
+                self._grade_in_flight = False
+            logger.warning("bounded grade thread failed to start: %s — not capturing", e)
+            return None
+        t.join(timeout)
+        if t.is_alive():
+            logger.warning(
+                "awaiting-operator grade exceeded %ss bound; skipping capture (offloaded)",
+                timeout,
+            )
+            return None
+        if "e" in box:
+            logger.warning("awaiting-operator classify failed: %s — not capturing", box["e"])
+            return None
+        return box.get("r")
 
     def _maybe_capture_operator_wait(self, text: str) -> bool:
         """If the Brain message reports it is waiting on the operator or on the Brain
@@ -2664,13 +2746,10 @@ class IroncladeDaemon:
             return False
         if _NOT_AWAITING_RE.search(text):
             return False
-        try:
-            result = self._grader.grade(
-                _AWAITING_OP_SYSTEM, f"Classify this Brain message:\n{truncate_middle(text)}", _AWAITING_OP_SCHEMA
-            )
-        except Exception as e:
-            logger.warning("awaiting-operator classify failed: %s — not capturing", e)
-            return False
+        # R3: bounded/offloaded so a stalled grader cannot block the operator fast lane.
+        result = self._grade_bounded(
+            _AWAITING_OP_SYSTEM, f"Classify this Brain message:\n{truncate_middle(text)}", _AWAITING_OP_SCHEMA
+        )
         if (not isinstance(result, dict)) or result.get("infrastructure_error"):
             return False
         waiting_on = result.get("waiting_on")
@@ -2693,9 +2772,41 @@ class IroncladeDaemon:
             oldest = min(self._operator_waits, key=lambda k: self._operator_waits[k]["updated_at"])
             self._operator_waits.pop(oldest, None)
             self._operator_wait_alerted.pop(oldest, None)
-        # One-time alert per (worker, question) — heartbeat handles the repeat surfacing.
-        if self._operator_wait_alerted.get(worker_id) != question:
-            self._operator_wait_alerted[worker_id] = question
+        # R6: alert once per PENDING DIRECTIVE, not once per sweep or paraphrase.
+        directive_id = _extract_directive_id(text)
+        # (1) If the directive already sits in pending_confirmation, the heartbeat's
+        # deterministic pending-confirmation surface already shows it — skip the
+        # duplicate one-time alert (the wait itself is still recorded above).
+        if directive_id is not None and f"d{directive_id}" in self._get_pending_confirmation_waits():
+            logger.info(
+                "operator_wait alert suppressed: d%s already pending_confirmation", directive_id
+            )
+            logger.info("operator_wait recorded for %s: %s", worker_id, question[:80])
+            return True
+        # (2) Alert key is (worker, directive, directive-status): a paraphrased
+        # question for the same pending directive does NOT re-alert; a status change
+        # (e.g. -> blocked) does. The marker survives the TTL prune (see
+        # _prune_operator_waits) so a still-pending wait is not re-alerted.
+        status = None
+        if directive_id is not None and self._db is not None:
+            try:
+                row = self._db.execute(
+                    "SELECT status FROM directives WHERE id=?", (directive_id,)
+                ).fetchone()
+                status = row[0] if row else None
+            except Exception as e:
+                logger.warning("directive status lookup failed for d%s: %s", directive_id, e)
+        # With a directive id, the (worker, directive, status) key intentionally
+        # suppresses a paraphrased re-ask of the SAME directive. Without one, fall
+        # back to the question text so two DISTINCT questions from the same worker
+        # do not collapse into a single alert.
+        alert_key = (
+            (worker_id, directive_id, status)
+            if directive_id is not None
+            else (worker_id, None, question.strip())
+        )
+        if self._operator_wait_alerted.get(worker_id) != alert_key:
+            self._operator_wait_alerted[worker_id] = alert_key
             operator_name = self.config.get("operator_name", "Operator")
             alert_body = f"⏳ *Waiting on {operator_name}:* `{worker_id}` — {_escape_mrkdwn(question) or '(awaiting your reply)'}"
             ts = self.slack.post_message(alert_body)
@@ -2739,6 +2850,20 @@ class IroncladeDaemon:
         """Drain brain responses, validate context, and post to Slack."""
         for text in self.brain.get_pending_responses():
             logger.info(f"Brain response: {text[:100]}...")
+            # R1: the Brain's reply to an idle [PING] health probe is a liveness
+            # ack only — never relay it to Slack. Tolerate Brain non-compliance:
+            # strip the narration prefix, then an optional leading [reply-to:...]
+            # marker the Brain may thread onto the ack (R2 encourages threading),
+            # then drop when the residual leads with the ack token. The len bound
+            # keeps a genuine narration that merely mentions the token from being
+            # dropped.
+            _probe_body = text[len(_NARRATION_PREFIX):] if text.startswith(_NARRATION_PREFIX) else text
+            if "[PING-ACK]" in _probe_body:
+                _probe_parsed = parse_reply_to_marker(_probe_body.strip())
+                _probe_core = _probe_parsed[0] if _probe_parsed else _probe_body.strip()
+                if _probe_core.startswith("[PING-ACK]") and len(_probe_core) <= 60:
+                    logger.debug("Brain [PING-ACK] received; not relayed")
+                    continue
             # Usage-limit surfacing runs BEFORE the operator-wait continue so a limit
             # message that also reads as "waiting" still prompts the operator to /login.
             limit = detect_account_limit(text)
@@ -2750,6 +2875,14 @@ class IroncladeDaemon:
                 if last is None or now - last > _LIMIT_COOLDOWN_S:
                     self._limit_alerted[limit] = now
                     self.slack.post_message(f"⚠️ Usage limit hit ({limit}). Send `login` to switch accounts.")
+            # R2: the Brain prepends _NARRATION_PREFIX to ALL its text
+            # (brain_client.py:848), which defeats parse_reply_to_marker's leading
+            # [reply-to: check. Strip the prefix ONLY when the text is marker-led,
+            # so a solicited threaded reply reaches the ✅ branch; ordinary narration
+            # keeps its prefix and flows to the narration branch below. An
+            # UNCONDITIONAL strip would misroute plain narration (TestBrainNarrationThreading).
+            if text.startswith(f"{_NARRATION_PREFIX}[reply-to:"):
+                text = text[len(_NARRATION_PREFIX):]
             # Solicited reply: the Brain echoes the operator ts as [reply-to:<ts>].
             # Thread the answer under the operator's message and mark it answered (✅).
             # Malformed leading markers are dropped instead of being treated as chatter.
@@ -4293,6 +4426,16 @@ class IroncladeDaemon:
 
         idle_duration = now - self._idle_enforcement_start
 
+        # R4: operator priority. While the Brain is mid-turn on operator work,
+        # suppress the idle-escalation SENDS this cycle so a background nudge never
+        # competes with the operator's own request. _idle_enforcement_start kept
+        # accumulating above, so escalation resumes at the correct tier once the
+        # turn completes. Gated on `is True` (a real bool in production;
+        # brain_client.py:838 clears it on the first assistant text) — this also
+        # keeps the gate inert for the MagicMock brains used in other tests.
+        if self.brain._executing_tool is True:
+            return
+
         if idle_duration < 60:
             if self._idle_escalation_tier < 1:
                 self._idle_escalation_tier = 1
@@ -4594,8 +4737,11 @@ class IroncladeDaemon:
             )
         )
 
-        # Grader enforcement: if no alive workers but directives exist, nudge the Brain
-        if not worker_details and self._db is not None:
+        # Grader enforcement: if no alive workers but directives exist, nudge the Brain.
+        # R4: skip while the Brain is mid-turn on operator work (`is True`; inert for
+        # MagicMock brains) — this defers the grader-check nudge one heartbeat interval
+        # (~900s) when busy, which is acceptable.
+        if not worker_details and self._db is not None and self.brain._executing_tool is not True:
             try:
                 unworked = self._db.execute(
                     "SELECT count(*) FROM directives d "
@@ -4639,7 +4785,11 @@ class IroncladeDaemon:
                     # never create a second Brain action for the same episode.
                     self._heartbeat_stuck_notified.discard(worker_id)
                     continue
-                if worker_id not in self._heartbeat_stuck_notified:
+                # R4: suppress the stuck-notify while the Brain is mid-turn on
+                # operator work; skip the .add too so it re-evaluates (and notifies)
+                # on a later heartbeat once the turn completes. `is True` keeps the
+                # gate inert for MagicMock brains in other tests.
+                if worker_id not in self._heartbeat_stuck_notified and self.brain._executing_tool is not True:
                     minutes = int(heartbeat_interval / 60) * 2
                     self.brain.send_message(
                         f"[ACTION REQUIRED] Worker {worker_id} unchanged for 2 consecutive heartbeats "
@@ -4662,40 +4812,132 @@ class IroncladeDaemon:
                 self._heartbeat_stuck_notified.discard(wid)
 
     def run(self):
-        """Main daemon loop."""
+        """Main daemon loop.
+
+        R3: operator fast lane. Slack commands, Brain responses, and the Slack
+        send-queue flush run every ~fast_interval (2-3s) so operator input is
+        picked up promptly; the heavier worker/heartbeat/maintenance sweeps stay on
+        the slower poll_interval (15s). The slow-lane members are the single writer
+        of their state — they run ONLY on the slow tick, never on a fast tick, so
+        the fast lane introduces no concurrent writer. post_heartbeat already
+        self-throttles internally, so it needs no separate timer beyond the slow
+        tick. last_slow starts a full interval in the past so the first iteration
+        runs the slow lane immediately (parity with the pre-split loop)."""
         poll_interval = self.config.get("poll_interval_seconds", 15)
+        fast_interval = self.config.get("fast_poll_interval_seconds", 3)
+        last_slow = time.monotonic() - poll_interval
         while self._running:
+            # Fast lane: operator-facing I/O only.
             self.poll_slack_commands()
             self.poll_brain_responses()
-            self._sweep_expired_push_requests()
-            if not self._paused:
-                self.check_brain()
-                self.process_brain_decisions()
-                self.check_workers()
-                self.check_directive_capability_blocks()
-                self.check_confirmed_directives()
-                self.check_idle_enforcement()
-                self.check_post_kill_sweep()
-                self.check_message_aging()
-            self.post_heartbeat()
-            self._run_maintenance()
             self.slack.flush_queue()
-            time.sleep(poll_interval)
+            # Slow lane: worker/heartbeat/maintenance sweeps on poll_interval.
+            now = time.monotonic()
+            if now - last_slow >= poll_interval:
+                last_slow = now
+                self._sweep_expired_push_requests()
+                if not self._paused:
+                    self.check_brain()
+                    self.process_brain_decisions()
+                    self.check_workers()
+                    self.check_directive_capability_blocks()
+                    self.check_confirmed_directives()
+                    self.check_idle_enforcement()
+                    self.check_post_kill_sweep()
+                    self.check_message_aging()
+                self.post_heartbeat()
+                self._run_maintenance()
+            time.sleep(fast_interval)
+
+
+def _sync_brain_settings_hooks(template_path: str, settings_path: str,
+                               hooks_src_dir: str, hooks_dst_dir: str) -> None:
+    """SF2/R5a: register the repo-declared PreToolUse hooks into the Brain's live
+    settings.json and deploy their scripts. The Brain loads these via
+    setting_sources=[project,local]; the in-process can_use_tool callback is dead
+    under bypassPermissions, so shell-hook registration is the live enforcement
+    layer. The merge APPENDS each entry only if its command is absent (idempotent —
+    running twice yields exactly one), and NEVER rewrites the hooks object, so every
+    existing PreToolUse entry and the entire PostToolUse block (block-pin-enforcer
+    on update_ledger included) are preserved; settings.local.json is untouched.
+    Template-driven: a new hook (e.g. Task 9's Agent gate) is added by editing the
+    template only. hook-logger.sh, which the scripts source, is NOT template-listed
+    — it is deployed to hooks_dst_dir by `make deploy-hooks`."""
+    try:
+        with open(template_path) as f:
+            template = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logger.error("brain_settings_hooks template unavailable (%s); skipping sync", e)
+        return
+    entries = template.get("PreToolUse", [])
+    if not entries:
+        return
+
+    # Deploy every hook script the template references (bash $HOME/.../<script>.sh).
+    os.makedirs(hooks_dst_dir, exist_ok=True)
+    for entry in entries:
+        for hook in entry.get("hooks", []):
+            m = re.search(r"([A-Za-z0-9._-]+\.sh)\s*$", hook.get("command", ""))
+            if not m:
+                continue
+            script = m.group(1)
+            src = os.path.join(hooks_src_dir, script)
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(hooks_dst_dir, script))
+            else:
+                logger.warning("brain settings hook script missing at source: %s", src)
+
+    # Merge (append-if-absent) into settings.json PreToolUse — preserve everything else.
+    # A missing file is fine (fresh install → create it). A CORRUPT file must NOT be
+    # clobbered: overwriting it with only the template entries would silently drop the
+    # existing guardrail hooks (memory-search, block-push, the PostToolUse block-pin) —
+    # so log and skip, leaving the file for a human to repair.
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+    except FileNotFoundError:
+        settings = {}
+    except json.JSONDecodeError as e:
+        logger.error(
+            "brain settings.json is corrupt (%s); skipping hook sync to avoid clobbering "
+            "existing guardrail hooks at %s", e, settings_path,
+        )
+        return
+    hooks = settings.setdefault("hooks", {})
+    pre = hooks.setdefault("PreToolUse", [])
+    existing_cmds = {h.get("command") for e in pre for h in e.get("hooks", [])}
+    added = False
+    for entry in entries:
+        entry_cmds = [h.get("command") for h in entry.get("hooks", [])]
+        if entry_cmds and all(c in existing_cmds for c in entry_cmds):
+            continue  # already registered — idempotent
+        pre.append(entry)
+        existing_cmds.update(entry_cmds)
+        added = True
+    if added:
+        os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+        with open(settings_path, "w") as f:
+            json.dump(settings, f, indent=2)
+        logger.info("Synced brain settings hooks into %s", settings_path)
 
 
 def main():
     _log_format = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
     os.makedirs("/tmp/ic", exist_ok=True)
-    _file_handler = RotatingFileHandler(
-        "/tmp/ic/daemon.log", maxBytes=5 * 1024 * 1024, backupCount=3
-    )
-    _file_handler.setFormatter(logging.Formatter(_log_format))
     _stderr_handler = logging.StreamHandler()
     _stderr_handler.setFormatter(logging.Formatter(_log_format))
     _root_logger = logging.getLogger()
     _root_logger.setLevel(logging.INFO)
-    _root_logger.addHandler(_file_handler)
     _root_logger.addHandler(_stderr_handler)
+    # SF1: never attach the live /tmp/ic/daemon.log handler under pytest — test
+    # runs that call main() (test_daemon.py) would else write into the real daemon
+    # log and corrupt its latency stats. Production behaviour is unchanged.
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        _file_handler = RotatingFileHandler(
+            "/tmp/ic/daemon.log", maxBytes=5 * 1024 * 1024, backupCount=3
+        )
+        _file_handler.setFormatter(logging.Formatter(_log_format))
+        _root_logger.addHandler(_file_handler)
 
     no_respawn = '--no-respawn' in sys.argv
 
@@ -4766,6 +5008,17 @@ def main():
             except FileNotFoundError:
                 logger.error(f"Rules file not found at {src_path}")
                 sys.exit(1)
+
+    # SF2/R5a: register the repo-declared Brain PreToolUse hooks (48h-lookback
+    # enforcer, and the Task-9 Agent fan-out gate) into the Brain's live
+    # settings.json and deploy their scripts. can_use_tool is dead under
+    # bypassPermissions, so this shell-hook layer is the real enforcement.
+    _sync_brain_settings_hooks(
+        template_path=os.path.join(repo_root, "src", "brain", "brain_settings_hooks.json"),
+        settings_path=os.path.join(brain_cwd, ".claude", "settings.json"),
+        hooks_src_dir=os.path.join(repo_root, "hooks"),
+        hooks_dst_dir=os.path.expanduser("~/.claude/ironclaude-hooks"),
+    )
 
     # Sync grader CLAUDE.md from source control to grader home (with template substitution)
     grader_home = os.path.expanduser("~/.ironclaude/grader")

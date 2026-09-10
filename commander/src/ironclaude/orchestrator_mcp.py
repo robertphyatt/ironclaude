@@ -467,6 +467,12 @@ class OrchestratorTools:
     """
 
     GRADER_TIMEOUT_SECONDS = 120  # hard subprocess kill; typical grade ~40s (was a 600s false poll-timeout)
+    # R5b: bound the operator-facing message grader (send_to_worker/post_message)
+    # so an empty-Ollama stall (up to 339s) can't hang the daemon path. Conservative
+    # 120s (NOT 60) + keep_alive so a genuine cold model load does not trip a false
+    # infrastructure_error -> Opus fallback on every cold call. Separate from the
+    # shared _local_grader (600s config) which serves the non-interactive spots.
+    MESSAGE_GRADER_TIMEOUT_SECONDS = 120
     # Floor at 1 — a log-line count must be positive. A zero/negative override
     # would otherwise reach TmuxManager.read_log_tail's deque(maxlen=...),
     # which raises ValueError on a negative maxlen.
@@ -516,6 +522,12 @@ class OrchestratorTools:
         self._ollama_client: OllamaClient | None = None
         self._ollama_cfg_cache: dict = {}
         self._local_grader = LocalGrader(config_path=self._ollama_config_path)
+        # R5b: bounded + kept-alive grader for the operator-facing message path only.
+        self._message_grader = LocalGrader(
+            config_path=self._ollama_config_path,
+            timeout=self.MESSAGE_GRADER_TIMEOUT_SECONDS,
+            keep_alive="30m",
+        )
         self._shadow_grader = ShadowGrader(config_path=self._ollama_config_path)
         self._last_grader_delta: str = ""
         self._grader_router_cache = None
@@ -1262,9 +1274,15 @@ class OrchestratorTools:
                 return self._grader_failure(batch, f"Grader exited {proc.returncode}: {proc.stderr[:300]}")
             return self._parse_claude_grader_output(proc, batch)
 
-    def _call_local_grader(self, system_prompt: str, user_prompt: str, format_schema: dict) -> dict:
-        """Call Ollama for local grading. Delegates to self._local_grader."""
-        return self._local_grader.grade(system_prompt, user_prompt, format_schema)
+    def _call_local_grader(self, system_prompt: str, user_prompt: str, format_schema: dict,
+                           *, bounded: bool = False) -> dict:
+        """Call Ollama for local grading. bounded=True routes to the operator-facing
+        message grader (R5b: short timeout + keep_alive) so a stalled Ollama cannot
+        hang the send_to_worker/post_message path; default False uses the shared
+        grader. bounded is keyword-only so the ~50 existing positional mock seams
+        (call_args.args) are unaffected."""
+        grader = self._message_grader if bounded else self._local_grader
+        return grader.grade(system_prompt, user_prompt, format_schema)
 
     def _provider_router(self):
         """Lazily build + cache (router, config, state, registry) for provider routing.
@@ -3919,6 +3937,123 @@ class OrchestratorTools:
         {"status", "rerebase", "continue", "abort", "restore_frozen"}
     )
 
+    # Fallback provider for a Brain-local (no worker_id) shared-resource operation
+    # when no Brain role is persisted yet. The live client is resolved from
+    # provider_role_state (a Codex Brain is a shipped mode), and this constant is
+    # only the default for the pre-persist edge.
+    _LOCAL_WORKSPACE_CLIENT = "claude"
+
+    def _shared_resources_transport(self, repository_path: str, worker_id: str | None):
+        """Resolve (client, ssh_host, installed_root) for a shared-resource op.
+
+        worker_id given: authority (provider client + ssh host) is derived from
+        the persisted worker registry exactly as recover_worker_integration
+        derives it — a missing worker is a hard error, never a silent fall-through
+        to local. worker_id None: a Brain-local op on the primary checkout, using
+        the persisted Brain client resolved from provider_role_state
+        (_LOCAL_WORKSPACE_CLIENT is only the pre-persist fallback).
+
+        Returns a transport dict on success, or a structured error dict (never
+        raises) whose presence the caller detects via an "error" key.
+        """
+        if worker_id is not None:
+            worker = self.registry.get_worker(worker_id)
+            if not worker:
+                return {"error": f"worker not found: {worker_id}", "repository_path": repository_path}
+            client = worker.get("client")
+            if client not in {"claude", "codex"}:
+                return {
+                    "error": "worker registry lacks supported provider client",
+                    "repository_path": repository_path,
+                }
+            if worker.get("machine"):
+                self._ensure_ssh_manager()
+            ssh_host = self._resolve_ssh_host(worker_id)
+        else:
+            client = ProviderState(self._db).current_client("brain", self._LOCAL_WORKSPACE_CLIENT)
+            ssh_host = None
+        try:
+            installed_root = self._workspace_client.discover_installed_plugin_root(
+                client, ssh_host=ssh_host,
+            )
+        except Exception as exc:
+            return {
+                "error": str(exc),
+                "failure_phase": "runtime_discovery",
+                "repository_path": repository_path,
+            }
+        return self._workspace_transport(installed_root, ssh_host)
+
+    def configure_shared_resources(
+        self,
+        repository_path: str,
+        entries: list,
+        worker_id: str | None = None,
+        allow_secret_entries: bool = False,
+    ) -> dict:
+        """Append entries to a repository's worktree-shared-resources config.
+
+        Call this when a managed-worktree worker reports that gitignored project
+        data (a path present in the primary checkout but absent from its isolated
+        worktree) is missing. This appends the explicit relative path(s) to the
+        repository's `worktree-shared-resources` config and relinks the newly-added
+        entries into every currently-active managed worktree for the repo, so a
+        live worker gets the data without a respawn, and every future allocation
+        gets it too. NEVER hand-write an `ln -s` script and NEVER ask the operator
+        to touch a worktree — this tool is the operator-free path.
+
+        Entries are validated exactly as the shipped mechanism validates them
+        (no globs, `..`, absolute paths, trailing slashes, or `!`/`#` prefixes).
+        worker_id, when given, resolves transport (provider + host) from the worker
+        registry; omit it for a Brain-local repository. Entries that look like
+        secrets are returned in `secretBlocked` and require operator approval;
+        pass `allow_secret_entries=True` only after the operator approves. Returns
+        a structured dict ({added, skipped, rejected, entries, relinked}) or a
+        structured error dict; never raises.
+        """
+        transport = self._shared_resources_transport(repository_path, worker_id)
+        if "error" in transport:
+            return transport
+        try:
+            return self._workspace_client.configure_shared_resources(
+                {
+                    "repository_path": repository_path,
+                    "entries": entries,
+                    "allow_secret_entries": allow_secret_entries,
+                },
+                **transport,
+            )
+        except Exception as exc:
+            return {
+                "error": str(exc),
+                "failure_phase": "configure_shared_resources",
+                "repository_path": repository_path,
+            }
+
+    def list_shared_resources(
+        self, repository_path: str, worker_id: str | None = None,
+    ) -> dict:
+        """Read a repository's current worktree-shared-resources config.
+
+        Returns the configured entries (a structured dict) or a structured error
+        dict; never raises. worker_id resolves transport from the worker registry
+        when given; omit it for a Brain-local repository.
+        """
+        transport = self._shared_resources_transport(repository_path, worker_id)
+        if "error" in transport:
+            return transport
+        try:
+            return self._workspace_client.list_shared_resources(
+                {"repository_path": repository_path},
+                **transport,
+            )
+        except Exception as exc:
+            return {
+                "error": str(exc),
+                "failure_phase": "list_shared_resources",
+                "repository_path": repository_path,
+            }
+
     def recover_worker_integration(self, worker_id: str, action: str) -> dict:
         """Drive one managed-worktree integration-recovery reconcile for a worker.
 
@@ -5679,7 +5814,7 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
                 "feedback": {"type": "string"},
             },
             "required": ["grade", "approved", "feedback"],
-        })
+        }, bounded=True)  # R5b: operator-facing path — bounded grader
         if grade_result.get("infrastructure_error"):
             logger.info(f"Ollama grader unavailable for send_to_worker '{worker_id}', escalating to Opus")
             grade_result = self._call_grader(system_prompt, user_prompt)
@@ -6859,7 +6994,7 @@ Does this message report a problem? If so, does it include an action already tak
                 "feedback": {"type": "string"},
             },
             "required": ["grade", "approved", "feedback"],
-        })
+        }, bounded=True)  # R5b: operator-facing path — bounded grader
         if grade_result.get("infrastructure_error"):
             logger.info("Ollama grader unavailable for post_message, escalating to Opus")
             grade_result = self._call_grader(system_prompt, user_prompt)
@@ -7185,6 +7320,58 @@ def _create_mcp_server(tools: OrchestratorTools, plugin_dirs: list[str] | None =
         the action is not allowed or the runtime refuses the recovery.
         """
         return json.dumps(tools.recover_worker_integration(worker_id, action))
+
+    @mcp.tool()
+    def configure_shared_resources(
+        repository_path: str,
+        entries: list,
+        worker_id: str = "",
+        allow_secret_entries: bool = False,
+    ) -> str:
+        """Provision gitignored project data into managed worktrees, operator-free.
+
+        Call this when a managed-worktree worker reports that project data it needs
+        (a gitignored path present in the primary checkout but absent from its
+        isolated worktree) is missing. This appends the explicit relative path(s)
+        to the repository's `worktree-shared-resources` config and relinks the
+        newly-added entries into every currently-active managed worktree for the
+        repo — so the running worker gets the data without a respawn, and every
+        future allocation gets it too. NEVER hand-write an `ln -s` script and NEVER
+        ask the operator to touch a worktree; this tool is the operator-free path.
+
+        Args:
+            repository_path: Absolute path to the git repository (primary checkout).
+            entries: Explicit repo-relative paths to share (no globs, `..`,
+                absolute paths, trailing slashes, or `!`/`#` prefixes).
+            worker_id: The worker that reported the missing data (resolves its
+                provider + host); omit for a Brain-local repository.
+            allow_secret_entries: Set True only after the operator approves sharing
+                entries that look like secrets; the returned JSON now includes
+                `secretBlocked` for entries withheld pending that approval.
+
+        Returns JSON ({added, skipped, rejected, entries, relinked}) or a
+        structured error dict.
+        """
+        return json.dumps(
+            tools.configure_shared_resources(
+                repository_path, entries, worker_id or None, allow_secret_entries,
+            )
+        )
+
+    @mcp.tool()
+    def list_shared_resources(repository_path: str, worker_id: str = "") -> str:
+        """Read a repository's current worktree-shared-resources config.
+
+        Args:
+            repository_path: Absolute path to the git repository (primary checkout).
+            worker_id: Resolves the worker's provider + host; omit for a
+                Brain-local repository.
+
+        Returns JSON with the configured entries, or a structured error dict.
+        """
+        return json.dumps(
+            tools.list_shared_resources(repository_path, worker_id or None)
+        )
 
     @mcp.tool()
     def push_repo(repo: str, remote: str = "origin", branch: str = "") -> str:

@@ -26,6 +26,8 @@ function internalDependencies(): InternalCommandDependencies {
     cleanup: vi.fn().mockReturnValue({ lifecycle_status: 'cleaned' }),
     sync: vi.fn().mockReturnValue({ state: 'fast-forwarded' }),
     reap: vi.fn().mockReturnValue({ lifecycle_status: 'reaped' }),
+    configureSharedResources: vi.fn().mockReturnValue({ added: [], skipped: [], rejected: [], entries: [], relinked: {} }),
+    listSharedResources: vi.fn().mockReturnValue({ entries: [] }),
   };
 }
 

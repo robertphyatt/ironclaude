@@ -323,6 +323,36 @@ else
   echo "FAIL: hooks.json is invalid" >&2
 fi
 
+# Missing-logger fail-closed (obs-3 parity for the Codex Brain gate). Copy the hook into a
+# directory with NO hook-logger.sh beside it, so its `source` fails. The guarded hook must
+# still BLOCK the gated set under codex-brain env (fail closed) and ALLOW everything else
+# (arm tools, and any session that is not codex+brain). Pre-fix, the unguarded `source`
+# fails open and a gated action exits 0 — this is the RED case.
+NOLOG_DIR="$TMP_DIR/nolog"
+mkdir -p "$NOLOG_DIR"
+cp "$HOOK" "$NOLOG_DIR/codex-brain-gated-actions.sh"
+run_nolog() {
+  local tool_name="$1"
+  local client="${2:-codex}"
+  local role="${3:-brain}"
+  local payload
+  payload=$(jq -cn \
+    --arg tool_name "$tool_name" \
+    --arg cwd "$TMP_DIR" \
+    '{session_id:"codex-brain-gate-test",tool_name:$tool_name,tool_input:{},cwd:$cwd}')
+  IC_ROLE="$role" \
+  IRONCLAUDE_CLIENT="$client" \
+  IRONCLAUDE_BRAIN_GATE_SESSION="$TOKEN" \
+    bash "$NOLOG_DIR/codex-brain-gated-actions.sh" >"$TMP_DIR/output" 2>"$TMP_DIR/error" <<<"$payload"
+  return $?
+}
+assert_rc "no-logger: gated action blocked (codex brain)" 2 run_nolog \
+  "mcp__plugin_ironclaude_orchestrator__spawn_worker"
+assert_rc "no-logger: arm tool allowed (codex brain)" 0 run_nolog \
+  "mcp__plugin_ironclaude_episodic-memory__search"
+assert_rc "no-logger: gated action allowed (non-codex-brain)" 0 run_nolog \
+  "mcp__plugin_ironclaude_orchestrator__spawn_worker" "claude" "brain"
+
 if [ "$FAIL" -ne 0 ]; then
   echo "$FAIL CODEX BRAIN GATE TESTS FAILED ($PASS passed)" >&2
   exit 1

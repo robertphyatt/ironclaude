@@ -379,8 +379,7 @@ if [ "$prof_mode" = "undecided" ]; then
 
 Professional mode has not been activated or deactivated yet. You can only use read-only tools (Read, Grep, Glob) until the user decides.
 
-To activate, call the Skill tool with:
-  skill: \"ironclaude:activate-professional-mode\"
+To activate, invoke: $(ic_skill_ref "ironclaude:activate-professional-mode" "")
 
 Or wait for the user to run /activate-professional-mode or /deactivate-professional-mode.
 
@@ -391,8 +390,7 @@ Do NOT use Edit, Write, Bash, or any other write tool until professional mode is
 
 Professional mode has not been activated or deactivated yet. You can only use read-only tools (Read, Grep, Glob) until the user decides.
 
-To activate, call the Skill tool with:
-  skill: \"ironclaude:activate-professional-mode\"
+To activate, invoke: $(ic_skill_ref "ironclaude:activate-professional-mode" "")
 
 Or wait for the user to run /activate-professional-mode or /deactivate-professional-mode.
 
@@ -497,8 +495,7 @@ case "$TOOL_NAME" in
 
 EnterPlanMode and ExitPlanMode are disabled when professional mode is active.
 
-Call the Skill tool with:
-  skill: \"ironclaude:brainstorming\"
+Invoke: $(ic_skill_ref "ironclaude:brainstorming" "")
 
 Do NOT use EnterPlanMode or ExitPlanMode. Use the brainstorming skill for all design work."
     ;;
@@ -588,8 +585,7 @@ if [[ "$TOOL_NAME" == "Edit" || "$TOOL_NAME" == "Write" || "$TOOL_NAME" == "Mult
 
 Design documents can only be created during the brainstorming skill.
 
-Call the Skill tool with:
-  skill: \"ironclaude:brainstorming\"
+Invoke: $(ic_skill_ref "ironclaude:brainstorming" "")
 
 Do NOT create design documents outside of brainstorming."
       fi
@@ -603,8 +599,8 @@ Do NOT create design documents outside of brainstorming."
 You must create a design document before writing plan files.
 
 Follow this workflow:
-1. Call Skill tool with skill: \"ironclaude:brainstorming\" to create a design
-2. Call Skill tool with skill: \"ironclaude:writing-plans\" to create the plan
+1. $(ic_skill_ref "ironclaude:brainstorming" "") to create a design
+2. $(ic_skill_ref "ironclaude:writing-plans" "") to create the plan
 
 Do NOT create plan files without completing brainstorming first."
       fi
@@ -715,18 +711,18 @@ Do NOT run destructive or write commands during the reviewing stage."
     NEXT_ACTION=""
     case "$WORKFLOW" in
       idle|brainstorming)
-        NEXT_ACTION="SUGGESTED_NEXT_ACTION: Skill(skill=\"ironclaude:brainstorming\", args=\"\")"
+        NEXT_ACTION="SUGGESTED_NEXT_ACTION: $(ic_skill_ref "ironclaude:brainstorming" "")"
         ;;
       design_ready)
         _DESIGN_PATH=$(get_design_file)
         if [ -n "$_DESIGN_PATH" ]; then
-          NEXT_ACTION="SUGGESTED_NEXT_ACTION: Skill(skill=\"ironclaude:writing-plans\", args=\"${_DESIGN_PATH}\")"
+          NEXT_ACTION="SUGGESTED_NEXT_ACTION: $(ic_skill_ref "ironclaude:writing-plans" "${_DESIGN_PATH}")"
         fi
         ;;
       plan_ready)
         _PLAN_PATH=$(get_plan_json_path)
         if [ -n "$_PLAN_PATH" ]; then
-          NEXT_ACTION="SUGGESTED_NEXT_ACTION: Skill(skill=\"ironclaude:executing-plans\", args=\"${_PLAN_PATH} --mode=inline\")"
+          NEXT_ACTION="SUGGESTED_NEXT_ACTION: $(ic_skill_ref "ironclaude:executing-plans" "${_PLAN_PATH} --mode=inline")"
         fi
         ;;
     esac
@@ -743,9 +739,9 @@ They must contain no shell metacharacters (; & | \` \$( < >) — note that a pip
 inside a quoted regex is currently treated as a shell pipe and rejected.
 
 To reach execution, follow the workflow:
-1. Call Skill tool with skill: \"ironclaude:brainstorming\" to design
-2. Call Skill tool with skill: \"ironclaude:writing-plans\" to plan
-3. Call Skill tool with skill: \"ironclaude:executing-plans\" to execute
+1. $(ic_skill_ref "ironclaude:brainstorming" "") to design
+2. $(ic_skill_ref "ironclaude:writing-plans" "") to plan
+3. $(ic_skill_ref "ironclaude:executing-plans" "") to execute
 
 Do NOT use Edit, Write, or Bash until you are in the executing stage.
 
@@ -865,9 +861,7 @@ Stop all work immediately. The orchestrator will detect your idle state and take
 
 You submitted work for review but code review has not completed yet. Write tools are blocked.
 
-Call the Skill tool with:
-  skill: \"ironclaude:code-review\"
-  args: \"--task-boundary\"
+Invoke: $(ic_skill_ref "ironclaude:code-review" "--task-boundary")
 
 Do NOT use Edit, Write, MultiEdit, or Bash until code review completes."
       fi

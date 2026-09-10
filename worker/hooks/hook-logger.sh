@@ -98,6 +98,35 @@ init_session_id() {
   SESSION_TAG="${CLAUDE_SESSION_ID:-none}"
 }
 
+# Client detection + skill-invocation rendering, shared by the enforcement hooks so
+# remediation guidance names the invocation form the CURRENT client actually has:
+# Claude Code's Skill(...) tool vs Codex's $ironclaude:<skill> markdown links.
+# Detection mirrors get-back-to-work-claude.sh (PLUGIN_ROOT under /.codex/), with an
+# IC_HOOK_CLIENT override for tests. Fail-safe default: claude.
+ic_is_codex() {
+  case "${IC_HOOK_CLIENT:-}" in
+    codex) return 0 ;;
+    claude) return 1 ;;
+  esac
+  case "${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}" in
+    */.codex/*|*/.codex) return 0 ;;
+  esac
+  return 1
+}
+
+# ic_skill_ref SKILL [ARGS] -> the client-appropriate invocation string.
+#   Codex : $<skill> <args>   (e.g. $ironclaude:code-review --task-boundary)
+#   Claude: Skill(skill="<skill>", args="<args>")
+# The Codex printf format is single-quoted so the leading $ stays literal.
+ic_skill_ref() {
+  local _skill="$1" _args="${2:-}"
+  if ic_is_codex; then
+    printf '$%s%s' "$_skill" "${_args:+ $_args}"
+  else
+    printf 'Skill(skill="%s", args="%s")' "$_skill" "$_args"
+  fi
+}
+
 # json_escape VALUE
 # Escapes a string for safe embedding in a JSON string literal.
 # Order: backslash first (prevents double-escaping), then other characters.

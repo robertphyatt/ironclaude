@@ -82,9 +82,9 @@ def test_activation_skill_propagates_all_boy_scout_paths():
     assert text.count(DIRECTIVE_BODY) == 3
     assert DETECTION_ROW in text
     assert "Concept 11 (Boy Scout Rule):" in text
-    assert "12 concepts" in text
-    assert "(12 principles)" in text
-    assert "12-principle template" in text
+    assert "13 concepts" in text
+    assert "(13 principles)" in text
+    assert "13-principle template" in text
     concept_10 = text.index("Concept 10 (No Workflow Avoidance Under Stage/Context Restrictions):")
     concept_11 = text.index("Concept 11 (Boy Scout Rule):")
     assert concept_10 < text.index("N. **No Workflow Avoidance", concept_10) < concept_11

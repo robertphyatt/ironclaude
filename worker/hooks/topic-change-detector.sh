@@ -89,8 +89,8 @@ if [ -z "$OK" ]; then
 fi
 
 if [ "$OK" = "false" ]; then
-  jq -n --arg reason "${REASON:-Topic appears unrelated to active plan}" '{
-    "systemMessage": ("\u26a0\ufe0f [TOPIC-CHANGE-DETECTOR]: Topic change detected \u2014 " + $reason + ". You MUST invoke the plan-interruption skill BEFORE responding to the user. Call the Skill tool with skill: ironclaude:plan-interruption. Do NOT respond to the user first.")
+  jq -n --arg reason "${REASON:-Topic appears unrelated to active plan}" --arg ref "$(ic_skill_ref "ironclaude:plan-interruption")" '{
+    "systemMessage": ("\u26a0\ufe0f [TOPIC-CHANGE-DETECTOR]: Topic change detected \u2014 " + $reason + ". You MUST invoke the plan-interruption skill BEFORE responding to the user. Invoke: " + $ref + ". Do NOT respond to the user first.")
   }'
 else
   log_llm_result "TOPIC-CHANGE-DETECTOR" "Passed" "on-topic"

@@ -4,7 +4,17 @@
 # Arms when mcp__episodic-memory__* is called; disarms after each gated action.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/hook-logger.sh"
+if ! source "$SCRIPT_DIR/hook-logger.sh" 2>/dev/null; then
+  # Fail-closed: block gated actions when enforcement infra is missing; allow reads.
+  _IN=$(cat)
+  _TN=$(echo "$_IN" | jq -r '.tool_name // empty' 2>/dev/null || true)
+  case "$_TN" in
+    mcp__orchestrator__spawn_worker|mcp__orchestrator__spawn_workers|mcp__orchestrator__approve_plan|mcp__orchestrator__reject_plan|mcp__orchestrator__send_to_worker|mcp__orchestrator__kill_worker|AskUserQuestion)
+      echo "✗ [memory-search-enforcer]: Blocked - IronClaude hook-logger.sh missing; enforcement cannot run. Run 'make deploy-hooks', then retry." >&2
+      exit 2 ;;
+    *) exit 0 ;;
+  esac
+fi
 run_hook "memory-search-enforcer"
 
 INPUT=$(cat)

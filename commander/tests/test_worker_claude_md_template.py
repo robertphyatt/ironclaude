@@ -84,9 +84,12 @@ class TestWorkerClaudeMdTemplate:
             "Boy Scout Rule",
             "Recipient-Based Communication Profiles",
         ]
-        assert _concept_headings(claude) == expected
+        assert _concept_headings(claude) == expected + [
+            "Managed Worktree — Missing Shared Data Is a Blocker to Report, Never to Hand-Fix"
+        ]
         assert _concept_headings(codex) == expected + [
-            "Actual Claude Fable from Codex"
+            "Actual Claude Fable from Codex",
+            "Managed Worktree — Missing Shared Data Is a Blocker to Report, Never to Hand-Fix",
         ]
         assert "`Agent` tool (`model=fable`" in claude
         assert "`model=opus`" in claude
@@ -98,3 +101,26 @@ class TestWorkerClaudeMdTemplate:
         assert "nested `codex exec`" in codex
         assert "ironclaude:use-fable-subagent" in codex
         assert "Native Codex subagents cannot satisfy" in codex
+
+    def test_activation_existing_file_gate_requires_managed_worktree_concept(self):
+        """I1: the existing-file semantic-check table, the verify-only NAME list, and the
+        read-back counts must require the 13th (Claude) / 14th (Codex) 'Managed Worktree'
+        concept, or activation on an EXISTING standalone project reports complete at the old
+        count and never writes it."""
+        skill = ACTIVATION_SKILL_PATH.read_text()
+        # The existing-file concept table lists the Managed-Worktree concept.
+        assert "| Managed Worktree — Missing Shared Data" in skill
+        # Read-back counts are reconciled (Claude 13 / Codex 14).
+        assert "fourteen for Codex, thirteen for Claude" in skill
+        # No stale Claude=twelve / Codex=thirteen read-back count remains.
+        assert "thirteen for Codex, twelve for Claude" not in skill
+        # verify-only enumerates uncovered concepts by exact name from the list between
+        # these two markers; it must name Managed Worktree, directly before the
+        # Codex-only concept so "preceding thirteen" (line 236) is literally true.
+        name_list = skill.split("its exact name from this list:", 1)[1].split(
+            "The enumerated name set must equal", 1
+        )[0]
+        assert (
+            "- Managed Worktree — Missing Shared Data Is a Blocker to Report, Never to Hand-Fix\n"
+            "- Actual Claude Fable from Codex"
+        ) in name_list

@@ -193,6 +193,72 @@ export function readSharedResourceConfig(repositoryIdentity: string): string[] {
     .filter((line) => line.length > 0 && !line.startsWith('#'));
 }
 
+/**
+ * Append explicit relative paths to `<commonDir>/info/worktree-shared-resources`,
+ * the same config `linkSharedResources` reads on every allocation. Each entry is
+ * validated by `isSafeSharedEntry` (rejected entries are never written); entries
+ * already present are skipped (deduped). This is the write half that lets the
+ * Commander configure shared resources for a repo without any operator file edit.
+ * Returns which entries were added, skipped (already present), rejected (unsafe),
+ * and the full resulting list.
+ */
+export function addSharedResourceEntries(
+  repositoryIdentity: string,
+  entries: readonly string[],
+  allowSecretEntries = false,
+): { added: string[]; skipped: string[]; rejected: string[]; secretBlocked: string[]; entries: string[] } {
+  const configPath = path.join(repositoryIdentity, 'info', SHARED_RESOURCE_CONFIG);
+  const present = new Set(readSharedResourceConfig(repositoryIdentity));
+  const added: string[] = [];
+  const skipped: string[] = [];
+  const rejected: string[] = [];
+  const secretBlocked: string[] = [];
+  for (const entry of entries) {
+    if (!isSafeSharedEntry(entry)) {
+      rejected.push(entry);
+      continue;
+    }
+    if (!allowSecretEntries && isSecretEntry(entry)) {
+      secretBlocked.push(entry);
+      continue;
+    }
+    if (present.has(entry)) {
+      skipped.push(entry);
+      continue;
+    }
+    present.add(entry);
+    added.push(entry);
+  }
+  if (added.length > 0) {
+    mkdirSync(path.dirname(configPath), { recursive: true });
+    const existing = existsSync(configPath) ? readFileSync(configPath, 'utf8') : '';
+    const separator = existing.length === 0 || existing.endsWith('\n') ? '' : '\n';
+    writeFileSync(configPath, existing + separator + added.map((entry) => `${entry}\n`).join(''));
+  }
+  return { added, skipped, rejected, secretBlocked, entries: [...present] };
+}
+
+/**
+ * True when an entry names a well-known secret file, or lies under a directory
+ * that conventionally holds secrets. Defense-in-depth on top of the explicit
+ * allowlist — NOT exhaustive. Matched case-insensitively on the basename and on
+ * any path segment (so both `.aws` and `.aws/credentials` are caught).
+ */
+function isSecretEntry(entry: string): boolean {
+  const lower = entry.split('/').map((s) => s.toLowerCase());
+  const SECRET_DIRS = new Set(['.ssh', '.aws', '.gnupg']);
+  if (lower.some((s) => SECRET_DIRS.has(s))) return true;
+  const base = lower[lower.length - 1];
+  const SECRET_FILES = new Set([
+    '.env', '.netrc', '.npmrc', '.pypirc', '.git-credentials',
+    'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'credentials',
+  ]);
+  if (SECRET_FILES.has(base)) return true;
+  if (base.startsWith('.env.')) return true;
+  if (/\.(pem|key|p12|pfx)$/.test(base)) return true;
+  return false;
+}
+
 /** Rejects any entry that could escape the worktree or carry gitignore semantics. */
 function isSafeSharedEntry(entry: string): boolean {
   if (entry.length === 0) return false;
@@ -201,7 +267,9 @@ function isSafeSharedEntry(entry: string): boolean {
   if (entry.endsWith('/')) return false;
   if (entry.includes('\\')) return false;
   if (/[*?[\]]/.test(entry)) return false;
-  if (entry.split('/').some((segment) => segment === '..')) return false;
+  if (entry.split('/').some((segment) => segment === '..' || segment === '.' || segment === '')) return false;
+  if (entry !== entry.trim()) return false;
+  if (/[\x00-\x1f]/.test(entry)) return false;
   return true;
 }
 
@@ -221,15 +289,16 @@ function pathPresent(target: string): boolean {
  * isolated worker. For each explicitly configured relative path present in the
  * primary checkout, plant a symlink into the worktree, then exclude the planted
  * links from Git's view. Only listed paths are linked — the .gitignore is never
- * auto-scanned, so secrets like `.env` are never exposed. One bad entry is
- * logged and skipped; it never throws and never aborts allocation.
+ * auto-scanned, and well-known secret paths (`.env`, `.ssh`, `.aws`, private keys, ...)
+ * are rejected by default and require explicit operator approval to share — defense-in-depth,
+ * not exhaustive. One bad entry is logged and skipped; it never throws and never aborts allocation.
  */
 export function linkSharedResources(
   primaryCheckoutPath: string,
   worktreePath: string,
   repositoryIdentity: string,
   entries: readonly string[],
-): void {
+): string[] {
   const linked: string[] = [];
   for (const entry of entries) {
     if (!isSafeSharedEntry(entry)) {
@@ -256,6 +325,7 @@ export function linkSharedResources(
   if (linked.length > 0) {
     ensureExcludeEntries(repositoryIdentity, linked);
   }
+  return linked;
 }
 
 export function removeWorktree(primaryCheckoutPath: string, worktreePath: string): void {

@@ -10,6 +10,120 @@
 > `vX.Y.Z`. Land changes under `## [Unreleased]` as you go, then rename that
 > heading to the new version at release time so the entry matches what shipped.
 
+## 1.1.9: Brain self-serve worktree shared resources, Commander operator-responsiveness, and Codex-aware hook guidance
+
+- **Brain self-serve worktree shared resources.** The managed-worktree shared-resources
+  mechanism (an explicit per-repo allowlist at `<git-common-dir>/info/worktree-shared-resources`,
+  symlinked into each worktree on allocation) is now Brain-configurable at runtime and
+  discoverable. New orchestrator MCP tools `configure_shared_resources(repository_path, entries,
+  worker_id)` and `list_shared_resources(repository_path)` proxy through the Commander's
+  WorkspaceClient → workspace-manager `cli.js` internal commands → the git.ts primitives.
+  `configure_shared_resources` validates and appends explicit entries (no globs/`..`/absolute
+  paths/trailing slashes/`!`/`#`) and **relinks the newly added ones into every currently-live
+  managed worktree** for the repo, so a running worker gets missing gitignored project data
+  without a respawn. Previously the mechanism existed but was undiscoverable and not
+  Brain-reachable, so a worker missing gitignored data would stall or fall back to hand-written
+  symlink scripts — a violation of the operator-free-worktree pillar.
+- Documented the mechanism where the Brain and workers look: README (with the explicit-entries
+  security model, write-through-symlink caution, and plugin-cache-refresh deploy note), the Brain
+  workflow rules, the `use-managed-worktree` skill, and the worker templates (report the missing
+  path to the Brain; never hand-symlink or fiddle with the worktree).
+- Added a generalized never-fake-past-a-gate guardrail: when a task's declared input is absent,
+  surface a real blocker or produce it through the workflow — never skip, override, or rationalize
+  past the gate to emit a green-but-empty result.
+- **Idle Brain is probed, not restarted (R1).** The 1800s "absolute inactivity" check no
+  longer restarts the idle Brain every ~30 min (which wiped the prompt cache/context and
+  forced MCP schema re-discovery). It now sends a lightweight `[PING]` health probe and
+  restarts only if the ping goes unanswered within `timeout_seconds`; ping state resets on
+  any SDK activity and on `restart()`. The Brain answers `[PING]` with `[PING-ACK]`, which
+  the daemon discards (never relayed to Slack). All real-failure restart paths (dead thread,
+  tool-execution hang, normal timeout) are unchanged.
+- **Threaded `[reply-to:]` replies work again (R2).** The `[NARRATION]` prefix the Brain
+  prepends to all text defeated the leading-`[reply-to:` marker check, so solicited threaded
+  replies never threaded. The daemon now strips the prefix before marker parsing for
+  marker-led text only (ordinary narration is untouched).
+- **Operator fast lane (R3).** The daemon loop now polls Slack commands, Brain responses, and
+  the send-queue flush every ~3s, while worker/heartbeat/maintenance sweeps stay on the 15s
+  slow lane. The awaiting-operator classifier grade is bounded off the fast lane so an
+  empty-Ollama stall can't block operator pickup.
+- **Operator priority over background nudges (R4).** Idle-escalation tiers, the heartbeat
+  GRADER CHECK, and worker stuck-notifications are suppressed while the Brain is mid-turn on
+  operator work (the idle clock keeps accumulating; nudges resume when the turn completes). An
+  operator message now gets a brief acknowledgement/ETA before the Brain continues long work.
+- **De-duplicated operator-wait alerts (R6).** One `⏳ Waiting on operator` alert per pending
+  directive (keyed on worker + directive id + directive status, skipped when the directive is
+  already surfaced by the pending-confirmation heartbeat), instead of one per restart/paraphrase.
+- **Bounded operator-facing message grader (R5b).** `send_to_worker`/`post_message` use a
+  separate `keep_alive`-warmed grader with a conservative 120s bound so a stalled Ollama can't
+  hang the daemon path; the shared 600s grader for non-interactive spots is unchanged.
+- **Tests no longer pollute the live daemon log (SF1).** Under pytest, `main()` does not attach
+  the `/tmp/ic/daemon.log` handler.
+- **48h-lookback + Agent-fan-out gates are now actually enforced for the daemon Brain (SF2, R5a).**
+  The Brain runs with `bypassPermissions`, which makes the in-process `can_use_tool` callback
+  dead (verified: 0 `TOOL_INVOKE` across all brain-session logs), so the lookback gate and the
+  subagent fan-out limit lived only in dead code. A version-controlled, template-driven
+  daemon-start sync (`commander/src/brain/brain_settings_hooks.json` → the Brain's live
+  `settings.json`) now registers `startup-lookback-enforcer.sh` and `brain-task-gate.sh` as
+  PreToolUse shell hooks (the real enforcement layer, loaded via `setting_sources`). The merge
+  appends idempotently and never clobbers existing PreToolUse/PostToolUse entries. See
+  `docs/plans/2026-09-07-sf2-lookback-findings.md` for the gap analysis and the per-session
+  re-arm cost.
+- **Tolerant `[PING-ACK]` drop.** The idle-Brain liveness ack is discarded even when the Brain
+  threads it under a `[reply-to:]` marker or appends a stray token: the daemon strips the
+  narration prefix and an optional leading reply-to marker, then drops a message that leads with
+  `[PING-ACK]` — bounded by length so a genuine narration that merely mentions the token is still
+  delivered — so an ack never leaks into the heartbeat thread.
+- **In-flight cap on the bounded grader.** `_grade_bounded` now runs at most one grade at a time:
+  a grade abandoned past its timeout keeps an in-flight flag set until its worker finishes, so a
+  sustained local-model stall returns `None` immediately for subsequent calls instead of piling up
+  daemon threads against the shared grader.
+- **Client-aware enforcement-hook guidance (Codex no longer dead-locks at gates).** A shared
+  `ic_is_codex` / `ic_skill_ref` renderer in `hook-logger.sh` makes the remediation guidance in
+  `get-back-to-work-impl.sh`, `professional-mode-guard.sh`, `topic-change-detector.sh`, and
+  `plan-task-context.sh` name the invocation form the current client actually has —
+  `$ironclaude:<skill> <args>` for Codex, the canonical `Skill(skill=…, args=…)` for Claude — so a
+  Codex session hitting a review/write gate is no longer told to invoke a `Skill` tool it does not
+  have and dead-lock. Guidance text only; no block/allow decision, exit code, or gate logic changed.
+- **Post-review hardening (v1.1.9 review rounds).** Brain gates (`brain-task-gate`,
+  `startup-lookback-enforcer`, `memory-search-enforcer`) now fail **closed** — block
+  their gated actions, allow reads — when `hook-logger.sh` is missing, instead of
+  silently failing open; and memory-search-enforcer is wired into the Brain
+  settings-sync so its script deploys with the others. Deploying memory-search-enforcer
+  through the settings-sync also activates its `AskUserQuestion` gating on the Brain in
+  production (previously the stale deployed copy did not gate it). Brain advisor-fallback (rule
+  23) routes review through a blind `spawn_worker` reviewer instead of the (gated)
+  `Agent` tool; the directive-read lookback is `hours_back=72` (arms the startup
+  gate) across the quick-ref and workflow docs. Commander: the bounded operator-wait
+  grader clears its in-flight flag if the grader thread fails to start, and the
+  operator-wait alert key no longer collapses distinct directive-less questions into
+  one alert.
+- **Grader reasoning suppressed by default on the OpenAI-compatible backend.** A new
+  per-spot knob `spots.grader.thinking` (bool, default off) controls whether the grader's
+  openai payload carries `reasoning_effort: "none"` and
+  `chat_template_kwargs: {enable_thinking: false}`. Default-off stops a reasoning-capable
+  local model (e.g. amd-halo `gemma4-26b-a4b`) from spending the completion-token budget on
+  reasoning and returning empty `message.content` — the grader reads only `content`, so those
+  verdicts came back empty and ~7x slower with no accuracy gain (measured over two A/B runs).
+  Setting `spots.grader.thinking: true` restores the prior wire shape (neither field sent),
+  keeping a strict OpenAI-compatible endpoint safe. The Ollama path is unchanged. A strict
+  OpenAI-compatible endpoint that rejects `chat_template_kwargs` outright (HTTP 400) degrades
+  to `infrastructure_error` rather than a graded verdict — set `spots.grader.thinking: true`
+  for such endpoints.
+- **Shared-resource secret deny-list.** The shared-resource validator now refuses well-known
+  secret paths (`.env`, `.ssh`, `.aws`, private keys) by default; `configure_shared_resources`
+  returns them in a `secretBlocked` list instead of sharing them, and the Brain asks the
+  operator, re-calling with `allow_secret_entries=true` only on approval. The git.ts "secrets
+  never exposed" claim was corrected to accurate defense-in-depth wording — the deny-list is a
+  safety net, not an exhaustive guarantee.
+- **Shared-resource entry validator + relink hardening (v1.1.9 review rounds).**
+  `isSafeSharedEntry` now rejects `.`, `./`, and empty (`//`) path segments, not just `..`.
+  Such an entry previously planted a symlink whose `info/exclude` literal git could not match,
+  leaving the worktree permanently dirty and blocking finalize/reconcile/cleanup (the entry also
+  persisted to config and re-planted on every allocation). `configure_shared_resources` now
+  relinks already-configured (skipped) entries as well as newly-added ones, so a resource
+  supplied after worktree allocation links on the Brain's recovery call instead of dead-ending
+  (`linkSharedResources` is idempotent).
+
 ## 1.1.8: opt-in OpenAI-compatible LLM backend, per-tier reasoning effort, GPT-6 Astra, Commander plugin architecture, and reliability fixes
 
 - Every place IronClaude shadows Claude with a local model — shell plan validation, the

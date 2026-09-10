@@ -3431,6 +3431,46 @@ class TestInlineGraderEnforcement:
 
 
 
+class TestMessageGraderBounded:
+    """R5b: the operator-facing message grader (send_to_worker/post_message) is a
+    SEPARATE bounded instance (short timeout + keep_alive) so an empty-Ollama stall
+    cannot hang the daemon path; the shared 600s grader is left unchanged."""
+
+    def test_message_grader_is_separate_bounded_kept_alive(self, tools):
+        assert tools._message_grader is not tools._local_grader
+        assert tools._message_grader._timeout_override == 120
+        assert tools._message_grader._keep_alive == "30m"
+
+    def test_call_local_grader_bounded_routes_to_message_grader(self, tools, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(tools._message_grader, "grade",
+                            lambda *a, **k: seen.setdefault("bounded", True) or {"grade": "A"})
+        monkeypatch.setattr(tools._local_grader, "grade",
+                            lambda *a, **k: seen.setdefault("shared", True) or {"grade": "A"})
+        tools._call_local_grader("s", "u", {}, bounded=True)
+        assert seen == {"bounded": True}
+        seen.clear()
+        tools._call_local_grader("s", "u", {})   # default: shared grader
+        assert seen == {"shared": True}
+
+    def test_send_to_worker_uses_bounded_grader(self, tools, registry, mock_tmux):
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok"
+        })
+        tools.send_to_worker("w1", "The design looks good, proceed to planning.")
+        assert tools._call_local_grader.call_args.kwargs.get("bounded") is True
+
+    def test_post_message_uses_bounded_grader(self, tools):
+        tools._slack = MagicMock()
+        tools._slack.post_message.return_value = "1700000010.654321"
+        tools._call_local_grader = MagicMock(return_value={
+            "grade": "A", "approved": True, "feedback": "ok"
+        })
+        tools.post_message("[reply-to:1700000000.123456] Task 2 complete, action taken.")
+        assert tools._call_local_grader.call_args.kwargs.get("bounded") is True
+
+
 class TestSendToWorkerGrader:
     """Tests for grader enforcement on send_to_worker messages."""
 
@@ -11308,3 +11348,99 @@ class TestRecoverWorkerIntegration:
         assert isinstance(result, str)
         parsed = json.loads(result)
         assert "not allowed" in parsed["error"]
+
+
+class TestConfigureSharedResources:
+    """Brain self-serve orchestrator tools for worktree-shared-resources."""
+
+    def _tools(self):
+        tools = object.__new__(OrchestratorTools)
+        tools.registry = MagicMock()
+        tools._db = init_db(":memory:")
+        tools._workspace_client = MagicMock()
+        tools._workspace_client.discover_installed_plugin_root.return_value = "/installed/claude"
+        tools._ensure_ssh_manager = MagicMock()
+        tools._resolve_ssh_host = MagicMock(return_value=None)
+        return tools
+
+    def test_configure_local_forwards_exact_payload_and_installed_transport(self):
+        tools = self._tools()
+        expected = {"added": ["data/x"], "skipped": [], "rejected": [], "entries": ["data/x"], "relinked": {}}
+        tools._workspace_client.configure_shared_resources.return_value = expected
+
+        result = tools.configure_shared_resources("/repo", ["data/x"])
+
+        assert result == expected
+        tools._workspace_client.discover_installed_plugin_root.assert_called_once_with(
+            "claude", ssh_host=None,
+        )
+        call = tools._workspace_client.configure_shared_resources.call_args
+        assert call.args[0] == {"repository_path": "/repo", "entries": ["data/x"], "allow_secret_entries": False}
+        assert call.kwargs == {"plugin_root": "/installed/claude"}
+
+    def test_configure_forwards_allow_secret_entries_true(self):
+        tools = self._tools()
+        tools._workspace_client.configure_shared_resources.return_value = {
+            "added": ["data/x"], "skipped": [], "rejected": [], "secretBlocked": [],
+            "entries": ["data/x"], "relinked": {},
+        }
+        tools.configure_shared_resources("/repo", ["data/x"], allow_secret_entries=True)
+        call = tools._workspace_client.configure_shared_resources.call_args
+        assert call.args[0] == {
+            "repository_path": "/repo", "entries": ["data/x"], "allow_secret_entries": True,
+        }
+
+    def test_list_local_forwards_exact_payload(self):
+        tools = self._tools()
+        tools._workspace_client.list_shared_resources.return_value = {"entries": ["data/x"]}
+
+        result = tools.list_shared_resources("/repo")
+
+        assert result == {"entries": ["data/x"]}
+        call = tools._workspace_client.list_shared_resources.call_args
+        assert call.args[0] == {"repository_path": "/repo"}
+        assert call.kwargs == {"plugin_root": "/installed/claude"}
+
+    def test_configure_local_resolves_codex_brain_client_from_persisted_state(self):
+        tools = self._tools()
+        ProviderState(tools._db).set_current_client("brain", "codex")
+        expected = {"added": ["data/x"], "skipped": [], "rejected": [], "entries": ["data/x"], "relinked": {}}
+        tools._workspace_client.configure_shared_resources.return_value = expected
+
+        result = tools.configure_shared_resources("/repo", ["data/x"])
+
+        assert result == expected
+        tools._workspace_client.discover_installed_plugin_root.assert_called_once_with(
+            "codex", ssh_host=None,
+        )
+
+    def test_configure_never_raises_on_workspace_error(self):
+        tools = self._tools()
+        tools._workspace_client.configure_shared_resources.side_effect = WorkspaceClientError("boom")
+
+        result = tools.configure_shared_resources("/repo", ["data/x"])
+
+        assert isinstance(result, dict)
+        assert "boom" in result["error"]
+
+    def test_configure_worker_not_found_does_not_discover(self):
+        tools = self._tools()
+        tools.registry.get_worker.return_value = None
+
+        result = tools.configure_shared_resources("/repo", ["data/x"], worker_id="ghost")
+
+        assert "ghost" in result["error"]
+        tools._workspace_client.discover_installed_plugin_root.assert_not_called()
+
+    def test_registered_as_mcp_tools_returning_str(self, tools):
+        from ironclaude.orchestrator_mcp import _create_mcp_server
+
+        mcp_server = _create_mcp_server(tools)
+        tools.configure_shared_resources = MagicMock(return_value={"added": ["data/x"]})
+        tools.list_shared_resources = MagicMock(return_value={"entries": []})
+
+        configure_fn = mcp_server._tool_manager.get_tool("configure_shared_resources").fn
+        list_fn = mcp_server._tool_manager.get_tool("list_shared_resources").fn
+
+        assert json.loads(configure_fn("/repo", ["data/x"])) == {"added": ["data/x"]}
+        assert json.loads(list_fn("/repo")) == {"entries": []}

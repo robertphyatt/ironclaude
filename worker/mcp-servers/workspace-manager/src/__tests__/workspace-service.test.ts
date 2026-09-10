@@ -1458,4 +1458,123 @@ describe('WorkspaceService real-Git lifecycle', () => {
       .toMatchObject({ lifecycle_status: 'abandoned' });
     expect(git(root, 'branch', '--list', branch)).not.toBe('');
   });
+
+  it('configureSharedResources appends config and relinks into an ALREADY-LIVE managed worktree', () => {
+    const root = repository();
+    ignoreResources(root, 'models/');
+    seedDirectory(root, 'models', 'weights.bin', 'weights\n');
+    const manager = service(root);
+    // Live worktree created BEFORE the entry is configured (the incident shape).
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    expect(existsSync(join(assignment.worktree_path, 'models'))).toBe(false);
+
+    const result = manager.configureSharedResources({ repositoryPath: root, entries: ['models'] });
+
+    expect(result.added).toEqual(['models']);
+    expect(result.relinked[assignment.worktree_path]).toEqual(['models']);
+    // The live worker now has the data — no respawn.
+    expect(lstatSync(join(assignment.worktree_path, 'models')).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(assignment.worktree_path, 'models', 'weights.bin'), 'utf8')).toBe('weights\n');
+    expect(worktreeIsClean(assignment.worktree_path)).toBe(true);
+    expect(manager.listSharedResources({ repositoryPath: root })).toEqual({ entries: ['models'] });
+  });
+
+  it('configureSharedResources writes a source-absent entry to config but does NOT relink it', () => {
+    const root = repository();
+    const manager = service(root);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+
+    const result = manager.configureSharedResources({ repositoryPath: root, entries: ['absent-data'] });
+
+    expect(result.added).toEqual(['absent-data']);
+    expect(result.relinked[assignment.worktree_path] ?? []).toEqual([]);
+    expect(existsSync(join(assignment.worktree_path, 'absent-data'))).toBe(false);
+    expect(manager.listSharedResources({ repositoryPath: root })).toEqual({ entries: ['absent-data'] });
+  });
+
+  it('configureSharedResources blocks a well-known secret entry from being relinked into a live worktree', () => {
+    const root = repository();
+    const manager = service(root);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+
+    const result = manager.configureSharedResources({ repositoryPath: root, entries: ['.env'] });
+
+    expect(result.secretBlocked).toEqual(['.env']);
+    expect(existsSync(join(assignment.worktree_path, '.env'))).toBe(false);
+  });
+
+  it('configureSharedResources relinks a secret entry into a live worktree when the operator sets allowSecretEntries', () => {
+    const root = repository();
+    ignoreResources(root, '.env');
+    writeFileSync(join(root, '.env'), 'SECRET=1\n');
+    const manager = service(root);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+
+    const result = manager.configureSharedResources({ repositoryPath: root, entries: ['.env'], allowSecretEntries: true });
+
+    expect(result.relinked[assignment.worktree_path]).toEqual(['.env']);
+    expect(lstatSync(join(assignment.worktree_path, '.env')).isSymbolicLink()).toBe(true);
+    expect(worktreeIsClean(assignment.worktree_path)).toBe(true);
+  });
+
+  it('configureSharedResources relinks an already-configured entry once its source appears (present-but-unlinked recovery)', () => {
+    const root = repository();
+    ignoreResources(root, 'models/');
+    const manager = service(root);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    // Configured while the source is absent: written to config, nothing linked.
+    const first = manager.configureSharedResources({ repositoryPath: root, entries: ['models'] });
+    expect(first.added).toEqual(['models']);
+    expect(first.relinked[assignment.worktree_path] ?? []).toEqual([]);
+    expect(existsSync(join(assignment.worktree_path, 'models'))).toBe(false);
+    // Operator provides the source; the Brain re-issues configure to recover.
+    seedDirectory(root, 'models', 'weights.bin', 'weights\n');
+    const second = manager.configureSharedResources({ repositoryPath: root, entries: ['models'] });
+    expect(second.skipped).toEqual(['models']);
+    expect(second.relinked[assignment.worktree_path]).toEqual(['models']);
+    expect(lstatSync(join(assignment.worktree_path, 'models')).isSymbolicLink()).toBe(true);
+    expect(worktreeIsClean(assignment.worktree_path)).toBe(true);
+  });
+
+  it('configureSharedResources does NOT relink into an operator worktree outside the managed root', () => {
+    const root = repository();
+    ignoreResources(root, 'models/');
+    seedDirectory(root, 'models', 'weights.bin', 'weights\n');
+    const manager = service(root);
+    // An operator-created worktree OUTSIDE .ironclaude/worktrees/, with no assignments row.
+    const operatorWt = mkdtempSync(join(tmpdir(), 'ironclaude-operator-wt-'));
+    directories.push(operatorWt);
+    rmSync(operatorWt, { recursive: true, force: true });
+    git(root, 'worktree', 'add', '-b', 'operator-branch', operatorWt);
+
+    const result = manager.configureSharedResources({ repositoryPath: root, entries: ['models'] });
+
+    expect(result.added).toEqual(['models']);
+    // No live assignments row → nothing relinked; the operator worktree is untouched.
+    expect(result.relinked).toEqual({});
+    expect(existsSync(join(operatorWt, 'models'))).toBe(false);
+  });
+
+  it('does NOT relink into a managed worktree whose row is in a TERMINAL lifecycle (integrated), even with the dir on disk', () => {
+    // Discriminating test for the `lifecycle_status NOT IN ('integrated','abandoned','cleaned')`
+    // clause: this is the ONLY case that fails if that clause is deleted (a terminal row
+    // whose worktree dir still exists would then be wrongly relinked).
+    const root = repository();
+    ignoreResources(root, 'models/');
+    seedDirectory(root, 'models', 'weights.bin', 'weights\n');
+    const database = initDb(join(root, 'terminal-lifecycle.db'));
+    const manager = new WorkspaceService(database);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+    // Move the row to a TERMINAL lifecycle while the worktree dir stays on disk.
+    database.prepare("UPDATE assignments SET lifecycle_status = 'integrated' WHERE workspace_guid = ?")
+      .run(assignment.workspace_guid);
+    expect(existsSync(assignment.worktree_path)).toBe(true);
+
+    const result = manager.configureSharedResources({ repositoryPath: root, entries: ['models'] });
+
+    expect(result.added).toEqual(['models']);
+    // Terminal row is excluded by the lifecycle filter → not relinked, no symlink planted.
+    expect(result.relinked[assignment.worktree_path] ?? []).toEqual([]);
+    expect(existsSync(join(assignment.worktree_path, 'models'))).toBe(false);
+  });
 });

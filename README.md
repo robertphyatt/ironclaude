@@ -15,64 +15,14 @@ You can use the Worker alone for single-session discipline, or add the Commander
 
 ---
 
-## What's New in v1.1.8
+## What's New in v1.1.9
 
-- **Bring your own local-model endpoint.** Every spot where IronClaude runs a local model to shadow Claude — plan validation, conversation summarization, and Commander's grader / shadow-grader / session summarization — can now point at any OpenAI-compatible `/v1/chat/completions` server (llama.cpp, vLLM, a self-hosted box, …) alongside Ollama. Set a global default and override any single spot with `spots.<spot>.{backend,model}`; one shared resolution rule governs all three implementations (bash, TypeScript, Python).
-- **Fail-open by construction.** A broken or unreachable backend — a missing `openai` block, a wrong URL, a non-JSON 200 response — degrades through the existing error seams instead of crashing the caller, and per-spot model overrides work on both backends with zero change to existing Ollama request bytes. Block-level `timeout_seconds` is honored per backend, so slow local models don't time out early (and Commander's grader now honors that timeout too, instead of a hardcoded 15s).
-- **Reasoning effort is now per-tier.** Every worker / Brain / grader spawn resolves reasoning effort tier-first — a per-tier override else the global default — so you can dial one tier without touching the rest. An optional `effort_levels` map sits alongside the global `effort_level` (shipped default: global `high`, `fable` `medium`).
-- **GPT-6 Astra is the Codex Fable-tier peer.** `gpt-6-astra` joins the Codex model roster as the top-tier reviewer, giving Codex tier-up plan reviews and advisor consultations a ceiling that matches Claude's Fable.
-- **Reliability fixes.** The get-back-to-work Stop hook no longer misfires "STOP — TASKS STILL IN PROGRESS" on a live subagent when a large transcript's byte-tail cut a record mid-line; Commander's heartbeat routes Brain-owned waits to a distinct "WAITING ON Brain" section instead of mislabeling them as the operator; and PM-on `/commit` / `/commit-and-push` now work in an unassigned primary checkout, scoped to the session's `allowed_files` so a shared checkout's foreign staged files stay out.
-- See [CHANGELOG.md](CHANGELOG.md) for full details.
-
----
-
-## What's New in v1.1.7
-
-- **Human worktree lifecycle verbs.** A managed `/commit` now commits and *stays* in the worktree for continued work (verb 1), and a new `/close-out` integrates a worktree's HEAD into local `main` and tears the worktree down in one step (verb 4) — the reconcile-and-close counterpart to `/reconcile`, which keeps the worktree alive. Landing stays on local `main`; publishing remains the separate, human-only `/push`.
-- **Conflicts become a plain-language conversation, never a dead end.** Merge and rebase conflicts are detected and surfaced in plain language, then resolved interactively — the operator confirms the resolution with a non-forgeable keystroke and the reviewed work lands with its resolved content pinned by provenance and hardened against path traversal. Conflicts are never handed back to the operator to fix by hand and re-run.
-- **Never-lose-work, completed across all three teardown paths.** `/reconcile`, `/commit`, and the reaper/`tombstone` cleanup path all now *preserve* an unfulfilled push obligation instead of recycling it away; a structural backstop makes discarding one impossible, and the daemon reaper surfaces a preserved obligation **once** rather than dropping it or spamming "release failed." A stuck push is a *dropped obligation*, never lost commits — those are already on local `main`, and a manual `/push` completes it. Proven against the deployed build.
-- **The Stop hook stops fighting legitimate work.** The get-back-to-work hook's continuation check is completion-aware — it honors a live in-flight subagent instead of nagging (G1); its execution-lifecycle blocks were retoned to end context anxiety and to defer on an in-flight review; and its professional-mode bypass check no longer false-flags the sanctioned `/deactivate` commit handoff, while a mixed-turn precedence rule keeps real circumvention blocked.
-- **Guards can't be silently reverted, and free-text git verbs don't dead-end.** `session-init` now seeds the shared stable hook dir only when it's empty — an older or staler cached session can no longer overwrite newer deployed guards — and a free-text "commit and push" is guided to the rendered command form instead of refusing. The GitHub Actions CI workflow is removed (local testing only).
-- See [CHANGELOG.md](CHANGELOG.md) for full details.
-
----
-
-## What's New in v1.1.6
-
-- **Human-controlled git, end to end.** New human-only lanes for an unassigned primary checkout — `/commit`, `/push` (ff-only, `--force-with-lease`), and `/commit-and-push` — plus a new `/reconcile` verb that integrates a managed worktree into local `main` and *keeps the worktree alive* for continued work (publishing stays the separate `/push`). Each lane mints single-use authority from your typed command; the model issues the call but can never supply the authority that makes it succeed.
-- **The managed-worktree leak is closed — without losing work.** A reaper reclaims leaked worktree assignments and preserves any reviewed work on a recovery ref, and professional-mode kill-switch invariants guarantee a human is never blocked and that professional-mode-off means no enforcement. Smaller fixes land alongside: a stash-pop no longer un-stages prior tasks, a legacy NULL-guid row no longer crashes the workspace-manager CLI, and Codex Desktop's `/deactivate` and `/commit` gates fire again.
-- **The daemon's worktree auto-recovery is redesigned probe-first — it never mints an empty commit, strands the integration lock, or completes a worker it shouldn't.** `_finalize_and_release_worker` runs a non-mutating status probe *before* anything that can mint, so a frozen/drifted/paused/already-integrated worktree is recovered without re-entering the branch that used to mint an empty commit every cycle; the interrupted-CAS state releases the repo-wide lock instead of stranding it; and a fail-closed abandon guard refuses to remove anything but an active worktree.
-- **The daemon completes nothing — the orchestrator seam owns all completion, and never completes a live worker.** A managed worker is never marked "completed" on a transient error (its reviewed work is preserved for retry), a *live* idle worker whose work integrated stays under monitoring instead of being dropped as a zombie, and a drift held past the retry cap raises a one-time operator alert. The dead-session surface no longer reports "Worker Completed" for a worker it deliberately left preserved-but-uncompleted.
-- **Opus 4.8 still recommended over Opus 5.** Every internal Opus-tier string resolves to `claude-opus-4-8`; see [Model Configuration](#model-configuration).
-- See [CHANGELOG.md](CHANGELOG.md) for full details.
-
----
-
-## What's New in v1.1.5
-
-- **Managed worktrees recover themselves — no external terminal, ever.** Finalize checks for a clean tree before it freezes, recycles the worktree in place so the cwd, GUID, and branch survive across sequential commits, and — when a finalize is interrupted and an assignment freezes at `ready_for_integration` — a new ownership-gated `reconcile_finalization` command completes or aborts the bookkeeping in-session, with no fresh human intent and no sqlite surgery. Stale checkout locks auto-reap with live-owner heartbeats, and integration recovery (deferred cleanup, content-changing rebase resolutions) is completed end-to-end.
-- **Opus 4.8 recommended over Opus 5.** Every internal Opus-tier string now resolves to `claude-opus-4-8` to prevent silent drift to Opus 5 — which in practice is too easily distracted to follow IronClaude's structured workflow reliably. See [Model Configuration](#model-configuration).
-- **Codex grader failures now tell you what broke.** A nonzero exit used to report `stderr or stdout`, truncated from the head — and since `codex exec --json` streams JSONL, that meant 300 characters of `thread.started` boilerplate instead of the actual error. Diagnostics are now extracted tail-first, bounded, and labelled by channel.
-- See [CHANGELOG.md](CHANGELOG.md) for full details.
-
----
-
-## What's New in v1.1.4
-
-- **Managed worktrees, opt-in per session.** Two sessions sharing one checkout and one index overwrite each other silently. Run `/use-managed-worktree` and that session gets its own Git worktree, with file and command paths transparently rewritten into it — so a second session, or a Commander worker, can work the same repository without collision. **Nothing changes unless you ask for it:** professional mode works in your primary checkout by default, exactly as before. `/use-primary-checkout` returns an isolated session to the real checkout. Commander workers always get worktrees, since concurrency is the whole point of running them.
-- **Commit and push became human-only commands.** Committing, pushing, and switching checkouts are minted as single-use authority by the `UserPromptSubmit` hook from *your* typed `/commit`, `/push`, `/commit-and-push`, `/use-primary-checkout`, or `/return-to-managed-worktree`. The model issues the call; it cannot supply the authority that makes the call succeed. Commander can create a reviewed local commit through its own control plane, but it cannot push.
-- **Codex parity for the guard surface.** Codex's native `apply_patch` and `exec_command` previously never reached the PreToolUse guard at all. They now do, and are normalized to their Claude-native equivalents before the human-only config gate and the Commander-only transport gate.
-- **Portability fixes that mattered on macOS.** `realpath -m` is a GNU extension — on BSD/macOS it failed and the fallback returned the raw, unresolved path, leaving path-identity guards inert. A separate `bash` 4-only parameter expansion made the worktree escape check fail *open* on macOS's stock bash 3.2. Both are fixed, `make test` runs every hook suite, and CI exercises them on bash 3.2 and 5.
-- See [CHANGELOG.md](CHANGELOG.md) for full details.
-
----
-
-## What's New in v1.1.0
-
-- **Codex↔Claude parity for workers and grader.** A provider router lets those roles run on OpenAI Codex (`gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-5.6-sol` / `gpt-6-astra`), selected per role in `config/ironclaude.json`. See [CODEX_SETUP.md](CODEX_SETUP.md).
-- **Codex Brain (workflow + memory).** The Brain can run as a persistent `codex app-server` (`BRAIN_CLIENT=codex`) with a read-only sandbox, on-request approval, and a git-command allowlist guard, driving the full brainstorm → plan → execute workflow and episodic memory. Worker-orchestration from the Codex Brain, Brain tool-gating, and Codex advisor wiring are v1.1.1.
-- **Reliability & hygiene.** A periodic session-artifact sweep prunes stale session rows and dead-PID id files; Brain narration is threaded into Slack without re-triggering the earlier restart loop; the Commander test suite runs warning-clean.
-- See [CHANGELOG.md](CHANGELOG.md) for full details.
+- **Brain self-serve worktree shared resources.** Orchestrator MCP tools (`configure_shared_resources` / `list_shared_resources`) let the Brain provision gitignored project data into managed worktrees, relinking new entries into currently-live worktrees so a running worker gets the data without a respawn — closing the operator-free-worktree gap where a worker missing gitignored data would stall. Adds a generalized never-fake-past-a-gate guardrail and hardens the shared-entry validator against control characters and surrounding whitespace.
+- **Commander is far more responsive to the operator.** The idle Brain is now health-probed with `[PING]`/`[PING-ACK]` instead of being restarted every ~30 min (which wiped its prompt cache and context and forced MCP schema re-discovery); threaded `[reply-to:]` replies reach Slack again; a ~3s operator fast lane runs ahead of the 15s sweep lane; background nudges defer while the Brain is mid-turn on operator work; operator-wait alerts are de-duplicated to one per pending directive; and the operator-facing message grader is bounded so a stalled local model can't hang the daemon path.
+- **Guardrail enforcement runs even where the in-process callback is dead.** Under `bypassPermissions` the SDK's in-process `can_use_tool` callback never fires, so the 48h-lookback and Task-fan-out gates are registered as Brain shell hooks via a version-controlled settings sync — the actual live enforcement layer — without disturbing existing hooks.
+- **Responsiveness hardening.** A tolerant `[PING-ACK]` drop keeps a threaded or decorated ack from leaking into Slack, and an in-flight cap on the bounded grader stops a sustained local-model stall from piling up daemon threads.
+- **Codex sessions no longer dead-lock at gates.** Enforcement-hook remediation guidance is now client-aware: a Codex session is told to invoke `$ironclaude:<skill>` (the form it actually has) while Claude keeps the `Skill(...)` tool form. Guidance text only — no block/allow decision changed.
+- See [CHANGELOG.md](CHANGELOG.md) for full details, and `git log` / [CHANGELOG.md](CHANGELOG.md) for earlier releases.
 
 ---
 
@@ -217,6 +167,17 @@ That session then behaves like this:
 If allocation fails, the session stays in the primary checkout and reports the error rather than half-entering isolation.
 
 Commander workers always get their own worktree. Isolation is the reason to run several at once, and they aren't a human who can be surprised by it.
+
+#### Shared resources (gitignored project data)
+
+A managed worktree is a fresh checkout: it does **not** contain gitignored files that live only in the primary checkout (model weights, scanned assets, local caches — anything a task needs but Git does not track). IronClaude provisions these through an explicit per-repository allowlist at `<git-common-dir>/info/worktree-shared-resources` — one relative path per line. On every worktree allocation, each listed path is symlinked from the primary checkout into the new worktree and added to the worktree's `info/exclude`, so the data is present and `git status` stays clean.
+
+Configure it **self-serve** — never by hand-editing the file and never by asking the operator to touch a worktree (operators never fiddle with worktrees). In Commander mode the Brain calls the orchestrator MCP tool `configure_shared_resources(repository_path, entries, worker_id)`: it validates and appends the entries, and **relinks the newly added ones into every currently-live managed worktree for that repo**, so a running worker gets the data without a respawn. `list_shared_resources(repository_path)` reads the current config. A worker that discovers it is missing gitignored data reports the exact path to the Brain as a blocker rather than symlinking anything itself.
+
+- **Explicit entries only.** Each entry must be a plain relative path — no globs, `..`, absolute paths, trailing slashes, or `!`/`#` prefixes. There is no auto-scan of `.gitignore`; you list exactly what to share.
+- **Write-through symlinks.** The shared paths are symlinks back into the primary checkout, so a worker that *writes* to a shared path writes into the primary checkout's real files. Share read-mostly data; treat shared paths as shared state.
+- **Deploy note.** The Brain runtime loads workspace-manager's `cli.js` from the plugin **cache** (a copy), so a newly added `configure_shared_resources` tool takes effect only after a plugin-cache refresh (marketplace reinstall) — not on `npm run build` alone.
+- **Secret paths need approval.** The validator refuses well-known secret paths (`.env`, `.ssh`, `.aws`, private keys) by default; sharing one requires explicit operator approval — the Brain asks, then re-calls with `allow_secret_entries=true` — and the deny-list is defense-in-depth, not exhaustive.
 
 ### Set Up Statusline (Recommended)
 

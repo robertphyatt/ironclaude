@@ -13,7 +13,10 @@ class WorkspaceClientError(RuntimeError):
     """Workspace-manager transport or response failure."""
 
 
-_COMMANDS = frozenset({"allocate", "bind", "finalize", "abandon", "reconcile", "cleanup", "sync", "reap"})
+_COMMANDS = frozenset({
+    "allocate", "bind", "finalize", "abandon", "reconcile", "cleanup", "sync", "reap",
+    "configure-shared-resources", "list-shared-resources",
+})
 
 
 class WorkspaceClient:
@@ -236,3 +239,9 @@ class WorkspaceClient:
 
     def reap(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
         return self._invoke("reap", payload, **transport)
+
+    def configure_shared_resources(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
+        return self._invoke("configure-shared-resources", payload, **transport)
+
+    def list_shared_resources(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
+        return self._invoke("list-shared-resources", payload, **transport)

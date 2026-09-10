@@ -2,7 +2,55 @@
 # Codex Brain parity for BrainClient._tool_guard_logic's stateful MCP action gate.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/hook-logger.sh"
+if ! source "$SCRIPT_DIR/hook-logger.sh" 2>/dev/null; then
+  # Fail-closed: enforcement infra is missing, so the stateful gate below cannot run.
+  # Mirror obs-3's selective fail-closed for the three Claude gates: still BLOCK the
+  # Codex-Brain gated set (the action + game cases, both naming variants) when this is a
+  # codex+brain session; ALLOW arm tools, reads, and every non-codex-brain session.
+  if [ "${IC_ROLE:-}" != "brain" ] || [ "${IRONCLAUDE_CLIENT:-}" != "codex" ]; then
+    exit 0
+  fi
+  _IN=$(cat)
+  _TN=$(echo "$_IN" | jq -r '.tool_name // empty' 2>/dev/null || true)
+  case "$_TN" in
+    mcp__plugin_ironclaude_orchestrator__spawn_worker|\
+    mcp__plugin_ironclaude_orchestrator__spawn_workers|\
+    mcp__plugin_ironclaude_orchestrator__approve_plan|\
+    mcp__plugin_ironclaude_orchestrator__reject_plan|\
+    mcp__plugin_ironclaude_orchestrator__send_to_worker|\
+    mcp__plugin_ironclaude_orchestrator__kill_worker|\
+    mcp__orchestrator__spawn_worker|\
+    mcp__orchestrator__spawn_workers|\
+    mcp__orchestrator__approve_plan|\
+    mcp__orchestrator__reject_plan|\
+    mcp__orchestrator__send_to_worker|\
+    mcp__orchestrator__kill_worker|\
+    mcp__plugin_ironclaude_ollama__pull_model|\
+    mcp__plugin_ironclaude_ollama__remove_model|\
+    mcp__plugin_ironclaude_ollama__create_model|\
+    mcp__ollama__pull_model|\
+    mcp__ollama__remove_model|\
+    mcp__ollama__create_model|\
+    mcp__plugin_ironclaude_orchestrator__game_launch|\
+    mcp__plugin_ironclaude_orchestrator__game_screenshot|\
+    mcp__plugin_ironclaude_orchestrator__game_click|\
+    mcp__plugin_ironclaude_orchestrator__game_type|\
+    mcp__plugin_ironclaude_orchestrator__game_key|\
+    mcp__plugin_ironclaude_orchestrator__game_kill|\
+    mcp__orchestrator__game_launch|\
+    mcp__orchestrator__game_screenshot|\
+    mcp__orchestrator__game_click|\
+    mcp__orchestrator__game_type|\
+    mcp__orchestrator__game_key|\
+    mcp__orchestrator__game_kill)
+      echo "✗ [codex-brain-gated-actions]: Blocked - IronClaude hook-logger.sh missing; enforcement cannot run. Run 'make deploy-hooks', then retry." >&2
+      exit 2
+      ;;
+    *)
+      exit 0
+      ;;
+  esac
+fi
 run_hook "codex-brain-gated-actions"
 
 INPUT=$(cat)

@@ -18,6 +18,7 @@ import {
 } from './db.js';
 import { pushPendingSummary } from './integration.js';
 import {
+  addSharedResourceEntries,
   addWorktree,
   deleteTemporaryBranch,
   discoverRepository,
@@ -38,6 +39,24 @@ import type { Assignment, AssignmentLifecycle, HumanIntentReceipt } from './type
 
 interface RepositoryRequest {
   repositoryPath: string;
+}
+
+interface ConfigureSharedResourcesInput extends RepositoryRequest {
+  entries: readonly string[];
+  allowSecretEntries?: boolean;
+}
+
+interface ConfigureSharedResourcesResult {
+  added: string[];
+  skipped: string[];
+  rejected: string[];
+  secretBlocked: string[];
+  entries: string[];
+  relinked: Record<string, string[]>;
+}
+
+interface ListSharedResourcesResult {
+  entries: string[];
 }
 
 interface AssignmentRequest extends RepositoryRequest {
@@ -869,5 +888,54 @@ export class WorkspaceService {
         .sort(),
       ambiguousWorktreePaths,
     };
+  }
+
+  /**
+   * Current explicit shared-resource entries configured for the repository,
+   * wrapped in an object. The return MUST be an object (not a bare array): the
+   * Commander's WorkspaceClient._decode rejects any non-object JSON response, so a
+   * bare array would make the orchestrator list tool error on every real call.
+   */
+  listSharedResources(input: RepositoryRequest): ListSharedResourcesResult {
+    const repository = discoverRepository(input.repositoryPath);
+    return { entries: readSharedResourceConfig(repository.repositoryIdentity) };
+  }
+
+  /**
+   * Add explicit shared-resource entries for a repository and relink the newly
+   * added ones into every currently-live MANAGED worktree, so a running worker
+   * gets the data without a respawn. Only live managed worktrees (rows in the
+   * assignments table, non-terminal, still on disk) are relinked — operator-created
+   * or orphaned worktrees are never touched. `relinked` reports the entries actually
+   * planted per worktree (a source-absent entry is written to config but not linked).
+   */
+  configureSharedResources(input: ConfigureSharedResourcesInput): ConfigureSharedResourcesResult {
+    const repository = discoverRepository(input.repositoryPath);
+    const written = addSharedResourceEntries(repository.repositoryIdentity, input.entries, input.allowSecretEntries ?? false);
+    const relinked: Record<string, string[]> = {};
+    // Relink every safe in-config entry from this request (added ∪ skipped), not
+    // just newly-added ones: an entry configured while its source was absent is
+    // written to config but never linked, and the Brain's recovery re-issues it
+    // (so it arrives as `skipped`, already present). linkSharedResources is
+    // idempotent (pathPresent skip), so already-linked entries are no-ops.
+    const toRelink = [...written.added, ...written.skipped];
+    if (toRelink.length > 0) {
+      const liveManaged = this.db.prepare(`
+        SELECT worktree_path FROM assignments
+        WHERE repository_identity = ?
+          AND lifecycle_status NOT IN ('integrated', 'abandoned', 'cleaned')
+      `).all(repository.repositoryIdentity) as { worktree_path: string }[];
+      for (const { worktree_path } of liveManaged) {
+        if (!existsSync(worktree_path)) continue;
+        const planted = linkSharedResources(
+          repository.primaryCheckoutPath,
+          worktree_path,
+          repository.repositoryIdentity,
+          toRelink,
+        );
+        if (planted.length > 0) relinked[worktree_path] = planted;
+      }
+    }
+    return { ...written, relinked };
   }
 }

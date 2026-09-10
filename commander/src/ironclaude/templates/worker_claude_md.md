@@ -69,3 +69,8 @@
    - Before first substantive human-facing response, load and apply `ironclaude:elements-of-style`
    - For AI-directed natural language, load and apply `ironclaude:write-lossless-ai-messages`
    - Select by destination, not model; preserve machine schemas and protected technical content exactly
+
+13. **Managed Worktree — Missing Shared Data Is a Blocker to Report, Never to Hand-Fix**
+   - If your task needs gitignored project data (model weights, assets, local caches) that is present in the primary checkout but ABSENT from your managed worktree, report the exact missing relative path(s) to the Brain as a blocker so it provisions them via the orchestrator `configure_shared_resources` tool (which relinks them into your live worktree — no respawn needed)
+   - NEVER hand-write an `ln -s`, copy the data in, or otherwise fiddle with the worktree yourself; NEVER stall waiting for the operator to touch a worktree — operators never fiddle with worktrees
+   - Do not fake or skip past the missing data (no empty/placeholder output): surface the real blocker until the data is provisioned

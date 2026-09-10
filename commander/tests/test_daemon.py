@@ -390,6 +390,47 @@ class TestBrainNarrationThreading:
         daemon.brain.send_message.assert_not_called()
         daemon.slack.post_message.assert_not_called()
 
+    def test_ping_ack_is_not_relayed(self, daemon):
+        """R1: the Brain's [PING-ACK] reply to an idle health probe is a liveness
+        ack only — never posted to Slack (prefixed or bare)."""
+        from ironclaude.brain_client import _NARRATION_PREFIX
+        daemon._last_heartbeat_ts = "1234.5"  # a thread exists; still must not post
+        for resp in (f"{_NARRATION_PREFIX}[PING-ACK]", "[PING-ACK]"):
+            daemon.slack.post_message.reset_mock()
+            daemon.brain.get_pending_responses = lambda r=resp: [r]
+            daemon.poll_brain_responses()
+            daemon.slack.post_message.assert_not_called()
+
+    def test_ping_ack_tolerant_drop(self, daemon):
+        """FIX 1: a [PING-ACK] the Brain threads (leading [reply-to:...] marker) or
+        appends a token to is still a liveness ack — never posted to Slack. A real
+        narration that leads with the token but runs long IS delivered (the len bound
+        keeps the drop from over-widening)."""
+        from ironclaude.brain_client import _NARRATION_PREFIX
+        daemon._db = MagicMock()               # let the reply-to branch run fully
+        daemon._db.in_transaction = False      # so persist_ack does not raise (idle-conn guard)
+        daemon._last_heartbeat_ts = "1234.5"   # a narration thread exists
+
+        # Positive: threaded ack (would otherwise post + ✅ via the reply-to branch)
+        daemon.slack.reset_mock()
+        daemon.brain.get_pending_responses = lambda: [f"{_NARRATION_PREFIX}[reply-to:123.456] [PING-ACK]"]
+        daemon.poll_brain_responses()
+        daemon.slack.post_message.assert_not_called()
+        daemon.slack.add_reaction.assert_not_called()
+
+        # Positive: trailing-token ack (would otherwise post via the narration branch)
+        daemon.slack.reset_mock()
+        daemon.brain.get_pending_responses = lambda: [f"{_NARRATION_PREFIX}[PING-ACK]."]
+        daemon.poll_brain_responses()
+        daemon.slack.post_message.assert_not_called()
+
+        # Negative (bounds the guard): a long narration leading with the token is delivered.
+        daemon.slack.reset_mock()
+        long_narration = f"{_NARRATION_PREFIX}[PING-ACK] and then I did a great many other things that make this message unambiguously a real narration well beyond sixty characters."
+        daemon.brain.get_pending_responses = lambda: [long_narration]
+        daemon.poll_brain_responses()
+        daemon.slack.post_message.assert_called()
+
 
 class TestCheckWorkersDoneMarker:
     def test_done_marker_notifies_brain_idle(self, daemon):
@@ -1934,6 +1975,285 @@ class TestDaemonProcessGroupIsolation:
              pytest.raises(SystemExit):
             main_module.main()
         # No crash = pass
+
+    def test_main_does_not_attach_daemon_log_handler_under_pytest(self):
+        """SF1: under pytest (PYTEST_CURRENT_TEST set), main() must NOT attach the
+        live /tmp/ic/daemon.log RotatingFileHandler — test runs that call main()
+        would else pollute the real daemon log and corrupt latency stats."""
+        import logging as _logging
+        from logging.handlers import RotatingFileHandler as _RFH
+        import ironclaude.main as main_module
+
+        root = _logging.getLogger()
+        before = list(root.handlers)
+
+        def stop_lock():
+            raise SystemExit(0)
+
+        try:
+            with patch.object(main_module.os, 'setpgid', lambda *a: None), \
+                 patch.object(main_module, '_acquire_singleton_lock', side_effect=stop_lock), \
+                 pytest.raises(SystemExit):
+                main_module.main()
+            added_daemon_log = [
+                h for h in root.handlers
+                if h not in before
+                and isinstance(h, _RFH)
+                and getattr(h, "baseFilename", "").endswith("daemon.log")
+            ]
+            assert not added_daemon_log, "daemon.log handler must not attach under pytest"
+        finally:
+            for h in list(root.handlers):
+                if h not in before:
+                    root.removeHandler(h)
+
+
+class TestOperatorFastLane:
+    """R3: operator-facing I/O (Slack commands, Brain responses, send-queue flush)
+    runs on a ~3s fast lane; heavy worker/heartbeat sweeps stay on the 15s slow
+    lane; the awaiting-operator classifier grade is bounded off the fast lane."""
+
+    def test_fast_lane_runs_more_often_than_slow_sweep(self, daemon, monkeypatch):
+        import ironclaude.main as main_module
+        counts = {}
+
+        def counter(name):
+            def _f(*a, **k):
+                counts[name] = counts.get(name, 0) + 1
+            return _f
+
+        for name in ("poll_slack_commands", "poll_brain_responses", "check_brain",
+                     "process_brain_decisions", "check_workers",
+                     "check_directive_capability_blocks", "check_confirmed_directives",
+                     "check_idle_enforcement", "check_post_kill_sweep",
+                     "check_message_aging", "post_heartbeat", "_run_maintenance",
+                     "_sweep_expired_push_requests"):
+            monkeypatch.setattr(daemon, name, counter(name))
+        daemon.slack.flush_queue = counter("flush_queue")
+        daemon._paused = False
+        daemon.config["poll_interval_seconds"] = 15
+        daemon.config["fast_poll_interval_seconds"] = 3
+
+        clock = {"t": 0.0}
+        state = {"n": 0}
+        monkeypatch.setattr(main_module.time, "monotonic", lambda: clock["t"])
+
+        def fake_sleep(s):
+            clock["t"] += s
+            state["n"] += 1
+            if state["n"] >= 10:
+                daemon._running = False
+        monkeypatch.setattr(main_module.time, "sleep", fake_sleep)
+
+        daemon._running = True
+        daemon.run()
+
+        assert counts["poll_slack_commands"] == 10           # fast lane: every tick
+        assert counts["flush_queue"] == 10                   # flush on the fast lane
+        assert counts["check_workers"] < counts["poll_slack_commands"]  # slow < fast
+        assert counts["check_workers"] >= 2                  # slow lane still runs
+
+    def test_awaiting_grade_is_bounded_off_the_fast_lane(self, daemon):
+        import time as _t
+        from unittest.mock import MagicMock
+        daemon.config["fast_lane_grade_timeout_seconds"] = 0.3
+        daemon._db = None
+        daemon._grader = MagicMock()
+
+        def slow_grade(*a, **k):
+            _t.sleep(5)  # simulate an empty-Ollama stall
+            return {"waiting_on": "operator", "worker_id": "w1", "question": "?"}
+        daemon._grader.grade.side_effect = slow_grade
+
+        started = _t.monotonic()
+        captured = daemon._maybe_capture_operator_wait("Still holding, awaiting your decision")
+        elapsed = _t.monotonic() - started
+
+        assert captured is False           # bound elapsed → not captured
+        assert elapsed < 2.0               # returned at the ~0.3s bound, not the 5s stall
+
+
+class TestOperatorPriorityNudgeGating:
+    """R4: while the Brain is mid-turn on operator work (_executing_tool is True),
+    background idle/grader/stuck nudges are suppressed so they never compete with
+    the operator's own request. The idle clock keeps accumulating; nudges resume
+    when the turn completes. Gated on `is True` so the MagicMock brains used in
+    other tests (truthy _executing_tool) are unaffected."""
+
+    def test_idle_escalation_suppressed_while_brain_executing(self, daemon):
+        import time as _t
+        daemon.registry.get_recent_workers.return_value = []
+        daemon._db = None
+        daemon._get_unprocessed_messages = lambda: ["m1"]  # pending work exists
+        daemon._last_idle_check = 0.0
+        daemon._idle_enforcement_start = _t.time() - 400  # tier-3 territory
+        daemon._idle_escalation_tier = 0
+        daemon._operator_notified_idle = False
+        daemon.brain._executing_tool = True  # busy on operator work
+
+        daemon.check_idle_enforcement()
+
+        daemon.brain.send_message.assert_not_called()   # escalation nudge suppressed
+        daemon.slack.post_message.assert_not_called()   # [ALERT] suppressed
+        assert daemon._idle_enforcement_start != 0.0     # idle clock kept accumulating
+
+    def test_idle_escalation_resumes_when_not_executing(self, daemon):
+        import time as _t
+        daemon.registry.get_recent_workers.return_value = []
+        daemon._db = None
+        daemon._get_unprocessed_messages = lambda: ["m1"]
+        daemon._last_idle_check = 0.0
+        daemon._idle_enforcement_start = _t.time() - 400
+        daemon._idle_escalation_tier = 0
+        daemon._operator_notified_idle = False
+        daemon.brain._executing_tool = False  # not busy
+
+        daemon.check_idle_enforcement()
+
+        daemon.brain.send_message.assert_called()   # tier-3 CRITICAL nudge fires
+
+    def test_grader_check_suppressed_while_brain_executing(self, daemon, tmp_path):
+        daemon._db = init_db(str(tmp_path / "gc.db"))
+        daemon._db.execute(
+            "INSERT INTO directives (source_ts, source_text, interpretation, status) "
+            "VALUES ('1.1', 'txt', 'do x', 'confirmed')"
+        )
+        daemon._db.commit()
+        daemon.registry.get_recent_workers.return_value = []
+        daemon._prompt_store = lambda: None
+        daemon._last_heartbeat = 0.0
+        daemon.brain._executing_tool = True
+
+        daemon.post_heartbeat(now=10_000.0)
+
+        assert not any(
+            "GRADER CHECK" in str(c.args[0])
+            for c in daemon.brain.send_message.call_args_list if c.args
+        )
+
+
+class TestBrainSettingsHookSync:
+    """SF2: register repo-declared PreToolUse hooks into the Brain's settings.json
+    via a template-driven, idempotent, non-clobbering merge that preserves every
+    existing PreToolUse entry and the entire PostToolUse block."""
+
+    @staticmethod
+    def _real_settings():
+        H = "$HOME/.claude/ironclaude-hooks"
+        B = "$HOME/.ironclaude/brain/hooks"
+        return {
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": f"bash {B}/block-push.sh"}]},
+                    {"matcher": "", "hooks": [{"type": "command", "command": f"bash {H}/memory-search-enforcer.sh"}]},
+                    {"matcher": "", "hooks": [{"type": "command", "command": f"bash {H}/wiki-synthesis-enforcer.sh"}]},
+                    {"matcher": "", "hooks": [{"type": "command", "command": f"bash {H}/attention-sweep-enforcer.sh"}]},
+                ],
+                "PostToolUse": [
+                    {"matcher": "mcp__orchestrator__get_worker_status", "hooks": [{"type": "command", "command": f"bash {H}/attention-sweep-arm.sh"}]},
+                    {"matcher": "mcp__orchestrator__update_ledger", "hooks": [{"type": "command", "command": f"bash {B}/block-pin-enforcer.sh"}]},
+                ],
+            }
+        }
+
+    def test_sync_appends_preserves_all_deploys_and_is_idempotent(self, tmp_path):
+        import json as _json
+        from ironclaude.main import _sync_brain_settings_hooks
+
+        lookback_cmd = "bash $HOME/.claude/ironclaude-hooks/startup-lookback-enforcer.sh"
+        template = {"PreToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": lookback_cmd}]}]}
+        template_path = tmp_path / "brain_settings_hooks.json"
+        template_path.write_text(_json.dumps(template))
+        settings_path = tmp_path / "settings.json"
+        original = self._real_settings()
+        settings_path.write_text(_json.dumps(original))
+        hooks_src = tmp_path / "src_hooks"
+        hooks_src.mkdir()
+        (hooks_src / "startup-lookback-enforcer.sh").write_text("#!/bin/bash\nexit 0\n")
+        hooks_dst = tmp_path / "dst_hooks"
+
+        _sync_brain_settings_hooks(str(template_path), str(settings_path), str(hooks_src), str(hooks_dst))
+
+        result = _json.loads(settings_path.read_text())
+        pre_cmds = [h["command"] for e in result["hooks"]["PreToolUse"] for h in e["hooks"]]
+        # every original PreToolUse command preserved
+        for e in original["hooks"]["PreToolUse"]:
+            for h in e["hooks"]:
+                assert h["command"] in pre_cmds
+        # lookback appended exactly once
+        assert pre_cmds.count(lookback_cmd) == 1
+        # PostToolUse byte-identical — block-pin-enforcer NOT dropped
+        assert result["hooks"]["PostToolUse"] == original["hooks"]["PostToolUse"]
+        # referenced script deployed
+        assert (hooks_dst / "startup-lookback-enforcer.sh").is_file()
+
+        # idempotent: a second run leaves exactly one lookback entry
+        _sync_brain_settings_hooks(str(template_path), str(settings_path), str(hooks_src), str(hooks_dst))
+        result2 = _json.loads(settings_path.read_text())
+        pre_cmds2 = [h["command"] for e in result2["hooks"]["PreToolUse"] for h in e["hooks"]]
+        assert pre_cmds2.count(lookback_cmd) == 1
+        assert result2["hooks"]["PostToolUse"] == original["hooks"]["PostToolUse"]
+
+    def test_sync_leaves_corrupt_settings_untouched(self, tmp_path):
+        """A corrupt settings.json must NOT be clobbered — overwriting it with only
+        the template entries would silently drop the existing guardrail hooks."""
+        import json as _json
+        from ironclaude.main import _sync_brain_settings_hooks
+
+        template = {"PreToolUse": [{"matcher": "", "hooks": [{"type": "command",
+                    "command": "bash $HOME/.claude/ironclaude-hooks/startup-lookback-enforcer.sh"}]}]}
+        template_path = tmp_path / "brain_settings_hooks.json"
+        template_path.write_text(_json.dumps(template))
+        settings_path = tmp_path / "settings.json"
+        corrupt = '{"hooks": {"PreToolUse": [ THIS IS NOT JSON'
+        settings_path.write_text(corrupt)
+        hooks_src = tmp_path / "src_hooks"
+        hooks_src.mkdir()
+        (hooks_src / "startup-lookback-enforcer.sh").write_text("#!/bin/bash\nexit 0\n")
+
+        _sync_brain_settings_hooks(str(template_path), str(settings_path),
+                                   str(hooks_src), str(tmp_path / "dst"))
+
+        # File is left exactly as-is for a human to repair (not overwritten).
+        assert settings_path.read_text() == corrupt
+
+    def test_template_includes_agent_task_gate_entry(self):
+        """R5a: the version-controlled template declares the brain-task-gate hook with
+        matcher 'Agent|Task', so the Task-8 sync deploys + registers it."""
+        import json as _json
+        import os as _os
+        import ironclaude.main as _m
+        repo_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(_m.__file__))))
+        template_path = _os.path.join(repo_root, "src", "brain", "brain_settings_hooks.json")
+        with open(template_path) as f:
+            template = _json.load(f)
+        gate = [
+            e for e in template["PreToolUse"]
+            if any("brain-task-gate.sh" in h.get("command", "") for h in e["hooks"])
+        ]
+        assert gate, "brain-task-gate.sh entry missing from brain_settings_hooks.json"
+        assert gate[0]["matcher"] == "Agent|Task"
+
+    def test_sync_creates_settings_when_missing(self, tmp_path):
+        """A missing settings.json is fine — create it with the template entries."""
+        import json as _json
+        from ironclaude.main import _sync_brain_settings_hooks
+
+        lookback_cmd = "bash $HOME/.claude/ironclaude-hooks/startup-lookback-enforcer.sh"
+        template = {"PreToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": lookback_cmd}]}]}
+        template_path = tmp_path / "brain_settings_hooks.json"
+        template_path.write_text(_json.dumps(template))
+        settings_path = tmp_path / "nested" / "settings.json"  # dir does not exist yet
+        hooks_src = tmp_path / "src_hooks"
+        hooks_src.mkdir()
+        (hooks_src / "startup-lookback-enforcer.sh").write_text("#!/bin/bash\nexit 0\n")
+
+        _sync_brain_settings_hooks(str(template_path), str(settings_path),
+                                   str(hooks_src), str(tmp_path / "dst"))
+
+        result = _json.loads(settings_path.read_text())
+        cmds = [h["command"] for e in result["hooks"]["PreToolUse"] for h in e["hooks"]]
+        assert cmds == [lookback_cmd]
 
 
 class TestCrashRespawner:
@@ -3543,6 +3863,24 @@ class TestSolicitedReply:
         )
         daemon.slack.add_reaction.assert_called_once_with("white_check_mark", "1700000000.123456")
 
+    def test_narration_prefixed_reply_marker_still_threads(self, daemon, tmp_path):
+        """R2: the Brain prepends _NARRATION_PREFIX to ALL its text, which defeats
+        parse_reply_to_marker's leading-[reply-to: check. A marker-led reply must
+        still thread under the operator ts with a ✅, not fall through to narration."""
+        from ironclaude.brain_client import _NARRATION_PREFIX
+        daemon._db = init_db(str(tmp_path / "reply-ack.db"))
+        daemon.brain.get_pending_responses.return_value = [
+            f"{_NARRATION_PREFIX}[reply-to:1700000000.123456] #12 completed requested work"
+        ]
+        daemon.slack.post_message.return_value = "1700000001.000001"
+
+        daemon.poll_brain_responses()
+
+        daemon.slack.post_message.assert_called_once_with(
+            "*Brain:* #12 completed requested work", thread_ts="1700000000.123456"
+        )
+        daemon.slack.add_reaction.assert_called_once_with("white_check_mark", "1700000000.123456")
+
     def test_solicited_reply_does_not_react_when_delivery_is_incomplete(self, daemon):
         daemon.brain.get_pending_responses.return_value = [
             "[reply-to:1700000000.123456] #12 completed requested work"
@@ -4626,3 +4964,99 @@ class TestDeadSessionAccurateSurface:
         assert disposition2 == "held"
         assert daemon.slack.post_message.call_count == 1
         assert daemon.brain.send_message.call_count == 1
+
+
+class TestGradeBoundedInFlightCap:
+    def test_second_call_while_in_flight_returns_none_without_second_grade(self, daemon):
+        """FIX 2: while one bounded grade is still running (abandoned past its
+        timeout), a second call returns None immediately and does NOT invoke the
+        grader again — capping concurrent grade threads at one. Once the abandoned
+        worker finishes, the flag clears and a later call proceeds."""
+        import threading as _t
+        import time as _time
+        gate = _t.Event()
+        calls = []
+
+        def _blocking_grade(system, user, schema):
+            calls.append(1)
+            gate.wait(5)
+            return {"ok": True}
+
+        daemon._grader = MagicMock()
+        daemon._grader.grade.side_effect = _blocking_grade
+
+        # First call abandons at the tiny timeout; the flag stays set.
+        assert daemon._grade_bounded("s", "u", None, timeout=0.1) is None
+        # Second call while the first is in flight: immediate None, grade NOT re-invoked.
+        assert daemon._grade_bounded("s", "u", None, timeout=0.1) is None
+        assert len(calls) == 1
+
+        # Release the abandoned worker; its finally clears the flag.
+        gate.set()
+        for _ in range(100):
+            if not daemon._grade_in_flight:
+                break
+            _time.sleep(0.05)
+        assert daemon._grade_in_flight is False
+        # A subsequent call now proceeds and invokes the grader again.
+        assert daemon._grade_bounded("s", "u", None, timeout=2) == {"ok": True}
+        assert len(calls) == 2
+
+
+class TestCodexBrainExecutingToolAttr:
+    def test_idle_enforcement_does_not_crash_on_real_codex_brain(self, tmp_path):
+        """C1 regression: CodexBrainClient lacked _executing_tool, so the R4 gating
+        deref at main.py:4417 AttributeError'd and crash-looped the daemon under
+        BRAIN_CLIENT=codex. A MagicMock brain hides the gap; a real client exposes it."""
+        import time as _t
+        from ironclaude.codex_brain_client import CodexBrainClient
+        slack = MagicMock()
+        registry = MagicMock()
+        registry.get_recent_workers.return_value = []
+        tmux = MagicMock()
+        tmux.log_dir = str(tmp_path / "logs")
+        os.makedirs(tmux.log_dir, exist_ok=True)
+        d = IroncladeDaemon({"tmp_dir": str(tmp_path)}, slack, None, registry, tmux, CodexBrainClient())
+        d._state_manager_db_path = str(tmp_path / "state-manager.db")
+        d._db = None
+        d._get_unprocessed_messages = lambda: ["m1"]
+        d._last_idle_check = 0.0
+        d._idle_enforcement_start = _t.time() - 400
+        d._idle_escalation_tier = 0
+        d._operator_notified_idle = False
+
+        # Load-bearing regression assertion: this call must NOT raise AttributeError.
+        d.check_idle_enforcement()
+
+        # The inert Codex semantic is pinned.
+        assert d.brain._executing_tool is False
+
+
+def test_brain_settings_hooks_template_lists_all_three_gates():
+    """#1: _sync_brain_settings_hooks only deploys+registers hooks named in this
+    template. All three commander Brain gates must be listed so their scripts reach
+    the stable dir on daemon start (else a source fix — e.g. obs-3's memory-search
+    fail-closed — never reaches prod)."""
+    import json as _json
+    from pathlib import Path
+    template = _json.loads(
+        (Path(__file__).resolve().parents[1] / "src" / "brain" / "brain_settings_hooks.json").read_text()
+    )
+    cmds = "\n".join(
+        h.get("command", "")
+        for e in template.get("PreToolUse", [])
+        for h in e.get("hooks", [])
+    )
+    assert "brain-task-gate.sh" in cmds
+    assert "startup-lookback-enforcer.sh" in cmds
+    assert "memory-search-enforcer.sh" in cmds
+    # obs-6(c): every command must use $HOME, not ~. _sync appends an entry only when its
+    # exact command string is absent, so a ~-vs-$HOME drift would register a SECOND copy of a
+    # gate; memory-search rm -f's its arm flag each pass, so a double-registration blocks every
+    # gated action. Pin the exact deployed prefix.
+    for e in template.get("PreToolUse", []):
+        for h in e.get("hooks", []):
+            cmd = h.get("command", "")
+            assert cmd.startswith("bash $HOME/.claude/ironclaude-hooks/"), (
+                f"template hook command must use $HOME (not ~); got: {cmd!r}"
+            )

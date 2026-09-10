@@ -620,6 +620,60 @@ function readSharedResourceConfig(repositoryIdentity) {
   if (!existsSync(configPath)) return [];
   return readFileSync(configPath, "utf8").split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0 && !line.startsWith("#"));
 }
+function addSharedResourceEntries(repositoryIdentity, entries, allowSecretEntries = false) {
+  const configPath = path2.join(repositoryIdentity, "info", SHARED_RESOURCE_CONFIG);
+  const present = new Set(readSharedResourceConfig(repositoryIdentity));
+  const added = [];
+  const skipped = [];
+  const rejected = [];
+  const secretBlocked = [];
+  for (const entry of entries) {
+    if (!isSafeSharedEntry(entry)) {
+      rejected.push(entry);
+      continue;
+    }
+    if (!allowSecretEntries && isSecretEntry(entry)) {
+      secretBlocked.push(entry);
+      continue;
+    }
+    if (present.has(entry)) {
+      skipped.push(entry);
+      continue;
+    }
+    present.add(entry);
+    added.push(entry);
+  }
+  if (added.length > 0) {
+    mkdirSync(path2.dirname(configPath), { recursive: true });
+    const existing = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
+    const separator = existing.length === 0 || existing.endsWith("\n") ? "" : "\n";
+    writeFileSync(configPath, existing + separator + added.map((entry) => `${entry}
+`).join(""));
+  }
+  return { added, skipped, rejected, secretBlocked, entries: [...present] };
+}
+function isSecretEntry(entry) {
+  const lower = entry.split("/").map((s) => s.toLowerCase());
+  const SECRET_DIRS = /* @__PURE__ */ new Set([".ssh", ".aws", ".gnupg"]);
+  if (lower.some((s) => SECRET_DIRS.has(s))) return true;
+  const base = lower[lower.length - 1];
+  const SECRET_FILES = /* @__PURE__ */ new Set([
+    ".env",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "credentials"
+  ]);
+  if (SECRET_FILES.has(base)) return true;
+  if (base.startsWith(".env.")) return true;
+  if (/\.(pem|key|p12|pfx)$/.test(base)) return true;
+  return false;
+}
 function isSafeSharedEntry(entry) {
   if (entry.length === 0) return false;
   if (entry.startsWith("!") || entry.startsWith("#")) return false;
@@ -627,7 +681,9 @@ function isSafeSharedEntry(entry) {
   if (entry.endsWith("/")) return false;
   if (entry.includes("\\")) return false;
   if (/[*?[\]]/.test(entry)) return false;
-  if (entry.split("/").some((segment) => segment === "..")) return false;
+  if (entry.split("/").some((segment) => segment === ".." || segment === "." || segment === "")) return false;
+  if (entry !== entry.trim()) return false;
+  if (/[\x00-\x1f]/.test(entry)) return false;
   return true;
 }
 function pathPresent(target) {
@@ -665,6 +721,7 @@ function linkSharedResources(primaryCheckoutPath, worktreePath, repositoryIdenti
   if (linked.length > 0) {
     ensureExcludeEntries(repositoryIdentity, linked);
   }
+  return linked;
 }
 function removeWorktree(primaryCheckoutPath, worktreePath) {
   runGit(primaryCheckoutPath, ["worktree", "remove", "--", worktreePath]);
@@ -1616,6 +1673,48 @@ var WorkspaceService = class {
       missingWorktreePaths: assignments.map((assignment) => path6.resolve(assignment.worktree_path)).filter((worktreePath) => !observedPaths.has(worktreePath)).sort(),
       ambiguousWorktreePaths
     };
+  }
+  /**
+   * Current explicit shared-resource entries configured for the repository,
+   * wrapped in an object. The return MUST be an object (not a bare array): the
+   * Commander's WorkspaceClient._decode rejects any non-object JSON response, so a
+   * bare array would make the orchestrator list tool error on every real call.
+   */
+  listSharedResources(input) {
+    const repository = discoverRepository(input.repositoryPath);
+    return { entries: readSharedResourceConfig(repository.repositoryIdentity) };
+  }
+  /**
+   * Add explicit shared-resource entries for a repository and relink the newly
+   * added ones into every currently-live MANAGED worktree, so a running worker
+   * gets the data without a respawn. Only live managed worktrees (rows in the
+   * assignments table, non-terminal, still on disk) are relinked — operator-created
+   * or orphaned worktrees are never touched. `relinked` reports the entries actually
+   * planted per worktree (a source-absent entry is written to config but not linked).
+   */
+  configureSharedResources(input) {
+    const repository = discoverRepository(input.repositoryPath);
+    const written = addSharedResourceEntries(repository.repositoryIdentity, input.entries, input.allowSecretEntries ?? false);
+    const relinked = {};
+    const toRelink = [...written.added, ...written.skipped];
+    if (toRelink.length > 0) {
+      const liveManaged = this.db.prepare(`
+        SELECT worktree_path FROM assignments
+        WHERE repository_identity = ?
+          AND lifecycle_status NOT IN ('integrated', 'abandoned', 'cleaned')
+      `).all(repository.repositoryIdentity);
+      for (const { worktree_path } of liveManaged) {
+        if (!existsSync2(worktree_path)) continue;
+        const planted = linkSharedResources(
+          repository.primaryCheckoutPath,
+          worktree_path,
+          repository.repositoryIdentity,
+          toRelink
+        );
+        if (planted.length > 0) relinked[worktree_path] = planted;
+      }
+    }
+    return { ...written, relinked };
   }
 };
 

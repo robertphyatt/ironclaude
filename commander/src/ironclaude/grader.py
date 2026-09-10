@@ -53,6 +53,7 @@ class LocalGrader:
         self._openai_model: str | None = None
         self._openai_max_tokens: int | None = None
         self._spot_model: str | None = None
+        self._spot_thinking: bool = False
 
     @staticmethod
     def _build_infrastructure_error(detail: str) -> dict:
@@ -74,6 +75,7 @@ class LocalGrader:
                 cfg = {}
             resolved = resolve_backend(cfg, "grader")
             self._spot_model = ((cfg.get("spots") or {}).get("grader") or {}).get("model")
+            self._spot_thinking = bool(((cfg.get("spots") or {}).get("grader") or {}).get("thinking", False))
             timeout = (
                 self._timeout_override if self._timeout_override is not None
                 else (resolved.timeout if resolved.timeout is not None else 120)
@@ -132,6 +134,10 @@ class LocalGrader:
                     "type": "json_schema",
                     "json_schema": {"name": "verdict", "schema": schema},
                 }
+            if not self._spot_thinking:
+                # A STRICT OpenAI endpoint that rejects chat_template_kwargs (400) degrades to infrastructure_error; set spots.grader.thinking:true to send neither field for such endpoints.
+                payload["reasoning_effort"] = "none"
+                payload["chat_template_kwargs"] = {"enable_thinking": False}
         else:
             model = self._spot_model or self._cfg.get("model", _DEFAULT_MODEL)
             payload = {

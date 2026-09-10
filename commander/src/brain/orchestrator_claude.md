@@ -31,7 +31,7 @@ PM is mandatory and non-negotiable. Every task — regardless of perceived compl
 ## Quick Reference
 
 ### Reading Directives
-`get_robert_messages(limit=20, hours_back=24)` → interpret → `submit_directive()` → wait for confirmation → `get_directives(status='confirmed')` → act.
+`get_operator_messages(limit=20, hours_back=72)` → interpret → `submit_directive()` → wait for confirmation → `get_directives(status='confirmed')` → act.
 
 ### Spawning Workers
 Every objective MUST include:
