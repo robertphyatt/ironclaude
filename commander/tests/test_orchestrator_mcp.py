@@ -8743,6 +8743,15 @@ class TestOllamaConfigPath:
         client = t._get_ollama_client()
         assert client._url == "http://test-host:11434"
 
+    def test_connect_timeout_from_ollama_block(self, tmp_path, monkeypatch, registry, mock_tmux):
+        """ollama.connect_timeout_seconds is wired into the constructed OllamaClient."""
+        cfg_file = tmp_path / "test_ollama.json"
+        cfg_file.write_text('{"ollama": {"connect_timeout_seconds": 5}}')
+        monkeypatch.setenv("IC_OLLAMA_CONFIG_PATH", str(cfg_file))
+        t = OrchestratorTools(registry, mock_tmux)
+        client = t._get_ollama_client()
+        assert client._connect_timeout == 5
+
 
 class TestCallLocalGraderDelegation:
     def test_delegates_to_local_grader(self, tools):
@@ -11389,6 +11398,27 @@ class TestConfigureSharedResources:
         assert call.args[0] == {
             "repository_path": "/repo", "entries": ["data/x"], "allow_secret_entries": True,
         }
+
+    def test_configure_forwards_secret_hits_and_scan_truncated(self):
+        tools = self._tools()
+        expected = {
+            "added": [],
+            "skipped": [],
+            "rejected": [],
+            "secretBlocked": ["config"],
+            "entries": ["config", "bigdir"],
+            "relinked": {},
+            "secretHits": {"config": ["config/.env"]},
+            "scanTruncated": ["bigdir"],
+        }
+        tools._workspace_client.configure_shared_resources.return_value = expected
+
+        result = tools.configure_shared_resources("/repo", ["config", "bigdir"])
+
+        assert result == expected
+        assert result["secretBlocked"] == ["config"]
+        assert result["secretHits"] == {"config": ["config/.env"]}
+        assert result["scanTruncated"] == ["bigdir"]
 
     def test_list_local_forwards_exact_payload(self):
         tools = self._tools()

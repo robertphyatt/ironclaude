@@ -38,19 +38,25 @@ import time as _time
 
 _BREAKER_BASE_BACKOFF = 5.0
 _BREAKER_MAX_BACKOFF = 300.0
+_BREAKER_FAILURE_THRESHOLD = 3
+_BREAKER_DEGRADED_GRACE = 120.0
 
 
 class _UrlBreaker:
-    __slots__ = ("open_until", "backoff", "probing")
+    __slots__ = ("open_until", "backoff", "probing", "failures", "open_since", "last_slow")
 
     def __init__(self) -> None:
         self.open_until = 0.0
         self.backoff = _BREAKER_BASE_BACKOFF
         self.probing = False
+        self.failures = 0
+        self.open_since = 0.0
+        self.last_slow = 0.0
 
 
 class _CircuitBreakerRegistry:
-    """Per-URL circuit breaker. Opens on the first transport failure; exactly ONE
+    """Per-URL circuit breaker. Opens only after _BREAKER_FAILURE_THRESHOLD
+    consecutive failures; exactly ONE
     caller is admitted as the half-open prober once open_until passes; exponential
     backoff (base 5s x2, cap 300s) on repeated probe failure. Thread-safe (the
     daemon has a second grader thread). The lock is never held across a network
@@ -67,6 +73,8 @@ class _CircuitBreakerRegistry:
             b = self._breakers.get(url)
             if b is None:
                 return True                       # closed
+            if b.open_until == 0.0:
+                return True
             if self._now() < b.open_until:
                 return False                      # open, not yet
             if b.probing:
@@ -84,20 +92,50 @@ class _CircuitBreakerRegistry:
             if b is None:
                 b = _UrlBreaker()
                 self._breakers[url] = b
+            b.failures += 1
+            b.probing = False
+            if b.failures < _BREAKER_FAILURE_THRESHOLD:
+                return
+            if b.open_until == 0.0:
+                b.open_since = self._now()
             else:
                 b.backoff = min(b.backoff * 2, _BREAKER_MAX_BACKOFF)
-            b.probing = False
             b.open_until = self._now() + b.backoff
+
+    def record_slow(self, url: str) -> None:
+        """Reachable-but-slow (busy) = UP: reset any accumulated unreachable state, stamp last_slow. Never opens."""
+        with self._lock:
+            b = _UrlBreaker()
+            b.last_slow = self._now()
+            self._breakers[url] = b
+
+    def busy_urls(self) -> list[str]:
+        with self._lock:
+            now = self._now()
+            return [
+                u for u, b in self._breakers.items()
+                if b.open_until == 0.0 and b.last_slow and now - b.last_slow < _BREAKER_DEGRADED_GRACE
+            ]
 
     def open_urls(self) -> list[str]:
         with self._lock:
             now = self._now()
             return [u for u, b in self._breakers.items() if now < b.open_until]
 
+    def degraded_urls(self) -> list[str]:
+        with self._lock:
+            now = self._now()
+            return [
+                u for u, b in self._breakers.items()
+                if b.open_until != 0.0
+                and (now < b.open_until or b.probing)
+                and now - b.open_since >= _BREAKER_DEGRADED_GRACE
+            ]
+
     def backoff_for(self, url: str):
         with self._lock:
             b = self._breakers.get(url)
-            return None if b is None else b.backoff
+            return None if b is None or b.open_until == 0.0 else b.backoff
 
     def reset(self) -> None:
         with self._lock:
@@ -108,8 +146,14 @@ _BREAKERS = _CircuitBreakerRegistry()
 
 
 def ollama_degraded_urls() -> list[str]:
-    """URLs whose breaker is currently open (for heartbeat observability)."""
-    return _BREAKERS.open_urls()
+    """URLs whose breaker has been open past the degraded grace period (for
+    heartbeat observability)."""
+    return _BREAKERS.degraded_urls()
+
+
+def ollama_busy_urls() -> list[str]:
+    """URLs recently marked reachable-but-slow (busy), not unreachable."""
+    return _BREAKERS.busy_urls()
 
 
 def _http_error(url: str, err: "requests.HTTPError", verb: str = "request", backend: str = "Ollama") -> OllamaHTTPError:
@@ -145,13 +189,17 @@ class OllamaClient:
         url: str,
         fallback_url: str | None = None,
         timeout: int = 120,
+        connect_timeout: int = 3,
+        probe_timeout: int = 3,
     ) -> None:
         self._url = url.rstrip("/")
         self._fallback_url = fallback_url.rstrip("/") if fallback_url else None
         self._timeout = timeout
-        # Short connect timeout when fallback configured: fail fast to fallback
-        # rather than waiting the full timeout on an unreachable primary.
-        self._connect_timeout = 2 if fallback_url else timeout
+        # Fixed short connect timeout, independent of fallback: fail fast to
+        # fallback (or surface unreachable) rather than waiting the full
+        # read-timeout budget on an unreachable primary.
+        self._connect_timeout = connect_timeout
+        self._probe_timeout = probe_timeout
 
     def post_generate(self, payload: dict) -> str:
         """POST /api/generate. Returns response["response"] text.
@@ -180,8 +228,15 @@ class OllamaClient:
             except OllamaHTTPError:
                 _BREAKERS.record_success(url)     # endpoint responded -> healthy; clears probe
                 raise
-            except (OllamaConnectionError, OllamaTimeoutError) as e:
+            except OllamaConnectionError as e:
                 _BREAKERS.record_failure(url)
+                last_err = e
+                continue
+            except OllamaTimeoutError as e:
+                if self._probe_reachable(url):
+                    _BREAKERS.record_slow(url)    # reachable but slow = busy, not a failure
+                else:
+                    _BREAKERS.record_failure(url)
                 last_err = e
                 continue
             except BaseException:
@@ -213,12 +268,16 @@ class OllamaClient:
             return self._read_chat_response(resp)
         except requests.HTTPError as e:
             raise _http_error(url, e) from e
-        except requests.ConnectionError as e:
-            raise OllamaConnectionError(f"Ollama unreachable at {url}: {e}") from e
+        except requests.ConnectTimeout as e:
+            raise OllamaConnectionError(
+                f"Ollama connect timed out at {url} (connect={self._connect_timeout}s)"
+            ) from e
         except requests.Timeout:
             raise OllamaTimeoutError(
                 f"Ollama timed out at {url} (connect={self._connect_timeout}s, read={self._timeout}s)"
             )
+        except requests.ConnectionError as e:
+            raise OllamaConnectionError(f"Ollama unreachable at {url}: {e}") from e
         except requests.RequestException as e:
             raise OllamaConnectionError(f"Ollama request failed at {url}: {e}") from e
 
@@ -260,15 +319,19 @@ class OllamaClient:
             resp.raise_for_status()
         except requests.HTTPError as e:
             raise _http_error(self._url, e, verb="create_model") from e
-        except requests.ConnectionError as e:
+        except requests.ConnectTimeout as e:
             raise OllamaConnectionError(
-                f"Ollama create_model failed at {self._url}: {e}"
+                f"Ollama create_model connect timed out at {self._url} (connect={self._connect_timeout}s)"
             ) from e
         except requests.Timeout:
             raise OllamaTimeoutError(
                 f"Ollama create_model timed out at {self._url} "
                 f"(connect={self._connect_timeout}s, read={self._timeout}s)"
             )
+        except requests.ConnectionError as e:
+            raise OllamaConnectionError(
+                f"Ollama create_model failed at {self._url}: {e}"
+            ) from e
         except requests.RequestException as e:
             raise OllamaConnectionError(f"Ollama create_model request failed: {e}") from e
 
@@ -278,6 +341,14 @@ class OllamaClient:
         Raises OllamaConnectionError or OllamaTimeoutError on failure.
         """
         return self._get("/api/ps")
+
+    def _probe_reachable(self, url: str) -> bool:
+        """Cheap liveness probe OUTSIDE the breaker path; never raises; never touches _BREAKERS."""
+        try:
+            resp = requests.get(f"{url}/api/version", timeout=(self._connect_timeout, self._probe_timeout))
+            return resp.status_code < 500
+        except Exception:
+            return False
 
     # ── internals ─────────────────────────────────────────────────────────
 
@@ -295,12 +366,16 @@ class OllamaClient:
             return self._read_post_response(resp, is_streaming)
         except requests.HTTPError as e:
             raise _http_error(url, e) from e
-        except requests.ConnectionError as e:
-            raise OllamaConnectionError(f"Ollama unreachable at {url}: {e}") from e
+        except requests.ConnectTimeout as e:
+            raise OllamaConnectionError(
+                f"Ollama connect timed out at {url} (connect={self._connect_timeout}s)"
+            ) from e
         except requests.Timeout:
             raise OllamaTimeoutError(
                 f"Ollama timed out at {url} (connect={self._connect_timeout}s, read={self._timeout}s)"
             )
+        except requests.ConnectionError as e:
+            raise OllamaConnectionError(f"Ollama unreachable at {url}: {e}") from e
         except requests.RequestException as e:
             raise OllamaConnectionError(f"Ollama request failed at {url}: {e}") from e
 
@@ -314,12 +389,16 @@ class OllamaClient:
             return resp.json()
         except requests.HTTPError as e:
             raise _http_error(url, e) from e
-        except requests.ConnectionError as e:
-            raise OllamaConnectionError(f"Ollama unreachable at {url}: {e}") from e
+        except requests.ConnectTimeout as e:
+            raise OllamaConnectionError(
+                f"Ollama connect timed out at {url} (connect={self._connect_timeout}s)"
+            ) from e
         except requests.Timeout:
             raise OllamaTimeoutError(
                 f"Ollama timed out at {url} (connect={self._connect_timeout}s, read={self._timeout}s)"
             )
+        except requests.ConnectionError as e:
+            raise OllamaConnectionError(f"Ollama unreachable at {url}: {e}") from e
         except requests.RequestException as e:
             raise OllamaConnectionError(f"Ollama request failed at {url}: {e}") from e
 

@@ -42,9 +42,11 @@ def test_dry_run_reports_reviewed_paths_without_spawning(helper, monkeypatch, ca
     assert payload["script"] == str(SCRIPT.resolve())
     assert payload["sha256"] == hashlib.sha256(SCRIPT.read_bytes()).hexdigest()
     assert payload["quit_argv"] == [
-        "/usr/bin/osascript",
-        "-e",
-        'tell application "ChatGPT" to quit',
+        "/usr/bin/pkill",
+        "-9",
+        "-a",
+        "-f",
+        r"^/Applications/ChatGPT\.app/Contents/MacOS/ChatGPT( |$)",
     ]
     assert payload["probe_argv"] == [
         "/usr/bin/pgrep",
@@ -57,6 +59,7 @@ def test_dry_run_reports_reviewed_paths_without_spawning(helper, monkeypatch, ca
 
 def test_probe_pattern_is_valid_posix_ere_and_matches_exact_app_executable(helper):
     pattern = helper.PROBE_ARGV[-1]
+    assert helper.QUIT_ARGV[-1] == pattern
     valid = subprocess.run(
         ["/usr/bin/grep", "-E", pattern],
         input="/Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n",
@@ -174,7 +177,7 @@ def test_schedule_failure_removes_only_created_snapshot(helper, tmp_path):
     assert list(tmp_path.glob("ironclaude-restart-*")) == []
 
 
-def test_perform_refuses_digest_mismatch_before_sleep_or_applescript(
+def test_perform_refuses_digest_mismatch_before_sleep_or_force_quit(
     helper, tmp_path
 ):
     calls = []
@@ -267,6 +270,61 @@ def test_quit_timeout_is_distinct_and_never_launches(helper, tmp_path):
     assert result == helper.EXIT_QUIT_TIMEOUT
     assert helper.LAUNCH_ARGV not in calls
     assert "quit timeout" in (tmp_path / "restart.log").read_text()
+
+
+def test_force_quit_no_match_still_verifies_exit_before_launch(helper, tmp_path):
+    calls = []
+    probes = iter([1, 0])
+
+    def runner(argv, **_kwargs):
+        calls.append(argv)
+        if argv == helper.QUIT_ARGV:
+            return SimpleNamespace(returncode=1)
+        if argv == helper.PROBE_ARGV:
+            return SimpleNamespace(returncode=next(probes))
+        return SimpleNamespace(returncode=0)
+
+    assert helper.perform_restart(
+        helper.sha256_file(SCRIPT), script_path=SCRIPT, runner=runner,
+        sleeper=lambda _value: None, poll_attempts=2,
+        log_path=tmp_path / "restart.log",
+    ) == 0
+    assert calls == [helper.QUIT_ARGV, helper.PROBE_ARGV,
+                     helper.LAUNCH_ARGV, helper.PROBE_ARGV]
+
+
+def test_force_quit_no_signal_never_launches_while_app_remains(helper, tmp_path):
+    calls = []
+
+    def runner(argv, **_kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=1 if argv == helper.QUIT_ARGV else 0)
+
+    assert helper.perform_restart(
+        helper.sha256_file(SCRIPT), script_path=SCRIPT, runner=runner,
+        sleeper=lambda _value: None, poll_attempts=2,
+        log_path=tmp_path / "restart.log",
+    ) == helper.EXIT_QUIT_TIMEOUT
+    assert helper.LAUNCH_ARGV not in calls
+
+
+@pytest.mark.parametrize("returncode", [2, 3])
+def test_force_quit_command_error_never_launches(helper, tmp_path, returncode):
+    calls = []
+
+    def runner(argv, **_kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=returncode)
+
+    assert helper.perform_restart(
+        helper.sha256_file(SCRIPT), script_path=SCRIPT, runner=runner,
+        sleeper=lambda _value: None,
+        log_path=tmp_path / "restart.log",
+    ) == helper.EXIT_COMMAND_FAILURE
+    assert calls == [helper.QUIT_ARGV]
+    assert f"pkill returned status {returncode}" in (
+        tmp_path / "restart.log"
+    ).read_text()
 
 
 def test_relaunch_timeout_is_distinct_without_false_success(helper, tmp_path):

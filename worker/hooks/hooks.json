@@ -158,14 +158,6 @@
             "command": "bash $HOME/.claude/ironclaude-hooks/plan-execution-reminder.sh"
           }
         ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash $HOME/.claude/ironclaude-hooks/topic-change-detector.sh"
-          }
-        ]
       }
     ],
     "SubagentStop": [

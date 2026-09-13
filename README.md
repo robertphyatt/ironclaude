@@ -15,13 +15,12 @@ You can use the Worker alone for single-session discipline, or add the Commander
 
 ---
 
-## What's New in v1.1.9
+## What's New in v1.1.10
 
-- **Brain self-serve worktree shared resources.** Orchestrator MCP tools (`configure_shared_resources` / `list_shared_resources`) let the Brain provision gitignored project data into managed worktrees, relinking new entries into currently-live worktrees so a running worker gets the data without a respawn — closing the operator-free-worktree gap where a worker missing gitignored data would stall. Adds a generalized never-fake-past-a-gate guardrail and hardens the shared-entry validator against control characters and surrounding whitespace.
-- **Commander is far more responsive to the operator.** The idle Brain is now health-probed with `[PING]`/`[PING-ACK]` instead of being restarted every ~30 min (which wiped its prompt cache and context and forced MCP schema re-discovery); threaded `[reply-to:]` replies reach Slack again; a ~3s operator fast lane runs ahead of the 15s sweep lane; background nudges defer while the Brain is mid-turn on operator work; operator-wait alerts are de-duplicated to one per pending directive; and the operator-facing message grader is bounded so a stalled local model can't hang the daemon path.
-- **Guardrail enforcement runs even where the in-process callback is dead.** Under `bypassPermissions` the SDK's in-process `can_use_tool` callback never fires, so the 48h-lookback and Task-fan-out gates are registered as Brain shell hooks via a version-controlled settings sync — the actual live enforcement layer — without disturbing existing hooks.
-- **Responsiveness hardening.** A tolerant `[PING-ACK]` drop keeps a threaded or decorated ack from leaking into Slack, and an in-flight cap on the bounded grader stops a sustained local-model stall from piling up daemon threads.
-- **Codex sessions no longer dead-lock at gates.** Enforcement-hook remediation guidance is now client-aware: a Codex session is told to invoke `$ironclaude:<skill>` (the form it actually has) while Claude keeps the `Skill(...)` tool form. Guidance text only — no block/allow decision changed.
+- **Busy ≠ down: three-state validator liveness.** The remote grading box (`amd-halo:8080`) is busy by design — it runs all local inference — so high latency is now treated as healthy, not an outage. A short connect budget (default 3s) is decoupled from the long inference read budget; a read-timeout triggers a cheap non-inference liveness probe (reachable ⇒ *busy*, which never trips the circuit breaker; probe fails ⇒ *unreachable*, which does); and the heartbeat gains a non-alarming "validator busy" line distinct from the ⚠️ "unreachable/degraded" banner. The inert per-prompt `topic-change-detector` hook — whose only output was a `systemMessage` that never reached the model, and the source of the `UserPromptSubmit hook timed out after 30s` message on a busy box — is removed, and the shared bash validation transport is bounded (fixed connect timeout + a hook wall-budget) so a busy or dead box can't hang a hook.
+- **Grader circuit-breaker stops crying wolf.** The breaker opens only after 3 consecutive failures (not the first), a 120s hysteresis gates the "validator degraded" banner so a momentary blip followed by idle no longer raises it, and a connect timeout is now classified as *unreachable* rather than a slow read.
+- **Shared-resource secrets deny-list covers directory contents.** Sharing a directory into a managed worktree now checks its contents (file names only, bounded depth and size, symlinks not followed) for well-known secret files before accepting it — so sharing `config/` no longer silently links the `.env` inside — and a nested shared entry creates its parent directory before symlinking instead of dead-ending.
+- **Operator tooling and guidance.** `restart-codex` force-quits the ChatGPT app by its exact executable path instead of an osascript `quit` that could hang on a modal; and a new behavioral principle makes a managed worktree missing shared project data a blocker to report to the Brain (which provisions it), never to hand-fix.
 - See [CHANGELOG.md](CHANGELOG.md) for full details, and `git log` / [CHANGELOG.md](CHANGELOG.md) for earlier releases.
 
 ---
@@ -178,6 +177,7 @@ Configure it **self-serve** — never by hand-editing the file and never by aski
 - **Write-through symlinks.** The shared paths are symlinks back into the primary checkout, so a worker that *writes* to a shared path writes into the primary checkout's real files. Share read-mostly data; treat shared paths as shared state.
 - **Deploy note.** The Brain runtime loads workspace-manager's `cli.js` from the plugin **cache** (a copy), so a newly added `configure_shared_resources` tool takes effect only after a plugin-cache refresh (marketplace reinstall) — not on `npm run build` alone.
 - **Secret paths need approval.** The validator refuses well-known secret paths (`.env`, `.ssh`, `.aws`, private keys) by default; sharing one requires explicit operator approval — the Brain asks, then re-calls with `allow_secret_entries=true` — and the deny-list is defense-in-depth, not exhaustive.
+- **Listed directories are checked, not scanned for candidates.** This is detection on an entry you already listed, not auto-discovery of what to share. A listed directory is checked (file names only, bounded depth and size, symlinks not followed) for well-known secret files among its contents before it is accepted; that check can only withhold an entry, never add one.
 
 ### Set Up Statusline (Recommended)
 
@@ -239,7 +239,7 @@ ollama serve
 
 ### Hook System
 
-Enforcement is implemented in 16 hooks across 6 lifecycle events (SessionStart, PreToolUse, PostToolUse, UserPromptSubmit, SubagentStop, Stop). Key hooks:
+Enforcement is implemented in 15 hooks across 6 lifecycle events (SessionStart, PreToolUse, PostToolUse, UserPromptSubmit, SubagentStop, Stop). Key hooks:
 
 | Hook | Trigger | Purpose |
 |------|---------|---------|
@@ -247,7 +247,6 @@ Enforcement is implemented in 16 hooks across 6 lifecycle events (SessionStart, 
 | `skill-state-bridge.sh` | PreToolUse | Detects Skill invocations; requests state machine transitions |
 | `state-activator.sh` | UserPromptSubmit | Handles professional mode on/off; PPID-based session binding |
 | `session-init.sh` | SessionStart | Initializes session, creates DB schema, configures statusline |
-| `topic-change-detector.sh` | UserPromptSubmit | Detects topic changes during plan execution |
 | `get-back-to-work-claude.sh` | Stop | Multi-check grading gate before session stop |
 | `task-completion-validator.sh` | PostToolUse | Validates task completion claims against plan |
 | `subagent-circuit-breaker.sh` | PreToolUse/PostToolUse | Detects context-limit failures in subagents |

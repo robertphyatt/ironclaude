@@ -65,6 +65,24 @@ _resolve_spot() {
   echo "$backend $model $url"
 }
 
+# Pure helper: resolve the bounded-transport budgets (connect timeout, probe
+# timeout, hook wall budget) for a given backend, block-then-top precedence.
+# Args: $1 = config JSON (content, not a path), $2 = backend name (e.g. "ollama"/"openai")
+# Output: "<connect_timeout> <probe_timeout> <hook_validation_budget>"
+# Implements: KEY = .<backend>.KEY // .KEY // default (independent of any
+# per-spot inference timeout — a busy/dead box must not hang a hook).
+_resolve_budgets() {
+  local cfg_json="$1" backend="$2"
+  local ct pt hb
+  ct=$(printf '%s' "$cfg_json" | jq -r --arg b "$backend" '.[$b].connect_timeout_seconds // .connect_timeout_seconds // 3' 2>/dev/null) || ct=3
+  pt=$(printf '%s' "$cfg_json" | jq -r --arg b "$backend" '.[$b].probe_timeout_seconds // .probe_timeout_seconds // 3' 2>/dev/null) || pt=3
+  hb=$(printf '%s' "$cfg_json" | jq -r --arg b "$backend" '.[$b].hook_validation_budget_seconds // .hook_validation_budget_seconds // 8' 2>/dev/null) || hb=8
+  [ -n "$ct" ] && [ "$ct" != "null" ] || ct=3
+  [ -n "$pt" ] && [ "$pt" != "null" ] || pt=3
+  [ -n "$hb" ] && [ "$hb" != "null" ] || hb=8
+  echo "$ct $pt $hb"
+}
+
 # =============================================================================
 # CENTRALIZED LLM VALIDATION
 # =============================================================================
@@ -96,6 +114,15 @@ call_validation_llm() {
     timeout_sec=$(jq -r '.timeout_seconds // 60' "$config" 2>/dev/null) || timeout_sec=60
   fi
 
+  # Bounded transport budgets — independent of the inference timeout above.
+  # A busy/dead box must not hang a hook for the (long) inference timeout.
+  local connect_to hook_budget _budgets
+  _budgets=$(_resolve_budgets "$(cat "$config" 2>/dev/null)" "$backend")
+  connect_to=$(printf '%s' "$_budgets" | awk '{print $1}')
+  hook_budget=$(printf '%s' "$_budgets" | awk '{print $3}')
+  [ -n "$connect_to" ] || connect_to=3
+  [ -n "$hook_budget" ] || hook_budget=8
+
   case "$backend" in
     "ollama")
       local url model fallback_url
@@ -123,18 +150,16 @@ call_validation_llm() {
           '{model: $model, prompt: $prompt, stream: false, format: "json", options: {temperature: 0.1, num_predict: -1}}')
       fi
 
-      # Try primary URL (2s connect timeout if fallback configured, full timeout otherwise)
+      # Try primary URL. Connect/wall budgets are the bounded hook transport
+      # budgets resolved above — fixed and fallback-independent, never the
+      # (long) inference timeout, so a busy/dead box can't hang the hook.
       local result=""
-      local connect_timeout="$timeout_sec"
-      if [ -n "$fallback_url" ]; then
-        connect_timeout=2
-      fi
-      result=$(curl -s --connect-timeout "$connect_timeout" --max-time "$timeout_sec" "$url/api/generate" -d "$payload" 2>/dev/null | jq -r '.response // empty' 2>/dev/null) || true
+      result=$(curl -s --connect-timeout "$connect_to" --max-time "$hook_budget" "$url/api/generate" -d "$payload" 2>/dev/null | jq -r '.response // empty' 2>/dev/null) || true
 
       # If primary failed and fallback exists, try fallback
       if [ -z "$result" ] && [ -n "$fallback_url" ]; then
         export VALIDATION_LLM_BACKEND="ollama:${model}(fallback)"
-        result=$(curl -s --max-time "$timeout_sec" "$fallback_url/api/generate" -d "$payload" 2>/dev/null | jq -r '.response // empty' 2>/dev/null) || true
+        result=$(curl -s --connect-timeout "$connect_to" --max-time "$hook_budget" "$fallback_url/api/generate" -d "$payload" 2>/dev/null | jq -r '.response // empty' 2>/dev/null) || true
       fi
 
       # Strip think tags — gemma4/other thinking models may prefix JSON with <think>...</think>
@@ -166,8 +191,7 @@ call_validation_llm() {
       fi
 
       local result
-      local connect_timeout="$timeout_sec"
-      result=$(curl -s --connect-timeout "$connect_timeout" --max-time "$timeout_sec" \
+      result=$(curl -s --connect-timeout "$connect_to" --max-time "$hook_budget" \
         -H "Authorization: Bearer ollama" -H "Content-Type: application/json" \
         "$base_url/chat/completions" -d "$payload" 2>/dev/null | jq -r '.choices[0].message.content // empty' 2>/dev/null) || true
 

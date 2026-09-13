@@ -2691,10 +2691,13 @@ class IroncladeDaemon:
     def _grade_bounded(self, system: str, user: str, schema, timeout: float | None = None):
         """R3: run a classifier grade off the poll thread with a hard wall-clock
         bound so an empty-Ollama stall (up to 339s observed) cannot block the
-        operator fast lane. LocalGrader exposes no per-call timeout, so offload +
-        join is the mechanism. Returns the grade dict, or None on timeout/error
-        (the caller treats None as 'do not capture'). A grade that overruns the
-        bound is abandoned to its daemon thread and discarded when it finishes."""
+        operator fast lane. LocalGrader's per-call read_timeout bounds the
+        client's own read timeout to `timeout`, so an abandoned grade's daemon
+        thread ends near that bound instead of the full inference read timeout
+        (e.g. 600s); offload + join still caps how long THIS call blocks.
+        Returns the grade dict, or None on timeout/error (the caller treats None
+        as 'do not capture'). A grade that overruns the bound is abandoned to its
+        daemon thread and discarded when it finishes."""
         if timeout is None:
             timeout = self.config.get("fast_lane_grade_timeout_seconds", 5)
         # FIX 2: only one bounded grade may be in flight. If a prior grade is still
@@ -2709,7 +2712,7 @@ class IroncladeDaemon:
 
         def _worker():
             try:
-                box["r"] = self._grader.grade(system, user, schema)
+                box["r"] = self._grader.grade(system, user, schema, read_timeout=timeout)
             except Exception as e:  # noqa: BLE001 — surfaced as None, matches prior catch
                 box["e"] = e
             finally:
@@ -4719,7 +4722,7 @@ class IroncladeDaemon:
         # entry — a stale/false-positive classifier entry must never mask a real
         # pending_confirmation directive sharing the same d{id} key.
         merged_waits = {**dict(self._operator_waits), **self._get_pending_confirmation_waits()}
-        from ironclaude.ollama_client import ollama_degraded_urls
+        from ironclaude.ollama_client import ollama_busy_urls, ollama_degraded_urls
         from ironclaude.notifications import resolve_degraded_backend_label
         _hooks_cfg_path = os.environ.get("IC_OLLAMA_CONFIG_PATH") or os.path.expanduser(
             "~/.claude/ironclaude-hooks-config.json"
@@ -4732,6 +4735,7 @@ class IroncladeDaemon:
                 brain_waits=dict(self._brain_waits),
                 operator_name=operator_name,
                 ollama_degraded=bool(ollama_degraded_urls()),
+                ollama_busy=bool(ollama_busy_urls()),
                 blocked_directives=blocked_directives,
                 degraded_backend_label=resolve_degraded_backend_label(_hooks_cfg_path),
             )

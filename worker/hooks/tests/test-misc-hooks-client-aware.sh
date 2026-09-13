@@ -1,12 +1,14 @@
 #!/bin/bash
 # test-misc-hooks-client-aware.sh
-# Verifies topic-change-detector.sh and plan-task-context.sh use the
-# client-aware ic_skill_ref helper for human-readable skill-invocation
-# guidance text, instead of hardcoding Claude-specific "Skill tool" wording.
+# Verifies plan-task-context.sh uses the client-aware ic_skill_ref helper
+# for human-readable skill-invocation guidance text, instead of hardcoding
+# Claude-specific "Skill tool" wording. Also guards that the inert
+# topic-change-detector hook (its systemMessage output never reached the
+# model) stays fully removed.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TC="$SCRIPT_DIR/../topic-change-detector.sh"
 PT="$SCRIPT_DIR/../plan-task-context.sh"
+HOOKS_JSON="$SCRIPT_DIR/../hooks.json"
 
 pass=0
 fail=0
@@ -23,14 +25,14 @@ check() {
   fi
 }
 
-# (1) topic-change-detector.sh calls ic_skill_ref for plan-interruption
-grep -qF 'ic_skill_ref "ironclaude:plan-interruption"' "$TC"
-check "topic-change-detector.sh calls ic_skill_ref for plan-interruption" "$?"
+# (1) topic-change-detector.sh no longer exists (inert hook removed)
+[ ! -e "$SCRIPT_DIR/../topic-change-detector.sh" ]
+check "topic-change-detector.sh does not exist" "$?"
 
-# (2) old hardcoded literal is gone from topic-change-detector.sh
-count=$(grep -cF 'Call the Skill tool with skill: ironclaude:plan-interruption' "$TC")
+# (2) hooks.json no longer references topic-change-detector
+count=$(grep -cF 'topic-change-detector' "$HOOKS_JSON")
 [ "$count" = "0" ]
-check "topic-change-detector.sh no longer hardcodes 'Call the Skill tool with skill: ironclaude:plan-interruption'" "$?"
+check "hooks.json no longer references topic-change-detector" "$?"
 
 # (3) plan-task-context.sh calls ic_skill_ref for code-review --task-boundary
 grep -qF 'ic_skill_ref "ironclaude:code-review" "--task-boundary"' "$PT"

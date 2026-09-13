@@ -22,6 +22,9 @@ def test_fixture_case(case):
     assert resolved.backend == expect["backend"], case["name"]
     assert resolved.model == expect["model"], case["name"]
     assert resolved.url == expect["url"], case["name"]
+    assert resolved.connect_timeout == expect.get("connect_timeout"), case["name"]
+    assert resolved.probe_timeout == expect.get("probe_timeout"), case["name"]
+    assert resolved.hook_validation_budget == expect.get("hook_validation_budget"), case["name"]
 
 
 def test_unset_backend_defaults_to_ollama_for_grader():

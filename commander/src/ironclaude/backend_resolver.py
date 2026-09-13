@@ -26,6 +26,9 @@ class ResolvedBackend:
     fallback_url: str | None = None
     timeout: int | None = None
     max_tokens: int | None = None
+    connect_timeout: int | None = None
+    probe_timeout: int | None = None
+    hook_validation_budget: int | None = None
 
 
 def _legacy_alias(cfg: dict, spot: str) -> str | None:
@@ -71,6 +74,11 @@ def resolve_backend(cfg: dict, spot: str) -> ResolvedBackend:
         max_tokens = None
 
     timeout = block.get("timeout_seconds") or cfg.get("timeout_seconds")
+    connect_timeout = block.get("connect_timeout_seconds") or cfg.get("connect_timeout_seconds")
+    probe_timeout = block.get("probe_timeout_seconds") or cfg.get("probe_timeout_seconds")
+    hook_validation_budget = block.get("hook_validation_budget_seconds") or cfg.get(
+        "hook_validation_budget_seconds"
+    )
 
     return ResolvedBackend(
         backend=backend,
@@ -79,23 +87,40 @@ def resolve_backend(cfg: dict, spot: str) -> ResolvedBackend:
         fallback_url=fallback_url,
         timeout=timeout,
         max_tokens=max_tokens,
+        connect_timeout=connect_timeout,
+        probe_timeout=probe_timeout,
+        hook_validation_budget=hook_validation_budget,
     )
 
 
-def make_client(resolved: ResolvedBackend, timeout: int = 120, fallback: str | None = None):
+def make_client(
+    resolved: ResolvedBackend,
+    timeout: int = 120,
+    fallback: str | None = None,
+    connect_timeout: int | None = None,
+    probe_timeout: int | None = None,
+):
     """Build the transport client for a resolved backend.
 
     Returns an OpenAiClient for the openai backend, else an OllamaClient.
+    connect_timeout/probe_timeout: explicit value wins; else falls back to the
+    resolved backend's config value; else defaults to 3.
     """
     fallback_url = fallback if fallback is not None else resolved.fallback_url
+    ct = connect_timeout if connect_timeout is not None else (resolved.connect_timeout or 3)
+    pt = probe_timeout if probe_timeout is not None else (resolved.probe_timeout or 3)
     if resolved.backend == "openai":
         return OpenAiClient(
             base_url=resolved.url,
             fallback_base_url=fallback_url,
             timeout=timeout,
+            connect_timeout=ct,
+            probe_timeout=pt,
         )
     return OllamaClient(
         url=resolved.url,
         fallback_url=fallback_url,
         timeout=timeout,
+        connect_timeout=ct,
+        probe_timeout=pt,
     )

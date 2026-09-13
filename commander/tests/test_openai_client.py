@@ -38,6 +38,19 @@ def test_connection_error_raises_ollama_error_subclass():
     assert isinstance(exc_info.value, OllamaError)
 
 
+def test_connect_timeout_raises_connection_error_not_timeout():
+    _BREAKERS.reset()
+    with patch("requests.post", side_effect=requests.ConnectTimeout("connect timed out")) as mock_post:
+        with pytest.raises(OllamaError) as exc_info:
+            OpenAiClient(base_url="http://h/v1").post_generate(
+                {"model": "m", "messages": [{"role": "user", "content": "x"}]}
+            )
+    from ironclaude.ollama_client import OllamaTimeoutError, OllamaConnectionError
+    assert isinstance(exc_info.value, OllamaConnectionError)
+    assert not isinstance(exc_info.value, OllamaTimeoutError)
+    assert mock_post.call_count == 1
+
+
 def test_get_models_probes_models_endpoint():
     resp = MagicMock()
     resp.json.return_value = {"data": []}
@@ -115,3 +128,20 @@ def test_openai_get_models_http_error_message_prefixed_openai():
         with pytest.raises(OllamaHTTPError) as exc_info:
             OpenAiClient(base_url="http://h/v1").get_models()
     assert str(exc_info.value).startswith("OpenAI request returned HTTP")
+
+
+def test_probe_reachable_true_on_200():
+    client = OpenAiClient(base_url="http://h/v1")
+    resp = MagicMock()
+    resp.status_code = 200
+    with patch("ironclaude.openai_client.requests.get", return_value=resp) as mock_get:
+        assert client._probe_reachable("http://h/v1") is True
+    args, kwargs = mock_get.call_args
+    assert args[0].endswith("/models")
+    assert kwargs["timeout"] == (client._connect_timeout, client._probe_timeout)
+
+
+def test_probe_reachable_false_on_exception():
+    client = OpenAiClient(base_url="http://h/v1")
+    with patch("ironclaude.openai_client.requests.get", side_effect=requests.ConnectionError("refused")):
+        assert client._probe_reachable("http://h/v1") is False

@@ -39,6 +39,9 @@ for arg in "$@"; do
   if [ "$prev" = "--max-time" ] && [ -n "$CURL_MAXTIME_FILE" ]; then
     printf '%s' "$arg" > "$CURL_MAXTIME_FILE"
   fi
+  if [ "$prev" = "--connect-timeout" ] && [ -n "$CURL_CONNECT_FILE" ]; then
+    printf '%s' "$arg" > "$CURL_CONNECT_FILE"
+  fi
   case "$arg" in
     http*) url="$arg" ;;
   esac
@@ -69,7 +72,9 @@ assert_contains "openai backend returns parsed .choices[0].message.content" "ok"
 rm -f "$TMPCFG"
 
 # =============================================================================
-# call_validation_llm(): openai backend honors openai.timeout_seconds override
+# call_validation_llm(): openai.timeout_seconds does NOT drive --max-time —
+# the hook transport budget is bounded independently of the inference timeout,
+# so a busy/dead box can't hang the hook for 300s.
 # =============================================================================
 TMPCFG5=$(mktemp)
 printf '%s' '{"backend":"openai","openai":{"base_url":"http://h/v1","model":"m","timeout_seconds":300}}' > "$TMPCFG5"
@@ -77,17 +82,17 @@ export IC_OLLAMA_CONFIG_PATH="$TMPCFG5"
 CAPTURE_MT_A=$(mktemp)
 export CURL_MAXTIME_FILE="$CAPTURE_MT_A"
 
-echo "=== call_validation_llm: openai backend honors openai.timeout_seconds override ==="
+echo "=== call_validation_llm: openai.timeout_seconds=300 does NOT drive --max-time (hook budget default 8) ==="
 call_validation_llm "test prompt" "" >/dev/null
 MAXTIME_A=$(cat "$CAPTURE_MT_A" 2>/dev/null)
-assert_eq "openai arm uses openai.timeout_seconds for --max-time" "300" "$MAXTIME_A"
+assert_eq "openai arm --max-time ignores openai.timeout_seconds, defaults to hook budget 8" "8" "$MAXTIME_A"
 
 rm -f "$TMPCFG5" "$CAPTURE_MT_A"
 unset CURL_MAXTIME_FILE
 
 # =============================================================================
-# call_validation_llm(): openai backend falls back to default 60s when no
-# openai.timeout_seconds and no top-level timeout_seconds are set
+# call_validation_llm(): openai backend falls back to default hook budget 8s
+# when no hook_validation_budget_seconds is set anywhere
 # =============================================================================
 TMPCFG6=$(mktemp)
 printf '%s' '{"backend":"openai","openai":{"base_url":"http://h/v1","model":"m"}}' > "$TMPCFG6"
@@ -95,10 +100,10 @@ export IC_OLLAMA_CONFIG_PATH="$TMPCFG6"
 CAPTURE_MT_B=$(mktemp)
 export CURL_MAXTIME_FILE="$CAPTURE_MT_B"
 
-echo "=== call_validation_llm: openai backend defaults --max-time to 60 without override ==="
+echo "=== call_validation_llm: openai backend defaults --max-time to 8 without override ==="
 call_validation_llm "test prompt" "" >/dev/null
 MAXTIME_B=$(cat "$CAPTURE_MT_B" 2>/dev/null)
-assert_eq "openai arm defaults --max-time to 60" "60" "$MAXTIME_B"
+assert_eq "openai arm defaults --max-time to 8" "8" "$MAXTIME_B"
 
 rm -f "$TMPCFG6" "$CAPTURE_MT_B"
 unset CURL_MAXTIME_FILE
@@ -138,7 +143,8 @@ rm -f "$TMPCFG4" "$CAPTURE_B"
 unset CURL_CAPTURE_FILE
 
 # =============================================================================
-# call_validation_llm(): ollama backend honors ollama.timeout_seconds for --max-time
+# call_validation_llm(): ollama.timeout_seconds does NOT drive --max-time —
+# hook budget default 8 applies regardless of inference timeout
 # =============================================================================
 TMPCFG_OT=$(mktemp)
 printf '%s' '{"backend":"ollama","ollama":{"url":"http://x","model":"m","timeout_seconds":300}}' > "$TMPCFG_OT"
@@ -146,13 +152,101 @@ export IC_OLLAMA_CONFIG_PATH="$TMPCFG_OT"
 CAPTURE_OT=$(mktemp)
 export CURL_MAXTIME_FILE="$CAPTURE_OT"
 
-echo "=== call_validation_llm: ollama backend honors ollama.timeout_seconds override ==="
+echo "=== call_validation_llm: ollama.timeout_seconds=300 does NOT drive --max-time (hook budget default 8) ==="
 call_validation_llm "test prompt" "" >/dev/null
 MAXTIME_OT=$(cat "$CAPTURE_OT" 2>/dev/null)
-assert_eq "ollama arm uses ollama.timeout_seconds for --max-time" "300" "$MAXTIME_OT"
+assert_eq "ollama arm --max-time ignores ollama.timeout_seconds, defaults to hook budget 8" "8" "$MAXTIME_OT"
 
 rm -f "$TMPCFG_OT" "$CAPTURE_OT"
 unset CURL_MAXTIME_FILE
+
+# =============================================================================
+# call_validation_llm(): top-level hook_validation_budget_seconds drives --max-time
+# =============================================================================
+TMPCFG_HB=$(mktemp)
+printf '%s' '{"backend":"openai","openai":{"base_url":"http://h/v1","model":"m"},"hook_validation_budget_seconds":12}' > "$TMPCFG_HB"
+export IC_OLLAMA_CONFIG_PATH="$TMPCFG_HB"
+CAPTURE_HB=$(mktemp)
+export CURL_MAXTIME_FILE="$CAPTURE_HB"
+
+echo "=== call_validation_llm: top-level hook_validation_budget_seconds=12 drives --max-time ==="
+call_validation_llm "test prompt" "" >/dev/null
+MAXTIME_HB=$(cat "$CAPTURE_HB" 2>/dev/null)
+assert_eq "top-level hook_validation_budget_seconds=12 -> --max-time 12" "12" "$MAXTIME_HB"
+
+rm -f "$TMPCFG_HB" "$CAPTURE_HB"
+unset CURL_MAXTIME_FILE
+
+# =============================================================================
+# call_validation_llm(): block-level openai.hook_validation_budget_seconds
+# wins over top-level hook_validation_budget_seconds
+# =============================================================================
+TMPCFG_HB2=$(mktemp)
+printf '%s' '{"backend":"openai","openai":{"base_url":"http://h/v1","model":"m","hook_validation_budget_seconds":11},"hook_validation_budget_seconds":12}' > "$TMPCFG_HB2"
+export IC_OLLAMA_CONFIG_PATH="$TMPCFG_HB2"
+CAPTURE_HB2=$(mktemp)
+export CURL_MAXTIME_FILE="$CAPTURE_HB2"
+
+echo "=== call_validation_llm: block-level openai.hook_validation_budget_seconds wins over top-level ==="
+call_validation_llm "test prompt" "" >/dev/null
+MAXTIME_HB2=$(cat "$CAPTURE_HB2" 2>/dev/null)
+assert_eq "block-level hook_validation_budget_seconds=11 wins over top-level 12" "11" "$MAXTIME_HB2"
+
+rm -f "$TMPCFG_HB2" "$CAPTURE_HB2"
+unset CURL_MAXTIME_FILE
+
+# =============================================================================
+# call_validation_llm(): no connect_timeout_seconds configured -> --connect-timeout
+# defaults to 3
+# =============================================================================
+TMPCFG_CT_DEFAULT=$(mktemp)
+printf '%s' '{"backend":"openai","openai":{"base_url":"http://h/v1","model":"m"}}' > "$TMPCFG_CT_DEFAULT"
+export IC_OLLAMA_CONFIG_PATH="$TMPCFG_CT_DEFAULT"
+CAPTURE_CT_DEFAULT=$(mktemp)
+export CURL_CONNECT_FILE="$CAPTURE_CT_DEFAULT"
+
+echo "=== call_validation_llm: no connect_timeout_seconds configured -> --connect-timeout defaults to 3 ==="
+call_validation_llm "test prompt" "" >/dev/null
+CONNECT_DEFAULT=$(cat "$CAPTURE_CT_DEFAULT" 2>/dev/null)
+assert_eq "no connect key -> --connect-timeout 3" "3" "$CONNECT_DEFAULT"
+
+rm -f "$TMPCFG_CT_DEFAULT" "$CAPTURE_CT_DEFAULT"
+unset CURL_CONNECT_FILE
+
+# =============================================================================
+# call_validation_llm(): openai.connect_timeout_seconds=4 -> --connect-timeout 4
+# =============================================================================
+TMPCFG_CT4=$(mktemp)
+printf '%s' '{"backend":"openai","openai":{"base_url":"http://h/v1","model":"m","connect_timeout_seconds":4}}' > "$TMPCFG_CT4"
+export IC_OLLAMA_CONFIG_PATH="$TMPCFG_CT4"
+CAPTURE_CT4=$(mktemp)
+export CURL_CONNECT_FILE="$CAPTURE_CT4"
+
+echo "=== call_validation_llm: openai.connect_timeout_seconds=4 -> --connect-timeout 4 ==="
+call_validation_llm "test prompt" "" >/dev/null
+CONNECT_4=$(cat "$CAPTURE_CT4" 2>/dev/null)
+assert_eq "openai.connect_timeout_seconds=4 -> --connect-timeout 4" "4" "$CONNECT_4"
+
+rm -f "$TMPCFG_CT4" "$CAPTURE_CT4"
+unset CURL_CONNECT_FILE
+
+# =============================================================================
+# call_validation_llm(): ollama arm with fallback_url set -> --connect-timeout
+# stays fallback-independent (NOT hardcoded to 2)
+# =============================================================================
+TMPCFG_FB=$(mktemp)
+printf '%s' '{"backend":"ollama","ollama":{"url":"http://x","model":"m","fallback_url":"http://y"}}' > "$TMPCFG_FB"
+export IC_OLLAMA_CONFIG_PATH="$TMPCFG_FB"
+CAPTURE_FB=$(mktemp)
+export CURL_CONNECT_FILE="$CAPTURE_FB"
+
+echo "=== call_validation_llm: ollama arm with fallback_url set -> --connect-timeout stays fallback-independent ==="
+call_validation_llm "test prompt" "" >/dev/null
+CONNECT_FB=$(cat "$CAPTURE_FB" 2>/dev/null)
+assert_eq "ollama fallback_url set -> --connect-timeout still 3 (not hardcoded 2)" "3" "$CONNECT_FB"
+
+rm -f "$TMPCFG_FB" "$CAPTURE_FB"
+unset CURL_CONNECT_FILE
 
 # =============================================================================
 # call_validation_llm(): config-path resolution honors IC_OLLAMA_CONFIG_PATH
@@ -194,6 +288,20 @@ else
     assert_eq "$NAME: backend" "$EXP_BACKEND" "$ACT_BACKEND"
     assert_eq "$NAME: model" "$EXP_MODEL" "$ACT_MODEL"
     assert_eq "$NAME: url" "$EXP_URL" "$ACT_URL"
+
+    EXP_CONNECT=$(jq -r ".[$i].expect.connect_timeout // empty" "$FIXTURE")
+    EXP_PROBE=$(jq -r ".[$i].expect.probe_timeout // empty" "$FIXTURE")
+    EXP_BUDGET=$(jq -r ".[$i].expect.hook_validation_budget // empty" "$FIXTURE")
+
+    if [ -n "$EXP_CONNECT" ] || [ -n "$EXP_PROBE" ] || [ -n "$EXP_BUDGET" ]; then
+      ACT_BUDGETS=$(_resolve_budgets "$CASE_CONFIG" "$ACT_BACKEND")
+      ACT_CONNECT=$(printf '%s' "$ACT_BUDGETS" | awk '{print $1}')
+      ACT_PROBE=$(printf '%s' "$ACT_BUDGETS" | awk '{print $2}')
+      ACT_BUDGET=$(printf '%s' "$ACT_BUDGETS" | awk '{print $3}')
+      [ -n "$EXP_CONNECT" ] && assert_eq "$NAME: connect_timeout" "$EXP_CONNECT" "$ACT_CONNECT"
+      [ -n "$EXP_PROBE" ] && assert_eq "$NAME: probe_timeout" "$EXP_PROBE" "$ACT_PROBE"
+      [ -n "$EXP_BUDGET" ] && assert_eq "$NAME: hook_validation_budget" "$EXP_BUDGET" "$ACT_BUDGET"
+    fi
 
     i=$((i + 1))
   done

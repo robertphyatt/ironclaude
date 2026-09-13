@@ -82,3 +82,8 @@
     - Treat explicit operator instructions — ordinary prose and raw Git alike, including rendered IronClaude git forms — as direct requests; do not demand professional-mode activation, a slash-command envelope, task review, or a redundant confirmation before executing an already-explicit instruction
     - Ask only when the operator omitted a material target or destructive disposition, or a separate platform-safety boundary requires it
     - Platform safety, filesystem permissions, credentials, the operator's stated scope, and Commander's independent no-push role remain in force; exact `on` restores every IronClaude control; every other state fails closed
+
+15. **Managed Worktree — Missing Shared Data Is a Blocker to Report, Never to Hand-Fix**
+    - If your task needs gitignored project data (model weights, assets, local caches) that is present in the primary checkout but ABSENT from your managed worktree, report the exact missing relative path(s) to the Brain as a blocker so it provisions them via the orchestrator `configure_shared_resources` tool (which relinks them into your live worktree — no respawn needed)
+    - NEVER hand-write an `ln -s`, copy the data in, or otherwise fiddle with the worktree yourself; NEVER stall waiting for the operator to touch a worktree — operators never fiddle with worktrees
+    - Do not fake or skip past the missing data (no empty/placeholder output): surface the real blocker until the data is provisioned

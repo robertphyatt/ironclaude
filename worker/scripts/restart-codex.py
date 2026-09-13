@@ -29,16 +29,21 @@ POLL_INTERVAL_SECONDS = 0.25
 POLL_ATTEMPTS = 120
 COMMAND_TIMEOUT_SECONDS = 5.0
 
+CHATGPT_EXECUTABLE_PATTERN = (
+    r"^/Applications/ChatGPT\.app/Contents/MacOS/ChatGPT( |$)"
+)
 QUIT_ARGV = [
-    "/usr/bin/osascript",
-    "-e",
-    'tell application "ChatGPT" to quit',
+    "/usr/bin/pkill",
+    "-9",
+    "-a",  # Include the scheduling app's ancestor process on macOS.
+    "-f",
+    CHATGPT_EXECUTABLE_PATTERN,
 ]
 PROBE_ARGV = [
     "/usr/bin/pgrep",
     "-a",  # macOS otherwise excludes the scheduling app's ancestor process.
     "-f",
-    r"^/Applications/ChatGPT\.app/Contents/MacOS/ChatGPT( |$)",
+    CHATGPT_EXECUTABLE_PATTERN,
 ]
 LAUNCH_ARGV = ["/usr/bin/open", "/Applications/ChatGPT.app"]
 
@@ -255,14 +260,17 @@ def perform_restart(
 
         sleeper(START_DELAY_SECONDS)
 
-        # Close the schedule-to-mutation race immediately before AppleScript.
+        # Close the schedule-to-mutation race immediately before force termination.
         if sha256_file(source) != expected_sha256:
             _record("pre-quit digest mismatch: restart refused", log_path=log_path)
             return EXIT_DIGEST_MISMATCH
 
         _record("restart requested", log_path=log_path)
-        if _run_command(runner, QUIT_ARGV) != 0:
-            raise RuntimeError("osascript quit returned nonzero")
+        terminate_returncode = _run_command(runner, QUIT_ARGV)
+        if terminate_returncode not in {0, 1}:
+            raise RuntimeError(
+                f"pkill returned status {terminate_returncode}"
+            )
 
         for attempt in range(poll_attempts):
             if not _chatgpt_running(runner):

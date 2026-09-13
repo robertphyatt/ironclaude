@@ -806,14 +806,55 @@ def test_heartbeat_shows_marker_in_idle_no_workers_case():
 def test_heartbeat_degraded_label_names_backend():
     from ironclaude.notifications import format_heartbeat
     out = format_heartbeat([], ollama_degraded=True, degraded_backend_label="OpenAI")
-    assert "OpenAI endpoint(s) down" in out
-    assert "Ollama endpoint(s) down" not in out
+    assert "OpenAI endpoint(s) unreachable/degraded" in out
+    assert "Ollama endpoint(s) unreachable/degraded" not in out
+
+
+def test_heartbeat_degraded_label_with_workers_path():
+    from ironclaude.notifications import format_heartbeat
+    out = format_heartbeat(
+        [{"id": "w1", "description": "task", "workflow_stage": "executing"}],
+        ollama_degraded=True, degraded_backend_label="OpenAI",
+    )
+    assert "OpenAI endpoint(s) unreachable/degraded" in out
+    assert "Ollama endpoint(s) unreachable/degraded" not in out
 
 
 def test_heartbeat_degraded_label_defaults_to_ollama():
     from ironclaude.notifications import format_heartbeat
     out = format_heartbeat([], ollama_degraded=True)
-    assert "Ollama endpoint(s) down" in out
+    assert "Ollama endpoint(s) unreachable/degraded" in out
+
+
+def test_heartbeat_shows_busy_marker_no_workers_case():
+    from ironclaude.notifications import format_heartbeat
+    out = format_heartbeat(
+        [], ollama_busy=True, ollama_degraded=False, degraded_backend_label="OpenAI",
+    )
+    assert "OpenAI" in out
+    assert "busy" in out.lower()
+    assert "degraded" not in out.lower()
+
+
+def test_heartbeat_shows_busy_marker_with_workers_path():
+    from ironclaude.notifications import format_heartbeat
+    out = format_heartbeat(
+        [{"id": "w1", "description": "task", "workflow_stage": "executing"}],
+        ollama_busy=True, ollama_degraded=False, degraded_backend_label="OpenAI",
+    )
+    assert "OpenAI" in out
+    assert "busy" in out.lower()
+    assert "degraded" not in out.lower()
+
+
+def test_heartbeat_degraded_wins_over_busy():
+    from ironclaude.notifications import format_heartbeat
+    out = format_heartbeat(
+        [], ollama_degraded=True, ollama_busy=True, degraded_backend_label="OpenAI",
+    )
+    assert "⚠️" in out
+    assert "degraded" in out.lower()
+    assert "busy" not in out.lower()
 
 
 def test_resolve_degraded_backend_label_openai(tmp_path):

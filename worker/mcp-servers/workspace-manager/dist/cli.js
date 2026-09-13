@@ -535,7 +535,7 @@ import path4 from "node:path";
 
 // src/git.ts
 import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import path2 from "node:path";
 var MANAGED_WORKTREE_EXCLUSION = "/.ironclaude/worktrees/";
 function gitError(cwd, args, stderr) {
@@ -650,13 +650,15 @@ function readSharedResourceConfig(repositoryIdentity) {
   if (!existsSync(configPath)) return [];
   return readFileSync(configPath, "utf8").split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0 && !line.startsWith("#"));
 }
-function addSharedResourceEntries(repositoryIdentity, entries, allowSecretEntries = false) {
+function addSharedResourceEntries(repositoryIdentity, entries, primaryCheckoutPath, allowSecretEntries = false) {
   const configPath = path2.join(repositoryIdentity, "info", SHARED_RESOURCE_CONFIG);
   const present = new Set(readSharedResourceConfig(repositoryIdentity));
   const added = [];
   const skipped = [];
   const rejected = [];
   const secretBlocked = [];
+  const secretHits = {};
+  const scanTruncated = [];
   for (const entry of entries) {
     if (!isSafeSharedEntry(entry)) {
       rejected.push(entry);
@@ -665,6 +667,24 @@ function addSharedResourceEntries(repositoryIdentity, entries, allowSecretEntrie
     if (!allowSecretEntries && isSecretEntry(entry)) {
       secretBlocked.push(entry);
       continue;
+    }
+    if (!SCAN_VENDOR_SKIP.has(entry.split("/")[0])) {
+      const absDir = path2.join(primaryCheckoutPath, entry);
+      let isDir = false;
+      try {
+        isDir = statSync(absDir).isDirectory();
+      } catch {
+        isDir = false;
+      }
+      if (isDir) {
+        const { hits, truncated } = directoryContainsSecret(absDir, entry);
+        if (truncated) scanTruncated.push(entry);
+        if (hits.length > 0 && !allowSecretEntries) {
+          secretBlocked.push(entry);
+          secretHits[entry] = hits;
+          continue;
+        }
+      }
     }
     if (present.has(entry)) {
       skipped.push(entry);
@@ -680,13 +700,14 @@ function addSharedResourceEntries(repositoryIdentity, entries, allowSecretEntrie
     writeFileSync(configPath, existing + separator + added.map((entry) => `${entry}
 `).join(""));
   }
-  return { added, skipped, rejected, secretBlocked, entries: [...present] };
+  return { added, skipped, rejected, secretBlocked, entries: [...present], secretHits, scanTruncated };
 }
 function isSecretEntry(entry) {
   const lower = entry.split("/").map((s) => s.toLowerCase());
   const SECRET_DIRS = /* @__PURE__ */ new Set([".ssh", ".aws", ".gnupg"]);
   if (lower.some((s) => SECRET_DIRS.has(s))) return true;
   const base = lower[lower.length - 1];
+  if (base.endsWith(".example")) return false;
   const SECRET_FILES = /* @__PURE__ */ new Set([
     ".env",
     ".netrc",
@@ -703,6 +724,48 @@ function isSecretEntry(entry) {
   if (base.startsWith(".env.")) return true;
   if (/\.(pem|key|p12|pfx)$/.test(base)) return true;
   return false;
+}
+var SCAN_MAX_DEPTH = 6;
+var SCAN_MAX_ENTRIES = 2e4;
+var SCAN_MAX_HITS = 5;
+var SCAN_VENDOR_SKIP = /* @__PURE__ */ new Set(["node_modules", ".venv", "venv", "site-packages", ".git"]);
+function directoryContainsSecret(absEntryDir, entryRel, limits = {}) {
+  const maxDepth = limits.maxDepth ?? SCAN_MAX_DEPTH;
+  const maxEntries = limits.maxEntries ?? SCAN_MAX_ENTRIES;
+  const hits = [];
+  let examined = 0;
+  let truncated = false;
+  const queue = [{ abs: absEntryDir, rel: entryRel, depth: 0 }];
+  while (queue.length > 0) {
+    const { abs, rel, depth } = queue.shift();
+    let dir;
+    try {
+      dir = opendirSync(abs);
+      for (let d = dir.readSync(); d !== null; d = dir.readSync()) {
+        if (examined >= maxEntries) {
+          truncated = true;
+          return { hits, truncated };
+        }
+        examined++;
+        const childRel = `${rel}/${d.name}`;
+        if (isSecretEntry(childRel)) {
+          if (hits.length < SCAN_MAX_HITS) hits.push(childRel);
+          if (hits.length >= SCAN_MAX_HITS) return { hits, truncated };
+        } else if (d.isDirectory() && !SCAN_VENDOR_SKIP.has(d.name)) {
+          if (depth + 1 <= maxDepth) {
+            queue.push({ abs: path2.join(abs, d.name), rel: childRel, depth: depth + 1 });
+          } else {
+            truncated = true;
+          }
+        }
+      }
+    } catch {
+      truncated = true;
+    } finally {
+      dir?.closeSync();
+    }
+  }
+  return { hits, truncated };
 }
 function isSafeSharedEntry(entry) {
   if (entry.length === 0) return false;
@@ -742,6 +805,7 @@ function linkSharedResources(primaryCheckoutPath, worktreePath, repositoryIdenti
       continue;
     }
     try {
+      mkdirSync(path2.dirname(target), { recursive: true });
       symlinkSync(source, target);
       linked.push(entry);
     } catch (error) {
@@ -2316,7 +2380,12 @@ var WorkspaceService = class {
    */
   configureSharedResources(input) {
     const repository = discoverRepository(input.repositoryPath);
-    const written = addSharedResourceEntries(repository.repositoryIdentity, input.entries, input.allowSecretEntries ?? false);
+    const written = addSharedResourceEntries(
+      repository.repositoryIdentity,
+      input.entries,
+      repository.primaryCheckoutPath,
+      input.allowSecretEntries ?? false
+    );
     const relinked = {};
     const toRelink = [...written.added, ...written.skipped];
     if (toRelink.length > 0) {

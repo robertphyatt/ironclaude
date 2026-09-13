@@ -117,6 +117,32 @@
     }
   },
   {
+    "name": "openai-block-level-budget-keys-win-over-top-level",
+    "config": {
+      "backend": "openai",
+      "openai": {
+        "base_url": "http://llm-host:8080/v1",
+        "model": "example-model-a",
+        "max_tokens": 1024,
+        "connect_timeout_seconds": 4,
+        "probe_timeout_seconds": 5,
+        "hook_validation_budget_seconds": 11
+      },
+      "connect_timeout_seconds": 9,
+      "probe_timeout_seconds": 9,
+      "hook_validation_budget_seconds": 12
+    },
+    "spot": "grader",
+    "expect": {
+      "backend": "openai",
+      "model": "example-model-a",
+      "url": "http://llm-host:8080/v1",
+      "connect_timeout": 4,
+      "probe_timeout": 5,
+      "hook_validation_budget": 11
+    }
+  },
+  {
     "name": "spots-summarization-model-wins-over-nested-alias",
     "config": {
       "backend": "ollama",

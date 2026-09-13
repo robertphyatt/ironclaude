@@ -3076,8 +3076,8 @@ class TestPostHeartbeat:
         with patch("ironclaude.ollama_client.ollama_degraded_urls", return_value=["http://h/v1"]):
             daemon.post_heartbeat()
         msg = daemon.slack.post_message.call_args[0][0]
-        assert "OpenAI endpoint(s) down" in msg
-        assert "Ollama endpoint(s) down" not in msg
+        assert "OpenAI endpoint(s) unreachable/degraded" in msg
+        assert "Ollama endpoint(s) unreachable/degraded" not in msg
 
 
 class TestGetRecentWorkers:
@@ -4977,7 +4977,7 @@ class TestGradeBoundedInFlightCap:
         gate = _t.Event()
         calls = []
 
-        def _blocking_grade(system, user, schema):
+        def _blocking_grade(system, user, schema, **kw):
             calls.append(1)
             gate.wait(5)
             return {"ok": True}
@@ -5001,6 +5001,61 @@ class TestGradeBoundedInFlightCap:
         # A subsequent call now proceeds and invokes the grader again.
         assert daemon._grade_bounded("s", "u", None, timeout=2) == {"ok": True}
         assert len(calls) == 2
+
+
+class TestGradeBoundedFastLaneReadTimeout:
+    def test_abandoned_grade_clears_flag_near_bound_not_full_read_timeout(self, daemon, tmp_path):
+        """Cherry-pick A: LocalGrader.grade's per-call read_timeout must bound the
+        underlying client's read timeout to _grade_bounded's `timeout`, so the
+        thread left running past an abandoned call's join ends near that bound
+        (~5s target) instead of stalling for the full 600s inference read
+        timeout — clearing _grade_in_flight promptly and letting the NEXT call
+        proceed rather than being skipped as still-in-flight."""
+        import time as _time
+        import requests
+        from ironclaude.grader import LocalGrader
+        from ironclaude.ollama_client import OllamaClient
+
+        # The fake transport stalls for a fixed 0.5s — reliably longer than the
+        # 0.2s _grade_bounded join (so the first call is deterministically
+        # abandoned, not racing thread-scheduling jitter against an equal
+        # sleep) yet still well under the OLD 120s default that read_timeout
+        # replaces, and short enough to clear within the poll window below.
+        # kw["timeout"][1] is captured directly to prove the CLIENT's own read
+        # timeout was actually threaded down to ~0.2s (not left at 120s).
+        captured_read_timeouts = []
+
+        def fake_post(url, **kw):
+            captured_read_timeouts.append(kw["timeout"][1])
+            _time.sleep(0.5)
+            raise requests.ReadTimeout()
+
+        daemon._grader = LocalGrader(config_path=str(tmp_path / "absent.json"), keep_alive="30m")
+
+        with patch("ironclaude.ollama_client.requests.post", side_effect=fake_post) as mock_post, \
+                patch.object(OllamaClient, "_probe_reachable", return_value=True):
+            assert daemon._grade_bounded("s", "u", None, timeout=0.2) is None
+            assert captured_read_timeouts == [0.2]   # client's read timeout bounded near the join, not 120s
+
+            for _ in range(60):
+                if not daemon._grade_in_flight:
+                    break
+                _time.sleep(0.05)
+            assert daemon._grade_in_flight is False
+            assert mock_post.call_count == 1
+
+            # A second call now proceeds (not skipped as still-in-flight) and
+            # actually invokes the transport again.
+            daemon._grade_bounded("s", "u", None, timeout=0.2)
+            assert mock_post.call_count == 2
+
+            # Drain the second abandoned worker while the patches are still
+            # active, so it never falls through to a real network probe.
+            for _ in range(60):
+                if not daemon._grade_in_flight:
+                    break
+                _time.sleep(0.05)
+            assert daemon._grade_in_flight is False
 
 
 class TestCodexBrainExecutingToolAttr:

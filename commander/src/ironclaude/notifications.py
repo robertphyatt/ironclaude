@@ -112,6 +112,7 @@ def format_heartbeat(
     brain_waits: dict | None = None,
     operator_name: str = "Operator",
     ollama_degraded: bool = False,
+    ollama_busy: bool = False,
     blocked_directives: list[dict] | None = None,
     degraded_backend_label: str = "Ollama",
 ) -> str:
@@ -121,7 +122,9 @@ def format_heartbeat(
     if not workers and not waits and not brain_waits and not blocked_directives:
         base = "*Heartbeat* | No active workers"
         if ollama_degraded:
-            base += f"\n⚠️ validator degraded ({degraded_backend_label} endpoint(s) down — see logs)"
+            base += f"\n⚠️ validator degraded ({degraded_backend_label} endpoint(s) unreachable/degraded — see logs)"
+        if ollama_busy and not ollama_degraded:
+            base += f"\n⏳ validator busy ({degraded_backend_label} endpoint(s) reachable but slow — normal under load)"
         return base
     lines = ["*Heartbeat*"]
     if blocked_directives:
@@ -183,7 +186,9 @@ def format_heartbeat(
                 line += f" — turn in progress (last activity {_fmt_duration(age)} ago)"
         lines.append(line)
     if ollama_degraded:
-        lines.append(f"⚠️ validator degraded ({degraded_backend_label} endpoint(s) down — see logs)")
+        lines.append(f"⚠️ validator degraded ({degraded_backend_label} endpoint(s) unreachable/degraded — see logs)")
+    if ollama_busy and not ollama_degraded:
+        lines.append(f"⏳ validator busy ({degraded_backend_label} endpoint(s) reachable but slow — normal under load)")
     return "\n".join(lines)
 
 

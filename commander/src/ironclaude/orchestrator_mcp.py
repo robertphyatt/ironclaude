@@ -811,6 +811,8 @@ class OrchestratorTools:
                 url=ollama_cfg.get("url", "http://localhost:11434"),
                 fallback_url=ollama_cfg.get("fallback_url"),
                 timeout=cfg.get("timeout_seconds", 120),
+                connect_timeout=(ollama_cfg.get("connect_timeout_seconds") or cfg.get("connect_timeout_seconds") or 3),
+                probe_timeout=(ollama_cfg.get("probe_timeout_seconds") or cfg.get("probe_timeout_seconds") or 3),
             )
         return self._ollama_client
 
@@ -4007,9 +4009,13 @@ class OrchestratorTools:
         worker_id, when given, resolves transport (provider + host) from the worker
         registry; omit it for a Brain-local repository. Entries that look like
         secrets are returned in `secretBlocked` and require operator approval;
-        pass `allow_secret_entries=True` only after the operator approves. Returns
-        a structured dict ({added, skipped, rejected, entries, relinked}) or a
-        structured error dict; never raises.
+        pass `allow_secret_entries=True` only after the operator approves. When a
+        blocked entry is a directory, `secretHits[entry]` lists the offending
+        child path(s) found inside it. `scanTruncated` lists entries whose bounded
+        content-scan hit a depth/size cap -- these are allowed, not blocked, so
+        their contents were only partially scanned for secrets. Returns
+        a structured dict ({added, skipped, rejected, secretBlocked, secretHits,
+        scanTruncated, entries, relinked}) or a structured error dict; never raises.
         """
         transport = self._shared_resources_transport(repository_path, worker_id)
         if "error" in transport:
@@ -7349,8 +7355,11 @@ def _create_mcp_server(tools: OrchestratorTools, plugin_dirs: list[str] | None =
                 entries that look like secrets; the returned JSON now includes
                 `secretBlocked` for entries withheld pending that approval.
 
-        Returns JSON ({added, skipped, rejected, entries, relinked}) or a
-        structured error dict.
+        Returns JSON ({added, skipped, rejected, secretBlocked, secretHits,
+        scanTruncated, entries, relinked}) or a structured error dict.
+        `secretHits[entry]` lists the offending child path(s) for a blocked
+        directory entry. `scanTruncated` lists entries whose bounded
+        content-scan hit a depth/size cap -- allowed, not blocked.
         """
         return json.dumps(
             tools.configure_shared_resources(

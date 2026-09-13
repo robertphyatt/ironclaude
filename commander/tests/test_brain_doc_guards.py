@@ -39,3 +39,14 @@ def test_workflow_secret_block_operator_ask_rule_present():
     text = WF.read_text()
     assert "secretBlocked" in text
     assert "allow_secret_entries=true" in text
+
+
+def test_workflow_secret_scan_inspects_listed_directory_contents():
+    """The secret deny-list is DETECTION on an already-listed directory, not
+    auto-discovery of what to share: it inspects the contents (names only,
+    bounded) of a directory the caller explicitly listed, and names the
+    offending child via secretHits. It can only withhold an entry, never add
+    one that wasn't listed."""
+    text = WF.read_text()
+    assert "secretHits" in text
+    assert "inspects the contents of a directory you explicitly list" in text

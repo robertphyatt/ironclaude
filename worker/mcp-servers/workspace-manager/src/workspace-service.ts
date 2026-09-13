@@ -53,6 +53,8 @@ interface ConfigureSharedResourcesResult {
   secretBlocked: string[];
   entries: string[];
   relinked: Record<string, string[]>;
+  secretHits: Record<string, string[]>;
+  scanTruncated: string[];
 }
 
 interface ListSharedResourcesResult {
@@ -911,7 +913,12 @@ export class WorkspaceService {
    */
   configureSharedResources(input: ConfigureSharedResourcesInput): ConfigureSharedResourcesResult {
     const repository = discoverRepository(input.repositoryPath);
-    const written = addSharedResourceEntries(repository.repositoryIdentity, input.entries, input.allowSecretEntries ?? false);
+    const written = addSharedResourceEntries(
+      repository.repositoryIdentity,
+      input.entries,
+      repository.primaryCheckoutPath,
+      input.allowSecretEntries ?? false,
+    );
     const relinked: Record<string, string[]> = {};
     // Relink every safe in-config entry from this request (added ∪ skipped), not
     // just newly-added ones: an entry configured while its source was absent is

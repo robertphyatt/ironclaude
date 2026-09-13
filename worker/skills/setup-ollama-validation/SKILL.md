@@ -29,7 +29,6 @@ Display:
 🔧 Hook Validation Backend Setup
 
 Professional mode hooks that use LLM validation (benefiting from Ollama):
-- Checks if messages relate to the active plan (topic-change-detector) — uses LLM
 - Confirms task completion (task-completion-validator) — uses LLM
 
 Other professional mode hooks (rule-based, no LLM):

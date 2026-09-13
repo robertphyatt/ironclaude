@@ -1577,4 +1577,29 @@ describe('WorkspaceService real-Git lifecycle', () => {
     expect(result.relinked[assignment.worktree_path] ?? []).toEqual([]);
     expect(existsSync(join(assignment.worktree_path, 'models'))).toBe(false);
   });
+
+  it('configureSharedResources scans an explicitly-shared directory for secrets end-to-end, blocks it, and relinks under allowSecretEntries', () => {
+    const root = repository();
+    ignoreResources(root, 'config/', 'models/');
+    seedDirectory(root, 'config', '.env', 'SECRET=1\n');
+    const manager = service(root);
+    const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+
+    const blocked = manager.configureSharedResources({ repositoryPath: root, entries: ['config'] });
+    expect(blocked.secretBlocked).toEqual(['config']);
+    expect(blocked.secretHits.config).toEqual(['config/.env']);
+    expect(existsSync(join(assignment.worktree_path, 'config'))).toBe(false);
+
+    const overridden = manager.configureSharedResources({ repositoryPath: root, entries: ['config'], allowSecretEntries: true });
+    expect(overridden.relinked[assignment.worktree_path]).toEqual(['config']);
+    expect(lstatSync(join(assignment.worktree_path, 'config')).isSymbolicLink()).toBe(true);
+    expect(worktreeIsClean(assignment.worktree_path)).toBe(true);
+
+    // Regression: a clean shared directory (no secrets) still links normally (operator-free path).
+    seedDirectory(root, 'models', 'weights.bin', 'weights\n');
+    const clean = manager.configureSharedResources({ repositoryPath: root, entries: ['models'] });
+    expect(clean.relinked[assignment.worktree_path]).toEqual(['models']);
+    expect(lstatSync(join(assignment.worktree_path, 'models')).isSymbolicLink()).toBe(true);
+    expect(worktreeIsClean(assignment.worktree_path)).toBe(true);
+  });
 });

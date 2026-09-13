@@ -41,15 +41,19 @@ class OpenAiClient:
         base_url: str,
         fallback_base_url: str | None = None,
         timeout: int = 120,
+        connect_timeout: int = 3,
+        probe_timeout: int = 3,
     ) -> None:
         if not base_url:
             raise OllamaConnectionError("OpenAI base_url is empty/missing; cannot construct client")
         self._url = base_url.rstrip("/")
         self._fallback_url = fallback_base_url.rstrip("/") if fallback_base_url else None
         self._timeout = timeout
-        # Short connect timeout when fallback configured: fail fast to fallback
-        # rather than waiting the full timeout on an unreachable primary.
-        self._connect_timeout = 2 if fallback_base_url else timeout
+        # Fixed short connect timeout, independent of fallback: fail fast to
+        # fallback (or surface unreachable) rather than waiting the full
+        # read-timeout budget on an unreachable primary.
+        self._connect_timeout = connect_timeout
+        self._probe_timeout = probe_timeout
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -78,6 +82,16 @@ class OpenAiClient:
         """
         return self._attempt(lambda url: self._do_get_models(url))
 
+    def _probe_reachable(self, url: str) -> bool:
+        """Cheap liveness probe OUTSIDE the breaker path; never raises; never touches _BREAKERS."""
+        try:
+            resp = requests.get(
+                f"{url}/models", headers=self._headers(), timeout=(self._connect_timeout, self._probe_timeout)
+            )
+            return resp.status_code < 500
+        except Exception:
+            return False
+
     # ── retry / breaker orchestration (mirrors OllamaClient._attempt) ──────
 
     def _attempt(self, do_request):
@@ -93,8 +107,15 @@ class OpenAiClient:
             except OllamaHTTPError:
                 _BREAKERS.record_success(url)     # endpoint responded -> healthy
                 raise
-            except (OllamaConnectionError, OllamaTimeoutError) as e:
+            except OllamaConnectionError as e:
                 _BREAKERS.record_failure(url)
+                last_err = e
+                continue
+            except OllamaTimeoutError as e:
+                if self._probe_reachable(url):
+                    _BREAKERS.record_slow(url)    # reachable but slow = busy, not a failure
+                else:
+                    _BREAKERS.record_failure(url)
                 last_err = e
                 continue
             except BaseException:
@@ -133,12 +154,16 @@ class OpenAiClient:
             return resp
         except requests.HTTPError as e:
             raise _http_error(url, e, backend="OpenAI") from e
-        except requests.ConnectionError as e:
-            raise OllamaConnectionError(f"OpenAI unreachable at {url}: {e}") from e
+        except requests.ConnectTimeout as e:
+            raise OllamaConnectionError(
+                f"OpenAI connect timed out at {url} (connect={self._connect_timeout}s)"
+            ) from e
         except requests.Timeout:
             raise OllamaTimeoutError(
                 f"OpenAI timed out at {url} (connect={self._connect_timeout}s, read={self._timeout}s)"
             )
+        except requests.ConnectionError as e:
+            raise OllamaConnectionError(f"OpenAI unreachable at {url}: {e}") from e
         except requests.RequestException as e:
             raise OllamaConnectionError(f"OpenAI request failed at {url}: {e}") from e
 
@@ -153,12 +178,16 @@ class OpenAiClient:
             return resp.json()
         except requests.HTTPError as e:
             raise _http_error(url, e, backend="OpenAI") from e
-        except requests.ConnectionError as e:
-            raise OllamaConnectionError(f"OpenAI unreachable at {url}: {e}") from e
+        except requests.ConnectTimeout as e:
+            raise OllamaConnectionError(
+                f"OpenAI connect timed out at {url} (connect={self._connect_timeout}s)"
+            ) from e
         except requests.Timeout:
             raise OllamaTimeoutError(
                 f"OpenAI timed out at {url} (connect={self._connect_timeout}s, read={self._timeout}s)"
             )
+        except requests.ConnectionError as e:
+            raise OllamaConnectionError(f"OpenAI unreachable at {url}: {e}") from e
         except requests.RequestException as e:
             raise OllamaConnectionError(f"OpenAI request failed at {url}: {e}") from e
 

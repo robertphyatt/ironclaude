@@ -565,6 +565,18 @@ class TestGetClient:
             grader._get_client()
         assert mock_cls.call_args.kwargs["timeout"] == 300
 
+    def test_ollama_arm_honors_connect_and_probe_timeout(self, tmp_path):
+        cfg = tmp_path / "hooks.json"
+        cfg.write_text(
+            '{"ollama": {"connect_timeout_seconds": 5, "probe_timeout_seconds": 6}}'
+        )
+        grader = ShadowGrader(config_path=str(cfg))
+        with patch("ironclaude.shadow_grader.OllamaClient") as mock_cls:
+            mock_cls.return_value = MagicMock()
+            grader._get_client()
+        assert mock_cls.call_args.kwargs["connect_timeout"] == 5
+        assert mock_cls.call_args.kwargs["probe_timeout"] == 6
+
 
 class TestNumCtx:
     def test_num_ctx_present_in_both_payloads(self, tmp_path):

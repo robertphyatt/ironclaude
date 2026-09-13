@@ -18,7 +18,10 @@ conformance fixture; later per-language tests assert against it directly.
     "fallback_url": string?,
     "model": string,
     "summarization_model": string?,                       // legacy alias, see below
-    "timeout_seconds": number?
+    "timeout_seconds": number?,
+    "connect_timeout_seconds": number?,
+    "probe_timeout_seconds": number?,
+    "hook_validation_budget_seconds": number?
   },
 
   "openai": {
@@ -26,7 +29,10 @@ conformance fixture; later per-language tests assert against it directly.
     "model": string,
     "max_tokens": number,
     "timeout_seconds": number?,
-    "fallback_base_url": string?
+    "fallback_base_url": string?,
+    "connect_timeout_seconds": number?,
+    "probe_timeout_seconds": number?,
+    "hook_validation_budget_seconds": number?
   },
 
   "spots": {
@@ -38,7 +44,10 @@ conformance fixture; later per-language tests assert against it directly.
 
   "shadow_model": string?,                                 // legacy alias, see below
 
-  "timeout_seconds": number?
+  "timeout_seconds": number?,
+  "connect_timeout_seconds": number?,
+  "probe_timeout_seconds": number?,
+  "hook_validation_budget_seconds": number?
 }
 ```
 
@@ -60,6 +69,19 @@ config `C`:
    `C.openai.{base_url,fallback_base_url}`; `timeout` and (openai) `max_tokens` come from
    that block else `C.timeout_seconds`.
 4. On any backend error, fail open exactly as the consumer does today.
+
+`connect_timeout_seconds`, `probe_timeout_seconds`, and `hook_validation_budget_seconds`
+resolve block-then-top identically to `timeout_seconds` — i.e.
+`<resolvedBackend>.<key> ?? C.<key>`:
+
+- `connect_timeout_seconds` (default 3) — TCP connect budget.
+- `probe_timeout_seconds` (default 3) — the probe's READ half; worst-case probe wall
+  time is `connect_timeout_seconds + probe_timeout_seconds`.
+- `hook_validation_budget_seconds` (default 8) — total wall budget for a bash-hook LLM
+  validation call.
+
+Note `timeout_seconds` itself is the **inference READ budget only** — it does not cover
+connect or probe time, which is why the three keys above exist separately.
 
 Every parser (shell, TS, Python/Commander) must implement steps 1–4 identically. The
 only thing that varies per consumer is the default in step 1/step 2 when nothing in

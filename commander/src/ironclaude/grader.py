@@ -54,10 +54,58 @@ class LocalGrader:
         self._openai_max_tokens: int | None = None
         self._spot_model: str | None = None
         self._spot_thinking: bool = False
+        # Fast lane (per-call read_timeout): a SEPARATE cached client, keyed by
+        # (config mtime, read_timeout), built from the same resolved config as
+        # self._client but with a short read timeout. Never overwrites
+        # self._client/self._client_mtime — the 600s-timeout normal path stays
+        # byte-identical when read_timeout is not passed to grade().
+        self._fast_client: OllamaClient | None = None
+        self._fast_client_key: tuple[float | None, float] | None = None
+        self._fast_state: tuple | None = None
 
     @staticmethod
     def _build_infrastructure_error(detail: str) -> dict:
         return {"infrastructure_error": True, "error_detail": detail}
+
+    def _read_config(self) -> dict:
+        """Load the config JSON (or {} on missing/invalid file). Never raises."""
+        try:
+            with open(self._config_path) as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logger.warning("Ollama config unavailable (%s): using localhost defaults", e)
+            return {}
+
+    @staticmethod
+    def _resolve_for_grader(cfg: dict):
+        """resolve_backend cfg for the 'grader' spot, plus its spot overrides."""
+        resolved = resolve_backend(cfg, "grader")
+        spot_model = ((cfg.get("spots") or {}).get("grader") or {}).get("model")
+        spot_thinking = bool(((cfg.get("spots") or {}).get("grader") or {}).get("thinking", False))
+        return resolved, spot_model, spot_thinking
+
+    @staticmethod
+    def _build_client(cfg: dict, resolved, timeout) -> tuple:
+        """Construct a client for `resolved`/`cfg` with the given read timeout.
+
+        Returns (client, backend, openai_model, openai_max_tokens, effective_cfg).
+        Pure — does not touch `self`, so it is safe to share between the normal
+        (cached self._client) and fast (per-call read_timeout) paths.
+        """
+        if resolved.backend == "openai":
+            client = make_client(resolved, timeout=timeout)
+            return client, "openai", resolved.model, resolved.max_tokens, cfg.get("openai", {})
+        # Ollama path — construct OllamaClient directly (by name) so the
+        # existing test seams that patch `grader.OllamaClient` stay intact.
+        ollama_cfg = cfg.get("ollama", {})
+        client = OllamaClient(
+            url=ollama_cfg.get("url", "http://localhost:11434"),
+            fallback_url=ollama_cfg.get("fallback_url"),
+            timeout=timeout,
+            connect_timeout=(resolved.connect_timeout or 3),
+            probe_timeout=(resolved.probe_timeout or 3),
+        )
+        return client, "ollama", None, None, ollama_cfg
 
     def _get_client(self) -> OllamaClient:
         try:
@@ -67,42 +115,59 @@ class LocalGrader:
         # Rebuild only when there is no client yet, or the file exists AND its mtime
         # changed. A deleted config keeps the last client (no per-call rebuild spam).
         if self._client is None or (mtime is not None and mtime != self._client_mtime):
-            try:
-                with open(self._config_path) as f:
-                    cfg = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError) as e:
-                logger.warning("Ollama config unavailable (%s): using localhost defaults", e)
-                cfg = {}
-            resolved = resolve_backend(cfg, "grader")
-            self._spot_model = ((cfg.get("spots") or {}).get("grader") or {}).get("model")
-            self._spot_thinking = bool(((cfg.get("spots") or {}).get("grader") or {}).get("thinking", False))
+            cfg = self._read_config()
+            resolved, self._spot_model, self._spot_thinking = self._resolve_for_grader(cfg)
             timeout = (
                 self._timeout_override if self._timeout_override is not None
                 else (resolved.timeout if resolved.timeout is not None else 120)
             )
-            if resolved.backend == "openai":
-                self._backend = "openai"
-                self._openai_model = resolved.model
-                self._openai_max_tokens = resolved.max_tokens
-                self._cfg = cfg.get("openai", {})
-                self._client = make_client(resolved, timeout=timeout)
-            else:
-                # Ollama path — construct OllamaClient directly (by name) so the
-                # existing test seams that patch `grader.OllamaClient` and inject
-                # `self._cfg` stay intact.
-                self._backend = "ollama"
-                ollama_cfg = cfg.get("ollama", {})
-                self._cfg = ollama_cfg
-                self._client = OllamaClient(
-                    url=ollama_cfg.get("url", "http://localhost:11434"),
-                    fallback_url=ollama_cfg.get("fallback_url"),
-                    timeout=timeout,
-                )
+            self._client, self._backend, self._openai_model, self._openai_max_tokens, self._cfg = (
+                self._build_client(cfg, resolved, timeout)
+            )
             self._client_mtime = mtime
         return self._client
 
-    def grade(self, system_prompt: str, user_prompt: str, schema: dict | None = None) -> dict:
+    def _get_fast_client_state(self, read_timeout: float) -> tuple:
+        """Build/cache a SEPARATE client bounded to `read_timeout`, from the same
+        resolved config as the normal client. Keyed by (config mtime, read_timeout)
+        so a config hot-reload or a differing bound rebuilds it; otherwise cached.
+        Never touches self._client/self._client_mtime.
+
+        Returns (client, backend, openai_model, openai_max_tokens, effective_cfg,
+        spot_model, spot_thinking).
+        """
+        try:
+            mtime = os.stat(self._config_path).st_mtime
+        except OSError:
+            mtime = None
+        key = (mtime, read_timeout)
+        if self._fast_client is None or self._fast_client_key != key:
+            cfg = self._read_config()
+            resolved, spot_model, spot_thinking = self._resolve_for_grader(cfg)
+            client, backend, openai_model, openai_max_tokens, eff_cfg = self._build_client(
+                cfg, resolved, read_timeout
+            )
+            self._fast_client = client
+            self._fast_client_key = key
+            self._fast_state = (backend, openai_model, openai_max_tokens, eff_cfg, spot_model, spot_thinking)
+        return (self._fast_client,) + self._fast_state
+
+    def grade(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        schema: dict | None = None,
+        *,
+        read_timeout: float | None = None,
+    ) -> dict:
         """Grade content using a local Ollama model.
+
+        `read_timeout`, when given, bounds the underlying client's read timeout
+        to that many seconds (a SEPARATE cached client from the normal one) so a
+        caller with a hard wall-clock bound (see main.py `_grade_bounded`) can
+        abandon a stalled call and have the daemon thread it left running end
+        near that bound instead of the full (e.g. 600s) inference read timeout.
+        Omitting it uses the normal cached client, unchanged.
 
         Returns parsed JSON dict on success, or
         {"infrastructure_error": True, "error_detail": "..."} on failure.
@@ -116,17 +181,29 @@ class LocalGrader:
             return self._build_infrastructure_error(str(exc))
 
         try:
-            client = self._get_client()
+            if read_timeout is None:
+                client = self._get_client()
+                backend = self._backend
+                openai_model = self._openai_model
+                openai_max_tokens = self._openai_max_tokens
+                cfg = self._cfg
+                spot_model = self._spot_model
+                spot_thinking = self._spot_thinking
+            else:
+                (
+                    client, backend, openai_model, openai_max_tokens, cfg,
+                    spot_model, spot_thinking,
+                ) = self._get_fast_client_state(read_timeout)
         except OllamaError as e:
             return self._build_infrastructure_error(str(e))
-        if self._backend == "openai":
-            model = self._openai_model or _DEFAULT_MODEL
+        if backend == "openai":
+            model = openai_model or _DEFAULT_MODEL
             payload = {
                 "model": model,
                 "messages": [
                     {"role": "user", "content": f"{profiled_system_prompt}\n\n{user_prompt}"}
                 ],
-                "max_tokens": self._openai_max_tokens or 1024,
+                "max_tokens": openai_max_tokens or 1024,
                 "temperature": 0.1,
             }
             if schema is not None:
@@ -134,12 +211,12 @@ class LocalGrader:
                     "type": "json_schema",
                     "json_schema": {"name": "verdict", "schema": schema},
                 }
-            if not self._spot_thinking:
+            if not spot_thinking:
                 # A STRICT OpenAI endpoint that rejects chat_template_kwargs (400) degrades to infrastructure_error; set spots.grader.thinking:true to send neither field for such endpoints.
                 payload["reasoning_effort"] = "none"
                 payload["chat_template_kwargs"] = {"enable_thinking": False}
         else:
-            model = self._spot_model or self._cfg.get("model", _DEFAULT_MODEL)
+            model = spot_model or cfg.get("model", _DEFAULT_MODEL)
             payload = {
                 "model": model,
                 "prompt": f"{profiled_system_prompt}\n\n{user_prompt}",

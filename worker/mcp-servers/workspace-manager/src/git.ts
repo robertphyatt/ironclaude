@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 export interface RepositoryLocation {
@@ -205,14 +205,25 @@ export function readSharedResourceConfig(repositoryIdentity: string): string[] {
 export function addSharedResourceEntries(
   repositoryIdentity: string,
   entries: readonly string[],
+  primaryCheckoutPath: string,
   allowSecretEntries = false,
-): { added: string[]; skipped: string[]; rejected: string[]; secretBlocked: string[]; entries: string[] } {
+): {
+  added: string[];
+  skipped: string[];
+  rejected: string[];
+  secretBlocked: string[];
+  entries: string[];
+  secretHits: Record<string, string[]>;
+  scanTruncated: string[];
+} {
   const configPath = path.join(repositoryIdentity, 'info', SHARED_RESOURCE_CONFIG);
   const present = new Set(readSharedResourceConfig(repositoryIdentity));
   const added: string[] = [];
   const skipped: string[] = [];
   const rejected: string[] = [];
   const secretBlocked: string[] = [];
+  const secretHits: Record<string, string[]> = {};
+  const scanTruncated: string[] = [];
   for (const entry of entries) {
     if (!isSafeSharedEntry(entry)) {
       rejected.push(entry);
@@ -221,6 +232,24 @@ export function addSharedResourceEntries(
     if (!allowSecretEntries && isSecretEntry(entry)) {
       secretBlocked.push(entry);
       continue;
+    }
+    if (!SCAN_VENDOR_SKIP.has(entry.split('/')[0])) {
+      const absDir = path.join(primaryCheckoutPath, entry);
+      let isDir = false;
+      try {
+        isDir = statSync(absDir).isDirectory();
+      } catch {
+        isDir = false;
+      }
+      if (isDir) {
+        const { hits, truncated } = directoryContainsSecret(absDir, entry);
+        if (truncated) scanTruncated.push(entry);
+        if (hits.length > 0 && !allowSecretEntries) {
+          secretBlocked.push(entry);
+          secretHits[entry] = hits;
+          continue;
+        }
+      }
     }
     if (present.has(entry)) {
       skipped.push(entry);
@@ -235,7 +264,7 @@ export function addSharedResourceEntries(
     const separator = existing.length === 0 || existing.endsWith('\n') ? '' : '\n';
     writeFileSync(configPath, existing + separator + added.map((entry) => `${entry}\n`).join(''));
   }
-  return { added, skipped, rejected, secretBlocked, entries: [...present] };
+  return { added, skipped, rejected, secretBlocked, entries: [...present], secretHits, scanTruncated };
 }
 
 /**
@@ -249,6 +278,7 @@ function isSecretEntry(entry: string): boolean {
   const SECRET_DIRS = new Set(['.ssh', '.aws', '.gnupg']);
   if (lower.some((s) => SECRET_DIRS.has(s))) return true;
   const base = lower[lower.length - 1];
+  if (base.endsWith('.example')) return false;
   const SECRET_FILES = new Set([
     '.env', '.netrc', '.npmrc', '.pypirc', '.git-credentials',
     'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'credentials',
@@ -257,6 +287,71 @@ function isSecretEntry(entry: string): boolean {
   if (base.startsWith('.env.')) return true;
   if (/\.(pem|key|p12|pfx)$/.test(base)) return true;
   return false;
+}
+
+const SCAN_MAX_DEPTH = 6;
+const SCAN_MAX_ENTRIES = 20_000;
+const SCAN_MAX_HITS = 5;
+const SCAN_VENDOR_SKIP = new Set(['node_modules', '.venv', 'venv', 'site-packages', '.git']);
+
+/**
+ * Bounded, name-only, non-following breadth-first walk of an explicitly-shared
+ * directory looking for well-known secret paths (per `isSecretEntry`). A
+ * symlink is matched by name at the level it appears but never followed to
+ * descend into whatever it points at. Vendor directories (`node_modules`,
+ * `.venv`, ...) are skipped entirely rather than descended into. Reads dirents
+ * incrementally via `opendirSync`/`readSync` (one at a time — a directory's
+ * listing is never materialized) and returns the moment `maxEntries` dirents
+ * have been examined, so both the number of dirents examined and the pending
+ * queue are bounded by `maxEntries`: a huge or adversarial directory cannot make
+ * add-time configuration hang or exhaust memory. Within-directory iteration order
+ * is filesystem-native; this does not affect the security property because
+ * shallow levels are fully examined before any descent, and per-directory order
+ * only matters once a single directory exceeds the remaining budget — the
+ * accepted "allow and report" (`truncated`) case. Bounded by `maxDepth` (relative
+ * to the shared entry itself).
+ */
+export function directoryContainsSecret(
+  absEntryDir: string,
+  entryRel: string,
+  limits: { maxDepth?: number; maxEntries?: number } = {},
+): { hits: string[]; truncated: boolean } {
+  const maxDepth = limits.maxDepth ?? SCAN_MAX_DEPTH;
+  const maxEntries = limits.maxEntries ?? SCAN_MAX_ENTRIES;
+  const hits: string[] = [];
+  let examined = 0;
+  let truncated = false;
+  const queue: Array<{ abs: string; rel: string; depth: number }> = [{ abs: absEntryDir, rel: entryRel, depth: 0 }];
+  while (queue.length > 0) {
+    const { abs, rel, depth } = queue.shift()!;
+    let dir: ReturnType<typeof opendirSync> | undefined;
+    try {
+      dir = opendirSync(abs);
+      for (let d = dir.readSync(); d !== null; d = dir.readSync()) {
+        if (examined >= maxEntries) {
+          truncated = true;
+          return { hits, truncated };
+        }
+        examined++;
+        const childRel = `${rel}/${d.name}`;
+        if (isSecretEntry(childRel)) {
+          if (hits.length < SCAN_MAX_HITS) hits.push(childRel);
+          if (hits.length >= SCAN_MAX_HITS) return { hits, truncated };
+        } else if (d.isDirectory() && !SCAN_VENDOR_SKIP.has(d.name)) {
+          if (depth + 1 <= maxDepth) {
+            queue.push({ abs: path.join(abs, d.name), rel: childRel, depth: depth + 1 });
+          } else {
+            truncated = true;
+          }
+        }
+      }
+    } catch {
+      truncated = true;
+    } finally {
+      dir?.closeSync();
+    }
+  }
+  return { hits, truncated };
 }
 
 /** Rejects any entry that could escape the worktree or carry gitignore semantics. */
@@ -288,10 +383,14 @@ function pathPresent(target: string): boolean {
  * .venv, node_modules, caches), so resource-dependent tests fail in every
  * isolated worker. For each explicitly configured relative path present in the
  * primary checkout, plant a symlink into the worktree, then exclude the planted
- * links from Git's view. Only listed paths are linked — the .gitignore is never
- * auto-scanned, and well-known secret paths (`.env`, `.ssh`, `.aws`, private keys, ...)
- * are rejected by default and require explicit operator approval to share — defense-in-depth,
- * not exhaustive. One bad entry is logged and skipped; it never throws and never aborts allocation.
+ * links from Git's view. Only listed paths are linked — nothing is discovered
+ * from `.gitignore` or by walking the tree here or anywhere else in this module.
+ * The single filesystem inspection of shared-resource content happens at add
+ * time, in `addSharedResourceEntries`: an explicitly listed directory entry gets
+ * a bounded, name-only, non-following walk (`directoryContainsSecret`) for
+ * well-known secret paths (`.env`, `.ssh`, `.aws`, private keys, ...). That scan
+ * can only WITHHOLD an entry pending explicit operator approval — it never adds
+ * one on its own. Defense-in-depth, not exhaustive.
  */
 export function linkSharedResources(
   primaryCheckoutPath: string,
@@ -316,6 +415,7 @@ export function linkSharedResources(
       continue;
     }
     try {
+      mkdirSync(path.dirname(target), { recursive: true });
       symlinkSync(source, target);
       linked.push(entry);
     } catch (error) {

@@ -167,6 +167,8 @@ class ShadowGrader:
                     url=ollama_cfg.get("url", "http://localhost:11434"),
                     fallback_url=ollama_cfg.get("fallback_url"),
                     timeout=ollama_cfg.get("timeout_seconds") or cfg.get("timeout_seconds", 600),
+                    connect_timeout=(resolved.connect_timeout or 3),
+                    probe_timeout=(resolved.probe_timeout or 3),
                 )
         return self._client
 

@@ -218,6 +218,8 @@ class TestConfigLoading:
             url="http://localhost:11434",
             fallback_url=None,
             timeout=120,
+            connect_timeout=3,
+            probe_timeout=3,
         )
 
 
@@ -279,3 +281,90 @@ class TestConfigHotReload:
         c1 = g._get_client()
         os.remove(str(cfg))
         assert g._get_client() is c1            # missing file -> keep cached client
+
+
+class TestFastLaneReadTimeout:
+    def test_no_read_timeout_uses_normal_cached_client_unchanged(self):
+        """grade() with no read_timeout must not touch the fast-lane path at all."""
+        grader, mock_client = _make_grader()
+        mock_client.post_generate.return_value = '{"valid": true}'
+        result = grader.grade("sys", "user", SIMPLE_SCHEMA)
+        assert result == {"valid": True}
+        mock_client.post_generate.assert_called_once()
+        assert grader._fast_client is None
+
+    def test_read_timeout_builds_separate_client_with_configured_timeout(self, tmp_path):
+        with patch("ironclaude.grader.OllamaClient") as MockClient:
+
+            def _make(**kw):
+                c = MagicMock()
+                c._timeout = kw.get("timeout")
+                c.post_generate.return_value = '{"valid": true}'
+                return c
+
+            MockClient.side_effect = _make
+            grader = LocalGrader(config_path=str(tmp_path / "nonexistent.json"))
+
+            # Build + use the normal (600s-style) client first.
+            normal_client = grader._get_client()
+
+            # Now grade with a fast-lane read_timeout.
+            result = grader.grade("sys", "user", SIMPLE_SCHEMA, read_timeout=2)
+
+        assert result == {"valid": True}
+        assert MockClient.call_count == 2  # one normal + one fast
+        fast_client = grader._fast_client
+        assert fast_client is not None
+        assert fast_client is not normal_client
+        assert fast_client._timeout == 2
+        assert normal_client._timeout == 120  # unchanged default, not clobbered
+        fast_client.post_generate.assert_called_once()
+        normal_client.post_generate.assert_not_called()
+
+    def test_second_call_with_same_read_timeout_reuses_cached_fast_client(self, tmp_path):
+        with patch("ironclaude.grader.OllamaClient") as MockClient:
+
+            def _make(**kw):
+                c = MagicMock()
+                c._timeout = kw.get("timeout")
+                c.post_generate.return_value = '{"valid": true}'
+                return c
+
+            MockClient.side_effect = _make
+            grader = LocalGrader(config_path=str(tmp_path / "nonexistent.json"))
+
+            grader.grade("sys", "user", SIMPLE_SCHEMA, read_timeout=2)
+            first_fast_client = grader._fast_client
+            call_count_after_first = MockClient.call_count
+
+            grader.grade("sys", "user", SIMPLE_SCHEMA, read_timeout=2)
+
+        assert MockClient.call_count == call_count_after_first  # cache hit, no rebuild
+        assert grader._fast_client is first_fast_client
+        assert first_fast_client.post_generate.call_count == 2
+
+
+class TestMakeClientConnectProbeBudgets:
+    def test_resolved_connect_timeout_threaded_through(self):
+        from ironclaude.backend_resolver import make_client, ResolvedBackend
+        resolved = ResolvedBackend(
+            backend="openai", model="m", url="http://x/v1", connect_timeout=4
+        )
+        client = make_client(resolved)
+        assert client._connect_timeout == 4
+
+    def test_explicit_connect_timeout_overrides_resolved(self):
+        from ironclaude.backend_resolver import make_client, ResolvedBackend
+        resolved = ResolvedBackend(
+            backend="openai", model="m", url="http://x/v1", connect_timeout=4
+        )
+        client = make_client(resolved, connect_timeout=7)
+        assert client._connect_timeout == 7
+
+    def test_resolved_connect_timeout_none_defaults_to_three(self):
+        from ironclaude.backend_resolver import make_client, ResolvedBackend
+        resolved = ResolvedBackend(
+            backend="openai", model="m", url="http://x/v1", connect_timeout=None
+        )
+        client = make_client(resolved)
+        assert client._connect_timeout == 3
