@@ -2,15 +2,42 @@
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import psutil
 import pytest
 
 from ironclaude.db import init_db
 from ironclaude.ollama_client import OllamaError
 from ironclaude.worker_registry import WorkerRegistry
 from ironclaude.orchestrator_mcp import OrchestratorTools
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_swap_and_pressure_probes(monkeypatch):
+    """Hermetic swap/pressure baseline for the spawn gate.
+
+    _check_spawn_preconditions()'s swap and macOS memory-pressure guard read
+    real host state (psutil.swap_memory / a sysctl subprocess call). The P1
+    spawn tests reach that gate; without this they fail whenever the host's real
+    swap exceeds max_swap_used_gb. Individual tests may re-patch these for the
+    duration of their own body to override this default.
+    """
+    monkeypatch.setattr(psutil, "swap_memory", lambda: MagicMock(used=0))
+
+    _real_subprocess_run = subprocess.run
+
+    def _fake_subprocess_run(cmd, *args, **kwargs):
+        if cmd == ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]:
+            fake_result = MagicMock()
+            fake_result.returncode = 0
+            fake_result.stdout = "1\n"
+            return fake_result
+        return _real_subprocess_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _fake_subprocess_run)
 
 
 GRADE_SCHEMA = {

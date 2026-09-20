@@ -141,6 +141,94 @@ def daemon(tmp_path):
     return d
 
 
+def test_db_write_with_retry_recovers(daemon):
+    """Transient lock errors are rolled back and retried until the op succeeds."""
+    daemon._db = MagicMock()
+    sentinel = object()
+    calls = {"n": 0}
+
+    def op():
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise sqlite3.OperationalError("database is locked")
+        return sentinel
+
+    result = daemon._db_write_with_retry(op, backoff=0)
+
+    assert result is sentinel
+    assert calls["n"] == 3
+    assert daemon._db.rollback.call_count == 2
+
+
+def test_db_write_with_retry_persistent_lock_reraises_without_reconnect(daemon):
+    """A lock error that never clears is re-raised after exhausting attempts,
+    and self._db is never recreated/reassigned (rollback-only self-heal)."""
+    daemon._db = MagicMock()
+    original = daemon._db
+    op = MagicMock(side_effect=sqlite3.OperationalError("database is locked"))
+
+    with pytest.raises(sqlite3.OperationalError):
+        daemon._db_write_with_retry(op, attempts=3, backoff=0)
+
+    assert op.call_count == 3
+    assert daemon._db.rollback.call_count == 3
+    assert daemon._db is original
+
+
+def test_db_write_with_retry_non_lock_error_rolls_back_and_reraises(daemon):
+    """A non-lock error rolls back once and re-raises immediately (no retry)."""
+    daemon._db = MagicMock()
+    op = MagicMock(side_effect=sqlite3.IntegrityError("boom"))
+
+    with pytest.raises(sqlite3.IntegrityError):
+        daemon._db_write_with_retry(op, backoff=0)
+
+    assert op.call_count == 1
+    assert daemon._db.rollback.call_count == 1
+
+
+def test_sweep_self_heals_leaked_transaction(daemon, tmp_path):
+    """A wedged read snapshot (BEGIN + SELECT with no commit/rollback) that goes
+    stale against a concurrent writer self-heals via _db_write_with_retry: the
+    sweep does not raise, the expired row still gets marked, and the connection
+    is left outside any transaction."""
+    db_path = str(tmp_path / "sweep_selfheal.db")
+    daemon._db = init_db(db_path)
+    push_id = "wedge-push-1"
+    daemon._db.execute(
+        "INSERT INTO push_requests"
+        " (id, repo, remote, branch, commit_summary, diff_stats, status, message_ts, expires_at)"
+        " VALUES (?, '/tmp', 'origin', 'main', 'log', 'stats', 'pending', NULL,"
+        " datetime('now', '-10 minutes'))",
+        (push_id,),
+    )
+    daemon._db.commit()
+
+    # Wedge: open an explicit transaction and take a read snapshot, but never
+    # commit/rollback it before the sweep runs.
+    daemon._db.execute("BEGIN")
+    daemon._db.execute("SELECT COUNT(*) FROM push_requests").fetchone()
+
+    # A second connection commits a write, staling the first connection's
+    # already-open read snapshot (WAL busy-snapshot on the first write attempt).
+    other_conn = sqlite3.connect(db_path, isolation_level="IMMEDIATE")
+    other_conn.execute("PRAGMA busy_timeout=5000")
+    other_conn.execute(
+        "UPDATE push_requests SET diff_stats='changed-by-other' WHERE id=?",
+        (push_id,),
+    )
+    other_conn.commit()
+    other_conn.close()
+
+    daemon._sweep_expired_push_requests()
+
+    row = daemon._db.execute(
+        "SELECT status FROM push_requests WHERE id=?", (push_id,)
+    ).fetchone()
+    assert row[0] == "expired"
+    assert daemon._db.in_transaction is False
+
+
 class TestCodexBrainCapabilityContainment:
     @staticmethod
     def _codex_brain(block=None, *, alive=False):
@@ -1909,6 +1997,40 @@ class TestHandleRestart:
         assert (99999, signal.SIGTERM) in kill_calls, \
             "Must send SIGTERM to brain PID directly"
 
+    def test_handle_restart_captures_brain_pid_before_shutdown(self):
+        """Steps 5 & 7 must target the PRE-shutdown brain PID. Real
+        BrainClient.shutdown() clears _brain_pid, so the pid must be captured
+        BEFORE step 4 or the belt-and-suspenders kills run against None."""
+        import ironclaude.main as main_module
+
+        mock_daemon = MagicMock()
+        mock_daemon.brain._stop_event = MagicMock()
+        mock_daemon.brain._brain_pid = 99999
+        # Model the real clear: BrainClient.shutdown() -> _brain_pid = None.
+        mock_daemon.brain.shutdown.side_effect = lambda: setattr(
+            mock_daemon.brain, "_brain_pid", None
+        )
+        logged = []
+
+        def fake_subprocess_run(cmd, **kwargs):
+            m = MagicMock()
+            m.stdout = ""
+            m.returncode = 0
+            return m
+
+        with patch.object(main_module, '_daemon', mock_daemon), \
+             patch('os.execvp'), \
+             patch('os.kill'), \
+             patch.object(main_module, '_kill_orphan_brains') as mock_orphans, \
+             patch.object(main_module, '_logged_kill',
+                          side_effect=lambda pid, sig, reason: logged.append((pid, sig))), \
+             patch.object(main_module.subprocess, 'run', side_effect=fake_subprocess_run), \
+             patch.object(main_module.time, 'sleep'):
+            main_module._handle_restart(signal.SIGHUP, None)
+
+        mock_orphans.assert_called_once_with(99999)      # step 5 got the pre-shutdown pid
+        assert (99999, signal.SIGTERM) in logged         # step 7 targeted kill
+
 
 class TestHandleShutdown:
     def test_handle_shutdown_sets_brain_stop_event(self):
@@ -2391,6 +2513,94 @@ class TestRunMaintenance:
         rows = conn.execute("SELECT * FROM events").fetchall()
         assert len(rows) == 0  # DB pruning still ran
         conn.close()
+
+    @staticmethod
+    def _commander_conn_with_repo(repo="/repo"):
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            """CREATE TABLE workers (
+                id TEXT PRIMARY KEY, type TEXT NOT NULL, machine TEXT, repo TEXT,
+                description TEXT NOT NULL DEFAULT '', tmux_session TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running', task_id INTEGER,
+                spawned_at TEXT NOT NULL DEFAULT (datetime('now')), finished_at TEXT,
+                client TEXT, model TEXT, native_session_id TEXT, workspace_guid TEXT,
+                workspace_repository_identity TEXT, workspace_path TEXT,
+                workspace_branch TEXT, workspace_base_commit TEXT,
+                workspace_integration_target TEXT
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO workers (id, type, repo, tmux_session, status) "
+            "VALUES ('w1', 'claude', ?, 'ic-w1', 'completed')",
+            (repo,),
+        )
+        conn.commit()
+        return conn
+
+    def test_surfaces_preserved_unmerged_orphans_to_slack_and_counts_them(
+        self, daemon, tmp_path, monkeypatch
+    ):
+        """Row-less orphan reap step 7: preservedUnmerged names get posted to
+        Slack and tracked on the daemon for the heartbeat."""
+        monkeypatch.setenv("WORKSPACE_MANAGER_DB_PATH", str(tmp_path / "ws.db"))
+        daemon._db = self._commander_conn_with_repo()
+        orch = MagicMock()
+        orch._workspace_client.reap_orphans.return_value = {
+            "reaped": [], "preservedDirty": [],
+            "preservedUnmerged": ["ironclaude/y", "ironclaude/z"],
+            "skippedLive": [], "skippedYoung": [], "errors": [],
+        }
+        daemon._get_orchestrator = MagicMock(return_value=orch)
+
+        daemon._last_maintenance = 0
+        daemon._run_maintenance()
+
+        daemon.slack.post_message.assert_called_once()
+        posted = daemon.slack.post_message.call_args.args[0]
+        assert "/repo:ironclaude/y" in posted
+        assert "/repo:ironclaude/z" in posted
+        assert daemon._orphaned_unmerged_count == 2
+
+    def test_second_run_with_same_preserved_unmerged_names_does_not_repost(
+        self, daemon, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("WORKSPACE_MANAGER_DB_PATH", str(tmp_path / "ws.db"))
+        daemon._db = self._commander_conn_with_repo()
+        orch = MagicMock()
+        orch._workspace_client.reap_orphans.return_value = {
+            "reaped": [], "preservedDirty": [],
+            "preservedUnmerged": ["ironclaude/y", "ironclaude/z"],
+            "skippedLive": [], "skippedYoung": [], "errors": [],
+        }
+        daemon._get_orchestrator = MagicMock(return_value=orch)
+
+        daemon._last_maintenance = 0
+        daemon._run_maintenance()
+        daemon.slack.post_message.reset_mock()
+
+        daemon._last_maintenance = 0
+        daemon._run_maintenance()
+
+        daemon.slack.post_message.assert_not_called()
+        assert daemon._orphaned_unmerged_count == 2
+
+    def test_no_preserved_unmerged_orphans_leaves_count_zero_and_no_post(
+        self, daemon, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("WORKSPACE_MANAGER_DB_PATH", str(tmp_path / "ws.db"))
+        daemon._db = self._commander_conn_with_repo()
+        orch = MagicMock()
+        orch._workspace_client.reap_orphans.return_value = {
+            "reaped": [], "preservedDirty": [], "preservedUnmerged": [],
+            "skippedLive": [], "skippedYoung": [], "errors": [],
+        }
+        daemon._get_orchestrator = MagicMock(return_value=orch)
+
+        daemon._last_maintenance = 0
+        daemon._run_maintenance()
+
+        daemon.slack.post_message.assert_not_called()
+        assert daemon._orphaned_unmerged_count == 0
 
 
 class TestHandleSpawnWorkerSecurity:
@@ -4966,6 +5176,225 @@ class TestDeadSessionAccurateSurface:
         assert daemon.brain.send_message.call_count == 1
 
 
+# --------------------------------------------------------------------------
+# Component C — marker-aware, seam-independent daemon surface for a
+# persistently-failing finalize. commit_worker logs finalize_failed events
+# directly (see orchestrator_mcp.py); a live, still-retrying worker never
+# reaches the idle/reap/dead seams that drive _drive_finalization_recovery,
+# so check_workers separately counts finalize_failed events SINCE the last
+# finalize_integrated/finalize_reopened marker for every running worker and
+# fires the once-per-marker Slack+Brain surface. POSTS ONLY — never
+# update_worker_status, never a kill.
+# --------------------------------------------------------------------------
+
+
+def _live_worker(daemon, worker_id="w1"):
+    """Wire a single live (non-idle, non-dead) running worker, and pre-arm
+    its check-in cadence gate so the unrelated proactive-checkin brain
+    message in check_workers does not confound call-count assertions here."""
+    worker = {"id": worker_id, "tmux_session": f"ic-{worker_id}"}
+    daemon.registry.get_running_workers.return_value = [worker]
+    daemon.tmux.has_session.return_value = True
+    daemon.tmux.capture_pane.return_value = "Running..."
+    daemon._last_checkin_sent[worker_id] = time.time()
+    return worker
+
+
+class TestCommitWorkerFailureSurface:
+    def test_commit_worker_surface_fires_once_for_persistent_failures(self, daemon):
+        _live_worker(daemon)
+        daemon.registry.get_events_for_worker.return_value = [
+            {"id": 1, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 2, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 3, "event_type": "finalize_failed", "worker_id": "w1"},
+        ]
+
+        daemon.check_workers()
+
+        assert daemon.slack.post_message.call_count == 1
+        assert daemon.brain.send_message.call_count == 1
+        posted = daemon.slack.post_message.call_args[0][0]
+        assert "w1" in posted
+        assert "reopen_for_edit" in posted
+        # Never completes, never kills — posts only.
+        daemon.registry.update_worker_status.assert_not_called()
+
+        # A second cycle with the SAME events (no new marker) must not re-fire.
+        daemon.check_workers()
+        assert daemon.slack.post_message.call_count == 1
+        assert daemon.brain.send_message.call_count == 1
+
+    def test_commit_worker_surface_does_not_fire_below_cap_since_marker(self, daemon):
+        """3 failures, then a LATER finalize_integrated marker, then 1 new
+        failure -> only 1 failure since the marker -> below the cap -> no
+        fire."""
+        _live_worker(daemon)
+        daemon.registry.get_events_for_worker.return_value = [
+            {"id": 1, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 2, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 3, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 4, "event_type": "finalize_integrated", "worker_id": "w1"},
+            {"id": 5, "event_type": "finalize_failed", "worker_id": "w1"},
+        ]
+
+        daemon.check_workers()
+
+        assert daemon.slack.post_message.call_count == 0
+        assert daemon.brain.send_message.call_count == 0
+
+    def test_commit_worker_surface_refires_after_reopen_marker(self, daemon):
+        """Fires once on the first 3 failures; a later finalize_reopened marker
+        followed by 3 NEW (higher-id) failures re-arms the gate and fires
+        again."""
+        _live_worker(daemon)
+        daemon.registry.get_events_for_worker.return_value = [
+            {"id": 1, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 2, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 3, "event_type": "finalize_failed", "worker_id": "w1"},
+        ]
+        daemon.check_workers()
+        assert daemon.slack.post_message.call_count == 1
+
+        daemon.registry.get_events_for_worker.return_value = [
+            {"id": 1, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 2, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 3, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 4, "event_type": "finalize_reopened", "worker_id": "w1"},
+            {"id": 5, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 6, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 7, "event_type": "finalize_failed", "worker_id": "w1"},
+        ]
+        daemon.check_workers()
+
+        assert daemon.slack.post_message.call_count == 2
+        assert daemon.brain.send_message.call_count == 2
+        daemon.registry.update_worker_status.assert_not_called()
+
+    def test_reopen_rearm_fires_once_not_every_cycle(self, daemon):
+        """The reopen re-arm must fire at most once per new finalize_reopened
+        marker, not every cycle while it remains the newest marker."""
+        _live_worker(daemon)
+        daemon.registry.get_events_for_worker.return_value = [
+            {"id": 1, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 2, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 3, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 4, "event_type": "finalize_reopened", "worker_id": "w1"},
+        ]
+
+        daemon.check_workers()
+
+        daemon._finalize_drift_retry["w1"] = 2
+        daemon._finalize_recovery_alerted.add("w1")
+
+        # Second cycle with the SAME events (same marker) must not re-arm.
+        daemon.check_workers()
+
+        assert daemon._finalize_drift_retry.get("w1") == 2
+        assert "w1" in daemon._finalize_recovery_alerted
+
+    def test_reopen_rearm_fires_on_new_marker(self, daemon):
+        """A NEW (higher-id) finalize_reopened marker re-arms exactly once;
+        a later cycle with that same marker still present does not re-arm
+        again."""
+        _live_worker(daemon)
+        daemon.registry.get_events_for_worker.return_value = [
+            {"id": 1, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 2, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 3, "event_type": "finalize_failed", "worker_id": "w1"},
+            {"id": 4, "event_type": "finalize_reopened", "worker_id": "w1"},
+            {"id": 7, "event_type": "finalize_reopened", "worker_id": "w1"},
+        ]
+        daemon._finalize_drift_retry["w1"] = 2
+        daemon._finalize_recovery_alerted.add("w1")
+
+        daemon.check_workers()
+
+        assert "w1" not in daemon._finalize_drift_retry
+        assert "w1" not in daemon._finalize_recovery_alerted
+
+        daemon._finalize_drift_retry["w1"] = 2
+        daemon._finalize_recovery_alerted.add("w1")
+
+        # Same events (id 7 is still the newest marker, already processed):
+        # must not re-arm again.
+        daemon.check_workers()
+
+        assert daemon._finalize_drift_retry.get("w1") == 2
+        assert "w1" in daemon._finalize_recovery_alerted
+
+    def test_non_running_sweep_clears_marker_state(self, daemon):
+        """The non-running sweep in check_stuck_workers must clear both the
+        episode-marker dict and the alert set for a worker that has stopped
+        running. Fails with a TypeError if the sweep still calls .pop() on
+        the (now-set) _commit_failure_alerted, and leaves residual keys if
+        either loop is dropped."""
+        daemon._finalize_marker_seen["w1"] = 4
+        daemon._commit_failure_alerted.add("w1")
+        daemon.registry.get_running_workers.return_value = []
+        daemon._last_stuck_check = 0
+
+        daemon.check_stuck_workers()
+
+        assert "w1" not in daemon._finalize_marker_seen
+        assert "w1" not in daemon._commit_failure_alerted
+
+    def test_integrate_marker_rearms_drift_and_recovery_state(self, daemon):
+        """A NEW (higher-id) finalize_integrated marker re-arms exactly once
+        (not just finalize_reopened, since the two dicts collapsed into one
+        episode key); a later cycle with that same marker still present does
+        not re-arm again."""
+        _live_worker(daemon)
+        daemon.registry.get_events_for_worker.return_value = [
+            {"id": 4, "event_type": "finalize_integrated", "worker_id": "w1"},
+        ]
+        daemon._finalize_drift_retry["w1"] = 2
+        daemon._finalize_recovery_alerted.add("w1")
+
+        daemon.check_workers()
+
+        assert "w1" not in daemon._finalize_drift_retry
+        assert "w1" not in daemon._finalize_recovery_alerted
+
+        daemon._finalize_drift_retry["w1"] = 2
+        daemon._finalize_recovery_alerted.add("w1")
+
+        # Same events (id 4 is still the newest marker, already processed):
+        # must not re-arm again.
+        daemon.check_workers()
+
+        assert daemon._finalize_drift_retry.get("w1") == 2
+        assert "w1" in daemon._finalize_recovery_alerted
+
+
+class TestFinalizationFailureTransientSurface:
+    def test_transient_surface_fires_once_for_finalization_failure_no_mode(
+        self, daemon,
+    ):
+        """A finalization failure with no recognized recovery mode (probe
+        failure / unrecognized state fallback) reaches the driver's transient
+        branch, which must still surface it once — POSTS ONLY, never
+        completed, never abandoned."""
+        outcome = {
+            "failure_phase": "finalization",
+            "assignment_preserved": True,
+            "recovery": {"reconcile": {}},
+        }
+
+        disposition = daemon._drive_finalization_recovery("w9", outcome)
+
+        assert disposition == "transient"
+        assert daemon.slack.post_message.call_count == 1
+        assert daemon.brain.send_message.call_count == 1
+        assert "w9" in daemon._finalize_recovery_alerted
+        daemon.registry.update_worker_status.assert_not_called()
+
+        # A second call for the same worker/outcome does not re-fire.
+        disposition2 = daemon._drive_finalization_recovery("w9", outcome)
+        assert disposition2 == "transient"
+        assert daemon.slack.post_message.call_count == 1
+        assert daemon.brain.send_message.call_count == 1
+
+
 class TestGradeBoundedInFlightCap:
     def test_second_call_while_in_flight_returns_none_without_second_grade(self, daemon):
         """FIX 2: while one bounded grade is still running (abandoned past its
@@ -5115,3 +5544,65 @@ def test_brain_settings_hooks_template_lists_all_three_gates():
             assert cmd.startswith("bash $HOME/.claude/ironclaude-hooks/"), (
                 f"template hook command must use $HOME (not ~); got: {cmd!r}"
             )
+
+
+class TestOrphanSurfaceStatePersistence:
+    """The `_orphaned_surface_state` dedup map (main.py ~:1525) must survive a
+    daemon restart via the `orphan_surface_state` DB table, mirroring
+    `worker_staleness`. Without persistence, a restart starts the map empty
+    and `_surface_preserved_orphans` re-posts the full preserved-orphan set
+    to Slack even when nothing actually changed."""
+
+    def _make_daemon(self, tmp_path, db_conn, name="d"):
+        config = {"tmp_dir": str(tmp_path)}
+        slack = MagicMock()
+        registry = MagicMock()
+        tmux = MagicMock()
+        tmux.log_dir = str(tmp_path / f"logs-{name}")
+        os.makedirs(tmux.log_dir, exist_ok=True)
+        brain = MagicMock()
+        return IroncladeDaemon(
+            config, slack, None, registry, tmux, brain, db_conn=db_conn,
+        )
+
+    def test_restart_with_unchanged_preserved_set_does_not_repost(self, tmp_path):
+        db_path = str(tmp_path / "orphan-surface.db")
+        details = [{
+            "id": "d1", "category": "genuinely-unmerged", "branch": "ironclaude/g1",
+            "tip": "aaaaaaa1111", "evidence": "2 ahead of main", "repository_path": "/repo",
+        }]
+
+        conn1 = init_db(db_path)
+        daemon1 = self._make_daemon(tmp_path, conn1, name="first")
+        daemon1._surface_preserved_orphans(details)
+        assert daemon1.slack.post_message.call_count == 1
+        conn1.close()
+
+        # Simulate a daemon restart: fresh process, fresh connection to the
+        # same DB file, brand-new in-memory _orphaned_surface_state.
+        conn2 = init_db(db_path)
+        daemon2 = self._make_daemon(tmp_path, conn2, name="second")
+        assert daemon2._orphaned_surface_state == {"d1": ("aaaaaaa1111", "genuinely-unmerged")}
+
+        daemon2._surface_preserved_orphans(list(details))
+        assert daemon2.slack.post_message.call_count == 0
+        conn2.close()
+
+    def test_restart_with_changed_tip_still_reposts(self, tmp_path):
+        db_path = str(tmp_path / "orphan-surface-changed.db")
+        details = [{
+            "id": "d1", "category": "genuinely-unmerged", "branch": "ironclaude/g1",
+            "tip": "aaaaaaa1111", "evidence": "2 ahead of main", "repository_path": "/repo",
+        }]
+
+        conn1 = init_db(db_path)
+        daemon1 = self._make_daemon(tmp_path, conn1, name="first")
+        daemon1._surface_preserved_orphans(details)
+        conn1.close()
+
+        conn2 = init_db(db_path)
+        daemon2 = self._make_daemon(tmp_path, conn2, name="second")
+        changed = [dict(details[0], tip="bbbbbbb2222")]
+        daemon2._surface_preserved_orphans(changed)
+        assert daemon2.slack.post_message.call_count == 1
+        conn2.close()

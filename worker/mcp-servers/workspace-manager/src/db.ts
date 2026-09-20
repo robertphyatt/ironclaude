@@ -261,6 +261,37 @@ export function migrateSchema(db: Database.Database): void {
       `);
     })();
   }
+
+  if (!db.prepare('SELECT 1 FROM schema_migrations WHERE version = 6').get()) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS orphan_surface (
+          repository_identity TEXT NOT NULL,
+          workspace_guid TEXT NOT NULL,
+          short_id TEXT NOT NULL,
+          tip TEXT NOT NULL,
+          category TEXT NOT NULL,
+          surfaced_at TEXT NOT NULL DEFAULT (datetime('now')),
+          muted_tip TEXT,
+          PRIMARY KEY(repository_identity, workspace_guid)
+        );
+        CREATE INDEX IF NOT EXISTS orphan_surface_lookup_idx
+          ON orphan_surface(repository_identity, short_id);
+
+        CREATE TABLE IF NOT EXISTS orphan_resolution_audit (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repository_identity TEXT,
+          workspace_guid TEXT,
+          short_id TEXT,
+          action TEXT,
+          outcome TEXT,
+          at TEXT DEFAULT (datetime('now'))
+        );
+
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (6);
+      `);
+    })();
+  }
 }
 
 export interface PreservedWorkRow {

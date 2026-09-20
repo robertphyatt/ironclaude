@@ -1,0 +1,49 @@
+{
+  "name": "Memory-Efficiency End-Review Fixes",
+  "goal": "Fix the two Important integration defects + three idle-TTL observations the adversarial end review found in the memory-efficiency effort.",
+  "requirements_file": "docs/plans/2026-09-16-memefficiency-endreview-fixes-design.md",
+  "design_file": "docs/plans/2026-09-16-memefficiency-endreview-fixes-design.md",
+  "estimated_memory_gb": 0.5,
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Fix 1 _format_mem_line None-guard (A2)",
+      "description": "main.py _format_mem_line (:120-136) returns 'mem: unavailable' on the daemon host because psutil.process_iter yields memory_info=None for unreadable procs and None.rss raises AttributeError (not in the inner except). Guard `mi = p.info['memory_info']; if mi is None: continue`. Add the missing _format_mem_line unit test, patching psutil ATTRIBUTES (not the module).",
+      "allowed_files": ["commander/src/ironclaude/main.py", "commander/tests/test_main_validate.py"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: add test_format_mem_line_skips_unreadable_procs to test_main_validate.py. Patch psutil ATTRIBUTES via patch.object(main_module.psutil, 'virtual_memory'|'swap_memory'|'process_iter', ...) with SimpleNamespace fakes (NOT the whole module — that makes the except tuple Mocks). process_iter yields two: .info={'name':'root-proc','memory_info':None} and .info={'name':'real-proc','memory_info':SimpleNamespace(rss=1*1024**3)}. Assert out.startswith('mem: '), 'free'/'swap'/'real-proc' in out, 'unavailable' not in out.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_main_validate.py -k format_mem_line -x", "expected": "FAIL: 'mem: unavailable (NoneType has no attribute rss)'."},
+        {"description": "GREEN: _format_mem_line (~:126) loop body -> mi = p.info['memory_info']; if mi is None: continue; procs.append((mi.rss, p.info['name'])); keep except (NoSuchProcess, AccessDenied, TypeError)."},
+        {"description": "Verify.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_main_validate.py -k format_mem_line -x && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_main_validate.py tests/test_notifications.py -x", "expected": "PASS."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -- commander/src/ironclaude/main.py commander/tests/test_main_validate.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Fix 2 capture Brain PID before shutdown (D2)",
+      "description": "main.py _handle_restart reads _daemon.brain._brain_pid at step 5 (:1272) and step 7 (:1296) AFTER step 4 brain.shutdown() (:1265-1266) cleared it -> _kill_orphan_brains(None). Capture the pid BEFORE step 4 into a local; use it at steps 5+7. No post-shutdown file fallback (BRAIN_PID_FILE removed by shutdown; stale file risks PID recycling). Test lives in test_daemon.py TestHandleRestart (the ONLY safe execvp-patched _handle_restart harness).",
+      "allowed_files": ["commander/src/ironclaude/main.py", "commander/tests/test_daemon.py"],
+      "depends_on": [1],
+      "steps": [
+        {"description": "RED: in test_daemon.py class TestHandleRestart (:1742-1910) add test_handle_restart_captures_brain_pid_before_shutdown, mirroring test_handle_restart_uses_targeted_brain_kill_not_pkill (:1877). MUST patch os.execvp, os.kill, main.subprocess.run (fake stdout=''), main.time.sleep (unpatched execvp replaces the pytest process). mock_daemon.brain._brain_pid=99999; brain.shutdown.side_effect = lambda: setattr(mock_daemon.brain,'_brain_pid',None); patch.object(main,'_kill_orphan_brains') as mock_orphans; patch.object(main,'_logged_kill', side_effect recording (pid,sig)); call main._handle_restart(signal.SIGHUP, None); assert mock_orphans.assert_called_once_with(99999) AND (99999, signal.SIGTERM) in logged.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_daemon.py -k captures_brain_pid -x", "expected": "FAIL (both read _brain_pid after the clear -> _kill_orphan_brains(None), no step-7 kill)."},
+        {"description": "GREEN: before the step-4 try (~:1263) add `_recorded_brain_pid = getattr(getattr(_daemon, 'brain', None), '_brain_pid', None)`; step 5 (:1272) -> `_kill_orphan_brains(_recorded_brain_pid)`; step 7 (:1296) -> `brain_pid = _recorded_brain_pid` (keep the `if brain_pid is not None:` + _logged_kill guard). No file fallback (moot post-shutdown + recycling risk)."},
+        {"description": "Verify (existing :1877 stays green — its mock never clears _brain_pid).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_daemon.py -k TestHandleRestart tests/test_kill_orphan_brains.py -x", "expected": "PASS."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -- commander/src/ironclaude/main.py commander/tests/test_daemon.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Fix 3 idle-TTL polish (obs1/2/3)",
+      "description": "_reap_idle_worker: new signature (worker_id, session_name, ssh_host, remote_log_dir, armed); returns bool (True=reaped, False=deferred/aborted); re-reads get_log_mtime ONCE immediately before kill_session and aborts (return False) if fresh>armed+grace (obs2); the check_workers gate continues ONLY when it returns True (obs1: a deferred worker still reaches marker/session-died handling); the reaped Slack/Brain message is neutral about disposition (obs3). Tests must use numeric get_log_mtime values (a bare MagicMock return raises TypeError on the > compare).",
+      "allowed_files": ["commander/src/ironclaude/main.py", "commander/src/ironclaude/notifications.py", "commander/tests/test_idle_worker_ttl.py"],
+      "depends_on": [2],
+      "steps": [
+        {"description": "RED: update test_idle_worker_ttl.py to the new signature and: reap-order test -> armed=time.time()-2000; tmux.get_log_mtime.return_value=armed (numeric, <= armed+grace); call _reap_idle_worker(wid, session, None, None, armed); attach_mock(get_log_mtime,'mtime'); expect ['finalize','drive','mtime','kill','finalize','drive']. obs2 (DIRECT on _make_reap_daemon): get_log_mtime.return_value=armed+IDLE_ACTIVITY_GRACE_SECONDS+1, _worker_idle_since[wid]=armed -> result is False, kill_session.assert_not_called(), _worker_idle_since[wid]==armed, get_log_mtime.assert_called_once_with(session, ssh_host=None, remote_log_dir=None) (no [stale,fresh] side_effect). obs1 (gate pair on _make_gate_daemon, ttl elapsed, get_log_mtime.return_value=armed): (a) _reap_idle_worker=Mock(return_value=False) -> falls through -> assert wid in _session_died_notified and brain.send_message.assert_called_once(); (b) Mock(return_value=True) -> continue -> brain.send_message.assert_not_called() and wid not in _session_died_notified. Update test_ttl_elapsed_reaps_when_idle to assert called_args.args==(wid, session, None, None, armed). obs3: format_worker_idle_ttl_reaped(wid,5) -> 'integrated/rescued' not in msg, wid in msg, 'reaped' in msg.lower(). Deferred (held/retrying/surfaced) tests: signature-update only (return before the re-read).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_idle_worker_ttl.py -x", "expected": "FAIL."},
+        {"description": "GREEN _reap_idle_worker: signature (self, worker_id, session_name, ssh_host, remote_log_dir, armed); idle_seconds=time.time()-armed; pre=finalize(terminal=False); disp=drive(...); if disp in ('retrying','held','surfaced'): log + return False; fresh=self.tmux.get_log_mtime(session_name, ssh_host=ssh_host, remote_log_dir=remote_log_dir); if fresh is not None and fresh>armed+IDLE_ACTIVITY_GRACE_SECONDS: log 'reap aborted: fresh activity' + return False; else kill_session -> finalize(terminal=True) -> drive -> worker_finished if completed -> slack format_worker_idle_ttl_reaped(worker_id, int(idle_seconds//60)) -> brain [SWEEP] (neutral) -> _worker_idle_since.pop -> return True."},
+        {"description": "GREEN gate + message: gate reap branch (:4275-4277) -> `if self._reap_idle_worker(worker_id, session_name, ssh_host, remote_log_dir, armed): continue` (continue only on True; False falls through). Reword notifications.format_worker_idle_ttl_reaped + the [SWEEP] Brain string neutrally (no unconditional 'work integrated/rescued')."},
+        {"description": "Verify.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_idle_worker_ttl.py tests/test_main_validate.py tests/test_notifications.py -x", "expected": "PASS."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -- commander/src/ironclaude/main.py commander/src/ironclaude/notifications.py commander/tests/test_idle_worker_ttl.py", "expected": "Staged."}
+      ]
+    }
+  ]
+}

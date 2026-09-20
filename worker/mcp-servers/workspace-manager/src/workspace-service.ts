@@ -1,5 +1,7 @@
-import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import type Database from 'better-sqlite3';
 import {
@@ -16,15 +18,22 @@ import {
   reuseTerminalAssignment,
   transitionAssignment,
 } from './db.js';
-import { pushPendingSummary } from './integration.js';
+import { assertNoPrimaryOverlap, primaryOnRef, pushPendingSummary, verifyPrimaryAfterFastForward } from './integration.js';
 import {
   addSharedResourceEntries,
   addWorktree,
+  canonicalDefaultBranchRef,
+  carryForwardFastForward,
+  contentMergedInto,
   deleteTemporaryBranch,
   discoverRepository,
   ensureManagedWorktreeExclusion,
+  gitError,
+  GIT_MAX_BUFFER,
+  gitSupportsMergeTreeWriteTree,
   isAncestor,
   linkSharedResources,
+  listManagedBranches,
   listWorktrees,
   primaryBranch,
   readSharedResourceConfig,
@@ -141,6 +150,78 @@ export interface Reconciliation {
   knownWorktreePaths: string[];
   missingWorktreePaths: string[];
   ambiguousWorktreePaths: string[];
+}
+
+/** One PRESERVED ambiguous orphan, classified and surfaced for a human decision. */
+export interface PreservedOrphan {
+  id: string;
+  guid: string;
+  branch: string;
+  category: 'squash-merged' | 'merged-on-origin' | 'genuinely-unmerged' | 'dirty';
+  tip: string;
+  worktreePresent: boolean;
+  evidence: string;
+  muted: boolean;
+}
+
+/** One operator-authorized disposition for a previously surfaced ambiguous orphan. */
+export interface OrphanResolutionRequest {
+  /** The 8-hex short id `reapAmbiguousOrphans` reported; either this or `guid` must be given. */
+  id?: string;
+  guid?: string;
+  action: 'reap' | 'keep' | 'merge-then-reap';
+  /**
+   * Explicit integration target branch for `merge-then-reap`, overriding the
+   * repository's canonical default branch. An orphan carries no durable
+   * integration target of its own (unlike an assignment's `integration_target`,
+   * captured once at worktree materialization), so without this override the
+   * target is `canonicalDefaultBranchRef`: `refs/remotes/origin/HEAD`'s
+   * branch, falling back to `main` when origin/HEAD is unset. Ignored for
+   * `reap`/`keep`.
+   */
+  integrationTarget?: string;
+  /**
+   * The orphan category the operator's consent was obtained against (from
+   * the surface the operator was shown). For `action: 'reap'`, a dirty
+   * worktree is force-removed ONLY when this equals `'dirty'` AND the
+   * currently persisted `orphan_surface.category` also equals `'dirty'` —
+   * `row.category` alone is refreshed by the daemon sweep independently of
+   * consent, so it can silently flip to `'dirty'` after a non-dirty category
+   * was surfaced and consented to. Without a matching category, a dirty
+   * worktree is refused (`refused-changed`) rather than force-discarded.
+   * Ignored for `keep`/`merge-then-reap` (the latter has its own dirty
+   * refusal, unaffected by this field).
+   */
+  category?: 'squash-merged' | 'merged-on-origin' | 'genuinely-unmerged' | 'dirty';
+}
+
+export interface OrphanResolutionOutcome {
+  id: string;
+  guid: string;
+  outcome: string;
+  error?: string;
+}
+
+export interface ResolveOrphanInput {
+  repositoryPath: string;
+  protectedPaths?: string[];
+  resolutions: OrphanResolutionRequest[];
+}
+
+export interface ResolveOrphanResult {
+  results: OrphanResolutionOutcome[];
+}
+
+export interface OrphanReapResult {
+  repositoryIdentity: string;
+  reaped: string[];
+  reapedWorktreeOnly: string[];  // worktree removed but its branch delete failed (partial)
+  preservedDirty: string[];
+  preservedUnmerged: string[];
+  preservedDetail: PreservedOrphan[];
+  skippedLive: string[];
+  skippedYoung: string[];
+  errors: { name: string; error: string }[];
 }
 
 function managedWorktreePath(primaryCheckoutPath: string, workspaceGuid: string): string {
@@ -890,6 +971,504 @@ export class WorkspaceService {
         .sort(),
       ambiguousWorktreePaths,
     };
+  }
+
+  /**
+   * Owner-agnostic sweep over every AMBIGUOUS orphan — a managed-shaped
+   * worktree or branch (`ironclaude/<guid>`) with NO assignments row at all,
+   * so neither `cleanupWorkspace` nor `reapLeakedAssignment` can ever reach
+   * it. Every disposition preserves work by default: only a worktree proven
+   * clean, old enough (`ttlHours`), unprotected, and whose branch tip is an
+   * ancestor of the primary branch is actually removed. A dangling branch
+   * with no worktree at all is reaped the same way, by branch tip alone.
+   */
+  reapAmbiguousOrphans(input: { repositoryPath: string; protectedPaths?: string[]; ttlHours?: number }): OrphanReapResult {
+    const repository = discoverRepository(input.repositoryPath);
+    const protectedSet = new Set((input.protectedPaths ?? []).map((p) => path.resolve(p)));
+    const ttlHours = input.ttlHours ?? 24;
+    const cutoffMs = Date.now() - ttlHours * 3600 * 1000;
+    const target = integrationTargetRef(primaryBranch(repository.primaryCheckoutPath));
+
+    const result: OrphanReapResult = {
+      repositoryIdentity: repository.repositoryIdentity,
+      reaped: [], reapedWorktreeOnly: [], preservedDirty: [], preservedUnmerged: [], preservedDetail: [],
+      skippedLive: [], skippedYoung: [], errors: [],
+    };
+
+    const ambiguous = new Map<string, string>();
+    for (const worktreePath of this.reconcileRepository(input.repositoryPath).ambiguousWorktreePaths) {
+      ambiguous.set(path.basename(worktreePath), worktreePath);
+    }
+    const guids = new Set<string>([...ambiguous.keys()]);
+    for (const branch of listManagedBranches(repository.primaryCheckoutPath)) {
+      guids.add(branch.slice('ironclaude/'.length));
+    }
+
+    const scratchDir = mkdtempSync(path.join(os.tmpdir(), 'ironclaude-orphan-'));
+    try {
+      for (const guid of guids) {
+        const name = managedBranch(guid);
+        try {
+          if (this.hasNonCleanedAssignment(repository.repositoryIdentity, guid)) continue;
+          const branchRef = `refs/heads/${name}`;
+          const hasBranch = this.refResolves(repository.primaryCheckoutPath, branchRef);
+          const worktreePath = ambiguous.get(guid);
+          // A registered worktree whose directory was removed outside git still
+          // surfaces here (listWorktrees tolerates the ENOENT rather than
+          // throwing), but its directory is gone: treat it the same as no
+          // worktree at all rather than calling worktreeIsClean/worktreeHead
+          // against a path that no longer exists on disk.
+          const present = worktreePath !== undefined && existsSync(worktreePath);
+          if (present && protectedSet.has(path.resolve(worktreePath!))) { result.skippedLive.push(name); continue; }
+          const tip = hasBranch
+            ? runGit(repository.primaryCheckoutPath, ['rev-parse', branchRef]).trim()
+            : present ? worktreeHead(worktreePath!) : null;
+          if (tip === null) continue;
+          const committedMs = Number(runGit(repository.primaryCheckoutPath, ['show', '-s', '--format=%ct', tip]).trim()) * 1000;
+          if (committedMs > cutoffMs) { result.skippedYoung.push(name); continue; }
+          if (present && !worktreeIsClean(worktreePath!)) {
+            result.preservedDirty.push(name);
+            let evidence = `worktree at ${worktreePath} has uncommitted changes`;
+            if (!isAncestor(repository.primaryCheckoutPath, tip, target)) {
+              const unmergedCount = runGit(
+                repository.primaryCheckoutPath, ['rev-list', '--count', `${target}..${tip}`],
+              ).trim();
+              evidence += `; also ${unmergedCount} unmerged commit(s) not on ${target} (lost on reap)`;
+            }
+            result.preservedDetail.push(this.buildPreservedOrphan(
+              repository, guid, name, tip, 'dirty',
+              evidence, present,
+            ));
+            continue;
+          }
+          if (!isAncestor(repository.primaryCheckoutPath, tip, target)) {
+            result.preservedUnmerged.push(name);
+            const classified = this.classifyPreservedOrphan(repository, tip, target, scratchDir);
+            result.preservedDetail.push(this.buildPreservedOrphan(
+              repository, guid, name, tip, classified.category, classified.evidence, present,
+            ));
+            continue;
+          }
+          let worktreeRemoved = false;
+          if (present) {
+            removeWorktree(repository.primaryCheckoutPath, worktreePath!);
+            worktreeRemoved = true;
+          } else if (worktreePath !== undefined) {
+            // Registered in git's worktree administration but its directory is
+            // gone: targeted equivalent of `git worktree prune` for just this
+            // one entry, so the branch delete below is not refused as "used
+            // by worktree" — no blanket repository-wide prune.
+            removeWorktree(repository.primaryCheckoutPath, worktreePath, { force: true });
+            worktreeRemoved = true;
+          }
+          try {
+            if (this.refResolves(repository.primaryCheckoutPath, branchRef)) {
+              deleteTemporaryBranch(repository.primaryCheckoutPath, name);
+            }
+            result.reaped.push(name);
+            this.deleteOrphanSurface(repository.repositoryIdentity, guid);
+          } catch (branchError) {
+            if (worktreeRemoved) result.reapedWorktreeOnly.push(name);
+            result.errors.push({ name, error: branchError instanceof Error ? branchError.message : String(branchError) });
+          }
+        } catch (error) {
+          result.errors.push({ name, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+    } finally {
+      rmSync(scratchDir, { recursive: true, force: true });
+    }
+    return result;
+  }
+
+  /**
+   * Authorized-consent disposition of previously SURFACED ambiguous orphans
+   * (rows `reapAmbiguousOrphans` wrote to `orphan_surface`). Consent is bound
+   * to the exact tip surfaced: if the branch (or worktree) has moved since,
+   * the resolution is refused — it is never silently reaped or kept sight
+   * unseen. A refusal never mutates the surfaced row; only the daemon sweep
+   * (`upsertOrphanSurface`) refreshes tip/category, on its own schedule, so a
+   * subsequent re-review still sees the state it was surfaced against. Every
+   * resolution is processed independently (one bad entry never aborts the
+   * batch) and an audit row is written for every outcome.
+   */
+  resolveOrphan(input: ResolveOrphanInput): ResolveOrphanResult {
+    const repository = discoverRepository(input.repositoryPath);
+    const protectedSet = new Set((input.protectedPaths ?? []).map((p) => path.resolve(p)));
+
+    const results: OrphanResolutionOutcome[] = [];
+    for (const resolution of input.resolutions) {
+      const outcome = this.resolveOneOrphan(repository, protectedSet, resolution);
+      results.push(outcome);
+      this.recordOrphanResolutionAudit(
+        repository.repositoryIdentity,
+        outcome.guid || null,
+        outcome.id || null,
+        resolution.action,
+        outcome.outcome,
+      );
+    }
+    return { results };
+  }
+
+  private findOrphanSurfaceRow(
+    repositoryIdentity: string,
+    resolution: OrphanResolutionRequest,
+  ): { workspace_guid: string; short_id: string; tip: string; category: string } | undefined {
+    // Look up by the tip-bound `id` FIRST whenever it is present: the id is
+    // bound to the exact surfaced tip, so it must govern even if a (stable)
+    // guid is also supplied — otherwise an id+guid resolution would resolve
+    // against the guid's CURRENT row and bypass the tip-binding. An id that is
+    // present but no longer matches any row (its tip moved) returns undefined
+    // here → the caller reports not-surfaced, with no fall-through to the guid.
+    if (resolution.id) {
+      return this.db.prepare(`
+        SELECT workspace_guid, short_id, tip, category FROM orphan_surface
+        WHERE repository_identity = ? AND short_id = ?
+      `).get(repositoryIdentity, resolution.id) as
+        { workspace_guid: string; short_id: string; tip: string; category: string } | undefined;
+    }
+    if (resolution.guid) {
+      return this.db.prepare(`
+        SELECT workspace_guid, short_id, tip, category FROM orphan_surface
+        WHERE repository_identity = ? AND workspace_guid = ?
+      `).get(repositoryIdentity, resolution.guid) as
+        { workspace_guid: string; short_id: string; tip: string; category: string } | undefined;
+    }
+    return undefined;
+  }
+
+  private recordOrphanResolutionAudit(
+    repositoryIdentity: string,
+    workspaceGuid: string | null,
+    shortId: string | null,
+    action: string,
+    outcome: string,
+  ): void {
+    this.db.prepare(`
+      INSERT INTO orphan_resolution_audit (repository_identity, workspace_guid, short_id, action, outcome)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(repositoryIdentity, workspaceGuid, shortId, action, outcome);
+  }
+
+  /** One resolution's disposition. Never throws — every failure mode returns an `error` outcome instead. */
+  private resolveOneOrphan(
+    repository: RepositoryLocation,
+    protectedSet: Set<string>,
+    resolution: OrphanResolutionRequest,
+  ): OrphanResolutionOutcome {
+    let id = resolution.id ?? '';
+    let guid = resolution.guid ?? '';
+    try {
+      // A destructive disposition (reap / merge-then-reap) must be addressed
+      // by the tip-bound `id` surfaced for THIS specific tip, never by the
+      // guid alone: the guid is stable across tip moves, so accepting it here
+      // would silently bypass the tip-binding that makes a stale resolution
+      // refuse (`currentTip !== row.tip`, below) rather than discard new work.
+      // `keep` carries no destructive effect, so guid-only addressing remains
+      // fine for it.
+      if (!resolution.id && resolution.guid && (resolution.action === 'reap' || resolution.action === 'merge-then-reap')) {
+        return { id, guid, outcome: 'refused-changed' };
+      }
+
+      const row = this.findOrphanSurfaceRow(repository.repositoryIdentity, resolution);
+      if (!row) return { id, guid, outcome: 'not-surfaced' };
+      guid = row.workspace_guid;
+      id = row.short_id;
+
+      const name = managedBranch(guid);
+      const branchRef = `refs/heads/${name}`;
+      const worktreePath = managedWorktreePath(repository.primaryCheckoutPath, guid);
+      // Registered: git's worktree administration still references this path
+      // (listWorktrees tolerates a gone directory rather than throwing).
+      // Present: the directory actually exists on disk. A worktree can be
+      // registered but not present when its directory was removed outside
+      // git; git then refuses to delete the branch as "used by worktree"
+      // until that stale registration is cleared (see `registered` use below).
+      const registered = worktreeExists(repository.primaryCheckoutPath, worktreePath);
+      const present = registered && existsSync(worktreePath);
+      const hasBranch = this.refResolves(repository.primaryCheckoutPath, branchRef);
+      const currentTip = hasBranch
+        ? runGit(repository.primaryCheckoutPath, ['rev-parse', branchRef]).trim()
+        : present ? worktreeHead(worktreePath) : null;
+
+      if (currentTip === null || currentTip !== row.tip) {
+        // Never rewrite the surfaced row here: a refusal must leave the row
+        // exactly as surfaced. Only the daemon sweep (`upsertOrphanSurface`)
+        // refreshes tip/category, on its own schedule.
+        return { id, guid, outcome: 'refused-changed' };
+      }
+
+      if (this.hasNonCleanedAssignment(repository.repositoryIdentity, guid)
+        || (present && protectedSet.has(path.resolve(worktreePath)))) {
+        return { id, guid, outcome: 'skipped-live' };
+      }
+
+      if (resolution.action === 'keep') {
+        this.db.prepare(`
+          UPDATE orphan_surface SET muted_tip = ? WHERE repository_identity = ? AND workspace_guid = ?
+        `).run(currentTip, repository.repositoryIdentity, guid);
+        return { id, guid, outcome: 'kept' };
+      }
+
+      if (resolution.action === 'merge-then-reap') {
+        if (present && !worktreeIsClean(worktreePath)) {
+          // New uncommitted work appeared after consent was surfaced: refuse
+          // rather than let the merge silently discard it.
+          return { id, guid, outcome: row.category === 'dirty' ? 'refused-dirty' : 'refused-changed' };
+        }
+        return this.mergeOrphanThenReap(repository, name, branchRef, worktreePath, present, registered, currentTip, resolution, id, guid);
+      }
+
+      // action === 'reap'
+      let force = false;
+      if (present && !worktreeIsClean(worktreePath)) {
+        // Force-removing a dirty worktree is safe only when the operator's
+        // consent explicitly named the dirty category AND the persisted
+        // surface row agrees the orphan is currently dirty. `row.category`
+        // alone is not enough: the daemon sweep refreshes it independently
+        // of consent, so a resolution surfaced against a stale non-dirty
+        // category (or carrying no category at all) must never force a
+        // discard just because the row happens to read 'dirty' by the time
+        // this resolution runs.
+        if (row.category !== 'dirty' || resolution.category !== 'dirty') {
+          return { id, guid, outcome: 'refused-changed' };
+        }
+        force = true;
+      }
+      let worktreeRemoved = false;
+      if (present) {
+        removeWorktree(repository.primaryCheckoutPath, worktreePath, { force });
+        worktreeRemoved = true;
+      } else if (registered) {
+        // Targeted equivalent of `git worktree prune` for just this one
+        // stale (directory-gone) entry, so the branch delete below is not
+        // refused as "used by worktree" — no blanket repository-wide prune.
+        removeWorktree(repository.primaryCheckoutPath, worktreePath, { force: true });
+        worktreeRemoved = true;
+      }
+      try {
+        if (this.refResolves(repository.primaryCheckoutPath, branchRef)) {
+          deleteTemporaryBranch(repository.primaryCheckoutPath, name);
+        }
+        this.deleteOrphanSurface(repository.repositoryIdentity, guid);
+        return { id, guid, outcome: 'reaped' };
+      } catch (branchError) {
+        return {
+          id,
+          guid,
+          outcome: worktreeRemoved ? 'reaped-worktree-only' : 'error',
+          error: branchError instanceof Error ? branchError.message : String(branchError),
+        };
+      }
+    } catch (error) {
+      return { id, guid, outcome: 'error', error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  /**
+   * `merge-then-reap`: integrates the orphan branch's committed content into
+   * the reaper's target ref, then reaps the orphan — all via Git plumbing
+   * (rev-parse / merge-base / merge-tree / commit-tree / update-ref) against
+   * commit objects only. The operator's primary checkout is NEVER driven
+   * through `git checkout`, `git merge`, or any other working-tree command:
+   * when the primary is on a DIFFERENT branch than the target (an operator
+   * working on their own feature branch while a reap runs), the target ref
+   * is advanced by a bare CAS `update-ref` and the primary's checked-out tree
+   * and index are left byte-for-byte untouched. Only when the primary happens
+   * to be checked out ON the target ref does `carryForwardFastForward` (a
+   * two-tree `read-tree -m -u`) carry the checkout forward, exactly as
+   * `continueFrozenFinalization` in integration.ts does for assignments.
+   *
+   * The target defaults to the repository's CANONICAL default branch
+   * (`canonicalDefaultBranchRef`, derived from `refs/remotes/origin/HEAD`,
+   * falling back to `refs/heads/main`) — never the primary checkout's live
+   * current branch, which an operator may have moved since the orphan was
+   * surfaced. `resolution.integrationTarget` overrides this default and lets
+   * a caller pin the actual reaper target explicitly.
+   */
+  private mergeOrphanThenReap(
+    repository: RepositoryLocation,
+    name: string,
+    branchRef: string,
+    worktreePath: string,
+    present: boolean,
+    registered: boolean,
+    tip: string,
+    resolution: OrphanResolutionRequest,
+    id: string,
+    guid: string,
+  ): OrphanResolutionOutcome {
+    const primary = repository.primaryCheckoutPath;
+    const target = resolution.integrationTarget
+      ? integrationTargetRef(resolution.integrationTarget)
+      : canonicalDefaultBranchRef(primary);
+    const expected = runGit(primary, ['rev-parse', `${target}^{commit}`]).trim();
+
+    let newCommit: string;
+    if (isAncestor(primary, tip, expected)) {
+      // Already merged (or a no-op orphan): nothing to advance, go straight to reap.
+      newCommit = expected;
+    } else if (isAncestor(primary, expected, tip)) {
+      newCommit = tip; // fast-forward
+    } else {
+      if (!gitSupportsMergeTreeWriteTree()) {
+        return { id, guid, outcome: 'needs-manual-merge' };
+      }
+      const mergeTreeArgs = ['merge-tree', '--write-tree', expected, tip];
+      const mt = spawnSync('git', ['-C', primary, ...mergeTreeArgs], { encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER });
+      if (mt.error) throw mt.error;
+      if (mt.status === 1) return { id, guid, outcome: 'conflict' }; // no ref moved
+      if (mt.status !== 0) throw gitError(primary, mergeTreeArgs, mt.stderr || '');
+      const tree = (mt.stdout || '').split('\n')[0].trim();
+      const botEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: 'IronClaude Orphan Reaper',
+        GIT_AUTHOR_EMAIL: 'ironclaude-reaper@localhost',
+        GIT_COMMITTER_NAME: 'IronClaude Orphan Reaper',
+        GIT_COMMITTER_EMAIL: 'ironclaude-reaper@localhost',
+      };
+      const commitTreeArgs = ['commit-tree', tree, '-p', expected, '-p', tip, '-m', `ironclaude: merge orphan ${name} into ${target}`];
+      const ct = spawnSync('git', ['-C', primary, ...commitTreeArgs], { encoding: 'utf8', env: botEnv, maxBuffer: GIT_MAX_BUFFER });
+      if (ct.error) throw ct.error;
+      if (ct.status !== 0) throw gitError(primary, commitTreeArgs, ct.stderr || '');
+      newCommit = (ct.stdout || '').trim();
+    }
+
+    if (newCommit !== expected) {
+      // Refuse an un-applyable carry-forward BEFORE the CAS so the target
+      // never advances on a conflict; self-gates as a no-op when the primary
+      // is off the target ref (pure ref-advance case).
+      assertNoPrimaryOverlap(primary, target, expected, newCommit);
+      const upd = spawnSync('git', ['-C', primary, 'update-ref', target, newCommit, expected], { encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER });
+      if (upd.error) throw upd.error;
+      // Target ref moved concurrently between the rev-parse snapshot and this
+      // CAS (the orphan itself is unchanged); a plain retry recomputes the
+      // merge against the advanced target and succeeds.
+      if (upd.status !== 0) return { id, guid, outcome: 'target-moved' };
+      // Case dispatch: on ref -> carry the checkout forward preserving unrelated
+      // operator work; off ref (feature branch / detached) -> pure ref advance,
+      // ZERO working-tree commands against the operator's primary checkout.
+      if (primaryOnRef(primary, target)) {
+        carryForwardFastForward(primary, expected, newCommit);
+      }
+      verifyPrimaryAfterFastForward(primary, target, expected, newCommit);
+    }
+
+    let worktreeRemoved = false;
+    if (present) {
+      removeWorktree(primary, worktreePath);
+      worktreeRemoved = true;
+    } else if (registered) {
+      // Targeted equivalent of `git worktree prune` for just this one stale
+      // (directory-gone) entry, so the branch delete below is not refused as
+      // "used by worktree" — mirrors the plain-reap dir-gone path. No blanket
+      // repository-wide prune.
+      removeWorktree(primary, worktreePath, { force: true });
+      worktreeRemoved = true;
+    }
+    try {
+      if (this.refResolves(primary, branchRef)) {
+        deleteTemporaryBranch(primary, name);
+      }
+      this.deleteOrphanSurface(repository.repositoryIdentity, guid);
+      return { id, guid, outcome: 'merged-then-reaped' };
+    } catch (branchError) {
+      return {
+        id,
+        guid,
+        outcome: worktreeRemoved ? 'reaped-worktree-only' : 'error',
+        error: branchError instanceof Error ? branchError.message : String(branchError),
+      };
+    }
+  }
+
+  /**
+   * Determines why a preserved (non-ancestor) orphan's content has not
+   * reached `target`: already merged under a new SHA (squash), already merged
+   * to origin's copy of the target branch but not yet fast-forwarded locally,
+   * or genuinely unmerged anywhere. `contentMergedInto` is read-only and
+   * fail-safe (never over-claims merged on an error); the origin check is
+   * skipped when the origin-tracking ref does not resolve, or when origin is
+   * already at or behind `target` (merged-on-origin is then impossible, so
+   * running the expensive double-scan would only ever confirm
+   * genuinely-unmerged).
+   */
+  private classifyPreservedOrphan(
+    repository: RepositoryLocation,
+    tip: string,
+    target: string,
+    scratchDir: string,
+  ): { category: PreservedOrphan['category']; evidence: string } {
+    if (contentMergedInto(repository.primaryCheckoutPath, tip, target, scratchDir)) {
+      return { category: 'squash-merged', evidence: `content already reached ${target} (squash-merge detected)` };
+    }
+    const originRef = target.startsWith('refs/heads/')
+      ? `refs/remotes/origin/${target.slice('refs/heads/'.length)}`
+      : null;
+    if (originRef
+      && this.refResolves(repository.primaryCheckoutPath, originRef)
+      && !isAncestor(repository.primaryCheckoutPath, originRef, target)
+      && contentMergedInto(repository.primaryCheckoutPath, tip, originRef, scratchDir)) {
+      return { category: 'merged-on-origin', evidence: `content already reached ${originRef}` };
+    }
+    return { category: 'genuinely-unmerged', evidence: `not an ancestor of ${target}` };
+  }
+
+  /** Upserts the orphan's surface row and builds the reported PreservedOrphan, including `muted`. */
+  private buildPreservedOrphan(
+    repository: RepositoryLocation,
+    guid: string,
+    branch: string,
+    tip: string,
+    category: PreservedOrphan['category'],
+    evidence: string,
+    worktreePresent: boolean,
+  ): PreservedOrphan {
+    const id = createHash('sha256').update(`${guid}\0${tip}`).digest('hex').slice(0, 8);
+    const row = this.upsertOrphanSurface(repository.repositoryIdentity, guid, id, tip, category);
+    return { id, guid, branch, category, tip, worktreePresent, evidence, muted: row.muted_tip === tip };
+  }
+
+  /**
+   * Upserts the durable orphan_surface row for one (repository, guid), keyed
+   * on its primary key so a repeated sweep refreshes tip/category in place
+   * rather than duplicating rows. `muted_tip` is never written here — only an
+   * explicit operator mute action sets it — so it survives the upsert
+   * untouched and is returned for the caller to compare against the current tip.
+   */
+  private upsertOrphanSurface(
+    repositoryIdentity: string,
+    guid: string,
+    shortId: string,
+    tip: string,
+    category: string,
+  ): { muted_tip: string | null } {
+    this.db.prepare(`
+      INSERT INTO orphan_surface (repository_identity, workspace_guid, short_id, tip, category)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(repository_identity, workspace_guid) DO UPDATE SET
+        tip = excluded.tip,
+        category = excluded.category,
+        short_id = excluded.short_id
+    `).run(repositoryIdentity, guid, shortId, tip, category);
+    return this.db.prepare(
+      'SELECT muted_tip FROM orphan_surface WHERE repository_identity = ? AND workspace_guid = ?',
+    ).get(repositoryIdentity, guid) as { muted_tip: string | null };
+  }
+
+  /** Drops the surface row for a guid that is no longer a preserved orphan (reaped). */
+  private deleteOrphanSurface(repositoryIdentity: string, guid: string): void {
+    this.db.prepare(
+      'DELETE FROM orphan_surface WHERE repository_identity = ? AND workspace_guid = ?',
+    ).run(repositoryIdentity, guid);
+  }
+
+  private hasNonCleanedAssignment(repositoryIdentity: string, workspaceGuid: string): boolean {
+    return this.db.prepare(`
+      SELECT 1 FROM assignments
+      WHERE repository_identity = ? AND workspace_guid = ? AND lifecycle_status <> 'cleaned'
+    `).get(repositoryIdentity, workspaceGuid) !== undefined;
   }
 
   /**

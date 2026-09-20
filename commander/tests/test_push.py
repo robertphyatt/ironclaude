@@ -312,9 +312,14 @@ def test_sweep_handles_db_lock(daemon):
         daemon._db = original_db
 
 
-def test_sweep_rollback_on_db_lock(daemon):
-    """_sweep_expired_push_requests calls rollback() on lock error to clear stale transaction."""
+def test_sweep_rollback_on_db_lock(daemon, monkeypatch):
+    """_sweep_expired_push_requests routes its write through _db_write_with_retry,
+    which rolls back once per attempt while the lock error persists."""
     import sqlite3 as _sqlite3
+    import ironclaude.main as _main
+
+    monkeypatch.setattr(_main.time, "sleep", lambda *_a, **_kw: None)
+
     original_db = daemon._db
     mock_db = MagicMock()
     mock_db.execute.side_effect = _sqlite3.OperationalError("database is locked")
@@ -323,7 +328,7 @@ def test_sweep_rollback_on_db_lock(daemon):
         daemon._sweep_expired_push_requests()
     finally:
         daemon._db = original_db
-    mock_db.rollback.assert_called_once()
+    assert mock_db.rollback.call_count == 3
 
 
 def test_sweep_unpins_expired_messages(daemon, db_conn):

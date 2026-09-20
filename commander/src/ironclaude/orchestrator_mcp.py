@@ -221,12 +221,6 @@ VALID_ORDER_BY_COLUMNS = frozenset({"id", "created_at", "updated_at", "severity"
 RESERVED_SUPABASE_PARAMS = frozenset({"select", "limit", "order", "offset", "count", "and", "or", "not"})
 _SAFE_COLUMN_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_]*$')
 
-_MCP_CLEANUP_PATTERNS = [
-    "ironclaude/orchestrator_mcp",
-    "ironclaude-state-manager",
-    "ironclaude-episodic-memory",
-]
-
 
 def _load_avatar_skill() -> str:
     """Load the avatar decision skill from src/brain/avatar_skill.md."""
@@ -2781,6 +2775,31 @@ class OrchestratorTools:
                 "min_available_memory_pct": pct,
             }
 
+        # 3. Swap / macOS memory-pressure guard (additive to the floor above).
+        max_swap = self._config.get("max_swap_used_gb", 8.0)
+        swap_used = self._swap_used_gb()
+        if max_swap and max_swap > 0 and swap_used > max_swap:
+            logger.info("Spawn rejected: swap used %.1fGB > max %.1fGB", swap_used, max_swap)
+            return {
+                "error": (f"Spawn rejected: swap too high (used {swap_used}GB > "
+                          f"max {max_swap}GB). Free memory or close sessions."),
+                "swap_used_gb": swap_used, "max_swap_used_gb": max_swap,
+            }
+        if self._config.get("spawn_block_on_pressure", True):
+            block_level = self._config.get("spawn_block_pressure_level", 2)
+            pressure = self._memory_pressure_level()
+            if block_level and pressure >= block_level:
+                logger.info(
+                    "Spawn rejected: macOS memory pressure level %d (>=%d)",
+                    pressure, block_level,
+                )
+                return {
+                    "error": (f"Spawn rejected: macOS memory pressure elevated "
+                              f"(level {pressure} >= {block_level}; 2=warn, 4=critical)."),
+                    "memory_pressure_level": pressure,
+                    "spawn_block_pressure_level": block_level,
+                }
+
         logger.info(
             "Spawn preconditions passed: worker_type=%s, active_workers=%d, "
             "Ollama VRAM %.1fGB (vram_gated=%s), memory %.1fGB available (threshold %.1fGB / %.0f%% of %.1fGB)",
@@ -3045,6 +3064,7 @@ class OrchestratorTools:
             and integrated.get("state") in self._FINALIZATION_INTEGRATED_STATES
         ):
             self._complete_worker_if_session_dead(worker_id, ssh_host)
+            self.registry.log_event("finalize_integrated", worker_id=worker_id)
             return integrated
         if (
             isinstance(integrated, dict)
@@ -3092,6 +3112,7 @@ class OrchestratorTools:
             # probe result rather than an untagged failure pointing at a
             # possibly-deleted worktree.
             self._complete_worker_if_session_dead(worker_id, ssh_host)
+            self.registry.log_event("finalize_integrated", worker_id=worker_id)
             self._trigger_integrated_cleanup(recovery_payload, transport)
             return status
         if state == "rebase-paused-clean":
@@ -3395,9 +3416,16 @@ class OrchestratorTools:
                 **self._workspace_transport(installed_root, ssh_host),
             )
         except Exception as exc:
-            return self._classify_finalization_failure(
+            classified = self._classify_finalization_failure(
                 worker_id, repository, assignment, exc, installed_root, ssh_host,
             )
+            if (
+                isinstance(classified, dict)
+                and classified.get("failure_phase") == "finalization"
+            ):
+                self.registry.log_event("finalize_failed", worker_id=worker_id)
+            return classified
+        self.registry.log_event("finalize_integrated", worker_id=worker_id)
         self.registry.update_worker_status(worker_id, "completed")
         return result
 
@@ -3838,6 +3866,7 @@ class OrchestratorTools:
                 worker_id, repository, assignment, exc, installed_root, ssh_host,
             )
         sha = result.get("integratedCommit") if isinstance(result, dict) else None
+        self.registry.log_event("finalize_integrated", worker_id=worker_id)
         if terminal:
             self.registry.update_worker_status(worker_id, "completed")
         self._post_slack_safe(
@@ -3936,7 +3965,7 @@ class OrchestratorTools:
         }
 
     _RECOVERY_ACTIONS = frozenset(
-        {"status", "rerebase", "continue", "abort", "restore_frozen"}
+        {"status", "rerebase", "continue", "abort", "restore_frozen", "reopen_for_edit"}
     )
 
     # Fallback provider for a Brain-local (no worker_id) shared-resource operation
@@ -4036,6 +4065,83 @@ class OrchestratorTools:
                 "repository_path": repository_path,
             }
 
+    def resolve_orphan(
+        self, repository_path: str, resolutions: list, worker_id: str | None = None,
+    ) -> dict:
+        """Apply operator-confirmed dispositions to surfaced orphaned worktrees.
+
+        Call this after the operator has decided what to do with orphaned
+        managed-worktree rows the reaper could not auto-resolve (surfaced
+        preserved-dirty or preserved-unmerged entries). `resolutions` is the
+        list of per-orphan dispositions to apply (id/guid + the chosen action).
+        Each entry may carry `integration_target` (a branch name) for
+        `merge-then-reap`; default = the repo's canonical default branch.
+        Each entry may also carry `category` — the orphan category the
+        operator was shown (e.g. `dirty`); for `reap`, a dirty worktree is
+        force-removed ONLY when that consented `category` is `dirty` AND the
+        currently persisted row also agrees it's dirty — without a matching
+        category, a dirty worktree is refused rather than force-discarded.
+        protected_paths (currently-live worker worktrees) is computed here and
+        threaded through automatically, so a live worktree is never resolved
+        out from under a running worker. worker_id, when given, resolves
+        transport (provider + host) from the worker registry; omit it for a
+        Brain-local repository.
+
+        Returns {results: [{id, guid, outcome, error?}]} or a structured error
+        dict; never raises. outcome is one of: reaped, kept, refused-changed,
+        not-surfaced, skipped-live, reaped-worktree-only, merged-then-reaped,
+        conflict, needs-manual-merge, refused-dirty, target-moved, error.
+        """
+        from ironclaude.main import _live_worker_worktree_paths
+
+        transport = self._shared_resources_transport(repository_path, worker_id)
+        if "error" in transport:
+            return transport
+        try:
+            protected_paths = _live_worker_worktree_paths(self._db, self.tmux)
+            result = self._workspace_client.resolve_orphan(
+                {
+                    "repository_path": repository_path,
+                    "resolutions": resolutions,
+                    "protected_paths": protected_paths,
+                },
+                **transport,
+            )
+        except Exception as exc:
+            result = {
+                "error": str(exc),
+                "failure_phase": "resolve_orphan",
+                "repository_path": repository_path,
+            }
+
+        if isinstance(result, dict) and "results" in result:
+            actions_by_id = {
+                (r.get("id") or r.get("guid")): r.get("action")
+                for r in resolutions
+                if isinstance(r, dict)
+            }
+            summary = [
+                (
+                    r.get("id") or r.get("guid"),
+                    actions_by_id.get(r.get("id") or r.get("guid")),
+                    r.get("outcome"),
+                )
+                for r in result.get("results", [])
+            ]
+            logger.info(
+                "resolve_orphan repository_path=%s results=%s",
+                repository_path,
+                summary,
+            )
+        else:
+            logger.info(
+                "resolve_orphan repository_path=%s error=%s",
+                repository_path,
+                result.get("error") if isinstance(result, dict) else result,
+            )
+
+        return result
+
     def list_shared_resources(
         self, repository_path: str, worker_id: str | None = None,
     ) -> dict:
@@ -4066,7 +4172,8 @@ class OrchestratorTools:
         action selects a single non-push finalization reconcile mode: 'status'
         (non-mutating classification), 'continue'/'abort' (resolve a paused
         rebase), or 'rerebase'/'restore_frozen' (recover a drifted frozen
-        worktree). Authority — repository, workspace_guid, owner_session_id,
+        worktree), or 'reopen_for_edit' (return a stuck reviewed row to
+        editable 'active', preserving work). Authority — repository, workspace_guid, owner_session_id,
         transport — is derived from the persisted worker registry exactly as
         commit_worker derives it; no caller-supplied refs/trees/owners are
         accepted. A WorkspaceClientError is returned as a structured dict, never
@@ -4157,6 +4264,7 @@ class OrchestratorTools:
             # so mark it completed here too. Non-terminal results (a repair
             # still required, a paused rebase) must NOT mark completed.
             self.registry.update_worker_status(worker_id, "completed")
+            self.registry.log_event("finalize_integrated", worker_id=worker_id)
             cleanup_payload = {
                 "repository_path": repository,
                 "workspace_guid": assignment["workspace_guid"],
@@ -4165,6 +4273,12 @@ class OrchestratorTools:
             self._trigger_integrated_cleanup(
                 cleanup_payload, self._workspace_transport(installed_root, ssh_host)
             )
+        if (
+            action == "reopen_for_edit"
+            and isinstance(result, dict)
+            and result.get("state") == "finalization-reopened-for-edit"
+        ):
+            self.registry.log_event("finalize_reopened", worker_id=worker_id)
         return result
 
     def drive_frozen_reconcile_recovery(self, worker_id: str) -> dict:
@@ -4255,6 +4369,7 @@ class OrchestratorTools:
             # This seam owns drift-success completion. Never complete a worker
             # whose tmux session is still alive — a live worker is integrated
             # but stays under monitoring until its session is confirmed dead.
+            self.registry.log_event("finalize_integrated", worker_id=worker_id)
             session_name = worker.get("tmux_session")
             if not (
                 isinstance(session_name, str)
@@ -6703,74 +6818,6 @@ Has the worker genuinely completed its objective based on the evidence?
             "status_file": status_file,
         })
 
-    def _cleanup_zombie_mcp_processes(self) -> list[int]:
-        """Find and kill orphaned MCP processes whose parent process is dead.
-
-        Returns list of killed PIDs.
-        """
-        import signal as _signal
-
-        my_pid = os.getpid()
-        killed = []
-
-        for pattern in _MCP_CLEANUP_PATTERNS:
-            try:
-                result = subprocess.run(
-                    ["pgrep", "-f", pattern],
-                    capture_output=True,
-                    text=True,
-                )
-                if result.returncode not in (0, 1):
-                    continue
-                for line in result.stdout.strip().splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        pid = int(line)
-                    except ValueError:
-                        continue
-                    if pid == my_pid:
-                        continue
-                    ps_result = subprocess.run(
-                        ["ps", "-p", str(pid), "-o", "ppid="],
-                        capture_output=True,
-                        text=True,
-                    )
-                    if ps_result.returncode != 0:
-                        continue
-                    try:
-                        ppid = int(ps_result.stdout.strip())
-                    except ValueError:
-                        continue
-                    try:
-                        os.kill(ppid, 0)
-                        continue  # parent alive — not an orphan
-                    except ProcessLookupError:
-                        pass  # parent dead — orphan confirmed
-                    except PermissionError:
-                        continue  # parent exists (can't signal it)
-                    try:
-                        os.kill(pid, _signal.SIGTERM)
-                        killed.append(pid)
-                        logger.info(
-                            "restart_mcp: killed orphan MCP process pid=%d pattern=%r ppid=%d",
-                            pid, pattern, ppid,
-                        )
-                    except (ProcessLookupError, PermissionError) as e:
-                        logger.debug("restart_mcp: could not kill pid=%d: %s", pid, e)
-            except Exception as e:
-                logger.warning(
-                    "restart_mcp: zombie scan error for pattern=%r: %s", pattern, e
-                )
-
-        if killed:
-            logger.info(
-                "restart_mcp: cleaned up %d orphan MCP process(es): pids=%s",
-                len(killed), killed,
-            )
-        return killed
-
     def restart_mcp(self) -> str:
         """Close DB and exec a fresh instance of this MCP server.
 
@@ -6788,7 +6835,6 @@ Has the worker genuinely completed its objective based on the evidence?
                 self._db.close()
             except Exception:
                 pass
-        self._cleanup_zombie_mcp_processes()
         sys.stdout.flush()
         sys.stderr.flush()
         os.execvp(sys.executable, [sys.executable] + sys.argv)
@@ -6855,6 +6901,27 @@ Has the worker genuinely completed its objective based on the evidence?
             "total_gb": round(mem.total / (1024**3), 1),
             "available_gb": round(mem.available / (1024**3), 1),
         }
+
+    def _swap_used_gb(self) -> float:
+        """Swap in use, GB. Fail-open (0.0) so a probe error never blocks spawning."""
+        try:
+            return round(psutil.swap_memory().used / (1024**3), 1)
+        except Exception as exc:  # noqa: BLE001 - telemetry, never fatal
+            logger.info("swap probe failed (fail-open): %s", exc)
+            return 0.0
+
+    def _memory_pressure_level(self) -> int:
+        """macOS memory pressure: 1=normal, 2=warn, 4=critical; 0 if unavailable."""
+        try:
+            out = subprocess.run(
+                ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                return int(out.stdout.strip())
+        except Exception as exc:  # noqa: BLE001 - telemetry, never fatal
+            logger.info("memory pressure probe failed (fail-open): %s", exc)
+        return 0
 
     def get_process_info(self) -> dict:
         """Return per-process resource usage for relevant local processes.
@@ -7319,7 +7386,8 @@ def _create_mcp_server(tools: OrchestratorTools, plugin_dirs: list[str] | None =
         action selects a single non-push finalization reconcile mode: 'status'
         (non-mutating classification of the worktree), 'continue'/'abort' (resolve
         a paused integration rebase), or 'rerebase'/'restore_frozen' (recover a
-        drifted frozen worktree). Authority is derived from the persisted worker
+        drifted frozen worktree), or 'reopen_for_edit' (return a stuck reviewed
+        row to editable 'active', preserving work). Authority is derived from the persisted worker
         registry; no caller-supplied refs, trees, or owners are accepted.
 
         Returns JSON with the reconcile result, or a structured error dict when
@@ -7365,6 +7433,44 @@ def _create_mcp_server(tools: OrchestratorTools, plugin_dirs: list[str] | None =
             tools.configure_shared_resources(
                 repository_path, entries, worker_id or None, allow_secret_entries,
             )
+        )
+
+    @mcp.tool()
+    def resolve_orphan(
+        repository_path: str,
+        resolutions: list,
+        worker_id: str = "",
+    ) -> str:
+        """Apply operator-confirmed dispositions to surfaced orphaned worktrees.
+
+        Call this after the operator has decided what to do with orphaned
+        managed-worktree rows the reaper could not auto-resolve (surfaced
+        preserved-dirty or preserved-unmerged entries). Currently-live worker
+        worktrees are computed and threaded through automatically as
+        protected_paths, so a live worktree is never resolved out from under
+        a running worker.
+
+        Args:
+            repository_path: Absolute path to the git repository (primary checkout).
+            resolutions: Per-orphan dispositions to apply (id/guid + chosen action).
+                Each entry may carry `integration_target` (a branch name) for
+                `merge-then-reap`; default = the repo's canonical default branch.
+                Each entry may also carry `category` — the orphan category the
+                operator was shown (e.g. `dirty`); for `reap`, a dirty worktree
+                is force-removed ONLY when that consented `category` is `dirty`
+                AND the currently persisted row also agrees it's dirty —
+                without a matching category, a dirty worktree is refused
+                rather than force-discarded.
+            worker_id: The worker whose report surfaced the orphan (resolves its
+                provider + host); omit for a Brain-local repository.
+
+        Returns JSON {results: [{id, guid, outcome, error?}]} or a structured
+        error dict. outcome is one of: reaped, kept, refused-changed,
+        not-surfaced, skipped-live, reaped-worktree-only, merged-then-reaped,
+        conflict, needs-manual-merge, refused-dirty, target-moved, error.
+        """
+        return json.dumps(
+            tools.resolve_orphan(repository_path, resolutions, worker_id or None)
         )
 
     @mcp.tool()

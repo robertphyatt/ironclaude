@@ -130,6 +130,17 @@ class TestSystemNotifications:
         assert "context lost" in msg.lower() or "fresh session" in msg.lower()
         assert "2" in msg
 
+    def test_heartbeat_mem_line_renders_on_both_paths(self):
+        """mem_line must render both in the no-workers early-return path and
+        the main workers-present path."""
+        mem_line = "mem: 12.0G free / swap 2.0G / top a=1.0G"
+        empty_msg = format_heartbeat([], mem_line=mem_line)
+        assert mem_line in empty_msg
+
+        workers = [{"id": "w1", "description": "Your task: Do stuff", "workflow_stage": "executing"}]
+        workers_msg = format_heartbeat(workers, mem_line=mem_line)
+        assert mem_line in workers_msg
+
     def test_circuit_breaker_notification(self):
         """format_brain_circuit_breaker includes restart count and limit."""
         msg = format_brain_circuit_breaker(restart_count=5, max_restarts=3, window_seconds=600)
@@ -855,6 +866,156 @@ def test_heartbeat_degraded_wins_over_busy():
     assert "⚠️" in out
     assert "degraded" in out.lower()
     assert "busy" not in out.lower()
+
+
+def test_heartbeat_shows_orphaned_unmerged_marker_with_workers_path():
+    from ironclaude.notifications import format_heartbeat
+    out = format_heartbeat(
+        [{"id": "w1", "description": "task", "workflow_stage": "executing"}],
+        orphaned_unmerged=3,
+    )
+    assert "3" in out
+    assert "orphan" in out.lower()
+    assert "need review" in out.lower() or "review" in out.lower()
+    assert "unmerged" not in out.lower()
+
+
+def test_heartbeat_shows_orphaned_unmerged_marker_no_workers_case():
+    from ironclaude.notifications import format_heartbeat
+    out = format_heartbeat([], orphaned_unmerged=2)   # no workers/waits -> early-return path
+    assert "2" in out
+    assert "orphan" in out.lower()
+    assert "unmerged" not in out.lower()
+
+
+def test_heartbeat_no_orphaned_unmerged_marker_when_zero_with_workers_path():
+    from ironclaude.notifications import format_heartbeat
+    out = format_heartbeat(
+        [{"id": "w1", "description": "task", "workflow_stage": "executing"}],
+    )
+    assert "orphaned worktrees preserved" not in out
+
+
+def test_heartbeat_no_orphaned_unmerged_marker_when_zero_no_workers_case():
+    from ironclaude.notifications import format_heartbeat
+    out = format_heartbeat([], orphaned_unmerged=0)
+    assert "orphaned worktrees preserved" not in out
+
+
+def test_format_orphaned_unmerged_lists_sorted_entries():
+    from ironclaude.notifications import format_orphaned_unmerged
+    out = format_orphaned_unmerged(["/r:ironclaude/z", "/r:ironclaude/y"])
+    assert "2" in out
+    assert "/r:ironclaude/y" in out
+    assert "/r:ironclaude/z" in out
+    assert out.index("/r:ironclaude/y") < out.index("/r:ironclaude/z")
+
+
+def test_format_orphaned_orphans_renders_fields_and_reply_instruction():
+    from ironclaude.notifications import format_orphaned_orphans
+    details = [
+        {
+            "id": "/repo:ironclaude/abc123", "guid": "abc123",
+            "branch": "ironclaude/abc123", "category": "genuinely-unmerged",
+            "tip": "deadbeefcafe0011", "worktreePresent": True,
+            "evidence": "2 commits ahead of origin/main", "muted": False,
+            "repository_path": "/repo",
+        },
+    ]
+    out = format_orphaned_orphans(details)
+    assert "/repo:ironclaude/abc123" in out
+    assert "genuinely-unmerged" in out
+    assert "ironclaude/abc123" in out
+    assert "deadbee" in out  # tip[:7]
+    assert "deadbeefcafe0011" not in out  # truncated, not the full tip
+    assert "2 commits ahead of origin/main" in out
+    assert "/repo" in out
+    assert "reap" in out
+    assert "keep" in out
+    assert "merge" in out
+    assert "<ids>" in out
+
+
+def test_format_orphaned_orphans_empty_list_still_returns_string():
+    from ironclaude.notifications import format_orphaned_orphans
+    out = format_orphaned_orphans([])
+    assert isinstance(out, str)
+    assert "0" in out
+
+
+def test_format_orphaned_orphans_header_need_review_excludes_squash_merged():
+    """Header 'need review' count must match the heartbeat's
+    _orphaned_unmerged_count (main.py:1940-1942), which excludes
+    squash-merged entries — while every entry still gets listed as a
+    bullet so squash-merged ids remain reapable."""
+    from ironclaude.notifications import format_orphaned_orphans
+    details = [
+        {
+            "id": "/repo:ironclaude/sm1", "guid": "sm1",
+            "branch": "ironclaude/sm1", "category": "squash-merged",
+            "tip": "1111111111111111", "worktreePresent": True,
+            "evidence": "squash-merged onto origin/main", "muted": False,
+            "repository_path": "/repo",
+        },
+        {
+            "id": "/repo:ironclaude/gu1", "guid": "gu1",
+            "branch": "ironclaude/gu1", "category": "genuinely-unmerged",
+            "tip": "2222222222222222", "worktreePresent": True,
+            "evidence": "2 commits ahead of origin/main", "muted": False,
+            "repository_path": "/repo",
+        },
+        {
+            "id": "/repo:ironclaude/d1", "guid": "d1",
+            "branch": "ironclaude/d1", "category": "dirty",
+            "tip": "3333333333333333", "worktreePresent": True,
+            "evidence": "uncommitted changes", "muted": False,
+            "repository_path": "/repo",
+        },
+    ]
+    out = format_orphaned_orphans(details)
+    header = out.splitlines()[0]
+    assert "*2 orphaned worktree branch(es) preserved" in header
+    assert "*3 orphaned worktree branch(es) preserved" not in header
+    assert "/repo:ironclaude/sm1" in out
+    assert "/repo:ironclaude/gu1" in out
+    assert "/repo:ironclaude/d1" in out
+
+
+def test_format_orphaned_orphans_header_need_review_zero_when_all_squash_merged():
+    from ironclaude.notifications import format_orphaned_orphans
+    details = [
+        {
+            "id": "/repo:ironclaude/sm1", "guid": "sm1",
+            "branch": "ironclaude/sm1", "category": "squash-merged",
+            "tip": "1111111111111111", "worktreePresent": True,
+            "evidence": "squash-merged onto origin/main", "muted": False,
+            "repository_path": "/repo",
+        },
+        {
+            "id": "/repo:ironclaude/sm2", "guid": "sm2",
+            "branch": "ironclaude/sm2", "category": "squash-merged",
+            "tip": "4444444444444444", "worktreePresent": True,
+            "evidence": "squash-merged onto origin/main", "muted": False,
+            "repository_path": "/repo",
+        },
+    ]
+    out = format_orphaned_orphans(details)
+    header = out.splitlines()[0]
+    assert "*0 orphaned worktree branch(es) preserved" in header
+    assert "/repo:ironclaude/sm1" in out
+    assert "/repo:ironclaude/sm2" in out
+
+
+def test_heartbeat_orphaned_count_label_does_not_say_unmerged_verbatim():
+    """Heartbeat wording no longer claims every preserved orphan is
+    'unmerged' now that squash-merged/muted are excluded from the count
+    upstream — reword the human-facing label only; the keyword arg name
+    (orphaned_unmerged=) stays stable."""
+    from ironclaude.notifications import format_heartbeat
+    out = format_heartbeat([], orphaned_unmerged=2)
+    assert "unmerged" not in out.lower()
+    assert "2" in out
+    assert "orphan" in out.lower()
 
 
 def test_resolve_degraded_backend_label_openai(tmp_path):

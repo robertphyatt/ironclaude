@@ -54,6 +54,13 @@ def format_worker_idle(worker_id: str) -> str:
     return f"*Worker Idle:* `{worker_id}` went idle (stop hook fired). Brain notified."
 
 
+def format_worker_idle_ttl_reaped(worker_id: str, minutes: int) -> str:
+    return (
+        f"*Worker Idle-TTL Reaped:* `{worker_id}` was idle for {minutes}min\n"
+        f"Finalization handled by the integration seam; Brain notified to respawn if unfinished."
+    )
+
+
 def format_worker_failed(worker_id: str, error: str, attempts: int) -> str:
     return (
         f"*Worker Failed:* `{worker_id}` after {attempts} attempt(s)\n"
@@ -115,6 +122,8 @@ def format_heartbeat(
     ollama_busy: bool = False,
     blocked_directives: list[dict] | None = None,
     degraded_backend_label: str = "Ollama",
+    orphaned_unmerged: int = 0,
+    mem_line: str | None = None,
 ) -> str:
     waits = waits or {}
     brain_waits = brain_waits or {}
@@ -125,6 +134,10 @@ def format_heartbeat(
             base += f"\n⚠️ validator degraded ({degraded_backend_label} endpoint(s) unreachable/degraded — see logs)"
         if ollama_busy and not ollama_degraded:
             base += f"\n⏳ validator busy ({degraded_backend_label} endpoint(s) reachable but slow — normal under load)"
+        if orphaned_unmerged:
+            base += f"\n⚠️ {orphaned_unmerged} preserved orphan(s) need review"
+        if mem_line:
+            base += f"\n{mem_line}"
         return base
     lines = ["*Heartbeat*"]
     if blocked_directives:
@@ -189,6 +202,45 @@ def format_heartbeat(
         lines.append(f"⚠️ validator degraded ({degraded_backend_label} endpoint(s) unreachable/degraded — see logs)")
     if ollama_busy and not ollama_degraded:
         lines.append(f"⏳ validator busy ({degraded_backend_label} endpoint(s) reachable but slow — normal under load)")
+    if orphaned_unmerged:
+        lines.append(f"⚠️ {orphaned_unmerged} preserved orphan(s) need review")
+    if mem_line:
+        lines.append(mem_line)
+    return "\n".join(lines)
+
+
+def format_orphaned_orphans(details: list[dict]) -> str:
+    """Slack surface for row-less orphan worktrees/branches the auto-reaper
+    preserved (muted entries already excluded by the caller). Each `details`
+    entry is a dict with keys id/guid/branch/category/tip/worktreePresent/
+    evidence/repository_path, as returned by workspace-manager's
+    reap_orphans (preservedDetail)."""
+    need_review = len([d for d in details if d.get("category") != "squash-merged"])
+    already_merged = len(details) - need_review
+    header = f"⚠️ *{need_review} orphaned worktree branch(es) preserved — need review*"
+    if already_merged:
+        header += f" (+{already_merged} already squash-merged, listed below)"
+    lines = [header]
+    for d in details:
+        tip = str(d.get("tip") or "")[:7]
+        evidence = _escape_mrkdwn(str(d.get("evidence") or ""))
+        lines.append(
+            f"• `{d.get('id')}` [{d.get('category')}] `{d.get('branch')}` "
+            f"tip `{tip}` — {evidence} (repo `{d.get('repository_path')}`)"
+        )
+    lines.append(
+        "Not deleted. Reply `reap <ids>`, `keep <ids>`, or `merge <ids>` to act on these."
+    )
+    return "\n".join(lines)
+
+
+def format_orphaned_unmerged(entries: list[str]) -> str:
+    """Slack surface for row-less orphan branches the auto-reaper preserved
+    because they hold commits not on the integration target. `entries` are
+    'repo_path:ironclaude/<guid>' strings."""
+    lines = [f"⚠️ *{len(entries)} orphaned worktree branch(es) preserved (unmerged — need review)*"]
+    lines.extend(f"• `{entry}`" for entry in sorted(entries))
+    lines.append("Not deleted: each holds commits not on the integration target. Review, merge, or delete manually.")
     return "\n".join(lines)
 
 

@@ -1,0 +1,139 @@
+{
+  "name": "Grader Circuit-Breaker Trip Against amd-halo",
+  "goal": "Reproduce the real cause of the grader circuit breaker tripping against amd-halo with live evidence, then implement only the branch that evidence confirms.",
+  "requirements_file": "docs/plans/2026-09-13-grader-thinking-timeout-investigation-requirements.md",
+  "design_file": "docs/plans/2026-09-13-grader-thinking-timeout-investigation-design.md",
+  "estimated_memory_gb": 0.5,
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Live root-cause investigation",
+      "description": "Read-only/network diagnostic. Determines H1 (amd-halo ignores disable-thinking fields, slow response trips some timeout, at least one alternate field combination confirmed to work) vs H2 (amd-halo genuinely network-unreachable, breaker correct) vs inconclusive (either already-fine or no candidate suppresses thinking). Evidence excludes /tmp/ic/daemon.log narration and episodic-memory archive results (both flagged inadmissible/fabricated this session). Revised after tier-up review found the prior version tested only 2 field variants, could never produce a 'confirmed-working field' for Task 2's H1 branch, and used a non-grading-shaped probe.",
+      "allowed_files": ["docs/plans/2026-09-13-grader-thinking-timeout-investigation-findings.md"],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Identify live Commander daemon process; record PID, start time, and full command line including interpreter path.",
+          "command": "ps aux | grep \"ironclaude.main\" | grep -v grep"
+        },
+        {
+          "description": "Identify the primary checkout's path and HEAD without naming its path as a command argument (a direct path reference, e.g. git -C <primary-path>, is blocked by managed-worktree enforcement even for reads). Compare against this worktree's 255d594 and Step 1's interpreter path.",
+          "command": "git worktree list --porcelain"
+        },
+        {
+          "description": "Probe amd-halo reachability; capture the FULL /v1/models response body (not discarded) to identify the server implementation, which informs which Step 5 candidates are plausible.",
+          "command": "curl -sS -m 5 -w \"\\nhttp_code=%{http_code} time_total=%{time_total}\\n\" http://amd-halo:8080/v1/models"
+        },
+        {
+          "description": "If reachable: baseline grader payload (current suppression fields). Record full response body, latency, and check explicitly for 3 thinking-presence signals: (1) a reasoning_content/reasoning field anywhere in the response, (2) finish_reason=='length' with empty/near-empty message.content, (3) <think> tags in message.content.",
+          "command": "curl -sS -m 60 -w \"\\nHTTP:%{http_code} TIME:%{time_total}\\n\" http://amd-halo:8080/v1/chat/completions -H \"Content-Type: application/json\" -H \"Authorization: Bearer ollama\" -d '{\"model\":\"gemma4-26b-a4b\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly the word: ok\"}],\"max_tokens\":16,\"temperature\":0.1,\"reasoning_effort\":\"none\",\"chat_template_kwargs\":{\"enable_thinking\":false}}'"
+        },
+        {
+          "description": "Only if the prior step showed a thinking-presence signal: probe Candidate A (chat_template_kwargs alone, no reasoning_effort). Record the same 3 signals plus latency.",
+          "command": "curl -sS -m 60 -w \"\\nHTTP:%{http_code} TIME:%{time_total}\\n\" http://amd-halo:8080/v1/chat/completions -H \"Content-Type: application/json\" -H \"Authorization: Bearer ollama\" -d '{\"model\":\"gemma4-26b-a4b\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly the word: ok\"}],\"max_tokens\":16,\"temperature\":0.1,\"chat_template_kwargs\":{\"enable_thinking\":false}}'"
+        },
+        {
+          "description": "Candidate B (reasoning_effort alone, no chat_template_kwargs). Same signals.",
+          "command": "curl -sS -m 60 -w \"\\nHTTP:%{http_code} TIME:%{time_total}\\n\" http://amd-halo:8080/v1/chat/completions -H \"Content-Type: application/json\" -H \"Authorization: Bearer ollama\" -d '{\"model\":\"gemma4-26b-a4b\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly the word: ok\"}],\"max_tokens\":16,\"temperature\":0.1,\"reasoning_effort\":\"none\"}'"
+        },
+        {
+          "description": "Candidate C (top-level enable_thinking, not nested). Same signals.",
+          "command": "curl -sS -m 60 -w \"\\nHTTP:%{http_code} TIME:%{time_total}\\n\" http://amd-halo:8080/v1/chat/completions -H \"Content-Type: application/json\" -H \"Authorization: Bearer ollama\" -d '{\"model\":\"gemma4-26b-a4b\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly the word: ok\"}],\"max_tokens\":16,\"temperature\":0.1,\"enable_thinking\":false}'"
+        },
+        {
+          "description": "Candidate D (thinking object, Anthropic-style shape — tested empirically here, not trusted from any source). Same signals.",
+          "command": "curl -sS -m 60 -w \"\\nHTTP:%{http_code} TIME:%{time_total}\\n\" http://amd-halo:8080/v1/chat/completions -H \"Content-Type: application/json\" -H \"Authorization: Bearer ollama\" -d '{\"model\":\"gemma4-26b-a4b\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly the word: ok\"}],\"max_tokens\":16,\"temperature\":0.1,\"thinking\":{\"type\":\"disabled\"}}'"
+        },
+        {
+          "description": "Candidate E (system-message instruction). Same signals.",
+          "command": "curl -sS -m 60 -w \"\\nHTTP:%{http_code} TIME:%{time_total}\\n\" http://amd-halo:8080/v1/chat/completions -H \"Content-Type: application/json\" -H \"Authorization: Bearer ollama\" -d '{\"model\":\"gemma4-26b-a4b\",\"messages\":[{\"role\":\"system\",\"content\":\"Respond directly without extended reasoning or thinking.\"},{\"role\":\"user\",\"content\":\"Reply with exactly the word: ok\"}],\"max_tokens\":16,\"temperature\":0.1}'"
+        },
+        {
+          "description": "No-fields-at-all baseline, for comparison against all candidates above.",
+          "command": "curl -sS -m 60 -w \"\\nHTTP:%{http_code} TIME:%{time_total}\\n\" http://amd-halo:8080/v1/chat/completions -H \"Content-Type: application/json\" -H \"Authorization: Bearer ollama\" -d '{\"model\":\"gemma4-26b-a4b\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly the word: ok\"}],\"max_tokens\":16,\"temperature\":0.1}'"
+        },
+        {
+          "description": "If a working suppression variant was found (current fields or a Step 5 candidate): grading-shaped probe, objective 1, suppressed variant — real GRADE_SCHEMA response_format, substituting confirmed fields for the ones shown if a candidate other than current fields won.",
+          "command": "curl -sS -m 60 -w \"\\nHTTP:%{http_code} TIME:%{time_total}\\n\" http://amd-halo:8080/v1/chat/completions -H \"Content-Type: application/json\" -H \"Authorization: Bearer ollama\" -d '{\"model\":\"gemma4-26b-a4b\",\"messages\":[{\"role\":\"user\",\"content\":\"You are grading whether a response correctly implements the requested feature. Respond only with JSON matching the schema.\\n\\nTask: Add a function add(a, b) that returns a+b. Response: def add(a, b): return a + b. Grade this response.\"}],\"max_tokens\":256,\"temperature\":0.1,\"reasoning_effort\":\"none\",\"chat_template_kwargs\":{\"enable_thinking\":false},\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"verdict\",\"schema\":{\"type\":\"object\",\"properties\":{\"grade\":{\"type\":\"string\",\"enum\":[\"A\",\"B\",\"C\",\"D\",\"F\"]},\"approved\":{\"type\":\"boolean\"},\"feedback\":{\"type\":\"string\"}},\"required\":[\"grade\",\"approved\",\"feedback\"]}}}}'"
+        },
+        {
+          "description": "Grading-shaped probe, objective 2, suppressed variant.",
+          "command": "curl -sS -m 60 -w \"\\nHTTP:%{http_code} TIME:%{time_total}\\n\" http://amd-halo:8080/v1/chat/completions -H \"Content-Type: application/json\" -H \"Authorization: Bearer ollama\" -d '{\"model\":\"gemma4-26b-a4b\",\"messages\":[{\"role\":\"user\",\"content\":\"You are grading whether a response correctly implements the requested feature. Respond only with JSON matching the schema.\\n\\nTask: Write a function is_even(n) that returns True if n is even. Response: def is_even(n): return n % 2 == 1. Grade this response.\"}],\"max_tokens\":256,\"temperature\":0.1,\"reasoning_effort\":\"none\",\"chat_template_kwargs\":{\"enable_thinking\":false},\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"verdict\",\"schema\":{\"type\":\"object\",\"properties\":{\"grade\":{\"type\":\"string\",\"enum\":[\"A\",\"B\",\"C\",\"D\",\"F\"]},\"approved\":{\"type\":\"boolean\"},\"feedback\":{\"type\":\"string\"}},\"required\":[\"grade\",\"approved\",\"feedback\"]}}}}'"
+        },
+        {
+          "description": "Same objective 1, thinking-enabled reference (no suppression fields), for direct comparison.",
+          "command": "curl -sS -m 60 -w \"\\nHTTP:%{http_code} TIME:%{time_total}\\n\" http://amd-halo:8080/v1/chat/completions -H \"Content-Type: application/json\" -H \"Authorization: Bearer ollama\" -d '{\"model\":\"gemma4-26b-a4b\",\"messages\":[{\"role\":\"user\",\"content\":\"You are grading whether a response correctly implements the requested feature. Respond only with JSON matching the schema.\\n\\nTask: Add a function add(a, b) that returns a+b. Response: def add(a, b): return a + b. Grade this response.\"}],\"max_tokens\":256,\"temperature\":0.1,\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"verdict\",\"schema\":{\"type\":\"object\",\"properties\":{\"grade\":{\"type\":\"string\",\"enum\":[\"A\",\"B\",\"C\",\"D\",\"F\"]},\"approved\":{\"type\":\"boolean\"},\"feedback\":{\"type\":\"string\"}},\"required\":[\"grade\",\"approved\",\"feedback\"]}}}}'"
+        },
+        {
+          "description": "Same objective 2, thinking-enabled reference.",
+          "command": "curl -sS -m 60 -w \"\\nHTTP:%{http_code} TIME:%{time_total}\\n\" http://amd-halo:8080/v1/chat/completions -H \"Content-Type: application/json\" -H \"Authorization: Bearer ollama\" -d '{\"model\":\"gemma4-26b-a4b\",\"messages\":[{\"role\":\"user\",\"content\":\"You are grading whether a response correctly implements the requested feature. Respond only with JSON matching the schema.\\n\\nTask: Write a function is_even(n) that returns True if n is even. Response: def is_even(n): return n % 2 == 1. Grade this response.\"}],\"max_tokens\":256,\"temperature\":0.1,\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"verdict\",\"schema\":{\"type\":\"object\",\"properties\":{\"grade\":{\"type\":\"string\",\"enum\":[\"A\",\"B\",\"C\",\"D\",\"F\"]},\"approved\":{\"type\":\"boolean\"},\"feedback\":{\"type\":\"string\"}},\"required\":[\"grade\",\"approved\",\"feedback\"]}}}}'"
+        },
+        {
+          "description": "If unreachable in the /v1/models step: capture exact connection-stage error (DNS/refused/timeout/route) with verbose curl output — this is the H2 evidence if confirmed.",
+          "command": "curl -sS -m 5 -v http://amd-halo:8080/v1/models"
+        },
+        {
+          "description": "Write the finding to the findings file, based only on this task's own step output — not on /tmp/ic/daemon.log or episodic-memory archive content. H1 = reachable, current fields showed a thinking-presence signal, AND at least one candidate showed none. H2 = unreachable. Inconclusive = reachable and current fields already suppress thinking (no fix needed), OR current fields fail and no candidate works either. This finding gates Task 2's branch."
+        },
+        {
+          "description": "Stage the findings file.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude/.ironclaude/worktrees/352afa8c-9e57-42c1-bada-de222093de5c add -f docs/plans/2026-09-13-grader-thinking-timeout-investigation-findings.md",
+          "expected": "findings file staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Apply the fix confirmed by Task 1",
+      "description": "Branches on Task 1's finding. H2/inconclusive: no code change, report only, no memory write claiming resolution. H1: implement the confirmed suppression field(s) in grader.py, size probe_timeout/connect_timeout only if Task 1's grading-shaped probe latency requires it (never fast_lane_grade_timeout_seconds), add a verdict-equivalence test tied to Task 1's actual captured response bodies (not author-chosen placeholders), update CHANGELOG.",
+      "allowed_files": [
+        "commander/src/ironclaude/grader.py",
+        "commander/src/ironclaude/backend_resolver.py",
+        "commander/tests/test_local_grader.py",
+        "CHANGELOG.md"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "If Task 1 found H2 or inconclusive: make no code change. Summarize Task 1's findings in task completion notes. Do not write memory claiming resolution. Skip all remaining steps in this task."
+        },
+        {
+          "description": "If Task 1 found H1 (RED): update test_grade_openai_default_thinking_off_injects_suppression (commander/tests/test_local_grader.py:876-891) to assert the field(s)/value(s) Task 1 Step 5 demonstrated actually suppress thinking, replacing reasoning_effort/chat_template_kwargs.enable_thinking if those were shown not to work.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/.ironclaude/worktrees/352afa8c-9e57-42c1-bada-de222093de5c/commander && .venv/bin/python -m pytest tests/test_local_grader.py -k test_grade_openai_default_thinking_off_injects_suppression -v",
+          "expected": "FAIL — test now asserts a field the current implementation doesn't send yet"
+        },
+        {
+          "description": "GREEN: edit grader.py:214-217 (currently payload[\"reasoning_effort\"]=\"none\"; payload[\"chat_template_kwargs\"]={\"enable_thinking\": False}) to send the confirmed-working field(s), still gated behind `if not spot_thinking:` so spots.grader.thinking:true continues to omit both fields (test_grade_openai_thinking_true_omits_suppression, :894-916, must keep passing unmodified).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/.ironclaude/worktrees/352afa8c-9e57-42c1-bada-de222093de5c/commander && .venv/bin/python -m pytest tests/test_local_grader.py -k \"test_grade_openai_default_thinking_off_injects_suppression or test_grade_openai_thinking_true_omits_suppression or test_grade_openai_thinking_off_preserves_core_payload_fields\" -v",
+          "expected": "3 passed"
+        },
+        {
+          "description": "Only if Task 1's grading-shaped probe (Step 6) latency shows the existing probe_timeout/connect_timeout defaults (3s) are insufficient for correct breaker classification: adjust resolution in backend_resolver.py using that exact measured value (not the trivial 16-token 'ok' probe's latency). Never touch fast_lane_grade_timeout_seconds (main.py:2691-2702, bounds an unrelated operator-fast-lane path). Skip this step if measured latency is already well under the existing defaults."
+        },
+        {
+          "description": "RED: add a verdict-equivalence test to test_local_grader.py using the existing _openai_post_response helper (:726-730), with Task 1's ACTUAL captured grading-shaped response bodies (suppressed variant vs. thinking-enabled reference, one objective) as the mocked requests.post return values verbatim — not author-chosen content. Assert both: (1) grade() against each mock parses to equal verdict dicts, and (2) mock_post.call_args[1][\"json\"] on the suppressed-path call contains the confirmed field(s) (same style as :889-891). Assertion 2 is what makes the test fail if the fix is reverted.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/.ironclaude/worktrees/352afa8c-9e57-42c1-bada-de222093de5c/commander && .venv/bin/python -m pytest tests/test_local_grader.py -k test_grade_verdict_equivalence -v",
+          "expected": "FAIL — test doesn't exist yet"
+        },
+        {
+          "description": "GREEN: confirm the full test_local_grader.py suite passes including the new verdict-equivalence test.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/.ironclaude/worktrees/352afa8c-9e57-42c1-bada-de222093de5c/commander && .venv/bin/python -m pytest tests/test_local_grader.py -v",
+          "expected": "all tests in the file pass"
+        },
+        {
+          "description": "Full suite regression check.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/.ironclaude/worktrees/352afa8c-9e57-42c1-bada-de222093de5c/commander && .venv/bin/python -m pytest tests/ -v",
+          "expected": "no new failures relative to the pre-change baseline"
+        },
+        {
+          "description": "Add an ## [Unreleased] section at the top of CHANGELOG.md (below the versioning note, above ## 1.1.10) describing the confirmed root cause and fix, following the existing ## 1.1.10 entry style."
+        },
+        {
+          "description": "Stage changed files (grader.py, backend_resolver.py, test_local_grader.py, CHANGELOG.md — git add on an untouched backend_resolver.py is harmless if Step 3 was skipped).",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude/.ironclaude/worktrees/352afa8c-9e57-42c1-bada-de222093de5c add commander/src/ironclaude/grader.py commander/src/ironclaude/backend_resolver.py commander/tests/test_local_grader.py CHANGELOG.md",
+          "expected": "changes staged (professional mode blocks commit)"
+        }
+      ]
+    }
+  ]
+}

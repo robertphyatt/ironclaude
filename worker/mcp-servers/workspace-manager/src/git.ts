@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 export interface RepositoryLocation {
@@ -18,14 +18,55 @@ export interface GitWorktree {
 
 const MANAGED_WORKTREE_EXCLUSION = '/.ironclaude/worktrees/';
 
-function gitError(cwd: string, args: readonly string[], stderr: string): Error {
+export function gitError(cwd: string, args: readonly string[], stderr: string): Error {
   const detail = stderr.trim() || 'Git command failed';
   return new Error(`${detail} (git -C ${cwd} ${args.join(' ')})`);
 }
 
+/**
+ * Ceiling for a `git` child process's captured stdout/stderr, applied to every
+ * spawnSync call in this module that reads command output back into the
+ * process (Node's spawnSync default is 1MB, which ENOBUFS on a routine diff or
+ * log against a repository with any real history or content).
+ */
+export const GIT_MAX_BUFFER = 64 * 1024 * 1024;
+
+/**
+ * Turns a spawnSync ENOBUFS failure into an error naming the git invocation
+ * that overflowed the buffer, so the cause is legible instead of a bare
+ * "ENOBUFS". Returns undefined for any other error (including no error at
+ * all), so callers can `throw overflow ?? result.error` unchanged.
+ */
+export function gitBufferOverflowError(args: readonly string[], error: NodeJS.ErrnoException | undefined): Error | undefined {
+  if (error && error.code === 'ENOBUFS') {
+    return new Error(`git ${args.join(' ')} exceeded the ${GIT_MAX_BUFFER}-byte output buffer (ENOBUFS)`);
+  }
+  return undefined;
+}
+
+/**
+ * True when the installed `git` binary supports `merge-tree --write-tree`
+ * (added in Git 2.38), the plumbing command used to compute a true (non-fast-
+ * forward) merge without touching any worktree. Parses `git --version`'s
+ * major.minor; an unparseable version string is treated as unsupported
+ * (fail-safe) rather than risking a crash on an unrecognized flag.
+ */
+export function gitSupportsMergeTreeWriteTree(): boolean {
+  const result = spawnSync('git', ['--version'], { encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw gitError('.', ['--version'], result.stderr || '');
+  const match = /git version (\d+)\.(\d+)/.exec(result.stdout || '');
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major > 2 || (major === 2 && minor >= 38);
+}
+
 /** Executes Git through argv only. User-provided paths and refs never enter a shell. */
 export function runGit(cwd: string, args: readonly string[]): string {
-  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
+  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER });
+  const overflow = gitBufferOverflowError(args, result.error as NodeJS.ErrnoException | undefined);
+  if (overflow) throw overflow;
   if (result.error) throw result.error;
   if (result.status !== 0) throw gitError(cwd, args, result.stderr || '');
   return result.stdout || '';
@@ -36,7 +77,9 @@ export function runGit(cwd: string, args: readonly string[]): string {
  * index outside the worktree). Same argv-only, no-shell contract as runGit.
  */
 export function runGitEnv(cwd: string, args: readonly string[], env: NodeJS.ProcessEnv): string {
-  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', env });
+  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', env, maxBuffer: GIT_MAX_BUFFER });
+  const overflow = gitBufferOverflowError(args, result.error as NodeJS.ErrnoException | undefined);
+  if (overflow) throw overflow;
   if (result.error) throw result.error;
   if (result.status !== 0) throw gitError(cwd, args, result.stderr || '');
   return result.stdout || '';
@@ -47,7 +90,35 @@ function absoluteFrom(cwd: string, value: string): string {
 }
 
 function canonicalPath(value: string): string {
-  return realpathSync(value);
+  try {
+    return realpathSync(value);
+  } catch (error) {
+    // A registered worktree whose directory is gone: git still lists it
+    // (prunable). Keep the entry on its stored absolute path so listWorktrees /
+    // discoverRepository observe it instead of the whole listing throwing. git
+    // stores worktree paths already realpath'd, so path.resolve matches what
+    // realpathSync would have returned for set-equality against knownPaths.
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return path.resolve(value);
+    throw error;
+  }
+}
+
+/**
+ * Lists local managed branch names (e.g. 'ironclaude/<guid>') under
+ * refs/heads/ironclaude/. Includes branches with no attached worktree, which
+ * listWorktrees cannot see. Empty list when none exist.
+ */
+export function listManagedBranches(primaryCheckoutPath: string): string[] {
+  const out = runGit(primaryCheckoutPath, [
+    'for-each-ref', '--format=%(refname)', 'refs/heads/ironclaude/',
+  ]);
+  const prefix = 'refs/heads/';
+  return out
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith(prefix + 'ironclaude/'))
+    .map((line) => line.slice(prefix.length))
+    .sort();
 }
 
 export function listWorktrees(cwd: string): GitWorktree[] {
@@ -126,6 +197,22 @@ export function primaryBranch(primaryCheckoutPath: string): string {
     throw new Error('Primary checkout is not on a branch; supply integration_target explicitly');
   }
   return ref.slice('refs/heads/'.length);
+}
+
+/**
+ * The repository's canonical default branch, as ref `refs/heads/<name>`,
+ * derived from `refs/remotes/origin/HEAD` — never the primary checkout's
+ * live current branch, which an operator may have moved. Falls back to
+ * `refs/heads/main` whenever origin/HEAD is unset, unresolvable, or does not
+ * point under `refs/remotes/origin/`. Never throws.
+ */
+export function canonicalDefaultBranchRef(cwd: string): string {
+  const result = spawnSync('git', ['-C', cwd, 'symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], { encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER });
+  if (result.error || result.status !== 0) return 'refs/heads/main';
+  const ref = (result.stdout || '').trim();
+  const prefix = 'refs/remotes/origin/';
+  if (!ref.startsWith(prefix)) return 'refs/heads/main';
+  return `refs/heads/${ref.slice(prefix.length)}`;
 }
 
 export function addWorktree(primaryCheckoutPath: string, worktreePath: string, branch: string, baseCommit: string): void {
@@ -428,8 +515,12 @@ export function linkSharedResources(
   return linked;
 }
 
-export function removeWorktree(primaryCheckoutPath: string, worktreePath: string): void {
-  runGit(primaryCheckoutPath, ['worktree', 'remove', '--', worktreePath]);
+export function removeWorktree(
+  primaryCheckoutPath: string,
+  worktreePath: string,
+  opts: { force?: boolean } = {},
+): void {
+  runGit(primaryCheckoutPath, ['worktree', 'remove', ...(opts.force ? ['--force'] : []), '--', worktreePath]);
 }
 
 /** Deletes only a branch name already proven to be this assignment's canonical private branch. */
@@ -472,9 +563,178 @@ export function carryForwardFastForward(cwd: string, fromCommit: string, toCommi
 
 /** Returns false for a missing or unresolvable ref rather than treating it as proof. */
 export function isAncestor(cwd: string, ancestor: string, descendant: string): boolean {
-  const result = spawnSync('git', ['-C', cwd, 'merge-base', '--is-ancestor', ancestor, descendant], { encoding: 'utf8' });
+  const result = spawnSync('git', ['-C', cwd, 'merge-base', '--is-ancestor', ancestor, descendant], { encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER });
   if (result.error) throw result.error;
   if (result.status === 0) return true;
   if (result.status === 1 || result.status === 128) return false;
   throw gitError(cwd, ['merge-base', '--is-ancestor', ancestor, descendant], result.stderr || '');
+}
+
+/**
+ * Stable patch-id for the diff `revA..revB` (`git diff revA revB` piped into
+ * `git patch-id --stable`). Returns null when the diff is empty (patch-id
+ * emits nothing for a no-op diff), never an empty string.
+ */
+export function patchId(cwd: string, revA: string, revB: string): string | null {
+  const diff = spawnSync('git', ['-C', cwd, 'diff', '--no-ext-diff', revA, revB], { encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER });
+  if (diff.error) throw diff.error;
+  if (diff.status !== 0) throw gitError(cwd, ['diff', revA, revB], diff.stderr || '');
+  const patchIdResult = spawnSync('git', ['-C', cwd, 'patch-id', '--stable'], {
+    encoding: 'utf8',
+    input: diff.stdout || '',
+    maxBuffer: GIT_MAX_BUFFER,
+  });
+  if (patchIdResult.error) throw patchIdResult.error;
+  if (patchIdResult.status !== 0) throw gitError(cwd, ['patch-id', '--stable'], patchIdResult.stderr || '');
+  const line = (patchIdResult.stdout || '').trim();
+  if (!line) return null;
+  return line.split(/\s+/)[0] ?? null;
+}
+
+function tryTell(fn: () => boolean): boolean {
+  try {
+    return fn();
+  } catch {
+    // Any spawn/exec failure means this tell is inconclusive, not proof of a
+    // merge: never over-claim merged on an error.
+    return false;
+  }
+}
+
+/**
+ * `git cherry targetRef tip`: every line "- <sha> ..." means the commit's
+ * patch already has an equivalent in targetRef's history; a "+" line means
+ * it does not. Empty output means git found nothing unique to `tip` at all
+ * (never treated as vacuously merged) or that it doesn't resolve.
+ */
+function cherryTellMerged(cwd: string, tip: string, targetRef: string): boolean {
+  const result = spawnSync('git', ['-C', cwd, 'cherry', targetRef, tip], { encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw gitError(cwd, ['cherry', targetRef, tip], result.stderr || '');
+  const output = (result.stdout || '').trim();
+  if (!output) return false;
+  return output.split('\n').every((line) => line.startsWith('- '));
+}
+
+/**
+ * Compares the aggregate patch-id of `mergeBase..tip` against the patch-id
+ * of every non-merge commit unique to targetRef since mergeBase that touches
+ * a path `mergeBase..tip` itself touched. Catches a squash merge, where the
+ * target's single squash commit carries the same net diff as the source
+ * branch's full range.
+ *
+ * Bounded to O(1) `spawnSync` calls regardless of how many commits lie
+ * between `mergeBase` and `targetRef`: rather than spawning `git diff` +
+ * `git patch-id` once per candidate commit (unbounded in the length of
+ * `targetRef`'s history), this restricts the walk to the paths `tip`
+ * touched, then pipes the whole `-p` patch stream for that pathspec-filtered
+ * range through a single `git patch-id --stable` call, comparing each
+ * resulting per-commit id against the aggregate.
+ */
+function patchIdAggregateTellMerged(cwd: string, tip: string, targetRef: string): boolean {
+  const mergeBase = runGit(cwd, ['merge-base', targetRef, tip]).trim();
+  const aggregateId = patchId(cwd, mergeBase, tip);
+  if (aggregateId === null) return false;
+
+  const namesRes = spawnSync('git', ['-C', cwd, 'diff', '--name-only', '--no-renames', '-z', mergeBase, tip], {
+    encoding: 'utf8',
+    maxBuffer: GIT_MAX_BUFFER,
+  });
+  if (namesRes.error) throw namesRes.error;
+  if (namesRes.status !== 0) {
+    throw gitError(cwd, ['diff', '--name-only', '--no-renames', '-z', mergeBase, tip], namesRes.stderr || '');
+  }
+  const paths = (namesRes.stdout || '').split('\0').filter(Boolean);
+  if (paths.length === 0) return false;
+
+  const logRes = spawnSync(
+    'git',
+    ['-C', cwd, '--literal-pathspecs', 'log', '--no-merges', '--no-ext-diff', '--format=commit %H', '-p', `${mergeBase}..${targetRef}`, '--', ...paths],
+    { encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER },
+  );
+  if (logRes.error) throw logRes.error;
+  if (logRes.status !== 0) {
+    throw gitError(
+      cwd,
+      ['--literal-pathspecs', 'log', '--no-merges', '--no-ext-diff', '--format=commit %H', '-p', `${mergeBase}..${targetRef}`, '--', ...paths],
+      logRes.stderr || '',
+    );
+  }
+
+  const idRes = spawnSync('git', ['-C', cwd, 'patch-id', '--stable'], {
+    encoding: 'utf8',
+    input: logRes.stdout || '',
+    maxBuffer: GIT_MAX_BUFFER,
+  });
+  if (idRes.error) throw idRes.error;
+  if (idRes.status !== 0) throw gitError(cwd, ['patch-id', '--stable'], idRes.stderr || '');
+
+  const lines = (idRes.stdout || '').split('\n').filter((line) => line.trim().length > 0);
+  for (const line of lines) {
+    const id = line.split(/\s+/)[0];
+    if (id === aggregateId) return true;
+  }
+  return false;
+}
+
+/**
+ * Builds the `mergeBase..tip` diff as a patch file, loads targetRef's tree
+ * into a scratch index (outside the repo's real index, via GIT_INDEX_FILE),
+ * and checks whether that diff can be cleanly reverse-applied to it. A clean
+ * reverse-apply means targetRef's tree already contains tip's content.
+ * Writes only to `scratchDir`, cleaned up on the way out; never touches the
+ * repository's object database or its real index.
+ */
+function reverseApplyTellMerged(cwd: string, tip: string, targetRef: string, scratchDir: string): boolean {
+  const mergeBase = runGit(cwd, ['merge-base', targetRef, tip]).trim();
+  const unique = `${tip.slice(0, 12)}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const patchPath = path.join(scratchDir, `${unique}.patch`);
+  const indexPath = path.join(scratchDir, `${unique}.idx`);
+  try {
+    const diff = spawnSync('git', ['-C', cwd, 'diff', '--binary', mergeBase, tip], { encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER });
+    if (diff.error) throw diff.error;
+    if (diff.status !== 0) throw gitError(cwd, ['diff', '--binary', mergeBase, tip], diff.stderr || '');
+    const diffText = diff.stdout || '';
+    if (!diffText.trim()) return false;
+    writeFileSync(patchPath, diffText);
+
+    const env: NodeJS.ProcessEnv = { ...process.env, GIT_INDEX_FILE: indexPath };
+    runGitEnv(cwd, ['read-tree', targetRef], env);
+
+    const apply = spawnSync('git', ['-C', cwd, 'apply', '--cached', '--check', '--reverse', patchPath], {
+      encoding: 'utf8',
+      env,
+      maxBuffer: GIT_MAX_BUFFER,
+    });
+    if (apply.error) throw apply.error;
+    return apply.status === 0;
+  } finally {
+    try {
+      rmSync(patchPath, { force: true });
+    } catch {
+      // best-effort scratch cleanup
+    }
+    try {
+      rmSync(indexPath, { force: true });
+    } catch {
+      // best-effort scratch cleanup
+    }
+  }
+}
+
+/**
+ * Read-only detection of whether `tip`'s content already reached
+ * `targetRef`, even when `tip` is not literally an ancestor of `targetRef`
+ * (e.g. after a squash merge). Runs three independent tells and returns
+ * true if any one fires; each tell is fail-safe — a spawn error or
+ * unresolvable ref makes that tell report "not merged" rather than
+ * over-claiming. Writes nothing to the repository's object database or its
+ * real index; scratch files live under `scratchDir`, which callers must
+ * place outside the repo's .git.
+ */
+export function contentMergedInto(cwd: string, tip: string, targetRef: string, scratchDir: string): boolean {
+  if (tryTell(() => cherryTellMerged(cwd, tip, targetRef))) return true;
+  if (tryTell(() => reverseApplyTellMerged(cwd, tip, targetRef, scratchDir))) return true;
+  if (tryTell(() => patchIdAggregateTellMerged(cwd, tip, targetRef))) return true;
+  return false;
 }

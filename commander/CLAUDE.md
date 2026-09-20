@@ -36,7 +36,7 @@
 
 7. **Subagent Discipline**
    - Keep subagent prompts focused: one task, one clear deliverable, no open-ended exploration
-   - Use inline execution mode when tasks are complex enough to risk context exhaustion spirals
+   - Delegate execution to a focused subagent by default (Sonnet on Claude, Terra on Codex); reserve inline for orchestration itself, a step that genuinely can't be captured in a focused prompt, or a task a prior subagent attempt already spiraled on — the per-task code review, testing-theatre, and tier-up gates catch subagent drift
    - Set max_turns on subagents so they fail fast rather than spiral (compaction loses critical detail, causing re-research loops)
    - Never put orchestration in subagents — state management, code review invocation, flag management, and task sequencing belong in the main context
 
@@ -54,7 +54,7 @@
    - "The file is too large" is the start of a decomposition strategy, not a stopping condition
 
 10. **Right-Size Every Subagent (delegate liberally, match model to difficulty)**
-    - Delegate liberally: if a subagent can do a task, dispatch one — reserve your own context for orchestration and the judgment only you can provide. (This does not override Subagent Discipline: keep prompts focused, set max_turns, and run inline when a task is complex enough to risk a context spiral.)
+    - Delegate liberally: if a subagent can do a task, dispatch one — reserve your own context for orchestration and the judgment only you can provide. (This does not override Subagent Discipline: keep prompts focused, set max_turns, and reserve inline for the narrow cases in Subagent Discipline.)
     - Match the model to the task's difficulty — never higher than needed. Capability (and cost) ranking, highest to lowest: Fable → Opus → Sonnet → Haiku.
     - Pick the LEAST capable model that will reliably succeed: Haiku for mechanical or lookup work, Sonnet for routine implementation, Opus for hard multi-step reasoning, Fable only for the hardest problems lower tiers cannot handle.
     - Never burn a higher tier on lower-tier work: no Fable doing Opus's job, no Opus doing Sonnet's, no Sonnet doing Haiku's. When unsure, start one tier lower and escalate only if it genuinely fails.

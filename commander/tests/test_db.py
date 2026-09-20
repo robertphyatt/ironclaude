@@ -65,6 +65,50 @@ class TestInitDb:
         assert timeout == 5000
         conn.close()
 
+    def test_lock_timeout_leaves_no_open_transaction(self, tmp_path):
+        db_path = str(tmp_path / "t.db")
+        conn_a = init_db(db_path)
+        conn_a.execute("PRAGMA busy_timeout=50")
+        conn_b = sqlite3.connect(db_path)
+        conn_b.execute("BEGIN IMMEDIATE")
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                conn_a.execute(
+                    "INSERT INTO directives (source_ts, source_text, interpretation, status) "
+                    "VALUES ('1', 'x', 'x', 'blocked')"
+                )
+            assert conn_a.in_transaction is False
+        finally:
+            conn_b.rollback()
+            conn_b.close()
+            conn_a.close()
+
+    def test_select_does_not_open_transaction(self, tmp_path):
+        db_path = str(tmp_path / "t.db")
+        conn = init_db(db_path)
+        conn.execute("SELECT 1").fetchall()
+        assert conn.in_transaction is False
+        conn.close()
+
+    def test_deferred_snapshot_trap_reproduction_and_rollback_cure(self, tmp_path):
+        db_path = str(tmp_path / "t.db")
+        conn_d = sqlite3.connect(db_path)
+        conn_d.execute("PRAGMA busy_timeout=50")
+        conn_d.execute("CREATE TABLE t (x INTEGER)")
+        conn_d.commit()
+        conn_b = sqlite3.connect(db_path)
+        conn_b.execute("BEGIN IMMEDIATE")
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                conn_d.execute("INSERT INTO t VALUES (1)")
+            assert conn_d.in_transaction is True
+        finally:
+            conn_b.rollback()
+            conn_b.close()
+        conn_d.rollback()
+        assert conn_d.in_transaction is False
+        conn_d.close()
+
     def test_idempotent(self, tmp_path):
         db_path = str(tmp_path / "test.db")
         conn1 = init_db(db_path)
@@ -170,6 +214,14 @@ def test_init_db_creates_shadow_concordance_created_at_index(tmp_path):
     conn = init_db(str(tmp_path / "test.db"))
     cur = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_shadow_concordance_created_at'"
+    )
+    assert cur.fetchone() is not None
+
+
+def test_init_db_creates_orphan_surface_state_table(tmp_path):
+    conn = init_db(str(tmp_path / "test.db"))
+    cur = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='orphan_surface_state'"
     )
     assert cur.fetchone() is not None
 

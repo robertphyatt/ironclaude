@@ -144,6 +144,44 @@ def test_reap_forwards_payload_into_cli_argv(tmp_path: Path):
     assert json.loads(argv[3]) == payload
 
 
+def test_reap_orphans_forwards_payload_into_cli_argv(tmp_path: Path):
+    runner = Mock(return_value=completed('{"state":"released"}\n'))
+    client = WorkspaceClient(tmp_path, runner=runner)
+    payload = {
+        "repositoryPath": "/r",
+        "protectedPaths": ["/p"],
+        "ttlHours": 0,
+    }
+
+    assert client.reap_orphans(payload) == {"state": "released"}
+    argv = runner.call_args.args[0]
+    assert argv[:3] == [
+        "node",
+        str(tmp_path / "mcp-servers/workspace-manager/dist/cli.js"),
+        "reap-orphans",
+    ]
+    assert json.loads(argv[3]) == payload
+
+
+def test_resolve_orphan_forwards_payload_into_cli_argv(tmp_path: Path):
+    runner = Mock(return_value=completed('{"results":[{"outcome":"reaped"}]}\n'))
+    client = WorkspaceClient(tmp_path, runner=runner)
+    payload = {
+        "repository_path": "/r",
+        "resolutions": [{"id": "1", "guid": "g1", "action": "reap"}],
+        "protected_paths": ["/p"],
+    }
+
+    assert client.resolve_orphan(payload) == {"results": [{"outcome": "reaped"}]}
+    argv = runner.call_args.args[0]
+    assert argv[:3] == [
+        "node",
+        str(tmp_path / "mcp-servers/workspace-manager/dist/cli.js"),
+        "resolve-orphan",
+    ]
+    assert json.loads(argv[3]) == payload
+
+
 def test_sync_forwards_payload_into_cli_argv(tmp_path: Path):
     runner = Mock(return_value=completed('{"state":"fast-forwarded"}\n'))
     client = WorkspaceClient(tmp_path, runner=runner)

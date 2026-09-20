@@ -449,6 +449,7 @@ def _make_poll_daemon():
     d._heartbeat_stuck_notified = set()
     d._last_heartbeat_ts = None
     d._last_brain_context = None
+    d._orphaned_unmerged_count = 0
     d._db = init_db(":memory:")
     from ironclaude.auth_relay import AuthRelay
     d._auth_relay = AuthRelay()   # __new__ bypasses __init__; the new tick() needs this
@@ -1097,3 +1098,27 @@ def test_limit_alert_fires_even_when_waiting(monkeypatch):
     d.brain.get_pending_responses.return_value = ["You've hit your limit · resets 4:10am (America/Chicago)"]
     d.poll_brain_responses()
     assert d.slack.post_message.called                   # alert fired BEFORE the continue
+
+
+def test_format_mem_line_skips_unreadable_procs():
+    """_format_mem_line must skip procs whose memory_info is None (macOS
+    AccessDenied on root-owned procs -> process_iter stores None), NOT return
+    'mem: unavailable'. Patch psutil ATTRIBUTES, not the module (else the except
+    tuple becomes Mocks -> 'catching classes that do not inherit from BaseException')."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from ironclaude import main as main_module
+
+    with patch.object(main_module.psutil, "virtual_memory",
+                      return_value=SimpleNamespace(available=12 * 1024**3)), \
+         patch.object(main_module.psutil, "swap_memory",
+                      return_value=SimpleNamespace(used=2 * 1024**3)), \
+         patch.object(main_module.psutil, "process_iter", return_value=[
+             SimpleNamespace(info={"name": "root-proc", "memory_info": None}),
+             SimpleNamespace(info={"name": "real-proc", "memory_info": SimpleNamespace(rss=1 * 1024**3)}),
+         ]):
+        out = main_module._format_mem_line()
+
+    assert out.startswith("mem: ")
+    assert "free" in out and "swap" in out and "real-proc" in out
+    assert "unavailable" not in out

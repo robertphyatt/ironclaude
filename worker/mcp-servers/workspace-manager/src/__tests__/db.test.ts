@@ -471,7 +471,7 @@ describe('human_intents FK-drop migration (v2)', () => {
     const before = database.prepare("SELECT * FROM human_intents WHERE nonce='keep1'").get();
     migrateSchema(database);
     expect(database.prepare("SELECT * FROM human_intents WHERE nonce='keep1'").get()).toEqual(before);
-    expect((database.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[]).map((v) => v.version)).toEqual([1, 2, 3, 4, 5]);
+    expect((database.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[]).map((v) => v.version)).toEqual([1, 2, 3, 4, 5, 6]);
     expect(() => database.prepare("INSERT INTO human_intents (operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce) VALUES ('commit','claude-user-prompt','s2','/repo','primary:/repo','{}','2030-01-01T00:00:00.000Z','n2')").run()).not.toThrow();
     expect(() => database.prepare("INSERT INTO human_intents (operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce) VALUES ('commit','claude-user-prompt','s3','/repo',NULL,'{}','2030-01-01T00:00:00.000Z','n3')").run()).toThrow();
     expect(database.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='human_intents_lookup_idx'").get()).toBeTruthy();
@@ -549,7 +549,7 @@ describe('human_intents v2 migration tolerates a legacy NULL workspace_guid row'
     database.prepare("INSERT INTO human_intents (operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, consumed_at) VALUES ('commit','claude-user-prompt','sess','/repo',NULL,'{}','2030-01-01T00:00:00.000Z','dead-null','2029-01-01T00:00:00.000Z')").run();
     // Pre-fix: migrateSchema throws NOT NULL constraint failed on the NULL row -> RED.
     migrateSchema(database);
-    expect((database.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[]).map((v) => v.version)).toEqual([1, 2, 3, 4, 5]);
+    expect((database.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[]).map((v) => v.version)).toEqual([1, 2, 3, 4, 5, 6]);
     expect(database.prepare("SELECT nonce FROM human_intents WHERE nonce='keep-valid'").get()).toEqual({ nonce: 'keep-valid' });
     expect(database.prepare('SELECT COUNT(*) AS c FROM human_intents WHERE workspace_guid IS NULL').get()).toEqual({ c: 0 });
     // Positive control: the recreated v2 table dropped the FK - the sentinel inserts cleanly.
@@ -604,7 +604,9 @@ describe('human_intents operation-widen migration (v3)', () => {
     database.exec(V2_HUMAN_INTENTS_DDL);
     database.prepare("INSERT INTO human_intents (operation, human_channel, provider_root_session_id, repository_identity, workspace_guid, expected_evidence, expires_at, nonce, consumed_at) VALUES ('commit','claude-user-prompt','sess','/repo','11111111-1111-4111-8111-111111111111','{}','2030-01-01T00:00:00.000Z','v2-row',NULL)").run();
     migrateSchema(database);
-    expect((database.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[]).map((v) => v.version)).toEqual([1, 2, 3, 4, 5]);
+    expect((database.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[]).map((v) => v.version)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='orphan_surface'").get()).toBeTruthy();
+    expect(database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='orphan_resolution_audit'").get()).toBeTruthy();
     expect(database.prepare("SELECT nonce FROM human_intents WHERE nonce='v2-row'").get()).toEqual({ nonce: 'v2-row' });
     expect(database.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='human_intents_lookup_idx'").get()).toBeTruthy();
     database.close();

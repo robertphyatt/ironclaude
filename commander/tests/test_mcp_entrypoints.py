@@ -78,3 +78,16 @@ class TestServesInsteadOfExiting:
                 for stream in (proc.stdout, proc.stderr):
                     if stream:
                         stream.close()
+
+
+class TestZombieCleanupRemoved:
+    """`_cleanup_zombie_mcp_processes` never fires on macOS: `os.kill(ppid, 0)` on a
+    launchd-reparented orphan always succeeds, so the orphan check always skips. Dead
+    code — deleted along with its `_MCP_CLEANUP_PATTERNS` helper list."""
+
+    def test_zombie_cleanup_method_and_pattern_list_are_gone(self):
+        import ironclaude.orchestrator_mcp as om
+        from ironclaude.orchestrator_mcp import OrchestratorTools
+
+        assert not hasattr(OrchestratorTools, "_cleanup_zombie_mcp_processes")
+        assert not hasattr(om, "_MCP_CLEANUP_PATTERNS")

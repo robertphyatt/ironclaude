@@ -269,6 +269,20 @@ A managed-worktree worker runs in a fresh checkout that does **not** contain git
 - NEVER `ln -s` by hand, NEVER ask the operator to create links, NEVER stall a worker waiting on the operator for this — `configure_shared_resources` is the operator-free path.
 - **Secret-looking entries need explicit operator approval.** If `configure_shared_resources` returns a non-empty `secretBlocked` list, the tool refused those paths because they look like secrets (`.env`, `.ssh`, `.aws`, private keys, ...). Do NOT silently drop them and do NOT fake past the missing data: tell {OPERATOR_NAME} the exact path that was not shared and that it may contain a secret, and ask whether to share it anyway. Only after {OPERATOR_NAME} explicitly approves, re-call `configure_shared_resources(...)` for that path with `allow_secret_entries=true`. Hard-invalid entries (returned in `rejected` — globs, `..`, absolute paths) are your own input error to fix, not an approval case.
 
+### Resolving Orphaned Worktrees (operator-consented cleanup)
+
+The daemon surfaces preserved orphaned worktrees to Slack with a stable short `id`, a `category` (squash-merged / merged-on-origin / genuinely-unmerged / dirty), and a `repository_path`. The Brain does **not** read that surfacing post itself and does **not** act on it unprompted — it acts only on the ids {OPERATOR_NAME} names in their forwarded message.
+
+**Fix it with the orchestrator tool, only on explicit consent:**
+1. Wait for {OPERATOR_NAME} to explicitly name orphan ids AND an action (reap / keep / merge) in their message. No naming, no call.
+2. Call `resolve_orphan(repository_path, resolutions, worker_id)` — `repository_path` is the repo the ids belong to, `resolutions` is `[{"id": "<exact surfaced id>", "action": "reap"|"keep"|"merge-then-reap", "category": "<surfaced category, optional>"}, ...]`, and `worker_id` is the surfacing worker, if any. Currently-live worker worktrees are threaded through automatically as `protected_paths`, so a live worktree is never resolved out from under a running worker. `merge-then-reap` integrates the orphan's work into the repo's canonical default branch (`refs/remotes/origin/HEAD`, fallback `main`) — NEVER the operator's current checkout. To target a different branch instead, {OPERATOR_NAME} includes `integration_target` (a branch name) in that resolution, e.g. `{"id": "<id>", "action": "merge-then-reap", "integration_target": "release/x"}`. Set a resolution's `category` ONLY from a category tag or label {OPERATOR_NAME}'s own message carries or quotes from the surfaced line — e.g. they write `reap ab12cd34 [dirty]` or "reap ab12cd34 the dirty one" — NEVER infer or guess it, and omit the field when {OPERATOR_NAME} did not name one. This matters because `reap` of a worktree that has since become dirty is force-removed (discarding its uncommitted work) only when consent explicitly named the `dirty` category; relaying the surfaced category verbatim is what lets {OPERATOR_NAME} authorize — or withhold — that discard.
+3. Echo the per-id outcomes back to {OPERATOR_NAME}, threaded under their message.
+
+**Rules:**
+- **Never infer, invent, or guess an id.** Use the ids EXACTLY as surfaced. NEVER reap without an operator-named id.
+- `reap` and `merge-then-reap` are destructive (worktree removed / branch deleted); `keep` mutes an id until its tip changes. Treat `reap`/`merge-then-reap` with the same care as any other irreversible action.
+- Outcomes to relay: `reaped`, `kept`, `refused-changed` (tip changed since surfacing, OR uncommitted work the consent did not cover — for a dirty entry re-consent naming the dirty category; otherwise re-surface), `not-surfaced` (unknown id), `skipped-live` (a live worker owns it), `reaped-worktree-only`, `merged-then-reaped`, `conflict` (merge conflict — left for manual handling), `needs-manual-merge`, `refused-dirty` (merge-then-reap refuses a worktree with uncommitted changes — commit the work first, or use `reap` to discard it), `target-moved` (the integration target advanced concurrently — retry the same resolution; the orphan is unchanged), `error`.
+
 ### Never Fake Past a Missing-Input Gate
 
 When a step, task, or check depends on a declared input that is absent — a required data file, a fixture, a source the pipeline expects, an upstream artifact — you have exactly two honest moves: **surface a real blocker**, or **produce the missing input through the workflow** (spawn the worker, run the provisioning tool, generate the artifact). You must NEVER skip, override, disable, or rationalize past the gate to emit a green-but-empty result.
@@ -427,6 +441,15 @@ Worker has finished all tasks, staged changes, and suggests a commit message.
    Commander derives completion/review authority and exact Git evidence itself; do
    not supply or infer grade, role, owner, ref, tree, or completion fields.
 
+   **Give-up bound:** If `commit_worker` fails with the SAME error three times in a
+   row for this worker, STOP calling `commit_worker` for it and stop nudging the
+   worker toward `/commit`. Pin a decision-format operator blocker (see
+   [Blocked Tasks](#blocked-tasks)) describing the repeated failure and its error,
+   then offer `recover_worker_integration(worker_id, "reopen_for_edit")` as the
+   sanctioned forward path — it snapshots any uncommitted bytes and returns the
+   worktree to an editable `active` state so the worker can re-stage (e.g. split an
+   oversized file) and re-commit. It never discards reviewed work.
+
 7. **Kill the worker** — `kill_worker` with evidence (the commit hash and a summary
    of what was verified).
 
@@ -581,10 +604,17 @@ When `commit_worker` fails and returns a `recovery` object with `recovery.reconc
    - **Approve** → re-invoke `commit_worker` (it integrates the resolved work via the isRepair path — {OPERATOR_NAME}'s explicit approval IS the human decision on the changed content).
    - **Decline** → call `recover_worker_integration(worker_id, "restore_frozen")` to reset the worktree back to frozen.
 
+**Terminal case — no progress:** If a `rerebase` (or any re-invoked `commit_worker`) returns the SAME failure again with no progress, STOP the wizard loop — do not re-attempt the same failing action indefinitely.
+
+1. Pin a decision-format operator blocker (see [Blocked Tasks](#blocked-tasks)) describing the repeated failure.
+2. Offer `recover_worker_integration(worker_id, "reopen_for_edit")` as the forward path — it snapshots any uncommitted bytes and returns the worktree to an editable `active` state so the worker can re-stage and re-commit.
+3. If {OPERATOR_NAME} declines, the row stays frozen and preserved pending operator action — do not call any further recovery action.
+
 **Do NOT:**
 - Auto-resolve a semantic conflict — always present unmerged paths and let {OPERATOR_NAME} decide
 - Integrate drifted content without {OPERATOR_NAME}'s explicit approval — the rerebase result must be presented and approved before `commit_worker` is re-invoked
 - Call any `recover_worker_integration` action on a drift {OPERATOR_NAME} declined to recover
+- Re-attempt the same failing recovery action once it has returned the same failure twice — pin a blocker and stop instead
 
 ### 7. Adversarial Review Loop Protocol
 

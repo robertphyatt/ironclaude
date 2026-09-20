@@ -179,6 +179,18 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // Exit when the parent (Claude/Codex session) goes away so this server never
+  // lingers as an orphan holding memory. macOS has no PDEATHSIG, so watch both:
+  process.stdin.on('end', () => process.exit(0));
+  const icPpid = Number(process.env.CLAUDE_PPID);
+  if (Number.isInteger(icPpid) && icPpid > 1) {
+    const pollMs = Number(process.env.IC_PPID_POLL_MS) || 30000;
+    setInterval(() => {
+      try { process.kill(icPpid, 0); }
+      catch (err: any) { if (err && err.code === 'ESRCH') process.exit(0); }
+    }, pollMs); // refed on purpose — this watchdog must keep running
+  }
 }
 
 // Run the Server

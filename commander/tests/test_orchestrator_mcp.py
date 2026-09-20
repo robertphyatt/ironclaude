@@ -251,6 +251,35 @@ def test_ensure_ssh_manager_idempotent(tmp_path, db_conn, registry, mock_tmux):
     mock_mgr.register_machines.assert_called_once()
 
 
+@pytest.fixture(autouse=True)
+def _deterministic_swap_and_pressure_probes(monkeypatch):
+    """Every test in this module runs with a hermetic swap/pressure baseline.
+
+    _check_spawn_preconditions()'s swap and macOS memory-pressure guard read
+    real host state (psutil.swap_memory / a sysctl subprocess call). Without
+    this, any test that reaches that gate is at the mercy of the actual
+    machine's swap usage and pressure level, whether or not it constructs
+    OrchestratorTools via the `tools` fixture. Individual tests that want to
+    exercise the guard directly (see TestSpawnMemoryPressureGate) re-patch
+    psutil.swap_memory / subprocess.run / _memory_pressure_level themselves
+    for the duration of their own `with` block or test body, which overrides
+    this default and is restored afterward.
+    """
+    monkeypatch.setattr(psutil, "swap_memory", lambda: MagicMock(used=0))
+
+    _real_subprocess_run = subprocess.run
+
+    def _fake_subprocess_run(cmd, *args, **kwargs):
+        if cmd == ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]:
+            fake_result = MagicMock()
+            fake_result.returncode = 0
+            fake_result.stdout = "1\n"
+            return fake_result
+        return _real_subprocess_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _fake_subprocess_run)
+
+
 @pytest.fixture
 def tools(registry, mock_tmux, tmp_path, db_conn, monkeypatch):
     """Create OrchestratorTools with test dependencies."""
@@ -258,6 +287,11 @@ def tools(registry, mock_tmux, tmp_path, db_conn, monkeypatch):
     empty_cfg = tmp_path / "empty_ollama.json"
     empty_cfg.write_text("{}")
     monkeypatch.setenv("IC_OLLAMA_CONFIG_PATH", str(empty_cfg))
+    # Deterministic swap baseline: the host running these tests may have real
+    # swap usage that would otherwise trip the swap guard in
+    # _check_spawn_preconditions() nondeterministically. Individual tests for
+    # that guard (TestSpawnMemoryPressureGate) re-patch psutil.swap_memory
+    # for the duration of their own test.
     t = OrchestratorTools(registry, mock_tmux, ledger_path, db_conn=db_conn)
     t._get_ollama_vram = MagicMock(return_value=(0.0, []))
     t._ensure_worker_instructions = MagicMock(return_value=None)
@@ -6695,7 +6729,12 @@ class TestProviderAwareBatchLifecycle:
         self, tools, registry, mock_tmux,
     ):
         tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
-        tools._activate_pm_via_sqlite.side_effect = ["database busy", None]
+        # spawn_workers activates PM on worker threads (ThreadPoolExecutor), so an
+        # ordered-list side_effect races (which thread consumes which element is a
+        # scheduling race, not request order). Key on the argument, never on order.
+        def _activate_side_effect(session_name, **kwargs):
+            return "database busy" if session_name == "ic-bad" else None
+        tools._activate_pm_via_sqlite.side_effect = _activate_side_effect
 
         result = tools.spawn_workers([
             self._request("bad"),
@@ -7239,7 +7278,6 @@ class TestRestartMcp:
         monkeypatch.setenv("IRONCLAUDE_CLIENT", "codex")
         mock_db = MagicMock()
         with patch.object(tools, "_db", mock_db), \
-             patch.object(tools, "_cleanup_zombie_mcp_processes") as cleanup, \
              patch("os.execvp") as execvp, \
              patch("sys.stdout.flush") as stdout_flush, \
              patch("sys.stderr.flush") as stderr_flush:
@@ -7248,7 +7286,6 @@ class TestRestartMcp:
         assert "unsupported for a Codex Brain" in result
         assert "restart_daemon" in result
         mock_db.close.assert_not_called()
-        cleanup.assert_not_called()
         execvp.assert_not_called()
         stdout_flush.assert_not_called()
         stderr_flush.assert_not_called()
@@ -7258,104 +7295,13 @@ class TestRestartMcp:
         import sys as _sys
         mock_db = MagicMock()
         with patch("os.execvp") as mock_exec, \
-             patch.object(tools, "_db", mock_db), \
-             patch.object(tools, "_cleanup_zombie_mcp_processes", return_value=[]):
+             patch.object(tools, "_db", mock_db):
             tools.restart_mcp()
 
         mock_db.close.assert_called_once()
         mock_exec.assert_called_once_with(
             _sys.executable, [_sys.executable] + _sys.argv
         )
-
-    def test_restart_mcp_calls_zombie_cleanup_before_exec(self, tools):
-        """restart_mcp calls zombie cleanup before os.execvp."""
-        call_order = []
-
-        def record_cleanup(*args, **kwargs):
-            call_order.append("cleanup")
-            return []
-
-        def record_exec(*args, **kwargs):
-            call_order.append("exec")
-
-        mock_db = MagicMock()
-        with patch("os.execvp", side_effect=record_exec), \
-             patch.object(tools, "_db", mock_db), \
-             patch.object(tools, "_cleanup_zombie_mcp_processes", side_effect=record_cleanup):
-            tools.restart_mcp()
-
-        assert call_order == ["cleanup", "exec"]
-
-    def test_cleanup_zombie_mcp_skips_own_pid(self, tools):
-        """_cleanup_zombie_mcp_processes never sends SIGTERM to the current process."""
-        import signal as _signal
-        my_pid = os.getpid()
-
-        pgrep_result = MagicMock()
-        pgrep_result.returncode = 0
-        pgrep_result.stdout = f"{my_pid}\n"
-
-        with patch("subprocess.run", return_value=pgrep_result), \
-             patch("os.kill") as mock_kill:
-            killed = tools._cleanup_zombie_mcp_processes()
-
-        assert my_pid not in killed
-        sigterm_calls = [c for c in mock_kill.call_args_list
-                         if c[0] == (my_pid, _signal.SIGTERM)]
-        assert not sigterm_calls
-
-    def test_cleanup_zombie_mcp_kills_dead_parent_process(self, tools):
-        """_cleanup_zombie_mcp_processes kills processes whose parent is dead."""
-        import signal as _signal
-        orphan_pid = 9999
-        orphan_ppid = 8888
-
-        def fake_run(args, **kwargs):
-            result = MagicMock()
-            if args[0] == "pgrep":
-                result.returncode = 0
-                result.stdout = f"{orphan_pid}\n"
-            elif args[0] == "ps":
-                result.returncode = 0
-                result.stdout = f" {orphan_ppid}\n"
-            return result
-
-        def fake_kill(pid, sig):
-            if sig == 0 and pid == orphan_ppid:
-                raise ProcessLookupError()
-
-        with patch("subprocess.run", side_effect=fake_run), \
-             patch("os.kill", side_effect=fake_kill), \
-             patch("os.getpid", return_value=1111):
-            killed = tools._cleanup_zombie_mcp_processes()
-
-        assert orphan_pid in killed
-
-    def test_cleanup_zombie_mcp_spares_live_parent_process(self, tools):
-        """_cleanup_zombie_mcp_processes does not kill processes with living parents."""
-        import signal as _signal
-        active_pid = 9998
-        active_ppid = 8887
-
-        def fake_run(args, **kwargs):
-            result = MagicMock()
-            if args[0] == "pgrep":
-                result.returncode = 0
-                result.stdout = f"{active_pid}\n"
-            elif args[0] == "ps":
-                result.returncode = 0
-                result.stdout = f" {active_ppid}\n"
-            return result
-
-        with patch("subprocess.run", side_effect=fake_run), \
-             patch("os.kill") as mock_kill, \
-             patch("os.getpid", return_value=1111):
-            killed = tools._cleanup_zombie_mcp_processes()
-
-        assert active_pid not in killed
-        sigterm_calls = [c for c in mock_kill.call_args_list
-                         if c[0] == (active_pid, _signal.SIGTERM)]
-        assert not sigterm_calls
 
 
 class TestEnsureWorkerTrustedSecurity:
@@ -8279,6 +8225,8 @@ class TestCheckSpawnPreconditions:
         tools._config = {
             "ollama_vram_block_threshold_gb": 8.0,
             "min_available_memory_pct": 0.10,
+            "max_swap_used_gb": 999999.0,
+            "spawn_block_on_pressure": False,
         }
         tools._get_ollama_vram = MagicMock(return_value=(4.0, ["qwen3.5:4b (4.0GB)"]))
         mock_mem = MagicMock()
@@ -8327,6 +8275,8 @@ class TestCheckSpawnPreconditions:
         tools._config = {
             "ollama_vram_block_threshold_gb": 8.0,
             "min_available_memory_pct": 0.10,
+            "max_swap_used_gb": 999999.0,
+            "spawn_block_on_pressure": False,
         }
         tools._get_ollama_vram = MagicMock(return_value=(0.0, []))
         mock_mem = MagicMock()
@@ -8353,6 +8303,8 @@ class TestCheckSpawnPreconditions:
         tools._config = {
             "ollama_vram_block_threshold_gb": 20.0,
             "min_available_memory_pct": 0.10,
+            "max_swap_used_gb": 999999.0,
+            "spawn_block_on_pressure": False,
         }
         tools._get_ollama_vram = MagicMock(return_value=(0.0, []))
         mock_mem = MagicMock()
@@ -8569,7 +8521,7 @@ class TestSpawnPreconditions:
 
     def test_spawn_worker_passes_preconditions(self, tools, registry, mock_tmux):
         """spawn_worker proceeds to grader when preconditions pass."""
-        tools._config = {}
+        tools._config = {"max_swap_used_gb": 999999.0, "spawn_block_on_pressure": False}
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
         _mock_grader_approve(tools)
         mock_mem = MagicMock()
@@ -8588,7 +8540,7 @@ class TestSpawnPreconditions:
 
     def test_spawn_workers_batch_passes(self, tools, registry, mock_tmux):
         """spawn_workers proceeds when current + batch <= max."""
-        tools._config = {}
+        tools._config = {"max_swap_used_gb": 999999.0, "spawn_block_on_pressure": False}
         tools._activate_pm_via_sqlite = MagicMock(return_value=None)
         _mock_grader_approve(tools)
         registry.register_worker("existing1", "claude-sonnet", "ic-existing1", repo="/tmp")
@@ -8645,7 +8597,11 @@ class TestSpawnPreconditionsWorkerType:
         configured-threshold path deterministically (the default is now
         host-aware — covered by the host-aware tests below).
         """
-        tools._config = {"ollama_vram_block_threshold_gb": 8.0}
+        tools._config = {
+            "ollama_vram_block_threshold_gb": 8.0,
+            "max_swap_used_gb": 999999.0,
+            "spawn_block_on_pressure": False,
+        }
         tools._get_ollama_vram = MagicMock(return_value=(12.0, ["gemma4:31b (12.0GB)"]))
         tools.get_system_memory = MagicMock(return_value={"available_gb": 30.0, "total_gb": 48.0})
         return tools
@@ -8689,6 +8645,89 @@ class TestSpawnPreconditionsWorkerType:
         """batch_type='' (no ollama in batch) skips VRAM gate for the whole batch."""
         result = vram_loaded_tools._check_spawn_preconditions(worker_type="")
         assert result is None
+
+
+class TestSpawnMemoryPressureGate:
+    """Swap / macOS memory-pressure guard, additive to the 10%-floor check."""
+
+    @pytest.fixture
+    def pressure_tools(self, tools):
+        """tools with plenty of free RAM so only the new guard is exercised."""
+        tools._get_ollama_vram = MagicMock(return_value=(0.0, []))
+        tools.get_system_memory = MagicMock(return_value={"available_gb": 30.0, "total_gb": 48.0})
+        return tools
+
+    def test_swap_over_limit_blocks_spawn(self, pressure_tools):
+        pressure_tools._config = {"max_swap_used_gb": 8.0}
+        mock_swap = MagicMock(used=9 * 1024**3)
+        with patch("psutil.swap_memory", return_value=mock_swap):
+            result = pressure_tools._check_spawn_preconditions("claude-sonnet")
+        assert result is not None
+        assert "swap too high" in result["error"]
+
+    def test_memory_pressure_blocks_spawn_when_configured(self, pressure_tools):
+        pressure_tools._config = {
+            "max_swap_used_gb": 8.0,
+            "spawn_block_on_pressure": True,
+        }
+        mock_swap = MagicMock(used=2 * 1024**3)
+        pressure_tools._memory_pressure_level = MagicMock(return_value=4)
+        with patch("psutil.swap_memory", return_value=mock_swap):
+            result = pressure_tools._check_spawn_preconditions("claude-sonnet")
+        assert result is not None
+        assert "memory pressure" in result["error"]
+
+    def test_normal_pressure_and_swap_allows_spawn(self, pressure_tools):
+        pressure_tools._config = {
+            "max_swap_used_gb": 8.0,
+            "spawn_block_on_pressure": True,
+        }
+        mock_swap = MagicMock(used=2 * 1024**3)
+        pressure_tools._memory_pressure_level = MagicMock(return_value=1)
+        with patch("psutil.swap_memory", return_value=mock_swap):
+            result = pressure_tools._check_spawn_preconditions("claude-sonnet")
+        assert result is None
+
+    def test_probe_errors_fail_open(self, pressure_tools):
+        pressure_tools._config = {
+            "max_swap_used_gb": 8.0,
+            "spawn_block_on_pressure": True,
+        }
+        with patch("psutil.swap_memory", side_effect=RuntimeError("boom")), \
+             patch("subprocess.run", side_effect=RuntimeError("boom")):
+            result = pressure_tools._check_spawn_preconditions("claude-sonnet")
+        assert result is None
+
+    def test_configured_pressure_level_allows_warn_below_threshold(self, pressure_tools):
+        """A box that idles at warn (2) with block-level=4 spawns freely; only
+        critical (4) blocks. Falsifiable: with the old hardcoded >=2, pressure 2
+        would return an error here."""
+        pressure_tools._config = {
+            "max_swap_used_gb": 50.0,
+            "spawn_block_on_pressure": True,
+            "spawn_block_pressure_level": 4,
+        }
+        mock_swap = MagicMock(used=2 * 1024**3)
+        pressure_tools._memory_pressure_level = MagicMock(return_value=2)
+        with patch("psutil.swap_memory", return_value=mock_swap):
+            result = pressure_tools._check_spawn_preconditions("claude-sonnet")
+        assert result is None
+
+    def test_configured_pressure_level_blocks_at_critical(self, pressure_tools):
+        """With block-level=4, critical pressure (4) still blocks and the error
+        reports the configured threshold."""
+        pressure_tools._config = {
+            "max_swap_used_gb": 50.0,
+            "spawn_block_on_pressure": True,
+            "spawn_block_pressure_level": 4,
+        }
+        mock_swap = MagicMock(used=2 * 1024**3)
+        pressure_tools._memory_pressure_level = MagicMock(return_value=4)
+        with patch("psutil.swap_memory", return_value=mock_swap):
+            result = pressure_tools._check_spawn_preconditions("claude-sonnet")
+        assert result is not None
+        assert "memory pressure" in result["error"]
+        assert result["spawn_block_pressure_level"] == 4
 
 
 class TestUnloadOllamaModel:
@@ -11178,6 +11217,108 @@ class TestCommitWorkerFinalizationRecovery:
         assert result == integrated
         tools.registry.update_worker_status.assert_not_called()
 
+    def test_finalize_failed_event_logged_on_finalization_failure(
+        self, finalize_failure_tools,
+    ):
+        # A finalize raise that classifies as a genuine finalization failure
+        # (failure_phase == 'finalization', e.g. the untagged probe-failure
+        # fallback) must log a finalize_failed event so the daemon's
+        # marker-aware surface can count it, even though the worker stays
+        # running/uncompleted.
+        tools = finalize_failure_tools
+        tools._workspace_client.reconcile.side_effect = WorkspaceClientError(
+            "probe boom",
+        )
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result["failure_phase"] == "finalization"
+        tools.registry.log_event.assert_any_call(
+            "finalize_failed", worker_id="worker-1",
+        )
+        tools.registry.update_worker_status.assert_not_called()
+
+    def test_finalize_failed_event_not_logged_on_authority_failure(
+        self, finalize_failure_tools,
+    ):
+        # An authority-phase failure (never reaches finalize) must not log
+        # finalize_failed — only a genuine finalization failure_phase does.
+        tools = finalize_failure_tools
+        tools._read_worker_finalization_state.side_effect = RuntimeError(
+            "authority boom",
+        )
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result["failure_phase"] == "authority"
+        finalize_failed_calls = [
+            c for c in tools.registry.log_event.call_args_list
+            if c.args and c.args[0] == "finalize_failed"
+        ]
+        assert finalize_failed_calls == []
+
+    def test_finalize_marker_logged_on_commit_worker_success(
+        self, finalize_failure_tools,
+    ):
+        # A clean, non-raising finalize must log finalize_integrated (the
+        # marker the daemon's since-marker count resets on) before marking
+        # the worker completed.
+        tools = finalize_failure_tools
+        tools._workspace_client.finalize.side_effect = None
+        success = {"state": "pushed", "integratedCommit": "f" * 40}
+        tools._workspace_client.finalize.return_value = success
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result == success
+        tools.registry.log_event.assert_any_call(
+            "finalize_integrated", worker_id="worker-1",
+        )
+        tools.registry.update_worker_status.assert_called_once_with(
+            "worker-1", "completed",
+        )
+
+    def test_finalize_integrated_on_recovery_probe_already_integrated(
+        self, finalize_failure_tools,
+    ):
+        # finalize raised but the recovery status probe shows the work
+        # already landed (_classify_finalization_failure's state=="integrated"
+        # branch). This is a real integrate path with earlier finalize_failed
+        # rows uncovered by any marker — it must log finalize_integrated too,
+        # or an already-integrated worker can trip a false "failing
+        # repeatedly" alert off stale finalize_failed rows.
+        tools = finalize_failure_tools
+        integrated_status = {"state": "integrated", "integratedCommit": "e" * 40}
+        tools._workspace_client.reconcile.return_value = integrated_status
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result == integrated_status
+        tools.registry.log_event.assert_any_call(
+            "finalize_integrated", worker_id="worker-1",
+        )
+
+    def test_finalize_integrated_on_recovery_continue_reaches_integrated(
+        self, finalize_failure_tools,
+    ):
+        # finalize raised; the probe finds a clean paused rebase and the
+        # driven 'continue' reconcile reaches a terminal integrated state
+        # (_drive_continue_recovery's integrated branch). This too is an
+        # integrate path that must log finalize_integrated.
+        tools = finalize_failure_tools
+        integrated = {"state": "cleaned", "integratedCommit": "d" * 40}
+        tools._workspace_client.reconcile.side_effect = [
+            {"state": "rebase-paused-clean"},
+            integrated,
+        ]
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result == integrated
+        tools.registry.log_event.assert_any_call(
+            "finalize_integrated", worker_id="worker-1",
+        )
+
 
 def test_complete_worker_if_session_dead_missing_session_never_completes(
     finalize_failure_tools,
@@ -11259,6 +11400,32 @@ class TestRecoverWorkerIntegration:
         }
         assert call.kwargs == {"plugin_root": "/installed/codex"}
 
+    def test_recover_worker_integration_reopen_for_edit_forwards_mode(
+        self, recover_tools,
+    ):
+        # reopen_for_edit is a non-terminal recovery mode (the TS side returns
+        # 'finalization-reopened-for-edit', which is deliberately NOT in
+        # _FINALIZATION_INTEGRATED_STATES) -> must reach reconcile like the
+        # other allowlisted actions, and must NOT mark the worker completed.
+        recover_tools._workspace_client.reconcile.return_value = {
+            "state": "finalization-reopened-for-edit",
+        }
+
+        result = recover_tools.recover_worker_integration(
+            "worker-1", "reopen_for_edit",
+        )
+
+        assert result == {"state": "finalization-reopened-for-edit"}
+        assert "not allowed" not in str(result.get("error", ""))
+        call = recover_tools._workspace_client.reconcile.call_args
+        assert call.args[0] == {
+            "repository_path": "/repo",
+            "workspace_guid": "22222222-2222-4222-8222-222222222222",
+            "owner_session_id": _FINALIZE_OWNER,
+            "rebase_recovery": "reopen_for_edit",
+        }
+        recover_tools.registry.update_worker_status.assert_not_called()
+
     def test_ssh_worker_recovery_uses_remote_transport(self, recover_tools):
         recover_tools.registry.get_worker.return_value = _finalize_worker(
             machine="worker-host", repo="/srv/repo",
@@ -11280,6 +11447,61 @@ class TestRecoverWorkerIntegration:
                 "/home/worker/.codex/plugins/cache/ironclaude/ironclaude/1.1.4"
             ),
         }
+
+    def test_finalize_marker_logged_when_reconcile_reaches_integrated_state(
+        self, recover_tools,
+    ):
+        # A recovery reconcile that lands the work in a terminal integrated
+        # state (e.g. 'cleaned', continuing a rebase) must log
+        # finalize_integrated alongside marking the worker completed.
+        recover_tools._workspace_client.reconcile.return_value = {
+            "state": "cleaned",
+        }
+
+        result = recover_tools.recover_worker_integration("worker-1", "continue")
+
+        assert result == {"state": "cleaned"}
+        recover_tools.registry.log_event.assert_any_call(
+            "finalize_integrated", worker_id="worker-1",
+        )
+        recover_tools.registry.update_worker_status.assert_called_once_with(
+            "worker-1", "completed",
+        )
+
+    def test_finalize_marker_logged_on_reopen_for_edit(self, recover_tools):
+        # reopen_for_edit reaching 'finalization-reopened-for-edit' must log
+        # finalize_reopened (the marker that re-arms the daemon's
+        # since-marker failure count) and must NOT complete the worker.
+        recover_tools._workspace_client.reconcile.return_value = {
+            "state": "finalization-reopened-for-edit",
+        }
+
+        result = recover_tools.recover_worker_integration(
+            "worker-1", "reopen_for_edit",
+        )
+
+        assert result == {"state": "finalization-reopened-for-edit"}
+        recover_tools.registry.log_event.assert_any_call(
+            "finalize_reopened", worker_id="worker-1",
+        )
+        recover_tools.registry.update_worker_status.assert_not_called()
+
+    def test_finalize_marker_not_logged_for_non_terminal_status_action(
+        self, recover_tools,
+    ):
+        # A plain 'status' probe result (not integrated, not reopened) must
+        # log neither marker event.
+        recover_tools._workspace_client.reconcile.return_value = {
+            "state": "rebase-paused-conflict",
+        }
+
+        recover_tools.recover_worker_integration("worker-1", "status")
+
+        marker_calls = [
+            c for c in recover_tools.registry.log_event.call_args_list
+            if c.args and c.args[0] in ("finalize_integrated", "finalize_reopened")
+        ]
+        assert marker_calls == []
 
     @pytest.mark.parametrize(
         "raised",
@@ -11474,3 +11696,98 @@ class TestConfigureSharedResources:
 
         assert json.loads(configure_fn("/repo", ["data/x"])) == {"added": ["data/x"]}
         assert json.loads(list_fn("/repo")) == {"entries": []}
+
+
+class TestResolveOrphan:
+    """Brain self-serve orchestrator tool surfacing workspace-manager's
+    resolve-orphan verb, threading live-worker protected_paths."""
+
+    def _tools(self):
+        tools = object.__new__(OrchestratorTools)
+        tools.registry = MagicMock()
+        tools._db = init_db(":memory:")
+        tools.tmux = MagicMock()
+        tools._workspace_client = MagicMock()
+        tools._workspace_client.discover_installed_plugin_root.return_value = "/installed/claude"
+        tools._ensure_ssh_manager = MagicMock()
+        tools._resolve_ssh_host = MagicMock(return_value=None)
+        return tools
+
+    def test_resolve_orphan_forwards_protected_paths_from_live_workers(self):
+        tools = self._tools()
+        expected = {"results": [{"id": "1", "guid": "g1", "outcome": "reaped"}]}
+        tools._workspace_client.resolve_orphan.return_value = expected
+
+        with patch(
+            "ironclaude.main._live_worker_worktree_paths",
+            return_value=["/live/worktree/one"],
+        ) as protected_fn:
+            result = tools.resolve_orphan(
+                "/repo", [{"id": "1", "guid": "g1", "action": "reap"}],
+            )
+
+        assert result == expected
+        protected_fn.assert_called_once_with(tools._db, tools.tmux)
+        call = tools._workspace_client.resolve_orphan.call_args
+        assert call.args[0] == {
+            "repository_path": "/repo",
+            "resolutions": [{"id": "1", "guid": "g1", "action": "reap"}],
+            "protected_paths": ["/live/worktree/one"],
+        }
+        assert call.kwargs == {"plugin_root": "/installed/claude"}
+
+    def test_resolve_orphan_forwards_per_resolution_integration_target_verbatim(self):
+        """CHARACTERIZATION test: resolve_orphan forwards each resolution dict
+        to the workspace client unmodified, including an `integration_target`
+        key. This passes before and after this task's docstring-only change
+        (the passthrough already works; workspace_client.py's generic
+        passthrough is proven at test_workspace_client.py:166-183). It exists
+        to guard the resolution dict against future key-whitelisting."""
+        tools = self._tools()
+        tools._workspace_client.resolve_orphan.return_value = {"results": []}
+        resolutions = [
+            {"id": "1", "guid": "g1", "action": "merge-then-reap", "integration_target": "trunk"},
+        ]
+
+        with patch("ironclaude.main._live_worker_worktree_paths", return_value=[]):
+            tools.resolve_orphan("/repo", resolutions)
+
+        call = tools._workspace_client.resolve_orphan.call_args
+        assert call.args[0]["resolutions"] == resolutions
+
+    def test_resolve_orphan_never_raises_on_workspace_error(self):
+        tools = self._tools()
+        tools._workspace_client.resolve_orphan.side_effect = WorkspaceClientError("boom")
+
+        with patch("ironclaude.main._live_worker_worktree_paths", return_value=[]):
+            result = tools.resolve_orphan("/repo", [{"id": "1", "guid": "g1", "action": "reap"}])
+
+        assert isinstance(result, dict)
+        assert "boom" in result["error"]
+
+    def test_registered_as_mcp_tool_returning_str(self, tools):
+        from ironclaude.orchestrator_mcp import _create_mcp_server
+
+        mcp_server = _create_mcp_server(tools)
+        tools.resolve_orphan = MagicMock(return_value={"results": []})
+
+        resolve_fn = mcp_server._tool_manager.get_tool("resolve_orphan").fn
+
+        assert json.loads(resolve_fn("/repo", [{"id": "1", "guid": "g1", "action": "reap"}])) == {"results": []}
+
+    def test_resolve_orphan_emits_audit_log(self, caplog):
+        tools = self._tools()
+        tools._workspace_client.resolve_orphan.return_value = {
+            "results": [{"id": "a1", "guid": "g1", "outcome": "reaped"}]
+        }
+
+        with patch("ironclaude.main._live_worker_worktree_paths", return_value=[]), \
+             caplog.at_level(logging.INFO, logger="ironclaude.orchestrator_mcp"):
+            tools.resolve_orphan(
+                "/repo", [{"id": "a1", "guid": "g1", "action": "reap"}],
+            )
+
+        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.INFO]
+        assert any(
+            "a1" in m and "reap" in m and "reaped" in m for m in messages
+        )

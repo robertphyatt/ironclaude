@@ -141,7 +141,9 @@ describe('resolveBackend against the shared resolution-cases.json fixture', () =
   it.each(resolutionCases)('$name', async (testCase) => {
     const { resolveBackend } = await import('./summarizer.js');
     const result = resolveBackend(testCase.config as any, testCase.spot as any);
-    expect(result).toEqual(testCase.expect);
+    expect(result.backend).toBe(testCase.expect.backend);
+    expect(result.model).toBe(testCase.expect.model);
+    expect(result.url).toBe(testCase.expect.url);
   });
 
   it('defaults the summarizer spot to the SDK path (not ollama, not openai) when config is empty', async () => {

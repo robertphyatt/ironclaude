@@ -48,12 +48,13 @@ from ironclaude.protocol import read_pending_decisions, read_task_ledger, write_
 from ironclaude.notifications import (
     format_worker_spawned, format_worker_completed, format_worker_failed,
     format_worker_session_ended_preserved,
-    format_worker_idle, format_worker_checkin,
+    format_worker_idle, format_worker_idle_ttl_reaped, format_worker_checkin,
     format_heartbeat, format_brain_restarted, format_brain_compacted, format_brain_circuit_breaker,
     format_brain_capability_blocked,
     format_objective_received,
     format_task_progress, format_plan_ready, format_blocked,
     format_worker_heartbeat_stuck_slack,
+    format_orphaned_orphans,
     _escape_mrkdwn,
 )
 from ironclaude.grader import LocalGrader, truncate_middle
@@ -114,6 +115,28 @@ _NOT_AWAITING_RE = re.compile(
 # `#N`. Used to de-duplicate operator_wait alerts per directive rather than per
 # paraphrased question.
 _DIRECTIVE_ID_RE = re.compile(r"\bd(\d+)\b|#(\d+)")
+
+
+def _format_mem_line() -> str:
+    """One-line memory status for the heartbeat: available / swap / top-3 RSS."""
+    try:
+        vm = psutil.virtual_memory()
+        sw = psutil.swap_memory()
+        procs = []
+        for p in psutil.process_iter(["name", "memory_info"]):
+            try:
+                mi = p.info["memory_info"]
+                if mi is None:  # process_iter stores None for unreadable procs (macOS AccessDenied)
+                    continue
+                procs.append((mi.rss, p.info["name"]))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError):
+                pass
+        procs.sort(reverse=True)
+        top = ", ".join(f"{n}={rss/(1024**3):.1f}G" for rss, n in procs[:3])
+        return (f"mem: {vm.available/(1024**3):.1f}G free / "
+                f"swap {sw.used/(1024**3):.1f}G / top {top}")
+    except Exception as exc:  # noqa: BLE001 - telemetry, never fatal
+        return f"mem: unavailable ({exc})"
 
 
 def _extract_directive_id(text: str) -> int | None:
@@ -482,6 +505,105 @@ def _reap_ownerless_assignment(workspace_client, assignment: dict, transport: di
     )
 
 
+def _live_worker_worktree_paths(commander_conn, tmux) -> list[str]:
+    """Worktree paths of currently-live workers, for reaper protectedPaths."""
+    commander_conn.row_factory = sqlite3.Row
+    paths: list[str] = []
+    for row in commander_conn.execute(
+        "SELECT status, tmux_session, workspace_path FROM workers WHERE workspace_path IS NOT NULL"
+    ).fetchall():
+        worker = {"status": row["status"], "tmux_session": row["tmux_session"]}
+        if _worker_is_live(worker, tmux) and row["workspace_path"]:
+            paths.append(row["workspace_path"])
+    return paths
+
+
+def _managed_repositories(commander_conn, *, workspace_db_path: str | None = None) -> list[tuple[str, dict | None]]:
+    """Distinct (repo_path, representative_worker_or_None) the daemon manages.
+    workers rows give every repo ever spawned into (local or remote, keyed by
+    (repo, machine)); the local workspace-manager DB adds repos the operator's
+    own sessions used. None worker = local host."""
+    seen: dict[tuple[str, str], dict | None] = {}
+    commander_conn.row_factory = sqlite3.Row
+    for row in commander_conn.execute(
+        "SELECT * FROM workers WHERE repo IS NOT NULL AND repo != '' ORDER BY spawned_at DESC"
+    ).fetchall():
+        worker = dict(row)
+        key = (worker["repo"], worker.get("machine") or "")
+        seen.setdefault(key, worker if key[1] else None)
+    try:
+        ws = sqlite3.connect(workspace_db_path or _workspace_manager_db_path(), timeout=10)
+        try:
+            marker = "/.ironclaude/worktrees/"
+            for (wt_path,) in ws.execute("SELECT worktree_path FROM assignments").fetchall():
+                if wt_path and marker in wt_path:
+                    seen.setdefault((wt_path.split(marker)[0], ""), None)
+        finally:
+            ws.close()
+    except Exception as exc:
+        logger.warning("Orphan reaper: could not read workspace-manager DB: %s", exc)
+    return [(repo, worker) for (repo, _machine), worker in seen.items()]
+
+
+def _reap_row_less_orphans(commander_conn, workspace_client, tmux, *,
+                           workspace_db_path: str | None = None, resolve_transport=None,
+                           ttl_hours: float = _WORKTREE_REAP_TTL_HOURS) -> dict:
+    """Step-7 sweep. Per-repo try/except so one failing/unreachable repo never
+    aborts the rest. Returns counts + preserved-unmerged names ('repo:branch')
+    and per-orphan detail dicts (preserved_detail, muted entries excluded,
+    each tagged with repository_path)."""
+    if resolve_transport is None:
+        resolve_transport = lambda _worker: {}  # noqa: E731
+    protected = _live_worker_worktree_paths(commander_conn, tmux)
+    summary = {"reaped": 0, "preservedDirty": 0, "preservedUnmerged": 0,
+               "skippedLive": 0, "skippedYoung": 0, "errors": 0, "repo_failures": 0,
+               "reapedWorktreeOnly": 0}
+    preserved_unmerged: list[str] = []
+    preserved_detail: list[dict] = []
+    for repo_path, worker in _managed_repositories(commander_conn, workspace_db_path=workspace_db_path):
+        transport = resolve_transport(worker) if worker is not None else {}
+        try:
+            res = workspace_client.reap_orphans(
+                {"repository_path": repo_path, "protected_paths": protected, "ttl_hours": ttl_hours},
+                **transport,
+            )
+        except Exception as exc:
+            summary["repo_failures"] += 1
+            logger.warning("Orphan reaper: %s failed: %s", repo_path, exc)
+            continue
+        for key in ("reaped", "preservedDirty", "preservedUnmerged", "skippedLive", "skippedYoung", "errors", "reapedWorktreeOnly"):
+            summary[key] += len(res.get(key, []))
+        names = list(res.get("preservedUnmerged", []))
+        preserved_unmerged.extend(f"{repo_path}:{n}" for n in names)
+        if "preservedDetail" in res:
+            for detail in res.get("preservedDetail") or []:
+                if detail.get("muted"):
+                    continue
+                tagged = dict(detail)
+                tagged["repository_path"] = repo_path
+                preserved_detail.append(tagged)
+        else:
+            # Back-compat: an older/stubbed reap_orphans response that only
+            # carries preservedUnmerged branch names. Synthesize a minimal
+            # detail per name so downstream count/surface logic has one
+            # shape; the id mirrors the historical "repo:branch" string.
+            for n in names:
+                preserved_detail.append({
+                    "id": f"{repo_path}:{n}", "guid": n, "branch": n,
+                    "category": "genuinely-unmerged", "tip": "",
+                    "worktreePresent": True, "evidence": "", "muted": False,
+                    "repository_path": repo_path,
+                })
+        if res.get("reaped") or names or res.get("errors"):
+            logger.info("Orphan reaper: %s -> %s", repo_path,
+                        {k: len(res.get(k, [])) for k in ("reaped", "preservedDirty", "preservedUnmerged", "skippedLive", "skippedYoung", "errors", "reapedWorktreeOnly")})
+            logger.debug("Orphan reaper: %s reaped=%s preservedUnmerged=%s preservedDirty=%s errors=%s",
+                         repo_path, res.get("reaped"), names, res.get("preservedDirty"), res.get("errors"))
+    summary["preserved_unmerged_names"] = preserved_unmerged
+    summary["preserved_detail"] = preserved_detail
+    return summary
+
+
 def _reap_leaked_worktrees(
     commander_conn,
     workspace_client,
@@ -757,6 +879,11 @@ PM_GATE_STAGES = frozenset({"plan_ready", "design_ready"})
 PM_GATE_SLACK_SECONDS = 1800
 MAX_LIVENESS_DEFERRALS = 2
 
+# Grace window (seconds) a pane-log mtime must exceed the idle-arm time by before
+# it counts as fresh activity that disarms the idle-TTL reaper. Absorbs the
+# clock/flush skew between arming and the first mtime read.
+IDLE_ACTIVITY_GRACE_SECONDS = 5.0
+
 # Cap on how many times the daemon will drive the plain-reconcile recovery
 # for a worker stuck in finalization drift before it stops retrying and
 # surfaces-and-holds (leaves the worker running, never abandons). The
@@ -772,6 +899,34 @@ FINALIZE_DRIFT_RETRY_CAP = 3
 FINALIZATION_INTEGRATED_STATES = frozenset(
     {"cleaned", "pushed", "pushed-only", "integrated-local"}
 )
+
+# Event types that mark a finalization "settled" point for a worker: an
+# integration landed, or the reviewed commit was reopened for edit. The
+# marker-aware commit_worker surface below counts finalize_failed events
+# SINCE the highest-id marker only, so a resolved-then-retried worker does
+# not keep tripping the alert on stale pre-marker failures.
+_FINALIZE_MARKER_EVENT_TYPES = frozenset({"finalize_integrated", "finalize_reopened"})
+
+
+def max_marker_id(events: list[dict]) -> int:
+    """Highest event id among finalize_integrated/finalize_reopened markers
+    in `events`, or 0 if there is none."""
+    ids = [
+        e.get("id", 0) for e in events
+        if e.get("event_type") in _FINALIZE_MARKER_EVENT_TYPES
+    ]
+    return max(ids) if ids else 0
+
+
+def count_failed_since_marker(events: list[dict]) -> int:
+    """Count of finalize_failed events strictly newer (higher id) than the
+    latest integrate/reopen marker in `events`."""
+    marker = max_marker_id(events)
+    return sum(
+        1 for e in events
+        if e.get("event_type") == "finalize_failed" and e.get("id", 0) > marker
+    )
+
 
 STAGE_STALENESS_MULTIPLIER = {
     "executing": 1.5,
@@ -1106,24 +1261,27 @@ def _kill_orphan_workers(tmux: TmuxManager, registry: WorkerRegistry) -> None:
         logger.error(f"Failed to kill orphan worker sessions: {e}")
 
 
-def _kill_orphan_brains() -> None:
-    """Kill any orphaned brain claude subprocesses surviving daemon restart."""
+def _kill_orphan_brains(recorded_brain_pid: int | None = None) -> None:
+    """Belt-and-suspenders: terminate a surviving Brain subprocess by its RECORDED
+    PID (never by pattern). pgrep is used only to LOG residue for diagnostics."""
+    if recorded_brain_pid:
+        try:
+            _logged_kill(recorded_brain_pid, signal.SIGTERM,
+                         f"kill_orphan_brain recorded_pid={recorded_brain_pid}")
+            logger.info(f"Signalled recorded brain PID {recorded_brain_pid}")
+            time.sleep(2)
+        except (ProcessLookupError, PermissionError) as e:
+            logger.warning(f"Could not signal recorded brain PID {recorded_brain_pid}: {e}")
     try:
         result = subprocess.run(
             ["pgrep", "-f", "claude.*stream-json.*Orchestrator"],
             capture_output=True, text=True, timeout=5,
         )
-        pids = [int(p) for p in result.stdout.strip().split() if p.strip()]
-        for pid in pids:
-            try:
-                _logged_kill(pid, signal.SIGTERM, f"kill_orphan_brain pid={pid}")
-                logger.info(f"Killed orphan brain subprocess PID {pid}")
-            except (ProcessLookupError, PermissionError) as e:
-                logger.warning(f"Could not kill orphan brain PID {pid}: {e}")
-        if pids:
-            time.sleep(2)
-    except Exception as e:
-        logger.warning(f"Failed to kill orphan brains: {e}")
+        residue = [p for p in result.stdout.strip().split() if p.strip()]
+        if residue:
+            logger.warning("Brain pattern residue after recorded-PID kill (NOT killed): %s", residue)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Brain residue pgrep check failed: {e}")
 
 
 def _handle_restart(signum, frame):
@@ -1156,6 +1314,10 @@ def _handle_restart(signum, frame):
                 _daemon.socket_handler.stop()
         except Exception:
             pass
+        # Capture the recorded Brain PID BEFORE brain.shutdown() clears it (step 4
+        # sets _brain_pid=None and removes BRAIN_PID_FILE), so the belt-and-suspenders
+        # kills of steps 5 and 7 target the real pid instead of None.
+        _recorded_brain_pid = getattr(getattr(_daemon, "brain", None), "_brain_pid", None)
         # Shut down BrainClient — thread joins quickly since _stop_event already set
         try:
             logger.info("Restart step 4: brain.shutdown()")
@@ -1165,7 +1327,7 @@ def _handle_restart(signum, frame):
         # Belt-and-suspenders: kill any brain subprocesses that survived shutdown
         try:
             logger.info("Restart step 5: _kill_orphan_brains()")
-            _kill_orphan_brains()
+            _kill_orphan_brains(_recorded_brain_pid)
         except Exception:
             pass
         # Kill orphaned worker tmux sessions from previous daemon lifecycle
@@ -1189,7 +1351,7 @@ def _handle_restart(signum, frame):
             pass
         # Belt-and-suspenders: targeted kill of brain subprocess if still alive
         try:
-            brain_pid = _daemon.brain._brain_pid
+            brain_pid = _recorded_brain_pid
             if brain_pid is not None:
                 logger.info(f"Restart step 7: targeted kill of brain PID {brain_pid}")
                 _logged_kill(brain_pid, signal.SIGTERM, "handle_restart targeted brain kill")
@@ -1386,6 +1548,10 @@ class IroncladeDaemon:
         self._last_message_aging_check: float = 0.0
         self._message_aging_alerted: set[str] = set()
         self._push_pending_alerted: set[str] = set()
+        # Row-less orphan reaper (step 7 of _run_maintenance) surfacing state.
+        self._orphaned_unmerged_count = 0
+        self._orphaned_surface_state: dict[str, tuple[str, str]] = {}  # {orphan id: (tip, category)}
+        self._load_orphan_surface_state()
         # /login account-switch relay (operator-triggered; SIGHUP-restart on verified success)
         self._auth_relay = AuthRelay()
         # Usage-limit surfacing: {reset-string: last-alert-epoch} for a per-window cooldown
@@ -1395,6 +1561,11 @@ class IroncladeDaemon:
         self._stuck_since: dict[str, float] = {}
         self._stuck_alert_sent: dict[str, bool] = {}
         self._stuck_kill_deferred: dict[str, float] = {}
+        # Idle-TTL reaper: {worker_id: epoch first seen idle}. Armed on a .done
+        # sighting, disarmed on pane-log activity, cleared when the worker leaves
+        # the running set. A worker armed past idle_worker_ttl_seconds with no
+        # activity is reaped (see _reap_idle_worker).
+        self._worker_idle_since: dict[str, float] = {}
         self._last_stuck_check: float = 0.0
         self._grader = LocalGrader(keep_alive="30m")
         # FIX 2: cap concurrent bounded grades at one. _grade_bounded sets this flag
@@ -1422,6 +1593,17 @@ class IroncladeDaemon:
         # non-running cleanup so it neither leaks nor permanently suppresses a
         # re-alert on worker-id reuse.
         self._finalize_recovery_alerted: set[str] = set()
+        # Marker-aware once-per-episode gate for the persistently-failing
+        # commit_worker surface and the reopen/integrate re-arm, collapsed
+        # into a single episode key: worker_id -> the highest integrate/
+        # reopen marker id already observed for that worker (0 if none yet).
+        # A later marker re-arms the drift/recovery state and clears the
+        # alert set below, so a re-fail after the worker is fixed still
+        # surfaces. Without this, the re-arm block would fire every cycle
+        # while a marker remains the newest event, repeatedly clearing
+        # drift/alert state and defeating the drift cap.
+        self._finalize_marker_seen: dict[str, int] = {}
+        self._commit_failure_alerted: set[str] = set()
         # Awaiting-operator surfacing (in-memory; refreshed by Brain re-emission)
         self._operator_waits: dict[str, dict] = {}
         # R6: worker_id -> (worker_id, directive_id, directive_status) of the last
@@ -1570,6 +1752,26 @@ class IroncladeDaemon:
                 )
             return "surfaced"
         # Transient preserved failure (authority/probe) or None: leave running.
+        # A finalization failure with no recognized recovery mode still needs
+        # operator eyes eventually — surface it once, same style as the
+        # conflict/repair branch above, never completing/abandoning.
+        if (
+            mode is None
+            and isinstance(outcome, dict)
+            and outcome.get("failure_phase") == "finalization"
+            and worker_id not in self._finalize_recovery_alerted
+        ):
+            self._finalize_recovery_alerted.add(worker_id)
+            self.slack.post_message(
+                f"Worker {worker_id} finalization failed with no recognized "
+                "recovery mode; left running, not completed, reviewed work "
+                "preserved."
+            )
+            self.brain.send_message(
+                f"Worker {worker_id} finalization failed with no recognized "
+                "recovery mode; needs operator intervention. Not completed, "
+                "not abandoned."
+            )
         return "transient"
 
     def _get_operator_message_dispositions(self) -> dict[str, str]:
@@ -1716,10 +1918,12 @@ class IroncladeDaemon:
         # 2. Prune daemon events table (30 days)
         try:
             if self._db:
-                self._db.execute(
-                    "DELETE FROM events WHERE timestamp < datetime('now', '-30 days')"
-                )
-                self._db.commit()
+                def _prune_events():
+                    self._db.execute(
+                        "DELETE FROM events WHERE timestamp < datetime('now', '-30 days')"
+                    )
+                    self._db.commit()
+                self._db_write_with_retry(_prune_events)
         except Exception as e:
             logger.warning(f"Maintenance: events pruning failed: {e}")
 
@@ -1784,6 +1988,38 @@ class IroncladeDaemon:
                     logger.info("Maintenance: worktree sync sweep %s", counts)
         except Exception as e:
             logger.warning(f"Maintenance: worktree sync sweep failed: {e}")
+
+        # 7. Reap ROW-LESS orphaned worktrees/branches (git-state, not DB-driven).
+        try:
+            orchestrator = self._get_orchestrator()
+            if orchestrator is not None:
+                summary = _reap_row_less_orphans(
+                    self._db, orchestrator._workspace_client, self.tmux,
+                    resolve_transport=self._worktree_reap_transport,
+                )
+                summary.pop("preserved_unmerged_names")
+                preserved_detail = summary.pop("preserved_detail")
+                self._orphaned_unmerged_count = len(
+                    [d for d in preserved_detail if d.get("category") != "squash-merged"]
+                )
+                self._surface_preserved_orphans(preserved_detail)
+                if any(summary[k] for k in ("reaped", "preservedUnmerged", "errors", "repo_failures")):
+                    logger.info("Maintenance: orphan reaper %s", summary)
+        except Exception as e:
+            logger.warning(f"Maintenance: orphan reaper failed: {e}")
+
+    def _surface_preserved_orphans(self, details: list[dict]) -> None:
+        """Post preserved orphans to Slack on first appearance and whenever
+        the surfaced {id: (tip, category)} map changes; the heartbeat
+        carries the standing count between changes. Re-arms when the set
+        empties."""
+        current = {d["id"]: (d.get("tip", ""), d.get("category", "")) for d in details}
+        changed = current != self._orphaned_surface_state
+        if current and changed:
+            self.slack.post_message(format_orphaned_orphans(details))
+        self._orphaned_surface_state = current
+        if changed and getattr(self, "_db", None) is not None:
+            self._persist_orphan_surface_state()
 
     def _worktree_reap_transport(self, worker: dict) -> dict:
         """Best-effort transport kwargs (ssh_host/plugin_root) for a worktree
@@ -2645,11 +2881,37 @@ class IroncladeDaemon:
         self.slack.unpin_message(message_ts)
         return True
 
+    @staticmethod
+    def _is_lock_error(exc) -> bool:
+        return isinstance(exc, sqlite3.OperationalError) and ("locked" in str(exc) or "busy" in str(exc))
+
+    def _db_rollback_quietly(self) -> None:
+        try:
+            self._db.rollback()
+        except sqlite3.Error as exc:
+            logger.warning("db rollback failed: %s", exc)
+
+    def _db_write_with_retry(self, op, *, attempts: int = 3, backoff: float = 0.1):
+        """Run a self._db write op with rollback-based self-heal on lock errors.
+
+        Never recreates/reassigns self._db (WorkerRegistry and OrchestratorTools
+        cache the connection object) — self-heal is rollback-only.
+        """
+        for i in range(attempts):
+            try:
+                return op()
+            except Exception as exc:
+                self._db_rollback_quietly()
+                if not self._is_lock_error(exc) or i == attempts - 1:
+                    raise
+                time.sleep(backoff * (i + 1))
+
     def _sweep_expired_push_requests(self):
         """Mark pending push requests past their TTL as expired."""
         if self._db is None:
             return
-        try:
+
+        def _write():
             rows = self._db.execute(
                 "SELECT message_ts FROM push_requests"
                 " WHERE status='pending' AND expires_at < datetime('now')"
@@ -2659,11 +2921,14 @@ class IroncladeDaemon:
                 " WHERE status='pending' AND expires_at < datetime('now')"
             )
             self._db.commit()
+            return rows
+
+        try:
+            rows = self._db_write_with_retry(_write)
             for row in rows:
                 if row[0]:
                     self.slack.unpin_message(row[0])
         except sqlite3.OperationalError as e:
-            self._db.rollback()
             logger.warning("push_requests sweep skipped (db locked): %s", e)
 
     def _prune_operator_waits(self, now: float) -> None:
@@ -3721,33 +3986,69 @@ class IroncladeDaemon:
         except sqlite3.OperationalError:
             pass
 
+    def _load_orphan_surface_state(self):
+        """Load orphan surface-state dedup map from DB for restart persistence."""
+        if getattr(self, "_db", None) is None:
+            return
+        try:
+            rows = self._db.execute(
+                "SELECT orphan_id, tip, category FROM orphan_surface_state"
+            ).fetchall()
+            self._orphaned_surface_state = {row[0]: (row[1], row[2]) for row in rows}
+        except sqlite3.OperationalError:
+            pass
+
+    def _persist_orphan_surface_state(self):
+        """Persist the current orphan surface-state map to DB as a full
+        snapshot replace (the map itself is always replaced wholesale by
+        `_surface_preserved_orphans`, not merged)."""
+        if self._db is None:
+            return
+        snapshot = list(self._orphaned_surface_state.items())
+        try:
+            def _replace():
+                self._db.execute("DELETE FROM orphan_surface_state")
+                self._db.executemany(
+                    "INSERT INTO orphan_surface_state (orphan_id, tip, category, updated_at) "
+                    "VALUES (?, ?, ?, datetime('now'))",
+                    [(oid, tip, category) for oid, (tip, category) in snapshot],
+                )
+                self._db.commit()
+            self._db_write_with_retry(_replace)
+        except sqlite3.Error as e:
+            logger.warning(f"Failed to persist orphan surface state: {e}")
+
     def _persist_staleness_state(self, worker_id: str):
         """Persist single worker's staleness state to DB."""
         if self._db is None:
             return
         if worker_id not in self._stuck_since:
             try:
-                self._db.execute(
-                    "DELETE FROM worker_staleness WHERE worker_id = ?",
-                    (worker_id,),
-                )
-                self._db.commit()
+                def _delete():
+                    self._db.execute(
+                        "DELETE FROM worker_staleness WHERE worker_id = ?",
+                        (worker_id,),
+                    )
+                    self._db.commit()
+                self._db_write_with_retry(_delete)
             except sqlite3.Error as e:
                 logger.warning(f"Failed to delete staleness state for {worker_id}: {e}")
             return
         try:
-            self._db.execute(
-                "INSERT OR REPLACE INTO worker_staleness "
-                "(worker_id, hash_value, stale_since, alert_sent, updated_at) "
-                "VALUES (?, ?, ?, ?, datetime('now'))",
-                (
-                    worker_id,
-                    self._stuck_hash.get(worker_id, 0),
-                    self._stuck_since[worker_id],
-                    int(self._stuck_alert_sent.get(worker_id, False)),
-                ),
-            )
-            self._db.commit()
+            def _upsert():
+                self._db.execute(
+                    "INSERT OR REPLACE INTO worker_staleness "
+                    "(worker_id, hash_value, stale_since, alert_sent, updated_at) "
+                    "VALUES (?, ?, ?, ?, datetime('now'))",
+                    (
+                        worker_id,
+                        self._stuck_hash.get(worker_id, 0),
+                        self._stuck_since[worker_id],
+                        int(self._stuck_alert_sent.get(worker_id, False)),
+                    ),
+                )
+                self._db.commit()
+            self._db_write_with_retry(_upsert)
         except sqlite3.Error as e:
             logger.warning(f"Failed to persist staleness state for {worker_id}: {e}")
 
@@ -3857,6 +4158,12 @@ class IroncladeDaemon:
         for wid in list(self._finalize_recovery_alerted):
             if wid not in running_ids:
                 self._finalize_recovery_alerted.discard(wid)
+        for wid in list(self._commit_failure_alerted):
+            if wid not in running_ids:
+                self._commit_failure_alerted.discard(wid)
+        for wid in list(self._finalize_marker_seen):
+            if wid not in running_ids:
+                self._finalize_marker_seen.pop(wid, None)
 
     def _confirm_and_kill_stuck_worker(
         self, worker_id: str, session_name: str, duration: float,
@@ -3993,7 +4300,7 @@ class IroncladeDaemon:
         store = self._prompt_store()
         if store is not None:
             try:
-                store.resolve_worker(worker_id, now=now)
+                self._db_write_with_retry(lambda: store.resolve_worker(worker_id, now=now))
             except sqlite3.Error:
                 logger.exception(
                     "Prompt incident resolution failed for %s; retaining episode",
@@ -4085,6 +4392,41 @@ class IroncladeDaemon:
             )
         return True
 
+    def _reap_idle_worker(self, worker_id, session_name, ssh_host, remote_log_dir, armed):
+        """Reap a worker idle past its TTL. Drive finalization recovery, then
+        end the live session (the seam alone never kills a live worker). Never
+        kill a worker mid finalization-recovery (its drift row may hold the
+        integration lock). Returns True when the worker was actually killed and
+        finalized (caller may `continue`); False when the reap was deferred
+        (recovery in flight) or aborted (fresh pane activity), leaving the worker
+        running so it falls through to normal marker/session-died handling."""
+        idle_seconds = time.time() - armed
+        pre = self._finalize_and_release_worker(worker_id, reason="idle-ttl", terminal=False)
+        disp = self._drive_finalization_recovery(worker_id, pre)
+        if disp in ("retrying", "held", "surfaced"):
+            logger.info("Idle-TTL reap deferred for %s (disposition=%s); left running", worker_id, disp)
+            return False
+        # Re-read the pane-log mtime immediately before the kill: if activity
+        # landed after arm+grace between the gate's read and now, the worker is
+        # no longer idle — abort, leave it running, keep the idle clock.
+        fresh = self.tmux.get_log_mtime(session_name, ssh_host=ssh_host, remote_log_dir=remote_log_dir)
+        if fresh is not None and fresh > armed + IDLE_ACTIVITY_GRACE_SECONDS:
+            logger.info("Idle-TTL reap aborted for %s: fresh pane activity before kill", worker_id)
+            return False
+        self.tmux.kill_session(session_name, ssh_host=ssh_host)
+        outcome = self._finalize_and_release_worker(worker_id, reason="idle-ttl", terminal=True)
+        self._drive_finalization_recovery(worker_id, outcome)
+        _w = self.registry.get_worker(worker_id)
+        if isinstance(_w, dict) and _w.get("status") == "completed":
+            self.registry.log_event("worker_finished", worker_id=worker_id)
+        self.slack.post_message(format_worker_idle_ttl_reaped(worker_id, int(idle_seconds // 60)))
+        self.brain.send_message(
+            f"[SWEEP] Worker {worker_id} reaped after {int(idle_seconds // 60)} min idle; "
+            "finalization handled by the integration seam. Spawn a replacement if the objective is unfinished."
+        )
+        self._worker_idle_since.pop(worker_id, None)
+        return True
+
     def check_workers(self):
         """Check running workers for completion signals."""
         running_workers = self.registry.get_running_workers()
@@ -4093,6 +4435,52 @@ class IroncladeDaemon:
             worker_id = worker["id"]
             session_name = worker["tmux_session"]
             ssh_host, remote_log_dir = self._resolve_worker_ssh(worker)
+
+            # Marker-aware persistently-failing commit_worker surface. Runs
+            # every cycle for every running worker (BEFORE the .done-marker /
+            # idle-TTL / dead-session branches below) because a live worker
+            # whose finalize deterministically fails while it keeps retrying
+            # never reaches those seams — commit_worker logs finalize_failed
+            # events directly (see orchestrator_mcp.py), so this counts
+            # failures SINCE the last integrate/reopen marker and fires the
+            # existing one-shot operator surface for a still-running worker.
+            _events = self.registry.get_events_for_worker(worker_id)
+            if not isinstance(_events, list):
+                _events = []
+            _since = count_failed_since_marker(_events)
+            _latest_marker = max_marker_id(_events)
+            # A new integrate/reopen marker re-arms drift/recovery/alert state
+            # so a post-marker re-fail is handled fresh rather than inheriting
+            # stale drift/alert state. Gated to fire at most once per new
+            # marker (via _finalize_marker_seen) so it does not re-arm every
+            # cycle while that marker remains the newest event, which would
+            # defeat the drift cap and re-post the conflict/repair/transient
+            # surfaces.
+            if _latest_marker > self._finalize_marker_seen.get(worker_id, 0):
+                self._finalize_marker_seen[worker_id] = _latest_marker
+                self._finalize_drift_retry.pop(worker_id, None)
+                self._finalize_recovery_alerted.discard(worker_id)
+                self._commit_failure_alerted.discard(worker_id)
+            if (
+                _since >= FINALIZE_DRIFT_RETRY_CAP
+                and worker_id not in self._commit_failure_alerted
+            ):
+                self._commit_failure_alerted.add(worker_id)
+                self.slack.post_message(
+                    f"Worker {worker_id} finalization (commit_worker) has failed "
+                    f"{_since} times since its last integrate/reopen; reviewed work "
+                    f"preserved, not integrated, not completed. Try "
+                    f'recover_worker_integration("{worker_id}", "reopen_for_edit") '
+                    "to hand it back for edits."
+                )
+                self.brain.send_message(
+                    f"Worker {worker_id} finalization via commit_worker is failing "
+                    f"repeatedly ({_since} failures since the last marker). Stop "
+                    "calling commit_worker for this worker; pin a blocker and "
+                    'offer recover_worker_integration("' + worker_id + '", '
+                    '"reopen_for_edit") to hand the reviewed commit back for '
+                    "edits. Not completed, not abandoned."
+                )
 
             # Primary: check for .done marker from stop hook
             if ssh_host:
@@ -4103,7 +4491,22 @@ class IroncladeDaemon:
                 marker_path = os.path.join(self.tmux.log_dir, f"{session_name}.done")
                 marker_exists = os.path.exists(marker_path)
 
+            # Idle-TTL gate: a worker armed idle (a prior .done sighting) that has
+            # written nothing to its pane log past the TTL is reaped. Fresh pane
+            # activity (mtime after arm + grace) disarms; a missing log fails safe.
+            ttl = self.config.get("idle_worker_ttl_seconds", 1800)
+            armed = self._worker_idle_since.get(worker_id)
+            if armed is not None and ttl and ttl > 0:
+                mtime = self.tmux.get_log_mtime(session_name, ssh_host=ssh_host, remote_log_dir=remote_log_dir)
+                if mtime is not None and mtime > armed + IDLE_ACTIVITY_GRACE_SECONDS:
+                    self._worker_idle_since.pop(worker_id, None)
+                elif (mtime is not None and time.time() - armed >= ttl
+                      and not self._routine_prompt_active(worker_id)):
+                    if self._reap_idle_worker(worker_id, session_name, ssh_host, remote_log_dir, armed):
+                        continue
+
             if marker_exists:
+                self._worker_idle_since.setdefault(worker_id, time.time())
                 self._resolve_worker_prompt(worker_id, now=time.time())
                 log_worker_event("WORKER_IDLE", worker_id=worker_id)
                 self.slack.post_message(format_worker_idle(worker_id))
@@ -4315,6 +4718,12 @@ class IroncladeDaemon:
 
             # Routine prompt incidents never directly surface through the PM-gate
             # Slack path. Brain-declared operator wait is the sole escalation.
+
+        # Prune idle-TTL arm times for workers no longer running (completed or
+        # reaped) so a recycled worker id never inherits a stale idle clock.
+        for _wid in list(self._worker_idle_since):
+            if _wid not in running_ids:
+                self._worker_idle_since.pop(_wid, None)
 
         store = self._prompt_store()
         if store is not None:
@@ -4738,6 +5147,8 @@ class IroncladeDaemon:
                 ollama_busy=bool(ollama_busy_urls()),
                 blocked_directives=blocked_directives,
                 degraded_backend_label=resolve_degraded_backend_label(_hooks_cfg_path),
+                orphaned_unmerged=self._orphaned_unmerged_count,
+                mem_line=_format_mem_line(),
             )
         )
 

@@ -54,7 +54,7 @@ CANONICAL_SHARED_BODIES = (
    - Don't add features that weren't requested""",
     """7. **Subagent Discipline**
    - Keep subagent prompts focused: one task, one clear deliverable, no open-ended exploration
-   - Use inline execution mode when tasks are complex enough to risk context exhaustion spirals
+   - Delegate execution to a focused subagent by default (Sonnet on Claude, Terra on Codex); reserve inline for orchestration itself, a step that genuinely can't be captured in a focused prompt, or a task a prior subagent attempt already spiraled on — the per-task code review, testing-theatre, and tier-up gates catch subagent drift
    - Set max_turns on subagents so they fail fast rather than spiral (compaction loses critical detail, causing re-research loops)
    - Never put orchestration in subagents — state management, code review invocation, flag management, and task sequencing belong in the main context""",
     """8. **No Sycophantic Responses**
@@ -78,6 +78,34 @@ CANONICAL_SHARED_BODIES = (
    - For AI-directed natural language, load and apply `ironclaude:write-lossless-ai-messages`
    - Select by destination, not model; preserve machine schemas and protected technical content exactly""",
 )
+
+BEHAVIORAL_MIRRORS = (
+    "AGENTS.md",
+    "CLAUDE.md",
+    "worker/CLAUDE.md",
+    "commander/CLAUDE.md",
+    ".claude/rules/behavioral.md",
+    "commander/src/ironclaude/templates/worker_claude_md.md",
+    "commander/src/ironclaude/templates/worker_agents.md",
+)
+
+SUBAGENT_DISCIPLINE_BODY = next(
+    b for b in CANONICAL_SHARED_BODIES if b.startswith("7. **Subagent Discipline**")
+)
+
+RETIRED_INLINE_PHRASES = (
+    "Use inline execution mode when tasks are complex enough to risk context exhaustion spirals",
+    "run inline when a task is complex enough to risk a context spiral",
+)
+
+
+def test_subagent_discipline_body7_mirrored_in_all_behavioral_files():
+    for rel in BEHAVIORAL_MIRRORS:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        assert SUBAGENT_DISCIPLINE_BODY in text, f"Subagent-Discipline body 7 drifted or missing in {rel}"
+        for phrase in RETIRED_INLINE_PHRASES:
+            assert phrase not in text, f"retired inline-bias phrasing present in {rel}: {phrase!r}"
+
 
 CANONICAL_CODEX_SEARCH_BODY = """6. **Search Before Guessing**
    - If context feels incomplete (after compaction), search episodic memory

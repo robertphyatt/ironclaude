@@ -67,6 +67,7 @@ unchanged. Do not treat that exemption as permission to retry it blindly.
 | "I'll fix this other thing while I'm here" | Scope creep. Stick to the current task. |
 | "The next task is simple, let me just do both" | Each task has its own review. Batching skips reviews. |
 | "Context might get long — let me checkpoint / find a safe stopping point" | Plan JSON + MCP task state + workflow_stage on disk ARE the checkpoint. Pauses are operator-initiated via `plan-interruption`. See `ironclaude:workflow-durability`. |
+| "This task needs my context / has judgment, so I'll run it inline" | Scope it into a focused subagent prompt; the per-task code review, testing-theatre, and tier-up gates catch drift; inline burns the orchestrator's own context and costs more. Default to a Sonnet/Terra subagent. |
 
 ## Process
 
@@ -505,7 +506,7 @@ When dispatching tasks via the Task tool, follow these rules to prevent context 
 **Subagent model tier:**
 - `model`: pick the LEAST capable tier that will reliably succeed —
   - `haiku`: mechanical or lookup work (locate a symbol, list files, apply a rote edit)
-  - `sonnet`: routine implementation — **the default for plan-task execution**
+  - `sonnet` (Sonnet on Claude / Terra on Codex): routine implementation — **the default for plan-task execution**
   - `opus`: hard multi-step reasoning, unclear root cause, cross-cutting judgment
   - `fable`: only when a lower tier has genuinely failed this same task
 - Apply that default according to who is driving. Run `echo "${IC_ROLE:-}"`:
@@ -518,12 +519,14 @@ When dispatching tasks via the Task tool, follow these rules to prevent context 
 - Dumping the full plan JSON or design doc into the subagent prompt
 - Asking subagents to "figure out" what needs to be done (open-ended = spiral)
 - Putting orchestration in subagents (code review, submit_task, state transitions)
-- Dispatching subagents for tasks that require reading large portions of the codebase
 
 **When to use inline instead:**
-- Task requires understanding broad codebase context
-- Task has ambiguous steps that may need clarification
-- Previous subagent attempt hit context limits (circuit breaker tripped)
+
+Subagent-sequential (Sonnet on Claude / Terra on Codex) is the default for plan-task
+execution. Run inline ONLY when one of these holds:
+- (a) The task is orchestration itself
+- (b) A step genuinely can't be captured in a focused subagent prompt
+- (c) A prior subagent attempt on this same task already spiraled (circuit-breaker)
 
 **Common execution steps (all modes):**
 

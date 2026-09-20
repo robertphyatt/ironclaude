@@ -301,7 +301,7 @@ Call `<WRITE_INSTRUCTION_FILE>` for root `AGENTS.md` with the complete canonical
 
 7. **Subagent Discipline**
    - Keep subagent prompts focused: one task, one clear deliverable, no open-ended exploration
-   - Use inline execution mode when tasks are complex enough to risk context exhaustion spirals
+   - Delegate execution to a focused subagent by default (Sonnet on Claude, Terra on Codex); reserve inline for orchestration itself, a step that genuinely can't be captured in a focused prompt, or a task a prior subagent attempt already spiraled on — the per-task code review, testing-theatre, and tier-up gates catch subagent drift
    - Set max_turns on subagents so they fail fast rather than spiral (compaction loses critical detail, causing re-research loops)
    - Never put orchestration in subagents — state management, code review invocation, flag management, and task sequencing belong in the main context
 
@@ -438,7 +438,7 @@ Call `<WRITE_INSTRUCTION_FILE>` for `.claude/rules/behavioral.md` with the compl
 
 7. **Subagent Discipline**
    - Keep subagent prompts focused: one task, one clear deliverable, no open-ended exploration
-   - Use inline execution mode when tasks are complex enough to risk context exhaustion spirals
+   - Delegate execution to a focused subagent by default (Sonnet on Claude, Terra on Codex); reserve inline for orchestration itself, a step that genuinely can't be captured in a focused prompt, or a task a prior subagent attempt already spiraled on — the per-task code review, testing-theatre, and tier-up gates catch subagent drift
    - Set max_turns on subagents so they fail fast rather than spiral (compaction loses critical detail, causing re-research loops)
    - Never put orchestration in subagents — state management, code review invocation, flag management, and task sequencing belong in the main context
 

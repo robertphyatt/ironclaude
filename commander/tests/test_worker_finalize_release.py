@@ -204,6 +204,21 @@ class TestTerminalDispatch:
         tools._workspace_client.abandon.assert_not_called()
         tools.registry.update_worker_status.assert_called_once_with("w1", "completed")
 
+    def test_finalize_integrated_logged_on_finalize_call_success(self, tmp_path):
+        # This seam's own successful finalize CALL (action=='integrated') is an
+        # integrate path with no marker today: earlier finalize_failed rows
+        # from prior cycles are left uncovered, which can trip a false
+        # "failing repeatedly, try reopen_for_edit" alert on an
+        # already-integrated worker. It must log finalize_integrated.
+        repo = _make_repo(tmp_path / "wt", new_work=True)
+        tools = _make_tools(_worker(repo))
+        tools._workspace_client.reconcile.return_value = {"state": "not-ready"}
+        out = tools._finalize_and_release_worker("w1", "session ended", terminal=True)
+        assert out["action"] == "integrated"
+        tools.registry.log_event.assert_any_call(
+            "finalize_integrated", worker_id="w1",
+        )
+
     def test_terminal_gates_fail_abandons_rescue_not_finalize(self, tmp_path):
         repo = _make_repo(tmp_path / "wt", new_work=True)
         tools = _make_tools(_worker(repo), gates_pass=False)
@@ -580,6 +595,25 @@ class TestDriftPlainReconcile:
         assert result["state"] == "cleaned"
         tools.registry.update_worker_status.assert_called_once_with("w1", "completed")
 
+    def test_drift_seam_logs_finalize_integrated_on_integrated_result(
+        self, tmp_path,
+    ):
+        # This seam owns drift-success completion but logs no marker today —
+        # a worker recovered from frozen drift can carry earlier
+        # finalize_failed rows the since-marker count never clears. It must
+        # log finalize_integrated whenever the plain reconcile reaches an
+        # integrated state (independent of session liveness/completion).
+        repo = _make_repo(tmp_path / "wt", new_work=True)
+        tools = _make_tools(_worker(repo), has_session=False)
+        tools._workspace_client.reconcile.return_value = {"state": "cleaned"}
+
+        result = tools.drive_frozen_reconcile_recovery("w1")
+
+        assert result["state"] == "cleaned"
+        tools.registry.log_event.assert_any_call(
+            "finalize_integrated", worker_id="w1",
+        )
+
     def test_drift_seam_does_not_complete_worker_when_session_alive(self, tmp_path):
         """A live worker is integrated but NEVER completed here — completing it
         would drop a still-running worker off monitoring."""
@@ -847,6 +881,30 @@ class TestProbeFirstRouter:
         assert out["action"] == "surfaced"
         assert out["assignment_preserved"] is True
         tools._workspace_client.finalize.assert_not_called()
+
+    def test_probe_integrated_resighting_does_not_log_finalize_integrated(
+        self, tmp_path,
+    ):
+        # This router branch (state == 'integrated' on the FIRST, non-mutating
+        # status probe) is a RE-SIGHTING of an already-landed row — reached
+        # every idle cycle while a .done marker persists, not a fresh
+        # integrate. It must NOT log finalize_integrated; the exception/
+        # paused-clean seams (_classify_finalization_failure /
+        # _drive_continue_recovery) already cover a genuine integrate here,
+        # and double-logging would defeat the since-marker failure count.
+        repo = _make_repo(tmp_path / "wt", new_work=True)
+        tools = _make_tools(_worker(repo))
+        tools._workspace_client.reconcile.side_effect = [
+            {"state": "integrated"},  # router status probe
+            {"state": "cleaned"},     # _trigger_integrated_cleanup plain reconcile
+        ]
+        out = tools._finalize_and_release_worker("w1", "session ended", terminal=True)
+        assert out["state"] == "integrated"
+        finalize_integrated_calls = [
+            c for c in tools.registry.log_event.call_args_list
+            if c.args and c.args[0] == "finalize_integrated"
+        ]
+        assert finalize_integrated_calls == []
 
 
 # --------------------------------------------------------------------------

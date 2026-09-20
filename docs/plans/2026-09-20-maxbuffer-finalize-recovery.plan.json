@@ -1,0 +1,116 @@
+{
+  "name": "maxBuffer + Deterministic-Finalize-Failure Recovery",
+  "goal": "Close the df69c3a4-class finalize deadlock: content-size-independent finalize equality check (digest body of cumulativeBinaryEffect; all 8 call sites unchanged) + bounded git buffers + overflow helper (A); a reopen_for_edit reconcile forward path that snapshots dirty work, resets to frozen, rolls ready_for_integration->active, deletes refs, releases lock (B); a marker-aware seam-independent daemon surface for a persistently-failing finalize (C); and a Brain give-up bound + 6d terminal branch (D). Never auto-abandon, never discard work.",
+  "requirements_file": "docs/plans/2026-09-20-maxbuffer-finalize-recovery-requirements.md",
+  "design_file": "docs/plans/2026-09-20-maxbuffer-finalize-recovery-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Component A: content-size-independent finalize equality check + bounded auxiliary git buffers",
+      "description": "Change ONLY the body of cumulativeBinaryEffect (integration.ts:295-297), keeping its name/signature (cwd,base,head):string so all 8 call sites (:849,:858,:1517,:1519,:1650,:1652,:2081,:2082) are untouched and become content-size independent: write `git diff --binary --full-index` to a temp file via a spawnSync stdout fd, sha256 via a chunked readSync streaming loop, unlink+rmdir in finally, return the hex digest. Add GIT_MAX_BUFFER=64MB + exported gitBufferOverflowError helper in git.ts, applied to runGit(:46)/runGitEnv(:57); replace the three literal 64*1024*1024 in patchIdAggregateTellMerged (:615/627/641) with the constant. Preserves the byte-exact equality at :849/:858. TDD.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/git.ts",
+        "worker/mcp-servers/workspace-manager/src/integration.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/git.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED git.test.ts: (a) runGit returns a >1MB git stdout in full; (b) same for runGitEnv (pass {...process.env}); (c) GIT_MAX_BUFFER===64*1024*1024; (d) gitBufferOverflowError(args,error) returns an Error containing the joined argv for a synthetic {code:'ENOBUFS'} and undefined for a non-ENOBUFS error; (e) source-text assertion that git.ts has exactly one `64 * 1024 * 1024` literal.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/git.test.ts", "expected": "RED: gitBufferOverflowError not a function; GIT_MAX_BUFFER undefined; >1MB reads throw ENOBUFS; multiple literals."},
+        {"description": "RED integration-cases.ts: registerFinalizationTests('recovery') case finalizing a commit whose --binary --full-index diff exceeds 1MB integrates (equality holds); companion asserts a divergent rebased effect is still refused with 'Finalization rebased cumulative effect differs from reviewed content; preserving worktree'; both assert the count of ic-finalize-diff-* entries in tmpdir() is equal before and after (temp cleaned, incl. the refused path).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/integration-recovery.test.ts", "expected": "RED: the large-diff finalize throws ENOBUFS via the current no-maxBuffer cumulativeBinaryEffect."},
+        {"description": "GREEN git.ts: add `export const GIT_MAX_BUFFER = 64 * 1024 * 1024;` and `export function gitBufferOverflowError(args, error): Error|undefined` (returns the clear ENOBUFS error naming the argv when error.code==='ENOBUFS', else undefined); set maxBuffer:GIT_MAX_BUFFER on spawnSync in runGit(:46)/runGitEnv(:57) and, before `throw result.error`, `const overflow = gitBufferOverflowError(args, result.error); if (overflow) throw overflow;`; replace the three literal 64*1024*1024 in patchIdAggregateTellMerged (:615/627/641) with GIT_MAX_BUFFER (leaving the sole literal in the constant).", "expected": ""},
+        {"description": "GREEN integration.ts: change ONLY the body of cumulativeBinaryEffect (:295-297), keep name+signature; spawnSync `git diff --binary --full-index base head` with stdio stdout->openSync(file,'w') fd (maxBuffer:GIT_MAX_BUFFER), closeSync, throw result.error, throw gitError on non-zero status, then sha256 via openSync(file,'r')+chunked readSync loop (1<<20 buffer), unlink+rmdir in finally; return digest. Imports: add `spawnSync` (node:child_process), `createHash` (node:crypto), extend node:fs with closeSync,mkdtempSync,openSync,readSync,unlinkSync,rmdirSync, add gitError+GIT_MAX_BUFFER to ./git.js import; use already-imported path.join and tmpdir. Update the :295 doc comment (returns a digest, opaque equality operand). Do NOT rename; do NOT edit any call site.", "expected": ""},
+        {"description": "Verify GREEN + type-check.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx tsc --noEmit && npx vitest run src/__tests__/git.test.ts src/__tests__/integration-recovery.test.ts src/__tests__/integration-core.test.ts", "expected": "tsc --noEmit exits 0; vitest passed | 0 failed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/git.ts worker/mcp-servers/workspace-manager/src/integration.ts worker/mcp-servers/workspace-manager/src/__tests__/git.test.ts worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Component B (TS): reopen_for_edit reconcile mode",
+      "description": "Add a reopen_for_edit reconcile mode: extend the rebaseRecovery input union (integration.ts:100), the FinalizationResult.state union (:38-42) with 'finalization-reopened-for-edit', the optionalRebaseRecovery CLI validator (cli.ts:72/75-77), and the MCP tool optionalMode (index.ts:256-264). Add a dispatch branch after the ready-state guard and before the paused-rebase guard (near :1983) and a reopenForEdit(db,exact) handler: classifyRebaseState==='frozen-no-rebase' guard; snapshotResidualIfDirty(db,exact) to preserve dirty bytes; reset --hard frozen; verify worktreeHead===frozen; db.transaction(transitionAssignment ready_for_integration->active); delete candidate+freeze refs; DELETE integration_locks; return { state:'finalization-reopened-for-edit', detail, recovery }. TDD (happy+dirty+wrong-state).",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/integration.ts",
+        "worker/mcp-servers/workspace-manager/src/cli.ts",
+        "worker/mcp-servers/workspace-manager/src/index.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "RED integration-cases.ts: happy path from seedFrozenReadyNoRebase(false) but ALSO seed a real candidate ref (update-ref refs/ironclaude/finalization/<guid>/candidate) and a real lock (acquireIntegrationLock with repositoryIdentity/workspaceGuid/targetRef 'refs/heads/main'/expectedTarget=root HEAD); pre-assert both exist; reopen_for_edit returns state 'finalization-reopened-for-edit', lifecycle_status=='active', frozen+candidate refs gone, worktree HEAD==frozen, no integration_locks row. Dirty path: write untracked+modified files then reopen_for_edit -> result.recovery.ref resolves, HEAD==frozen, preserved_work row kind='recovery'. Wrong-state: paused-rebase row -> toThrow('reopen_for_edit requires a frozen, no-rebase ready row'); active row -> toThrow('No ready finalization is available'). Extend the validator test at :2706-2717 to include 'reopen_for_edit'.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/integration-recovery.test.ts", "expected": "RED: reopen_for_edit rejected by optionalRebaseRecovery / not dispatched."},
+        {"description": "GREEN unions+validators: integration.ts:100 add `| 'reopen_for_edit'`; integration.ts:38-42 FinalizationResult.state add `| 'finalization-reopened-for-edit'`; cli.ts:72 return-type union and cli.ts:75-77 guard+error add 'reopen_for_edit'; index.ts:256-264 optionalMode accepted set+type union add 'reopen_for_edit'.", "expected": ""},
+        {"description": "GREEN dispatch+handler: in reconcileFinalization add `if (input.rebaseRecovery === 'reopen_for_edit') return reopenForEdit(db, exact);` after the ready-state guard, before the paused-rebase guard (near :1983); add reopenForEdit(db,exact) near recoverNoPausedRebase (:1901): require classifyRebaseState(worktree)==='frozen-no-rebase' (else throw the requires-frozen message); resolve frozen via freezeRef; const recovery = snapshotResidualIfDirty(db, exact); runGit reset --hard frozen; verify worktreeHead===frozen; db.transaction(transitionAssignment(db, guid, 'ready_for_integration', 'active')); best-effort update-ref -d candidateRef and freezeRef; DELETE FROM integration_locks WHERE repository_identity=? AND workspace_guid=?; return { state:'finalization-reopened-for-edit', detail, recovery }. Confirm snapshotResidualIfDirty(:1428-1477) signature/return matches FinalizationResult.recovery(:49) before wiring; the reset --hard frozen is idempotent after snapshot's own reset.", "expected": ""},
+        {"description": "Verify GREEN + type-check.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx tsc --noEmit && npx vitest run src/__tests__/integration-recovery.test.ts src/__tests__/cli.test.ts src/__tests__/tool-dispatch.test.ts", "expected": "tsc --noEmit exits 0; vitest passed | 0 failed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/integration.ts worker/mcp-servers/workspace-manager/src/cli.ts worker/mcp-servers/workspace-manager/src/index.ts worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Component B (Python): expose reopen_for_edit via _RECOVERY_ACTIONS",
+      "description": "Add 'reopen_for_edit' to OrchestratorTools._RECOVERY_ACTIONS (orchestrator_mcp.py:3957-3959) so recover_worker_integration accepts it and forwards rebase_recovery='reopen_for_edit' on the reconcile verb. The non-terminal state 'finalization-reopened-for-edit' is not in _FINALIZATION_INTEGRATED_STATES, so the worker is correctly not marked completed. TDD.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {"description": "RED: in test_orchestrator_mcp.py add a test that recover_worker_integration(worker_id, 'reopen_for_edit') is accepted and calls _workspace_client.reconcile with rebase_recovery='reopen_for_edit' (mock the workspace client; follow the existing recover_worker_integration test pattern).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -k reopen_for_edit -q", "expected": "RED: 'recovery action is not allowed: reopen_for_edit'."},
+        {"description": "GREEN: add \"reopen_for_edit\" to the _RECOVERY_ACTIONS frozenset (orchestrator_mcp.py:3957-3959).", "expected": ""},
+        {"description": "Verify GREEN.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -k reopen_for_edit -q", "expected": "pass."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Component C: seam-independent daemon surface with integrate/reopen markers",
+      "description": "commit_worker records a persistent finalize_failed event on a preserved finalization failure and a finalize_integrated marker on success; recover_worker_integration records finalize_integrated on an integrated result and finalize_reopened on a reopen_for_edit result. The daemon counts finalize_failed events SINCE the worker's newest integrate/reopen marker (R2 MUST-clear); when the since-marker count >= FINALIZE_DRIFT_RETRY_CAP (3) and not already alerted for that marker, check_workers fires the one-shot Slack+Brain surface for a live non-idle non-dead worker, re-arming after a new marker; a finalize_reopened marker also pops _finalize_drift_retry/_finalize_recovery_alerted. _drive_finalization_recovery's transient branch surfaces-once. TDD.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_orchestrator_mcp.py",
+        "commander/tests/test_daemon.py"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {"description": "RED test_orchestrator_mcp.py: (a) commit_worker records finalize_failed when finalize raises and classifies failure_phase=='finalization'; (b) commit_worker success records finalize_integrated; (c) recover_worker_integration records finalize_integrated when result state in _FINALIZATION_INTEGRATED_STATES and finalize_reopened when action=='reopen_for_edit' and result state=='finalization-reopened-for-edit'.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -k \"finalize_failed_event or finalize_marker\" -q", "expected": "RED: no such events recorded."},
+        {"description": "GREEN orchestrator: commit_worker finalize except (:3416-3419) capture classified; if dict and failure_phase=='finalization', registry.log_event('finalize_failed', worker_id); return it. commit_worker success (:3420, before update_worker_status('completed')): registry.log_event('finalize_integrated', worker_id). recover_worker_integration integrated branch (:4247-4255): registry.log_event('finalize_integrated', worker_id); and before returning, if action=='reopen_for_edit' and result dict state=='finalization-reopened-for-edit': registry.log_event('finalize_reopened', worker_id).", "expected": ""},
+        {"description": "RED test_daemon.py (set registry.get_events_for_worker explicitly; fixture registry is a MagicMock): (a) live non-idle non-dead worker with 3 finalize_failed and no later marker -> check_workers fires slack+brain ONCE, not re-fire next cycle; (b) 3 failed then a later finalize_integrated then 1 failed -> no fire (since-marker count 1); (c) fire once then a later finalize_reopened then 3 new failed -> fires again; (d) _drive_finalization_recovery transient branch (outcome failure_phase=='finalization', mode None) returns 'transient' AND surfaces once.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_daemon.py -k \"commit_worker_surface or transient_surface\" -q", "expected": "RED: no surface for the live worker; count not marker-aware; transient branch silent."},
+        {"description": "GREEN daemon (main.py): add a helper counting finalize_failed events with id > max id of the worker's finalize_integrated/finalize_reopened events (0 markers -> all failures); add self._commit_failure_alerted: dict[str,int] init near :1567. In check_workers (:4369) at the TOP of the per-worker loop (before marker/idle/dead branches): events=registry.get_events_for_worker(worker_id); since=count_failed_since_marker(events); latest_marker=max_marker_id(events); if since>=FINALIZE_DRIFT_RETRY_CAP and self._commit_failure_alerted.get(worker_id)!=latest_marker: set it and post the one-shot Slack+Brain surface (mention reopen_for_edit); on a finalize_reopened marker newer than seen, pop _finalize_drift_retry and discard _finalize_recovery_alerted. Clear _commit_failure_alerted in the non-running sweep (:4093-4101). Extend _drive_finalization_recovery transient branch (:1715-1716): when _finalization_recovery_mode(outcome) is None and outcome dict failure_phase=='finalization' and worker not in _finalize_recovery_alerted, add and post once, then return 'transient'.", "expected": ""},
+        {"description": "Verify GREEN (both suites).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py tests/test_daemon.py -q", "expected": "0 failed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/src/ironclaude/main.py commander/tests/test_orchestrator_mcp.py commander/tests/test_daemon.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Component D: Brain give-up bound + 6d wizard terminal branch",
+      "description": "Prompt-only Brain-rule change in workflow.md: SHIP step 6 (~:440) gains a 3-failure give-up bound (stop calling commit_worker, pin a decision-format blocker, stop nudging /commit, offer recover_worker_integration reopen_for_edit); the 6d Guided Integration-Recovery Wizard (~:566-601) gains a terminal branch (same-failure re-attempt -> pin a blocker and stop, offer reopen_for_edit). No tests required: Brain-prompt rule change (behavioral; not unit-testable).",
+      "allowed_files": [
+        "commander/src/brain/rules/workflow.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Edit SHIP checklist step 6 (~:440): add the 3-consecutive-failure give-up bound (stop calling commit_worker; pin a decision-format operator blocker ~:894-938; stop nudging /commit; offer recover_worker_integration(worker_id,'reopen_for_edit') as the sanctioned forward path that snapshots uncommitted bytes and returns the worktree to editable active without discarding reviewed work).", "expected": ""},
+        {"description": "Edit the 6d Guided Integration-Recovery Wizard (~:566-601): add a terminal branch (if rerebase / re-invoked commit_worker returns the same failure again -> STOP the loop, pin an operator blocker, offer reopen_for_edit; if declined, row stays frozen and preserved).", "expected": ""},
+        {"description": "Verify the markers landed (read-only).", "command": "grep -n \"reopen_for_edit\" /Users/roberthyatt/Code/ironclaude/commander/src/brain/rules/workflow.md", "expected": "matches in both the SHIP step 6 area and the 6d wizard area."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/brain/rules/workflow.md", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 6,
+      "name": "Rebuild dist + full-suite verification",
+      "description": "Rebuild the workspace-manager dist bundle (daemon/Brain run dist/, not src/), confirm the new reopen_for_edit symbol reached dist, run the full vitest + commander pytest suites, and stage dist with git add -f (tracked-but-gitignored). No tests required: build + verification task.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js"
+      ],
+      "depends_on": [1, 2, 3, 4, 5],
+      "steps": [
+        {"description": "Rebuild dist.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build", "expected": "tsc && npm run bundle completes with no error; esbuild writes dist/cli.js, dist/index.js, dist/hook-intent.js."},
+        {"description": "Confirm the new mode reached dist (read-only).", "command": "grep -c \"reopen_for_edit\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js", "expected": "at least 1."},
+        {"description": "Full workspace-manager suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run", "expected": "passed | 0 failed (onTaskUpdate RPC timeout benign)."},
+        {"description": "Full commander suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "0 failed."},
+        {"description": "Stage dist (force; tracked-but-gitignored).", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/hook-intent.js", "expected": "Staged."}
+      ]
+    }
+  ]
+}

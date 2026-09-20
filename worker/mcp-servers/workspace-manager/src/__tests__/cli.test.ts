@@ -28,6 +28,10 @@ function internalDependencies(): InternalCommandDependencies {
     reap: vi.fn().mockReturnValue({ lifecycle_status: 'reaped' }),
     configureSharedResources: vi.fn().mockReturnValue({ added: [], skipped: [], rejected: [], entries: [], relinked: {} }),
     listSharedResources: vi.fn().mockReturnValue({ entries: [] }),
+    'reap-orphans': vi.fn().mockReturnValue({
+      repositoryIdentity: '/r/.git', reaped: [], reapedWorktreeOnly: [], preservedDirty: [], preservedUnmerged: [], skippedLive: [], skippedYoung: [], errors: [],
+    }),
+    'resolve-orphan': vi.fn().mockReturnValue({ results: [] }),
   };
 }
 
@@ -192,5 +196,205 @@ describe('workspace-manager internal CLI: reap command (owner-agnostic reaper pa
     });
     expect(reap).toHaveBeenCalledTimes(1);
     expect(result).toEqual({ lifecycle_status: 'reaped' });
+  });
+});
+
+describe('workspace-manager internal CLI: reap-orphans command (ambiguous-orphan reaper path)', () => {
+  it('exposes reap-orphans as an internal command alongside the existing set', () => {
+    expect(INTERNAL_COMMAND_NAMES).toContain('reap-orphans');
+  });
+
+  it('dispatches the reap-orphans command to its handler exactly once', () => {
+    const dependencies = internalDependencies();
+    const result = dispatchInternalCommand('reap-orphans', { marker: 'reap-orphans' }, dependencies);
+    expect(dependencies['reap-orphans']).toHaveBeenCalledWith({ marker: 'reap-orphans' });
+    expect(dependencies['reap-orphans']).toHaveBeenCalledTimes(1);
+    const calledOthers = [dependencies.allocate, dependencies.bind, dependencies.finalize, dependencies.abandon, dependencies.reconcile, dependencies.cleanup, dependencies.sync, dependencies.reap]
+      .filter((dependency) => vi.mocked(dependency).mock.calls.length > 0);
+    expect(calledOthers).toHaveLength(0);
+    expect(result).toBeDefined();
+  });
+
+  it('forwards repositoryPath, protectedPaths, and ttlHours into reapAmbiguousOrphans', () => {
+    const reapOrphans = vi.spyOn(WorkspaceService.prototype, 'reapAmbiguousOrphans')
+      .mockReturnValue({
+        repositoryIdentity: '/r/.git', reaped: [], reapedWorktreeOnly: [], preservedDirty: [], preservedUnmerged: [], skippedLive: [], skippedYoung: [], errors: [],
+      } as never);
+    const dependencies = createInternalCommandDependencies({} as never);
+
+    const result = dependencies['reap-orphans']({
+      repository_path: '/r',
+      protected_paths: ['/p'],
+      ttl_hours: 0,
+    });
+
+    expect(reapOrphans).toHaveBeenCalledWith({
+      repositoryPath: '/r',
+      protectedPaths: ['/p'],
+      ttlHours: 0,
+    });
+    expect(reapOrphans).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({
+      repositoryIdentity: '/r/.git', reaped: [], reapedWorktreeOnly: [], preservedDirty: [], preservedUnmerged: [], skippedLive: [], skippedYoung: [], errors: [],
+    });
+  });
+
+  it('rejects an unknown internal command', () => {
+    expect(() => dispatchInternalCommand('bogus-verb', {}, internalDependencies()))
+      .toThrow('Unknown internal workspace command: bogus-verb');
+  });
+});
+
+describe('workspace-manager internal CLI: resolve-orphan command (orphan resolution path)', () => {
+  it('exposes resolve-orphan as an internal command alongside the existing set', () => {
+    expect(INTERNAL_COMMAND_NAMES).toContain('resolve-orphan');
+  });
+
+  it('dispatches the resolve-orphan command to its handler exactly once', () => {
+    const dependencies = internalDependencies();
+    const result = dispatchInternalCommand('resolve-orphan', { marker: 'resolve-orphan' }, dependencies);
+    expect(dependencies['resolve-orphan']).toHaveBeenCalledWith({ marker: 'resolve-orphan' });
+    expect(dependencies['resolve-orphan']).toHaveBeenCalledTimes(1);
+    const calledOthers = [
+      dependencies.allocate, dependencies.bind, dependencies.finalize, dependencies.abandon,
+      dependencies.reconcile, dependencies.cleanup, dependencies.sync, dependencies.reap,
+      dependencies['reap-orphans'],
+    ].filter((dependency) => vi.mocked(dependency).mock.calls.length > 0);
+    expect(calledOthers).toHaveLength(0);
+    expect(result).toBeDefined();
+  });
+
+  it('forwards repositoryPath, protectedPaths, and resolutions into service.resolveOrphan', () => {
+    const resolveOrphan = vi.spyOn(WorkspaceService.prototype, 'resolveOrphan')
+      .mockReturnValue({ results: [] } as never);
+    const dependencies = createInternalCommandDependencies({} as never);
+
+    const result = dependencies['resolve-orphan']({
+      repository_path: '/r',
+      protected_paths: ['/p'],
+      resolutions: [{ guid: 'g1', action: 'reap' }],
+    });
+
+    expect(resolveOrphan).toHaveBeenCalledWith({
+      repositoryPath: '/r',
+      protectedPaths: ['/p'],
+      resolutions: [{ guid: 'g1', action: 'reap' }],
+    });
+    expect(resolveOrphan).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ results: [] });
+  });
+
+  it('rejects a resolutions payload that is missing, empty, or has an entry with no id/guid or a bad action', () => {
+    expect(() => createInternalCommandDependencies({} as never)['resolve-orphan']({
+      repository_path: '/r',
+    })).toThrow();
+    expect(() => createInternalCommandDependencies({} as never)['resolve-orphan']({
+      repository_path: '/r',
+      resolutions: [],
+    })).toThrow();
+    expect(() => createInternalCommandDependencies({} as never)['resolve-orphan']({
+      repository_path: '/r',
+      resolutions: [{ action: 'reap' }],
+    })).toThrow();
+    expect(() => createInternalCommandDependencies({} as never)['resolve-orphan']({
+      repository_path: '/r',
+      resolutions: [{ guid: 'g1', action: 'bogus' }],
+    })).toThrow();
+  });
+
+  it('maps a resolution entry\'s snake_case integration_target into camelCase integrationTarget for service.resolveOrphan', () => {
+    const resolveOrphan = vi.spyOn(WorkspaceService.prototype, 'resolveOrphan')
+      .mockReturnValue({ results: [] } as never);
+    const dependencies = createInternalCommandDependencies({} as never);
+
+    dependencies['resolve-orphan']({
+      repository_path: '/r',
+      resolutions: [{ guid: 'g1', action: 'merge-then-reap', integration_target: 'trunk' }],
+    });
+
+    expect(resolveOrphan).toHaveBeenCalledWith({
+      repositoryPath: '/r',
+      protectedPaths: undefined,
+      resolutions: [{ guid: 'g1', action: 'merge-then-reap', integrationTarget: 'trunk' }],
+    });
+    expect(resolveOrphan).toHaveBeenCalledTimes(1);
+  });
+
+  it('omits integrationTarget when integration_target is absent from the resolution entry', () => {
+    const resolveOrphan = vi.spyOn(WorkspaceService.prototype, 'resolveOrphan')
+      .mockReturnValue({ results: [] } as never);
+    const dependencies = createInternalCommandDependencies({} as never);
+
+    dependencies['resolve-orphan']({
+      repository_path: '/r',
+      resolutions: [{ guid: 'g1', action: 'reap' }],
+    });
+
+    expect(resolveOrphan).toHaveBeenCalledWith({
+      repositoryPath: '/r',
+      protectedPaths: undefined,
+      resolutions: [{ guid: 'g1', action: 'reap' }],
+    });
+  });
+
+  it('rejects a resolution entry whose integration_target is not a non-empty string', () => {
+    expect(() => createInternalCommandDependencies({} as never)['resolve-orphan']({
+      repository_path: '/r',
+      resolutions: [{ guid: 'g1', action: 'merge-then-reap', integration_target: '' }],
+    })).toThrow('resolutions entries integration_target must be a non-empty string');
+    expect(() => createInternalCommandDependencies({} as never)['resolve-orphan']({
+      repository_path: '/r',
+      resolutions: [{ guid: 'g1', action: 'merge-then-reap', integration_target: 7 }],
+    })).toThrow('resolutions entries integration_target must be a non-empty string');
+  });
+
+  it('forwards a resolution entry\'s category through to service.resolveOrphan', () => {
+    const resolveOrphan = vi.spyOn(WorkspaceService.prototype, 'resolveOrphan')
+      .mockReturnValue({ results: [] } as never);
+    const dependencies = createInternalCommandDependencies({} as never);
+
+    dependencies['resolve-orphan']({
+      repository_path: '/r',
+      resolutions: [{ guid: 'g1', action: 'reap', category: 'dirty' }],
+    });
+
+    expect(resolveOrphan).toHaveBeenCalledWith({
+      repositoryPath: '/r',
+      protectedPaths: undefined,
+      resolutions: [{ guid: 'g1', action: 'reap', category: 'dirty' }],
+    });
+    expect(resolveOrphan).toHaveBeenCalledTimes(1);
+  });
+
+  it('omits category when absent from the resolution entry', () => {
+    const resolveOrphan = vi.spyOn(WorkspaceService.prototype, 'resolveOrphan')
+      .mockReturnValue({ results: [] } as never);
+    const dependencies = createInternalCommandDependencies({} as never);
+
+    dependencies['resolve-orphan']({
+      repository_path: '/r',
+      resolutions: [{ guid: 'g1', action: 'reap' }],
+    });
+
+    expect(resolveOrphan).toHaveBeenCalledWith({
+      repositoryPath: '/r',
+      protectedPaths: undefined,
+      resolutions: [{ guid: 'g1', action: 'reap' }],
+    });
+  });
+
+  it('rejects a resolution entry whose category is not a non-empty string naming one of the known categories', () => {
+    expect(() => createInternalCommandDependencies({} as never)['resolve-orphan']({
+      repository_path: '/r',
+      resolutions: [{ guid: 'g1', action: 'reap', category: '' }],
+    })).toThrow("resolutions entries category must be 'squash-merged', 'merged-on-origin', 'genuinely-unmerged', or 'dirty'");
+    expect(() => createInternalCommandDependencies({} as never)['resolve-orphan']({
+      repository_path: '/r',
+      resolutions: [{ guid: 'g1', action: 'reap', category: 7 }],
+    })).toThrow("resolutions entries category must be 'squash-merged', 'merged-on-origin', 'genuinely-unmerged', or 'dirty'");
+    expect(() => createInternalCommandDependencies({} as never)['resolve-orphan']({
+      repository_path: '/r',
+      resolutions: [{ guid: 'g1', action: 'reap', category: 'bogus-category' }],
+    })).toThrow("resolutions entries category must be 'squash-merged', 'merged-on-origin', 'genuinely-unmerged', or 'dirty'");
   });
 });

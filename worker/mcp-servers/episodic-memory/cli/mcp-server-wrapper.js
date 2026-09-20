@@ -4,10 +4,10 @@
  * Dependencies are committed to git — no runtime npm install needed.
  */
 
-import { spawn, execSync } from 'child_process';
+import { execSync } from 'child_process';
 import { existsSync, cpSync, appendFileSync, mkdirSync, writeFileSync, renameSync, unlinkSync } from 'fs';
 import { dirname, join, sep } from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { homedir } from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -207,32 +207,18 @@ async function main() {
     const mcpServerPath = join(EPISODIC_MEMORY_ROOT, 'dist', 'mcp-server.js');
     log(`Launching MCP server: ${mcpServerPath}`);
 
-    const child = spawn(process.execPath, [mcpServerPath], {
-      stdio: 'inherit',
-      shell: false,
-      env: { ...process.env, CLAUDE_PPID: String(process.ppid) }
-    });
+    // In-process load: the bundle runs in THIS process (no spawned child dist proc).
+    // CLAUDE_PPID must be set BEFORE import — the bundle reads it at module-load for
+    // session resolution and the parent-death poller.
+    process.env.CLAUDE_PPID = String(process.ppid);
 
-    process.on('SIGTERM', () => child.kill('SIGTERM'));
-    process.on('SIGINT', () => child.kill('SIGINT'));
     process.on('exit', () => { try { unlinkSync(PENDING_MARKER); } catch {} });
+    for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+      process.on(sig, () => { try { log(`[signal] ${sig} received — exiting`); } catch {} process.exit(0); });
+    }
 
-    child.on('exit', (code, signal) => {
-      log(`MCP server exited: code=${code} signal=${signal}`);
-      if (code && code !== 0) {
-        log(`[diagnostic] Node ${process.version}, platform=${process.platform}, arch=${process.arch}`);
-        log(`[diagnostic] dist/ exists: ${existsSync(join(EPISODIC_MEMORY_ROOT, 'dist'))}`);
-        log(`[diagnostic] node_modules/ exists: ${existsSync(join(EPISODIC_MEMORY_ROOT, 'node_modules'))}`);
-        log(`[diagnostic] Check full log at: ${LOG_FILE}`);
-      }
-      if (signal) process.kill(process.pid, signal);
-      else process.exit(code || 0);
-    });
-
-    child.on('error', (err) => {
-      log(`MCP server spawn error: ${err.message}`);
-      process.exit(1);
-    });
+    // The bundle calls main() unconditionally on load and connects the stdio transport.
+    await import(pathToFileURL(mcpServerPath).href);
 
   } catch (error) {
     log(`FATAL: ${error.message}`);

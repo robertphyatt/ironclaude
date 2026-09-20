@@ -16174,6 +16174,18 @@ async function main() {
   console.error("State Manager MCP server running via stdio");
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  process.stdin.on("end", () => process.exit(0));
+  const icPpid = Number(process.env.CLAUDE_PPID);
+  if (Number.isInteger(icPpid) && icPpid > 1) {
+    const pollMs = Number(process.env.IC_PPID_POLL_MS) || 3e4;
+    setInterval(() => {
+      try {
+        process.kill(icPpid, 0);
+      } catch (err2) {
+        if (err2 && err2.code === "ESRCH") process.exit(0);
+      }
+    }, pollMs);
+  }
 }
 main().catch((error) => {
   console.error("Server error:", error);

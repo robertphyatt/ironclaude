@@ -1,0 +1,36 @@
+{
+  "name": "Finalize-Recovery End-Review Corrective - Completion (post-retreat)",
+  "goal": "Fix the C5 regression (Task-1's re-arm guard AttributeErrors on __new__-built daemon test fixtures) caught by the full-suite verification, then rebuild dist and verify both suites green. C1-C4 already landed and are staged.",
+  "requirements_file": "docs/plans/2026-09-20-finalize-recovery-endreview-corrective-requirements.md",
+  "design_file": "docs/plans/2026-09-20-finalize-recovery-endreview-corrective-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "C5: short-circuit the reopen re-arm guard + harden __new__ test fixtures",
+      "description": "check_workers' re-arm guard `if latest_reopen_id > self._commit_reopen_processed.get(...)` accesses the attr unconditionally, AttributeError-ing on test_idle_worker_ttl.py's __new__-built partial-daemon fixtures (7 TestIdleGate failures). Change to `if latest_reopen_id and latest_reopen_id > ...` (short-circuits when no reopen marker). Add _commit_reopen_processed={} and _commit_failure_alerted={} to both __new__ fixtures in test_idle_worker_ttl.py, and a test_daemon.py test for the no-reopen-marker marker-block path.",
+      "allowed_files": ["commander/src/ironclaude/main.py", "commander/tests/test_idle_worker_ttl.py", "commander/tests/test_daemon.py"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: confirm the 7 TestIdleGate failures (AttributeError _commit_reopen_processed). Also add a FALSIFIABLE test_daemon.py::test_check_workers_marker_block_no_reopen_marker_no_attr_error: _live_worker(daemon), then del daemon._commit_reopen_processed and del daemon._commit_failure_alerted (model the __new__ partial daemon); set registry.get_events_for_worker.return_value to TWO finalize_failed events and NO marker (so _since<CAP and the _commit_failure_alerted surface short-circuits); pre-seed daemon._finalize_drift_retry['w1']=2 and daemon._finalize_recovery_alerted.add('w1'); call check_workers() and assert it does NOT raise AND drift still 2 AND 'w1' still alerted. RED before the short-circuit (AttributeError on the deleted _commit_reopen_processed), GREEN after.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_idle_worker_ttl.py -q", "expected": "RED: 7 TestIdleGate failures with AttributeError ... _commit_reopen_processed."},
+        {"description": "GREEN main.py: change the check_workers re-arm guard to `if latest_reopen_id and latest_reopen_id > self._commit_reopen_processed.get(worker_id, 0):` (short-circuit when no reopen marker).", "expected": ""},
+        {"description": "GREEN fixtures: in test_idle_worker_ttl.py, in BOTH IroncladeDaemon.__new__ fixtures (the blocks setting daemon._finalize_drift_retry={} / daemon._finalize_recovery_alerted=set()), add daemon._commit_reopen_processed={} and daemon._commit_failure_alerted={}.", "expected": ""},
+        {"description": "Verify.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_idle_worker_ttl.py tests/test_daemon.py -q", "expected": "0 failed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/tests/test_idle_worker_ttl.py commander/tests/test_daemon.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Rebuild dist + full-suite verification + cleanup",
+      "description": "Rebuild dist (the corrective loop changed integration.ts in C2), run full vitest + commander pytest (0 failed, TestIdleGate green, test_batch_pm_failure stable), unstage the stray diagnosis pollution docs, stage dist with git add -f.",
+      "allowed_files": ["worker/mcp-servers/workspace-manager/dist/cli.js", "worker/mcp-servers/workspace-manager/dist/index.js", "worker/mcp-servers/workspace-manager/dist/hook-intent.js"],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Rebuild dist.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build", "expected": "tsc && bundle no error."},
+        {"description": "Full workspace-manager vitest.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run", "expected": "passed | 0 failed."},
+        {"description": "Full commander pytest.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "0 failed (TestIdleGate green; test_batch_pm_failure stable)."},
+        {"description": "Unstage the stray diagnosis docs.", "command": "git -C /Users/roberthyatt/Code/ironclaude restore --staged commander/docs/plans/2026-09-20-orchestrator-mcp-test-pollution-design.md commander/docs/plans/2026-09-20-orchestrator-mcp-test-pollution.md commander/docs/plans/2026-09-20-orchestrator-mcp-test-pollution.plan.json", "expected": "those 3 paths no longer staged."},
+        {"description": "Stage dist (force).", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/hook-intent.js", "expected": "Staged."}
+      ]
+    }
+  ]
+}

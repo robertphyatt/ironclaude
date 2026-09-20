@@ -1,0 +1,42 @@
+{
+  "name": "AMD Halo Grader Cold Probe",
+  "goal": "Run one live timed probe against AMD Halo reproducing grader.py's default request shape; record pass/fail and close.",
+  "requirements_file": "docs/plans/2026-09-15-amd-halo-cold-probe-requirements.md",
+  "design_file": "docs/plans/2026-09-15-amd-halo-cold-probe-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Run cold probe and record findings",
+      "description": "Confirm deployed grader model, curl AMD Halo /v1/chat/completions with grader.py's default thinking-suppression fields, evaluate pass/fail, write findings doc, stage it. No code changes.",
+      "allowed_files": [
+        "docs/plans/2026-09-15-amd-halo-cold-probe-findings.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Confirm current deployed grader model",
+          "command": "cat /Users/roberthyatt/.claude/ironclaude-hooks-config.json",
+          "expected": "backend:openai, openai.base_url:http://100.76.144.47:8080/v1, openai.model:gemma4-26b-a4b, no spots.grader override, timeout_seconds:600"
+        },
+        {
+          "description": "Issue the probe request using grader.py's default suppression fields",
+          "command": "curl -sS -m 30 -w \"\\nHTTP:%{http_code} TIME:%{time_total}\\n\" -X POST http://100.76.144.47:8080/v1/chat/completions -H \"Content-Type: application/json\" -H \"Authorization: Bearer ollama\" -d '{\"model\":\"gemma4-26b-a4b\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly one word: ok\"}],\"max_tokens\":16,\"temperature\":0.1,\"reasoning_effort\":\"none\",\"chat_template_kwargs\":{\"enable_thinking\":false}}'",
+          "expected": "HTTP:200, finish_reason:stop, no reasoning_content field, TIME <= 15.0"
+        },
+        {
+          "description": "Evaluate pass/fail against the four conditions: HTTP 200, finish_reason stop, no reasoning_content, TIME <= 15.0",
+          "expected": "PASS if all four hold; FAIL with the specific violated condition otherwise"
+        },
+        {
+          "description": "Write findings doc with actual Step 1/2/3 output and conclusion",
+          "expected": "docs/plans/2026-09-15-amd-halo-cold-probe-findings.md created with verbatim evidence and verdict"
+        },
+        {
+          "description": "Stage the findings doc",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude/.ironclaude/worktrees/4ffd1c68-a4a6-4b67-8322-39a5677c6c87 add -f docs/plans/2026-09-15-amd-halo-cold-probe-findings.md",
+          "expected": "findings doc staged"
+        }
+      ]
+    }
+  ]
+}

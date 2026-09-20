@@ -1,5 +1,9 @@
 import type Database from 'better-sqlite3';
-import { existsSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import {
+  closeSync, existsSync, mkdtempSync, openSync, readSync, rmdirSync, rmSync, unlinkSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
@@ -17,6 +21,9 @@ import {
   deleteTemporaryBranch,
   dirtyAndUntrackedPaths,
   discoverRepository,
+  gitBufferOverflowError,
+  gitError,
+  GIT_MAX_BUFFER,
   isAncestor,
   removeWorktree,
   runGit,
@@ -39,7 +46,8 @@ export interface FinalizationResult {
     | 'rebase-aborted' | 'rebase-recovery-repair-required'
     | 'rebase-rerebased-ready-for-repair' | 'rebase-frozen-restored'
     | 'rebase-paused-conflict' | 'rebase-paused-clean' | 'frozen-no-rebase'
-    | 'integrated' | 'not-ready' | 'reconciled' | 'committed' | 'closed-out';
+    | 'integrated' | 'not-ready' | 'reconciled' | 'committed' | 'closed-out'
+    | 'finalization-reopened-for-edit';
   integratedCommit?: string;
   /** The new commit sha for a commit-and-stay (verb 1) result. */
   commit?: string;
@@ -97,7 +105,7 @@ export interface ReconcileFinalizationInput {
    * onto the drifted target on the ATTACHED branch without integrating; 'restore_frozen'
    * resets the clean worktree back to the frozen pre-rebase commit. Neither integrates.
    */
-  rebaseRecovery?: 'continue' | 'abort' | 'rerebase' | 'restore_frozen' | 'status';
+  rebaseRecovery?: 'continue' | 'abort' | 'rerebase' | 'restore_frozen' | 'status' | 'reopen_for_edit';
 }
 
 export interface SyncWorktreeToTargetInput {
@@ -292,8 +300,48 @@ export function pushPendingSummary(
     : undefined;
 }
 
+/**
+ * Opaque equality operand for `base..head`'s cumulative binary content effect:
+ * a sha256 digest of `git diff --binary --full-index base head`'s raw output,
+ * streamed to a temp file rather than captured in a process buffer. Two calls
+ * are equal exactly when the underlying `--binary --full-index` diffs were
+ * byte-identical — the digest carries no other meaning and is never
+ * interpreted as a patch. Content-size independent: a >1MB diff (which would
+ * ENOBUFS a captured-stdout call, and remains costly even under a raised
+ * maxBuffer) costs a bounded amount of memory here regardless of diff size.
+ */
 function cumulativeBinaryEffect(cwd: string, base: string, head: string): string {
-  return runGit(cwd, ['diff', '--binary', '--full-index', base, head]);
+  const dir = mkdtempSync(path.join(tmpdir(), 'ic-finalize-diff-'));
+  const file = path.join(dir, 'diff.bin');
+  let wfd: number | undefined;
+  try {
+    wfd = openSync(file, 'w');
+    const args = ['diff', '--binary', '--full-index', base, head];
+    const result = spawnSync('git', ['-C', cwd, ...args], { stdio: ['ignore', wfd, 'pipe'], maxBuffer: GIT_MAX_BUFFER });
+    closeSync(wfd);
+    wfd = undefined;
+    if (result.error) {
+      const overflow = gitBufferOverflowError(args, result.error);
+      throw overflow ?? result.error;
+    }
+    if (result.status !== 0) throw gitError(cwd, args, (result.stderr || '').toString());
+    const hash = createHash('sha256');
+    const rfd = openSync(file, 'r');
+    try {
+      const buf = Buffer.allocUnsafe(1 << 20);
+      let n: number;
+      while ((n = readSync(rfd, buf, 0, buf.length, null)) > 0) hash.update(buf.subarray(0, n));
+    } finally {
+      closeSync(rfd);
+    }
+    return hash.digest('hex');
+  } finally {
+    if (wfd !== undefined) {
+      try { closeSync(wfd); } catch { /* already closed */ }
+    }
+    try { unlinkSync(file); } catch { /* best-effort: absent if openSync threw */ }
+    try { rmdirSync(dir); } catch { /* best-effort */ }
+  }
 }
 
 function requireExactIntegrationLock(
@@ -526,7 +574,7 @@ export function syncWorktreeToTarget(db: Database.Database, input: SyncWorktreeT
  * branch ref, not HEAD's symref), so a primary classified off-ref before the CAS
  * stays off-ref in the checkout dispatch afterward.
  */
-function primaryOnRef(primaryCheckoutPath: string, ref: string): boolean {
+export function primaryOnRef(primaryCheckoutPath: string, ref: string): boolean {
   try {
     return runGit(primaryCheckoutPath, ['symbolic-ref', '--quiet', 'HEAD']).trim() === ref;
   } catch {
@@ -547,7 +595,7 @@ function primaryOnRef(primaryCheckoutPath: string, ref: string): boolean {
  * `dirtyAndUntrackedPaths` is HEAD-relative, so it is only meaningful BEFORE the
  * CAS (while HEAD == expectedTarget); do not reuse it after the CAS has moved HEAD.
  */
-function assertNoPrimaryOverlap(
+export function assertNoPrimaryOverlap(
   primaryCheckoutPath: string,
   ref: string,
   expectedTarget: string,
@@ -595,7 +643,7 @@ function verifyPrimaryTarget(primaryCheckoutPath: string, ref: string, expectedT
  * the operator's checkout was never touched. Content is compared against
  * `integrated` directly (not HEAD-relative) because HEAD has already moved.
  */
-function verifyPrimaryAfterFastForward(
+export function verifyPrimaryAfterFastForward(
   primaryCheckoutPath: string,
   ref: string,
   expectedTarget: string,
@@ -1425,6 +1473,44 @@ function closeOutRelease(
  * so a crash never loses the residual. Integration then lands only the reviewed HEAD.
  * NOT rescueAbandon (which commits residual onto the branch — that would ride into main).
  */
+// Mints (or reuses, tolerate-same-oid) a content-addressed recovery ref for `oid`, records
+// it durably (assignments.recovery_ref + preserved_work row), and re-verifies it resolves
+// BEFORE any caller performs a destructive reset. Shared by snapshotResidualIfDirty (a
+// synthesized dirty-tree snapshot commit) and reopenForEdit's clean-diverged-HEAD branch
+// (a committed oid above frozen) — both mint the same shape of proof, differing only in
+// which oid is being preserved and its residualFiles count.
+function persistRecoveryRef(
+  db: Database.Database,
+  exact: { assignment: Assignment; primaryCheckoutPath: string },
+  oid: string,
+  residualFiles: number,
+): string {
+  const recoveryRef = `refs/ironclaude/recovery/${exact.assignment.workspace_guid}-${oid}`;
+  try {
+    // CREATE-ONLY: empty old-oid refuses to overwrite an existing ref.
+    runGit(exact.primaryCheckoutPath, ['update-ref', recoveryRef, oid, '']);
+  } catch (error) {
+    // TOLERATE-SAME-OID (I-3): a prior identical-content snapshot already minted this exact
+    // ref. Accept it only when the existing ref resolves to the same oid; else rethrow.
+    const existing = runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${recoveryRef}^{commit}`]).trim();
+    if (existing !== oid) throw error;
+  }
+  // I-4: durably record BOTH the assignments column AND the reuse-proof table row BEFORE the
+  // destructive reset, so a crash never orphans the residual (the flat column is wiped on reuse).
+  db.prepare("UPDATE assignments SET recovery_ref = ?, updated_at = datetime('now') WHERE workspace_guid = ?")
+    .run(recoveryRef, exact.assignment.workspace_guid);
+  insertPreservedWork(db, {
+    workspaceGuid: exact.assignment.workspace_guid,
+    repositoryIdentity: exact.assignment.repository_identity,
+    ownerSessionId: exact.assignment.owner_session_id,
+    kind: 'recovery',
+    payload: JSON.stringify({ ref: recoveryRef, residualFiles }),
+  });
+  // Re-verify the ref resolves BEFORE any destructive reset.
+  runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${recoveryRef}^{commit}`]);
+  return recoveryRef;
+}
+
 function snapshotResidualIfDirty(
   db: Database.Database,
   exact: { assignment: Assignment; primaryCheckoutPath: string },
@@ -1447,30 +1533,7 @@ function snapshotResidualIfDirty(
   // Per-lifecycle content-addressed ref (C2/R11): a flat <guid> ref would clobber a prior
   // snapshot when the same GUID is reused. Suffixing the snapshot oid makes each lifecycle's
   // residual its own ref; identical residual content maps to the same ref (tolerate-same-oid).
-  const recoveryRef = `refs/ironclaude/recovery/${exact.assignment.workspace_guid}-${snapshot}`;
-  try {
-    // CREATE-ONLY: empty old-oid refuses to overwrite an existing ref.
-    runGit(exact.primaryCheckoutPath, ['update-ref', recoveryRef, snapshot, '']);
-  } catch (error) {
-    // TOLERATE-SAME-OID (I-3): a prior identical-content snapshot already minted this exact
-    // ref. Accept it only when the existing ref resolves to the same snapshot; else rethrow.
-    const existing = runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${recoveryRef}^{commit}`]).trim();
-    if (existing !== snapshot) throw error;
-  }
-  const payload = JSON.stringify({ ref: recoveryRef, residualFiles });
-  // I-4: durably record BOTH the assignments column AND the reuse-proof table row BEFORE the
-  // destructive reset, so a crash never orphans the residual (the flat column is wiped on reuse).
-  db.prepare("UPDATE assignments SET recovery_ref = ?, updated_at = datetime('now') WHERE workspace_guid = ?")
-    .run(recoveryRef, exact.assignment.workspace_guid);
-  insertPreservedWork(db, {
-    workspaceGuid: exact.assignment.workspace_guid,
-    repositoryIdentity: exact.assignment.repository_identity,
-    ownerSessionId: exact.assignment.owner_session_id,
-    kind: 'recovery',
-    payload,
-  });
-  // Re-verify the ref resolves BEFORE any destructive reset.
-  runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${recoveryRef}^{commit}`]);
+  const recoveryRef = persistRecoveryRef(db, exact, snapshot, residualFiles);
   runGit(worktree, ['reset', '--hard', 'HEAD']);
   runGit(worktree, ['clean', '-fd']);
   return { ref: recoveryRef, residualFiles };
@@ -1880,6 +1943,77 @@ function rerebaseFromFrozen(
   return { state: 'rebase-rerebased-ready-for-repair', detail: worktreeHead(worktree) };
 }
 
+/**
+ * Returns a stuck ready_for_integration finalization to an editable active state
+ * WITHOUT discarding work: any dirty bytes are snapshotted first (Case B, same as
+ * close-out), the worktree is landed on the frozen reviewed commit, the assignment
+ * transitions back to active for re-staging, and the finalization candidate/frozen
+ * refs plus any held integration lock are cleared so a later /commit starts clean.
+ * Requires 'frozen-no-rebase' (same as rerebase/restore_frozen); a paused rebase
+ * must be resolved via continue/abort first.
+ */
+function reopenForEdit(
+  db: Database.Database,
+  exact: { assignment: Assignment; primaryCheckoutPath: string },
+): FinalizationResult {
+  const assignment = exact.assignment;
+  const worktree = assignment.worktree_path;
+  // Refuse only a GENUINE this-lifecycle landed CAS: the candidate is reachable from the
+  // target, the integration lock is held, AND the candidate descends from the lock's
+  // expected_target (the CAS wrote candidate = expected_target + reviewed content). A stale
+  // prior-lifecycle leftover candidate whose target has since advanced is a STRICT ancestor
+  // of expected_target — it predates this lock — so it proceeds to a cleaning reopen instead
+  // of stranding. Known gap: a leftover that still EQUALS expected_target (target never
+  // advanced between lifecycles) is indistinguishable here from a landed empty-effect CAS
+  // and is still refused; reconcile also refuses it at its source-HEAD check.
+  // Refusal routes to reconcile, which completes the genuine landed row via markIntegrated.
+  let landedCandidate: string | undefined;
+  try {
+    landedCandidate = runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${candidateRef(assignment.workspace_guid)}^{commit}`]).trim();
+  } catch { /* no candidate ref: not an interrupted-CAS row */ }
+  if (landedCandidate) {
+    const landed = isAncestor(exact.primaryCheckoutPath, landedCandidate, targetRef(assignment));
+    const lockRow = db.prepare('SELECT expected_target FROM integration_locks WHERE repository_identity = ? AND workspace_guid = ?')
+      .get(assignment.repository_identity, assignment.workspace_guid) as { expected_target: string } | undefined;
+    if (landed && lockRow && isAncestor(exact.primaryCheckoutPath, lockRow.expected_target, landedCandidate)) {
+      throw new Error('reopen_for_edit refused: integration already landed on the target (interrupted-CAS); run reconcile — it will finish the integration or report the repair needed — do not reopen');
+    }
+  }
+  const state = classifyRebaseState(worktree);
+  if (state !== 'frozen-no-rebase') {
+    throw new Error('reopen_for_edit requires a frozen, no-rebase ready row; resolve any paused rebase via continue/abort first; preserving worktree');
+  }
+  const frozen = runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${freezeRef(assignment.workspace_guid)}^{commit}`]).trim();
+  const head = worktreeHead(worktree);
+  let recovery = snapshotResidualIfDirty(db, exact);
+  // Case: the tree is CLEAN (snapshotResidualIfDirty declined) but HEAD is a COMMITTED
+  // commit above frozen (e.g. a 'continue' rebase resolution that then failed the
+  // equality proof). The reset --hard below would discard those commits with no
+  // recovery ref; preserve the diverged HEAD first, mirroring snapshotResidualIfDirty's
+  // content-addressed create-only ref pattern.
+  if (recovery === undefined && head !== frozen) {
+    const recoveryRef = persistRecoveryRef(db, exact, head, 0);
+    recovery = { ref: recoveryRef, residualFiles: 0 };
+  }
+  runGit(worktree, ['reset', '--hard', frozen]);
+  if (worktreeHead(worktree) !== frozen) {
+    throw new Error('reopen_for_edit did not restore the frozen reviewed commit; preserving worktree');
+  }
+  db.transaction(() => {
+    transitionAssignment(db, assignment.workspace_guid, 'ready_for_integration', 'active');
+    setDisposition(db, assignment.workspace_guid, null);
+  })();
+  try { runGit(exact.primaryCheckoutPath, ['update-ref', '-d', candidateRef(assignment.workspace_guid)]); } catch { /* candidate may be absent */ }
+  try { runGit(exact.primaryCheckoutPath, ['update-ref', '-d', freezeRef(assignment.workspace_guid)]); } catch { /* freeze may be absent */ }
+  db.prepare('DELETE FROM integration_locks WHERE repository_identity = ? AND workspace_guid = ?')
+    .run(assignment.repository_identity, assignment.workspace_guid);
+  return {
+    state: 'finalization-reopened-for-edit',
+    detail: 'Uncommitted work or a diverged committed HEAD preserved to a recovery ref if any; worktree reset to the frozen reviewed commit; assignment returned to active for re-staging; finalization refs and lock cleared.',
+    recovery,
+  };
+}
+
 /** Resets a clean worktree back to the frozen pre-rebase commit; never touches the target. */
 function restoreFrozen(worktree: string, frozen: string): FinalizationResult {
   if (!worktreeIsClean(worktree)) {
@@ -1984,6 +2118,12 @@ export function reconcileFinalization(db: Database.Database, input: ReconcileFin
     || input.rebaseRecovery === 'restore_frozen') {
     return recoverNoPausedRebase(exact, input.rebaseRecovery);
   }
+  // reopen_for_edit is likewise a no-paused-rebase recovery (frozen-no-rebase only)
+  // and must dispatch before the paused-rebase guard below, which requires the
+  // OPPOSITE precondition (an actual rebase in progress).
+  if (input.rebaseRecovery === 'reopen_for_edit') {
+    return reopenForEdit(db, exact);
+  }
   if (input.rebaseRecovery) {
     // Managed rebase recovery applies only while a rebase is actually paused.
     // Without this guard, an 'abort' request on a non-rebase ready row would fall
@@ -2064,17 +2204,19 @@ export function reconcileFinalization(db: Database.Database, input: ReconcileFin
     // integration record. Target reachability is sufficient durable proof.
     if (candidate) {
       const currentTarget = runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${ref}^{commit}`]).trim();
-      if (currentTarget !== candidate) {
-        throw new Error('Crash reconciliation target is not the exact candidate; preserving worktree');
+      if (!isAncestor(exact.primaryCheckoutPath, candidate, currentTarget)) {
+        throw new Error('Crash reconciliation candidate did not land on the target; preserving worktree');
       }
       const expectedTarget = recoveryIntegrationLockExpectedTarget(db, assignment, ref);
       let integrationRecorded = false;
       try {
         requireExactIntegrationLock(db, assignment, ref, expectedTarget);
-        try {
-          verifyPrimaryAfterFastForward(exact.primaryCheckoutPath, ref, expectedTarget, candidate);
-        } catch {
-          repairPrimaryCheckoutAfterInterruptedCas(exact.primaryCheckoutPath, ref, expectedTarget, candidate);
+        if (currentTarget === candidate) {
+          try {
+            verifyPrimaryAfterFastForward(exact.primaryCheckoutPath, ref, expectedTarget, candidate);
+          } catch {
+            repairPrimaryCheckoutAfterInterruptedCas(exact.primaryCheckoutPath, ref, expectedTarget, candidate);
+          }
         }
         requireExactIntegrationLock(db, assignment, ref, expectedTarget);
         const frozen = runGit(exact.primaryCheckoutPath, ['rev-parse', '--verify', `${freezeRef(assignment.workspace_guid)}^{commit}`]).trim();

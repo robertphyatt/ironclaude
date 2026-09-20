@@ -152,6 +152,13 @@ CREATE TABLE IF NOT EXISTS worker_staleness (
     updated_at TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS orphan_surface_state (
+    orphan_id TEXT PRIMARY KEY,
+    tip TEXT NOT NULL,
+    category TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS shadow_concordance (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     context TEXT NOT NULL,
@@ -328,7 +335,7 @@ def persist_operator_message_acknowledgement(
 def init_db(db_path: str) -> sqlite3.Connection:
     """Initialize database with schema. Returns connection."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, isolation_level="IMMEDIATE")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)

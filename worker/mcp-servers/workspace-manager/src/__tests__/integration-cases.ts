@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -47,6 +47,11 @@ const OTHER = '019f7cdf-023c-74e0-9ead-9c155636885d';
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }).trim();
+}
+
+/** Count of cumulativeBinaryEffect's temp diff directories currently in os.tmpdir(). */
+function countFinalizeDiffTempDirs(): number {
+  return readdirSync(tmpdir()).filter((name) => name.startsWith('ic-finalize-diff-')).length;
 }
 
 export function registerFinalizationTests(part: 'core' | 'recovery'): void {
@@ -1708,10 +1713,10 @@ describe('finalization coordinator', () => {
     expect(movedAfter.database.prepare('SELECT 1 FROM integration_records WHERE workspace_guid = ?')
       .get(movedAfter.assignment.workspace_guid)).toBeUndefined();
     expect(existsSync(movedAfter.assignment.worktree_path)).toBe(true);
-    expect(() => reconcileFinalization(movedAfter.database, {
+    const movedAfterCandidate = git(movedAfter.root, 'rev-parse', `refs/ironclaude/finalization/${movedAfter.assignment.workspace_guid}/candidate`);
+    expect(reconcileFinalization(movedAfter.database, {
       repositoryPath: movedAfter.root, workspaceGuid: movedAfter.assignment.workspace_guid, providerRootSessionId: OWNER,
-    })).toThrow('exact candidate');
-    expect(existsSync(movedAfter.assignment.worktree_path)).toBe(true);
+    })).toMatchObject({ state: 'cleaned', integratedCommit: movedAfterCandidate });
 
     const casMoved = setup(false);
     const casInput = commanderInput(casMoved.root, casMoved.assignment, 'CAS target race');
@@ -2703,10 +2708,10 @@ describe('finalization coordinator', () => {
     expect(status.state).toBe('not-ready');
   });
 
-  it('managed no-rebase recovery: the reconcile validator accepts all five modes and rejects an unknown one (case e, bounded widening)', () => {
+  it('managed no-rebase recovery: the reconcile validator accepts all six modes and rejects an unknown one (case e, bounded widening)', () => {
     const { database } = setup(false);
     const deps = createInternalCommandDependencies(database);
-    for (const mode of ['continue', 'abort', 'rerebase', 'restore_frozen', 'status'] as const) {
+    for (const mode of ['continue', 'abort', 'rerebase', 'restore_frozen', 'status', 'reopen_for_edit'] as const) {
       // Reaches past validation and fails on the missing guid/owner pairing, proving
       // the value itself was accepted by optionalRebaseRecovery.
       expect(() => deps.reconcile({ repository_path: '/x', rebase_recovery: mode }))
@@ -2714,6 +2719,240 @@ describe('finalization coordinator', () => {
     }
     expect(() => deps.reconcile({ repository_path: '/x', rebase_recovery: 'bogus' }))
       .toThrow('rebase_recovery must be');
+  });
+
+  it('reopen_for_edit: a clean frozen-no-rebase ready row returns to active, worktree lands at frozen, refs+lock cleared', () => {
+    const { root, database, assignment, wt, frozen } = seedFrozenReadyNoRebase(false);
+    git(root, 'update-ref', `refs/ironclaude/finalization/${assignment.workspace_guid}/candidate`, frozen);
+    acquireIntegrationLock(database, {
+      repositoryIdentity: assignment.repository_identity,
+      workspaceGuid: assignment.workspace_guid,
+      targetRef: 'refs/heads/main',
+      expectedTarget: git(root, 'rev-parse', 'HEAD'),
+    });
+    // Pre-assert both the candidate ref and the lock actually exist before recovery.
+    expect(git(root, 'rev-parse', '--verify', `refs/ironclaude/finalization/${assignment.workspace_guid}/candidate`)).toBe(frozen);
+    expect(database.prepare('SELECT 1 FROM integration_locks WHERE repository_identity = ? AND workspace_guid = ?')
+      .get(assignment.repository_identity, assignment.workspace_guid)).toBeDefined();
+
+    const result = reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'reopen_for_edit',
+    });
+
+    expect(result.state).toBe('finalization-reopened-for-edit');
+    expect(database.prepare('SELECT lifecycle_status FROM assignments WHERE workspace_guid = ?')
+      .get(assignment.workspace_guid)).toMatchObject({ lifecycle_status: 'active' });
+    expect(() => git(root, 'rev-parse', '--verify', `refs/ironclaude/finalization/${assignment.workspace_guid}/frozen`)).toThrow();
+    expect(() => git(root, 'rev-parse', '--verify', `refs/ironclaude/finalization/${assignment.workspace_guid}/candidate`)).toThrow();
+    expect(git(wt, 'rev-parse', 'HEAD')).toBe(frozen);
+    expect(database.prepare('SELECT 1 FROM integration_locks WHERE repository_identity = ? AND workspace_guid = ?')
+      .get(assignment.repository_identity, assignment.workspace_guid)).toBeUndefined();
+  });
+
+  it('reopen_for_edit: dirty tracked+untracked bytes are snapshotted to a recovery ref before the worktree lands at frozen', () => {
+    const { root, database, assignment, wt, frozen } = seedFrozenReadyNoRebase(false);
+    writeFileSync(join(wt, 'untracked-note.txt'), 'dirty untracked\n');
+    writeFileSync(join(wt, 'work.txt'), 'dirty tracked edit\n');
+
+    const result = reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'reopen_for_edit',
+    });
+
+    expect(result.state).toBe('finalization-reopened-for-edit');
+    expect(result.recovery).toBeDefined();
+    expect(() => git(root, 'rev-parse', '--verify', `${result.recovery!.ref}^{commit}`)).not.toThrow();
+    expect(git(wt, 'rev-parse', 'HEAD')).toBe(frozen);
+    const preserved = database.prepare(
+      "SELECT payload FROM preserved_work WHERE workspace_guid = ? AND kind = 'recovery' AND resolved_at IS NULL",
+    ).get(assignment.workspace_guid) as { payload: string } | undefined;
+    expect(preserved).toBeDefined();
+  });
+
+  it('reopen_for_edit: refuses a paused rebase, preserving the worktree', () => {
+    const conflict = seedConflictMidRebase();
+    expect(() => reconcileFinalization(conflict.database, {
+      repositoryPath: conflict.root, workspaceGuid: conflict.assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'reopen_for_edit',
+    })).toThrow('reopen_for_edit requires a frozen, no-rebase ready row');
+    expect(existsSync(conflict.assignment.worktree_path)).toBe(true);
+    expect(conflict.database.prepare('SELECT lifecycle_status FROM assignments WHERE workspace_guid = ?')
+      .get(conflict.assignment.workspace_guid)).toMatchObject({ lifecycle_status: 'ready_for_integration' });
+  });
+
+  it('reopen_for_edit: refuses a non-ready (active) row', () => {
+    const { root, database, assignment } = setup(false);
+    expect(() => reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'reopen_for_edit',
+    })).toThrow('No ready finalization is available');
+  });
+
+  it('reopen_for_edit: a CLEAN committed HEAD diverged above frozen is preserved to a recovery ref, not discarded', () => {
+    const { root, database, assignment, wt, frozen } = seedFrozenReadyNoRebase(false);
+    // Simulate a 'continue' rebase resolution that then failed the equality proof: the
+    // worktree HEAD is a committed commit ABOVE frozen, and the tree is CLEAN.
+    writeFileSync(join(wt, 'extra.txt'), 'resolved above frozen\n');
+    git(wt, 'add', 'extra.txt');
+    git(wt, 'commit', '-m', 'resolved conflict above frozen');
+    const diverged = git(wt, 'rev-parse', 'HEAD');
+    expect(diverged).not.toBe(frozen);
+    expect(git(wt, 'status', '--porcelain')).toBe('');
+
+    const result = reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'reopen_for_edit',
+    });
+
+    expect(result.state).toBe('finalization-reopened-for-edit');
+    expect(result.recovery).toBeDefined();
+    expect(git(root, 'rev-parse', '--verify', `${result.recovery!.ref}^{commit}`)).toBe(diverged);
+    expect(git(wt, 'rev-parse', 'HEAD')).toBe(frozen);
+    const preserved = database.prepare(
+      "SELECT payload FROM preserved_work WHERE workspace_guid = ? AND kind = 'recovery' AND resolved_at IS NULL",
+    ).get(assignment.workspace_guid) as { payload: string } | undefined;
+    expect(preserved).toBeDefined();
+  });
+
+  it('reopen_for_edit: refuses an interrupted-CAS row where the candidate already landed on the target, preserving proof', () => {
+    const { root, database, assignment } = setup(false);
+    git(assignment.worktree_path, 'commit', '-m', 'landed work');
+    const landed = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+    const oldTarget = git(root, 'rev-parse', 'HEAD');
+    git(root, 'update-ref', `refs/ironclaude/finalization/${assignment.workspace_guid}/frozen`, landed);
+    acquireIntegrationLock(database, {
+      repositoryIdentity: assignment.repository_identity,
+      workspaceGuid: assignment.workspace_guid,
+      targetRef: 'refs/heads/main', expectedTarget: oldTarget,
+    });
+    git(root, 'merge', '--ff-only', landed);
+    git(root, 'update-ref', `refs/ironclaude/finalization/${assignment.workspace_guid}/candidate`, landed);
+    database.prepare("UPDATE assignments SET lifecycle_status = 'ready_for_integration' WHERE workspace_guid = ?")
+      .run(assignment.workspace_guid);
+
+    expect(() => reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'reopen_for_edit',
+    })).toThrow('integration already landed on the target (interrupted-CAS); run reconcile — it will finish the integration or report the repair needed — do not reopen');
+
+    expect(git(root, 'rev-parse', '--verify', `refs/ironclaude/finalization/${assignment.workspace_guid}/candidate`)).toBe(landed);
+    expect(git(root, 'rev-parse', '--verify', `refs/ironclaude/finalization/${assignment.workspace_guid}/frozen`)).toBe(landed);
+    expect(database.prepare('SELECT 1 FROM integration_locks WHERE repository_identity = ? AND workspace_guid = ?')
+      .get(assignment.repository_identity, assignment.workspace_guid)).toBeDefined();
+    expect(database.prepare('SELECT lifecycle_status FROM assignments WHERE workspace_guid = ?')
+      .get(assignment.workspace_guid)).toMatchObject({ lifecycle_status: 'ready_for_integration' });
+  });
+
+  it('reopen_for_edit: an unresolvable integration target does not throw a raw git error; reopen proceeds', () => {
+    const { root, database, assignment, frozen } = seedFrozenReadyNoRebase(false);
+    git(root, 'update-ref', `refs/ironclaude/finalization/${assignment.workspace_guid}/candidate`, frozen);
+    acquireIntegrationLock(database, {
+      repositoryIdentity: assignment.repository_identity,
+      workspaceGuid: assignment.workspace_guid,
+      targetRef: 'refs/heads/main', expectedTarget: git(root, 'rev-parse', 'HEAD'),
+    });
+    database.prepare("UPDATE assignments SET integration_target = 'nonexistent-target-branch' WHERE workspace_guid = ?").run(assignment.workspace_guid);
+    expect(reconcileFinalization(database, { repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER, rebaseRecovery: 'reopen_for_edit' }).state).toBe('finalization-reopened-for-edit');
+    expect(database.prepare('SELECT 1 FROM integration_locks WHERE repository_identity = ? AND workspace_guid = ?').get(assignment.repository_identity, assignment.workspace_guid)).toBeUndefined();
+  });
+
+  it('reopen_for_edit: a candidate that equals the target but has NO held lock is not an interrupted-CAS row; reopen proceeds', () => {
+    const { root, database, assignment } = setup(false);
+    git(assignment.worktree_path, 'commit', '-m', 'landed');
+    const landed = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+    git(root, 'update-ref', `refs/ironclaude/finalization/${assignment.workspace_guid}/frozen`, landed);
+    git(root, 'merge', '--ff-only', landed);
+    git(root, 'update-ref', `refs/ironclaude/finalization/${assignment.workspace_guid}/candidate`, landed);
+    database.prepare("UPDATE assignments SET lifecycle_status = 'ready_for_integration' WHERE workspace_guid = ?").run(assignment.workspace_guid);
+    expect(reconcileFinalization(database, { repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER, rebaseRecovery: 'reopen_for_edit' }).state).toBe('finalization-reopened-for-edit');
+    expect(() => git(root, 'rev-parse', '--verify', `refs/ironclaude/finalization/${assignment.workspace_guid}/candidate`)).toThrow();
+  });
+
+  it('reopen_for_edit: nulls a carried integration-pending disposition on reopen', () => {
+    const { root, database, assignment, frozen } = seedFrozenReadyNoRebase(false);
+    database.prepare('UPDATE assignments SET disposition = ? WHERE workspace_guid = ?').run(JSON.stringify({
+      phase: 'integration-pending', frozenCommit: frozen, remoteName: 'origin',
+      remoteUrl: 'file:///unused-remote', destinationRef: `refs/heads/${assignment.branch}`, expectedRemoteOldOid: null,
+    }), assignment.workspace_guid);
+    expect(database.prepare('SELECT disposition FROM assignments WHERE workspace_guid = ?').get(assignment.workspace_guid))
+      .toMatchObject({ disposition: expect.stringContaining('integration-pending') });
+
+    const result = reconcileFinalization(database, {
+      repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+      rebaseRecovery: 'reopen_for_edit',
+    });
+
+    expect(result.state).toBe('finalization-reopened-for-edit');
+    expect(database.prepare('SELECT disposition, lifecycle_status FROM assignments WHERE workspace_guid = ?')
+      .get(assignment.workspace_guid)).toMatchObject({ disposition: null, lifecycle_status: 'active' });
+  });
+
+  it('reopen_for_edit / reconcile: a landed candidate whose target has advanced completes via reconcile', () => {
+    const { root, database, assignment } = setup(false);
+    git(assignment.worktree_path, 'commit', '-m', 'reviewed work');
+    const landed = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+    const oldTarget = git(root, 'rev-parse', 'HEAD');
+    git(root, 'update-ref', `refs/ironclaude/finalization/${assignment.workspace_guid}/frozen`, landed);
+    acquireIntegrationLock(database, {
+      repositoryIdentity: assignment.repository_identity,
+      workspaceGuid: assignment.workspace_guid,
+      targetRef: 'refs/heads/main', expectedTarget: oldTarget,
+    });
+    git(root, 'merge', '--ff-only', landed);
+    git(root, 'update-ref', `refs/ironclaude/finalization/${assignment.workspace_guid}/candidate`, landed);
+    database.prepare("UPDATE assignments SET lifecycle_status = 'ready_for_integration' WHERE workspace_guid = ?").run(assignment.workspace_guid);
+    // advance the target PAST the landed candidate with an unrelated commit
+    git(root, 'commit', '--allow-empty', '-m', 'unrelated advance');
+    const result = reconcileFinalization(database, { repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER });
+    expect(result.state).toBe('cleaned');
+    expect(result.integratedCommit).toBe(landed);
+  });
+
+  it('reopen_for_edit: refuses a landed candidate whose target has advanced (ancestry), preserving proof', () => {
+    const { root, database, assignment } = setup(false);
+    git(assignment.worktree_path, 'commit', '-m', 'reviewed work');
+    const landed = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+    const oldTarget = git(root, 'rev-parse', 'HEAD');
+    git(root, 'update-ref', `refs/ironclaude/finalization/${assignment.workspace_guid}/frozen`, landed);
+    acquireIntegrationLock(database, {
+      repositoryIdentity: assignment.repository_identity,
+      workspaceGuid: assignment.workspace_guid,
+      targetRef: 'refs/heads/main', expectedTarget: oldTarget,
+    });
+    git(root, 'merge', '--ff-only', landed);
+    git(root, 'update-ref', `refs/ironclaude/finalization/${assignment.workspace_guid}/candidate`, landed);
+    database.prepare("UPDATE assignments SET lifecycle_status = 'ready_for_integration' WHERE workspace_guid = ?").run(assignment.workspace_guid);
+    git(root, 'commit', '--allow-empty', '-m', 'unrelated advance');
+    expect(() => reconcileFinalization(database, { repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER, rebaseRecovery: 'reopen_for_edit' }))
+      .toThrow('integration already landed on the target');
+    expect(git(root, 'rev-parse', '--verify', `refs/ironclaude/finalization/${assignment.workspace_guid}/candidate`)).toBe(landed);
+    expect(git(root, 'rev-parse', '--verify', `refs/ironclaude/finalization/${assignment.workspace_guid}/frozen`)).toBe(landed);
+    expect(database.prepare('SELECT 1 FROM integration_locks WHERE repository_identity = ? AND workspace_guid = ?').get(assignment.repository_identity, assignment.workspace_guid)).toBeDefined();
+  });
+
+  it('reopen_for_edit: a stale leftover candidate (ancestor of an advanced expected_target) proceeds to a cleaning reopen', () => {
+    const { root, database, assignment } = setup(false);
+    git(assignment.worktree_path, 'commit', '-m', 'prior lifecycle work');
+    const cOld = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+    git(root, 'merge', '--ff-only', cOld);
+    git(root, 'update-ref', `refs/ironclaude/finalization/${assignment.workspace_guid}/candidate`, cOld);
+    git(root, 'commit', '--allow-empty', '-m', 'target advanced past C_old');
+    const advancedTarget = git(root, 'rev-parse', 'HEAD');
+    git(assignment.worktree_path, 'commit', '--allow-empty', '-m', 'current lifecycle reviewed work');
+    const frozenF = git(assignment.worktree_path, 'rev-parse', 'HEAD');
+    git(root, 'update-ref', `refs/ironclaude/finalization/${assignment.workspace_guid}/frozen`, frozenF);
+    acquireIntegrationLock(database, {
+      repositoryIdentity: assignment.repository_identity,
+      workspaceGuid: assignment.workspace_guid,
+      targetRef: 'refs/heads/main', expectedTarget: advancedTarget,
+    });
+    database.prepare("UPDATE assignments SET lifecycle_status = 'ready_for_integration' WHERE workspace_guid = ?").run(assignment.workspace_guid);
+
+    const result = reconcileFinalization(database, { repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER, rebaseRecovery: 'reopen_for_edit' });
+    expect(result.state).toBe('finalization-reopened-for-edit');
+    expect(() => git(root, 'rev-parse', '--verify', `refs/ironclaude/finalization/${assignment.workspace_guid}/candidate`)).toThrow();
+    expect(database.prepare('SELECT 1 FROM integration_locks WHERE repository_identity = ? AND workspace_guid = ?').get(assignment.repository_identity, assignment.workspace_guid)).toBeUndefined();
   });
 
   describe('syncWorktreeToTarget', () => {
@@ -3323,6 +3562,45 @@ describe('finalization coordinator', () => {
 
       // The injection content did not land: benign.txt is byte-unchanged.
       expect(readFileSync(join(s.assignment.worktree_path, 'benign.txt'), 'utf8')).toBe('benign\n');
+    });
+  });
+
+  describe('finalize cumulative-effect equality is content-size independent', () => {
+    it('finalizes successfully when the reviewed --binary --full-index diff exceeds 1MB', () => {
+      const { root, database, assignment } = setup(false);
+      const tempDirsBefore = countFinalizeDiffTempDirs();
+      writeFileSync(join(assignment.worktree_path, 'big.txt'), 'x'.repeat(1_500_000) + '\n');
+      git(assignment.worktree_path, 'add', 'big.txt');
+
+      const result = finalizeCommanderLocalCommit(
+        database, commanderInput(root, assignment, 'large reviewed diff'),
+      );
+
+      expect(result.state).toBe('cleaned');
+      expect(readFileSync(join(root, 'big.txt'), 'utf8').length).toBeGreaterThanOrEqual(1_500_000);
+      expect(countFinalizeDiffTempDirs()).toBe(tempDirsBefore);
+    });
+
+    it('refuses finalization when the rebased cumulative effect diverges from the reviewed content, and still cleans up its temp diff files', () => {
+      const { root, database, assignment } = setup(false);
+      const tempDirsBefore = countFinalizeDiffTempDirs();
+
+      expect(() => finalizeCommanderLocalCommit(
+        database,
+        commanderInput(root, assignment, 'reviewed work'),
+        {
+          beforeDescendantProof: () => {
+            // Introduces an unreviewed change AFTER the rebase completes but BEFORE the
+            // rebased-effect equality check, so the check must catch it deterministically
+            // (no merge conflict is involved).
+            writeFileSync(join(assignment.worktree_path, 'divergent.txt'), 'unreviewed extra change\n');
+            git(assignment.worktree_path, 'add', 'divergent.txt');
+            git(assignment.worktree_path, 'commit', '-m', 'unreviewed extra change');
+          },
+        },
+      )).toThrow('Finalization rebased cumulative effect differs from reviewed content; preserving worktree');
+
+      expect(countFinalizeDiffTempDirs()).toBe(tempDirsBefore);
     });
   });
   });

@@ -1,0 +1,48 @@
+{
+  "name": "reopen_for_edit interrupted-CAS guard + disposition/discoverability fixes",
+  "goal": "Refuse reopen_for_edit on an interrupted-CAS row (C1/MATERIAL), null assignments.disposition on reopen (C2/O2), and list reopen_for_edit in the Brain-visible recovery-action docs (C3/O4).",
+  "requirements_file": "worker/mcp-servers/workspace-manager/docs/plans/2026-09-20-reopen-interrupted-cas-guard-requirements.md",
+  "design_file": "worker/mcp-servers/workspace-manager/docs/plans/2026-09-20-reopen-interrupted-cas-guard-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "C1 interrupted-CAS refusal + C2 null disposition (integration.ts + tests)",
+      "description": "reopenForEdit (integration.ts:1936) admits the interrupted-CAS crash-recovery row (candidate ref resolves AND target ref == candidate; lock held) and deletes candidate/freeze refs + lock + flips to active, stranding an already-landed assignment. C1: add a pre-mutation refusal guard at the top of reopenForEdit that resolves the candidate (best-effort rev-parse candidateRef^{commit}) and, if it equals targetRef(assignment)^{commit}, throws 'reopen_for_edit refused: integration already landed on the target (interrupted-CAS); run reconcile to complete it, not reopen'. C2: null assignments.disposition via setDisposition(db, guid, null) inside reopen's existing db.transaction. TDD: both vitest cases RED first. The new cases go in the RECOVERY part of integration-cases.ts (where the existing reopen_for_edit cases live) and are run via integration-recovery.test.ts.",
+      "allowed_files": ["worker/mcp-servers/workspace-manager/src/integration.ts", "worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: integration-cases.ts is not a standalone vitest file (exports registerFinalizationTests('core'|'recovery') at :57); the reopen_for_edit cases live in the recovery part (describe('recovery integration') :2255, gated part==='recovery'), registered by integration-recovery.test.ts. Insert two it() cases immediately AFTER the last existing reopen_for_edit case (closing }); at :2816) and BEFORE describe('syncWorktreeToTarget') (:2818), each name beginning 'reopen_for_edit:'. C1 (name 'reopen_for_edit: refuses an interrupted-CAS row where the candidate already landed on the target, preserving proof'): build interrupted-CAS inline (advancedWithoutRecord construction :1958-1971) — const {root,database,assignment}=setup(false); git(assignment.worktree_path,'commit','-m','landed work'); const landed=git(assignment.worktree_path,'rev-parse','HEAD'); const oldTarget=git(root,'rev-parse','HEAD'); git(root,'update-ref',`refs/ironclaude/finalization/${assignment.workspace_guid}/frozen`,landed); acquireIntegrationLock(database,{repositoryIdentity:assignment.repository_identity,workspaceGuid:assignment.workspace_guid,targetRef:'refs/heads/main',expectedTarget:oldTarget}); git(root,'merge','--ff-only',landed); git(root,'update-ref',`refs/ironclaude/finalization/${assignment.workspace_guid}/candidate`,landed); database.prepare(\"UPDATE assignments SET lifecycle_status='ready_for_integration' WHERE workspace_guid = ?\").run(assignment.workspace_guid); then expect(() => reconcileFinalization(database,{repositoryPath:root,workspaceGuid:assignment.workspace_guid,providerRootSessionId:OWNER,rebaseRecovery:'reopen_for_edit'})).toThrow('integration already landed on the target'); assert candidate ref === landed, frozen ref === landed, integration_locks row defined (SELECT 1 ... .get(...) toBeDefined), lifecycle still 'ready_for_integration'. C2 (name 'reopen_for_edit: nulls a carried integration-pending disposition on reopen'): const {root,database,assignment,frozen}=seedFrozenReadyNoRebase(false) (frozen-no-rebase ready, target!=candidate, NO candidate ref -> C1 guard skipped); database.prepare('UPDATE assignments SET disposition = ? WHERE workspace_guid = ?').run(JSON.stringify({phase:'integration-pending',frozenCommit:frozen,remoteName:'origin',remoteUrl:'file:///unused-remote',destinationRef:`refs/heads/${assignment.branch}`,expectedRemoteOldOid:null}), assignment.workspace_guid); expect(db...SELECT disposition...get).toMatchObject({disposition: expect.stringContaining('integration-pending')}); const result=reconcileFinalization(database,{...,rebaseRecovery:'reopen_for_edit'}); expect(result.state).toBe('finalization-reopened-for-edit'); expect(db...SELECT disposition, lifecycle_status...get).toMatchObject({disposition:null, lifecycle_status:'active'}). remoteUrl is a literal (setup(false) has no origin remote; do NOT use git remote get-url origin).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/integration-recovery.test.ts -t reopen_for_edit", "expected": "RED: C1 does NOT throw (without the guard reopen returns 'finalization-reopened-for-edit' and strips candidate/frozen refs + lock, so toThrow fails); C2 disposition is still the JSON, not null. The existing 5 reopen_for_edit cases still pass."},
+        {"description": "GREEN C1: at the TOP of reopenForEdit (integration.ts:1936), before classifyRebaseState/any mutation, add: `let landedCandidate: string | undefined; try { landedCandidate = runGit(exact.primaryCheckoutPath, ['rev-parse','--verify',`${candidateRef(assignment.workspace_guid)}^{commit}`]).trim(); } catch {} if (landedCandidate) { const currentTarget = runGit(exact.primaryCheckoutPath, ['rev-parse','--verify',`${targetRef(assignment)}^{commit}`]).trim(); if (currentTarget === landedCandidate) { throw new Error('reopen_for_edit refused: integration already landed on the target (interrupted-CAS); run reconcile to complete it, not reopen'); } }` (assignment is exact.assignment, already bound at :1940).", "expected": ""},
+        {"description": "GREEN C2: in reopenForEdit's db.transaction (:1979-1981), add setDisposition(db, assignment.workspace_guid, null) alongside transitionAssignment(db, assignment.workspace_guid, 'ready_for_integration', 'active').", "expected": ""},
+        {"description": "Verify both GREEN and no regression.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/integration-recovery.test.ts -t reopen_for_edit", "expected": "0 failed (both new cases GREEN; existing 5 reopen_for_edit cases still pass)."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/integration.ts worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "C3: list reopen_for_edit in Brain-visible recovery docs (orchestrator_mcp.py)",
+      "description": "recover_worker_integration's method docstring (:4172-4175) and the @mcp.tool() description (:7385-7388) enumerate only status/continue/abort/rerebase/restore_frozen; _RECOVERY_ACTIONS (:3968) already accepts reopen_for_edit and the body already handles it (:4276). Add reopen_for_edit to both docstrings so the Brain can discover it. Doc/prompt only; no test.",
+      "allowed_files": ["commander/src/ironclaude/orchestrator_mcp.py"],
+      "depends_on": [],
+      "steps": [
+        {"description": "In recover_worker_integration's method docstring (:4172-4175), after the 'rerebase'/'restore_frozen' (recover a drifted frozen worktree) clause, append: \", or 'reopen_for_edit' (return a stuck reviewed row to editable 'active', preserving work)\".", "expected": ""},
+        {"description": "In the @mcp.tool() recover_worker_integration description (:7385-7388), make the same addition after the 'rerebase'/'restore_frozen' clause.", "expected": ""},
+        {"description": "Verify.", "command": "grep -n \"reopen_for_edit\" /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude/orchestrator_mcp.py", "expected": "4 matches: the existing _RECOVERY_ACTIONS line (:3968), the existing 'action == \"reopen_for_edit\"' body hit (currently :4276, shifts down by the lines inserted at :4172-4175), and the two new docstring lines."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Rebuild dist + full-suite verification",
+      "description": "Rebuild dist (Task 1 changed integration.ts, bundled into dist), run full vitest + full commander pytest (both 0 failed), stage dist with git add -f.",
+      "allowed_files": ["worker/mcp-servers/workspace-manager/dist/cli.js", "worker/mcp-servers/workspace-manager/dist/index.js", "worker/mcp-servers/workspace-manager/dist/hook-intent.js"],
+      "depends_on": [1, 2],
+      "steps": [
+        {"description": "Rebuild dist.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build", "expected": "tsc && bundle, no error."},
+        {"description": "Full workspace-manager vitest.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run", "expected": "passed | 0 failed."},
+        {"description": "Full commander pytest.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "0 failed."},
+        {"description": "Stage dist (force).", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/hook-intent.js", "expected": "Staged."}
+      ]
+    }
+  ]
+}

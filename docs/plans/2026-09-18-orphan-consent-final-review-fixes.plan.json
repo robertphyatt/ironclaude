@@ -1,0 +1,109 @@
+{
+  "name": "Orphan-Consent-Cleanup Final-Review Fixes",
+  "goal": "Fix the 2 Important findings (I1 unbounded patch-id scan, I2 --force bound to sweep-refreshed category) plus 2 cheap observations (obs#1 CAS mislabel, obs#4 count mismatch) from the final tier-up Fable end review of the combined staged diff.",
+  "requirements_file": "docs/plans/2026-09-18-orphan-consent-final-review-fixes-requirements.md",
+  "design_file": "docs/plans/2026-09-18-orphan-consent-final-review-fixes-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "I1 — bound patchIdAggregateTellMerged (git.ts)",
+      "description": "Replace the per-commit patchId spawn loop in patchIdAggregateTellMerged (git.ts:599-613) with a single pathspec-restricted walk: aggregateId=patchId(mergeBase,tip) (null->false); P=NUL-split of `git diff --name-only --no-renames -z mergeBase tip` (empty->false); one `git --literal-pathspecs log --no-merges --no-ext-diff --format=commit %H -p mergeBase..targetRef -- P...` (maxBuffer 64MiB; error throws -> tryTell false) piped as input into one `git patch-id --stable`; return true iff any emitted patch-id === aggregateId. Add --no-ext-diff to patchId's `git diff` (git.ts:554). Reorder contentMergedInto (git.ts:669-674) tells to cherry -> reverseApply -> patchIdAggregate. Fixed spawn count independent of history depth; detection a strict superset; fail-safe preserved (never over-claims merged).",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/git.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/git-content-merged.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: add tests with a pass-through spawnSync counter (vi.mock('node:child_process',...) recording every call then delegating to the real spawnSync; git.ts imports spawnSync at :1; the test's execFileSync helpers stay real). Bound proof: genuinely-unmerged 2-file branch, advance main by K commits (half touching branch files); run contentMergedInto at K=5 and K=60; assert per-call recorded spawnSync count EQUAL for K=5 and K=60 and <=12, AND the K=5 recorded calls include one entry containing 'patch-id' and one containing 'cherry' (a no-op counter's 0===0 && 0<=12 would otherwise pass GREEN). Detection preserved: a >=2-commit distinct-diff branch (create file line1, then append line2) squash-merged into main, then a LATER main commit edits the same lines; first assert precondition `git cherry main <tip>` lists every commit with a leading '+ ' (cherry-dark, so a true result is attributable to the patch-id tell), then expect contentMergedInto true. Partial landing: two-file branch, main lands only one file identically -> false. Literal pathspec: a >=2-commit distinct-diff branch touching a file named 'weird[1].txt', squash + later overlapping edit, cherry-dark precondition -> true. Empty-diff tip (commit then revert) -> false. Keep existing :44-94 cases green.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/git-content-merged.test.ts", "expected": "RED: ONLY the bound-proof case fails against the per-commit implementation (K=60 spawn count exceeds K=5 by ~2x55). Detection-preserved, partial-landing, literal-pathspec, empty-diff pass pre-fix (per-commit walk at :603 uses no pathspec) and serve as regression guards; literal-pathspec becomes falsifiable only post-fix (dropping --literal-pathspecs empties the walk)."},
+        {"description": "GREEN: patchId adds --no-ext-diff; rewrite patchIdAggregateTellMerged to the bounded single-walk (P = `git diff --name-only --no-renames -z mergeBase tip`; one `git --literal-pathspecs log --no-merges --no-ext-diff --format=commit %H -p mergeBase..targetRef -- P...` with maxBuffer 64MiB) piped into one `git patch-id --stable`, matching aggregateId; reorder contentMergedInto to cherry -> reverseApply -> patchIdAggregate."},
+        {"description": "Verify GREEN + typecheck.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/git-content-merged.test.ts && npx tsc --noEmit", "expected": "0 failed; tsc clean."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/git.ts worker/mcp-servers/workspace-manager/src/__tests__/git-content-merged.test.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "obs#4 — surface header counts the need-review set (notifications.py)",
+      "description": "format_orphaned_orphans (notifications.py:212-229) headers len(details) which includes squash-merged, while the heartbeat count (main.py:1940-1942) excludes squash-merged. Change the header's need-review count to the number of details whose category != 'squash-merged' (matching the heartbeat); keep listing every entry (squash-merged still shown/reapable); the header may note how many squash-merged are listed.",
+      "allowed_files": [
+        "commander/src/ironclaude/notifications.py",
+        "commander/tests/test_notifications.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: (a) details with one squash-merged + two non-squash-merged -> header need-review number == 2 (not 3), all three bullets present. (b) all-squash-merged details (two entries) -> header need-review number == 0, both bullets present.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_notifications.py -q", "expected": "RED: header currently uses len(details)."},
+        {"description": "GREEN: header need-review count = number of details with category != 'squash-merged' (matching main.py:1940-1942); keep all bullets; header may note '(+N already squash-merged, listed below)'."},
+        {"description": "Verify.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_notifications.py -q", "expected": "0 failed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/notifications.py commander/tests/test_notifications.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "I1 — gate the origin double-scan + shared spawn wrapper (workspace-service.ts)",
+      "description": "classifyPreservedOrphan (workspace-service.ts:1322-1340) calls contentMergedInto against originRef unconditionally when originRef resolves. Run the origin pass only when originRef resolves AND !isAncestor(primaryCheckoutPath, originRef, target) — merged-on-origin is only possible when origin is ahead of local target; skipping when at/behind yields genuinely-unmerged (fail-safe) and halves cost in the common post-push state. Also introduce the shared pass-through spawnSync wrapper (vi.hoisted spawnControl{calls,beforeSpawn} + vi.mock('node:child_process') delegating to the real spawnSync) that Task 5 reuses.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/workspace-service.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "RED: add the shared spawn wrapper once: `const spawnControl = vi.hoisted(() => ({ calls: [] as string[][], beforeSpawn: null as null | ((args: readonly string[]) => void) }));` and `vi.mock('node:child_process', async (importOriginal) => { const actual = await importOriginal(); return { ...actual, spawnSync: (cmd, args, opts) => { spawnControl.calls.push([cmd, ...(args ?? [])]); spawnControl.beforeSpawn?.(args ?? []); return actual.spawnSync(cmd, args, opts); } }; });` with afterEach reset (calls.length=0; beforeSpawn=null). Pass-through -> existing ~2400 lines and the execFileSync helper unaffected. Then: (a) merged-on-origin positive (currently untested): squash the orphan onto a temp branch, update-ref refs/remotes/origin/main to that sha with local main behind -> category 'merged-on-origin'. (b) gate skip: refs/remotes/origin/main == local main, genuinely-unmerged orphan -> category 'genuinely-unmerged' AND spawnControl.calls contains exactly one entry ['-C',primary,'merge-base','--is-ancestor','refs/remotes/origin/main','refs/heads/main'] and NO entry containing both 'cherry' and 'refs/remotes/origin/main'.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts", "expected": "RED: gate-skip case fails — today the origin pass always runs when originRef resolves, so a cherry against refs/remotes/origin/main is recorded."},
+        {"description": "GREEN: run the origin pass only when originRef resolves AND !isAncestor(primaryCheckoutPath, originRef, target)."},
+        {"description": "Verify GREEN + typecheck.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts && npx tsc --noEmit", "expected": "0 failed; tsc clean."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/workspace-service.ts worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "I2 — category-consented --force reap (workspace-service.ts + cli.ts)",
+      "description": "resolveOneOrphan reap path (workspace-service.ts:1176-1188) forces on row.category==='dirty' (sweep-refreshed), not the operator-consented category. Add category? to OrphanResolutionRequest (:167-182); thread record.category through cli.ts requiredResolutions (:122-160) mirroring integration_target->integrationTarget (:150-157); in resolveOneOrphan set force=true only when present && !worktreeIsClean && row.category==='dirty' && resolution.category==='dirty', else refused-changed when the worktree is dirty. Clean-worktree reaps unaffected, need no category. WorkspaceClient passes resolutions verbatim (no change).",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/workspace-service.ts",
+        "worker/mcp-servers/workspace-manager/src/cli.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/cli.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {"description": "RED (the defect only manifests after the sweep flips row.category to 'dirty' while consent named a non-dirty category — use a TWO-SWEEP setup): create orphan worktree + commit unmerged work; sweep #1 reapAmbiguousOrphans({ttlHours:0}) -> assert preservedDetail[guid].category==='genuinely-unmerged'; write an uncommitted file into the worktree (tip unchanged); sweep #2 -> assert preservedDirty contains the branch AND `SELECT category,tip FROM orphan_surface` == ('dirty', same tip). Case 1 (stale consent, RED): resolveOrphan reap with category:'genuinely-unmerged' -> refused-changed, worktree+uncommitted file+branch present (pre-fix: reaped). Case 2 (regression guard): reap with category:'dirty' -> reaped (force), worktree gone. Case 3 (no category, RED): reap with NO category -> refused-changed (pre-fix: reaped). Case 4 (AND-conjunct guard): surfaced genuinely-unmerged, dirtied, NO second sweep (row stays genuinely-unmerged), reap with category:'dirty' -> refused-changed (requires row.category==='dirty' too). cli.test.ts: resolution category:'dirty' reaches the service call with category:'dirty'; empty/non-string category rejected.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts src/__tests__/cli.test.ts src/__tests__/tool-dispatch.test.ts", "expected": "RED: cases 1 and 3 return 'reaped' pre-fix (force fires on row.category alone at :1181-1182); after the fix they return 'refused-changed'."},
+        {"description": "GREEN: add category? ('squash-merged'|'merged-on-origin'|'genuinely-unmerged'|'dirty') to OrphanResolutionRequest; cli requiredResolutions reads record.category, validates (non-empty string in the known set when present), outputs category; resolveOneOrphan sets force=true only when present && !worktreeIsClean && row.category==='dirty' && resolution.category==='dirty', else refused-changed when the worktree is dirty."},
+        {"description": "Verify GREEN + typecheck.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts src/__tests__/cli.test.ts src/__tests__/tool-dispatch.test.ts && npx tsc --noEmit", "expected": "0 failed; tsc clean."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/workspace-service.ts worker/mcp-servers/workspace-manager/src/cli.ts worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts worker/mcp-servers/workspace-manager/src/__tests__/cli.test.ts worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 5,
+      "name": "obs#1 — distinct target-moved CAS outcome (workspace-service.ts)",
+      "description": "mergeOrphanThenReap returns refused-changed on update-ref CAS failure (target advanced concurrently), conflating it with 'orphan changed'. Return a distinct 'target-moved' outcome instead (a plain retry recomputes against the advanced target). No type change (outcome is a plain string). Identify the CAS-failure return by its `// target moved concurrently` comment (line numbers shift after earlier tasks).",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/workspace-service.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts"
+      ],
+      "depends_on": [4],
+      "steps": [
+        {"description": "RED (the CAS `expected` is snapshotted via rev-parse inside mergeOrphanThenReap at resolution time and the update-ref runs ~37 lines later, so the target must advance BETWEEN them — use the Task-3 spawn wrapper's beforeSpawn hook): surface a clean genuinely-unmerged orphan; const expected = git(root,'rev-parse','refs/heads/main'); let fired=false, concurrent=''; spawnControl.beforeSpawn = (args) => { if (!fired && args.includes('update-ref') && args.includes('refs/heads/main') && args[args.length-1]===expected) { fired=true; concurrent=git(root,'commit-tree', expected+'^{tree}','-p',expected,'-m','concurrent'); git(root,'update-ref','refs/heads/main',concurrent,expected); } }; resolveOrphan({resolutions:[{guid,action:'merge-then-reap'}]}). Assert fired===true (non-vacuous); outcome 'target-moved' (pre-fix 'refused-changed' -> RED); rev-parse refs/heads/main===concurrent (not clobbered); orphan branch tip unchanged; worktree present. Then spawnControl.beforeSpawn=null and re-run the same resolution -> 'merged-then-reaped' with main advanced past concurrent (proves the retry-succeeds semantics distinguishing target-moved from refused-changed).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts", "expected": "RED: the CAS-failure return is 'refused-changed' today."},
+        {"description": "GREEN: at the CAS-failure return (the `// target moved concurrently` line) return { id, guid, outcome: 'target-moved' }.", "expected": ""},
+        {"description": "Verify GREEN + typecheck.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts && npx tsc --noEmit", "expected": "0 failed; tsc clean."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/workspace-service.ts worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 6,
+      "name": "Outcome-contract + category docs, incl. Brain category source (orchestrator_mcp.py, workflow.md, README.md)",
+      "description": "Add 'target-moved' to both outcome lists in orchestrator_mcp.py (:4076-4078 and :7437-7439). In both resolutions descriptions (:4067-4068 and :7431-7432) note each entry may carry `category` (the surfaced [..] tag) so a consented reap --force only when consent covered a dirty worktree. workflow.md (:274/:278/:284): instruct the Brain to set `category` in a resolution ONLY from a tag/quoted surfaced label present in the operator's message (e.g. `reap ab12cd34 [dirty]`), never infer, omit otherwise; add optional category to the :278 resolutions schema example; revise :284 refused-changed to 'tip changed since surfacing OR uncommitted work the consent did not cover; for a [dirty] entry re-consent naming dirty, else re-surface' and add target-moved (target advanced concurrently — retry the same resolution). README.md :189 mirrors the outcome contract (target-moved + revised refused-changed + per-resolution category). This closes the operator-flow loop: without the Brain carrying the surfaced category tag, a bare `reap <id>` on a dirty entry would be refused-changed forever after I2.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/src/brain/rules/workflow.md",
+        "README.md",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [5],
+      "steps": [
+        {"description": "RED-or-none: if test_orchestrator_mcp.py asserts the outcome docstring set, extend it to require 'target-moved' (RED); else document 'No tests required: pure docstring/markdown documentation (no behavioral assertion for the outcome-list text)'.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -q", "expected": "RED if such an assertion exists; otherwise 0 failed."},
+        {"description": "GREEN: orchestrator_mcp.py add 'target-moved' to both outcome lists and the category note to both resolutions descriptions; workflow.md :274/:278 instruct the Brain to set category only from an operator-provided surfaced tag (never infer), add optional category to the :278 schema example; :284 revise refused-changed guidance and add target-moved; README.md :189 mirror.", "expected": ""},
+        {"description": "Verify.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -q", "expected": "0 failed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/src/brain/rules/workflow.md README.md commander/tests/test_orchestrator_mcp.py", "expected": "Staged."}
+      ]
+    }
+  ]
+}

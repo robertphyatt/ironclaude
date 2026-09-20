@@ -722,7 +722,7 @@ Do NOT run destructive or write commands during the reviewing stage."
       plan_ready)
         _PLAN_PATH=$(get_plan_json_path)
         if [ -n "$_PLAN_PATH" ]; then
-          NEXT_ACTION="SUGGESTED_NEXT_ACTION: $(ic_skill_ref "ironclaude:executing-plans" "${_PLAN_PATH} --mode=inline")"
+          NEXT_ACTION="SUGGESTED_NEXT_ACTION: $(ic_skill_ref "ironclaude:executing-plans" "${_PLAN_PATH} --mode=subagent-sequential")"
         fi
         ;;
     esac

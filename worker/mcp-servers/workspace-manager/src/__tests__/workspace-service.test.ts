@@ -3,10 +3,10 @@ import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createAssignment, createHumanIntent, initDb, recordIntegration } from '../db.js';
-import { worktreeIsClean } from '../git.js';
+import { canonicalDefaultBranchRef, ensureManagedWorktreeExclusion, gitSupportsMergeTreeWriteTree, worktreeIsClean } from '../git.js';
 import { WorkspaceService } from '../workspace-service.js';
 
 const OWNER = '019f7742-abd8-7c62-af7b-fe07189f1ffd';
@@ -38,10 +38,33 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }).trim();
 }
 
+// Shared pass-through spawnSync recorder: every git spawnSync call (from
+// git.ts and workspace-service.ts alike, since both import spawnSync from
+// 'node:child_process') is recorded here, and an optional hook can run
+// before each real call. Behavior is unchanged — it always delegates to the
+// real spawnSync — so this is safe for every existing test in this file.
+const spawnControl = vi.hoisted(() => ({
+  calls: [] as string[][],
+  beforeSpawn: null as null | ((args: readonly string[]) => void),
+}));
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return {
+    ...actual,
+    spawnSync: (cmd: string, args?: readonly string[], opts?: any) => {
+      spawnControl.calls.push([cmd, ...(args ?? [])]);
+      spawnControl.beforeSpawn?.(args ?? []);
+      return (actual.spawnSync as any)(cmd, args, opts);
+    },
+  };
+});
+
 describe('WorkspaceService real-Git lifecycle', () => {
   const directories: string[] = [];
 
   afterEach(() => {
+    spawnControl.calls.length = 0;
+    spawnControl.beforeSpawn = null;
     for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
   });
 
@@ -1601,5 +1624,1379 @@ describe('WorkspaceService real-Git lifecycle', () => {
     expect(clean.relinked[assignment.worktree_path]).toEqual(['models']);
     expect(lstatSync(join(assignment.worktree_path, 'models')).isSymbolicLink()).toBe(true);
     expect(worktreeIsClean(assignment.worktree_path)).toBe(true);
+  });
+
+  describe('canonicalDefaultBranchRef', () => {
+    it('returns refs/heads/<name> when origin/HEAD symbolically resolves to refs/remotes/origin/<name>', () => {
+      const root = repository();
+      git(root, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/trunk');
+
+      expect(canonicalDefaultBranchRef(root)).toBe('refs/heads/trunk');
+    });
+
+    it('falls back to refs/heads/main when origin/HEAD is unset', () => {
+      const root = repository();
+
+      expect(canonicalDefaultBranchRef(root)).toBe('refs/heads/main');
+    });
+  });
+
+  describe('reapAmbiguousOrphans', () => {
+    function orphanBranch(guid: string): string {
+      return `ironclaude/${guid}`;
+    }
+
+    function orphanPath(root: string, guid: string): string {
+      return join(root, '.ironclaude', 'worktrees', guid);
+    }
+
+    /** Builds a ROW-LESS orphan worktree directly with git: no assignments row is ever inserted. */
+    function createOrphanWorktree(root: string, guid: string, fromRef = 'HEAD'): string {
+      const worktreePath = orphanPath(root, guid);
+      git(root, 'worktree', 'add', '-b', orphanBranch(guid), worktreePath, fromRef);
+      return realpathSync(worktreePath);
+    }
+
+    function commitFile(worktreePath: string, name: string, content: string): void {
+      writeFileSync(join(worktreePath, name), content);
+      git(worktreePath, 'add', name);
+      git(worktreePath, 'commit', '-m', `add ${name}`);
+    }
+
+    it('reaps a clean orphan worktree whose branch tip is an ancestor of the primary branch under ttlHours:0', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.reaped).toEqual([orphanBranch(guid)]);
+      expect(existsSync(worktreePath)).toBe(false);
+      expect(git(root, 'branch', '--list', orphanBranch(guid))).toBe('');
+    });
+
+    it('preserves an orphan worktree with an uncommitted file as dirty', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      writeFileSync(join(worktreePath, 'dirty.txt'), 'uncommitted\n');
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.preservedDirty).toEqual([orphanBranch(guid)]);
+      expect(existsSync(worktreePath)).toBe(true);
+    });
+
+    it('preserves an orphan worktree whose branch has a commit not on the primary branch', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.preservedUnmerged).toEqual([orphanBranch(guid)]);
+      expect(existsSync(worktreePath)).toBe(true);
+    });
+
+    it('skips an orphan worktree path passed in protectedPaths as live', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+
+      const result = manager.reapAmbiguousOrphans({
+        repositoryPath: root,
+        ttlHours: 0,
+        protectedPaths: [worktreePath],
+      });
+
+      expect(result.skippedLive).toEqual([orphanBranch(guid)]);
+      expect(existsSync(worktreePath)).toBe(true);
+    });
+
+    it('deletes a dangling branch with no worktree when it is an ancestor of the primary branch', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      git(root, 'worktree', 'remove', '--force', worktreePath);
+      expect(existsSync(worktreePath)).toBe(false);
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.reaped).toEqual([orphanBranch(guid)]);
+      expect(git(root, 'branch', '--list', orphanBranch(guid))).toBe('');
+    });
+
+    it('preserves a dangling unmerged branch with no worktree', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+      git(root, 'worktree', 'remove', '--force', worktreePath);
+      expect(existsSync(worktreePath)).toBe(false);
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.preservedUnmerged).toEqual([orphanBranch(guid)]);
+      expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
+    });
+
+    it('skips a fresh commit as too young under a 24-hour ttl', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      commitFile(worktreePath, 'fresh.txt', 'fresh\n');
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 24 });
+
+      expect(result.skippedYoung).toEqual([orphanBranch(guid)]);
+      expect(existsSync(worktreePath)).toBe(true);
+    });
+
+    it('does not throw when a registered orphan worktree directory is gone, still reaps a second on-disk orphan, and reaps the dir-gone entry\'s dangling merged branch', () => {
+      const root = repository();
+      const manager = service(root);
+      const goneGuid = randomUUID();
+      const goneWorktreePath = createOrphanWorktree(root, goneGuid);
+      rmSync(goneWorktreePath, { recursive: true, force: true });
+      const liveGuid = randomUUID();
+      const liveWorktreePath = createOrphanWorktree(root, liveGuid);
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.errors).toEqual([]);
+      expect(result.reaped).toEqual(expect.arrayContaining([orphanBranch(liveGuid), orphanBranch(goneGuid)]));
+      expect(existsSync(liveWorktreePath)).toBe(false);
+      expect(git(root, 'branch', '--list', orphanBranch(liveGuid))).toBe('');
+      expect(git(root, 'branch', '--list', orphanBranch(goneGuid))).toBe('');
+    });
+
+    it('never invokes git worktree prune, and still does not throw when a registered orphan directory is gone', () => {
+      const root = repository();
+      const manager = service(root);
+      const goneGuid = randomUUID();
+      const goneWorktreePath = createOrphanWorktree(root, goneGuid);
+      rmSync(goneWorktreePath, { recursive: true, force: true });
+
+      spawnControl.calls.length = 0;
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.errors).toEqual([]);
+      const pruneCalls = spawnControl.calls.filter(
+        (call) => call.includes('worktree') && call.includes('prune'),
+      );
+      expect(pruneCalls).toEqual([]);
+    });
+
+    it('force-removes a MERGED dir-gone orphan via the targeted removeWorktree({force:true}) path (not a blanket prune)', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      commitFile(worktreePath, 'feature.txt', 'feature\n');
+      // Merge the orphan branch's content into main so its tip is an ancestor
+      // of the integration target before its directory is removed outside git.
+      git(root, 'merge', '--no-ff', '-m', 'merge orphan branch', orphanBranch(guid));
+      rmSync(worktreePath, { recursive: true, force: true });
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.errors).toEqual([]);
+      expect(result.reaped).toEqual([orphanBranch(guid)]);
+      expect(git(root, 'branch', '--list', orphanBranch(guid))).toBe('');
+    });
+
+    it('preserves an UNMERGED dir-gone orphan rather than force-removing it (never-lose-work)', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+      rmSync(worktreePath, { recursive: true, force: true });
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.errors).toEqual([]);
+      expect(result.preservedUnmerged).toEqual([orphanBranch(guid)]);
+      expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
+    });
+
+    it('reports a PARTIAL reap honestly when the worktree is removed but the branch delete then fails', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      // Force `git branch -D` to fail after `git worktree remove` has already
+      // succeeded: a stale <ref>.lock file makes git refuse to update the ref.
+      const headsDir = join(root, '.git', 'refs', 'heads', 'ironclaude');
+      mkdirSync(headsDir, { recursive: true });
+      writeFileSync(join(headsDir, `${guid}.lock`), '');
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.reapedWorktreeOnly).toEqual([orphanBranch(guid)]);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].name).toBe(orphanBranch(guid));
+      expect(result.reaped).toEqual([]);
+      expect(existsSync(worktreePath)).toBe(false);
+      expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
+    });
+
+    it('the hasNonCleanedAssignment guard alone blocks reaping a tracked dangling branch', () => {
+      const root = repository();
+      const database = initDb(join(root, 'guard.db'));
+      const manager = new WorkspaceService(database);
+      const assignment = manager.ensureSessionWorktree({ repositoryPath: root, ownerSessionId: OWNER });
+      git(root, 'worktree', 'remove', '--force', assignment.worktree_path);
+      expect(existsSync(assignment.worktree_path)).toBe(false);
+      database.prepare("UPDATE assignments SET lifecycle_status = 'integrated' WHERE workspace_guid = ?")
+        .run(assignment.workspace_guid);
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.reaped).toEqual([]);
+      expect(result.skippedYoung).toEqual([]);
+      expect(result.preservedUnmerged).toEqual([]);
+      expect(result.errors).toEqual([]);
+      expect(git(root, 'branch', '--list', assignment.branch)).not.toBe('');
+    });
+
+    it('classifies a squash-merged orphan as squash-merged in preservedDetail', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      commitFile(worktreePath, 'feature.txt', 'feature\n');
+      const tip = git(worktreePath, 'rev-parse', 'HEAD');
+      git(root, 'worktree', 'remove', '--force', worktreePath);
+
+      git(root, 'merge', '-q', '--squash', orphanBranch(guid));
+      git(root, 'commit', '-m', 'squash-merge orphan branch');
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.preservedUnmerged).toEqual([orphanBranch(guid)]);
+      const detail = result.preservedDetail.find((d) => d.guid === guid);
+      expect(detail?.category).toBe('squash-merged');
+      expect(detail?.tip).toBe(tip);
+      expect(detail?.worktreePresent).toBe(false);
+      expect(detail?.evidence).toContain('refs/heads/main');
+    });
+
+    it('classifies a genuinely unmerged orphan as genuinely-unmerged in preservedDetail', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+      const tip = git(worktreePath, 'rev-parse', 'HEAD');
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.preservedUnmerged).toEqual([orphanBranch(guid)]);
+      const detail = result.preservedDetail.find((d) => d.guid === guid);
+      expect(detail?.category).toBe('genuinely-unmerged');
+      expect(detail?.tip).toBe(tip);
+      expect(detail?.worktreePresent).toBe(true);
+      expect(detail?.evidence).toContain('refs/heads/main');
+    });
+
+    it('classifies as merged-on-origin when content reached origin but not local target', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      commitFile(worktreePath, 'feature.txt', 'feature\n');
+      const tip = git(worktreePath, 'rev-parse', 'HEAD');
+      git(root, 'worktree', 'remove', '--force', worktreePath);
+
+      // Squash the orphan's content onto a throwaway branch (never touching
+      // local main), then point refs/remotes/origin/main at that squash
+      // commit: origin has the content, local main does not.
+      const tmpPath = join(root, '.tmp-origin-squash');
+      git(root, 'worktree', 'add', '-b', 'tmp-origin-squash', tmpPath, 'main');
+      git(tmpPath, 'merge', '-q', '--squash', orphanBranch(guid));
+      git(tmpPath, 'commit', '-m', 'squash for origin');
+      const originSha = git(tmpPath, 'rev-parse', 'HEAD');
+      git(root, 'worktree', 'remove', '--force', tmpPath);
+      git(root, 'branch', '-D', 'tmp-origin-squash');
+      git(root, 'update-ref', 'refs/remotes/origin/main', originSha);
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.preservedUnmerged).toEqual([orphanBranch(guid)]);
+      const detail = result.preservedDetail.find((d) => d.guid === guid);
+      expect(detail?.category).toBe('merged-on-origin');
+      expect(detail?.tip).toBe(tip);
+      expect(detail?.evidence).toContain('refs/remotes/origin/main');
+    });
+
+    it('skips the origin merged-check when refs/remotes/origin/<target> is at/behind local target', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+      git(root, 'update-ref', 'refs/remotes/origin/main', git(root, 'rev-parse', 'main'));
+
+      const primaryCheckoutPath = realpathSync(root);
+      spawnControl.calls.length = 0;
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      const detail = result.preservedDetail.find((d) => d.guid === guid);
+      expect(detail?.category).toBe('genuinely-unmerged');
+
+      const expectedGateCall = [
+        'git', '-C', primaryCheckoutPath, 'merge-base', '--is-ancestor', 'refs/remotes/origin/main', 'refs/heads/main',
+      ];
+      const gateCalls = spawnControl.calls.filter(
+        (call) => JSON.stringify(call) === JSON.stringify(expectedGateCall),
+      );
+      expect(gateCalls).toHaveLength(1);
+
+      const originCherryCalls = spawnControl.calls.filter((call) =>
+        call.some((token) => token === 'cherry') && call.includes('refs/remotes/origin/main'));
+      expect(originCherryCalls).toEqual([]);
+
+      expect(existsSync(worktreePath)).toBe(true);
+    });
+
+    it('classifies a dirty orphan worktree as dirty in preservedDetail', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      writeFileSync(join(worktreePath, 'dirty.txt'), 'uncommitted\n');
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.preservedDirty).toEqual([orphanBranch(guid)]);
+      const detail = result.preservedDetail.find((d) => d.guid === guid);
+      expect(detail?.category).toBe('dirty');
+      expect(detail?.worktreePresent).toBe(true);
+    });
+
+    it('discloses unmerged committed work in the evidence of a dirty orphan whose branch also has a commit not on the target', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+      writeFileSync(join(worktreePath, 'dirty.txt'), 'uncommitted\n');
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.preservedDirty).toEqual([orphanBranch(guid)]);
+      const detail = result.preservedDetail.find((d) => d.guid === guid);
+      expect(detail?.category).toBe('dirty');
+      expect(detail?.evidence).toContain('unmerged');
+    });
+
+    it('omits unmerged-commit evidence for a dirty orphan whose branch is an ancestor of the target', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      writeFileSync(join(worktreePath, 'dirty.txt'), 'uncommitted\n');
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.preservedDirty).toEqual([orphanBranch(guid)]);
+      const detail = result.preservedDetail.find((d) => d.guid === guid);
+      expect(detail?.category).toBe('dirty');
+      expect(detail?.evidence).not.toContain('unmerged');
+    });
+
+    it('assigns a stable 8-hex id derived from the guid AND tip, identical across repeated calls while the tip is unchanged', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+      const tip = git(worktreePath, 'rev-parse', 'HEAD');
+
+      const first = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+      const second = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      const firstDetail = first.preservedDetail.find((d) => d.guid === guid);
+      const secondDetail = second.preservedDetail.find((d) => d.guid === guid);
+      expect(firstDetail?.id).toMatch(/^[0-9a-f]{8}$/);
+      expect(firstDetail?.id).toBe(secondDetail?.id);
+      expect(firstDetail?.id).toBe(createHash('sha256').update(`${guid}\0${tip}`).digest('hex').slice(0, 8));
+    });
+
+    it('changes the surfaced id when the branch tip moves (id is tip-bound, not guid-only)', () => {
+      const root = repository();
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      commitFile(worktreePath, 'first.txt', 'first\n');
+
+      const atTipA = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+      const idX = atTipA.preservedDetail.find((d) => d.guid === guid)!.id;
+
+      commitFile(worktreePath, 'second.txt', 'second\n');
+      const atTipB = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+      const idY = atTipB.preservedDetail.find((d) => d.guid === guid)!.id;
+
+      expect(idY).not.toBe(idX);
+    });
+
+    it('upserts the orphan_surface row for each preserved orphan and deletes it once the orphan is reaped', () => {
+      const root = repository();
+      const database = initDb(join(root, 'orphan-surface.db'));
+      const manager = new WorkspaceService(database);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+      const tip = git(worktreePath, 'rev-parse', 'HEAD');
+
+      const first = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+      expect(first.preservedUnmerged).toEqual([orphanBranch(guid)]);
+
+      const row = database.prepare(
+        'SELECT tip, category FROM orphan_surface WHERE repository_identity = ? AND workspace_guid = ?',
+      ).get(first.repositoryIdentity, guid) as { tip: string; category: string } | undefined;
+      expect(row).toBeTruthy();
+      expect(row?.tip).toBe(tip);
+      expect(row?.category).toBe('genuinely-unmerged');
+
+      // Merge the orphan branch's content into main so the next sweep finds it an ancestor and reaps it.
+      git(root, 'merge', '--no-ff', '-m', 'merge orphan branch', orphanBranch(guid));
+
+      const second = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+      expect(second.reaped).toEqual([orphanBranch(guid)]);
+
+      const rowAfter = database.prepare(
+        'SELECT 1 FROM orphan_surface WHERE repository_identity = ? AND workspace_guid = ?',
+      ).get(second.repositoryIdentity, guid);
+      expect(rowAfter).toBeUndefined();
+    });
+
+    it('computes muted true only when the persisted muted_tip matches the current tip', () => {
+      const root = repository();
+      const database = initDb(join(root, 'orphan-muted.db'));
+      const manager = new WorkspaceService(database);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+      const tip = git(worktreePath, 'rev-parse', 'HEAD');
+
+      const first = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+      const firstDetail = first.preservedDetail.find((d) => d.guid === guid);
+      expect(firstDetail?.muted).toBe(false);
+
+      database.prepare(
+        'UPDATE orphan_surface SET muted_tip = ? WHERE repository_identity = ? AND workspace_guid = ?',
+      ).run(tip, first.repositoryIdentity, guid);
+
+      const second = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+      const secondDetail = second.preservedDetail.find((d) => d.guid === guid);
+      expect(secondDetail?.muted).toBe(true);
+      expect(secondDetail?.tip).toBe(tip);
+
+      commitFile(worktreePath, 'more.txt', 'more\n');
+      const newTip = git(worktreePath, 'rev-parse', 'HEAD');
+
+      const third = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+      const thirdDetail = third.preservedDetail.find((d) => d.guid === guid);
+      expect(thirdDetail?.tip).toBe(newTip);
+      expect(thirdDetail?.muted).toBe(false);
+    });
+
+    it('classifies a squash-merge into a non-main primary branch using the reaper target, not a hardcoded refs/heads/main', () => {
+      const directory = mkdtempSync(join(tmpdir(), 'ironclaude-orphan-trunk-'));
+      directories.push(directory);
+      git(directory, 'init', '--initial-branch=trunk');
+      git(directory, 'config', 'user.name', 'Workspace Test');
+      git(directory, 'config', 'user.email', 'workspace-test@example.invalid');
+      writeFileSync(join(directory, 'README.md'), 'initial\n');
+      git(directory, 'add', 'README.md');
+      git(directory, 'commit', '-m', 'initial');
+
+      const manager = service(directory);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(directory, guid);
+      commitFile(worktreePath, 'feature.txt', 'feature\n');
+      git(directory, 'worktree', 'remove', '--force', worktreePath);
+
+      git(directory, 'merge', '-q', '--squash', orphanBranch(guid));
+      git(directory, 'commit', '-m', 'squash-merge orphan branch into trunk');
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: directory, ttlHours: 0 });
+
+      const detail = result.preservedDetail.find((d) => d.guid === guid);
+      expect(detail?.category).toBe('squash-merged');
+      expect(detail?.evidence).toContain('refs/heads/trunk');
+    });
+
+    describe('resolveOrphan', () => {
+      it('reaps a surfaced clean orphan by id: removes worktree, deletes branch, drops the surface row, writes an audit row, outcome reaped', () => {
+        const root = repository();
+        const database = initDb(join(root, 'resolve-reap.db'));
+        const manager = new WorkspaceService(database);
+        const guid = randomUUID();
+        const worktreePath = createOrphanWorktree(root, guid);
+        commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+
+        const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+        expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+        const detail = surfaced.preservedDetail.find((d) => d.guid === guid);
+        expect(detail).toBeTruthy();
+
+        const result = manager.resolveOrphan({
+          repositoryPath: root,
+          resolutions: [{ id: detail!.id, action: 'reap' }],
+        });
+
+        expect(result.results).toEqual([{ id: detail!.id, guid, outcome: 'reaped' }]);
+        expect(existsSync(worktreePath)).toBe(false);
+        expect(git(root, 'branch', '--list', orphanBranch(guid))).toBe('');
+
+        const surfaceRow = database.prepare(
+          'SELECT 1 FROM orphan_surface WHERE repository_identity = ? AND workspace_guid = ?',
+        ).get(surfaced.repositoryIdentity, guid);
+        expect(surfaceRow).toBeUndefined();
+
+        const audit = database.prepare(
+          'SELECT action, outcome FROM orphan_resolution_audit WHERE workspace_guid = ?',
+        ).get(guid) as { action: string; outcome: string } | undefined;
+        expect(audit).toEqual({ action: 'reap', outcome: 'reaped' });
+      });
+
+      it('force-removes a MERGED dir-gone orphan via resolveOrphan\'s registered-but-not-present reap path', () => {
+        const root = repository();
+        const database = initDb(join(root, 'resolve-dir-gone.db'));
+        const manager = new WorkspaceService(database);
+        const guid = randomUUID();
+        const worktreePath = createOrphanWorktree(root, guid);
+        commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+
+        const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+        expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+        const id = surfaced.preservedDetail.find((d) => d.guid === guid)!.id;
+
+        // Merge the branch after surfacing (its own ref tip is unaffected by
+        // being merged elsewhere), then remove its directory outside git so
+        // the worktree is registered but not present at resolution time.
+        git(root, 'merge', '--no-ff', '-m', 'merge orphan branch', orphanBranch(guid));
+        rmSync(worktreePath, { recursive: true, force: true });
+
+        const result = manager.resolveOrphan({
+          repositoryPath: root,
+          resolutions: [{ id, action: 'reap' }],
+        });
+
+        expect(result.results[0].outcome).toBe('reaped');
+        expect(git(root, 'branch', '--list', orphanBranch(guid))).toBe('');
+      });
+
+      it('refuses reap as refused-changed (addressed by the tip-bound id surfaced BEFORE the move) when the branch tip moved after surfacing, and leaves the surface row tip UNCHANGED', () => {
+        const root = repository();
+        const database = initDb(join(root, 'resolve-tip-moved.db'));
+        const manager = new WorkspaceService(database);
+        const guid = randomUUID();
+        const worktreePath = createOrphanWorktree(root, guid);
+        commitFile(worktreePath, 'first.txt', 'first\n');
+
+        const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+        expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+        const surfacedId = surfaced.preservedDetail.find((d) => d.guid === guid)!.id;
+
+        const surfacedTip = git(worktreePath, 'rev-parse', 'HEAD');
+        commitFile(worktreePath, 'second.txt', 'second\n');
+
+        const result = manager.resolveOrphan({
+          repositoryPath: root,
+          resolutions: [{ id: surfacedId, action: 'reap' }],
+        });
+
+        expect(result.results[0].outcome).toBe('refused-changed');
+        expect(existsSync(worktreePath)).toBe(true);
+        expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
+
+        const row = database.prepare(
+          'SELECT tip FROM orphan_surface WHERE repository_identity = ? AND workspace_guid = ?',
+        ).get(surfaced.repositoryIdentity, guid) as { tip: string } | undefined;
+        expect(row?.tip).toBe(surfacedTip);
+
+        // A refusal must never rewrite the surfaced tip: a second reap attempt
+        // against the same (still stale) row must refuse again, not succeed
+        // because the first refusal silently "caught up" the row.
+        const second = manager.resolveOrphan({
+          repositoryPath: root,
+          resolutions: [{ id: surfacedId, action: 'reap' }],
+        });
+        expect(second.results[0].outcome).toBe('refused-changed');
+        expect(existsSync(worktreePath)).toBe(true);
+        expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
+      });
+
+      it('a tip-bound id from BEFORE the move is not-surfaced (never-lose-work) once a re-sweep has replaced it with the current id, while the current id proceeds', () => {
+        const root = repository();
+        const database = initDb(join(root, 'resolve-id-tip-bound.db'));
+        const manager = new WorkspaceService(database);
+        const guid = randomUUID();
+        const worktreePath = createOrphanWorktree(root, guid);
+        commitFile(worktreePath, 'first.txt', 'first\n');
+
+        const surfacedA = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+        const idX = surfacedA.preservedDetail.find((d) => d.guid === guid)!.id;
+
+        commitFile(worktreePath, 'second.txt', 'second\n');
+        const surfacedB = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+        const idY = surfacedB.preservedDetail.find((d) => d.guid === guid)!.id;
+        expect(idY).not.toBe(idX);
+
+        const staleResult = manager.resolveOrphan({
+          repositoryPath: root,
+          resolutions: [{ id: idX, action: 'reap' }],
+        });
+        expect(staleResult.results[0].outcome).toBe('not-surfaced');
+        expect(existsSync(worktreePath)).toBe(true);
+        expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
+
+        const currentResult = manager.resolveOrphan({
+          repositoryPath: root,
+          resolutions: [{ id: idY, action: 'reap' }],
+        });
+        expect(currentResult.results[0].outcome).toBe('reaped');
+        expect(existsSync(worktreePath)).toBe(false);
+        expect(git(root, 'branch', '--list', orphanBranch(guid))).toBe('');
+      });
+
+      it('id governs over guid when a resolution carries BOTH: a stale tip-bound id is not-surfaced even though the (stable) guid still resolves at the new tip (never-lose-work)', () => {
+        const root = repository();
+        const database = initDb(join(root, 'resolve-id-governs-over-guid.db'));
+        const manager = new WorkspaceService(database);
+        const guid = randomUUID();
+        const worktreePath = createOrphanWorktree(root, guid);
+        commitFile(worktreePath, 'first.txt', 'first\n');
+
+        const surfacedA = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+        const idX = surfacedA.preservedDetail.find((d) => d.guid === guid)!.id;
+
+        commitFile(worktreePath, 'second.txt', 'second\n');
+        const surfacedB = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+        const idY = surfacedB.preservedDetail.find((d) => d.guid === guid)!.id;
+        expect(idY).not.toBe(idX);
+
+        // Resolution carries BOTH the stale id (X, bound to the tip surfaced
+        // before the second commit) and the still-valid guid. If guid were
+        // consulted first (or at all, once id is present) this would resolve
+        // against the CURRENT row (tip B) and reap it — discarding the new
+        // work the stale id was refused over. The id must govern: id X is not
+        // found for the CURRENT row (its own lookup by short_id fails, since
+        // the row's short_id is now Y), so this must refuse as not-surfaced
+        // with zero fall-through to the guid.
+        const staleResult = manager.resolveOrphan({
+          repositoryPath: root,
+          resolutions: [{ id: idX, guid, action: 'reap' }],
+        });
+        expect(staleResult.results[0].outcome).toBe('not-surfaced');
+        expect(existsSync(worktreePath)).toBe(true);
+        expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
+
+        // The current id (Y) together with the same guid proceeds normally.
+        const currentResult = manager.resolveOrphan({
+          repositoryPath: root,
+          resolutions: [{ id: idY, guid, action: 'reap' }],
+        });
+        expect(currentResult.results[0].outcome).toBe('reaped');
+        expect(existsSync(worktreePath)).toBe(false);
+        expect(git(root, 'branch', '--list', orphanBranch(guid))).toBe('');
+      });
+
+      it('reports not-surfaced for a guid with no orphan_surface row (action keep: guid-only addressing is not itself the reason for the refusal here)', () => {
+        const root = repository();
+        const database = initDb(join(root, 'resolve-not-surfaced.db'));
+        const manager = new WorkspaceService(database);
+        const guid = randomUUID();
+
+        const result = manager.resolveOrphan({
+          repositoryPath: root,
+          resolutions: [{ guid, action: 'keep' }],
+        });
+
+        expect(result.results).toEqual([{ id: '', guid, outcome: 'not-surfaced' }]);
+      });
+
+      describe('guid-only addressing (no id) is refused for destructive actions', () => {
+        it('refuses reap addressed by guid alone, without touching the worktree or branch', () => {
+          const root = repository();
+          const database = initDb(join(root, 'resolve-guid-refused-reap.db'));
+          const manager = new WorkspaceService(database);
+          const guid = randomUUID();
+          const worktreePath = createOrphanWorktree(root, guid);
+          commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+
+          const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+          expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+
+          const result = manager.resolveOrphan({
+            repositoryPath: root,
+            resolutions: [{ guid, action: 'reap' }],
+          });
+
+          expect(result.results[0].outcome).toBe('refused-changed');
+          expect(existsSync(worktreePath)).toBe(true);
+          expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
+        });
+
+        it('refuses merge-then-reap addressed by guid alone, without moving the target ref or touching the worktree', () => {
+          const root = repository();
+          const database = initDb(join(root, 'resolve-guid-refused-merge.db'));
+          const manager = new WorkspaceService(database);
+          const guid = randomUUID();
+          const worktreePath = createOrphanWorktree(root, guid);
+          commitFile(worktreePath, 'ff.txt', 'ff\n');
+          const mainTipBefore = git(root, 'rev-parse', 'refs/heads/main');
+
+          const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+          expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+
+          const result = manager.resolveOrphan({
+            repositoryPath: root,
+            resolutions: [{ guid, action: 'merge-then-reap' }],
+          });
+
+          expect(result.results[0].outcome).toBe('refused-changed');
+          expect(git(root, 'rev-parse', 'refs/heads/main')).toBe(mainTipBefore);
+          expect(existsSync(worktreePath)).toBe(true);
+          expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
+        });
+
+        it('still allows action keep addressed by guid alone', () => {
+          const root = repository();
+          const database = initDb(join(root, 'resolve-guid-keep-allowed.db'));
+          const manager = new WorkspaceService(database);
+          const guid = randomUUID();
+          const worktreePath = createOrphanWorktree(root, guid);
+          commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+          const tip = git(worktreePath, 'rev-parse', 'HEAD');
+
+          const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+          expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+
+          const result = manager.resolveOrphan({
+            repositoryPath: root,
+            resolutions: [{ guid, action: 'keep' }],
+          });
+
+          expect(result.results[0].outcome).toBe('kept');
+          const row = database.prepare(
+            'SELECT muted_tip FROM orphan_surface WHERE repository_identity = ? AND workspace_guid = ?',
+          ).get(surfaced.repositoryIdentity, guid) as { muted_tip: string | null } | undefined;
+          expect(row?.muted_tip).toBe(tip);
+        });
+      });
+
+      it('force-removes a dirty orphan that was surfaced as category dirty when action is reap', () => {
+        const root = repository();
+        const database = initDb(join(root, 'resolve-dirty.db'));
+        const manager = new WorkspaceService(database);
+        const guid = randomUUID();
+        const worktreePath = createOrphanWorktree(root, guid);
+        writeFileSync(join(worktreePath, 'dirty.txt'), 'uncommitted\n');
+
+        const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+        expect(surfaced.preservedDirty).toEqual([orphanBranch(guid)]);
+        const id = surfaced.preservedDetail.find((d) => d.guid === guid)!.id;
+
+        const result = manager.resolveOrphan({
+          repositoryPath: root,
+          resolutions: [{ id, action: 'reap', category: 'dirty' }],
+        });
+
+        expect(result.results[0].outcome).toBe('reaped');
+        expect(existsSync(worktreePath)).toBe(false);
+        expect(git(root, 'branch', '--list', orphanBranch(guid))).toBe('');
+      });
+
+      describe('reap force requires consent that matches BOTH the current row category and the resolution\'s own category claim', () => {
+        /**
+         * Surfaces an orphan as clean genuinely-unmerged (sweep #1), then adds
+         * uncommitted work with no new commit (tip unchanged) and reruns the
+         * sweep (sweep #2) so the persisted `orphan_surface.category` flips to
+         * 'dirty' independently of whatever category any pending consent named.
+         * This is the exact shape of the I2 attack: consent obtained against a
+         * genuinely-unmerged surface, then the daemon sweep silently upgrades
+         * the row to dirty before the consent is spent.
+         */
+        function surfaceGenuinelyUnmergedThenDirty(
+          root: string,
+          database: ReturnType<typeof initDb>,
+          manager: WorkspaceService,
+          guid: string,
+        ): { worktreePath: string; tip: string; id: string } {
+          const worktreePath = createOrphanWorktree(root, guid);
+          commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+          const tip = git(worktreePath, 'rev-parse', 'HEAD');
+
+          const first = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+          const firstDetail = first.preservedDetail.find((d) => d.guid === guid);
+          expect(firstDetail?.category).toBe('genuinely-unmerged');
+
+          writeFileSync(join(worktreePath, 'dirty.txt'), 'uncommitted\n');
+
+          const second = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+          expect(second.preservedDirty).toEqual([orphanBranch(guid)]);
+
+          const row = database.prepare(
+            'SELECT category, tip FROM orphan_surface WHERE repository_identity = ? AND workspace_guid = ?',
+          ).get(second.repositoryIdentity, guid) as { category: string; tip: string } | undefined;
+          expect(row).toEqual({ category: 'dirty', tip });
+          const id = second.preservedDetail.find((d) => d.guid === guid)!.id;
+
+          return { worktreePath, tip, id };
+        }
+
+        it('refuses reap as refused-changed when consent named the now-stale genuinely-unmerged category (RED pre-fix: reaped)', () => {
+          const root = repository();
+          const database = initDb(join(root, 'resolve-stale-consent.db'));
+          const manager = new WorkspaceService(database);
+          const guid = randomUUID();
+          const { worktreePath, id } = surfaceGenuinelyUnmergedThenDirty(root, database, manager, guid);
+
+          const result = manager.resolveOrphan({
+            repositoryPath: root,
+            resolutions: [{ id, action: 'reap', category: 'genuinely-unmerged' }],
+          });
+
+          expect(result.results[0].outcome).toBe('refused-changed');
+          expect(existsSync(worktreePath)).toBe(true);
+          expect(existsSync(join(worktreePath, 'dirty.txt'))).toBe(true);
+          expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
+        });
+
+        it('reaps when consent explicitly names the current dirty category (regression guard, passes pre- and post-fix)', () => {
+          const root = repository();
+          const database = initDb(join(root, 'resolve-explicit-dirty-consent.db'));
+          const manager = new WorkspaceService(database);
+          const guid = randomUUID();
+          const { worktreePath, id } = surfaceGenuinelyUnmergedThenDirty(root, database, manager, guid);
+
+          const result = manager.resolveOrphan({
+            repositoryPath: root,
+            resolutions: [{ id, action: 'reap', category: 'dirty' }],
+          });
+
+          expect(result.results[0].outcome).toBe('reaped');
+          expect(existsSync(worktreePath)).toBe(false);
+          expect(git(root, 'branch', '--list', orphanBranch(guid))).toBe('');
+        });
+
+        it('refuses reap as refused-changed when the resolution omits category entirely (RED pre-fix: reaped)', () => {
+          const root = repository();
+          const database = initDb(join(root, 'resolve-no-category.db'));
+          const manager = new WorkspaceService(database);
+          const guid = randomUUID();
+          const { worktreePath, id } = surfaceGenuinelyUnmergedThenDirty(root, database, manager, guid);
+
+          const result = manager.resolveOrphan({
+            repositoryPath: root,
+            resolutions: [{ id, action: 'reap' }],
+          });
+
+          expect(result.results[0].outcome).toBe('refused-changed');
+          expect(existsSync(worktreePath)).toBe(true);
+          expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
+        });
+
+        it('refuses reap as refused-changed when consent claims dirty but the persisted row has not caught up (row.category conjunct guard, passes pre- and post-fix)', () => {
+          const root = repository();
+          const database = initDb(join(root, 'resolve-row-not-dirty.db'));
+          const manager = new WorkspaceService(database);
+          const guid = randomUUID();
+          const worktreePath = createOrphanWorktree(root, guid);
+          commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+
+          const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+          const detail = surfaced.preservedDetail.find((d) => d.guid === guid);
+          expect(detail?.category).toBe('genuinely-unmerged');
+
+          // Dirty the worktree WITHOUT a second sweep: row.category stays
+          // 'genuinely-unmerged' even though this (lying) resolution claims dirty.
+          writeFileSync(join(worktreePath, 'dirty.txt'), 'uncommitted\n');
+
+          const result = manager.resolveOrphan({
+            repositoryPath: root,
+            resolutions: [{ id: detail!.id, action: 'reap', category: 'dirty' }],
+          });
+
+          expect(result.results[0].outcome).toBe('refused-changed');
+          expect(existsSync(worktreePath)).toBe(true);
+          expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
+        });
+      });
+
+      it('skips a resolution as skipped-live when the worktree path is protected', () => {
+        const root = repository();
+        const database = initDb(join(root, 'resolve-skipped-live.db'));
+        const manager = new WorkspaceService(database);
+        const guid = randomUUID();
+        const worktreePath = createOrphanWorktree(root, guid);
+        commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+
+        const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+        expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+        const id = surfaced.preservedDetail.find((d) => d.guid === guid)!.id;
+
+        const result = manager.resolveOrphan({
+          repositoryPath: root,
+          protectedPaths: [worktreePath],
+          resolutions: [{ id, action: 'reap' }],
+        });
+
+        expect(result.results[0].outcome).toBe('skipped-live');
+        expect(existsSync(worktreePath)).toBe(true);
+        expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
+      });
+
+      it('mutes with action keep: sets muted_tip to the current tip, outcome kept, nothing removed', () => {
+        const root = repository();
+        const database = initDb(join(root, 'resolve-keep.db'));
+        const manager = new WorkspaceService(database);
+        const guid = randomUUID();
+        const worktreePath = createOrphanWorktree(root, guid);
+        commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+        const tip = git(worktreePath, 'rev-parse', 'HEAD');
+
+        const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+        expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+
+        const result = manager.resolveOrphan({
+          repositoryPath: root,
+          resolutions: [{ guid, action: 'keep' }],
+        });
+
+        expect(result.results[0].outcome).toBe('kept');
+        expect(existsSync(worktreePath)).toBe(true);
+        expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
+
+        const row = database.prepare(
+          'SELECT muted_tip FROM orphan_surface WHERE repository_identity = ? AND workspace_guid = ?',
+        ).get(surfaced.repositoryIdentity, guid) as { muted_tip: string | null } | undefined;
+        expect(row?.muted_tip).toBe(tip);
+      });
+
+      it('resolves by short id as well as by guid', () => {
+        const root = repository();
+        const database = initDb(join(root, 'resolve-short-id.db'));
+        const manager = new WorkspaceService(database);
+        const guid = randomUUID();
+        const worktreePath = createOrphanWorktree(root, guid);
+        commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+
+        const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+        const shortId = surfaced.preservedDetail.find((d) => d.guid === guid)!.id;
+
+        const result = manager.resolveOrphan({
+          repositoryPath: root,
+          resolutions: [{ id: shortId, action: 'reap' }],
+        });
+
+        expect(result.results).toEqual([{ id: shortId, guid, outcome: 'reaped' }]);
+        expect(existsSync(worktreePath)).toBe(false);
+        expect(git(root, 'branch', '--list', orphanBranch(guid))).toBe('');
+      });
+
+      it('keep succeeds even when the primary checkout is in detached HEAD', () => {
+        const root = repository();
+        const database = initDb(join(root, 'resolve-keep-detached.db'));
+        const manager = new WorkspaceService(database);
+        const guid = randomUUID();
+        const worktreePath = createOrphanWorktree(root, guid);
+        commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+        const tip = git(worktreePath, 'rev-parse', 'HEAD');
+
+        const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+        expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+
+        git(root, 'checkout', '--detach');
+
+        const result = manager.resolveOrphan({
+          repositoryPath: root,
+          resolutions: [{ guid, action: 'keep' }],
+        });
+
+        expect(result.results[0].outcome).toBe('kept');
+        const row = database.prepare(
+          'SELECT muted_tip FROM orphan_surface WHERE repository_identity = ? AND workspace_guid = ?',
+        ).get(surfaced.repositoryIdentity, guid) as { muted_tip: string | null } | undefined;
+        expect(row?.muted_tip).toBe(tip);
+      });
+
+      describe('merge-then-reap', () => {
+        const gitSupportsTrueMerge = gitSupportsMergeTreeWriteTree();
+
+        it('fast-forwards the target ref to the orphan tip, then reaps, when the target is an ancestor of the orphan', () => {
+          const root = repository();
+          const database = initDb(join(root, 'resolve-merge-ff.db'));
+          const manager = new WorkspaceService(database);
+          const guid = randomUUID();
+          const worktreePath = createOrphanWorktree(root, guid);
+          commitFile(worktreePath, 'ff.txt', 'ff\n');
+          const orphanTip = git(worktreePath, 'rev-parse', 'HEAD');
+
+          const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+          expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+          const id = surfaced.preservedDetail.find((d) => d.guid === guid)!.id;
+
+          const result = manager.resolveOrphan({
+            repositoryPath: root,
+            resolutions: [{ id, action: 'merge-then-reap' }],
+          });
+
+          expect(result.results[0].outcome).toBe('merged-then-reaped');
+          expect(git(root, 'rev-parse', 'refs/heads/main')).toBe(orphanTip);
+          expect(existsSync(worktreePath)).toBe(false);
+          expect(git(root, 'branch', '--list', orphanBranch(guid))).toBe('');
+          const surfaceRow = database.prepare(
+            'SELECT 1 FROM orphan_surface WHERE repository_identity = ? AND workspace_guid = ?',
+          ).get(surfaced.repositoryIdentity, guid);
+          expect(surfaceRow).toBeUndefined();
+        });
+
+        it('force-removes a registered-but-directory-gone orphan via the targeted removeWorktree({force:true}) path when merge-then-reaping (mirrors the plain-reap dir-gone path)', () => {
+          const root = repository();
+          const database = initDb(join(root, 'resolve-merge-dir-gone.db'));
+          const manager = new WorkspaceService(database);
+          const guid = randomUUID();
+          const worktreePath = createOrphanWorktree(root, guid);
+          commitFile(worktreePath, 'ff.txt', 'ff\n');
+          const orphanTip = git(worktreePath, 'rev-parse', 'HEAD');
+
+          const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+          expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+          const id = surfaced.preservedDetail.find((d) => d.guid === guid)!.id;
+
+          // Directory removed outside git after consent was surfaced: git's
+          // worktree administration still references the path (registered),
+          // but nothing exists on disk (not present). The merge/ancestor logic
+          // still runs and advances the target ref; the worktree cleanup then
+          // needs the SAME targeted force-remove the plain reap path already
+          // has, so the branch delete below is not refused as "used by worktree".
+          rmSync(worktreePath, { recursive: true, force: true });
+
+          const result = manager.resolveOrphan({
+            repositoryPath: root,
+            resolutions: [{ id, action: 'merge-then-reap' }],
+          });
+
+          expect(result.results[0].outcome).toBe('merged-then-reaped');
+          expect(git(root, 'rev-parse', 'refs/heads/main')).toBe(orphanTip);
+          expect(git(root, 'branch', '--list', orphanBranch(guid))).toBe('');
+          const surfaceRow = database.prepare(
+            'SELECT 1 FROM orphan_surface WHERE repository_identity = ? AND workspace_guid = ?',
+          ).get(surfaced.repositoryIdentity, guid);
+          expect(surfaceRow).toBeUndefined();
+        });
+
+        it('leaves the operator primary checkout entirely untouched when it is on a different branch than the target', () => {
+          const root = repository();
+          // Mirrors what any real managed worktree already has: ensureSessionWorktree
+          // excludes .ironclaude/worktrees/ from the primary's status the moment it
+          // materializes the FIRST managed worktree. Set it up explicitly here since
+          // this orphan is built directly with raw git (createOrphanWorktree), not
+          // through that call, so it otherwise would not be excluded.
+          ensureManagedWorktreeExclusion(commonDir(root));
+          const database = initDb(join(root, 'resolve-merge-untouched.db'));
+          const manager = new WorkspaceService(database);
+          const guid = randomUUID();
+          const worktreePath = createOrphanWorktree(root, guid);
+          commitFile(worktreePath, 'ff.txt', 'ff\n');
+          const orphanTip = git(worktreePath, 'rev-parse', 'HEAD');
+
+          const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+          expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+          const id = surfaced.preservedDetail.find((d) => d.guid === guid)!.id;
+
+          // The operator moves the primary checkout off `main` onto their own
+          // branch and leaves uncommitted work there while the orphan is resolved.
+          git(root, 'checkout', '-b', 'operator-side-branch');
+          writeFileSync(join(root, 'operator-uncommitted.txt'), 'operator work in progress\n');
+          const statusBefore = git(root, 'status', '--porcelain');
+          expect(statusBefore).not.toBe('');
+          const headBefore = git(root, 'symbolic-ref', '--quiet', 'HEAD');
+
+          const result = manager.resolveOrphan({
+            repositoryPath: root,
+            resolutions: [{ id, action: 'merge-then-reap', integrationTarget: 'main' }],
+          });
+
+          expect(result.results[0].outcome).toBe('merged-then-reaped');
+          // The target ref (main) advanced by a pure ref CAS...
+          expect(git(root, 'rev-parse', 'refs/heads/main')).toBe(orphanTip);
+          // ...but the operator's checked-out working tree was never touched:
+          // same branch, same uncommitted file, identical status.
+          expect(git(root, 'symbolic-ref', '--quiet', 'HEAD')).toBe(headBefore);
+          expect(git(root, 'status', '--porcelain')).toBe(statusBefore);
+          expect(existsSync(join(root, 'operator-uncommitted.txt'))).toBe(true);
+          expect(readFileSync(join(root, 'operator-uncommitted.txt'), 'utf8')).toBe('operator work in progress\n');
+        });
+
+        it.skipIf(!gitSupportsTrueMerge)(
+          'creates a merge commit on the target ref for a clean, non-conflicting divergence, then reaps',
+          () => {
+            const root = repository();
+            const database = initDb(join(root, 'resolve-merge-true.db'));
+            const manager = new WorkspaceService(database);
+            const guid = randomUUID();
+            const worktreePath = createOrphanWorktree(root, guid);
+            commitFile(worktreePath, 'orphan-only.txt', 'from orphan\n');
+            const orphanTip = git(worktreePath, 'rev-parse', 'HEAD');
+            commitFile(root, 'main-only.txt', 'from main\n');
+            const mainTip = git(root, 'rev-parse', 'HEAD');
+
+            const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+            expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+            const id = surfaced.preservedDetail.find((d) => d.guid === guid)!.id;
+
+            const result = manager.resolveOrphan({
+              repositoryPath: root,
+              resolutions: [{ id, action: 'merge-then-reap' }],
+            });
+
+            expect(result.results[0].outcome).toBe('merged-then-reaped');
+            const newTip = git(root, 'rev-parse', 'refs/heads/main');
+            expect(newTip).not.toBe(mainTip);
+            expect(newTip).not.toBe(orphanTip);
+            const parents = git(root, 'log', '-1', '--format=%P', newTip).split(' ');
+            expect(parents).toEqual(expect.arrayContaining([mainTip, orphanTip]));
+            expect(parents).toHaveLength(2);
+            expect(existsSync(join(root, 'main-only.txt'))).toBe(true);
+            expect(readFileSync(join(root, 'orphan-only.txt'), 'utf8')).toBe('from orphan\n');
+            expect(existsSync(worktreePath)).toBe(false);
+            expect(git(root, 'branch', '--list', orphanBranch(guid))).toBe('');
+          },
+        );
+
+        it.skipIf(!gitSupportsTrueMerge)(
+          'reports conflict and preserves the orphan when the target and orphan changed the same line differently',
+          () => {
+            const root = repository();
+            const database = initDb(join(root, 'resolve-merge-conflict.db'));
+            const manager = new WorkspaceService(database);
+            const guid = randomUUID();
+            const worktreePath = createOrphanWorktree(root, guid);
+            writeFileSync(join(worktreePath, 'README.md'), 'orphan version\n');
+            git(worktreePath, 'add', 'README.md');
+            git(worktreePath, 'commit', '-m', 'orphan edits README');
+
+            writeFileSync(join(root, 'README.md'), 'main version\n');
+            git(root, 'add', 'README.md');
+            git(root, 'commit', '-m', 'main edits README');
+            const mainTip = git(root, 'rev-parse', 'HEAD');
+
+            const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+            expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+            const id = surfaced.preservedDetail.find((d) => d.guid === guid)!.id;
+
+            const result = manager.resolveOrphan({
+              repositoryPath: root,
+              resolutions: [{ id, action: 'merge-then-reap' }],
+            });
+
+            expect(result.results[0].outcome).toBe('conflict');
+            expect(git(root, 'rev-parse', 'refs/heads/main')).toBe(mainTip);
+            expect(existsSync(worktreePath)).toBe(true);
+            expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
+            const surfaceRow = database.prepare(
+              'SELECT 1 FROM orphan_surface WHERE repository_identity = ? AND workspace_guid = ?',
+            ).get(surfaced.repositoryIdentity, guid);
+            expect(surfaceRow).toBeTruthy();
+          },
+        );
+
+        it.skipIf(gitSupportsTrueMerge)(
+          'reports needs-manual-merge without moving any ref when git predates merge-tree --write-tree (< 2.38)',
+          () => {
+            const root = repository();
+            const database = initDb(join(root, 'resolve-merge-old-git.db'));
+            const manager = new WorkspaceService(database);
+            const guid = randomUUID();
+            const worktreePath = createOrphanWorktree(root, guid);
+            commitFile(worktreePath, 'orphan-only.txt', 'from orphan\n');
+            commitFile(root, 'main-only.txt', 'from main\n');
+            const mainTip = git(root, 'rev-parse', 'HEAD');
+
+            const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+            expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+            const id = surfaced.preservedDetail.find((d) => d.guid === guid)!.id;
+
+            const result = manager.resolveOrphan({
+              repositoryPath: root,
+              resolutions: [{ id, action: 'merge-then-reap' }],
+            });
+
+            expect(result.results[0].outcome).toBe('needs-manual-merge');
+            expect(git(root, 'rev-parse', 'refs/heads/main')).toBe(mainTip);
+            expect(existsSync(worktreePath)).toBe(true);
+          },
+        );
+
+        it('with no integrationTarget targets the canonical default branch (origin/HEAD), not the primary\'s live branch', () => {
+          const root = repository();
+          ensureManagedWorktreeExclusion(commonDir(root));
+          git(root, 'branch', 'trunk');
+          git(root, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/trunk');
+          const database = initDb(join(root, 'resolve-merge-canonical.db'));
+          const manager = new WorkspaceService(database);
+          const guid = randomUUID();
+          const worktreePath = createOrphanWorktree(root, guid);
+          commitFile(worktreePath, 'ff.txt', 'ff\n');
+          const orphanTip = git(worktreePath, 'rev-parse', 'HEAD');
+          const mainTipBefore = git(root, 'rev-parse', 'refs/heads/main');
+
+          const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+          expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+          const id = surfaced.preservedDetail.find((d) => d.guid === guid)!.id;
+
+          // The operator moves the primary checkout off `main` while the resolution runs.
+          git(root, 'checkout', '-b', 'operator-side-branch');
+          writeFileSync(join(root, 'operator-uncommitted.txt'), 'operator work in progress\n');
+          const statusBefore = git(root, 'status', '--porcelain');
+          const headBefore = git(root, 'symbolic-ref', '--quiet', 'HEAD');
+
+          const result = manager.resolveOrphan({
+            repositoryPath: root,
+            resolutions: [{ id, action: 'merge-then-reap' }],
+          });
+
+          expect(result.results[0].outcome).toBe('merged-then-reaped');
+          expect(git(root, 'rev-parse', 'refs/heads/trunk')).toBe(orphanTip);
+          expect(git(root, 'rev-parse', 'refs/heads/main')).toBe(mainTipBefore);
+          expect(git(root, 'symbolic-ref', '--quiet', 'HEAD')).toBe(headBefore);
+          expect(git(root, 'status', '--porcelain')).toBe(statusBefore);
+          expect(existsSync(join(root, 'operator-uncommitted.txt'))).toBe(true);
+          expect(readFileSync(join(root, 'operator-uncommitted.txt'), 'utf8')).toBe('operator work in progress\n');
+          expect(existsSync(worktreePath)).toBe(false);
+          expect(git(root, 'branch', '--list', orphanBranch(guid))).toBe('');
+        });
+
+        it('fails closed to error, without moving any ref, when neither origin/HEAD nor refs/heads/main exist', () => {
+          const root = repository();
+          const database = initDb(join(root, 'resolve-merge-fail-closed.db'));
+          const manager = new WorkspaceService(database);
+          const guid = randomUUID();
+          const worktreePath = createOrphanWorktree(root, guid);
+          commitFile(worktreePath, 'ff.txt', 'ff\n');
+
+          const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+          expect(surfaced.preservedUnmerged).toEqual([orphanBranch(guid)]);
+          const id = surfaced.preservedDetail.find((d) => d.guid === guid)!.id;
+
+          git(root, 'branch', '-m', 'main', 'trunk');
+          const trunkTipBefore = git(root, 'rev-parse', 'refs/heads/trunk');
+
+          const result = manager.resolveOrphan({
+            repositoryPath: root,
+            resolutions: [{ id, action: 'merge-then-reap' }],
+          });
+
+          expect(result.results[0].outcome).toBe('error');
+          expect(git(root, 'rev-parse', 'refs/heads/trunk')).toBe(trunkTipBefore);
+          expect(existsSync(worktreePath)).toBe(true);
+        });
+
+        it('refuses merge-then-reap as refused-dirty when the surfaced orphan worktree is still dirty at resolution time', () => {
+          const root = repository();
+          const database = initDb(join(root, 'resolve-merge-dirty.db'));
+          const manager = new WorkspaceService(database);
+          const guid = randomUUID();
+          const worktreePath = createOrphanWorktree(root, guid);
+          commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+          writeFileSync(join(worktreePath, 'dirty.txt'), 'uncommitted\n');
+
+          const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+          expect(surfaced.preservedDirty).toEqual([orphanBranch(guid)]);
+          const detail = surfaced.preservedDetail.find((d) => d.guid === guid);
+          expect(detail?.category).toBe('dirty');
+          const mainTipBefore = git(root, 'rev-parse', 'refs/heads/main');
+
+          const result = manager.resolveOrphan({
+            repositoryPath: root,
+            resolutions: [{ id: detail!.id, action: 'merge-then-reap' }],
+          });
+
+          expect(result.results[0].outcome).toBe('refused-dirty');
+          expect(git(root, 'rev-parse', 'refs/heads/main')).toBe(mainTipBefore);
+          expect(existsSync(worktreePath)).toBe(true);
+          expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
+        });
+
+        it('reports target-moved (not refused-changed) and retries clean when the target ref advances concurrently between the CAS snapshot and the update-ref, leaving the unchanged orphan intact', () => {
+          const root = repository();
+          const database = initDb(join(root, 'resolve-target-moved.db'));
+          const manager = new WorkspaceService(database);
+          const guid = randomUUID();
+          const worktreePath = createOrphanWorktree(root, guid);
+          commitFile(worktreePath, 'orphan-work.txt', 'orphan\n');
+          const orphanTipBefore = git(worktreePath, 'rev-parse', 'HEAD');
+          const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+          const id = surfaced.preservedDetail.find((d) => d.guid === guid)!.id;
+
+          const expected = git(root, 'rev-parse', 'refs/heads/main');
+          let fired = false;
+          let concurrent = '';
+          spawnControl.beforeSpawn = (args) => {
+            if (!fired && args.includes('update-ref') && args.includes('refs/heads/main') && args[args.length - 1] === expected) {
+              fired = true;
+              concurrent = git(root, 'commit-tree', `${expected}^{tree}`, '-p', expected, '-m', 'concurrent target advance');
+              git(root, 'update-ref', 'refs/heads/main', concurrent, expected);
+            }
+          };
+
+          const result = manager.resolveOrphan({
+            repositoryPath: root,
+            resolutions: [{ id, action: 'merge-then-reap' }],
+          });
+
+          expect(fired).toBe(true);
+          expect(result.results[0].outcome).toBe('target-moved');
+          expect(git(root, 'rev-parse', 'refs/heads/main')).toBe(concurrent);
+          expect(git(worktreePath, 'rev-parse', 'HEAD')).toBe(orphanTipBefore);
+          expect(existsSync(worktreePath)).toBe(true);
+
+          spawnControl.beforeSpawn = null;
+          const retry = manager.resolveOrphan({
+            repositoryPath: root,
+            resolutions: [{ id, action: 'merge-then-reap' }],
+          });
+
+          expect(retry.results[0].outcome).toBe('merged-then-reaped');
+        });
+      });
+
+      it('never invokes git worktree prune', () => {
+        const root = repository();
+        const database = initDb(join(root, 'resolve-no-prune.db'));
+        const manager = new WorkspaceService(database);
+        const guid = randomUUID();
+        const worktreePath = createOrphanWorktree(root, guid);
+        commitFile(worktreePath, 'unmerged.txt', 'unmerged\n');
+        const surfaced = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+        const id = surfaced.preservedDetail.find((d) => d.guid === guid)!.id;
+
+        spawnControl.calls.length = 0;
+        manager.resolveOrphan({
+          repositoryPath: root,
+          resolutions: [{ id, action: 'reap' }],
+        });
+
+        const pruneCalls = spawnControl.calls.filter(
+          (call) => call.includes('worktree') && call.includes('prune'),
+        );
+        expect(pruneCalls).toEqual([]);
+      });
+    });
   });
 });

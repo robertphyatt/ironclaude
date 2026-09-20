@@ -1,6 +1,8 @@
 {
   "poll_interval_seconds": 15,
   "heartbeat_interval_seconds": 900,
+  "max_swap_used_gb": 50,
+  "spawn_block_pressure_level": 4,
   "worker_stale_threshold_seconds": 300,
   "brain_heartbeat_timeout_seconds": 60,
   "max_worker_retries": 3,

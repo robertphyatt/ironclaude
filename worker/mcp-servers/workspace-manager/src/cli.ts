@@ -27,9 +27,11 @@ export interface InternalCommandDependencies {
   reap: InternalDependency;
   configureSharedResources: InternalDependency;
   listSharedResources: InternalDependency;
+  'reap-orphans': InternalDependency;
+  'resolve-orphan': InternalDependency;
 }
 
-export const INTERNAL_COMMAND_NAMES = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile', 'cleanup', 'sync', 'reap', 'configure-shared-resources', 'list-shared-resources'] as const;
+export const INTERNAL_COMMAND_NAMES = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile', 'cleanup', 'sync', 'reap', 'configure-shared-resources', 'list-shared-resources', 'reap-orphans', 'resolve-orphan'] as const;
 
 function waitForCliDatabase(milliseconds: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
@@ -67,12 +69,12 @@ function optionalString(args: Args, key: string): string | undefined {
 
 function optionalRebaseRecovery(
   args: Args,
-): 'continue' | 'abort' | 'rerebase' | 'restore_frozen' | 'status' | undefined {
+): 'continue' | 'abort' | 'rerebase' | 'restore_frozen' | 'status' | 'reopen_for_edit' | undefined {
   const value = args.rebase_recovery;
   if (value === undefined) return undefined;
   if (value !== 'continue' && value !== 'abort' && value !== 'rerebase'
-    && value !== 'restore_frozen' && value !== 'status') {
-    throw new Error("rebase_recovery must be 'continue', 'abort', 'rerebase', 'restore_frozen', or 'status'");
+    && value !== 'restore_frozen' && value !== 'status' && value !== 'reopen_for_edit') {
+    throw new Error("rebase_recovery must be 'continue', 'abort', 'rerebase', 'restore_frozen', 'status', or 'reopen_for_edit'");
   }
   return value;
 }
@@ -98,6 +100,78 @@ function requiredStringArray(args: Args, key: string): string[] {
   return value as string[];
 }
 
+function optionalStringArray(args: Args, key: string): string[] | undefined {
+  const value = args[key];
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+    throw new Error(`${key} must be an array of strings`);
+  }
+  return value as string[];
+}
+
+function optionalNumber(args: Args, key: string): number | undefined {
+  const value = args[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || Number.isNaN(value)) throw new Error(`${key} must be a number`);
+  return value;
+}
+
+type OrphanResolutionAction = 'reap' | 'keep' | 'merge-then-reap';
+const ORPHAN_RESOLUTION_ACTIONS: readonly OrphanResolutionAction[] = ['reap', 'keep', 'merge-then-reap'];
+
+type OrphanCategory = 'squash-merged' | 'merged-on-origin' | 'genuinely-unmerged' | 'dirty';
+const ORPHAN_CATEGORIES: readonly OrphanCategory[] = ['squash-merged', 'merged-on-origin', 'genuinely-unmerged', 'dirty'];
+
+function requiredResolutions(
+  args: Args,
+  key: string,
+): { id?: string; guid?: string; action: OrphanResolutionAction; integrationTarget?: string; category?: OrphanCategory }[] {
+  const value = args[key];
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(`${key} must be a non-empty array of resolution objects`);
+  }
+  return value.map((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new Error(`${key} entries must be objects`);
+    }
+    const record = item as Record<string, unknown>;
+    const action = record.action;
+    if (typeof action !== 'string' || !ORPHAN_RESOLUTION_ACTIONS.includes(action as OrphanResolutionAction)) {
+      throw new Error(`${key} entries must have action 'reap', 'keep', or 'merge-then-reap'`);
+    }
+    const id = record.id;
+    const guid = record.guid;
+    if (id !== undefined && (typeof id !== 'string' || id.length === 0)) {
+      throw new Error(`${key} entries id must be a non-empty string`);
+    }
+    if (guid !== undefined && (typeof guid !== 'string' || guid.length === 0)) {
+      throw new Error(`${key} entries guid must be a non-empty string`);
+    }
+    if (id === undefined && guid === undefined) {
+      throw new Error(`${key} entries must have an id or a guid`);
+    }
+    const integrationTargetValue = record.integration_target;
+    let integrationTarget: string | undefined;
+    if (integrationTargetValue !== undefined) {
+      if (typeof integrationTargetValue !== 'string' || integrationTargetValue.length === 0) {
+        throw new Error(`${key} entries integration_target must be a non-empty string`);
+      }
+      integrationTarget = integrationTargetValue;
+    }
+    const categoryValue = record.category;
+    let category: OrphanCategory | undefined;
+    if (categoryValue !== undefined) {
+      if (typeof categoryValue !== 'string' || !ORPHAN_CATEGORIES.includes(categoryValue as OrphanCategory)) {
+        throw new Error(
+          `${key} entries category must be 'squash-merged', 'merged-on-origin', 'genuinely-unmerged', or 'dirty'`,
+        );
+      }
+      category = categoryValue as OrphanCategory;
+    }
+    return { id, guid, action: action as OrphanResolutionAction, integrationTarget, category };
+  });
+}
+
 export function dispatchInternalCommand(
   name: string,
   args: Args,
@@ -114,6 +188,8 @@ export function dispatchInternalCommand(
     case 'reap': return dependencies.reap(args);
     case 'configure-shared-resources': return dependencies.configureSharedResources(args);
     case 'list-shared-resources': return dependencies.listSharedResources(args);
+    case 'reap-orphans': return dependencies['reap-orphans'](args);
+    case 'resolve-orphan': return dependencies['resolve-orphan'](args);
     default: throw new Error(`Unknown internal workspace command: ${name}`);
   }
 }
@@ -216,6 +292,16 @@ export function createInternalCommandDependencies(
     }),
     listSharedResources: (args) => service.listSharedResources({
       repositoryPath: requiredString(args, 'repository_path'),
+    }),
+    'reap-orphans': (args) => service.reapAmbiguousOrphans({
+      repositoryPath: requiredString(args, 'repository_path'),
+      protectedPaths: optionalStringArray(args, 'protected_paths'),
+      ttlHours: optionalNumber(args, 'ttl_hours'),
+    }),
+    'resolve-orphan': (args) => service.resolveOrphan({
+      repositoryPath: requiredString(args, 'repository_path'),
+      protectedPaths: optionalStringArray(args, 'protected_paths'),
+      resolutions: requiredResolutions(args, 'resolutions'),
     }),
   };
 }

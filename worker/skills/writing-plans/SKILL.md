@@ -411,22 +411,32 @@ git add docs/plans/YYYY-MM-DD-<feature-name>.md
 
 **Step 7: Present execution options with recommendation**
 
-Before presenting options, analyze the plan to determine the recommended execution strategy:
+Before presenting options, analyze the plan to determine the recommended execution strategy.
 
-**Recommend inline (option 3) when:**
-- Total tasks ≤ 2
-- Any task has complex or ambiguous steps requiring judgment
-- Tasks require reading large portions of the codebase
+**Subagent-sequential (option 1) is the default.** Plan execution defaults to
+subagent-sequential, dispatching one subagent per task at the cheapest capable tier —
+Sonnet on Claude, Terra on Codex. Drift-fear is not a reason to go inline: the per-task
+code review, testing-theatre check, and tier-up review are the mechanism that catches
+subagent drift, not the orchestrator's own presence in the work.
 
 **Recommend subagent-parallel (option 2) when:**
 - Wave 1 has 3+ independent tasks
 - Tasks are self-contained file edits with clear, mechanical steps
 - No task requires broad codebase context
 
-**Recommend subagent-sequential (option 1) when:**
-- Moderate task count (3-5) with mixed complexity
-- Tasks have subtle inter-dependencies beyond what depends_on captures
-- Default choice when neither inline nor parallel is clearly better
+**Recommend inline (option 3) ONLY when one of these holds:**
+- (a) The task is orchestration itself
+- (b) A step genuinely can't be captured in a focused subagent prompt
+- (c) A prior subagent attempt on this same task already spiraled (circuit-breaker)
+
+A task that needs reading large portions of the codebase is NOT a reason to go inline —
+route it to an `Explore` subagent (or another well-scoped subagent), then hand the
+findings to the executing subagent in its prompt.
+
+**Inline has real costs, so the tradeoff is symmetric:** running tasks inline burns the
+orchestrator's own context window — the orchestrator risks its own compaction or context
+spiral — and spends a top-tier orchestrator model on work a Sonnet/Terra subagent would
+do more cheaply. Default to subagent-sequential unless (a), (b), or (c) applies.
 
 Display with recommendation:
 ```
@@ -462,7 +472,7 @@ Three execution options:
 
 Which approach? (1/2/3)
 
-SUGGESTED_NEXT_ACTION: Skill(skill="ironclaude:executing-plans", args="docs/plans/YYYY-MM-DD-<feature-name>.plan.json --mode=inline")
+SUGGESTED_NEXT_ACTION: Skill(skill="ironclaude:executing-plans", args="docs/plans/YYYY-MM-DD-<feature-name>.plan.json --mode=subagent-sequential")
 ```
 
 (Move the "(Recommended)" label to whichever option is recommended for this specific plan.)

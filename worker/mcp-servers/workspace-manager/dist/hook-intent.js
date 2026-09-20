@@ -237,6 +237,36 @@ function migrateSchema(db) {
       `);
     })();
   }
+  if (!db.prepare("SELECT 1 FROM schema_migrations WHERE version = 6").get()) {
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS orphan_surface (
+          repository_identity TEXT NOT NULL,
+          workspace_guid TEXT NOT NULL,
+          short_id TEXT NOT NULL,
+          tip TEXT NOT NULL,
+          category TEXT NOT NULL,
+          surfaced_at TEXT NOT NULL DEFAULT (datetime('now')),
+          muted_tip TEXT,
+          PRIMARY KEY(repository_identity, workspace_guid)
+        );
+        CREATE INDEX IF NOT EXISTS orphan_surface_lookup_idx
+          ON orphan_surface(repository_identity, short_id);
+
+        CREATE TABLE IF NOT EXISTS orphan_resolution_audit (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repository_identity TEXT,
+          workspace_guid TEXT,
+          short_id TEXT,
+          action TEXT,
+          outcome TEXT,
+          at TEXT DEFAULT (datetime('now'))
+        );
+
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (6);
+      `);
+    })();
+  }
 }
 function insertPreservedWork(db, input) {
   const existing = db.prepare(
@@ -505,21 +535,42 @@ import path5 from "node:path";
 
 // src/git.ts
 import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import path2 from "node:path";
 var MANAGED_WORKTREE_EXCLUSION = "/.ironclaude/worktrees/";
 function gitError(cwd, args, stderr) {
   const detail = stderr.trim() || "Git command failed";
   return new Error(`${detail} (git -C ${cwd} ${args.join(" ")})`);
 }
+var GIT_MAX_BUFFER = 64 * 1024 * 1024;
+function gitBufferOverflowError(args, error) {
+  if (error && error.code === "ENOBUFS") {
+    return new Error(`git ${args.join(" ")} exceeded the ${GIT_MAX_BUFFER}-byte output buffer (ENOBUFS)`);
+  }
+  return void 0;
+}
+function gitSupportsMergeTreeWriteTree() {
+  const result = spawnSync("git", ["--version"], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw gitError(".", ["--version"], result.stderr || "");
+  const match = /git version (\d+)\.(\d+)/.exec(result.stdout || "");
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major > 2 || major === 2 && minor >= 38;
+}
 function runGit(cwd, args) {
-  const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
+  const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
+  const overflow = gitBufferOverflowError(args, result.error);
+  if (overflow) throw overflow;
   if (result.error) throw result.error;
   if (result.status !== 0) throw gitError(cwd, args, result.stderr || "");
   return result.stdout || "";
 }
 function runGitEnv(cwd, args, env) {
-  const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", env });
+  const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", env, maxBuffer: GIT_MAX_BUFFER });
+  const overflow = gitBufferOverflowError(args, result.error);
+  if (overflow) throw overflow;
   if (result.error) throw result.error;
   if (result.status !== 0) throw gitError(cwd, args, result.stderr || "");
   return result.stdout || "";
@@ -528,7 +579,21 @@ function absoluteFrom(cwd, value) {
   return path2.resolve(cwd, value);
 }
 function canonicalPath(value) {
-  return realpathSync(value);
+  try {
+    return realpathSync(value);
+  } catch (error) {
+    if (error.code === "ENOENT") return path2.resolve(value);
+    throw error;
+  }
+}
+function listManagedBranches(primaryCheckoutPath) {
+  const out = runGit(primaryCheckoutPath, [
+    "for-each-ref",
+    "--format=%(refname)",
+    "refs/heads/ironclaude/"
+  ]);
+  const prefix = "refs/heads/";
+  return out.split("\n").map((line) => line.trim()).filter((line) => line.startsWith(prefix + "ironclaude/")).map((line) => line.slice(prefix.length)).sort();
 }
 function listWorktrees(cwd) {
   const output = runGit(cwd, ["worktree", "list", "--porcelain"]);
@@ -585,6 +650,14 @@ function primaryBranch(primaryCheckoutPath) {
     throw new Error("Primary checkout is not on a branch; supply integration_target explicitly");
   }
   return ref.slice("refs/heads/".length);
+}
+function canonicalDefaultBranchRef(cwd) {
+  const result = spawnSync("git", ["-C", cwd, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
+  if (result.error || result.status !== 0) return "refs/heads/main";
+  const ref = (result.stdout || "").trim();
+  const prefix = "refs/remotes/origin/";
+  if (!ref.startsWith(prefix)) return "refs/heads/main";
+  return `refs/heads/${ref.slice(prefix.length)}`;
 }
 function addWorktree(primaryCheckoutPath, worktreePath, branch, baseCommit) {
   if (existsSync(worktreePath)) throw new Error(`Managed worktree path already exists: ${worktreePath}`);
@@ -787,22 +860,146 @@ function linkSharedResources(primaryCheckoutPath, worktreePath, repositoryIdenti
   }
   return linked;
 }
-function removeWorktree(primaryCheckoutPath, worktreePath) {
-  runGit(primaryCheckoutPath, ["worktree", "remove", "--", worktreePath]);
+function removeWorktree(primaryCheckoutPath, worktreePath, opts = {}) {
+  runGit(primaryCheckoutPath, ["worktree", "remove", ...opts.force ? ["--force"] : [], "--", worktreePath]);
 }
 function deleteTemporaryBranch(primaryCheckoutPath, branch) {
   runGit(primaryCheckoutPath, ["branch", "-D", "--", branch]);
 }
+function splitPaths(output) {
+  return output.split("\n").filter((line) => line.length > 0);
+}
+function changedPaths(cwd, a, b) {
+  return splitPaths(runGit(cwd, ["diff", "--name-only", a, b]));
+}
+function dirtyAndUntrackedPaths(cwd) {
+  const unstaged = splitPaths(runGit(cwd, ["diff", "--name-only"]));
+  const staged = splitPaths(runGit(cwd, ["diff", "--name-only", "--cached"]));
+  const untracked = splitPaths(runGit(cwd, ["ls-files", "--others", "--exclude-standard"]));
+  return [.../* @__PURE__ */ new Set([...unstaged, ...staged, ...untracked])];
+}
+function carryForwardFastForward(cwd, fromCommit, toCommit) {
+  runGit(cwd, ["read-tree", "-m", "-u", fromCommit, toCommit]);
+}
 function isAncestor(cwd, ancestor, descendant) {
-  const result = spawnSync("git", ["-C", cwd, "merge-base", "--is-ancestor", ancestor, descendant], { encoding: "utf8" });
+  const result = spawnSync("git", ["-C", cwd, "merge-base", "--is-ancestor", ancestor, descendant], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
   if (result.error) throw result.error;
   if (result.status === 0) return true;
   if (result.status === 1 || result.status === 128) return false;
   throw gitError(cwd, ["merge-base", "--is-ancestor", ancestor, descendant], result.stderr || "");
 }
+function patchId(cwd, revA, revB) {
+  const diff = spawnSync("git", ["-C", cwd, "diff", "--no-ext-diff", revA, revB], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
+  if (diff.error) throw diff.error;
+  if (diff.status !== 0) throw gitError(cwd, ["diff", revA, revB], diff.stderr || "");
+  const patchIdResult = spawnSync("git", ["-C", cwd, "patch-id", "--stable"], {
+    encoding: "utf8",
+    input: diff.stdout || "",
+    maxBuffer: GIT_MAX_BUFFER
+  });
+  if (patchIdResult.error) throw patchIdResult.error;
+  if (patchIdResult.status !== 0) throw gitError(cwd, ["patch-id", "--stable"], patchIdResult.stderr || "");
+  const line = (patchIdResult.stdout || "").trim();
+  if (!line) return null;
+  return line.split(/\s+/)[0] ?? null;
+}
+function tryTell(fn) {
+  try {
+    return fn();
+  } catch {
+    return false;
+  }
+}
+function cherryTellMerged(cwd, tip, targetRef) {
+  const result = spawnSync("git", ["-C", cwd, "cherry", targetRef, tip], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw gitError(cwd, ["cherry", targetRef, tip], result.stderr || "");
+  const output = (result.stdout || "").trim();
+  if (!output) return false;
+  return output.split("\n").every((line) => line.startsWith("- "));
+}
+function patchIdAggregateTellMerged(cwd, tip, targetRef) {
+  const mergeBase = runGit(cwd, ["merge-base", targetRef, tip]).trim();
+  const aggregateId = patchId(cwd, mergeBase, tip);
+  if (aggregateId === null) return false;
+  const namesRes = spawnSync("git", ["-C", cwd, "diff", "--name-only", "--no-renames", "-z", mergeBase, tip], {
+    encoding: "utf8",
+    maxBuffer: GIT_MAX_BUFFER
+  });
+  if (namesRes.error) throw namesRes.error;
+  if (namesRes.status !== 0) {
+    throw gitError(cwd, ["diff", "--name-only", "--no-renames", "-z", mergeBase, tip], namesRes.stderr || "");
+  }
+  const paths = (namesRes.stdout || "").split("\0").filter(Boolean);
+  if (paths.length === 0) return false;
+  const logRes = spawnSync(
+    "git",
+    ["-C", cwd, "--literal-pathspecs", "log", "--no-merges", "--no-ext-diff", "--format=commit %H", "-p", `${mergeBase}..${targetRef}`, "--", ...paths],
+    { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER }
+  );
+  if (logRes.error) throw logRes.error;
+  if (logRes.status !== 0) {
+    throw gitError(
+      cwd,
+      ["--literal-pathspecs", "log", "--no-merges", "--no-ext-diff", "--format=commit %H", "-p", `${mergeBase}..${targetRef}`, "--", ...paths],
+      logRes.stderr || ""
+    );
+  }
+  const idRes = spawnSync("git", ["-C", cwd, "patch-id", "--stable"], {
+    encoding: "utf8",
+    input: logRes.stdout || "",
+    maxBuffer: GIT_MAX_BUFFER
+  });
+  if (idRes.error) throw idRes.error;
+  if (idRes.status !== 0) throw gitError(cwd, ["patch-id", "--stable"], idRes.stderr || "");
+  const lines = (idRes.stdout || "").split("\n").filter((line) => line.trim().length > 0);
+  for (const line of lines) {
+    const id = line.split(/\s+/)[0];
+    if (id === aggregateId) return true;
+  }
+  return false;
+}
+function reverseApplyTellMerged(cwd, tip, targetRef, scratchDir) {
+  const mergeBase = runGit(cwd, ["merge-base", targetRef, tip]).trim();
+  const unique = `${tip.slice(0, 12)}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const patchPath = path2.join(scratchDir, `${unique}.patch`);
+  const indexPath = path2.join(scratchDir, `${unique}.idx`);
+  try {
+    const diff = spawnSync("git", ["-C", cwd, "diff", "--binary", mergeBase, tip], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
+    if (diff.error) throw diff.error;
+    if (diff.status !== 0) throw gitError(cwd, ["diff", "--binary", mergeBase, tip], diff.stderr || "");
+    const diffText = diff.stdout || "";
+    if (!diffText.trim()) return false;
+    writeFileSync(patchPath, diffText);
+    const env = { ...process.env, GIT_INDEX_FILE: indexPath };
+    runGitEnv(cwd, ["read-tree", targetRef], env);
+    const apply = spawnSync("git", ["-C", cwd, "apply", "--cached", "--check", "--reverse", patchPath], {
+      encoding: "utf8",
+      env,
+      maxBuffer: GIT_MAX_BUFFER
+    });
+    if (apply.error) throw apply.error;
+    return apply.status === 0;
+  } finally {
+    try {
+      rmSync(patchPath, { force: true });
+    } catch {
+    }
+    try {
+      rmSync(indexPath, { force: true });
+    } catch {
+    }
+  }
+}
+function contentMergedInto(cwd, tip, targetRef, scratchDir) {
+  if (tryTell(() => cherryTellMerged(cwd, tip, targetRef))) return true;
+  if (tryTell(() => reverseApplyTellMerged(cwd, tip, targetRef, scratchDir))) return true;
+  if (tryTell(() => patchIdAggregateTellMerged(cwd, tip, targetRef))) return true;
+  return false;
+}
 
 // src/scoped-tree.ts
-import { rmSync } from "node:fs";
+import { rmSync as rmSync2 } from "node:fs";
 import os2 from "node:os";
 import path3 from "node:path";
 function buildScopedStagedTree(repoPath, parentOid, allowedFiles) {
@@ -840,7 +1037,7 @@ function buildScopedStagedTree(repoPath, parentOid, allowedFiles) {
     return runGitEnv(repoPath, ["write-tree"], env).trim();
   } finally {
     try {
-      rmSync(tmpIndex, { force: true });
+      rmSync2(tmpIndex, { force: true });
     } catch {
     }
   }
@@ -1118,8 +1315,10 @@ function issueDirectGitHumanIntent(db, input) {
 }
 
 // src/workspace-service.ts
-import { randomUUID as randomUUID2 } from "node:crypto";
-import { existsSync as existsSync2 } from "node:fs";
+import { spawnSync as spawnSync2 } from "node:child_process";
+import { createHash, randomUUID as randomUUID2 } from "node:crypto";
+import { existsSync as existsSync2, mkdtempSync, rmSync as rmSync3 } from "node:fs";
+import os4 from "node:os";
 import path6 from "node:path";
 
 // src/integration.ts
@@ -1136,6 +1335,45 @@ function decodePushDisposition(value) {
 function pushPendingSummary(disposition) {
   const decoded = decodePushDisposition(disposition);
   return decoded && (decoded.phase === "push-pending" || decoded.phase === "push-failed") ? { candidateCommit: decoded.candidateCommit, remoteUrl: decoded.remoteUrl, destinationRef: decoded.destinationRef } : void 0;
+}
+function primaryOnRef(primaryCheckoutPath, ref) {
+  try {
+    return runGit(primaryCheckoutPath, ["symbolic-ref", "--quiet", "HEAD"]).trim() === ref;
+  } catch {
+    return false;
+  }
+}
+function assertNoPrimaryOverlap(primaryCheckoutPath, ref, expectedTarget, integrated) {
+  if (!primaryOnRef(primaryCheckoutPath, ref)) return;
+  const dirty = dirtyAndUntrackedPaths(primaryCheckoutPath);
+  if (dirty.length === 0) return;
+  const changed = new Set(changedPaths(primaryCheckoutPath, expectedTarget, integrated));
+  const overlap = dirty.filter((entry) => changed.has(entry));
+  if (overlap.length > 0) {
+    throw new Error(
+      `Finalization primary checkout has local changes overlapping the carried-forward integration; preserving worktree. Overlapping paths: ${overlap.join(", ")}`
+    );
+  }
+}
+function verifyPrimaryAfterFastForward(primaryCheckoutPath, ref, expectedTarget, integratedCommit) {
+  const target = runGit(primaryCheckoutPath, ["rev-parse", "--verify", `${ref}^{commit}`]).trim();
+  if (target !== integratedCommit) {
+    throw new Error("Finalization primary checkout is inconsistent after checked fast-forward");
+  }
+  if (!primaryOnRef(primaryCheckoutPath, ref)) return;
+  const head = runGit(primaryCheckoutPath, ["rev-parse", "--verify", "HEAD^{commit}"]).trim();
+  const unmerged = runGit(primaryCheckoutPath, ["ls-files", "--unmerged"]).trim();
+  if (head !== integratedCommit || unmerged !== "") {
+    throw new Error("Finalization primary checkout is inconsistent after checked fast-forward");
+  }
+  const carried = changedPaths(primaryCheckoutPath, expectedTarget, integratedCommit);
+  if (carried.length > 0) {
+    const worktreeDrift = runGit(primaryCheckoutPath, ["diff", "--name-only", integratedCommit, "--", ...carried]).trim();
+    const indexDrift = runGit(primaryCheckoutPath, ["diff", "--name-only", "--cached", integratedCommit, "--", ...carried]).trim();
+    if (worktreeDrift !== "" || indexDrift !== "") {
+      throw new Error("Finalization primary checkout is inconsistent after checked fast-forward");
+    }
+  }
 }
 
 // src/workspace-service.ts
@@ -1737,6 +1975,387 @@ var WorkspaceService = class {
       missingWorktreePaths: assignments.map((assignment) => path6.resolve(assignment.worktree_path)).filter((worktreePath) => !observedPaths.has(worktreePath)).sort(),
       ambiguousWorktreePaths
     };
+  }
+  /**
+   * Owner-agnostic sweep over every AMBIGUOUS orphan — a managed-shaped
+   * worktree or branch (`ironclaude/<guid>`) with NO assignments row at all,
+   * so neither `cleanupWorkspace` nor `reapLeakedAssignment` can ever reach
+   * it. Every disposition preserves work by default: only a worktree proven
+   * clean, old enough (`ttlHours`), unprotected, and whose branch tip is an
+   * ancestor of the primary branch is actually removed. A dangling branch
+   * with no worktree at all is reaped the same way, by branch tip alone.
+   */
+  reapAmbiguousOrphans(input) {
+    const repository = discoverRepository(input.repositoryPath);
+    const protectedSet = new Set((input.protectedPaths ?? []).map((p) => path6.resolve(p)));
+    const ttlHours = input.ttlHours ?? 24;
+    const cutoffMs = Date.now() - ttlHours * 3600 * 1e3;
+    const target = integrationTargetRef(primaryBranch(repository.primaryCheckoutPath));
+    const result = {
+      repositoryIdentity: repository.repositoryIdentity,
+      reaped: [],
+      reapedWorktreeOnly: [],
+      preservedDirty: [],
+      preservedUnmerged: [],
+      preservedDetail: [],
+      skippedLive: [],
+      skippedYoung: [],
+      errors: []
+    };
+    const ambiguous = /* @__PURE__ */ new Map();
+    for (const worktreePath of this.reconcileRepository(input.repositoryPath).ambiguousWorktreePaths) {
+      ambiguous.set(path6.basename(worktreePath), worktreePath);
+    }
+    const guids = /* @__PURE__ */ new Set([...ambiguous.keys()]);
+    for (const branch of listManagedBranches(repository.primaryCheckoutPath)) {
+      guids.add(branch.slice("ironclaude/".length));
+    }
+    const scratchDir = mkdtempSync(path6.join(os4.tmpdir(), "ironclaude-orphan-"));
+    try {
+      for (const guid of guids) {
+        const name = managedBranch(guid);
+        try {
+          if (this.hasNonCleanedAssignment(repository.repositoryIdentity, guid)) continue;
+          const branchRef = `refs/heads/${name}`;
+          const hasBranch = this.refResolves(repository.primaryCheckoutPath, branchRef);
+          const worktreePath = ambiguous.get(guid);
+          const present = worktreePath !== void 0 && existsSync2(worktreePath);
+          if (present && protectedSet.has(path6.resolve(worktreePath))) {
+            result.skippedLive.push(name);
+            continue;
+          }
+          const tip = hasBranch ? runGit(repository.primaryCheckoutPath, ["rev-parse", branchRef]).trim() : present ? worktreeHead(worktreePath) : null;
+          if (tip === null) continue;
+          const committedMs = Number(runGit(repository.primaryCheckoutPath, ["show", "-s", "--format=%ct", tip]).trim()) * 1e3;
+          if (committedMs > cutoffMs) {
+            result.skippedYoung.push(name);
+            continue;
+          }
+          if (present && !worktreeIsClean(worktreePath)) {
+            result.preservedDirty.push(name);
+            let evidence = `worktree at ${worktreePath} has uncommitted changes`;
+            if (!isAncestor(repository.primaryCheckoutPath, tip, target)) {
+              const unmergedCount = runGit(
+                repository.primaryCheckoutPath,
+                ["rev-list", "--count", `${target}..${tip}`]
+              ).trim();
+              evidence += `; also ${unmergedCount} unmerged commit(s) not on ${target} (lost on reap)`;
+            }
+            result.preservedDetail.push(this.buildPreservedOrphan(
+              repository,
+              guid,
+              name,
+              tip,
+              "dirty",
+              evidence,
+              present
+            ));
+            continue;
+          }
+          if (!isAncestor(repository.primaryCheckoutPath, tip, target)) {
+            result.preservedUnmerged.push(name);
+            const classified = this.classifyPreservedOrphan(repository, tip, target, scratchDir);
+            result.preservedDetail.push(this.buildPreservedOrphan(
+              repository,
+              guid,
+              name,
+              tip,
+              classified.category,
+              classified.evidence,
+              present
+            ));
+            continue;
+          }
+          let worktreeRemoved = false;
+          if (present) {
+            removeWorktree(repository.primaryCheckoutPath, worktreePath);
+            worktreeRemoved = true;
+          } else if (worktreePath !== void 0) {
+            removeWorktree(repository.primaryCheckoutPath, worktreePath, { force: true });
+            worktreeRemoved = true;
+          }
+          try {
+            if (this.refResolves(repository.primaryCheckoutPath, branchRef)) {
+              deleteTemporaryBranch(repository.primaryCheckoutPath, name);
+            }
+            result.reaped.push(name);
+            this.deleteOrphanSurface(repository.repositoryIdentity, guid);
+          } catch (branchError) {
+            if (worktreeRemoved) result.reapedWorktreeOnly.push(name);
+            result.errors.push({ name, error: branchError instanceof Error ? branchError.message : String(branchError) });
+          }
+        } catch (error) {
+          result.errors.push({ name, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+    } finally {
+      rmSync3(scratchDir, { recursive: true, force: true });
+    }
+    return result;
+  }
+  /**
+   * Authorized-consent disposition of previously SURFACED ambiguous orphans
+   * (rows `reapAmbiguousOrphans` wrote to `orphan_surface`). Consent is bound
+   * to the exact tip surfaced: if the branch (or worktree) has moved since,
+   * the resolution is refused — it is never silently reaped or kept sight
+   * unseen. A refusal never mutates the surfaced row; only the daemon sweep
+   * (`upsertOrphanSurface`) refreshes tip/category, on its own schedule, so a
+   * subsequent re-review still sees the state it was surfaced against. Every
+   * resolution is processed independently (one bad entry never aborts the
+   * batch) and an audit row is written for every outcome.
+   */
+  resolveOrphan(input) {
+    const repository = discoverRepository(input.repositoryPath);
+    const protectedSet = new Set((input.protectedPaths ?? []).map((p) => path6.resolve(p)));
+    const results = [];
+    for (const resolution of input.resolutions) {
+      const outcome = this.resolveOneOrphan(repository, protectedSet, resolution);
+      results.push(outcome);
+      this.recordOrphanResolutionAudit(
+        repository.repositoryIdentity,
+        outcome.guid || null,
+        outcome.id || null,
+        resolution.action,
+        outcome.outcome
+      );
+    }
+    return { results };
+  }
+  findOrphanSurfaceRow(repositoryIdentity, resolution) {
+    if (resolution.id) {
+      return this.db.prepare(`
+        SELECT workspace_guid, short_id, tip, category FROM orphan_surface
+        WHERE repository_identity = ? AND short_id = ?
+      `).get(repositoryIdentity, resolution.id);
+    }
+    if (resolution.guid) {
+      return this.db.prepare(`
+        SELECT workspace_guid, short_id, tip, category FROM orphan_surface
+        WHERE repository_identity = ? AND workspace_guid = ?
+      `).get(repositoryIdentity, resolution.guid);
+    }
+    return void 0;
+  }
+  recordOrphanResolutionAudit(repositoryIdentity, workspaceGuid, shortId, action, outcome) {
+    this.db.prepare(`
+      INSERT INTO orphan_resolution_audit (repository_identity, workspace_guid, short_id, action, outcome)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(repositoryIdentity, workspaceGuid, shortId, action, outcome);
+  }
+  /** One resolution's disposition. Never throws — every failure mode returns an `error` outcome instead. */
+  resolveOneOrphan(repository, protectedSet, resolution) {
+    let id = resolution.id ?? "";
+    let guid = resolution.guid ?? "";
+    try {
+      if (!resolution.id && resolution.guid && (resolution.action === "reap" || resolution.action === "merge-then-reap")) {
+        return { id, guid, outcome: "refused-changed" };
+      }
+      const row = this.findOrphanSurfaceRow(repository.repositoryIdentity, resolution);
+      if (!row) return { id, guid, outcome: "not-surfaced" };
+      guid = row.workspace_guid;
+      id = row.short_id;
+      const name = managedBranch(guid);
+      const branchRef = `refs/heads/${name}`;
+      const worktreePath = managedWorktreePath(repository.primaryCheckoutPath, guid);
+      const registered = worktreeExists(repository.primaryCheckoutPath, worktreePath);
+      const present = registered && existsSync2(worktreePath);
+      const hasBranch = this.refResolves(repository.primaryCheckoutPath, branchRef);
+      const currentTip = hasBranch ? runGit(repository.primaryCheckoutPath, ["rev-parse", branchRef]).trim() : present ? worktreeHead(worktreePath) : null;
+      if (currentTip === null || currentTip !== row.tip) {
+        return { id, guid, outcome: "refused-changed" };
+      }
+      if (this.hasNonCleanedAssignment(repository.repositoryIdentity, guid) || present && protectedSet.has(path6.resolve(worktreePath))) {
+        return { id, guid, outcome: "skipped-live" };
+      }
+      if (resolution.action === "keep") {
+        this.db.prepare(`
+          UPDATE orphan_surface SET muted_tip = ? WHERE repository_identity = ? AND workspace_guid = ?
+        `).run(currentTip, repository.repositoryIdentity, guid);
+        return { id, guid, outcome: "kept" };
+      }
+      if (resolution.action === "merge-then-reap") {
+        if (present && !worktreeIsClean(worktreePath)) {
+          return { id, guid, outcome: row.category === "dirty" ? "refused-dirty" : "refused-changed" };
+        }
+        return this.mergeOrphanThenReap(repository, name, branchRef, worktreePath, present, registered, currentTip, resolution, id, guid);
+      }
+      let force = false;
+      if (present && !worktreeIsClean(worktreePath)) {
+        if (row.category !== "dirty" || resolution.category !== "dirty") {
+          return { id, guid, outcome: "refused-changed" };
+        }
+        force = true;
+      }
+      let worktreeRemoved = false;
+      if (present) {
+        removeWorktree(repository.primaryCheckoutPath, worktreePath, { force });
+        worktreeRemoved = true;
+      } else if (registered) {
+        removeWorktree(repository.primaryCheckoutPath, worktreePath, { force: true });
+        worktreeRemoved = true;
+      }
+      try {
+        if (this.refResolves(repository.primaryCheckoutPath, branchRef)) {
+          deleteTemporaryBranch(repository.primaryCheckoutPath, name);
+        }
+        this.deleteOrphanSurface(repository.repositoryIdentity, guid);
+        return { id, guid, outcome: "reaped" };
+      } catch (branchError) {
+        return {
+          id,
+          guid,
+          outcome: worktreeRemoved ? "reaped-worktree-only" : "error",
+          error: branchError instanceof Error ? branchError.message : String(branchError)
+        };
+      }
+    } catch (error) {
+      return { id, guid, outcome: "error", error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  /**
+   * `merge-then-reap`: integrates the orphan branch's committed content into
+   * the reaper's target ref, then reaps the orphan — all via Git plumbing
+   * (rev-parse / merge-base / merge-tree / commit-tree / update-ref) against
+   * commit objects only. The operator's primary checkout is NEVER driven
+   * through `git checkout`, `git merge`, or any other working-tree command:
+   * when the primary is on a DIFFERENT branch than the target (an operator
+   * working on their own feature branch while a reap runs), the target ref
+   * is advanced by a bare CAS `update-ref` and the primary's checked-out tree
+   * and index are left byte-for-byte untouched. Only when the primary happens
+   * to be checked out ON the target ref does `carryForwardFastForward` (a
+   * two-tree `read-tree -m -u`) carry the checkout forward, exactly as
+   * `continueFrozenFinalization` in integration.ts does for assignments.
+   *
+   * The target defaults to the repository's CANONICAL default branch
+   * (`canonicalDefaultBranchRef`, derived from `refs/remotes/origin/HEAD`,
+   * falling back to `refs/heads/main`) — never the primary checkout's live
+   * current branch, which an operator may have moved since the orphan was
+   * surfaced. `resolution.integrationTarget` overrides this default and lets
+   * a caller pin the actual reaper target explicitly.
+   */
+  mergeOrphanThenReap(repository, name, branchRef, worktreePath, present, registered, tip, resolution, id, guid) {
+    const primary = repository.primaryCheckoutPath;
+    const target = resolution.integrationTarget ? integrationTargetRef(resolution.integrationTarget) : canonicalDefaultBranchRef(primary);
+    const expected = runGit(primary, ["rev-parse", `${target}^{commit}`]).trim();
+    let newCommit;
+    if (isAncestor(primary, tip, expected)) {
+      newCommit = expected;
+    } else if (isAncestor(primary, expected, tip)) {
+      newCommit = tip;
+    } else {
+      if (!gitSupportsMergeTreeWriteTree()) {
+        return { id, guid, outcome: "needs-manual-merge" };
+      }
+      const mergeTreeArgs = ["merge-tree", "--write-tree", expected, tip];
+      const mt = spawnSync2("git", ["-C", primary, ...mergeTreeArgs], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
+      if (mt.error) throw mt.error;
+      if (mt.status === 1) return { id, guid, outcome: "conflict" };
+      if (mt.status !== 0) throw gitError(primary, mergeTreeArgs, mt.stderr || "");
+      const tree = (mt.stdout || "").split("\n")[0].trim();
+      const botEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: "IronClaude Orphan Reaper",
+        GIT_AUTHOR_EMAIL: "ironclaude-reaper@localhost",
+        GIT_COMMITTER_NAME: "IronClaude Orphan Reaper",
+        GIT_COMMITTER_EMAIL: "ironclaude-reaper@localhost"
+      };
+      const commitTreeArgs = ["commit-tree", tree, "-p", expected, "-p", tip, "-m", `ironclaude: merge orphan ${name} into ${target}`];
+      const ct = spawnSync2("git", ["-C", primary, ...commitTreeArgs], { encoding: "utf8", env: botEnv, maxBuffer: GIT_MAX_BUFFER });
+      if (ct.error) throw ct.error;
+      if (ct.status !== 0) throw gitError(primary, commitTreeArgs, ct.stderr || "");
+      newCommit = (ct.stdout || "").trim();
+    }
+    if (newCommit !== expected) {
+      assertNoPrimaryOverlap(primary, target, expected, newCommit);
+      const upd = spawnSync2("git", ["-C", primary, "update-ref", target, newCommit, expected], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
+      if (upd.error) throw upd.error;
+      if (upd.status !== 0) return { id, guid, outcome: "target-moved" };
+      if (primaryOnRef(primary, target)) {
+        carryForwardFastForward(primary, expected, newCommit);
+      }
+      verifyPrimaryAfterFastForward(primary, target, expected, newCommit);
+    }
+    let worktreeRemoved = false;
+    if (present) {
+      removeWorktree(primary, worktreePath);
+      worktreeRemoved = true;
+    } else if (registered) {
+      removeWorktree(primary, worktreePath, { force: true });
+      worktreeRemoved = true;
+    }
+    try {
+      if (this.refResolves(primary, branchRef)) {
+        deleteTemporaryBranch(primary, name);
+      }
+      this.deleteOrphanSurface(repository.repositoryIdentity, guid);
+      return { id, guid, outcome: "merged-then-reaped" };
+    } catch (branchError) {
+      return {
+        id,
+        guid,
+        outcome: worktreeRemoved ? "reaped-worktree-only" : "error",
+        error: branchError instanceof Error ? branchError.message : String(branchError)
+      };
+    }
+  }
+  /**
+   * Determines why a preserved (non-ancestor) orphan's content has not
+   * reached `target`: already merged under a new SHA (squash), already merged
+   * to origin's copy of the target branch but not yet fast-forwarded locally,
+   * or genuinely unmerged anywhere. `contentMergedInto` is read-only and
+   * fail-safe (never over-claims merged on an error); the origin check is
+   * skipped when the origin-tracking ref does not resolve, or when origin is
+   * already at or behind `target` (merged-on-origin is then impossible, so
+   * running the expensive double-scan would only ever confirm
+   * genuinely-unmerged).
+   */
+  classifyPreservedOrphan(repository, tip, target, scratchDir) {
+    if (contentMergedInto(repository.primaryCheckoutPath, tip, target, scratchDir)) {
+      return { category: "squash-merged", evidence: `content already reached ${target} (squash-merge detected)` };
+    }
+    const originRef = target.startsWith("refs/heads/") ? `refs/remotes/origin/${target.slice("refs/heads/".length)}` : null;
+    if (originRef && this.refResolves(repository.primaryCheckoutPath, originRef) && !isAncestor(repository.primaryCheckoutPath, originRef, target) && contentMergedInto(repository.primaryCheckoutPath, tip, originRef, scratchDir)) {
+      return { category: "merged-on-origin", evidence: `content already reached ${originRef}` };
+    }
+    return { category: "genuinely-unmerged", evidence: `not an ancestor of ${target}` };
+  }
+  /** Upserts the orphan's surface row and builds the reported PreservedOrphan, including `muted`. */
+  buildPreservedOrphan(repository, guid, branch, tip, category, evidence, worktreePresent) {
+    const id = createHash("sha256").update(`${guid}\0${tip}`).digest("hex").slice(0, 8);
+    const row = this.upsertOrphanSurface(repository.repositoryIdentity, guid, id, tip, category);
+    return { id, guid, branch, category, tip, worktreePresent, evidence, muted: row.muted_tip === tip };
+  }
+  /**
+   * Upserts the durable orphan_surface row for one (repository, guid), keyed
+   * on its primary key so a repeated sweep refreshes tip/category in place
+   * rather than duplicating rows. `muted_tip` is never written here — only an
+   * explicit operator mute action sets it — so it survives the upsert
+   * untouched and is returned for the caller to compare against the current tip.
+   */
+  upsertOrphanSurface(repositoryIdentity, guid, shortId, tip, category) {
+    this.db.prepare(`
+      INSERT INTO orphan_surface (repository_identity, workspace_guid, short_id, tip, category)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(repository_identity, workspace_guid) DO UPDATE SET
+        tip = excluded.tip,
+        category = excluded.category,
+        short_id = excluded.short_id
+    `).run(repositoryIdentity, guid, shortId, tip, category);
+    return this.db.prepare(
+      "SELECT muted_tip FROM orphan_surface WHERE repository_identity = ? AND workspace_guid = ?"
+    ).get(repositoryIdentity, guid);
+  }
+  /** Drops the surface row for a guid that is no longer a preserved orphan (reaped). */
+  deleteOrphanSurface(repositoryIdentity, guid) {
+    this.db.prepare(
+      "DELETE FROM orphan_surface WHERE repository_identity = ? AND workspace_guid = ?"
+    ).run(repositoryIdentity, guid);
+  }
+  hasNonCleanedAssignment(repositoryIdentity, workspaceGuid) {
+    return this.db.prepare(`
+      SELECT 1 FROM assignments
+      WHERE repository_identity = ? AND workspace_guid = ? AND lifecycle_status <> 'cleaned'
+    `).get(repositoryIdentity, workspaceGuid) !== void 0;
   }
   /**
    * Current explicit shared-resource entries configured for the repository,

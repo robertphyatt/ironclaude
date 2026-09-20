@@ -1,0 +1,159 @@
+{
+  "name": "Concurrent IronClaude Memory-Efficiency Fixes",
+  "goal": "Implement all eight investigation/Fable-verified fixes so IronClaude runs reliably and memory-efficiently under many concurrent operator sessions + Commander (Brain + workers) on a 48 GB Mac.",
+  "requirements_file": "docs/plans/2026-09-16-mcp-memory-efficiency-design.md",
+  "design_file": "docs/plans/2026-09-16-mcp-memory-efficiency-design.md",
+  "estimated_memory_gb": 1,
+  "tasks": [
+    {
+      "id": 1,
+      "name": "A1 pressure-aware spawn gate",
+      "description": "Add a swap/macOS-memory-pressure guard to _check_spawn_preconditions (additive AFTER the deliberate 10% floor #1030, ends :2782); new config keys max_swap_used_gb (8.0) + spawn_block_on_pressure (true); fail-open inside the helpers. orchestrator_mcp.py uses self._config; psutil imported :33.",
+      "allowed_files": ["commander/src/ironclaude/orchestrator_mcp.py", "commander/src/ironclaude/config.py", "config/ironclaude.json.example", "commander/tests/test_orchestrator_mcp.py"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: add TestSpawnMemoryPressureGate to test_orchestrator_mcp.py (mirror the tools fixture). Each case MUST stub tools.get_system_memory = MagicMock(return_value={'available_gb':30.0,'total_gb':48.0}) (as :8650/:8676) so the floor passes and the swap/pressure guard is exercised. (a) swap 9GB + max 8 -> reject 'swap too high'; (b) _memory_pressure_level 4 + block True -> reject 'memory pressure'; (c) swap 2 + pressure 1 -> None; (d) psutil.swap_memory AND sysctl subprocess.run both raise -> None (fail-open).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -k SpawnMemoryPressure -x", "expected": "FAIL (helpers/gate absent)."},
+        {"description": "GREEN helpers: add _swap_used_gb (round(psutil.swap_memory().used/1024**3,1); except->log INFO + return 0.0) and _memory_pressure_level (subprocess sysctl -n kern.memorystatus_vm_pressure_level int; 0 on error) to OrchestratorTools near get_system_memory (~:6851)."},
+        {"description": "GREEN gate: after the memory-floor reject block (after :2782, before the passed logger :2784) insert the swap guard (max_swap=self._config.get('max_swap_used_gb',8.0); reject if >0 and swap_used>max_swap) then the pressure guard (if self._config.get('spawn_block_on_pressure',True) and _memory_pressure_level()>=2 -> reject). Each returns a dict with error + the measured value."},
+        {"description": "Config: config.py DEFAULTS (after min_available_memory_pct :34) add max_swap_used_gb:8.0 and spawn_block_on_pressure:True; config/ironclaude.json.example add both (JSON 8.0 / true)."},
+        {"description": "GREEN verify + config regression.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -k SpawnMemoryPressure -x && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_config.py -x", "expected": "PASS."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -- commander/src/ironclaude/orchestrator_mcp.py commander/src/ironclaude/config.py config/ironclaude.json.example commander/tests/test_orchestrator_mcp.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "A2 heartbeat memory line",
+      "description": "Add a mem_line kwarg to notifications.format_heartbeat, rendered in BOTH the early-return (no-workers ~:123-131) AND the lines path (default None = no change), plus a main.py _format_mem_line() helper (available/swap/top-3 RSS, fail-open) threaded into the format_heartbeat call at :4836. psutil imported main.py:24.",
+      "allowed_files": ["commander/src/ironclaude/notifications.py", "commander/src/ironclaude/main.py", "commander/tests/test_notifications.py"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Read notifications.format_heartbeat: it has an EARLY RETURN for no workers/waits (~:123-131) AND a lines path; mem_line must render in both."},
+        {"description": "RED: test asserting format_heartbeat(..., mem_line='mem: 12.0 free / swap 2.0 / top X=1.0G') includes it with workers=[] (early-return) AND non-empty workers.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_notifications.py -k mem -x", "expected": "FAIL."},
+        {"description": "GREEN notifications: add mem_line: str | None = None; when truthy append its own line in BOTH the early-return branch and the lines branch; None keeps output byte-identical."},
+        {"description": "GREEN daemon: add module helper _format_mem_line() (psutil.virtual_memory + swap_memory + process_iter top-3 RSS; except->'mem: unavailable (...)'); at the format_heartbeat call (:4836) add mem_line=_format_mem_line()."},
+        {"description": "GREEN verify.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_notifications.py -x", "expected": "PASS."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -- commander/src/ironclaude/notifications.py commander/src/ironclaude/main.py commander/tests/test_notifications.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "C(em) episodic-memory self-exit on parent death",
+      "description": "Add stdin-'end'->exit(0) + a refed CLAUDE_PPID poll (process.kill(ppid,0)->exit on ESRCH; interval Number(process.env.IC_PPID_POLL_MS)||30000) after server.connect in mcp-server.ts:333. em dist/mcp-server.js is rebuilt for the test but NOT staged (untracked/gitignored, built on demand by the wrapper).",
+      "allowed_files": ["worker/mcp-servers/episodic-memory/src/mcp-server.ts", "worker/mcp-servers/episodic-memory/src/__tests__/parent-death-exit.test.ts"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: create src/__tests__/parent-death-exit.test.ts (vitest): (a) build, spawn dist/mcp-server.js stdio [pipe,ignore,ignore], child.stdin.end(), assert exit 0 within 5s; (b) spawn with env.CLAUDE_PPID = a short-lived helper pid and env.IC_PPID_POLL_MS='500', kill the helper, assert child exits within 5s. Case (b) is the reliable RED.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory && npm run build && npx vitest run parent-death-exit", "expected": "FAIL (case b times out; no PPID watchdog)."},
+        {"description": "GREEN: in src/mcp-server.ts main() after `await server.connect(transport)` (:333) insert process.stdin.on('end',()=>process.exit(0)) + const icPpid=Number(process.env.CLAUDE_PPID); if Number.isInteger(icPpid)&&icPpid>1 { const pollMs=Number(process.env.IC_PPID_POLL_MS)||30000; setInterval(()=>{try{process.kill(icPpid,0)}catch(err:any){if(err&&err.code==='ESRCH')process.exit(0)}},pollMs) } (refed)."},
+        {"description": "Build + GREEN verify.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory && npm run build && npx vitest run parent-death-exit", "expected": "PASS."},
+        {"description": "Stage (src + test only, NOT dist).", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f -- worker/mcp-servers/episodic-memory/src/mcp-server.ts worker/mcp-servers/episodic-memory/src/__tests__/parent-death-exit.test.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "C(sm) state-manager self-exit on parent death",
+      "description": "Same self-exit block as Task 3 after server.connect in state-manager src/index.ts:181; rebuild dist/index.js (git-tracked). Spawn test passes STATE_MANAGER_DB_PATH=<tmp> in child env (sm initDb at startup :162).",
+      "allowed_files": ["worker/mcp-servers/state-manager/src/index.ts", "worker/mcp-servers/state-manager/dist/index.js", "worker/mcp-servers/state-manager/src/__tests__/parent-death-exit.test.ts"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: create src/__tests__/parent-death-exit.test.ts (same shape as Task 3) against dist/index.js; child env includes STATE_MANAGER_DB_PATH=<tmp> (src/db.ts:31-32) so it never touches the live state DB, and IC_PPID_POLL_MS='500'.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm run build && npx vitest run parent-death-exit", "expected": "FAIL (case b)."},
+        {"description": "GREEN: insert the identical self-exit block from Task 3 after `await server.connect(transport)` (:181)."},
+        {"description": "Verify.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm run build && npx vitest run parent-death-exit", "expected": "PASS."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f -- worker/mcp-servers/state-manager/src/index.ts worker/mcp-servers/state-manager/dist/index.js worker/mcp-servers/state-manager/src/__tests__/parent-death-exit.test.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 5,
+      "name": "C(ws) workspace-manager self-exit on parent death",
+      "description": "Same self-exit block as Task 3 after server.connect in workspace-manager src/index.ts:582 (inside startWorkspaceManagerServer); rebuild dist/index.js (git-tracked).",
+      "allowed_files": ["worker/mcp-servers/workspace-manager/src/index.ts", "worker/mcp-servers/workspace-manager/dist/index.js", "worker/mcp-servers/workspace-manager/src/__tests__/parent-death-exit.test.ts"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: create src/__tests__/parent-death-exit.test.ts (same shape) against dist/index.js (IC_PPID_POLL_MS='500').", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build && npx vitest run parent-death-exit", "expected": "FAIL (case b)."},
+        {"description": "GREEN: insert the identical self-exit block after `await server.connect(new StdioServerTransport());` (:582) inside startWorkspaceManagerServer."},
+        {"description": "Verify + full ws suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build && npx vitest run parent-death-exit && npx vitest run", "expected": "PASS."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f -- worker/mcp-servers/workspace-manager/src/index.ts worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/src/__tests__/parent-death-exit.test.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 6,
+      "name": "E vitest fan-out caps",
+      "description": "Cap vitest fork fan-out (maxForks 2) in all three MCP packages (vitest v3, poolOptions.forks valid). No tests required: build/test config only.",
+      "allowed_files": ["worker/mcp-servers/workspace-manager/vitest.config.ts", "worker/mcp-servers/state-manager/vitest.config.ts", "worker/mcp-servers/episodic-memory/vitest.config.ts"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Extend workspace-manager/vitest.config.ts test block with pool:'forks', poolOptions:{forks:{maxForks:2,minForks:1}} (preserve existing options)."},
+        {"description": "Create state-manager/vitest.config.ts and episodic-memory/vitest.config.ts: defineConfig({test:{pool:'forks',poolOptions:{forks:{maxForks:2,minForks:1}}}})."},
+        {"description": "Verify each config loads + suite passes (repeat cd per package).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run --reporter=dot", "expected": "Runs (no config error) + passes; repeat for episodic-memory + workspace-manager."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f -- worker/mcp-servers/workspace-manager/vitest.config.ts worker/mcp-servers/state-manager/vitest.config.ts worker/mcp-servers/episodic-memory/vitest.config.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 7,
+      "name": "D1 delete dead _cleanup_zombie_mcp_processes",
+      "description": "Delete _MCP_CLEANUP_PATTERNS (:224-228), _cleanup_zombie_mcp_processes (:6706-6772), and its call at :6791 in restart_mcp (never fires on macOS). ALSO adapt TestRestartMcp in test_orchestrator_mcp.py which directly tests + patch.objects the deleted method.",
+      "allowed_files": ["commander/src/ironclaude/orchestrator_mcp.py", "commander/tests/test_orchestrator_mcp.py", "commander/tests/test_mcp_entrypoints.py"],
+      "depends_on": [1],
+      "steps": [
+        {"description": "RED: test in test_mcp_entrypoints.py asserting OrchestratorTools has no attr _cleanup_zombie_mcp_processes and the module has no _MCP_CLEANUP_PATTERNS.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_mcp_entrypoints.py -k zombie -x", "expected": "FAIL."},
+        {"description": "GREEN source: delete _MCP_CLEANUP_PATTERNS (:224-228), the method (:6706-6772), and the call at :6791 (keep db-close + flush + execvp in restart_mcp)."},
+        {"description": "GREEN adapt TestRestartMcp (test_orchestrator_mcp.py :7237-7358): DELETE test_restart_mcp_calls_zombie_cleanup_before_exec (:7270-7287), test_cleanup_zombie_mcp_skips_own_pid (:7289-7305), test_cleanup_zombie_mcp_kills_dead_parent_process (:7307-7332), test_cleanup_zombie_mcp_spares_live_parent_process (:7334-7358); EDIT test_restart_mcp_codex_refuses_before_side_effects (drop patch.object :7242 + cleanup.assert_not_called() :7251) and test_restart_mcp_closes_db_and_execs (drop patch.object :7262)."},
+        {"description": "Verify + restart_mcp still valid.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_mcp_entrypoints.py tests/test_orchestrator_mcp.py -x", "expected": "PASS."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -- commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py commander/tests/test_mcp_entrypoints.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 8,
+      "name": "D2 _kill_orphan_brains recorded-PID (no pattern-kill)",
+      "description": "Rework _kill_orphan_brains (:1186-1203) to kill the RECORDED brain PID (self.brain._brain_pid :1269) belt-and-suspenders; keep pgrep -f as LOG-ONLY residue verification, never the kill selector. Thread the recorded pid from the _handle_restart caller (:1245).",
+      "allowed_files": ["commander/src/ironclaude/main.py", "commander/tests/test_kill_orphan_brains.py"],
+      "depends_on": [2],
+      "steps": [
+        {"description": "RED: create test_kill_orphan_brains.py: _kill_orphan_brains(recorded_brain_pid=<int>) with monkeypatched _logged_kill -> asserts it kills the recorded pid; patch subprocess.run to return fake pgrep pids and assert NEITHER is passed to _logged_kill (pgrep is log-only).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_kill_orphan_brains.py -x", "expected": "FAIL (current sig takes no pid; kills pgrep output)."},
+        {"description": "GREEN: _kill_orphan_brains(recorded_brain_pid: int | None = None): if recorded_brain_pid -> _logged_kill(recorded_brain_pid, signal.SIGTERM, ...) + time.sleep(2); then pgrep -f 'claude.*stream-json.*Orchestrator' LOG-ONLY (logger.warning residue, never kill). Update the _handle_restart caller (:1245) to pass _daemon.brain._brain_pid."},
+        {"description": "Verify.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_kill_orphan_brains.py tests/test_signal_handler.py -x", "expected": "PASS."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -- commander/src/ironclaude/main.py commander/tests/test_kill_orphan_brains.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 9,
+      "name": "B idle-worker TTL (pane-log-mtime signal, stuck-path-mirrored reap)",
+      "description": "Idle signal = tmux pane-log mtime (get_log_mtime :514-534), NOT the .done marker (deleted on delivery :4230-4238). Arm _worker_idle_since via setdefault in the marker branch (survives deletion); reap when now-armed>=ttl AND log mtime not after arm+grace AND not _routine_prompt_active, via _reap_idle_worker which mirrors the stuck path (:4009-4025): finalize(terminal=False)+drive -> if disp in retrying/held/surfaced return (no kill; recovery lock not stranded) -> else kill_session -> finalize(terminal=True)+drive -> worker_finished -> Slack+Brain+pop. Disarm on activity (mtime>arm+5s). ttl 0 disables. mtime None -> never reap (fail-safe). Prune in check_workers (running_ids :4196), NOT the dead check_stuck_workers :3942-3964.",
+      "allowed_files": ["commander/src/ironclaude/main.py", "commander/src/ironclaude/config.py", "config/ironclaude.json.example", "commander/tests/test_idle_worker_ttl.py", "commander/src/ironclaude/notifications.py"],
+      "depends_on": [8, 1],
+      "steps": [
+        {"description": "RED: create test_idle_worker_ttl.py (daemon __new__ fixture from test_main_validate.py) setting EVERY attr the path reads (operator __new__ rule): _worker_idle_since={}, config, tmux (MagicMock get_log_mtime + kill_session), brain, slack, registry, _finalize_drift_retry={}, _finalize_recovery_alerted=set(), _session_died_notified=set(); mock _finalize_and_release_worker, _drive_finalization_recovery, _routine_prompt_active. Assert: (a) first idle sets _worker_idle_since via setdefault; (b) armed + now-armed>=ttl + mtime not after arm + routine False -> _reap_idle_worker runs the ordered sequence finalize(terminal=False)->drive->kill_session(session,ssh_host=..)->finalize(terminal=True)->drive (attach_mock call order); (c) first drive returns 'held' -> kill_session.assert_not_called() and _worker_idle_since[wid] still set; (d) mtime > arm + IDLE_ACTIVITY_GRACE_SECONDS -> popped, no reap; (e) ttl 0 -> never reap; (f) get_log_mtime None -> never reap. Monkeypatch the clock.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_idle_worker_ttl.py -x", "expected": "FAIL."},
+        {"description": "GREEN state/config/helpers: main.py const IDLE_ACTIVITY_GRACE_SECONDS=5.0; __init__ (near :1477/:1498) self._worker_idle_since: dict[str,float]={}; config.py DEFAULTS idle_worker_ttl_seconds:1800 + config/ironclaude.json.example; notifications.format_worker_idle_ttl_reaped(worker_id, minutes); new method _reap_idle_worker(worker_id, session_name, ssh_host, idle_seconds) = finalize(terminal=False)+drive; if disp in ('retrying','held','surfaced') return; kill_session(session_name, ssh_host=ssh_host); finalize(terminal=True)+drive; registry worker_finished if completed; slack format_worker_idle_ttl_reaped; brain send_message('[SWEEP] Worker ... reaped after N min idle; work integrated/rescued; spawn replacement if unfinished'); _worker_idle_since.pop."},
+        {"description": "GREEN check_workers wiring: per worker BEFORE the `if marker_exists:` branch: ttl=self.config.get('idle_worker_ttl_seconds',1800); armed=self._worker_idle_since.get(worker_id); if armed is not None and ttl>0: mtime=self.tmux.get_log_mtime(session_name, ssh_host=ssh_host, remote_log_dir=remote_log_dir); if mtime is not None and mtime>armed+IDLE_ACTIVITY_GRACE_SECONDS: pop (active/reused disarm); elif mtime is not None and now-armed>=ttl and not self._routine_prompt_active(worker_id): _reap_idle_worker(...); continue; (mtime None -> never reap). In `if marker_exists:` FIRST line: self._worker_idle_since.setdefault(worker_id, time.time()). Prune AFTER the check_workers loop (running_ids :4196): for wid in list(self._worker_idle_since): if wid not in running_ids: pop. NOT at :3942-3964 (dead)."},
+        {"description": "Verify (+ no regression).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_idle_worker_ttl.py tests/test_main_validate.py tests/test_notifications.py -x", "expected": "PASS."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -- commander/src/ironclaude/main.py commander/src/ironclaude/config.py config/ironclaude.json.example commander/tests/test_idle_worker_ttl.py commander/src/ironclaude/notifications.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 10,
+      "name": "F configurable embedding backend (local default)",
+      "description": "Make episodic-memory's embedder configurable via IC_EMBEDDING_BACKEND (default 'local' = current Xenova, zero behaviour change); 'ollama' POSTs to /api/embeddings with a HARD fallback to local on any error. Re-index caveat documented. em dist/mcp-server.js rebuilt but NOT staged (untracked).",
+      "allowed_files": ["worker/mcp-servers/episodic-memory/src/embeddings.ts", "worker/mcp-servers/episodic-memory/src/__tests__/embedding-backend.test.ts"],
+      "depends_on": [3],
+      "steps": [
+        {"description": "RED: create embedding-backend.test.ts with vi.mock('@xenova/transformers') for determinism: (a) IC_EMBEDDING_BACKEND unset -> getEmbeddingBackend()==='local'; (b) 'ollama' + mocked failing fetch -> generateEmbedding falls back to local, returns 384-length vector; (c) 'ollama' + mocked ok /api/embeddings -> returns the remote vector.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory && npm run build && npx vitest run embedding-backend", "expected": "FAIL."},
+        {"description": "GREEN: getEmbeddingBackend() = process.env.IC_EMBEDDING_BACKEND ?? 'local'; refactor generateEmbedding to dispatch local (unchanged Xenova) vs ollama (POST {model: IC_EMBEDDING_MODEL ?? 'all-minilm', prompt: truncated} to (IC_EMBEDDING_BASE_URL ?? 'http://localhost:11434')/api/embeddings, return json.embedding); on ANY error console.error + fall through to local. Keep generateExchangeEmbedding delegating. Add reindex caveat comment atop embeddings.ts. Rebuild."},
+        {"description": "Verify (+ full em suite).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory && npm run build && npx vitest run embedding-backend && npx vitest run", "expected": "PASS."},
+        {"description": "Stage (src + test only, NOT dist).", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f -- worker/mcp-servers/episodic-memory/src/embeddings.ts worker/mcp-servers/episodic-memory/src/__tests__/embedding-backend.test.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 11,
+      "name": "G collapse fork wrapper to in-process load + preserve cleanup",
+      "description": "Replace each wrapper's spawn(...) with in-process load: set CLAUDE_PPID, add SIGTERM/SIGINT/SIGHUP handlers that process.exit(0) (fires the existing process.on('exit') PENDING_MARKER unlink for sm/em -> I2 fix), then em/sm `await import(pathToFileURL(bundle).href)` (they call main() unconditionally); ws `const mod = await import(pathToFileURL(bundle).href); await mod.startWorkspaceManagerServer()` (bundle exports it; guard stays false, no ws src edit). Keep ensureBuildComplete. Halves node MCP procs per session. No tests required: launch wrapper; verified by build + in-process smoke. DEPLOY to caches is a separate operator-gated step.",
+      "allowed_files": ["worker/mcp-servers/episodic-memory/cli/mcp-server-wrapper.js", "worker/mcp-servers/state-manager/cli/mcp-server-wrapper.js", "worker/mcp-servers/workspace-manager/cli/mcp-server-wrapper.js"],
+      "depends_on": [3, 4, 5, 10],
+      "steps": [
+        {"description": "em + sm: after ensureBuildComplete()/pre-spawn setup, REPLACE `const child = spawn(process.execPath,[bundle],{...})` + its SIGTERM/SIGINT/exit/child.on handling with: process.env.CLAUDE_PPID = String(process.ppid); for (const sig of ['SIGTERM','SIGINT','SIGHUP']) process.on(sig, ()=>{ try{log(`[signal] ${sig}`)}catch{}; process.exit(0) }); await import(pathToFileURL(bundle).href). Keep ensureBuildComplete + process.on('exit', ()=>{try{unlinkSync(PENDING_MARKER)}catch{}}). Add `import { pathToFileURL } from 'node:url'` (or require per module style)."},
+        {"description": "ws: process.env.CLAUDE_PPID=String(process.ppid); same SIGTERM/SIGINT/SIGHUP->exit handlers; const mod = await import(pathToFileURL(bundle).href); if (typeof mod.startWorkspaceManagerServer !== 'function') throw; await mod.startWorkspaceManagerServer(). (ws bundle guards its own start on argv[1]===import.meta.url which stays false under import; it EXPORTS startWorkspaceManagerServer. No ws src/dist edit.)"},
+        {"description": "Verify ws export exists + em/sm start on import (no argv guard around main()).", "command": "grep -n -e \"export\" -e \"startWorkspaceManagerServer\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/index.js", "expected": "A line exporting startWorkspaceManagerServer. Then grep em/sm bundles for an argv[1]===import.meta.url start-guard: grep -n -e \"import.meta.url\" -e \"argv\" episodic-memory/dist/mcp-server.js state-manager/dist/index.js -> expect NO such start-guard (they run main() on import); if either has one, STOP and report."},
+        {"description": "In-process smoke per server: starts in ONE proc, exits on stdin EOF (self-exit from Task 3), no child dist proc spawned.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory && node cli/mcp-server-wrapper.js < /dev/null", "expected": "Starts, logs the server-running line, exits code 0 on stdin EOF. Repeat per server (sm with STATE_MANAGER_DB_PATH=/tmp/ic-smoke-sm.db). Live sessions run the CACHE copy; DEPLOY is a separate operator-gated step."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f -- worker/mcp-servers/episodic-memory/cli/mcp-server-wrapper.js worker/mcp-servers/state-manager/cli/mcp-server-wrapper.js worker/mcp-servers/workspace-manager/cli/mcp-server-wrapper.js", "expected": "Staged."}
+      ]
+    }
+  ]
+}

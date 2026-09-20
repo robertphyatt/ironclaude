@@ -149,7 +149,7 @@ export const publicToolDefinitions = [
         workspace_guid: workspaceProperty,
         mode: {
           type: 'string' as const,
-          enum: ['status', 'continue', 'abort', 'rerebase', 'restore_frozen'],
+          enum: ['status', 'continue', 'abort', 'rerebase', 'restore_frozen', 'reopen_for_edit'],
           description: 'Optional explicit rebase-recovery mode; omitted defaults to auto-complete-when-proven.',
         },
       },
@@ -253,12 +253,14 @@ function requiredConflictHunkChoice(args: Args): 'keep-mine' | 'take-target' | '
   return value;
 }
 
-function optionalMode(args: Args): 'status' | 'continue' | 'abort' | 'rerebase' | 'restore_frozen' | undefined {
+function optionalMode(
+  args: Args,
+): 'status' | 'continue' | 'abort' | 'rerebase' | 'restore_frozen' | 'reopen_for_edit' | undefined {
   const value = args.mode;
   if (value === undefined) return undefined;
   if (value !== 'status' && value !== 'continue' && value !== 'abort'
-    && value !== 'rerebase' && value !== 'restore_frozen') {
-    throw new Error("mode must be 'status', 'continue', 'abort', 'rerebase', or 'restore_frozen'");
+    && value !== 'rerebase' && value !== 'restore_frozen' && value !== 'reopen_for_edit') {
+    throw new Error("mode must be 'status', 'continue', 'abort', 'rerebase', 'restore_frozen', or 'reopen_for_edit'");
   }
   return value;
 }
@@ -580,6 +582,18 @@ export async function startWorkspaceManagerServer(): Promise<void> {
   });
 
   await server.connect(new StdioServerTransport());
+
+  // Exit when the parent (Claude/Codex session) goes away so this server never
+  // lingers as an orphan holding memory. macOS has no PDEATHSIG, so watch both:
+  process.stdin.on('end', () => process.exit(0));
+  const icPpid = Number(process.env.CLAUDE_PPID);
+  if (Number.isInteger(icPpid) && icPpid > 1) {
+    const pollMs = Number(process.env.IC_PPID_POLL_MS) || 30000;
+    setInterval(() => {
+      try { process.kill(icPpid, 0); }
+      catch (err: any) { if (err && err.code === 'ESRCH') process.exit(0); }
+    }, pollMs); // refed on purpose — this watchdog must keep running
+  }
 }
 
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : null;

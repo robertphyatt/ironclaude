@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -8,9 +8,15 @@ import {
   carryForwardFastForward,
   changedPaths,
   directoryContainsSecret,
+  discoverRepository,
   dirtyAndUntrackedPaths,
+  gitBufferOverflowError,
   linkSharedResources,
+  listManagedBranches,
+  listWorktrees,
   readSharedResourceConfig,
+  runGit,
+  runGitEnv,
 } from '../git.js';
 
 function git(cwd: string, ...args: string[]): string {
@@ -385,5 +391,119 @@ describe('git.ts pure helpers', () => {
       expect(planted).toEqual(['data/models']);
       expect(lstatSync(join(worktree, 'data', 'models')).isSymbolicLink()).toBe(true);
     });
+  });
+
+  describe('listManagedBranches', () => {
+    it('returns sorted ironclaude/* branch names, excluding main', () => {
+      const root = repository();
+      writeFileSync(join(root, 'README.md'), 'base\n');
+      git(root, 'add', '-A');
+      git(root, 'commit', '-q', '-m', 'base');
+      git(root, 'branch', 'ironclaude/b');
+      git(root, 'branch', 'ironclaude/a');
+
+      expect(listManagedBranches(root)).toEqual(['ironclaude/a', 'ironclaude/b']);
+    });
+
+    it('returns an empty array when there are no ironclaude/* branches', () => {
+      const root = repository();
+      writeFileSync(join(root, 'README.md'), 'base\n');
+      git(root, 'add', '-A');
+      git(root, 'commit', '-q', '-m', 'base');
+
+      expect(listManagedBranches(root)).toEqual([]);
+    });
+
+    it('returns the exact branch name when a same-named tag collides (no %(refname:short) mangling)', () => {
+      const root = repository();
+      writeFileSync(join(root, 'README.md'), 'base\n');
+      git(root, 'add', '-A');
+      git(root, 'commit', '-q', '-m', 'base');
+      git(root, 'branch', 'ironclaude/a');
+      git(root, 'tag', 'ironclaude/a');   // refs/tags/ironclaude/a collides with refs/heads/ironclaude/a
+      expect(listManagedBranches(root)).toEqual(['ironclaude/a']);
+    });
+  });
+
+  describe('listWorktrees tolerates a registered worktree whose directory was deleted outside git', () => {
+    function managedWorktree(root: string, branch: string): string {
+      const path = mkdtempSync(join(tmpdir(), 'ironclaude-git-helpers-wt-'));
+      rmSync(path, { recursive: true, force: true });
+      directories.push(path);
+      git(root, 'worktree', 'add', '-q', '-b', branch, path, 'HEAD');
+      return path;
+    }
+
+    it('does not throw, still lists the dir-gone worktree, and still lists a second on-disk worktree', () => {
+      const root = repository();
+      writeFileSync(join(root, 'README.md'), 'base\n');
+      git(root, 'add', '-A');
+      git(root, 'commit', '-q', '-m', 'base');
+
+      const gone = managedWorktree(root, 'ironclaude/gone');
+      const present = managedWorktree(root, 'ironclaude/present');
+      // Capture the realpath while the directory still exists: `git worktree
+      // add` records the worktree path already realpath'd (e.g. macOS
+      // /var -> /private/var), so this is what listWorktrees returns for both
+      // entries — canonicalPath's ENOENT fallback (path.resolve, no symlink
+      // resolution) reproduces it unchanged because git's stored path is
+      // already canonical.
+      const goneCanonical = realpathSync(gone);
+      const presentCanonical = realpathSync(present);
+      rmSync(gone, { recursive: true, force: true });
+
+      let entries: ReturnType<typeof listWorktrees> = [];
+      expect(() => {
+        entries = listWorktrees(root);
+      }).not.toThrow();
+
+      const paths = entries.map((entry) => entry.path);
+      expect(paths).toContain(presentCanonical);
+      expect(paths).toContain(goneCanonical);
+
+      expect(() => discoverRepository(root)).not.toThrow();
+    });
+  });
+
+  describe('large-output buffer handling', () => {
+    function bigRepository(): { root: string; size: number } {
+      const root = repository();
+      const content = 'x'.repeat(1_500_000) + '\n';
+      writeFileSync(join(root, 'big.txt'), content);
+      git(root, 'add', 'big.txt');
+      git(root, 'commit', '-q', '-m', 'big file');
+      return { root, size: content.length };
+    }
+
+    it('runGit returns a >1MB git stdout in full, without throwing', () => {
+      const { root } = bigRepository();
+      expect(runGit(root, ['show', 'HEAD:big.txt']).length).toBeGreaterThanOrEqual(1_500_000);
+    });
+
+    it('runGitEnv returns a >1MB git stdout in full, without throwing', () => {
+      const { root } = bigRepository();
+      expect(runGitEnv(root, ['show', 'HEAD:big.txt'], { ...process.env }).length).toBeGreaterThanOrEqual(1_500_000);
+    });
+
+    describe('gitBufferOverflowError', () => {
+      it('returns an Error naming the joined argv for an ENOBUFS error', () => {
+        const args = ['diff', '--binary', '--full-index', 'base', 'head'];
+        const error = Object.assign(new Error('x'), { code: 'ENOBUFS' }) as NodeJS.ErrnoException;
+        const result = gitBufferOverflowError(args, error);
+        expect(result).toBeInstanceOf(Error);
+        expect(result?.message).toContain(args.join(' '));
+      });
+
+      it('returns undefined for a non-ENOBUFS error', () => {
+        const args = ['status'];
+        const error = Object.assign(new Error('x'), { code: 'EACCES' }) as NodeJS.ErrnoException;
+        expect(gitBufferOverflowError(args, error)).toBeUndefined();
+      });
+
+      it('returns undefined for an undefined error', () => {
+        expect(gitBufferOverflowError(['status'], undefined)).toBeUndefined();
+      });
+    });
+
   });
 });

@@ -1,0 +1,62 @@
+{
+  "name": "Interrupted-CAS ancestry recovery + proportionality cleanups",
+  "goal": "Fix I1 (interrupted-CAS recovery must detect 'already landed' by ancestry, not exact equality, so a landed-then-advanced row is completed rather than stranded) and fold in 4 SAFE proportionality cleanups. Folds into unpushed v1.1.11.",
+  "requirements_file": "docs/plans/2026-09-21-interrupted-cas-ancestry-requirements.md",
+  "design_file": "docs/plans/2026-09-21-interrupted-cas-ancestry-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "C1 (I1 ancestry fix) + C5 (persistRecoveryRef dedup) — integration.ts + tests",
+      "description": "reconcile crash branch + reopenForEdit guard must detect 'already landed' by ancestry (isAncestor(candidate, currentTarget)) not exact equality; the primary-checkout verify/repair is gated on currentTarget===candidate. NO worktreeHead conjunct on the guard (R1: refuse when landed AND lock held; a HEAD gate would strand a genuine post-CAS-recommit row). C5: extract persistRecoveryRef helper. TDD for C1.",
+      "allowed_files": ["worker/mcp-servers/workspace-manager/src/integration.ts", "worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: in integration-cases.ts recovery part add two cases with a landed-then-advanced interrupted-CAS seed (model on advancedWithoutRecord ~:1958-1975 which reaches markIntegrated): setup(false); commit reviewed work -> landed; oldTarget=git(root,'rev-parse','HEAD'); update-ref frozen=landed; acquireIntegrationLock(database,{repositoryIdentity,workspaceGuid,targetRef:'refs/heads/main',expectedTarget:oldTarget}); git(root,'merge','--ff-only',landed); update-ref candidate=landed; set lifecycle_status='ready_for_integration' (base_commit=oldTarget, frozen=landed so the effect proof holds); THEN advance target: git(root,'commit','--allow-empty','-m','unrelated advance'). Case A: expect(reconcileFinalization(database,{repositoryPath:root,workspaceGuid,providerRootSessionId:OWNER}).state).toBe('cleaned') and integratedCommit===landed [RED: throws 'Crash reconciliation target is not the exact candidate']. Case B: expect(() => reconcileFinalization(database,{...,rebaseRecovery:'reopen_for_edit'})).toThrow('integration already landed on the target'); assert candidate ref, frozen ref, integration_locks row survive [RED: equality guard doesn't fire so reopen proceeds]. Keep existing exact-target cases passing.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/integration-core.test.ts src/__tests__/integration-recovery.test.ts", "expected": "RED: Case A throws 'not the exact candidate'; Case B does not throw (reopen proceeds). Existing core + recovery cases pass."},
+        {"description": "GREEN C1 reconcile crash branch (integration.ts ~:2206-2242): (a) replace `if (currentTarget !== candidate) throw new Error('Crash reconciliation target is not the exact candidate; preserving worktree');` with `if (!isAncestor(exact.primaryCheckoutPath, candidate, currentTarget)) { throw new Error('Crash reconciliation candidate did not land on the target; preserving worktree'); }`. (b) wrap the existing `try { verifyPrimaryAfterFastForward(exact.primaryCheckoutPath, ref, expectedTarget, candidate); } catch { repairPrimaryCheckoutAfterInterruptedCas(exact.primaryCheckoutPath, ref, expectedTarget, candidate); }` block in `if (currentTarget === candidate) { … }`. Leave requireExactIntegrationLock, the effect proof, markIntegrated(candidate,ref), disposition check, recycleFinalized, and the ~:2192 sourceHead!==candidate gate unchanged.", "expected": ""},
+        {"description": "GREEN C1 reopenForEdit guard (integration.ts ~:1951-1964): replace the guard body with: `let landedCandidate: string | undefined; try { landedCandidate = runGit(exact.primaryCheckoutPath, ['rev-parse','--verify',`${candidateRef(assignment.workspace_guid)}^{commit}`]).trim(); } catch {} if (landedCandidate) { const landed = isAncestor(exact.primaryCheckoutPath, landedCandidate, targetRef(assignment)); const lockHeld = db.prepare('SELECT 1 FROM integration_locks WHERE repository_identity = ? AND workspace_guid = ?').get(assignment.repository_identity, assignment.workspace_guid) !== undefined; if (landed && lockHeld) { throw new Error('reopen_for_edit refused: integration already landed on the target (interrupted-CAS); run reconcile — it will finish the integration or report the repair needed — do not reopen'); } }` (NO worktreeHead conjunct; subsumes the lineage-118 unresolvable-target try/catch; isAncestor already imported).", "expected": ""},
+        {"description": "GREEN C5: extract persistRecoveryRef(db, exact, oid, residualFiles) — create-only `update-ref <recoveryRef> <oid> ''` (same-oid-tolerant catch) + `UPDATE assignments SET recovery_ref` + insertPreservedWork({kind:'recovery',payload:{ref,residualFiles}}) + re-verify rev-parse — and call it from both snapshotResidualIfDirty (~:1498-1521) and reopenForEdit's clean-diverged-HEAD branch (~:1979-1996). Behavior identical.", "expected": ""},
+        {"description": "Verify GREEN + no regression (core + recovery).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/integration-core.test.ts src/__tests__/integration-recovery.test.ts", "expected": "0 failed (Case A/B green; existing exact-target + reopen/crash cases pass)."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/integration.ts worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "C2 (collapse daemon marker dicts) + C3 (fix/delete marker tests) — main.py + commander tests",
+      "description": "Collapse _commit_failure_alerted (dict) + _commit_reopen_processed (dict) into one _finalize_marker_seen: dict[str,int] + _commit_failure_alerted: set[str], keyed off max_marker_id. The marker block is in check_workers (~:4451-4487); the non-running sweep is in check_stuck_workers (~:4162-4167) and its `_commit_failure_alerted.pop(wid,None)` MUST become `.discard(wid)` once it is a set (M1 fix). Delete the del-attrs test; add a sweep falsifier test + an integrate-marker-reset test; fix __new__ fixtures.",
+      "allowed_files": ["commander/src/ironclaude/main.py", "commander/tests/test_idle_worker_ttl.py", "commander/tests/test_daemon.py"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Survey baseline.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_daemon.py -q -k \"finalize or marker or reopen\"", "expected": "current marker tests pass (baseline)."},
+        {"description": "GREEN C2 main.py: (init ~:1601-1607) `self._finalize_marker_seen: dict[str, int] = {}` and `self._commit_failure_alerted: set[str] = set()`; remove the _commit_reopen_processed init. (marker block in check_workers ~:4451-4487) remove the latest_reopen_id computation; replace re-arm+alert with: `if _latest_marker > self._finalize_marker_seen.get(worker_id, 0): self._finalize_marker_seen[worker_id] = _latest_marker; self._finalize_drift_retry.pop(worker_id, None); self._finalize_recovery_alerted.discard(worker_id); self._commit_failure_alerted.discard(worker_id)` then `if _since >= FINALIZE_DRIFT_RETRY_CAP and worker_id not in self._commit_failure_alerted: self._commit_failure_alerted.add(worker_id); <unchanged slack.post_message + brain.send_message>`. (non-running sweep in check_stuck_workers ~:4162-4167) replace BOTH loops: `for wid in list(self._commit_failure_alerted): if wid not in running_ids: self._commit_failure_alerted.discard(wid)` and `for wid in list(self._finalize_marker_seen): if wid not in running_ids: self._finalize_marker_seen.pop(wid, None)`. (The existing :4164 .pop on the now-set _commit_failure_alerted is the M1 TypeError — must become .discard.)", "expected": ""},
+        {"description": "GREEN C3 tests: in test_daemon.py delete the del-attrs test (~:5325-5347); port the marker/re-arm tests (~:5204-5323) to _finalize_marker_seen dict + _commit_failure_alerted set. Add in TestCommitWorkerFailureSurface: (M1) test_non_running_sweep_clears_marker_state(self, daemon): daemon._finalize_marker_seen['w1']=4; daemon._commit_failure_alerted.add('w1'); daemon.registry.get_running_workers.return_value=[]; daemon._last_stuck_check=0; daemon.check_stuck_workers(); assert 'w1' not in daemon._finalize_marker_seen and 'w1' not in daemon._commit_failure_alerted. (Obs2) clone test_reopen_rearm_fires_on_new_marker (~:5295) with a single finalize_integrated marker id 4: seed _finalize_drift_retry['w1']=2 + _finalize_recovery_alerted.add('w1') -> check_workers() -> both cleared; same events again -> not re-cleared. In test_idle_worker_ttl.py (~:29,:60 and any other __new__ fixture reaching check_workers/reap): replace `daemon._commit_reopen_processed = {}` with `daemon._finalize_marker_seen = {}` and set `daemon._commit_failure_alerted = set()`.", "expected": ""},
+        {"description": "Verify.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_daemon.py tests/test_idle_worker_ttl.py -q", "expected": "0 failed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/tests/test_idle_worker_ttl.py commander/tests/test_daemon.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "C4 — delete two tautology tests + unused import (git.test.ts)",
+      "description": "Delete the GIT_MAX_BUFFER===64MB tautology test and the source-grep-for-literal test; drop the now-unused GIT_MAX_BUFFER import; keep the >1MB round-trip falsifiers.",
+      "allowed_files": ["worker/mcp-servers/workspace-manager/src/__tests__/git.test.ts"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Delete the `expect(GIT_MAX_BUFFER).toBe(64 * 1024 * 1024)` test (~:479-481) and the source-grep-for-literal test (~:513-517). Drop GIT_MAX_BUFFER from the import (~:13) since those were its only uses. Keep the >1MB round-trip tests.", "expected": ""},
+        {"description": "Verify.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/git.test.ts", "expected": "0 failed (round-trip tests remain)."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/__tests__/git.test.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Rebuild dist + full-suite verification",
+      "description": "Rebuild dist (Task 1 changed integration.ts), run full vitest + full commander pytest (both 0 failed), stage dist with git add -f.",
+      "allowed_files": ["worker/mcp-servers/workspace-manager/dist/cli.js", "worker/mcp-servers/workspace-manager/dist/index.js", "worker/mcp-servers/workspace-manager/dist/hook-intent.js"],
+      "depends_on": [1, 2, 3],
+      "steps": [
+        {"description": "Rebuild dist.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build", "expected": "tsc && bundle, no error."},
+        {"description": "Full workspace-manager vitest.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run", "expected": "passed | 0 failed."},
+        {"description": "Full commander pytest.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "0 failed."},
+        {"description": "Stage dist (force).", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/hook-intent.js", "expected": "Staged."}
+      ]
+    }
+  ]
+}

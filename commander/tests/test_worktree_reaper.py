@@ -41,7 +41,10 @@ from ironclaude.main import (
     _find_leaked_worktrees,
     _has_push_pending,
     _is_protected,
+    _live_worker_worktree_paths,
+    _managed_repositories,
     _reap_leaked_worktrees,
+    _reap_row_less_orphans,
     _sync_idle_worktrees,
     _WORKTREE_REAP_TTL_HOURS,
 )
@@ -783,3 +786,251 @@ class TestSyncIdleWorktrees:
 
         client.sync.assert_not_called()
         assert counts["errors"] == 1
+
+
+class TestLiveWorkerWorktreePaths:
+    def test_returns_only_live_worker_paths_excludes_dead_and_null(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        _insert_worker(commander, "w-live", status="running")
+        commander.execute(
+            "UPDATE workers SET workspace_path=? WHERE id='w-live'",
+            ("/repo/.ironclaude/worktrees/live-guid",),
+        )
+        _insert_worker(commander, "w-dead", status="completed", finished_ago="1 hour")
+        commander.execute(
+            "UPDATE workers SET workspace_path=? WHERE id='w-dead'",
+            ("/repo/.ironclaude/worktrees/dead-guid",),
+        )
+        # A running worker whose workspace_path is NULL must never appear —
+        # the SQL WHERE clause excludes it before liveness is even checked.
+        _insert_worker(commander, "w-null-path", status="running")
+        commander.commit()
+        tmux = Mock()
+        tmux.has_session.return_value = False
+
+        paths = _live_worker_worktree_paths(commander, tmux)
+
+        assert paths == ["/repo/.ironclaude/worktrees/live-guid"]
+
+
+class TestManagedRepositories:
+    def test_dedupes_local_and_remote_and_unions_workspace_manager_repos(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        # Local group: two workers, same repo, no machine -> deduped, worker=None.
+        _insert_worker(commander, "w1", status="completed", finished_ago="1 hour", repo="/repoA")
+        _insert_worker(commander, "w2", status="completed", finished_ago="2 hours", repo="/repoA")
+        # Remote group: machine set -> representative worker dict, not None.
+        commander.execute(
+            "INSERT INTO workers (id, type, repo, machine, tmux_session, status) "
+            "VALUES ('w3', 'claude', '/repoB', 'remote-host', 'ic-worker', 'completed')"
+        )
+        commander.commit()
+        ws = tmp_path / "workspaces.db"
+        ws_conn = _make_workspace_db(ws)
+        _insert_assignment(
+            ws_conn, _W1, repository_identity="repo-id",
+            worktree_path="/repoC/.ironclaude/worktrees/some-guid",
+        )
+        ws_conn.close()
+
+        repos = dict(_managed_repositories(commander, workspace_db_path=str(ws)))
+
+        assert repos["/repoA"] is None
+        assert repos["/repoB"] is not None
+        assert repos["/repoB"]["id"] == "w3"
+        assert repos["/repoB"]["machine"] == "remote-host"
+        assert repos["/repoC"] is None
+        assert len(repos) == 3
+
+
+class TestReapRowLessOrphans:
+    def test_partial_repo_failure_does_not_abort_sweep_and_transport_is_remote_only(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        # Live worker in repoA: its worktree path must be protected.
+        _insert_worker(commander, "w-live", status="running", repo="/repoA")
+        commander.execute(
+            "UPDATE workers SET workspace_path=? WHERE id='w-live'",
+            ("/repoA/.ironclaude/worktrees/live-guid",),
+        )
+        # Remote-group worker anchors repoB as a remote repo.
+        commander.execute(
+            "INSERT INTO workers (id, type, repo, machine, tmux_session, status) "
+            "VALUES ('w-remote', 'claude', '/repoB', 'remote-host', 'ic-worker', 'completed')"
+        )
+        commander.commit()
+        ws = tmp_path / "workspaces.db"
+        _make_workspace_db(ws).close()
+
+        def reap_side_effect(payload, **_transport):
+            if payload["repository_path"] == "/repoA":
+                raise RuntimeError("unreachable")
+            return {
+                "reaped": [], "preservedDirty": [],
+                "preservedUnmerged": ["ironclaude/y", "ironclaude/z"],
+                "skippedLive": [], "skippedYoung": [], "errors": [],
+                "reapedWorktreeOnly": ["ironclaude/w"],
+            }
+
+        client = Mock()
+        client.reap_orphans.side_effect = reap_side_effect
+        tmux = Mock()
+        tmux.has_session.return_value = False
+        resolve_transport = Mock(return_value={"ssh_host": "remote-host"})
+
+        summary = _reap_row_less_orphans(
+            commander, client, tmux,
+            workspace_db_path=str(ws), resolve_transport=resolve_transport,
+        )
+
+        assert summary["preservedUnmerged"] == 2
+        assert summary["repo_failures"] == 1
+        assert summary["reapedWorktreeOnly"] == 1
+        assert len(summary["preserved_unmerged_names"]) == 2
+
+        calls_by_repo = {
+            call.args[0]["repository_path"]: call
+            for call in client.reap_orphans.call_args_list
+        }
+        assert set(calls_by_repo) == {"/repoA", "/repoB"}
+        for call in calls_by_repo.values():
+            assert call.args[0]["protected_paths"] == ["/repoA/.ironclaude/worktrees/live-guid"]
+        # Transport kwargs applied only to the worker-bearing (remote) group.
+        assert calls_by_repo["/repoA"].kwargs == {}
+        assert calls_by_repo["/repoB"].kwargs == {"ssh_host": "remote-host"}
+        resolve_transport.assert_called_once()
+
+    def test_preserved_detail_excludes_muted_and_tags_repository_path(self, tmp_path):
+        """workspace-manager's reap_orphans now returns preservedDetail — a
+        richer per-orphan dict (id/guid/branch/category/tip/worktreePresent/
+        evidence/muted). The reaper must drop muted entries and stamp each
+        surviving one with the repo it came from, so a multi-repo daemon can
+        disambiguate ids that only need to be unique within one repo."""
+        commander = _make_commander_db(tmp_path / "commander.db")
+        _insert_worker(commander, "w1", status="completed", repo="/repo")
+        ws = tmp_path / "workspaces.db"
+        _make_workspace_db(ws).close()
+
+        detail_entries = [
+            {"id": "d1", "guid": "g1", "branch": "ironclaude/g1",
+             "category": "genuinely-unmerged", "tip": "aaaaaaa1111",
+             "worktreePresent": True, "evidence": "2 ahead of main", "muted": False},
+            {"id": "d2", "guid": "g2", "branch": "ironclaude/g2",
+             "category": "squash-merged", "tip": "bbbbbbb2222",
+             "worktreePresent": True, "evidence": "squash of #4", "muted": False},
+            {"id": "d3", "guid": "g3", "branch": "ironclaude/g3",
+             "category": "dirty", "tip": "ccccccc3333",
+             "worktreePresent": True, "evidence": "uncommitted changes", "muted": True},
+        ]
+        client = Mock()
+        client.reap_orphans.return_value = {
+            "reaped": [], "preservedDirty": [], "preservedUnmerged": [],
+            "skippedLive": [], "skippedYoung": [], "errors": [], "reapedWorktreeOnly": [],
+            "preservedDetail": detail_entries,
+        }
+        tmux = Mock()
+        tmux.has_session.return_value = False
+
+        summary = _reap_row_less_orphans(commander, client, tmux, workspace_db_path=str(ws))
+
+        preserved_detail = summary["preserved_detail"]
+        ids = {d["id"] for d in preserved_detail}
+        assert ids == {"d1", "d2"}  # muted d3 excluded
+        assert all(d["repository_path"] == "/repo" for d in preserved_detail)
+
+        # Heartbeat-count semantics: non-squash-merged, non-muted only.
+        non_squash = [d for d in preserved_detail if d["category"] != "squash-merged"]
+        assert len(non_squash) == 1
+        assert non_squash[0]["id"] == "d1"
+
+    def test_preserved_detail_falls_back_to_preserved_unmerged_names(self, tmp_path):
+        """Back-compat: a reap_orphans response that predates preservedDetail
+        (only preservedUnmerged branch names) must still populate
+        preserved_detail so downstream count/surface logic has one shape."""
+        commander = _make_commander_db(tmp_path / "commander.db")
+        _insert_worker(commander, "w1", status="completed", repo="/repo")
+        ws = tmp_path / "workspaces.db"
+        _make_workspace_db(ws).close()
+
+        client = Mock()
+        client.reap_orphans.return_value = {
+            "reaped": [], "preservedDirty": [],
+            "preservedUnmerged": ["ironclaude/y", "ironclaude/z"],
+            "skippedLive": [], "skippedYoung": [], "errors": [],
+        }
+        tmux = Mock()
+        tmux.has_session.return_value = False
+
+        summary = _reap_row_less_orphans(commander, client, tmux, workspace_db_path=str(ws))
+
+        preserved_detail = summary["preserved_detail"]
+        assert len(preserved_detail) == 2
+        assert {d["repository_path"] for d in preserved_detail} == {"/repo"}
+        assert all(d.get("category") != "squash-merged" for d in preserved_detail)
+        ids = {d["id"] for d in preserved_detail}
+        assert "/repo:ironclaude/y" in ids
+        assert "/repo:ironclaude/z" in ids
+
+
+class TestSurfacePreservedOrphans:
+    def test_change_gated_on_id_tip_map_and_reposts_on_tip_change(self):
+        """_surface_preserved_orphans posts once for a given {id: tip} set,
+        stays silent on a repeat call with the same set, and re-posts when a
+        tip changes (a genuinely different orphan state, not just a re-sweep
+        of the same one)."""
+        from types import SimpleNamespace
+
+        from ironclaude.main import IroncladeDaemon
+
+        fake = SimpleNamespace(_orphaned_surface_state={}, slack=Mock())
+        details = [{
+            "id": "d1", "category": "genuinely-unmerged", "branch": "ironclaude/g1",
+            "tip": "aaaaaaa1111", "evidence": "2 ahead of main", "repository_path": "/repo",
+        }]
+
+        IroncladeDaemon._surface_preserved_orphans(fake, details)
+        assert fake.slack.post_message.call_count == 1
+
+        # Same id+tip set on a re-sweep -> no repost.
+        IroncladeDaemon._surface_preserved_orphans(fake, list(details))
+        assert fake.slack.post_message.call_count == 1
+
+        # Tip changed (new commit) -> re-posts.
+        changed = [dict(details[0], tip="bbbbbbb2222")]
+        IroncladeDaemon._surface_preserved_orphans(fake, changed)
+        assert fake.slack.post_message.call_count == 2
+
+    def test_empty_details_posts_nothing(self):
+        from types import SimpleNamespace
+
+        from ironclaude.main import IroncladeDaemon
+
+        fake = SimpleNamespace(_orphaned_surface_state={}, slack=Mock())
+        IroncladeDaemon._surface_preserved_orphans(fake, [])
+        fake.slack.post_message.assert_not_called()
+
+    def test_reposts_on_category_change_with_same_id_and_tip(self):
+        """A same-id, same-tip orphan whose category changes (e.g. a clean
+        worktree going dirty) is a genuinely different state the operator
+        has not seen yet -> must re-post, not stay silently gated on tip
+        alone."""
+        from types import SimpleNamespace
+
+        from ironclaude.main import IroncladeDaemon
+
+        fake = SimpleNamespace(_orphaned_surface_state={}, slack=Mock())
+        details = [{
+            "id": "d1", "category": "genuinely-unmerged", "branch": "ironclaude/g1",
+            "tip": "aaaaaaa1111", "evidence": "2 ahead of main", "repository_path": "/repo",
+        }]
+
+        IroncladeDaemon._surface_preserved_orphans(fake, details)
+        assert fake.slack.post_message.call_count == 1
+
+        # Identical id+tip+category repeat -> no repost.
+        IroncladeDaemon._surface_preserved_orphans(fake, list(details))
+        assert fake.slack.post_message.call_count == 1
+
+        # Same id, same tip, but category changed -> must repost.
+        recategorized = [dict(details[0], category="dirty")]
+        IroncladeDaemon._surface_preserved_orphans(fake, recategorized)
+        assert fake.slack.post_message.call_count == 2
