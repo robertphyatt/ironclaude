@@ -18,7 +18,7 @@ ROLE_KEYS = frozenset(("preferred", "clients"))
 MACHINE_CLIENT_KEYS = frozenset(("enabled", "path"))
 EXPECTED_MODELS = {
     "claude": {
-        "haiku": "haiku", "sonnet": "sonnet", "opus": "claude-opus-4-8", "fable": "fable"
+        "haiku": "haiku", "sonnet": "sonnet", "opus": "opus", "fable": "fable"
     },
     "codex": {
         "haiku": "gpt-5.6-luna",

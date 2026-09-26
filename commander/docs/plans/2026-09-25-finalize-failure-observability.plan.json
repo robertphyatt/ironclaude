@@ -1,0 +1,58 @@
+{
+  "name": "Seam Finalization-Failure Observability",
+  "goal": "Make a persistently failing terminal finalize visible: WARNING-log swallowed exceptions, surface consecutive terminal non-finalization failures once past a cap, and make kill_worker's failure status unmistakable — never completing/abandoning any worker.",
+  "requirements_file": "docs/plans/2026-09-25-finalize-failure-observability-requirements.md",
+  "design_file": "docs/plans/2026-09-25-finalize-failure-observability-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Swallow-site WARNINGs + unambiguous kill_worker status (orchestrator_mcp.py)",
+      "description": "Add logger.warning at 3 swallow sites in commander/src/ironclaude/orchestrator_mcp.py: _probe_finalization_status except (:3033), _abandon_rescue_worker authority except (:3906), abandon except (:3943); return values unchanged. Reword kill_worker non-completed status (:6676-6680) to name FAILED/NOT completed/phase/error. Exact code: human plan docs/plans/2026-09-25-finalize-failure-observability.md Task 1. TDD.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_worker_finalize_release.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: in commander/tests/test_worker_finalize_release.py add `import logging` below `import os`; append class TestSwallowSiteWarnings (3 tests: probe raise -> WARNING containing 'finalization status probe failed' + 'probe down', failure_phase=='finalization'; authority raise via discover_installed_plugin_root side_effect WorkspaceClientError('no plugin root') -> WARNING containing 'w1' + 'plugin-root discovery failed' + 'no plugin root', failure_phase=='authority', action=='surfaced'; abandon raise (reconcile returns state not-ready, abandon side_effect WorkspaceClientError('sqlite bindings missing')) -> WARNING containing 'w1' + 'abandon failed' + 'sqlite bindings missing', failure_phase=='abandon', action=='surfaced', update_worker_status not called) using caplog.at_level(logging.WARNING, logger='ironclaude.orchestrator_mcp'); append class TestKillWorkerFailureStatusWording (2 tests: release {'failure_phase':'abandon','error':'sqlite bindings missing','assignment_preserved':True} -> status contains 'finalization FAILED','NOT completed','phase=abandon','sqlite bindings missing', not 'unintegrated work preserved', update_worker_status not called; release None -> status contains 'finalization FAILED','NOT completed','phase=unknown','no result'). Verbatim code in human plan Task 1 Step 1."},
+        {"description": "Run new tests (RED).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_finalize_release.py -k \"SwallowSiteWarnings or KillWorkerFailureStatusWording\"", "expected": "5 failed (3 WARNING tests fail the any(...) log assertion; 2 wording tests fail 'finalization FAILED' in status)."},
+        {"description": "GREEN: orchestrator_mcp.py — (a) :3033 `except Exception:` -> `except Exception as exc:  # noqa: BLE001 - probe failure is fail-closed` + logger.warning(\"finalization status probe failed for workspace %s: %s\", assignment[\"workspace_guid\"], exc) before unchanged return; (b) :3906 authority except: first line logger.warning(\"abandon-rescue for %s: plugin-root discovery failed: %s\", worker_id, exc); (c) :3943 abandon except: first line logger.warning(\"abandon-rescue for %s: abandon failed: %s\", worker_id, exc); (d) kill_worker else-branch (:6676-6680): _phase/_error from _release if dict else None; _status = f\"Worker {worker_id} session killed, but finalization FAILED (phase={_phase or 'unknown'}: {_error or 'no result'}) — worker NOT completed; work preserved; daemon will retry.\" Success string unchanged. Verbatim in human plan Task 1 Step 3."},
+        {"description": "Run file tests (GREEN).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_finalize_release.py", "expected": "0 failed (5 new tests pass; existing TestKillWorkerPositivePredicate and TestAbandonRescueWorkerFailClosedGuard still pass)."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_worker_finalize_release.py", "expected": "Both staged."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Bounded consecutive terminal-failure surface (main.py)",
+      "description": "In commander/src/ironclaude/main.py add FINALIZE_FAILURE_SURFACE_CAP=3 (below :894), self._finalize_failure_count dict (below :1588), keyword-only `terminal: bool = False` on _drive_finalization_recovery (:1676) + docstring 'transient' bullet update; before final `return \"transient\"` (:1775) count terminal outcomes with truthy failure_phase != 'finalization', post ONCE (gated by _finalize_recovery_alerted) to slack+brain past cap, still return 'transient', never complete. Pass terminal=True at :4237, :4434, :4568 only (leave :4421 pre and :4540 idle non-terminal — idle live workers legitimately return preserved failures every cycle). Prune counter in non-running sweep (after :4168-4170) and in new-marker re-arm (after :4477). Exact code: human plan Task 2. TDD.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_daemon.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "RED: commander/tests/test_daemon.py — add FINALIZE_FAILURE_SURFACE_CAP to the `from ironclaude.main import ...` line (:18); append class TestTerminalFinalizeFailureSurface after TestFinalizationFailureTransientSurface with 8 tests: surfaces_once_after_cap (CAP terminal calls -> 0 posts; next -> 1 slack + 1 brain, message has 'w1', f'{CAP+1} consecutive cycles', 'phase=abandon', 'abandon exploded', 'not completed'; 3 more -> still 1/1; update_worker_status not called; all return 'transient'); non_terminal_outcomes_never_count; none_outcome_never_counts; session_died_site_counts_as_terminal (_seam_session_died + check_workers -> count 1); stuck_kill_site_counts_as_terminal (_seam_stuck_kill + _confirm_and_kill_stuck_worker('w1','ic-w1',1200.0,'execution',False,None) -> count 1); idle_reap_counts_only_the_post_kill_outcome (orch mock, tmux.get_log_mtime None, _reap_idle_worker('w1','ic-w1',None,None,time.time()-100000) -> count 1); non_running_sweep_clears_failure_count (check_stuck_workers with no running workers); new_marker_rearms_failure_count (_live_worker + finalize_integrated id 4 event + check_workers). Verbatim code in human plan Task 2 Step 1."},
+        {"description": "Run new tests (RED).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_daemon.py -k TestTerminalFinalizeFailureSurface", "expected": "Collection ERROR: cannot import name 'FINALIZE_FAILURE_SURFACE_CAP' from 'ironclaude.main'."},
+        {"description": "GREEN: main.py edits (a)-(g) exactly as human plan Task 2 Step 3: constant + comment; instance dict; signature `def _drive_finalization_recovery(self, worker_id: str, outcome, *, terminal: bool = False) -> str:` + docstring bullet; counter/surface block before final return (phase = outcome.get('failure_phase') if dict; `if terminal and phase and phase != \"finalization\"`; failures > FINALIZE_FAILURE_SURFACE_CAP and worker_id not in _finalize_recovery_alerted -> add + slack.post_message(f\"Worker {worker_id} terminal finalize has failed {failures} consecutive cycles (phase={phase}): {error}; left running, not completed, needs operator help.\") + brain.send_message(f\"Worker {worker_id} terminal finalize has failed {failures} consecutive cycles (phase={phase}): {error}. Not completed, not abandoned. Needs operator intervention.\"), error = outcome.get('error') or 'no error detail'); terminal=True at :4237/:4434/:4568; prune loop after :4168-4170; `self._finalize_failure_count.pop(worker_id, None)` after :4477."},
+        {"description": "Run daemon + idle-TTL tests (GREEN).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_daemon.py tests/test_idle_worker_ttl.py", "expected": "0 failed (8 new tests pass; existing driver/surface/idle-TTL tests unchanged)."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/tests/test_daemon.py", "expected": "Both staged."}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "CHANGELOG entry + full-suite verification",
+      "description": "No tests required: documentation entry + full-suite verification. Insert the bullet verbatim from human plan Task 3 Step 1 as first entry under `## [Unreleased]` (CHANGELOG.md :13); run full commander pytest; stage CHANGELOG + plan docs.",
+      "allowed_files": [
+        "CHANGELOG.md",
+        "commander/docs/plans/2026-09-25-finalize-failure-observability.md",
+        "commander/docs/plans/2026-09-25-finalize-failure-observability.plan.json"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {"description": "Insert CHANGELOG bullet (verbatim from human plan Task 3 Step 1) as first entry under `## [Unreleased]`, blank line after heading and after bullet."},
+        {"description": "Full commander suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "0 failed; final line 'N passed' where N = pre-change count + 13."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f CHANGELOG.md commander/docs/plans/2026-09-25-finalize-failure-observability.md commander/docs/plans/2026-09-25-finalize-failure-observability.plan.json", "expected": "All three staged."}
+      ]
+    }
+  ]
+}

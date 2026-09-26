@@ -12,7 +12,7 @@ def _tools(tmp_path):
         "providers": {
             "clients": {
                 "claude": {"enabled": True, "path": "claude",
-                           "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "claude-opus-4-8", "fable": "fable"}},
+                           "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "opus", "fable": "fable"}},
                 "codex": {"enabled": False, "path": "codex",
                           "models": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol", "fable": "gpt-6-astra"}},
             },
@@ -66,7 +66,7 @@ def _codex_enabled_cfg(tmp_path, clients=("codex",), grader_model="opus"):
         "providers": {
             "clients": {
                 "claude": {"enabled": True, "path": "claude",
-                           "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "claude-opus-4-8", "fable": "fable"}},
+                           "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "opus", "fable": "fable"}},
                 "codex": {"enabled": True, "path": "codex",
                           "models": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol", "fable": "gpt-6-astra"}},
             },
@@ -96,7 +96,7 @@ def test_legacy_config_without_providers_uses_claude(tmp_path):
     assert out["grade"] == "C"
     argv = run.call_args.args[0]
     assert argv[0] == "claude"
-    assert argv[argv.index("--model") + 1] == "claude-opus-4-8[1m]"
+    assert argv[argv.index("--model") + 1] == "opus[1m]"
 
 
 def test_routed_claude_argv_still_opus(tmp_path):
@@ -342,7 +342,7 @@ def _codex_cfg_with_effort(tmp_path, effort):
         "providers": {
             "clients": {
                 "claude": {"enabled": True, "path": "claude",
-                           "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "claude-opus-4-8", "fable": "fable"}},
+                           "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "opus", "fable": "fable"}},
                 "codex": {"enabled": True, "path": "codex",
                           "models": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol", "fable": "gpt-6-astra"}},
             },

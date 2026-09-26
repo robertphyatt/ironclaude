@@ -163,6 +163,21 @@ def test_reap_orphans_forwards_payload_into_cli_argv(tmp_path: Path):
     assert json.loads(argv[3]) == payload
 
 
+def test_list_surfaced_orphans_forwards_payload_into_cli_argv(tmp_path: Path):
+    runner = Mock(return_value=completed('{"orphans":[]}\n'))
+    client = WorkspaceClient(tmp_path, runner=runner)
+    payload = {"repository_path": "/r"}
+
+    assert client.list_surfaced_orphans(payload) == {"orphans": []}
+    argv = runner.call_args.args[0]
+    assert argv[:3] == [
+        "node",
+        str(tmp_path / "mcp-servers/workspace-manager/dist/cli.js"),
+        "list-surfaced-orphans",
+    ]
+    assert json.loads(argv[3]) == payload
+
+
 def test_resolve_orphan_forwards_payload_into_cli_argv(tmp_path: Path):
     runner = Mock(return_value=completed('{"results":[{"outcome":"reaped"}]}\n'))
     client = WorkspaceClient(tmp_path, runner=runner)

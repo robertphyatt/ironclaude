@@ -13,7 +13,7 @@ def _tools(tmp_path, providers_overrides=None):
         "providers": providers_overrides or {
             "clients": {
                 "claude": {"enabled": True, "path": "claude",
-                           "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "claude-opus-4-8", "fable": "fable"}},
+                           "models": {"haiku": "haiku", "sonnet": "sonnet", "opus": "opus", "fable": "fable"}},
                 "codex": {"enabled": False, "path": "codex",
                           "models": {"haiku": "gpt-5.6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-5.6-sol", "fable": "gpt-6-astra"}},
             },

@@ -27,11 +27,12 @@ export interface InternalCommandDependencies {
   reap: InternalDependency;
   configureSharedResources: InternalDependency;
   listSharedResources: InternalDependency;
+  listSurfacedOrphans: InternalDependency;
   'reap-orphans': InternalDependency;
   'resolve-orphan': InternalDependency;
 }
 
-export const INTERNAL_COMMAND_NAMES = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile', 'cleanup', 'sync', 'reap', 'configure-shared-resources', 'list-shared-resources', 'reap-orphans', 'resolve-orphan'] as const;
+export const INTERNAL_COMMAND_NAMES = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile', 'cleanup', 'sync', 'reap', 'configure-shared-resources', 'list-shared-resources', 'list-surfaced-orphans', 'reap-orphans', 'resolve-orphan'] as const;
 
 function waitForCliDatabase(milliseconds: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
@@ -188,6 +189,7 @@ export function dispatchInternalCommand(
     case 'reap': return dependencies.reap(args);
     case 'configure-shared-resources': return dependencies.configureSharedResources(args);
     case 'list-shared-resources': return dependencies.listSharedResources(args);
+    case 'list-surfaced-orphans': return dependencies.listSurfacedOrphans(args);
     case 'reap-orphans': return dependencies['reap-orphans'](args);
     case 'resolve-orphan': return dependencies['resolve-orphan'](args);
     default: throw new Error(`Unknown internal workspace command: ${name}`);
@@ -291,6 +293,9 @@ export function createInternalCommandDependencies(
       allowSecretEntries: args.allow_secret_entries === true,
     }),
     listSharedResources: (args) => service.listSharedResources({
+      repositoryPath: requiredString(args, 'repository_path'),
+    }),
+    listSurfacedOrphans: (args) => service.listSurfacedOrphans({
       repositoryPath: requiredString(args, 'repository_path'),
     }),
     'reap-orphans': (args) => service.reapAmbiguousOrphans({

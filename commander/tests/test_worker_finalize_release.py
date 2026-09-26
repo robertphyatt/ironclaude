@@ -6,6 +6,7 @@ Temp-isolated: every git repo lives under pytest's per-test tmp_path; no process
 ever pattern-killed (recorded stubs only, never os.kill by name).
 """
 
+import logging
 import os
 import subprocess
 
@@ -443,6 +444,71 @@ class TestAbandonRescueWorkerFailClosedGuard:
         tools._workspace_client.abandon.assert_called_once()
         tools.registry.update_worker_status.assert_called_once_with("w1", "completed")
         assert out["action"] == "rescued"
+
+
+class TestSwallowSiteWarnings:
+    """Each swallowed workspace-client exception on the terminal abandon path
+    must log at WARNING (it was invisible for ~13 days on r2) while the
+    returned failure dict stays unchanged."""
+
+    def _call(self, tools, worker):
+        assignment = OrchestratorTools._registry_workspace_assignment(worker)
+        return tools._abandon_rescue_worker(
+            "w1", worker["repo"], worker["client"], assignment, None,
+            already_integrated=False,
+        )
+
+    @staticmethod
+    def _warnings(caplog):
+        return [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+
+    def test_probe_raise_logs_warning(self, tmp_path, caplog):
+        worker = _worker(tmp_path / "wt")
+        tools = _make_tools(worker)
+        tools._workspace_client.reconcile.side_effect = WorkspaceClientError(
+            "probe down",
+        )
+        with caplog.at_level(logging.WARNING, logger="ironclaude.orchestrator_mcp"):
+            out = self._call(tools, worker)
+        assert out["failure_phase"] == "finalization"
+        assert any(
+            "finalization status probe failed" in m and "probe down" in m
+            for m in self._warnings(caplog)
+        )
+
+    def test_authority_raise_logs_warning(self, tmp_path, caplog):
+        worker = _worker(tmp_path / "wt")
+        tools = _make_tools(worker)
+        tools._workspace_client.discover_installed_plugin_root.side_effect = (
+            WorkspaceClientError("no plugin root")
+        )
+        with caplog.at_level(logging.WARNING, logger="ironclaude.orchestrator_mcp"):
+            out = self._call(tools, worker)
+        assert out["failure_phase"] == "authority"
+        assert out["action"] == "surfaced"
+        assert any(
+            "w1" in m and "plugin-root discovery failed" in m and "no plugin root" in m
+            for m in self._warnings(caplog)
+        )
+
+    def test_abandon_raise_logs_warning(self, tmp_path, caplog):
+        worker = _worker(tmp_path / "wt")
+        tools = _make_tools(worker)
+        tools._workspace_client.reconcile.return_value = {"state": "not-ready"}
+        tools._workspace_client.abandon.side_effect = WorkspaceClientError(
+            "sqlite bindings missing",
+        )
+        with caplog.at_level(logging.WARNING, logger="ironclaude.orchestrator_mcp"):
+            out = self._call(tools, worker)
+        assert out["failure_phase"] == "abandon"
+        assert out["action"] == "surfaced"
+        tools.registry.update_worker_status.assert_not_called()
+        assert any(
+            "w1" in m and "abandon failed" in m and "sqlite bindings missing" in m
+            for m in self._warnings(caplog)
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1026,3 +1092,49 @@ class TestKillWorkerPositivePredicate:
         ]
         assert len(finished) == 1
         assert "marked completed" in result["status"]
+
+
+class TestKillWorkerFailureStatusWording:
+    """kill_worker's non-completed status must read as a FAILURE (the Brain
+    misread the old 'killed; …preserved' wording as success 5x)."""
+
+    @staticmethod
+    def _kill(release):
+        tools = object.__new__(OrchestratorTools)
+        tools.registry = MagicMock()
+        tools.registry.get_worker.return_value = {
+            "id": "w9", "machine": None,
+            "spawned_at": "2026-01-01T00:00:00+00:00",
+        }
+        tools.registry.update_worker_status = MagicMock()
+        tools.registry.log_event = MagicMock()
+        tools.tmux = MagicMock()
+        tools.tmux.list_pane_pid.return_value = "123"
+        tools._ensure_ssh_manager = MagicMock()
+        tools._resolve_ssh_host = MagicMock(return_value=None)
+        tools._db = None
+        tools._get_remaining_work_after_kill = MagicMock(return_value={})
+        tools._finalize_and_release_worker = MagicMock(return_value=release)
+        return tools, tools.kill_worker("w9")
+
+    def test_failure_status_names_phase_and_error(self):
+        tools, result = self._kill({
+            "failure_phase": "abandon",
+            "error": "sqlite bindings missing",
+            "assignment_preserved": True,
+        })
+        status = result["status"]
+        assert "finalization FAILED" in status
+        assert "NOT completed" in status
+        assert "phase=abandon" in status
+        assert "sqlite bindings missing" in status
+        assert "unintegrated work preserved" not in status
+        tools.registry.update_worker_status.assert_not_called()
+
+    def test_none_release_status_says_unknown(self):
+        _tools, result = self._kill(None)
+        status = result["status"]
+        assert "finalization FAILED" in status
+        assert "NOT completed" in status
+        assert "phase=unknown" in status
+        assert "no result" in status

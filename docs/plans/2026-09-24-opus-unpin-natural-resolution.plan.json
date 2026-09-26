@@ -1,0 +1,60 @@
+{
+  "name": "Opus-Tier Unpin — Natural Resolution",
+  "goal": "Remove every claude-opus-4-8 pin so the internal Opus tier resolves naturally via the bare opus alias.",
+  "requirements_file": "docs/plans/2026-09-24-opus-unpin-requirements.md",
+  "design_file": "docs/plans/2026-09-24-opus-unpin-natural-resolution-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Unpin the Opus tier (mechanical substitution + verify)",
+      "description": "Replace the literal claude-opus-4-8 with the bare opus alias across all 19 source/config/test files that contain it. Mechanical rename, not new behavior: existing tests assert the old literal and are updated in lockstep with source, then the full suite verifies GREEN (no tests added/removed). _MODELS_NEEDING_1M_BETA=(\"opus\",) is deliberately NOT changed (Opus still needs [1m]; claude-opus-4-8[1m] becomes opus[1m]). Scope excludes README.md and CHANGELOG.md (Task 2) and all docs/ artifacts. cwd is commander/; commands use absolute paths; macOS sed uses -i ''.",
+      "allowed_files": [
+        "commander/src/ironclaude/provider_config.py",
+        "commander/src/ironclaude/config.py",
+        "commander/src/ironclaude/main.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/src/ironclaude/fable_availability.py",
+        "commander/src/ironclaude/notifications.py",
+        "commander/src/ironclaude/brain_client.py",
+        "config/ironclaude.json",
+        "config/ironclaude.json.example",
+        "commander/config/ironclaude.json",
+        "commander/tests/test_worker_adapter.py",
+        "commander/tests/test_brain_client.py",
+        "commander/tests/test_grader_router.py",
+        "commander/tests/test_grader_routing.py",
+        "commander/tests/conftest.py",
+        "commander/tests/test_config.py",
+        "commander/tests/test_main_validate.py",
+        "commander/tests/test_orchestrator_mcp.py",
+        "commander/tests/test_fable_availability.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Enumerate current occurrences (baseline; do not hardcode the list).", "command": "rg -n claude-opus-4-8 /Users/roberthyatt/Code/ironclaude/commander/src /Users/roberthyatt/Code/ironclaude/commander/tests /Users/roberthyatt/Code/ironclaude/commander/config /Users/roberthyatt/Code/ironclaude/config", "expected": "Matches across the 19 allowed_files (incl. repo-root config/ironclaude.json); codex gpt-5.6-* entries do NOT match."},
+        {"description": "Substitute claude-opus-4-8 -> opus in exactly those files (claude-opus-4-8[1m] becomes opus[1m]).", "command": "rg -l claude-opus-4-8 /Users/roberthyatt/Code/ironclaude/commander/src /Users/roberthyatt/Code/ironclaude/commander/tests /Users/roberthyatt/Code/ironclaude/commander/config /Users/roberthyatt/Code/ironclaude/config | xargs sed -i '' 's/claude-opus-4-8/opus/g'", "expected": "No output; sed succeeds."},
+        {"description": "Prove no stray literal remains in scope (falsifiable: catches a missed file).", "command": "rg -n claude-opus-4-8 /Users/roberthyatt/Code/ironclaude/commander/src /Users/roberthyatt/Code/ironclaude/commander/tests /Users/roberthyatt/Code/ironclaude/commander/config /Users/roberthyatt/Code/ironclaude/config ; echo \"rg-exit=$?\"", "expected": "No match lines, then rg-exit=1."},
+        {"description": "Prove the [1m] beta guard is untouched (falsifiable: the swap must not alter it). Uses rg -F (fixed-string) because the source line contains literal parens that regex would treat as a group.", "command": "rg -F -n '_MODELS_NEEDING_1M_BETA = (\"opus\",)' /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude/brain_client.py ; echo \"rg-exit=$?\"", "expected": "One match line (brain_client.py:120), then rg-exit=0."},
+        {"description": "Run the full commander test suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "3309 passed (0 failed)."},
+        {"description": "Stage the changes (all 19 files).", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/provider_config.py commander/src/ironclaude/config.py commander/src/ironclaude/main.py commander/src/ironclaude/orchestrator_mcp.py commander/src/ironclaude/fable_availability.py commander/src/ironclaude/notifications.py commander/src/ironclaude/brain_client.py config/ironclaude.json config/ironclaude.json.example commander/config/ironclaude.json commander/tests/test_worker_adapter.py commander/tests/test_brain_client.py commander/tests/test_grader_router.py commander/tests/test_grader_routing.py commander/tests/conftest.py commander/tests/test_config.py commander/tests/test_main_validate.py commander/tests/test_orchestrator_mcp.py commander/tests/test_fable_availability.py", "expected": "Staged (professional mode blocks commit)."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Update the rationale docs",
+      "description": "Rewrite the README 'Recommended model: Opus 4.8' blockquote (README.md:287-292) to describe natural resolution, and add a new ## [Unreleased] CHANGELOG entry above ## 1.1.12. Leave the historical CHANGELOG entry that records the original pin intact. No tests required: documentation only.",
+      "allowed_files": [
+        "README.md",
+        "CHANGELOG.md"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Rewrite the README:287-292 blockquote. OLD (exact): the 6-line '> **Recommended model: Opus 4.8, not Opus 5.** ...' blockquote ending '> explicitly with `ANTHROPIC_DEFAULT_OPUS_MODEL` (below).'. NEW: '> **Opus tier resolves naturally.** IronClaude no longer pins its Opus tier to a specific version: every internal Opus-tier string uses the bare `opus` alias, which the Claude CLI resolves to current-latest Opus (as the `sonnet`, `haiku`, and `fable` tiers already do). An earlier pin to `claude-opus-4-8` existed because Opus 5 was too eager to improvise to follow the structured brainstorm -> plan -> execute workflow reliably; Opus 5.5 resolves that, so the pin is retired. To force a specific build, set `ANTHROPIC_DEFAULT_OPUS_MODEL` (below).' Full text in human plan Task 2 Step 1.", "expected": "README blockquote replaced."},
+        {"description": "Add a new '## [Unreleased]' CHANGELOG entry immediately below the versioning blockquote and above '## 1.1.12' describing the unpin (full text in human plan Task 2 Step 2). Do NOT modify the historical entry that records the original pin.", "expected": "New Unreleased entry added; historical entry unchanged."},
+        {"description": "Prove the historical CHANGELOG entry is intact (falsifiable: history must not be rewritten).", "command": "rg -n claude-opus-4-8 /Users/roberthyatt/Code/ironclaude/CHANGELOG.md ; echo \"rg-exit=$?\"", "expected": "The historical 'Opus tier pinned to claude-opus-4-8' entry lines still match, then rg-exit=0."},
+        {"description": "Prove the README no longer pins 4.8 (falsifiable).", "command": "rg -n claude-opus-4-8 /Users/roberthyatt/Code/ironclaude/README.md ; echo \"rg-exit=$?\"", "expected": "No match lines, then rg-exit=1."},
+        {"description": "Stage the docs.", "command": "git -C /Users/roberthyatt/Code/ironclaude add README.md CHANGELOG.md", "expected": "Staged."}
+      ]
+    }
+  ]
+}

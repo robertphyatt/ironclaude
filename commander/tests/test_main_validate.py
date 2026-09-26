@@ -215,8 +215,8 @@ class TestSpawnWorkerFableAvailabilityRedirect:
         daemon = self._spawn_daemon()
         decision = {"worker_id": "w-fable", "type": "claude-fable", "repo": "/tmp", "objective": "hard task"}
         daemon._handle_spawn_worker(decision)
-        # default_opus_model defaults to "claude-opus-4-8" when not set in config.
-        mock_make.assert_called_once_with("claude-opus-4-8", "high")
+        # default_opus_model defaults to "opus" when not set in config.
+        mock_make.assert_called_once_with("opus", "high")
         daemon.tmux.spawn_session.assert_called_once()
 
     @patch("ironclaude.main.log_worker_event")
@@ -401,7 +401,7 @@ class TestSpawnWorkerAdvisorTiering:
         daemon = self._spawn_daemon(config)
         decision = {"worker_id": "w-opus", "type": "claude-opus", "repo": "/tmp", "objective": "task"}
         daemon._handle_spawn_worker(decision)
-        assert self._advisor_sends(daemon) == ["/advisor claude-opus-4-8"]
+        assert self._advisor_sends(daemon) == ["/advisor opus"]
 
     @patch("ironclaude.main.log_worker_event")
     @patch("ironclaude.main.format_worker_spawned", return_value="spawned")

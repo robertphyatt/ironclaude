@@ -200,19 +200,31 @@ export function primaryBranch(primaryCheckoutPath: string): string {
 }
 
 /**
+ * The branch `refs/remotes/origin/HEAD` names, as ref `refs/heads/<name>`, or
+ * null when origin/HEAD is unset or does not point under
+ * `refs/remotes/origin/`. The returned LOCAL ref may not exist — a
+ * `clone -b` checkout, or a stale origin/HEAD after a remote default-branch
+ * rename — so callers must verify it before judging against it. Never throws.
+ */
+export function originHeadBranchRef(cwd: string): string | null {
+  const result = spawnSync('git', ['-C', cwd, 'symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], { encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER });
+  if (result.error || result.status !== 0) return null;
+  const ref = (result.stdout || '').trim();
+  const prefix = 'refs/remotes/origin/';
+  if (!ref.startsWith(prefix)) return null;
+  return `refs/heads/${ref.slice(prefix.length)}`;
+}
+
+/**
  * The repository's canonical default branch, as ref `refs/heads/<name>`,
  * derived from `refs/remotes/origin/HEAD` — never the primary checkout's
  * live current branch, which an operator may have moved. Falls back to
- * `refs/heads/main` whenever origin/HEAD is unset, unresolvable, or does not
- * point under `refs/remotes/origin/`. Never throws.
+ * `refs/heads/main` whenever origin/HEAD is unset or does not point under
+ * `refs/remotes/origin/`. The returned ref may not exist locally; callers
+ * that advance it fail closed on an unresolvable target. Never throws.
  */
 export function canonicalDefaultBranchRef(cwd: string): string {
-  const result = spawnSync('git', ['-C', cwd, 'symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], { encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER });
-  if (result.error || result.status !== 0) return 'refs/heads/main';
-  const ref = (result.stdout || '').trim();
-  const prefix = 'refs/remotes/origin/';
-  if (!ref.startsWith(prefix)) return 'refs/heads/main';
-  return `refs/heads/${ref.slice(prefix.length)}`;
+  return originHeadBranchRef(cwd) ?? 'refs/heads/main';
 }
 
 export function addWorktree(primaryCheckoutPath: string, worktreePath: string, branch: string, baseCommit: string): void {

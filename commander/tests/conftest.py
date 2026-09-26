@@ -282,7 +282,7 @@ def base_config():
                     "models": {
                         "haiku": "haiku",
                         "sonnet": "sonnet",
-                        "opus": "claude-opus-4-8",
+                        "opus": "opus",
                         "fable": "fable",
                     },
                 },

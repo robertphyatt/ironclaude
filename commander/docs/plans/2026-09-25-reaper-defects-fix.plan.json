@@ -1,0 +1,42 @@
+{
+  "name": "Reaper Integration-Target Fix (#1)",
+  "goal": "Make reapAmbiguousOrphans judge an orphan branch's merged/unmerged status against the repo's canonical default branch (refs/remotes/origin/HEAD) instead of the primary checkout's currently-checked-out branch.",
+  "requirements_file": "docs/plans/2026-09-25-reaper-defects-fix-requirements.md",
+  "design_file": "docs/plans/2026-09-25-reaper-defects-fix-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "#1 reaper judges against the canonical default branch (TS)",
+      "description": "Swap reapAmbiguousOrphans' ancestry-gate target (workspace-service.ts:990) from integrationTargetRef(primaryBranch(...)) to the existing canonicalDefaultBranchRef (git.ts:209). canonicalDefaultBranchRef is ALREADY imported at workspace-service.ts:25 — change ONLY line 990, do NOT touch the import. Scope is #1 only (#4 withdrawn: it would violate the seam-owns-completion invariant; the real defect is a silently-failing abandon, handled in a separate loop). TDD: PRESERVE test (orphan reachable from a feature branch but not origin/main -> preserved) + REAP test (orphan tip ancestor of origin/main but not the feature branch -> reaped), both falsifiable against the old target; plus fix the existing :2141-2165 test which flips post-swap.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/workspace-service.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: add PRESERVE test (temp repo, refs/remotes/origin/HEAD->origin/main set, primary on a FEATURE branch diverged from main, orphan tip reachable from feature but NOT origin/main, clean, old, no row, unprotected -> assert PRESERVED) and REAP test (same shape, orphan tip is an ancestor of origin/main but NOT the feature branch -> assert REAPED). ALSO fix existing test workspace-service.test.ts:2141-2165 (inits --initial-branch=trunk, no origin/HEAD): add `git update-ref refs/remotes/origin/trunk <sha>` + `git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/trunk` to its setup (pattern at ~:2877) so canonicalDefaultBranchRef returns refs/heads/trunk and its evidence/category assertions still hold.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts", "expected": "RED: the two NEW tests fail against the current integrationTargetRef(primaryBranch(...)) target (PRESERVE orphan wrongly reaped; REAP orphan wrongly preserved); the edited :2141 test passes both pre- and post-swap (compatibility fix, not a RED signal)."},
+        {"description": "GREEN: at workspace-service.ts:990 change `const target = integrationTargetRef(primaryBranch(repository.primaryCheckoutPath));` to `const target = canonicalDefaultBranchRef(repository.primaryCheckoutPath);`. Change ONLY line 990 — do NOT modify the ./git import (canonicalDefaultBranchRef already imported at :25). Returns refs/heads/<name> like the replaced expr; isAncestor/rev-list/classifyPreservedOrphan unchanged.", "expected": "Single-line edit applied; imports untouched."},
+        {"description": "GREEN verify: rerun the test.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts", "expected": "Both new tests pass; the edited :2141 test passes; all other reapAmbiguousOrphans/classify tests pass; 0 failed."},
+        {"description": "Falsifiable: confirm the old expression is gone.", "command": "rg -n 'integrationTargetRef\\(primaryBranch' /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/src/workspace-service.ts ; echo \"rg-exit=$?\"", "expected": "No match lines, then rg-exit=1."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/workspace-service.ts worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "dist rebuild + full-suite verification",
+      "description": "Rebuild the workspace-manager bundle (TS changed in task 1), run full vitest + full commander pytest (both 0 failed), stage dist. No tests required: build + full-suite verification.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Rebuild dist.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build", "expected": "tsc + bundle succeed, no error."},
+        {"description": "Full workspace-manager vitest.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run", "expected": "0 failed (benign onTaskUpdate RPC-timeout line ignored)."},
+        {"description": "Full commander pytest (no commander code changed; safety).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "0 failed."},
+        {"description": "Stage rebuilt dist.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/hook-intent.js", "expected": "Staged."}
+      ]
+    }
+  ]
+}

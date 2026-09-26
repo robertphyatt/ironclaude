@@ -472,7 +472,7 @@ class OrchestratorTools:
     # which raises ValueError on a negative maxlen.
     GRADER_LOG_MAX_LINES = _positive_int_env("GRADER_LOG_MAX_LINES", 500)
 
-    def __init__(self, registry, tmux, ledger_path: str = "", grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "claude-opus-4-8", opus_model: str = "claude-opus-4-8", effort_level: str = "high", effort_levels: dict | None = None, ssh_manager=None, config: dict | None = None, ollama_inventory=None, dispatch_cfg: dict | None = None):
+    def __init__(self, registry, tmux, ledger_path: str = "", grader_home: str = "~/.ironclaude/grader", slack_bot=None, db_conn=None, operator_name: str = "Operator", supabase_url: str = "", supabase_anon_key: str = "", advisor_cfg: dict | None = None, grader_model: str = "opus", opus_model: str = "opus", effort_level: str = "high", effort_levels: dict | None = None, ssh_manager=None, config: dict | None = None, ollama_inventory=None, dispatch_cfg: dict | None = None):
         self.registry = registry
         self.tmux = tmux
         self.ledger_path = ledger_path
@@ -532,7 +532,7 @@ class OrchestratorTools:
         Looks up worker_type in advisor_models (one-tier-up map); falls back
         to the scalar advisor_model default when worker_type is unmapped.
         """
-        return self._advisor_cfg.get("advisor_models", {}).get(worker_type) or self._advisor_cfg.get("advisor_model", "claude-opus-4-8")
+        return self._advisor_cfg.get("advisor_models", {}).get(worker_type) or self._advisor_cfg.get("advisor_model", "opus")
 
     def _track_failed_base(self, base: str) -> None:
         """Record a worker base for retry escalation, keeping the set bounded.
@@ -3030,7 +3030,11 @@ class OrchestratorTools:
                 {**recovery_payload, "rebase_recovery": "status"},
                 **transport,
             )
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - probe failure is fail-closed
+            logger.warning(
+                "finalization status probe failed for workspace %s: %s",
+                assignment["workspace_guid"], exc,
+            )
             return recovery_payload, None, transport
         return recovery_payload, status if isinstance(status, dict) else None, transport
 
@@ -3904,6 +3908,10 @@ class OrchestratorTools:
                 client, ssh_host=ssh_host,
             )
         except Exception as exc:
+            logger.warning(
+                "abandon-rescue for %s: plugin-root discovery failed: %s",
+                worker_id, exc,
+            )
             failure = self._workspace_failure(
                 "authority", repository, assignment, exc,
             )
@@ -3941,6 +3949,9 @@ class OrchestratorTools:
                 **self._workspace_transport(installed_root, ssh_host),
             )
         except Exception as exc:
+            logger.warning(
+                "abandon-rescue for %s: abandon failed: %s", worker_id, exc,
+            )
             failure = self._workspace_failure(
                 "abandon", repository, assignment, exc,
             )
@@ -4163,6 +4174,32 @@ class OrchestratorTools:
             return {
                 "error": str(exc),
                 "failure_phase": "list_shared_resources",
+                "repository_path": repository_path,
+            }
+
+    def list_surfaced_orphans(
+        self, repository_path: str, worker_id: str | None = None,
+    ) -> dict:
+        """Read the currently-surfaced orphans for a repo, for the Brain's
+        per-orphan walkthrough.
+
+        Returns {orphans: [{id, workspace_guid, branch, tip, category}]} (kept
+        /muted orphans excluded) or a structured error dict; never raises.
+        worker_id resolves transport from the worker registry when given; omit
+        it for a Brain-local repository.
+        """
+        transport = self._shared_resources_transport(repository_path, worker_id)
+        if "error" in transport:
+            return transport
+        try:
+            return self._workspace_client.list_surfaced_orphans(
+                {"repository_path": repository_path},
+                **transport,
+            )
+        except Exception as exc:
+            return {
+                "error": str(exc),
+                "failure_phase": "list_surfaced_orphans",
                 "repository_path": repository_path,
             }
 
@@ -4789,7 +4826,7 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                     if mark_result in ("transition", "write_failed"):
                         self._post_slack_safe(
                             format_fable_unavailable(
-                                "spawn-died", redirected_to="claude-opus-4-8", worker_id=worker_id,
+                                "spawn-died", redirected_to="opus", worker_id=worker_id,
                             )
                         )
 
@@ -5154,7 +5191,7 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                     self._post_slack_safe(
                         format_fable_unavailable(
                             "spawn-died",
-                            redirected_to="claude-opus-4-8",
+                            redirected_to="opus",
                             worker_id=worker_id,
                         )
                     )
@@ -6648,9 +6685,12 @@ Has the worker genuinely completed its objective based on the evidence?
         if _completed:
             _status = f"Worker {worker_id} killed and marked completed."
         else:
+            _phase = _release.get("failure_phase") if isinstance(_release, dict) else None
+            _error = _release.get("error") if isinstance(_release, dict) else None
             _status = (
-                f"Worker {worker_id} killed; unintegrated work preserved for "
-                "retry (not completed)."
+                f"Worker {worker_id} session killed, but finalization FAILED "
+                f"(phase={_phase or 'unknown'}: {_error or 'no result'}) — worker "
+                "NOT completed; work preserved; daemon will retry."
             )
         return {
             "status": _status,
@@ -7489,6 +7529,24 @@ def _create_mcp_server(tools: OrchestratorTools, plugin_dirs: list[str] | None =
         )
 
     @mcp.tool()
+    def list_surfaced_orphans(repository_path: str, worker_id: str = "") -> str:
+        """Read the currently-surfaced orphaned worktrees for a repository, for
+        a per-orphan review.
+
+        Returns JSON {orphans: [{id, workspace_guid, branch, tip, category}]}
+        (operator-kept/muted orphans excluded), or a structured error dict. Use
+        the returned ids with resolve_orphan to act on the operator's decision.
+
+        Args:
+            repository_path: Absolute path to the git repository (primary checkout).
+            worker_id: Resolves the worker's provider + host; omit for a
+                Brain-local repository.
+        """
+        return json.dumps(
+            tools.list_surfaced_orphans(repository_path, worker_id or None)
+        )
+
+    @mcp.tool()
     def push_repo(repo: str, remote: str = "origin", branch: str = "") -> str:
         """Submit a git push request for operator confirmation via Slack.
 
@@ -7997,8 +8055,8 @@ def main():
         supabase_url=supabase_url, supabase_anon_key=supabase_anon_key,
         advisor_cfg=cfg.get("advisor", {}),
         dispatch_cfg=cfg.get("dispatch", {}),
-        grader_model=cfg.get("grader_model", "claude-opus-4-8"),
-        opus_model=cfg.get("default_opus_model", "claude-opus-4-8"),
+        grader_model=cfg.get("grader_model", "opus"),
+        opus_model=cfg.get("default_opus_model", "opus"),
         effort_level=cfg.get("effort_level", "high"),
         effort_levels=cfg.get("effort_levels", {}),
         ssh_manager=ssh_manager,

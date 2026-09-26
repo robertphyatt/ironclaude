@@ -1,0 +1,50 @@
+{
+  "name": "Reaper origin/HEAD Resolves Check",
+  "goal": "Make reapAmbiguousOrphans use origin/HEAD's branch only when that local branch exists, otherwise the primary checkout's branch, so clone -b checkouts and stale origin/HEAD never judge orphans against a missing ref.",
+  "requirements_file": "docs/plans/2026-09-25-reaper-origin-head-resolves-requirements.md",
+  "design_file": "docs/plans/2026-09-25-reaper-origin-head-resolves-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Reaper target resolves check + tests + doc wording",
+      "description": "workspace-service.ts :991-998: target = originHead && this.refResolves(p, originHead) ? originHead : integrationTargetRef(primaryBranch(p)) with updated comment; re-wrap reaper doc :981-984. git.ts doc comments only (:202-206 originHeadBranchRef, :216-222 canonicalDefaultBranchRef): drop 'unresolvable' claim, state returned local ref may not exist. Tests: clone -b and stale-symref reap tests after detached fail-safe test (:2212). mergeOrphanThenReap/canonicalDefaultBranchRef behavior unchanged. Exact code: human plan docs/plans/2026-09-25-reaper-origin-head-resolves.md Task 1. TDD.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/workspace-service.ts",
+        "worker/mcp-servers/workspace-manager/src/git.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: insert the two tests verbatim from human plan Task 1 Step 1 directly after the detached fail-safe test's closing `});` (:2212): 'reaps against the primary checkout branch when origin/HEAD names a branch with no local ref (clone -b)' and 'reaps against the primary checkout branch when origin/HEAD is a stale symref to a missing origin branch'."},
+        {"description": "Run test file (RED).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts", "expected": "Exactly 2 failed — the two new tests (orphan in preservedUnmerged: target is missing refs/heads/main resp. refs/heads/master). All others pass."},
+        {"description": "GREEN workspace-service.ts per human plan Task 1 Step 3: (a) replace :991-998 comment+target with commented `const originHead = originHeadBranchRef(repository.primaryCheckoutPath); const target = originHead && this.refResolves(repository.primaryCheckoutPath, originHead) ? originHead : integrationTargetRef(primaryBranch(repository.primaryCheckoutPath));`; (b) re-wrap doc :981-984 verbatim."},
+        {"description": "git.ts doc comments only, verbatim from human plan Task 1 Step 4 (a) originHeadBranchRef :202-206, (b) canonicalDefaultBranchRef :216-222."},
+        {"description": "Run test file (GREEN).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts", "expected": "0 failed."},
+        {"description": "Stale wording gone.", "command": "rg -n -F 'unset, unresolvable' /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/src/git.ts", "expected": "No output (rg exit 1). Pre-change matched exactly :204 and :220."},
+        {"description": "merge-then-reap default untouched.", "command": "rg -n -F ': canonicalDefaultBranchRef(primary);' /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/src/workspace-service.ts", "expected": "Exactly one match."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/git.ts worker/mcp-servers/workspace-manager/src/workspace-service.ts worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts", "expected": "All three staged."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "dist rebuild + full vitest + CHANGELOG wording",
+      "description": "No tests required: build + documentation edit + full-suite verification; behavior tested in Task 1. Rebuild dist, confirm resolves check in both bundles, full vitest 0 failed, CHANGELOG :17 phrase replacement verbatim from human plan Task 2 Step 4, stage.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js",
+        "CHANGELOG.md",
+        "commander/docs/plans/2026-09-25-reaper-origin-head-resolves.md",
+        "commander/docs/plans/2026-09-25-reaper-origin-head-resolves.plan.json"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Rebuild.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build", "expected": "tsc + bundle succeed, no error."},
+        {"description": "Resolves check in both bundles.", "command": "rg -n -F 'originHead && this.refResolves(' /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/index.js", "expected": "One match in dist/cli.js and one in dist/index.js."},
+        {"description": "Full workspace-manager suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run", "expected": "0 failed (benign onTaskUpdate RPC-timeout line ignored)."},
+        {"description": "CHANGELOG.md:17: replace 'It now targets the branch `refs/remotes/origin/HEAD` names (new `originHeadBranchRef`); when origin/HEAD is unset it keeps' with 'It now targets the branch `refs/remotes/origin/HEAD` names (new `originHeadBranchRef`) when that branch exists locally; when origin/HEAD is unset, or names a branch with no local ref (a `clone -b` checkout, or a stale origin/HEAD after a remote default-branch rename), it keeps'."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/hook-intent.js CHANGELOG.md commander/docs/plans/2026-09-25-reaper-origin-head-resolves.md commander/docs/plans/2026-09-25-reaper-origin-head-resolves.plan.json", "expected": "All staged (unchanged dist file = no-op)."}
+      ]
+    }
+  ]
+}

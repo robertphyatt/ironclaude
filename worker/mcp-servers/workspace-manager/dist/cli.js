@@ -694,13 +694,16 @@ function primaryBranch(primaryCheckoutPath) {
   }
   return ref.slice("refs/heads/".length);
 }
-function canonicalDefaultBranchRef(cwd) {
+function originHeadBranchRef(cwd) {
   const result = spawnSync("git", ["-C", cwd, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
-  if (result.error || result.status !== 0) return "refs/heads/main";
+  if (result.error || result.status !== 0) return null;
   const ref = (result.stdout || "").trim();
   const prefix = "refs/remotes/origin/";
-  if (!ref.startsWith(prefix)) return "refs/heads/main";
+  if (!ref.startsWith(prefix)) return null;
   return `refs/heads/${ref.slice(prefix.length)}`;
+}
+function canonicalDefaultBranchRef(cwd) {
+  return originHeadBranchRef(cwd) ?? "refs/heads/main";
 }
 function addWorktree(primaryCheckoutPath, worktreePath, branch, baseCommit) {
   if (existsSync(worktreePath)) throw new Error(`Managed worktree path already exists: ${worktreePath}`);
@@ -2698,15 +2701,18 @@ var WorkspaceService = class {
    * so neither `cleanupWorkspace` nor `reapLeakedAssignment` can ever reach
    * it. Every disposition preserves work by default: only a worktree proven
    * clean, old enough (`ttlHours`), unprotected, and whose branch tip is an
-   * ancestor of the primary branch is actually removed. A dangling branch
-   * with no worktree at all is reaped the same way, by branch tip alone.
+   * ancestor of the reaper target (origin/HEAD's default branch when it exists
+   * locally, else the primary checkout's branch) is actually removed. A
+   * dangling branch with no worktree at all is reaped the same way, by branch
+   * tip alone.
    */
   reapAmbiguousOrphans(input) {
     const repository = discoverRepository(input.repositoryPath);
     const protectedSet = new Set((input.protectedPaths ?? []).map((p) => path5.resolve(p)));
     const ttlHours = input.ttlHours ?? 24;
     const cutoffMs = Date.now() - ttlHours * 3600 * 1e3;
-    const target = integrationTargetRef(primaryBranch(repository.primaryCheckoutPath));
+    const originHead = originHeadBranchRef(repository.primaryCheckoutPath);
+    const target = originHead && this.refResolves(repository.primaryCheckoutPath, originHead) ? originHead : integrationTargetRef(primaryBranch(repository.primaryCheckoutPath));
     const result = {
       repositoryIdentity: repository.repositoryIdentity,
       reaped: [],
@@ -2725,6 +2731,14 @@ var WorkspaceService = class {
     const guids = /* @__PURE__ */ new Set([...ambiguous.keys()]);
     for (const branch of listManagedBranches(repository.primaryCheckoutPath)) {
       guids.add(branch.slice("ironclaude/".length));
+    }
+    const surfacedRows = this.db.prepare(
+      "SELECT workspace_guid FROM orphan_surface WHERE repository_identity = ?"
+    ).all(repository.repositoryIdentity);
+    for (const { workspace_guid } of surfacedRows) {
+      if (!guids.has(workspace_guid)) {
+        this.deleteOrphanSurface(repository.repositoryIdentity, workspace_guid);
+      }
     }
     const scratchDir = mkdtempSync2(path5.join(os3.tmpdir(), "ironclaude-orphan-"));
     try {
@@ -2808,6 +2822,36 @@ var WorkspaceService = class {
       rmSync4(scratchDir, { recursive: true, force: true });
     }
     return result;
+  }
+  /**
+   * Read-only enumeration of the currently-surfaced, currently-LIVE orphans
+   * for a repo (the rows `reapAmbiguousOrphans` wrote to `orphan_surface`),
+   * for the Brain's per-orphan walkthrough. Excludes rows the operator has
+   * `keep`-muted (muted_tip === tip) so a kept orphan drops out until its tip
+   * changes. Also excludes a row whose branch ref no longer resolves AND
+   * whose worktree directory no longer exists — i.e. the orphan was removed
+   * out-of-band (outside the tool chain) since it was surfaced. That check is
+   * read-only: the stale `orphan_surface` row is left in place for the sweep
+   * to prune later. Purely read-only overall: this method never writes, and
+   * never re-runs the reaper.
+   */
+  listSurfacedOrphans(input) {
+    const repository = discoverRepository(input.repositoryPath);
+    const rows = this.db.prepare(`
+      SELECT workspace_guid, short_id, tip, category, muted_tip FROM orphan_surface
+      WHERE repository_identity = ?
+    `).all(repository.repositoryIdentity);
+    const orphans = rows.filter((row) => row.muted_tip !== row.tip).filter((row) => {
+      const branchRef = `refs/heads/${managedBranch(row.workspace_guid)}`;
+      return this.refResolves(repository.primaryCheckoutPath, branchRef) || existsSync3(managedWorktreePath(repository.primaryCheckoutPath, row.workspace_guid));
+    }).map((row) => ({
+      id: row.short_id,
+      workspace_guid: row.workspace_guid,
+      branch: managedBranch(row.workspace_guid),
+      tip: row.tip,
+      category: row.category
+    }));
+    return { orphans };
   }
   /**
    * Authorized-consent disposition of previously SURFACED ambiguous orphans
@@ -3123,7 +3167,7 @@ var WorkspaceService = class {
 };
 
 // src/cli.ts
-var INTERNAL_COMMAND_NAMES = ["allocate", "bind", "finalize", "abandon", "reconcile", "cleanup", "sync", "reap", "configure-shared-resources", "list-shared-resources", "reap-orphans", "resolve-orphan"];
+var INTERNAL_COMMAND_NAMES = ["allocate", "bind", "finalize", "abandon", "reconcile", "cleanup", "sync", "reap", "configure-shared-resources", "list-shared-resources", "list-surfaced-orphans", "reap-orphans", "resolve-orphan"];
 function waitForCliDatabase(milliseconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
@@ -3262,6 +3306,8 @@ function dispatchInternalCommand(name, args, dependencies) {
       return dependencies.configureSharedResources(args);
     case "list-shared-resources":
       return dependencies.listSharedResources(args);
+    case "list-surfaced-orphans":
+      return dependencies.listSurfacedOrphans(args);
     case "reap-orphans":
       return dependencies["reap-orphans"](args);
     case "resolve-orphan":
@@ -3365,6 +3411,9 @@ function createInternalCommandDependencies(db) {
       allowSecretEntries: args.allow_secret_entries === true
     }),
     listSharedResources: (args) => service.listSharedResources({
+      repositoryPath: requiredString(args, "repository_path")
+    }),
+    listSurfacedOrphans: (args) => service.listSurfacedOrphans({
       repositoryPath: requiredString(args, "repository_path")
     }),
     "reap-orphans": (args) => service.reapAmbiguousOrphans({

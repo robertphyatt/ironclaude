@@ -1,0 +1,98 @@
+{
+  "name": "Proactive Per-Orphan Discussion (Feature A)",
+  "goal": "Give the Brain a read-only list_surfaced_orphans tool and rewrite its orphan rule so it proactively offers then walks the operator through each preserved orphan one at a time with a category-driven recommendation, resolving each via the unchanged resolve_orphan.",
+  "requirements_file": "docs/plans/2026-09-22-proactive-orphan-discussion-requirements.md",
+  "design_file": "docs/plans/2026-09-22-proactive-orphan-discussion-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "listSurfacedOrphans service method + test",
+      "description": "Add read-only WorkspaceService.listSurfacedOrphans({repositoryPath}) returning {orphans:[{id,workspace_guid,branch,tip,category}]} from orphan_surface, excluding muted rows (muted_tip===tip), branch=managedBranch(guid). TDD. Full code in the human plan Task 1.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/workspace-service.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: in the reapAmbiguousOrphans describe, add a listSurfacedOrphans suite that seeds a real unmerged orphan via reapAmbiguousOrphans (createOrphanWorktree+commitFile+ttlHours:0), asserts listSurfacedOrphans returns it with branch=orphanBranch(guid)/category genuinely-unmerged/id /^[0-9a-f]{8}$/, then keep-mutes via resolveOrphan and asserts it is excluded (see human plan).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts", "expected": "RED: new test fails; listSurfacedOrphans does not exist on WorkspaceService."},
+        {"description": "GREEN: add the public listSurfacedOrphans method to WorkspaceService immediately after reapAmbiguousOrphans (before resolveOrphan): discoverRepository, SELECT workspace_guid,short_id,tip,category,muted_tip FROM orphan_surface WHERE repository_identity=?, filter muted_tip!==tip, map to {id:short_id,workspace_guid,branch:managedBranch(workspace_guid),tip,category}, return {orphans}. Full snippet in human plan Task 1 Step 2.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts", "expected": "GREEN: new test passes; no workspace-service regression."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/workspace-service.ts worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "list-surfaced-orphans CLI verb + test",
+      "description": "Register the list-surfaced-orphans verb in cli.ts (interface key listSurfacedOrphans, INTERNAL_COMMAND_NAMES, dispatchInternalCommand case, createInternalCommandDependencies handler calling service.listSurfacedOrphans({repositoryPath:requiredString(args,'repository_path')})), mirroring listSharedResources. TDD. Full code human plan Task 2.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/cli.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/cli.test.ts"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "RED: add listSurfacedOrphans: vi.fn().mockReturnValue({orphans:[]}) to internalDependencies(); add a describe asserting INTERNAL_COMMAND_NAMES contains 'list-surfaced-orphans' and dispatchInternalCommand('list-surfaced-orphans',{marker},deps) calls deps.listSurfacedOrphans once (mirror reap-orphans dispatch tests).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/cli.test.ts", "expected": "RED: name not in INTERNAL_COMMAND_NAMES; dispatch throws Unknown internal workspace command: list-surfaced-orphans."},
+        {"description": "GREEN: cli.ts four edits — add listSurfacedOrphans: InternalDependency to the interface; add 'list-surfaced-orphans' to INTERNAL_COMMAND_NAMES; add case 'list-surfaced-orphans': return dependencies.listSurfacedOrphans(args); add handler listSurfacedOrphans:(args)=>service.listSurfacedOrphans({repositoryPath:requiredString(args,'repository_path')}).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/cli.test.ts", "expected": "GREEN: new tests pass; no cli regression."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/cli.ts worker/mcp-servers/workspace-manager/src/__tests__/cli.test.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Python client list_surfaced_orphans + test",
+      "description": "Add 'list-surfaced-orphans' to WorkspaceClient._COMMANDS and a one-line list_surfaced_orphans method delegating to _invoke, mirroring list_shared_resources. TDD (mocked runner). Full code human plan Task 3.",
+      "allowed_files": [
+        "commander/src/ironclaude/workspace_client.py",
+        "commander/tests/test_workspace_client.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: add test_list_surfaced_orphans_forwards_payload_into_cli_argv mirroring test_reap_orphans: Mock runner returns completed('{\"orphans\":[]}\\n'), assert client.list_surfaced_orphans({'repository_path':'/r'})=={'orphans':[]}, argv[:3]==['node',cli.js,'list-surfaced-orphans'], json.loads(argv[3])==payload.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_workspace_client.py -q", "expected": "RED: WorkspaceClient has no list_surfaced_orphans / verb not in _COMMANDS."},
+        {"description": "GREEN: add 'list-surfaced-orphans' to _COMMANDS frozenset; add def list_surfaced_orphans(self,payload,**transport): return self._invoke('list-surfaced-orphans',payload,**transport) next to list_shared_resources.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_workspace_client.py -q", "expected": "GREEN."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/workspace_client.py commander/tests/test_workspace_client.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Orchestrator list_surfaced_orphans tool + test",
+      "description": "Add OrchestratorTools.list_surfaced_orphans (mirror list_shared_resources: _shared_resources_transport, call client, wrap errors, never raise; no protected_paths) + thin @mcp.tool() wrapper json.dumps(tools.list_surfaced_orphans(repository_path, worker_id or None)). TDD. Full code human plan Task 4.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {"description": "RED: add class TestListSurfacedOrphans with a _tools() helper (object.__new__(OrchestratorTools), MagicMock registry/tmux/_workspace_client, discover_installed_plugin_root->'/installed/claude', _ensure_ssh_manager/_resolve_ssh_host stubs; NO _live_worker_worktree_paths patch). Tests: forwards {'repository_path':'/repo'} + kwargs {'plugin_root':'/installed/claude'} and returns client value; never raises on client error (error/failure_phase='list_surfaced_orphans'/repository_path).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -q -k ListSurfacedOrphans", "expected": "RED: OrchestratorTools has no list_surfaced_orphans."},
+        {"description": "GREEN: add OrchestratorTools.list_surfaced_orphans(self,repository_path,worker_id=None)->dict mirroring list_shared_resources (transport=_shared_resources_transport; if 'error' return it; try return self._workspace_client.list_surfaced_orphans({'repository_path':repository_path},**transport) except wrap {error,failure_phase:'list_surfaced_orphans',repository_path}); add @mcp.tool() list_surfaced_orphans(repository_path,worker_id='')->str next to list_shared_resources wrapper.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -q -k ListSurfacedOrphans", "expected": "GREEN."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Rewrite Brain orphan rule (workflow.md)",
+      "description": "Replace the 'Resolving Orphaned Worktrees (operator-consented cleanup)' section (heading through its Rules list, before 'Never Fake Past a Missing-Input Gate') with the proactive-offer + operator-trigger + strictly-sequential per-orphan walkthrough that reads list_surfaced_orphans and preserves every resolve_orphan rail verbatim. Full replacement text in human plan Task 5. No tests required: Brain guidance prose (no behavioral harness; validated by review).",
+      "allowed_files": [
+        "commander/src/brain/rules/workflow.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Replace the orphan-resolution section with the human plan Task 5 markdown block: read via list_surfaced_orphans; proactive offer once per set on wake, no re-nag; operator trigger; strictly one-at-a-time presentation with category-driven recommendation (squash-merged/merged-on-origin->reap, genuinely-unmerged->keep/offer merge-then-reap, dirty->keep unless explicit dirty consent); resolve_orphan per single id with all existing rails (tip-bound id, dirty-category discard, protected_paths, integration_target, never-guess-id) and the full outcome list preserved verbatim.", "expected": ""},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/brain/rules/workflow.md", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 6,
+      "name": "Rebuild dist + full-suite verification",
+      "description": "Rebuild the workspace-manager bundle (TS changed), run full vitest + full commander pytest (both 0 failed), stage dist -f. No tests required: build + full-suite verification task.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js"
+      ],
+      "depends_on": [1, 2, 3, 4, 5],
+      "steps": [
+        {"description": "Rebuild dist.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build", "expected": "tsc + bundle succeed, no error."},
+        {"description": "Full workspace-manager vitest.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run", "expected": "passed | 0 failed (onTaskUpdate RPC-timeout line is benign; judge by 0 failed)."},
+        {"description": "Full commander pytest.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "0 failed."},
+        {"description": "Stage dist (force; dist gitignored).", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/hook-intent.js", "expected": "Staged."}
+      ]
+    }
+  ]
+}

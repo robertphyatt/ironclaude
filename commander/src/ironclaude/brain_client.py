@@ -71,7 +71,7 @@ def _is_model_unavailable(exc: Exception) -> bool:
 
 # Models that REQUIRE the [1m] suffix + context-1m-2025-08-07 beta to unlock a
 # 1M-token context window. Opus opts into 1M via this beta (this session runs on
-# "claude-opus-4-8[1m]"). Fable 5 and Sonnet 5 have 1M context NATIVELY and REJECT
+# "opus[1m]"). Fable 5 and Sonnet 5 have 1M context NATIVELY and REJECT
 # this beta — passing "fable[1m]"/"sonnet[1m]" is an error (observed brain crash:
 # "There's an issue with the selected model (fable[1m])"). So the suffix/beta is
 # applied ONLY to models in this set; everything else launches with the bare model.
@@ -126,7 +126,7 @@ def _model_needs_1m_beta(model: str) -> bool:
     False and must launch with the bare model string — no suffix, no beta.
 
     Matches on the base model token even if the value carries a suffix or provider
-    prefix (e.g. "claude-opus-4-8", "opus[1m]").
+    prefix (e.g. "opus", "opus[1m]").
     """
     model_lower = model.lower()
     return any(token in model_lower for token in _MODELS_NEEDING_1M_BETA)
@@ -268,7 +268,7 @@ class BrainClient:
         semantic tier selects a per-tier override from self._effort_levels, else
         falls back to the global self._effort_level. Used by _build_options per
         model_str so the opus-outage fallback (which re-enters with
-        claude-opus-4-8) resolves the opus-tier effort, not the original tier's."""
+        opus) resolves the opus-tier effort, not the original tier's."""
         return effort_for_tier(
             _semantic_tier(model_str, "brain_model", ""),
             self._effort_level,
@@ -864,7 +864,7 @@ class BrainClient:
             await _run_session(_build_options(self._model))
         except _ModelUnavailableFromMessage as exc:
             failing_model = self._model
-            resolved = "claude-opus-4-8"
+            resolved = "opus"
             logger.error(
                 f"BRAIN MODEL '{failing_model}' UNAVAILABLE (message-shaped) — resolving to '{resolved}'"
             )
@@ -876,7 +876,7 @@ class BrainClient:
         except Exception as exc:
             if _is_model_unavailable(exc):
                 failing_model = self._model
-                resolved = "claude-opus-4-8"
+                resolved = "opus"
                 logger.error(
                     f"BRAIN MODEL '{failing_model}' NOT AVAILABLE — resolving to '{resolved}'"
                 )

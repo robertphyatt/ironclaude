@@ -49,15 +49,15 @@ DEFAULTS = {
     "operator_name": "Operator",
     "autonomy_level": "3",
     "brain_model": "sonnet",
-    "default_opus_model": "claude-opus-4-8",
-    "grader_model": "claude-opus-4-8",
+    "default_opus_model": "opus",
+    "grader_model": "opus",
     "effort_level": "high",
     "effort_levels": {"fable": "medium"},
     "advisor": {
         "enabled": True,
         "executor_model": "sonnet",  # CLI routing only — sets --model flag for sonnet workers; not a Brain model selection input
-        "advisor_model": "claude-opus-4-8",  # scalar fallback for unknown worker types
-        "advisor_models": {"claude-sonnet": "claude-opus-4-8", "claude-opus": "fable"},  # one-tier-up map per worker type
+        "advisor_model": "opus",  # scalar fallback for unknown worker types
+        "advisor_models": {"claude-sonnet": "opus", "claude-opus": "fable"},  # one-tier-up map per worker type
     },
     "dispatch": {"use_goal": False},
     "providers": {
@@ -68,7 +68,7 @@ DEFAULTS = {
                 "models": {
                     "haiku": "haiku",
                     "sonnet": "sonnet",
-                    "opus": "claude-opus-4-8",
+                    "opus": "opus",
                     "fable": "fable",
                 },
             },

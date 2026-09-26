@@ -16,6 +16,7 @@ class WorkspaceClientError(RuntimeError):
 _COMMANDS = frozenset({
     "allocate", "bind", "finalize", "abandon", "reconcile", "cleanup", "sync", "reap",
     "reap-orphans", "resolve-orphan", "configure-shared-resources", "list-shared-resources",
+    "list-surfaced-orphans",
 })
 
 
@@ -251,3 +252,6 @@ class WorkspaceClient:
 
     def list_shared_resources(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
         return self._invoke("list-shared-resources", payload, **transport)
+
+    def list_surfaced_orphans(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
+        return self._invoke("list-surfaced-orphans", payload, **transport)

@@ -1,0 +1,50 @@
+{
+  "name": "Reaper Target Fallback",
+  "goal": "Make reapAmbiguousOrphans judge orphans against origin/HEAD's branch when set, else the primary checkout's current branch (v1.1.12; detached fails safe), leaving canonicalDefaultBranchRef and merge-then-reap unchanged.",
+  "requirements_file": "docs/plans/2026-09-25-default-branch-fallback-requirements.md",
+  "design_file": "docs/plans/2026-09-25-default-branch-fallback-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "originHeadBranchRef + reaper target fallback + tests + doc wording",
+      "description": "git.ts:202-216: add originHeadBranchRef(cwd): string|null (origin/HEAD half); canonicalDefaultBranchRef = originHeadBranchRef(cwd) ?? 'refs/heads/main' (no behavior change). workspace-service.ts: import originHeadBranchRef (between listWorktrees and primaryBranch); doc :981-982 wording; :990 target = originHeadBranchRef(p) ?? integrationTargetRef(primaryBranch(p)). mergeOrphanThenReap (:1357) untouched. Tests: import; originHeadBranchRef describe; retitle :1666/:1692/:1748; remove origin/HEAD setup :2150-2152 from :2141 trunk test; add master-no-origin/HEAD reap test + detached fail-safe test. :2966 and canonicalDefaultBranchRef tests unmodified. Exact code: human plan docs/plans/2026-09-25-default-branch-fallback.md Task 1. TDD.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/git.ts",
+        "worker/mcp-servers/workspace-manager/src/workspace-service.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: test edits (a)-(e) verbatim from human plan Task 1 Step 1: (a) :9 import adds originHeadBranchRef; (b) new describe('originHeadBranchRef') after describe('canonicalDefaultBranchRef') closes (:1642) — trunk via origin/HEAD -> 'refs/heads/trunk'; unset -> null; (c) retitle :1666/:1692/:1748 'primary branch' -> 'reaper target'; (d) delete :2150-2152 (trunkTip rev-parse, update-ref refs/remotes/origin/trunk, symbolic-ref refs/remotes/origin/HEAD); (e) after the trunk test add 'reaps a merged orphan against the primary checkout branch on a master repository with no origin/HEAD' and 'fails safe (throws, reaps nothing) when the primary checkout is detached and origin/HEAD is unset'."},
+        {"description": "Run test file (RED).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts", "expected": "RED confined to new/changed tests: originHeadBranchRef tests fail (not a function) or file load error naming originHeadBranchRef; if file loads, also :2141 trunk test, new master reaper test (preserved-unmerged not reaped), new detached test (no throw) fail. No other test fails."},
+        {"description": "GREEN git.ts: replace :202-216 verbatim with human plan Task 1 Step 3 (originHeadBranchRef + canonicalDefaultBranchRef returning originHeadBranchRef(cwd) ?? 'refs/heads/main', doc comments)."},
+        {"description": "GREEN workspace-service.ts per human plan Task 1 Step 4: (a) add `originHeadBranchRef,` between `listWorktrees,` and `primaryBranch,` in ./git.js import; (b) :982 'ancestor of the primary branch is actually removed.' -> 'ancestor of the reaper target (origin/HEAD's default branch, else the primary checkout's branch) is actually removed.'; (c) :990 replace `const target = canonicalDefaultBranchRef(repository.primaryCheckoutPath);` with the commented `const target = originHeadBranchRef(repository.primaryCheckoutPath) ?? integrationTargetRef(primaryBranch(repository.primaryCheckoutPath));`."},
+        {"description": "Run test file (GREEN).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts", "expected": "0 failed (incl. unmodified :2966 fail-closed and canonicalDefaultBranchRef tests)."},
+        {"description": "Stale wording gone.", "command": "rg -n -F 'the primary branch' /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/src/workspace-service.ts", "expected": "No output (rg exit 1). Pre-change matched only :982."},
+        {"description": "merge-then-reap default untouched.", "command": "rg -n -F ': canonicalDefaultBranchRef(primary);' /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/src/workspace-service.ts", "expected": "Exactly one match."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/git.ts worker/mcp-servers/workspace-manager/src/workspace-service.ts worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts", "expected": "All three staged."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "dist rebuild + full vitest + CHANGELOG entry",
+      "description": "No tests required: build + documentation entry + full-suite verification; behavior tested in Task 1. Rebuild dist, confirm helper in bundle, full vitest 0 failed, insert CHANGELOG reaper bullet (verbatim from human plan Task 2 Step 4) under ## [Unreleased] after the existing first bullet, stage.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js",
+        "CHANGELOG.md",
+        "commander/docs/plans/2026-09-25-default-branch-fallback.md",
+        "commander/docs/plans/2026-09-25-default-branch-fallback.plan.json"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Rebuild.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build", "expected": "tsc + bundle succeed, no error."},
+        {"description": "Helper present in bundle.", "command": "rg -n -F 'function originHeadBranchRef(' /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js", "expected": "Exactly one match."},
+        {"description": "Full workspace-manager suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run", "expected": "0 failed (benign onTaskUpdate RPC-timeout line ignored)."},
+        {"description": "Insert CHANGELOG bullet verbatim from human plan Task 2 Step 4 under ## [Unreleased], after the existing first (finalize-failure observability) bullet, blank line before and after."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/hook-intent.js CHANGELOG.md commander/docs/plans/2026-09-25-default-branch-fallback.md commander/docs/plans/2026-09-25-default-branch-fallback.plan.json", "expected": "All staged (unchanged dist file = no-op)."}
+      ]
+    }
+  ]
+}

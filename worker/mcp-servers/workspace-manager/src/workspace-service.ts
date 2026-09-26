@@ -35,6 +35,7 @@ import {
   linkSharedResources,
   listManagedBranches,
   listWorktrees,
+  originHeadBranchRef,
   primaryBranch,
   readSharedResourceConfig,
   removeWorktree,
@@ -979,15 +980,29 @@ export class WorkspaceService {
    * so neither `cleanupWorkspace` nor `reapLeakedAssignment` can ever reach
    * it. Every disposition preserves work by default: only a worktree proven
    * clean, old enough (`ttlHours`), unprotected, and whose branch tip is an
-   * ancestor of the primary branch is actually removed. A dangling branch
-   * with no worktree at all is reaped the same way, by branch tip alone.
+   * ancestor of the reaper target (origin/HEAD's default branch when it exists
+   * locally, else the primary checkout's branch) is actually removed. A
+   * dangling branch with no worktree at all is reaped the same way, by branch
+   * tip alone.
    */
   reapAmbiguousOrphans(input: { repositoryPath: string; protectedPaths?: string[]; ttlHours?: number }): OrphanReapResult {
     const repository = discoverRepository(input.repositoryPath);
     const protectedSet = new Set((input.protectedPaths ?? []).map((p) => path.resolve(p)));
     const ttlHours = input.ttlHours ?? 24;
     const cutoffMs = Date.now() - ttlHours * 3600 * 1000;
-    const target = integrationTargetRef(primaryBranch(repository.primaryCheckoutPath));
+    // origin/HEAD's branch when set AND present locally; otherwise the primary
+    // checkout's current branch (the v1.1.11 behavior). origin/HEAD can name a
+    // branch with no local ref — a `clone -b` checkout, or a stale origin/HEAD
+    // after a remote default-branch rename — and judging against a missing ref
+    // would misread every orphan as unmerged. Only when the fallback is needed
+    // does a detached primary matter: primaryBranch throws and the sweep fails
+    // safe, reaping nothing (a usable origin/HEAD makes it irrelevant). The reaper
+    // never advances a ref, unlike mergeOrphanThenReap, which keeps
+    // canonicalDefaultBranchRef's fail-closed default.
+    const originHead = originHeadBranchRef(repository.primaryCheckoutPath);
+    const target = originHead && this.refResolves(repository.primaryCheckoutPath, originHead)
+      ? originHead
+      : integrationTargetRef(primaryBranch(repository.primaryCheckoutPath));
 
     const result: OrphanReapResult = {
       repositoryIdentity: repository.repositoryIdentity,
@@ -1002,6 +1017,19 @@ export class WorkspaceService {
     const guids = new Set<string>([...ambiguous.keys()]);
     for (const branch of listManagedBranches(repository.primaryCheckoutPath)) {
       guids.add(branch.slice('ironclaude/'.length));
+    }
+
+    // Prune surfaced rows whose orphan no longer exists at all (branch AND
+    // worktree gone — e.g. removed out-of-band since it was surfaced); these
+    // guids are never visited by the loop below, so nothing else would delete
+    // them. This is the sweep, which is allowed to mutate.
+    const surfacedRows = this.db.prepare(
+      'SELECT workspace_guid FROM orphan_surface WHERE repository_identity = ?',
+    ).all(repository.repositoryIdentity) as Array<{ workspace_guid: string }>;
+    for (const { workspace_guid } of surfacedRows) {
+      if (!guids.has(workspace_guid)) {
+        this.deleteOrphanSurface(repository.repositoryIdentity, workspace_guid);
+      }
     }
 
     const scratchDir = mkdtempSync(path.join(os.tmpdir(), 'ironclaude-orphan-'));
@@ -1079,6 +1107,45 @@ export class WorkspaceService {
       rmSync(scratchDir, { recursive: true, force: true });
     }
     return result;
+  }
+
+  /**
+   * Read-only enumeration of the currently-surfaced, currently-LIVE orphans
+   * for a repo (the rows `reapAmbiguousOrphans` wrote to `orphan_surface`),
+   * for the Brain's per-orphan walkthrough. Excludes rows the operator has
+   * `keep`-muted (muted_tip === tip) so a kept orphan drops out until its tip
+   * changes. Also excludes a row whose branch ref no longer resolves AND
+   * whose worktree directory no longer exists — i.e. the orphan was removed
+   * out-of-band (outside the tool chain) since it was surfaced. That check is
+   * read-only: the stale `orphan_surface` row is left in place for the sweep
+   * to prune later. Purely read-only overall: this method never writes, and
+   * never re-runs the reaper.
+   */
+  listSurfacedOrphans(input: { repositoryPath: string }): {
+    orphans: Array<{ id: string; workspace_guid: string; branch: string; tip: string; category: string }>;
+  } {
+    const repository = discoverRepository(input.repositoryPath);
+    const rows = this.db.prepare(`
+      SELECT workspace_guid, short_id, tip, category, muted_tip FROM orphan_surface
+      WHERE repository_identity = ?
+    `).all(repository.repositoryIdentity) as Array<{
+      workspace_guid: string; short_id: string; tip: string; category: string; muted_tip: string | null;
+    }>;
+    const orphans = rows
+      .filter((row) => row.muted_tip !== row.tip)
+      .filter((row) => {
+        const branchRef = `refs/heads/${managedBranch(row.workspace_guid)}`;
+        return this.refResolves(repository.primaryCheckoutPath, branchRef)
+          || existsSync(managedWorktreePath(repository.primaryCheckoutPath, row.workspace_guid));
+      })
+      .map((row) => ({
+        id: row.short_id,
+        workspace_guid: row.workspace_guid,
+        branch: managedBranch(row.workspace_guid),
+        tip: row.tip,
+        category: row.category,
+      }));
+    return { orphans };
   }
 
   /**

@@ -2428,7 +2428,7 @@ class TestEffortLevel:
         cmd = t._get_worker_command_for_handle(
             "claude-opus", "",
             _provider_handle(client="claude", requested="opus",
-                             effective="opus", model="claude-opus-4-8"),
+                             effective="opus", model="opus"),
         )
         assert "CLAUDE_CODE_EFFORT_LEVEL=high" in cmd
 
@@ -2442,7 +2442,7 @@ class TestEffortLevel:
         cmd = t._get_worker_command_for_handle(
             "claude-fable", "",
             _provider_handle(client="claude", requested="fable",
-                             effective="opus", model="claude-opus-4-8"),
+                             effective="opus", model="opus"),
         )
         assert "CLAUDE_CODE_EFFORT_LEVEL=high" in cmd
 
@@ -2505,7 +2505,7 @@ class TestFableAvailabilityIntegration:
 
     def test_worker_type_redirect_when_fable_unavailable(self, tools, tmp_path, monkeypatch):
         """_get_worker_command('claude-fable') matches _get_worker_command('claude-opus')
-        once Fable has been marked unavailable — same command, --model claude-opus-4-8 not fable."""
+        once Fable has been marked unavailable — same command, --model opus not fable."""
         from ironclaude import fable_availability
         monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "fable_state.json")
         fable_availability.mark_fable_unavailable("test")
@@ -2514,11 +2514,11 @@ class TestFableAvailabilityIntegration:
         cmd_opus = tools._get_worker_command("claude-opus")
 
         assert cmd_fable == cmd_opus
-        assert "--model claude-opus-4-8" in cmd_fable
+        assert "--model opus" in cmd_fable
         assert "--model fable" not in cmd_fable
 
     def test_advisor_redirect_when_fable_unavailable(self, registry, mock_tmux, tmp_path, db_conn, monkeypatch):
-        """A claude-opus worker whose tiered advisor is 'fable' gets /advisor claude-opus-4-8
+        """A claude-opus worker whose tiered advisor is 'fable' gets /advisor opus
         instead once Fable has been marked unavailable."""
         from ironclaude import fable_availability
         monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "fable_state.json")
@@ -2541,7 +2541,7 @@ class TestFableAvailabilityIntegration:
                 objective="Do the thing",
             )
         keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
-        assert "/advisor claude-opus-4-8" in keys_sent
+        assert "/advisor opus" in keys_sent
         assert "/advisor fable" not in keys_sent
 
     def test_spawn_retry_on_fable_death_marks_and_posts_slack(
@@ -2584,7 +2584,7 @@ class TestFableAvailabilityIntegration:
         spawn_calls = mock_tmux.spawn_session.call_args_list
         assert len(spawn_calls) == 2
         retry_cmd = spawn_calls[1][0][1]
-        assert "--model claude-opus-4-8" in retry_cmd
+        assert "--model opus" in retry_cmd
 
         worker = registry.get_worker("w-fable-death")
         assert worker["type"] == "claude-opus"
@@ -2706,7 +2706,7 @@ class TestFableAvailabilityIntegration:
     def test_batch_spawn_advisor_redirect_when_fable_unavailable(self, tools, mock_tmux, tmp_path, monkeypatch):
         """spawn_workers (batch path) filters advisor model through
         resolve_advisor_model — a claude-opus worker whose advisor_model is
-        'fable' gets /advisor claude-opus-4-8 instead once Fable is flagged unavailable."""
+        'fable' gets /advisor opus instead once Fable is flagged unavailable."""
         from ironclaude import fable_availability
         monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "fable_state.json")
         fable_availability.mark_fable_unavailable("test")
@@ -2749,7 +2749,7 @@ class TestFableAvailabilityIntegration:
             ])
 
         keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
-        assert "/advisor claude-opus-4-8" in keys_sent
+        assert "/advisor opus" in keys_sent
         assert "/advisor fable" not in keys_sent
 
     def test_recovery_does_not_fire_when_default_opus_model_starts_with_fable(
@@ -7535,7 +7535,7 @@ class TestAdvisorModelFor:
 
     def test_falls_back_to_default_opus_when_no_config(self, tools):
         tools._advisor_cfg = {}
-        assert tools._advisor_model_for("claude-sonnet") == "claude-opus-4-8"
+        assert tools._advisor_model_for("claude-sonnet") == "opus"
 
 
 class TestGetWorkerCommand:
@@ -11791,3 +11791,43 @@ class TestResolveOrphan:
         assert any(
             "a1" in m and "reap" in m and "reaped" in m for m in messages
         )
+
+
+class TestListSurfacedOrphans:
+    """Brain self-serve read tool enumerating surfaced orphans for the
+    per-orphan walkthrough; delegates to workspace-manager's
+    list-surfaced-orphans verb, no protected_paths (read-only)."""
+
+    def _tools(self):
+        tools = object.__new__(OrchestratorTools)
+        tools.registry = MagicMock()
+        tools._db = init_db(":memory:")
+        tools.tmux = MagicMock()
+        tools._workspace_client = MagicMock()
+        tools._workspace_client.discover_installed_plugin_root.return_value = "/installed/claude"
+        tools._ensure_ssh_manager = MagicMock()
+        tools._resolve_ssh_host = MagicMock(return_value=None)
+        return tools
+
+    def test_list_surfaced_orphans_forwards_repository_path(self):
+        tools = self._tools()
+        expected = {"orphans": [{"id": "ab12cd34", "workspace_guid": "g1",
+                                 "branch": "ironclaude/g1", "tip": "abc", "category": "genuinely-unmerged"}]}
+        tools._workspace_client.list_surfaced_orphans.return_value = expected
+
+        result = tools.list_surfaced_orphans("/repo")
+
+        assert result == expected
+        call = tools._workspace_client.list_surfaced_orphans.call_args
+        assert call.args[0] == {"repository_path": "/repo"}
+        assert call.kwargs == {"plugin_root": "/installed/claude"}
+
+    def test_list_surfaced_orphans_never_raises_on_workspace_error(self):
+        tools = self._tools()
+        tools._workspace_client.list_surfaced_orphans.side_effect = RuntimeError("boom")
+
+        result = tools.list_surfaced_orphans("/repo")
+
+        assert result["error"] == "boom"
+        assert result["failure_phase"] == "list_surfaced_orphans"
+        assert result["repository_path"] == "/repo"

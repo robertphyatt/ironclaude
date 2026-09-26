@@ -28,6 +28,7 @@ function internalDependencies(): InternalCommandDependencies {
     reap: vi.fn().mockReturnValue({ lifecycle_status: 'reaped' }),
     configureSharedResources: vi.fn().mockReturnValue({ added: [], skipped: [], rejected: [], entries: [], relinked: {} }),
     listSharedResources: vi.fn().mockReturnValue({ entries: [] }),
+    listSurfacedOrphans: vi.fn().mockReturnValue({ orphans: [] }),
     'reap-orphans': vi.fn().mockReturnValue({
       repositoryIdentity: '/r/.git', reaped: [], reapedWorktreeOnly: [], preservedDirty: [], preservedUnmerged: [], skippedLive: [], skippedYoung: [], errors: [],
     }),
@@ -242,6 +243,20 @@ describe('workspace-manager internal CLI: reap-orphans command (ambiguous-orphan
   it('rejects an unknown internal command', () => {
     expect(() => dispatchInternalCommand('bogus-verb', {}, internalDependencies()))
       .toThrow('Unknown internal workspace command: bogus-verb');
+  });
+});
+
+describe('workspace-manager internal CLI: list-surfaced-orphans command (read-only orphan enumeration)', () => {
+  it('exposes list-surfaced-orphans as an internal command alongside the existing set', () => {
+    expect(INTERNAL_COMMAND_NAMES).toContain('list-surfaced-orphans');
+  });
+
+  it('dispatches the list-surfaced-orphans command to its handler exactly once', () => {
+    const dependencies = internalDependencies();
+    const result = dispatchInternalCommand('list-surfaced-orphans', { marker: 'list-surfaced-orphans' }, dependencies);
+    expect(dependencies.listSurfacedOrphans).toHaveBeenCalledWith({ marker: 'list-surfaced-orphans' });
+    expect(dependencies.listSurfacedOrphans).toHaveBeenCalledTimes(1);
+    expect(result).toBeDefined();
   });
 });
 

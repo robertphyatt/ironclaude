@@ -37,7 +37,7 @@ const PUBLIC_TOOLS = [
   'list_preserved_work',
 ] as const;
 
-const INTERNAL_COMMANDS = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile', 'cleanup', 'sync', 'reap', 'configure-shared-resources', 'list-shared-resources', 'reap-orphans', 'resolve-orphan'] as const;
+const INTERNAL_COMMANDS = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile', 'cleanup', 'sync', 'reap', 'configure-shared-resources', 'list-shared-resources', 'list-surfaced-orphans', 'reap-orphans', 'resolve-orphan'] as const;
 
 function publicDependencies(): PublicToolDependencies {
   return {
@@ -69,6 +69,7 @@ function internalDependencies(): InternalCommandDependencies {
     reap: vi.fn().mockReturnValue({ lifecycle_status: 'reaped' }),
     configureSharedResources: vi.fn().mockReturnValue({ added: [], skipped: [], rejected: [], entries: [], relinked: {} }),
     listSharedResources: vi.fn().mockReturnValue({ entries: [] }),
+    listSurfacedOrphans: vi.fn().mockReturnValue({ orphans: [] }),
     'reap-orphans': vi.fn().mockReturnValue({
       repositoryIdentity: '/r/.git', reaped: [], reapedWorktreeOnly: [], preservedDirty: [], preservedUnmerged: [], skippedLive: [], skippedYoung: [], errors: [],
     }),

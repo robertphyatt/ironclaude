@@ -981,7 +981,10 @@ class TestSurfacePreservedOrphans:
 
         from ironclaude.main import IroncladeDaemon
 
-        fake = SimpleNamespace(_orphaned_surface_state={}, slack=Mock())
+        fake = SimpleNamespace(
+            _orphaned_surface_state={}, slack=Mock(), brain=Mock(),
+            _orphaned_unmerged_count=1,
+        )
         details = [{
             "id": "d1", "category": "genuinely-unmerged", "branch": "ironclaude/g1",
             "tip": "aaaaaaa1111", "evidence": "2 ahead of main", "repository_path": "/repo",
@@ -1004,7 +1007,10 @@ class TestSurfacePreservedOrphans:
 
         from ironclaude.main import IroncladeDaemon
 
-        fake = SimpleNamespace(_orphaned_surface_state={}, slack=Mock())
+        fake = SimpleNamespace(
+            _orphaned_surface_state={}, slack=Mock(), brain=Mock(),
+            _orphaned_unmerged_count=1,
+        )
         IroncladeDaemon._surface_preserved_orphans(fake, [])
         fake.slack.post_message.assert_not_called()
 
@@ -1017,7 +1023,10 @@ class TestSurfacePreservedOrphans:
 
         from ironclaude.main import IroncladeDaemon
 
-        fake = SimpleNamespace(_orphaned_surface_state={}, slack=Mock())
+        fake = SimpleNamespace(
+            _orphaned_surface_state={}, slack=Mock(), brain=Mock(),
+            _orphaned_unmerged_count=1,
+        )
         details = [{
             "id": "d1", "category": "genuinely-unmerged", "branch": "ironclaude/g1",
             "tip": "aaaaaaa1111", "evidence": "2 ahead of main", "repository_path": "/repo",
@@ -1034,3 +1043,46 @@ class TestSurfacePreservedOrphans:
         recategorized = [dict(details[0], category="dirty")]
         IroncladeDaemon._surface_preserved_orphans(fake, recategorized)
         assert fake.slack.post_message.call_count == 2
+
+    def test_brain_notified_once_per_change_for_reviewable_set(self):
+        """A surfaced set that has something needing review pushes the Brain one
+        PRESERVED ORPHANS SURFACED notice per set-change; silent on a repeat, on an
+        empty set, and on a squash-merged-only set (nothing to review)."""
+        from types import SimpleNamespace
+
+        from ironclaude.main import IroncladeDaemon
+
+        fake = SimpleNamespace(
+            _orphaned_surface_state={}, slack=Mock(), brain=Mock(),
+            _orphaned_unmerged_count=1,
+        )
+        details = [{
+            "id": "d1", "category": "genuinely-unmerged", "branch": "ironclaude/g1",
+            "tip": "aaaaaaa1111", "evidence": "2 ahead of main", "repository_path": "/repo",
+        }]
+        IroncladeDaemon._surface_preserved_orphans(fake, details)
+        assert fake.brain.send_message.call_count == 1
+        msg = fake.brain.send_message.call_args.args[0]
+        assert "PRESERVED ORPHANS SURFACED" in msg and "/repo" in msg and "d1" in msg
+
+        IroncladeDaemon._surface_preserved_orphans(fake, list(details))
+        assert fake.brain.send_message.call_count == 1  # repeat -> no re-notify
+
+        fake_sm = SimpleNamespace(
+            _orphaned_surface_state={}, slack=Mock(), brain=Mock(),
+            _orphaned_unmerged_count=0,
+        )
+        sm = [{
+            "id": "s1", "category": "squash-merged", "branch": "ironclaude/g2",
+            "tip": "bbbbbbb2222", "evidence": "merged", "repository_path": "/repo",
+        }]
+        IroncladeDaemon._surface_preserved_orphans(fake_sm, sm)
+        fake_sm.slack.post_message.assert_called_once()
+        fake_sm.brain.send_message.assert_not_called()
+
+        fake_empty = SimpleNamespace(
+            _orphaned_surface_state={}, slack=Mock(), brain=Mock(),
+            _orphaned_unmerged_count=0,
+        )
+        IroncladeDaemon._surface_preserved_orphans(fake_empty, [])
+        fake_empty.brain.send_message.assert_not_called()

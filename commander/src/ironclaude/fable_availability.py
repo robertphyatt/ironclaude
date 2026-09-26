@@ -313,14 +313,14 @@ def resolve_worker_type(worker_type: str) -> str:
 
 
 def resolve_advisor_model(model):
-    """Redirect the 'fable' advisor model to 'claude-opus-4-8' when Fable is unavailable —
+    """Redirect the 'fable' advisor model to 'opus' when Fable is unavailable —
     UNLESS the block is an account-wide usage_limit (keep Fable; Opus is equally throttled).
     """
     try:
         if model == "fable" and is_fable_unavailable():
             if fable_block_category() == "usage_limit":
                 return "fable"
-            return "claude-opus-4-8"
+            return "opus"
     except Exception as exc:
         logger.debug("resolve_advisor_model: passthrough after error: %s", exc)
     return model

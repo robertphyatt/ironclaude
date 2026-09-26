@@ -15,7 +15,7 @@ import psutil
 import pytest
 from unittest.mock import MagicMock, patch
 
-from ironclaude.main import CHECKIN_CADENCE, FINALIZE_DRIFT_RETRY_CAP, PM_GATE_STAGES, PM_GATE_SLACK_SECONDS, IroncladeDaemon, PromptDetection, ensure_brain_trusted
+from ironclaude.main import CHECKIN_CADENCE, FINALIZE_DRIFT_RETRY_CAP, FINALIZE_FAILURE_SURFACE_CAP, PM_GATE_STAGES, PM_GATE_SLACK_SECONDS, IroncladeDaemon, PromptDetection, ensure_brain_trusted
 from ironclaude.orchestrator_mcp import OrchestratorTools
 from ironclaude.prompt_incidents import PromptIncidentStore
 from ironclaude.provider_state import ProviderState
@@ -5393,6 +5393,94 @@ class TestFinalizationFailureTransientSurface:
         assert disposition2 == "transient"
         assert daemon.slack.post_message.call_count == 1
         assert daemon.brain.send_message.call_count == 1
+
+
+class TestTerminalFinalizeFailureSurface:
+    """A TERMINAL finalize that keeps failing outside the 'finalization' phase
+    (authority/probe/abandon) was silently 'transient' forever (r2: ~13 days).
+    Past FINALIZE_FAILURE_SURFACE_CAP consecutive terminal failures it must be
+    surfaced to slack+brain exactly once — never completed, never abandoned."""
+
+    _OUTCOME = {
+        "failure_phase": "abandon",
+        "error": "abandon exploded",
+        "assignment_preserved": True,
+    }
+
+    def test_surfaces_once_after_cap(self, daemon):
+        for _ in range(FINALIZE_FAILURE_SURFACE_CAP):
+            assert daemon._drive_finalization_recovery(
+                "w1", self._OUTCOME, terminal=True,
+            ) == "transient"
+        assert daemon.slack.post_message.call_count == 0
+        assert daemon.brain.send_message.call_count == 0
+
+        assert daemon._drive_finalization_recovery(
+            "w1", self._OUTCOME, terminal=True,
+        ) == "transient"
+        assert daemon.slack.post_message.call_count == 1
+        assert daemon.brain.send_message.call_count == 1
+        posted = daemon.slack.post_message.call_args[0][0]
+        assert "w1" in posted
+        assert f"{FINALIZE_FAILURE_SURFACE_CAP + 1} consecutive cycles" in posted
+        assert "phase=abandon" in posted
+        assert "abandon exploded" in posted
+        assert "not completed" in posted
+
+        for _ in range(3):
+            daemon._drive_finalization_recovery("w1", self._OUTCOME, terminal=True)
+        assert daemon.slack.post_message.call_count == 1
+        assert daemon.brain.send_message.call_count == 1
+        daemon.registry.update_worker_status.assert_not_called()
+
+    def test_non_terminal_outcomes_never_count(self, daemon):
+        for _ in range(FINALIZE_FAILURE_SURFACE_CAP + 2):
+            daemon._drive_finalization_recovery("w1", self._OUTCOME)
+        assert "w1" not in daemon._finalize_failure_count
+        assert daemon.slack.post_message.call_count == 0
+
+    def test_none_outcome_never_counts(self, daemon):
+        for _ in range(FINALIZE_FAILURE_SURFACE_CAP + 2):
+            daemon._drive_finalization_recovery("w1", None, terminal=True)
+        assert "w1" not in daemon._finalize_failure_count
+        assert daemon.slack.post_message.call_count == 0
+
+    def test_session_died_site_counts_as_terminal(self, daemon):
+        _seam_session_died(daemon, dict(self._OUTCOME))
+        daemon.check_workers()
+        assert daemon._finalize_failure_count.get("w1") == 1
+
+    def test_stuck_kill_site_counts_as_terminal(self, daemon):
+        _seam_stuck_kill(daemon, dict(self._OUTCOME))
+        daemon._confirm_and_kill_stuck_worker(
+            "w1", "ic-w1", 1200.0, "execution", False, None,
+        )
+        assert daemon._finalize_failure_count.get("w1") == 1
+
+    def test_idle_reap_counts_only_the_post_kill_outcome(self, daemon):
+        orch = MagicMock()
+        orch._finalize_and_release_worker.return_value = dict(self._OUTCOME)
+        daemon._get_orchestrator = MagicMock(return_value=orch)
+        daemon.tmux.get_log_mtime.return_value = None
+        daemon._reap_idle_worker("w1", "ic-w1", None, None, time.time() - 100000)
+        # pre-kill (terminal=False) must not count; post-kill (terminal=True) counts once.
+        assert daemon._finalize_failure_count.get("w1") == 1
+
+    def test_non_running_sweep_clears_failure_count(self, daemon):
+        daemon._finalize_failure_count["w1"] = 2
+        daemon.registry.get_running_workers.return_value = []
+        daemon._last_stuck_check = 0
+        daemon.check_stuck_workers()
+        assert "w1" not in daemon._finalize_failure_count
+
+    def test_new_marker_rearms_failure_count(self, daemon):
+        _live_worker(daemon)
+        daemon.registry.get_events_for_worker.return_value = [
+            {"id": 4, "event_type": "finalize_integrated", "worker_id": "w1"},
+        ]
+        daemon._finalize_failure_count["w1"] = 2
+        daemon.check_workers()
+        assert "w1" not in daemon._finalize_failure_count
 
 
 class TestGradeBoundedInFlightCap:

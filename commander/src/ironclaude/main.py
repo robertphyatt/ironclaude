@@ -892,6 +892,10 @@ IDLE_ACTIVITY_GRACE_SECONDS = 5.0
 # recovery integrates or the worker leaves the running set (see the periodic
 # non-running cleanup), so a worker cannot "reset" the cap by going idle.
 FINALIZE_DRIFT_RETRY_CAP = 3
+# Consecutive TERMINAL finalize failures outside the 'finalization' phase
+# (authority/probe/abandon) tolerated before the daemon surfaces the stuck
+# worker to the operator once. Surface-only: never completes or abandons.
+FINALIZE_FAILURE_SURFACE_CAP = 3
 # Terminal states a reconcile reaches when the work has landed. Mirrors
 # OrchestratorTools._FINALIZATION_INTEGRATED_STATES (kept as a plain module
 # constant so the daemon does not reach through the orchestrator handle, which
@@ -1586,6 +1590,7 @@ class IroncladeDaemon:
         # the session-died posts exactly once and to hold — never re-alert — a
         # worker whose drift is unresolved after FINALIZE_DRIFT_RETRY_CAP cycles).
         self._finalize_drift_retry: dict[str, int] = {}
+        self._finalize_failure_count: dict[str, int] = {}
         self._session_died_notified: set[str] = set()
         # Once-per-worker gate for the conflict/repair finalization-recovery
         # operator surface (a stuck reconcile the daemon can neither drift-retry
@@ -1673,7 +1678,7 @@ class IroncladeDaemon:
             return outcome.get("recovery", {}).get("reconcile", {}).get("mode")
         return None
 
-    def _drive_finalization_recovery(self, worker_id: str, outcome) -> str:
+    def _drive_finalization_recovery(self, worker_id: str, outcome, *, terminal: bool = False) -> str:
         """Unified finalization-recovery driver for terminal AND idle finalize
         outcomes. The orchestrator seam owns ALL worker completion now; this
         driver NEVER calls update_worker_status. It switches on the reconcile
@@ -1692,8 +1697,11 @@ class IroncladeDaemon:
           'surfaced'   — 'conflict'/'repair': surfaced to the operator exactly
                          once (via _finalize_recovery_alerted). Never completed,
                          never abandoned.
-          'transient'  — None / any other mode (authority/probe/None): leave the
-                         worker running, do nothing.
+          'transient'  — None / any other mode (authority/probe/abandon/None):
+                         leave the worker running. A TERMINAL outcome with a
+                         non-'finalization' failure_phase is counted; past
+                         FINALIZE_FAILURE_SURFACE_CAP consecutive terminal
+                         failures it is surfaced once (never completed).
 
         Mints no commit and never calls _abandon_rescue_worker.
         """
@@ -1772,6 +1780,31 @@ class IroncladeDaemon:
                 "recovery mode; needs operator intervention. Not completed, "
                 "not abandoned."
             )
+        # A TERMINAL finalize failing outside the 'finalization' phase
+        # (authority/probe/abandon) used to stay silently 'transient' forever.
+        # Count consecutive terminal failures and surface ONCE past the cap.
+        # Non-terminal (idle) outcomes are not counted: an idle live worker
+        # legitimately returns a preserved failure every cycle.
+        phase = outcome.get("failure_phase") if isinstance(outcome, dict) else None
+        if terminal and phase and phase != "finalization":
+            failures = self._finalize_failure_count.get(worker_id, 0) + 1
+            self._finalize_failure_count[worker_id] = failures
+            if (
+                failures > FINALIZE_FAILURE_SURFACE_CAP
+                and worker_id not in self._finalize_recovery_alerted
+            ):
+                self._finalize_recovery_alerted.add(worker_id)
+                error = outcome.get("error") or "no error detail"
+                self.slack.post_message(
+                    f"Worker {worker_id} terminal finalize has failed {failures} "
+                    f"consecutive cycles (phase={phase}): {error}; left running, "
+                    "not completed, needs operator help."
+                )
+                self.brain.send_message(
+                    f"Worker {worker_id} terminal finalize has failed {failures} "
+                    f"consecutive cycles (phase={phase}): {error}. Not completed, "
+                    "not abandoned. Needs operator intervention."
+                )
         return "transient"
 
     def _get_operator_message_dispositions(self) -> dict[str, str]:
@@ -2017,6 +2050,22 @@ class IroncladeDaemon:
         changed = current != self._orphaned_surface_state
         if current and changed:
             self.slack.post_message(format_orphaned_orphans(details))
+            if self._orphaned_unmerged_count > 0:
+                by_repo: dict[str, list[str]] = {}
+                for d in details:
+                    by_repo.setdefault(d.get("repository_path", ""), []).append(
+                        f"{d.get('id')} [{d.get('category')}]"
+                    )
+                repo_lines = "\n".join(
+                    f"{repo}: {', '.join(ids)}" for repo, ids in by_repo.items()
+                )
+                self.brain.send_message(
+                    f"PRESERVED ORPHANS SURFACED — {self._orphaned_unmerged_count} need review.\n"
+                    f"{repo_lines}\n"
+                    "Per 'Resolving Orphaned Worktrees': call "
+                    "list_surfaced_orphans(repository_path) for each repo above and offer "
+                    "the operator a per-orphan walkthrough once."
+                )
         self._orphaned_surface_state = current
         if changed and getattr(self, "_db", None) is not None:
             self._persist_orphan_surface_state()
@@ -3726,7 +3775,7 @@ class IroncladeDaemon:
                 _ollama_url = "http://localhost:11434"
             cmd = f"export CLAUDE_CODE_ATTRIBUTION_HEADER=0; export ANTHROPIC_BASE_URL={shlex.quote(_ollama_url)}; export ANTHROPIC_AUTH_TOKEN=ollama; export ANTHROPIC_API_KEY=; exec claude --model {shlex.quote(model_name)} --dangerously-skip-permissions"
         elif worker_type == "claude-opus":
-            _default_opus_model = self.config.get("default_opus_model", "claude-opus-4-8")
+            _default_opus_model = self.config.get("default_opus_model", "opus")
             cmd = make_opus_command(
                 _default_opus_model,
                 effort_for_tier(
@@ -3794,7 +3843,7 @@ class IroncladeDaemon:
         # tier, no higher advisor available)
         advisor_cfg = self.config.get("advisor", {})
         if advisor_cfg.get("enabled") and worker_type != "claude-fable":
-            advisor_model = advisor_cfg.get("advisor_models", {}).get(worker_type) or advisor_cfg.get("advisor_model", "claude-opus-4-8")
+            advisor_model = advisor_cfg.get("advisor_models", {}).get(worker_type) or advisor_cfg.get("advisor_model", "opus")
             advisor_model = _resolve_fable_advisor_model(advisor_model)
             self.tmux.send_keys(session_name, f"/advisor {advisor_model}")
             self._wait_for_ready(session_name, timeout=10, marker="advisor")
@@ -4152,6 +4201,9 @@ class IroncladeDaemon:
         for wid in list(self._finalize_drift_retry.keys()):
             if wid not in running_ids:
                 self._finalize_drift_retry.pop(wid, None)
+        for wid in list(self._finalize_failure_count.keys()):
+            if wid not in running_ids:
+                self._finalize_failure_count.pop(wid, None)
         for wid in list(self._session_died_notified):
             if wid not in running_ids:
                 self._session_died_notified.discard(wid)
@@ -4218,7 +4270,7 @@ class IroncladeDaemon:
         # The seam owns ALL completion; the daemon completes nothing. Route the
         # outcome through the unified recovery driver (drift-retry / surface /
         # transient) which never calls update_worker_status.
-        self._drive_finalization_recovery(worker_id, outcome)
+        self._drive_finalization_recovery(worker_id, outcome, terminal=True)
         # Log worker_finished ONLY when the worker is actually completed (re-read
         # the registry after the seam+driver ran). A still-running transient/held
         # worker logs no finish.
@@ -4415,7 +4467,7 @@ class IroncladeDaemon:
             return False
         self.tmux.kill_session(session_name, ssh_host=ssh_host)
         outcome = self._finalize_and_release_worker(worker_id, reason="idle-ttl", terminal=True)
-        self._drive_finalization_recovery(worker_id, outcome)
+        self._drive_finalization_recovery(worker_id, outcome, terminal=True)
         _w = self.registry.get_worker(worker_id)
         if isinstance(_w, dict) and _w.get("status") == "completed":
             self.registry.log_event("worker_finished", worker_id=worker_id)
@@ -4459,6 +4511,7 @@ class IroncladeDaemon:
             if _latest_marker > self._finalize_marker_seen.get(worker_id, 0):
                 self._finalize_marker_seen[worker_id] = _latest_marker
                 self._finalize_drift_retry.pop(worker_id, None)
+                self._finalize_failure_count.pop(worker_id, None)
                 self._finalize_recovery_alerted.discard(worker_id)
                 self._commit_failure_alerted.discard(worker_id)
             if (
@@ -4549,7 +4602,7 @@ class IroncladeDaemon:
                 # The seam owns ALL completion; the daemon completes nothing.
                 # Route the outcome through the unified recovery driver
                 # (drift-retry / surface / transient) which never completes.
-                disposition = self._drive_finalization_recovery(worker_id, outcome)
+                disposition = self._drive_finalization_recovery(worker_id, outcome, terminal=True)
                 # Log worker_finished ONLY when the worker is actually completed
                 # (re-read the registry after the seam+driver ran). A worker left
                 # running (transient/held/surfaced) logs no finish.
@@ -5502,7 +5555,7 @@ def main():
     brain = select_brain_class(config, conn)(
         timeout_seconds=config.get("brain_timeout_seconds", 600),
         operator_name=config.get("operator_name", "Operator"),
-        model=config.get("brain_model", "claude-opus-4-8"),
+        model=config.get("brain_model", "opus"),
         effort_level=config.get("effort_level", "high"),
         effort_levels=config.get("effort_levels", {}),
     )

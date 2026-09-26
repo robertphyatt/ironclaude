@@ -1,0 +1,68 @@
+{
+  "name": "Proactive Orphan-Offer Wiring + Sweep Pruning (v1.1.12 corrective)",
+  "goal": "Make the Brain's proactive per-orphan offer actually fire (daemon->Brain push carrying repo context) and make the reaper sweep prune vanished orphan_surface rows, resolving the two v1.1.12 Fable-review findings; then rebuild dist and re-verify.",
+  "requirements_file": "docs/plans/2026-09-22-proactive-orphan-discussion-requirements.md",
+  "design_file": "docs/plans/2026-09-24-proactive-orphan-offer-wiring-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "daemon->Brain push in _surface_preserved_orphans + test",
+      "description": "In _surface_preserved_orphans (main.py), inside the existing 'if current and changed:' block after the slack.post_message, add a self.brain.send_message(PRESERVED ORPHANS SURFACED ...) grouped by repository_path, gated on self._orphaned_unmerged_count > 0. Update the 3 existing test_worktree_reaper surface fixtures (add brain=Mock(), _orphaned_unmerged_count=1) and add test_brain_notified_once_per_change_for_reviewable_set (once-on-change, not-repeat, not-empty, not-squash-merged-only). TDD. Full code in human plan Task 1.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_worktree_reaper.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: add brain=Mock()+_orphaned_unmerged_count=1 to the 3 existing SimpleNamespace surface fixtures (~:984/:1007/:1020) and add test_brain_notified_once_per_change_for_reviewable_set (asserts brain.send_message called once on change with msg containing PRESERVED ORPHANS SURFACED + /repo + d1; not on repeat; slack posts but brain NOT called for a squash-merged-only set with _orphaned_unmerged_count=0; not on empty).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_worktree_reaper.py -q -k \"surface or brain_notified or change_gated or empty_details or category_change\"", "expected": "RED: test_brain_notified_once_per_change_for_reviewable_set fails (brain.send_message.call_count 0 != 1); the 3 existing surface tests still pass."},
+        {"description": "GREEN: in _surface_preserved_orphans, inside 'if current and changed:' after slack.post_message, add: if self._orphaned_unmerged_count > 0: build by_repo dict of 'id [category]' grouped by repository_path, then self.brain.send_message(f\"PRESERVED ORPHANS SURFACED - {count} need review.\\n{repo_lines}\\nPer 'Resolving Orphaned Worktrees': call list_surfaced_orphans(repository_path) for each repo above and offer the operator a per-orphan walkthrough once.\"). Full snippet in human plan Task 1 Step 2.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_worktree_reaper.py -q -k \"surface or brain_notified or change_gated or empty_details or category_change\"", "expected": "GREEN: new test passes; existing surface tests still pass."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/tests/test_worktree_reaper.py", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Retrigger the workflow.md proactive-offer step",
+      "description": "Rewrite the 'Offer proactively, on your next wake' header + step 1 (~:279-280) in brain/rules/workflow.md to trigger on the daemon's PRESERVED ORPHANS SURFACED message (call list_surfaced_orphans(repository_path) per listed repo, offer once, no re-nag; note the heartbeat-narration threading and the operator-wait-phrasing gotcha). Leave step 2 (operator trigger) and the rest unchanged. No tests required: Brain guidance prose. Full replacement in human plan Task 2.",
+      "allowed_files": [
+        "commander/src/brain/rules/workflow.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Replace the '**Offer proactively, on your next wake (once per set):**' header + its numbered step 1 with the daemon-message-triggered version (per human plan Task 2 Step 1): trigger on PRESERVED ORPHANS SURFACED, call list_surfaced_orphans(repository_path) per repo, offer once, threads as heartbeat narration (no directive ref / [reply-to]), avoid awaiting/waiting phrasing, no re-nag (daemon won't resend until the set changes). Keep step 2 and the rest of the section verbatim.", "expected": ""},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/brain/rules/workflow.md", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Sweep prunes vanished orphan_surface rows + test",
+      "description": "In reapAmbiguousOrphans (workspace-service.ts), after the guids set is fully built, delete orphan_surface rows for the repo whose workspace_guid is not in guids (branch AND worktree gone) via deleteOrphanSurface. Add a vitest that a surfaced orphan whose branch+worktree are removed out-of-band is pruned by the next sweep. TDD. Full code in human plan Task 3.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/workspace-service.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: in the reapAmbiguousOrphans describe add a test that seeds a live orphan (row exists after reapAmbiguousOrphans), then git worktree remove --force + git branch -D, then reapAmbiguousOrphans again, asserting the orphan_surface row (SELECT 1) is now toBeUndefined. Full snippet in human plan Task 3 Step 1.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts", "expected": "RED: new test fails at expect(after).toBeUndefined() because the un-pruned sweep leaves the stale row."},
+        {"description": "GREEN: in reapAmbiguousOrphans, right after the guids set is built (after the listManagedBranches loop), add: SELECT workspace_guid FROM orphan_surface WHERE repository_identity = ?; for each row whose workspace_guid is not in guids, this.deleteOrphanSurface(repository.repositoryIdentity, workspace_guid). Full snippet in human plan Task 3 Step 2.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts", "expected": "GREEN: new test passes; existing listSurfacedOrphans liveness + reapAmbiguousOrphans tests still pass (a live orphan's guid is in guids)."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/workspace-service.ts worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts", "expected": "Staged."}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Rebuild dist + full-suite verification",
+      "description": "Rebuild the workspace-manager bundle (TS changed in task 3), run full vitest + full commander pytest (both 0 failed), stage dist. No tests required: build + full-suite verification.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js"
+      ],
+      "depends_on": [1, 2, 3],
+      "steps": [
+        {"description": "Rebuild dist.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build", "expected": "tsc + bundle succeed, no error."},
+        {"description": "Full workspace-manager vitest.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run", "expected": "passed | 0 failed (onTaskUpdate RPC-timeout line benign; judge by 0 failed)."},
+        {"description": "Full commander pytest.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "0 failed."},
+        {"description": "Stage rebuilt dist.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/hook-intent.js", "expected": "Staged."}
+      ]
+    }
+  ]
+}
