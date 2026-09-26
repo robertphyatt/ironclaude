@@ -46,7 +46,7 @@ export interface FinalizationResult {
     | 'rebase-aborted' | 'rebase-recovery-repair-required'
     | 'rebase-rerebased-ready-for-repair' | 'rebase-frozen-restored'
     | 'rebase-paused-conflict' | 'rebase-paused-clean' | 'frozen-no-rebase'
-    | 'integrated' | 'not-ready' | 'reconciled' | 'committed' | 'closed-out'
+    | 'integrated' | 'not-ready' | 'resolved' | 'reconciled' | 'committed' | 'closed-out'
     | 'finalization-reopened-for-edit';
   integratedCommit?: string;
   /** The new commit sha for a commit-and-stay (verb 1) result. */
@@ -2065,6 +2065,19 @@ export function reconcileFinalization(db: Database.Database, input: ReconcileFin
     if (assignment.lifecycle_status === 'ready_for_integration') {
       const state = classifyRebaseState(assignment.worktree_path);
       return { state, detail: `Managed finalization worktree state: ${state}.` };
+    }
+    // A cleaned row's work already landed or was preserved; an abandoned row
+    // was already abandoned (abandon returns it as a no-op). Either way nothing
+    // is left to finalize or rescue. Report it distinctly so the terminal seam
+    // completes a dead worker instead of re-attempting an abandon that refuses
+    // a cleaned (or integrated) row. 'not-ready' now covers every other lifecycle
+    // (active, reserved, materialized) — anything not integrated,
+    // ready_for_integration, or resolved.
+    if (assignment.lifecycle_status === 'cleaned' || assignment.lifecycle_status === 'abandoned') {
+      return {
+        state: 'resolved',
+        detail: `Assignment lifecycle is ${assignment.lifecycle_status}; nothing left to finalize or rescue.`,
+      };
     }
     return { state: 'not-ready' };
   }

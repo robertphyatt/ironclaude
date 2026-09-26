@@ -47,7 +47,7 @@ from ironclaude.fable_availability import (
     clear_fable_unavailable as _clear_fable_unavailable,
 )
 from ironclaude import paths
-from ironclaude.grader import LocalGrader
+from ironclaude.grader import GRAMMAR_MAX_STRING_LENGTH, LocalGrader
 from ironclaude.provider_config import provider_config_from_commander, _semantic_tier, ProviderConfigError
 from ironclaude.provider_state import ProviderState, TRANSIENT_UNAVAILABLE_REASONS
 from ironclaude.provider_capabilities import CapabilityRegistry, CapabilityProbe
@@ -908,6 +908,45 @@ class OrchestratorTools:
         },
         "required": ["grade", "approved", "feedback"],
         "additionalProperties": False,
+    }
+
+    # Schemas passed to the LOCAL grader (LocalGrader.grade via
+    # _call_local_grader). Every string carries maxLength and every array
+    # maxItems so the sampling grammar bounds output length and a response can
+    # never be cut off at the token cap into non-JSON. Guarded by
+    # tests/test_grade_schema_bounds.py. (_GRADER_VERDICT_SCHEMA above feeds the
+    # Claude/Codex CLIs, not LocalGrader, and is intentionally unchanged.)
+    _LOCAL_VERDICT_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"], "maxLength": 1},
+            "approved": {"type": "boolean"},
+            "feedback": {"type": "string", "maxLength": GRAMMAR_MAX_STRING_LENGTH},
+        },
+        "required": ["grade", "approved", "feedback"],
+    }
+    _LOCAL_CONFIDENCE_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"], "maxLength": 1},
+            "approved": {"type": "boolean"},
+            "feedback": {"type": "string", "maxLength": GRAMMAR_MAX_STRING_LENGTH},
+            "confidence": {"type": "string", "enum": ["high", "medium", "low"], "maxLength": 8},
+        },
+        "required": ["grade", "approved", "feedback", "confidence"],
+    }
+    _LOCAL_HEALTH_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "healthy": {"type": "boolean"},
+            "diagnosis": {"type": "string", "maxLength": GRAMMAR_MAX_STRING_LENGTH},
+            "severity": {
+                "type": "string",
+                "enum": ["none", "low", "medium", "high", "critical"],
+                "maxLength": 8,
+            },
+        },
+        "required": ["healthy", "diagnosis", "severity"],
     }
 
     # Every env var that could route the grader off the Claude Max subscription:
@@ -3119,6 +3158,14 @@ class OrchestratorTools:
             self.registry.log_event("finalize_integrated", worker_id=worker_id)
             self._trigger_integrated_cleanup(recovery_payload, transport)
             return status
+        if state == "resolved":
+            # The assignment is already cleaned (work landed or was preserved)
+            # or abandoned: nothing to reconcile, and — unlike 'integrated' —
+            # nothing to clean up. Complete the worker only if its session is
+            # dead and hand back the probe result instead of an untagged
+            # failure that would surface a false operator alert.
+            self._complete_worker_if_session_dead(worker_id, ssh_host)
+            return status
         if state == "rebase-paused-clean":
             return self._drive_continue_recovery(
                 worker_id, recovery_payload, transport, error, repository, assignment,
@@ -3692,6 +3739,15 @@ class OrchestratorTools:
             # worktree (that mints an empty commit).
             self._complete_worker_if_session_dead(worker_id, ssh_host)
             self._trigger_integrated_cleanup(recovery_payload, transport)
+            return status
+        elif state == "resolved":
+            # The assignment is already cleaned (work landed or was preserved)
+            # or abandoned (abandon already ran), so nothing is left to
+            # finalize or rescue. Complete the worker (only when its session is
+            # confirmed dead) — NEVER finalize or abandon a resolved row;
+            # abandon refuses a cleaned (or integrated) row, which left dead
+            # workers re-running a failing seam forever.
+            self._complete_worker_if_session_dead(worker_id, ssh_host)
             return status
         elif state == "rebase-paused-clean":
             # A clean paused rebase is driven to completion transparently; no
@@ -4606,17 +4662,7 @@ objective: {objective}
 Does this objective meet {self._operator_name}'s standards? Is the worker type appropriate?"""
 
         # Hybrid grading: Ollama pre-filter with Opus escalation
-        confidence_schema = {
-            "type": "object",
-            "properties": {
-                "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
-                "approved": {"type": "boolean"},
-                "feedback": {"type": "string"},
-                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-            },
-            "required": ["grade", "approved", "feedback", "confidence"],
-        }
-        local_result = self._call_local_grader(system_prompt, user_prompt, confidence_schema)
+        local_result = self._call_local_grader(system_prompt, user_prompt, self._LOCAL_CONFIDENCE_SCHEMA)
 
         confidence_threshold = self._ollama_cfg_cache.get("spawn_confidence_threshold", "high")
         confidence_levels = ["high", "medium", "low"]
@@ -5411,17 +5457,6 @@ Model recommendation (include "recommended_model" in your JSON response):
 - ollama (local 12B model): single-file edits only, concrete action verb, explicit success condition — no architectural decisions
 Tier choice alone never lowers the grade or affects approval — recommend, do not gate."""
 
-        confidence_schema = {
-            "type": "object",
-            "properties": {
-                "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
-                "approved": {"type": "boolean"},
-                "feedback": {"type": "string"},
-                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-            },
-            "required": ["grade", "approved", "feedback", "confidence"],
-        }
-
         # Determine confidence threshold once
         confidence_threshold = self._ollama_cfg_cache.get("spawn_confidence_threshold", "high")
         confidence_levels = ["high", "medium", "low"]
@@ -5438,7 +5473,7 @@ Tier choice alone never lowers the grade or affects approval — recommend, do n
                 f"repo: {req['repo']}\nobjective: {req['objective']}\n\n"
                 f"Does this objective meet {self._operator_name}'s standards? Is the worker type appropriate?"
             )
-            local_result = self._call_local_grader(ollama_system_prompt, per_req_prompt, confidence_schema)
+            local_result = self._call_local_grader(ollama_system_prompt, per_req_prompt, self._LOCAL_CONFIDENCE_SCHEMA)
 
             if local_result.get("infrastructure_error"):
                 logger.info(f"Ollama pre-filter for batch '{req['worker_id']}': infrastructure error, escalating to Opus")
@@ -5964,15 +5999,9 @@ Automatic F-grade triggers (in addition to avatar_skill banned terms):
 
 Does this message respect the ironclaude workflow? Would it block or misdirect the worker?"""
 
-        grade_result = self._call_local_grader(system_prompt, user_prompt, {
-            "type": "object",
-            "properties": {
-                "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
-                "approved": {"type": "boolean"},
-                "feedback": {"type": "string"},
-            },
-            "required": ["grade", "approved", "feedback"],
-        }, bounded=True)  # R5b: operator-facing path — bounded grader
+        grade_result = self._call_local_grader(
+            system_prompt, user_prompt, self._LOCAL_VERDICT_SCHEMA, bounded=True
+        )  # R5b: operator-facing path — bounded grader
         if grade_result.get("infrastructure_error"):
             logger.info(f"Ollama grader unavailable for send_to_worker '{worker_id}', escalating to Opus")
             grade_result = self._call_grader(system_prompt, user_prompt)
@@ -6053,20 +6082,7 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
 
         user_prompt = f"Terminal output from worker '{worker_id}':\n\n{pane_text}"
 
-        health_schema = {
-            "type": "object",
-            "properties": {
-                "healthy": {"type": "boolean"},
-                "diagnosis": {"type": "string"},
-                "severity": {
-                    "type": "string",
-                    "enum": ["none", "low", "medium", "high", "critical"],
-                },
-            },
-            "required": ["healthy", "diagnosis", "severity"],
-        }
-
-        result = self._call_local_grader(system_prompt, user_prompt, health_schema)
+        result = self._call_local_grader(system_prompt, user_prompt, self._LOCAL_HEALTH_SCHEMA)
 
         if result.get("infrastructure_error"):
             return {
@@ -6121,15 +6137,7 @@ Grading criteria:
 
             user_prompt = f"Text typed to worker '{worker_id}' via send_keys:\n\n{text_content}"
 
-            grade_result = self._call_local_grader(system_prompt, user_prompt, {
-                "type": "object",
-                "properties": {
-                    "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
-                    "approved": {"type": "boolean"},
-                    "feedback": {"type": "string"},
-                },
-                "required": ["grade", "approved", "feedback"],
-            })
+            grade_result = self._call_local_grader(system_prompt, user_prompt, self._LOCAL_VERDICT_SCHEMA)
             if grade_result.get("infrastructure_error"):
                 logger.info(f"Ollama grader unavailable for send_keys '{worker_id}', escalating to Opus")
                 grade_result = self._call_grader(system_prompt, user_prompt)
@@ -6575,6 +6583,33 @@ Grading criteria:
             machine = self._ssh_manager.get_machine(_kw["machine"]) if self._ssh_manager and _kw else None
             remote_log_dir = machine.log_dir if machine else None
 
+        if _kw is None:
+            # No registry row: nothing to grade, finalize or complete. Killing
+            # the session stays idempotent (test_kill_worker_idempotent_for_unknown).
+            self.tmux.kill_session(session_name, ssh_host=ssh_host)
+            log_worker_event(
+                "WORKER_KILLED",
+                worker_id=worker_id,
+                pane_pid=None,
+                had_evidence=bool(original_objective and evidence),
+                kill_reason=evidence[:200] if evidence else None,
+                runtime_seconds=None,
+            )
+            logger.warning(
+                "kill_worker: %s has no registry row — session killed, nothing to finalize",
+                worker_id,
+            )
+            return {
+                "status": f"Worker {worker_id} has no registry row; session killed; nothing to finalize.",
+                "runtime_seconds": None,
+                "remaining_work": self._get_remaining_work_after_kill(worker_id),
+            }
+        # No registry-status guard: a 'completed' worker may be a commit_worker-
+        # recycled worker still holding reviewed work, so the seam always runs.
+        # Duplicate completion is prevented by idempotency instead (registry
+        # does not re-stamp finished_at; worker_finished only on a real change).
+        _prior_status = _kw.get("status")
+
         directive_completed = False
         if directive_id is not None:
             if self._db is None:
@@ -6659,8 +6694,25 @@ Has the worker genuinely completed its objective based on the evidence?
         # transient failure (authority/probe/abandon/finalization) or a None
         # return leaves the worker uncompleted for a later retry cycle. This
         # closes I1: a managed worker on a transient error is never completed.
-        _completed = isinstance(_release, dict) and not _release.get("failure_phase")
+        # ...and the registry re-read confirms status == 'completed'.
         _wr = self.registry.get_worker(worker_id)
+        _seam_ok = isinstance(_release, dict) and not _release.get("failure_phase")
+        # Honest: claim completion only when the registry actually says so. A
+        # success-shaped probe result (resolved/integrated) with a live
+        # session is returned WITHOUT completing the worker.
+        _completed = _seam_ok and (_wr or {}).get("status") == "completed"
+        # The daemon sweeps only status == 'running' rows (get_running_workers);
+        # claim a daemon retry only when that is true. A 'failed' worker (dead-
+        # session detection) is never swept — kill_worker is its only path.
+        _post_status = (_wr or {}).get("status") or "unknown"
+        _retry_clause = (
+            "daemon will retry."
+            if _post_status == "running"
+            else (
+                f"worker status is '{_post_status}' (not swept by the daemon); "
+                "call kill_worker again to retry finalization."
+            )
+        )
         _runtime = None
         if _wr:
             try:
@@ -6678,19 +6730,40 @@ Has the worker genuinely completed its objective based on the evidence?
             kill_reason=evidence[:200] if evidence else None,
             runtime_seconds=_runtime,
         )
-        if _completed:
+        _already_completed = _prior_status == "completed"
+        if _completed and not _already_completed:
             self.registry.log_event("worker_finished", worker_id=worker_id)
         # Post-kill sweep: query remaining work for Brain visibility
         remaining_work = self._get_remaining_work_after_kill(worker_id)
-        if _completed:
+        _seam_result = (
+            (_release.get("state") or _release.get("action") or "unknown")
+            if isinstance(_release, dict) else "unknown"
+        )
+        if _completed and _already_completed:
+            _status = (
+                f"Worker {worker_id} killed; already completed (not re-recorded); "
+                f"seam result: {_seam_result}."
+            )
+        elif _completed:
             _status = f"Worker {worker_id} killed and marked completed."
+        elif _seam_ok:
+            _status = (
+                f"Worker {worker_id} session killed; the seam returned "
+                f"state={_seam_result} but did not complete "
+                f"the worker (status={(_wr or {}).get('status') or 'unknown'}); "
+                f"{_retry_clause}"
+            )
         else:
             _phase = _release.get("failure_phase") if isinstance(_release, dict) else None
             _error = _release.get("error") if isinstance(_release, dict) else None
+            _outcome = (
+                "worker remains completed (it was completed before this call)"
+                if _already_completed else "worker NOT completed"
+            )
             _status = (
                 f"Worker {worker_id} session killed, but finalization FAILED "
-                f"(phase={_phase or 'unknown'}: {_error or 'no result'}) — worker "
-                "NOT completed; work preserved; daemon will retry."
+                f"(phase={_phase or 'unknown'}: {_error or 'no result'}) — {_outcome}; "
+                f"work preserved; {_retry_clause}"
             )
         return {
             "status": _status,
@@ -7099,15 +7172,9 @@ Grading criteria:
 
 Does this message report a problem? If so, does it include an action already taken or a pinned escalation?"""
 
-        grade_result = self._call_local_grader(system_prompt, user_prompt, {
-            "type": "object",
-            "properties": {
-                "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
-                "approved": {"type": "boolean"},
-                "feedback": {"type": "string"},
-            },
-            "required": ["grade", "approved", "feedback"],
-        }, bounded=True)  # R5b: operator-facing path — bounded grader
+        grade_result = self._call_local_grader(
+            system_prompt, user_prompt, self._LOCAL_VERDICT_SCHEMA, bounded=True
+        )  # R5b: operator-facing path — bounded grader
         if grade_result.get("infrastructure_error"):
             logger.info("Ollama grader unavailable for post_message, escalating to Opus")
             grade_result = self._call_grader(system_prompt, user_prompt)

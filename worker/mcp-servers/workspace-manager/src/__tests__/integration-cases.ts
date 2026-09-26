@@ -2708,6 +2708,20 @@ describe('finalization coordinator', () => {
     expect(status.state).toBe('not-ready');
   });
 
+  for (const lifecycle of ['cleaned', 'abandoned'] as const) {
+    it(`reconcile status on a ${lifecycle} row returns resolved (nothing left to finalize or rescue)`, () => {
+      const { root, database, assignment } = setup(false);
+      database.prepare('UPDATE assignments SET lifecycle_status = ? WHERE workspace_guid = ?')
+        .run(lifecycle, assignment.workspace_guid);
+      const status = reconcileFinalization(database, {
+        repositoryPath: root, workspaceGuid: assignment.workspace_guid, providerRootSessionId: OWNER,
+        rebaseRecovery: 'status',
+      });
+      expect(status.state).toBe('resolved');
+      expect(status.detail).toContain(lifecycle);
+    });
+  }
+
   it('managed no-rebase recovery: the reconcile validator accepts all six modes and rejects an unknown one (case e, bounded widening)', () => {
     const { database } = setup(false);
     const deps = createInternalCommandDependencies(database);

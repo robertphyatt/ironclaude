@@ -141,6 +141,22 @@ class TestWorkers:
                 "integration_target": "target",
             })
 
+    def test_completing_already_completed_worker_keeps_finished_at(self, registry):
+        registry.register_worker("worker-1", "claude-max", "worker-1")
+        registry.update_worker_status("worker-1", "completed")
+        registry._conn.execute(
+            "UPDATE workers SET finished_at = '2000-01-01 00:00:00' WHERE id = 'worker-1'"
+        )
+        registry._conn.commit()
+        registry.update_worker_status("worker-1", "completed")
+        assert registry.get_worker("worker-1")["finished_at"] == "2000-01-01 00:00:00"
+
+    def test_completing_running_worker_sets_finished_at(self, registry):
+        registry.register_worker("worker-1", "claude-max", "worker-1")
+        assert registry.get_worker("worker-1")["finished_at"] is None
+        registry.update_worker_status("worker-1", "completed")
+        assert registry.get_worker("worker-1")["finished_at"] is not None
+
 
 class TestWorkersByType:
     def test_get_running_workers_by_type_returns_matching(self, registry):

@@ -72,6 +72,29 @@ assert_contains "openai backend returns parsed .choices[0].message.content" "ok"
 rm -f "$TMPCFG"
 
 # =============================================================================
+# call_validation_llm(): a json_schema request floors max_tokens at 8192; a
+# larger configured value wins; a schema-less request keeps the configured value
+# =============================================================================
+TMPCFG_MT=$(mktemp)
+printf '%s' '{"backend":"openai","openai":{"base_url":"http://h/v1","model":"m","max_tokens":1024}}' > "$TMPCFG_MT"
+export IC_OLLAMA_CONFIG_PATH="$TMPCFG_MT"
+CAPTURE_MT=$(mktemp)
+export CURL_CAPTURE_FILE="$CAPTURE_MT"
+
+echo "=== call_validation_llm: json_schema request floors max_tokens at 8192 ==="
+call_validation_llm "test prompt" '{"type":"object","properties":{"ok":{"type":"boolean"}}}' >/dev/null
+assert_eq "schema request max_tokens floored to 8192" "8192" "$(jq -r '.max_tokens' "$CAPTURE_MT")"
+call_validation_llm "test prompt" "" >/dev/null
+assert_eq "schema-less request keeps configured 1024" "1024" "$(jq -r '.max_tokens' "$CAPTURE_MT")"
+
+printf '%s' '{"backend":"openai","openai":{"base_url":"http://h/v1","model":"m","max_tokens":16384}}' > "$TMPCFG_MT"
+call_validation_llm "test prompt" '{"type":"object","properties":{"ok":{"type":"boolean"}}}' >/dev/null
+assert_eq "larger configured max_tokens wins for schema request" "16384" "$(jq -r '.max_tokens' "$CAPTURE_MT")"
+
+rm -f "$TMPCFG_MT" "$CAPTURE_MT"
+unset CURL_CAPTURE_FILE
+
+# =============================================================================
 # call_validation_llm(): openai.timeout_seconds does NOT drive --max-time —
 # the hook transport budget is bounded independently of the inference timeout,
 # so a busy/dead box can't hang the hook for 300s.

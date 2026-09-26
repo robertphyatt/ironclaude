@@ -2211,6 +2211,23 @@ describe('WorkspaceService real-Git lifecycle', () => {
       expect(git(root, 'branch', '--list', orphanBranch(guid))).not.toBe('');
     });
 
+    it('reaps when the primary checkout is detached but origin/HEAD resolves to a branch with a local ref', () => {
+      const root = repository();
+      const mainTip = git(root, 'rev-parse', 'HEAD');
+      git(root, 'update-ref', 'refs/remotes/origin/main', mainTip);
+      git(root, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main');
+      const manager = service(root);
+      const guid = randomUUID();
+      const worktreePath = createOrphanWorktree(root, guid);
+      git(root, 'checkout', '-q', '--detach');
+
+      const result = manager.reapAmbiguousOrphans({ repositoryPath: root, ttlHours: 0 });
+
+      expect(result.preservedUnmerged).toEqual([]);
+      expect(result.reaped).toEqual([orphanBranch(guid)]);
+      expect(existsSync(worktreePath)).toBe(false);
+    });
+
     it('reaps against the primary checkout branch when origin/HEAD names a branch with no local ref (clone -b)', () => {
       const source = repository();
       git(source, 'checkout', '-q', '-b', 'develop');

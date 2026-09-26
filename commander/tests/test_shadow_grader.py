@@ -377,6 +377,9 @@ class TestOpenAiBackend:
 
         # (b) OpenAI-shaped assistant tool-call turn + tool-result turn present
         verdict_body = mock_post.call_args_list[-1].kwargs["json"]
+        # The schema-bound verdict call is floored at 8192; the tool loop keeps
+        # the configured 1024 (asserted on first_body above).
+        assert verdict_body["max_tokens"] == 8192
         msgs = verdict_body["messages"]
         assistant = [m for m in msgs if m.get("role") == "assistant" and m.get("tool_calls")]
         assert assistant, msgs

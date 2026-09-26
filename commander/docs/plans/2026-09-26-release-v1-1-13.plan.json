@@ -1,0 +1,49 @@
+{
+  "name": "Release v1.1.13",
+  "goal": "Release the staged resolved-assignment-completion fix as v1.1.13: bump all five version sources, title the CHANGELOG section, update README What's New.",
+  "requirements_file": "docs/plans/2026-09-26-release-v1-1-13-requirements.md",
+  "design_file": "docs/plans/2026-09-26-release-v1-1-13-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Version bump to 1.1.13 in all five sources",
+      "description": "No tests required: version-string bump; verified by existing test_version_consistency.py + presence/absence guards. Edit commander/pyproject.toml:4, worker/.claude-plugin/plugin.json:3, worker/mcp-servers/workspace-manager/package.json:3, .claude-plugin/marketplace.json:10 from 1.1.12 to 1.1.13; worker/.codex-plugin/plugin.json:3 `1.1.12+codex.20260923220118` → `1.1.13+codex.<TS>` (TS = `date -u +%Y%m%d%H%M%S`).",
+      "allowed_files": [
+        "commander/pyproject.toml",
+        "worker/.claude-plugin/plugin.json",
+        "worker/mcp-servers/workspace-manager/package.json",
+        ".claude-plugin/marketplace.json",
+        "worker/.codex-plugin/plugin.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "UTC timestamp for Codex cachebuster; use output as <TS>.", "command": "date -u +%Y%m%d%H%M%S", "expected": "14 digits."},
+        {"description": "Exact replacements: pyproject `version = \"1.1.12\"`→`version = \"1.1.13\"`; claude plugin.json, workspace-manager package.json, marketplace.json `\"version\": \"1.1.12\",`→`\"version\": \"1.1.13\",`; codex plugin.json `\"version\": \"1.1.12+codex.20260923220118\",`→`\"version\": \"1.1.13+codex.<TS>\",`."},
+        {"description": "Presence guard.", "command": "rg -n -F 1.1.13 /Users/roberthyatt/Code/ironclaude/commander/pyproject.toml /Users/roberthyatt/Code/ironclaude/worker/.claude-plugin/plugin.json /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/package.json /Users/roberthyatt/Code/ironclaude/.claude-plugin/marketplace.json /Users/roberthyatt/Code/ironclaude/worker/.codex-plugin/plugin.json", "expected": "Exactly 5 lines, one per file; codex line `\"version\": \"1.1.13+codex.<TS>\",`."},
+        {"description": "Absence guard.", "command": "rg -n -F 1.1.12 /Users/roberthyatt/Code/ironclaude/commander/pyproject.toml /Users/roberthyatt/Code/ironclaude/worker/.claude-plugin/plugin.json /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/package.json /Users/roberthyatt/Code/ironclaude/.claude-plugin/marketplace.json /Users/roberthyatt/Code/ironclaude/worker/.codex-plugin/plugin.json", "expected": "No output (rg exit 1)."},
+        {"description": "Version consistency test.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_version_consistency.py", "expected": "10 passed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/pyproject.toml worker/.claude-plugin/plugin.json worker/mcp-servers/workspace-manager/package.json .claude-plugin/marketplace.json worker/.codex-plugin/plugin.json", "expected": "All five staged."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "CHANGELOG heading + README What's New + full suite",
+      "description": "No tests required: documentation + full-suite verification. CHANGELOG `## [Unreleased]` (:13) → `## 1.1.13: The seam completes a dead worker whose workspace assignment is already resolved`. README restructure via the python script verbatim from human plan Task 2 Step 2 (new What's New v1.1.13 + one bullet; former v1.1.12 bullets under `### Earlier — v1.1.12`; drop Earlier — v1.1.11 bullets; keep See-CHANGELOG line).",
+      "allowed_files": [
+        "CHANGELOG.md",
+        "README.md",
+        "commander/docs/plans/2026-09-26-release-v1-1-13.md",
+        "commander/docs/plans/2026-09-26-release-v1-1-13.plan.json"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "CHANGELOG.md: replace exact line `## [Unreleased]` with `## 1.1.13: The seam completes a dead worker whose workspace assignment is already resolved`."},
+        {"description": "README restructure: run the python heredoc script verbatim from human plan Task 2 Step 2 (from /Users/roberthyatt/Code/ironclaude).", "expected": "No output, exit 0."},
+        {"description": "README guard.", "command": "rg -n -e \"^## What's New in v1\\.1\\.13\" -e \"^### Earlier — v1\\.1\\.12\" -e \"^### Earlier — v1\\.1\\.11\" -e \"^- See \\[CHANGELOG\\.md\\]\" /Users/roberthyatt/Code/ironclaude/README.md", "expected": "Exactly 3 lines in order: `## What's New in v1.1.13`, `### Earlier — v1.1.12`, `- See [CHANGELOG.md]…`; no `Earlier — v1.1.11`."},
+        {"description": "CHANGELOG guard.", "command": "rg -n -e \"^## \\[Unreleased\\]\" -e \"^## 1\\.1\\.13: \" /Users/roberthyatt/Code/ironclaude/CHANGELOG.md", "expected": "Exactly 1 line: `13:## 1.1.13: The seam completes a dead worker whose workspace assignment is already resolved`."},
+        {"description": "Full commander suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "0 failed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f CHANGELOG.md README.md commander/docs/plans/2026-09-26-release-v1-1-13.md commander/docs/plans/2026-09-26-release-v1-1-13.plan.json", "expected": "All four staged."}
+      ]
+    }
+  ]
+}

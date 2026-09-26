@@ -1,0 +1,64 @@
+{
+  "name": "Resolved-Assignment Completion",
+  "goal": "Status probe reports 'resolved' for cleaned/abandoned assignments and the terminal seam completes a dead worker on 'resolved' instead of re-attempting a refused abandon forever.",
+  "requirements_file": "docs/plans/2026-09-26-resolved-assignment-completion-requirements.md",
+  "design_file": "docs/plans/2026-09-26-resolved-assignment-completion-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "'resolved' status-probe state (workspace-manager)",
+      "description": "integration.ts: add 'resolved' to FinalizationResult.state union (:49); in reconcileFinalization status branch replace `return { state: 'not-ready' };` (:2069) with a cleaned/abandoned → {state:'resolved', detail:`Assignment lifecycle is ${lifecycle}; nothing left to finalize or rescue.`} check followed by the unchanged not-ready return. Tests: two parametrized cases in integration-cases.ts after the active-row not-ready test (:2709). Exact code: human plan docs/plans/2026-09-26-resolved-assignment-completion.md Task 1. TDD.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/integration.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: insert the `for (const lifecycle of ['cleaned', 'abandoned'] as const)` test loop verbatim from human plan Task 1 Step 1 directly after the closing `});` of 'reconcile status on an active (not-ready) row returns not-ready without throwing' (:2709)."},
+        {"description": "Run recovery partition (RED).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/integration-recovery.test.ts", "expected": "Exactly 2 failed — the two new tests (received 'not-ready', expected 'resolved'). All others pass."},
+        {"description": "GREEN integration.ts per human plan Task 1 Step 3: (a) union line :49 gains `| 'resolved'` after `'not-ready'`; (b) replace `    return { state: 'not-ready' };` (:2069) with the commented cleaned/abandoned → resolved check followed by `    return { state: 'not-ready' };`."},
+        {"description": "Run both finalization partitions (GREEN).", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/integration-recovery.test.ts src/__tests__/integration-core.test.ts", "expected": "0 failed (incl. existing active-row not-ready test)."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/integration.ts worker/mcp-servers/workspace-manager/src/__tests__/integration-cases.ts", "expected": "Both staged."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Seam router 'resolved' branch (commander)",
+      "description": "orchestrator_mcp.py probe-first router: after the integrated branch's `return status` (:3695), before `elif state == \"rebase-paused-clean\":`, add `elif state == \"resolved\":` → `self._complete_worker_if_session_dead(worker_id, ssh_host)`; `return status` (with comment). Tests: two TestProbeFirstRouter methods after test_probe_integrated_live_session_never_completes_but_still_cleans (ends :904). Exact code: human plan Task 2. TDD.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_worker_finalize_release.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "RED: insert test_probe_resolved_dead_session_completes_never_finalizes_or_abandons and test_probe_resolved_live_session_never_completes verbatim from human plan Task 2 Step 1 into TestProbeFirstRouter after test_probe_integrated_live_session_never_completes_but_still_cleans (:904)."},
+        {"description": "Run new tests (RED).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_finalize_release.py -k \"probe_resolved\"", "expected": "2 failed (KeyError 'state': 'resolved' falls to the unknown-state branch returning failure_phase 'probe')."},
+        {"description": "GREEN orchestrator_mcp.py per human plan Task 2 Step 3: insert the commented `elif state == \"resolved\":` branch (complete-if-session-dead, return status) after the integrated branch's `return status` (:3695)."},
+        {"description": "Run file (GREEN).", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_finalize_release.py", "expected": "0 failed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_worker_finalize_release.py", "expected": "Both staged."}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "dist rebuild + full suites + CHANGELOG [Unreleased] entry",
+      "description": "No tests required: build + documentation entry + full-suite verification; behavior tested in Tasks 1-2. Rebuild dist, confirm 'resolved' in bundle, full vitest + full pytest 0 failed, insert `## [Unreleased]` block (verbatim from human plan Task 3 Step 5) immediately before the `## 1.1.12:` heading, stage.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js",
+        "CHANGELOG.md",
+        "commander/docs/plans/2026-09-26-resolved-assignment-completion.md",
+        "commander/docs/plans/2026-09-26-resolved-assignment-completion.plan.json"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {"description": "Rebuild.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build", "expected": "tsc + bundle succeed, no error."},
+        {"description": "'resolved' in both bundles (esbuild emits double-quoted literals; pre-change 0 matches each).", "command": "rg -n -F 'state: \"resolved\"' /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/index.js", "expected": "Exactly one match in dist/cli.js and exactly one in dist/index.js."},
+        {"description": "Full workspace-manager suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run", "expected": "0 failed (pre-existing benign onTaskUpdate RPC-timeout error ignored)."},
+        {"description": "Full commander suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "0 failed."},
+        {"description": "Insert the `## [Unreleased]` block verbatim from human plan Task 3 Step 5 immediately before the `## 1.1.12:` heading line, followed by one blank line."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/hook-intent.js CHANGELOG.md commander/docs/plans/2026-09-26-resolved-assignment-completion.md commander/docs/plans/2026-09-26-resolved-assignment-completion.plan.json", "expected": "All staged."}
+      ]
+    }
+  ]
+}

@@ -3312,6 +3312,20 @@ class TestKillWorker:
         kill_idx = next(i for i, n in enumerate(call_names) if n == "kill_session")
         assert pid_idx < kill_idx, "list_pane_pid must be called before kill_session"
 
+    def test_kill_worker_no_registry_row_emits_worker_killed(self, tools, mock_tmux, caplog):
+        with caplog.at_level(logging.INFO, logger="ironclaude.orchestrator_mcp"):
+            tools.kill_worker("nonexistent")
+        killed = []
+        for r in caplog.records:
+            try:
+                data = json.loads(r.getMessage())
+                if data.get("event_type") == "WORKER_KILLED":
+                    killed.append(data)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        assert len(killed) == 1
+        assert killed[0]["worker_id"] == "nonexistent"
+
 
 
 
@@ -11318,6 +11332,45 @@ class TestCommitWorkerFinalizationRecovery:
         tools.registry.log_event.assert_any_call(
             "finalize_integrated", worker_id="worker-1",
         )
+
+    def test_recovery_probe_resolved_completes_dead_worker_without_cleanup(
+        self, finalize_failure_tools,
+    ):
+        # finalize raised, but the status probe reports the assignment already
+        # resolved (cleaned/abandoned). Nothing left to reconcile: complete the
+        # dead worker and return the probe result — no untagged finalization
+        # failure (a false 'needs operator intervention' alert), no integrated
+        # cleanup, no finalize_integrated/finalize_failed marker.
+        tools = finalize_failure_tools
+        tools._trigger_integrated_cleanup = MagicMock()
+        resolved = {"state": "resolved", "detail": "Assignment lifecycle is cleaned; nothing left to finalize or rescue."}
+        tools._workspace_client.reconcile.return_value = resolved
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result == resolved
+        tools.registry.update_worker_status.assert_called_once_with("worker-1", "completed")
+        tools._trigger_integrated_cleanup.assert_not_called()
+        markers = [
+            c for c in tools.registry.log_event.call_args_list
+            if c.args and c.args[0] in ("finalize_integrated", "finalize_failed")
+        ]
+        assert markers == []
+
+    def test_recovery_probe_resolved_live_session_never_completes(
+        self, finalize_failure_tools,
+    ):
+        tools = finalize_failure_tools
+        tools.tmux.has_session.return_value = True
+        tools._trigger_integrated_cleanup = MagicMock()
+        resolved = {"state": "resolved", "detail": "x"}
+        tools._workspace_client.reconcile.return_value = resolved
+
+        result = tools.commit_worker("worker-1", "reviewed worker commit")
+
+        assert result == resolved
+        tools.registry.update_worker_status.assert_not_called()
+        tools._trigger_integrated_cleanup.assert_not_called()
 
 
 def test_complete_worker_if_session_dead_missing_session_never_completes(

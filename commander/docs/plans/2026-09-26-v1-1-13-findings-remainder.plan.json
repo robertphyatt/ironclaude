@@ -1,0 +1,181 @@
+{
+  "name": "v1.1.13 Findings — Remainder",
+  "goal": "Finish v1.1.13 findings: reaper repo list (+ test_daemon.py fixture adaptation), separate terminal-failure gate + consecutive reset, vitest onTaskUpdate culprit bisect, docs + full suites.",
+  "requirements_file": "docs/plans/2026-09-26-v1-1-13-findings-remainder-requirements.md",
+  "design_file": "docs/plans/2026-09-26-v1-1-13-findings-remainder-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Complete reaper repo list incl. test_daemon.py fixture",
+      "description": "main.py _managed_repositories new body + test_worktree_reaper.py (3 new, 4 adapted tests) already in working tree unstaged (lineage-132 RED observed: 3 failed/4 passed vs old body). Adapt test_daemon.py TestRunMaintenance: _commander_conn_with_repo(repo) with no default; its 3 callers create tmp_path/'repo', pass str; assertions f\"{repo}:ironclaude/y|z\"; each caller asserts orch._workspace_client.reap_orphans called with repository_path == repo (second test: after first _run_maintenance, before reset_mock). Reverse check proves the skip-vanished path is exercised. Never git stash. Exact edits: plan md Task 1.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_worktree_reaper.py",
+        "commander/tests/test_daemon.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Confirm reaper tests green with working-tree implementation.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worktree_reaper.py -k \"ManagedRepositories or ReapRowLessOrphans\"",
+          "expected": "7 passed"
+        },
+        {
+          "description": "RED: daemon fixture gap (count from lineage-132 execution; confirm and record names).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_daemon.py -k TestRunMaintenance",
+          "expected": "2 failed, 6 passed (measured in lineage 132; confirm): test_surfaces_preserved_unmerged_orphans_to_slack_and_counts_them, test_second_run_with_same_preserved_unmerged_names_does_not_repost"
+        },
+        {
+          "description": "GREEN: edit _commander_conn_with_repo signature + 3 callers (tmp_path/'repo' mkdir, pass str, f-string assertions, reap_orphans called-with-repo assertions) per plan md Task 1 Step 3.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_daemon.py -k TestRunMaintenance",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Reverse check: in test_no_preserved_unmerged_orphans_leaves_count_zero_and_no_post temporarily replace repo_dir.mkdir() with `pass  # REVERSE-CHECK`; run; then restore repo_dir.mkdir().",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_daemon.py -k test_no_preserved_unmerged_orphans_leaves_count_zero_and_no_post",
+          "expected": "1 failed at reap_orphans.assert_called() (before restore)"
+        },
+        {
+          "description": "Confirm reverse-check marker removed after restore. (AC2's nonexistent-path evidence for the two posting tests = Step 2 RED; this reverse check extends it to the previously vacuous third test.)",
+          "command": "rg -n -F \"REVERSE-CHECK\" /Users/roberthyatt/Code/ironclaude/commander/tests/test_daemon.py",
+          "expected": "no output"
+        },
+        {
+          "description": "Regression",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worktree_reaper.py tests/test_daemon.py",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/tests/test_worktree_reaper.py commander/tests/test_daemon.py",
+          "expected": "staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Separate terminal-failure once-gate + consecutive reset",
+      "description": "main.py (content anchors, not line numbers): init self._finalize_failure_alerted after `self._finalize_recovery_alerted: set[str] = set()`; _drive_finalization_recovery: before `mode = self._finalization_recovery_mode(outcome)` compute phase/counted_failure and pop _finalize_failure_count when terminal and not counted_failure; counter block: delete duplicate phase line, `if terminal and counted_failure:`, both _finalize_recovery_alerted uses -> _finalize_failure_alerted; docstring 'transient' note; prune new set after the _finalize_recovery_alerted prune loop in non-running sweep; discard in marker re-arm after `self._finalize_recovery_alerted.discard(worker_id)`. 6 tests appended to TestTerminalFinalizeFailureSurface verbatim per plan md Task 2.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_daemon.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "RED: append 6 tests per plan md Task 2 Step 1.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_daemon.py -k TestTerminalFinalizeFailureSurface",
+          "expected": "Predicted (not yet measured): 7 failed, 9 passed (parametrized test = 3 items). FAIL for 5 of 6 new tests (prior_recovery_alert: post count 0; does_not_suppress_conflict: count 1 not 2; non_counted reset: all 3 params; sweep_clears / marker_rearms: AttributeError _finalize_failure_alerted); test_non_terminal_outcome_neither_counts_nor_resets passes (regression guard); existing pass"
+        },
+        {
+          "description": "GREEN: implement plan md Task 2 Step 2 (a)-(d).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_daemon.py -k TestTerminalFinalizeFailureSurface",
+          "expected": "PASS, 0 failed"
+        },
+        {
+          "description": "Regression",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_daemon.py",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/tests/test_daemon.py",
+          "expected": "staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Bisect vitest onTaskUpdate culprit (investigation only)",
+      "description": "No tests required: evidence note only, no product/test/config change. Run each of 12 src/__tests__ files in isolation x3, one log per run under scratchpad/bisect/; find reproductions; bounded -t narrowing (<=10 extra runs) if 1-2 files reproduce; append '## Bisect (remainder loop)' section (table file x run x exit x error, quoted summaries, narrowing, conclusion VERIFIED/UNVERIFIED, one-line follow-up fix scope) to findings note.",
+      "allowed_files": [
+        "commander/docs/plans/2026-09-26-v1-1-13-vitest-ontaskupdate-findings.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Isolated runs x3, invocation 1/3 (integration-core; Bash timeout 600000). Never re-run a completed invocation — its logs are final.",
+          "command": "mkdir -p /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/bisect && cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && for f in integration-core; do for r in 1 2 3; do npx vitest run \"src/__tests__/$f.test.ts\" > \"/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/bisect/$f-run$r.log\" 2>&1; echo \"$f run$r exit=$?\"; done; done",
+          "expected": "3 `<file> run<N> exit=<code>` lines"
+        },
+        {
+          "description": "Isolated runs x3, invocation 2/3 (workspace-service, integration-recovery; Bash timeout 600000).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && for f in workspace-service integration-recovery; do for r in 1 2 3; do npx vitest run \"src/__tests__/$f.test.ts\" > \"/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/bisect/$f-run$r.log\" 2>&1; echo \"$f run$r exit=$?\"; done; done",
+          "expected": "6 exit lines"
+        },
+        {
+          "description": "Isolated runs x3, invocation 3/3 (remaining 9 files; Bash timeout 600000).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && for f in git-authority git-content-merged cli db git parent-death-exit plan-scope scoped-tree tool-dispatch; do for r in 1 2 3; do npx vitest run \"src/__tests__/$f.test.ts\" > \"/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/bisect/$f-run$r.log\" 2>&1; echo \"$f run$r exit=$?\"; done; done",
+          "expected": "27 exit lines (36 total across 3 invocations)"
+        },
+        {
+          "description": "List reproducing logs",
+          "command": "rg -l -F 'Timeout calling \"onTaskUpdate\"' /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/bisect",
+          "expected": "list of reproducing logs (possibly empty)"
+        },
+        {
+          "description": "Summary lines of every run",
+          "command": "rg -n -e 'Test Files' -e '     Tests ' -e '    Errors ' /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/bisect",
+          "expected": "per-run summary lines"
+        },
+        {
+          "description": "Bounded narrowing (<=10 runs): if 1-2 files reproduce, run their top-level describe blocks via -t, one log each under bisect/ (names from `rg -n \"^describe\\(\" <file>`). Skip if nothing reproduces in isolation.",
+          "command": "rg -n \"^describe\\(\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/src/__tests__",
+          "expected": "describe names per file"
+        },
+        {
+          "description": "Append '## Bisect (remainder loop)' section to findings note, then stage.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f commander/docs/plans/2026-09-26-v1-1-13-vitest-ontaskupdate-findings.md",
+          "expected": "staged"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "v1.1.13 CHANGELOG + README + full suites",
+      "description": "Docs only (no tests required: documentation; full suites are the gate). CHANGELOG: package-lock.json in versioning-note lockstep list; retitle ## 1.1.13 with ', plus v1.1.13 validation fixes'; replace '(`not-ready` again means strictly an active row)' with '(`not-ready` now covers every other lifecycle — active, reserved, materialized)'; 9 bullets per plan md Task 4 Step 1 (kill_worker guard/no-row/honest status; classify resolved arm; grammar-bounded schemas + guard test (prompt-waiting bounds = validator limits); 8192 floor; reaper repo list; alert gate + reset; detached reap test; package-lock; vitest defect root cause + bisect + fix pending); deploy line. README What's New v1.1.13: keep bullet; add bullets for kill_worker guard, grader truncation (3+4), reaper repo list, one line for classify arm + gate/reset.",
+      "allowed_files": [
+        "CHANGELOG.md",
+        "README.md"
+      ],
+      "depends_on": [1, 2, 3],
+      "steps": [
+        {
+          "description": "Edit CHANGELOG.md and README.md per task description; verify wording.",
+          "command": "rg -n -F \"strictly an active row\" /Users/roberthyatt/Code/ironclaude/CHANGELOG.md /Users/roberthyatt/Code/ironclaude/README.md",
+          "expected": "no output"
+        },
+        {
+          "description": "Full pytest",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q",
+          "expected": "0 failed; record exact pass line"
+        },
+        {
+          "description": "Full vitest, logged",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run > /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/vitest-final.log 2>&1; echo \"exit=$?\"",
+          "expected": "exit=0, or exit=1 solely from documented onTaskUpdate error"
+        },
+        {
+          "description": "Vitest gate check",
+          "command": "rg -n -e 'Test Files' -e '     Tests ' -e '    Errors ' -e '^[A-Za-z]*Error: ' /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/vitest-final.log",
+          "expected": "Tests line has no 'failed'; every '^[A-Za-z]*Error: ' line is exactly 'Error: [vitest-worker]: Timeout calling \"onTaskUpdate\"'"
+        },
+        {
+          "description": "Vitest gate count check",
+          "command": "rg -c -F 'Timeout calling \"onTaskUpdate\"' /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/vitest-final.log",
+          "expected": "count == N in 'Errors  N error(s)' (or Errors line absent and count 0 => exit 0); any other error line, any 'failed', or a count mismatch fails the gate"
+        },
+        {
+          "description": "Hook test",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-openai-backend.sh",
+          "expected": "Results: N passed, 0 failed"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add CHANGELOG.md README.md",
+          "expected": "staged"
+        }
+      ]
+    }
+  ]
+}

@@ -1890,6 +1890,12 @@ function reconcileFinalization(db, input) {
       const state = classifyRebaseState(assignment.worktree_path);
       return { state, detail: `Managed finalization worktree state: ${state}.` };
     }
+    if (assignment.lifecycle_status === "cleaned" || assignment.lifecycle_status === "abandoned") {
+      return {
+        state: "resolved",
+        detail: `Assignment lifecycle is ${assignment.lifecycle_status}; nothing left to finalize or rescue.`
+      };
+    }
     return { state: "not-ready" };
   }
   if (assignment.lifecycle_status === "integrated") {

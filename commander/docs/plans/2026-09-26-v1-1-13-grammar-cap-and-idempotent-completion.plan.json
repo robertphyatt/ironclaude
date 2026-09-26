@@ -1,0 +1,243 @@
+{
+  "name": "v1.1.13 Grammar Cap, Idempotent Completion and Review Fixes",
+  "goal": "Cap every grade-schema maxLength at llama.cpp's stock grammar ceiling (1999), replace kill_worker's status guard with idempotent completion, apply remaining review fixes, correct docs.",
+  "requirements_file": "docs/plans/2026-09-26-v1-1-13-grammar-cap-and-idempotent-completion-requirements.md",
+  "design_file": "docs/plans/2026-09-26-v1-1-13-grammar-cap-and-idempotent-completion-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Findings note: exact ceiling, upstream cause, final constants",
+      "description": "No tests required: documentation only. Edit findings note per plan md Task 1: Step 1 prompt-detection section (1920->1999 twice; 'The validator's prefix checks then reject it' -> suffix check `_suffix_is_prompt_chrome` tmux_manager.py:223 wording). Step 2 Method sentence 'The cap is `max(1024, HIGHEST_PASS - 64)`.' -> 'That bisect's cap rule was `max(1024, HIGHEST_PASS - 64)` (superseded; see Exact ceiling).'; Results bullets: 'Why the 64 margin matters' -> Superseded bullet; 'Unprobed range' -> covered-by-exact-search bullet. Step 3 insert '## Exact ceiling (follow-up)' section (exact text in plan md) before '## Prompt-detection consequence': 2000 probe 14/14 HTTP 500 (boundary-2000.log); binary search 1992/1996/1998/1999 15/15 pass, EXACT_HIGHEST_PASS=1999 EXACT_FIRST_FAIL=2000 (pin-max.log); upstream MAX_REPETITION_THRESHOLD 2000 in llama-grammar.cpp per amd-halo box; operator cap = threshold-1 = 1999. Step 4 replace final 3 constant lines with 4: LLAMA_CPP_MAX_REPETITION_THRESHOLD = 2000 / GRAMMAR_MAXLENGTH_HIGHEST_PASS = 1999 / GRAMMAR_MAXLENGTH_FIRST_FAIL = 2000 / GRAMMAR_MAX_STRING_LENGTH = 1999.",
+      "allowed_files": [
+        "commander/docs/plans/2026-09-26-grammar-maxlength-bisect-findings.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Apply plan md Task 1 Steps 1-4; verify closing constants.",
+          "command": "rg -n -e \"^LLAMA_CPP_MAX_REPETITION_THRESHOLD = \" -e \"^GRAMMAR_\" /Users/roberthyatt/Code/ironclaude/commander/docs/plans/2026-09-26-grammar-maxlength-bisect-findings.md",
+          "expected": "exactly 4 lines: values 2000, 1999, 2000, 1999 in order"
+        },
+        {
+          "description": "Wrong mechanism wording gone.",
+          "command": "rg -n -F \"prefix checks\" /Users/roberthyatt/Code/ironclaude/commander/docs/plans/2026-09-26-grammar-maxlength-bisect-findings.md",
+          "expected": "no output"
+        },
+        {
+          "description": "Exact result recorded.",
+          "command": "rg -n -F \"EXACT_HIGHEST_PASS=1999 EXACT_FIRST_FAIL=2000\" /Users/roberthyatt/Code/ironclaude/commander/docs/plans/2026-09-26-grammar-maxlength-bisect-findings.md",
+          "expected": "1 match"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f commander/docs/plans/2026-09-26-grammar-maxlength-bisect-findings.md",
+          "expected": "staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Set grammar cap to stock llama.cpp ceiling (1999)",
+      "description": "Working tree already holds HEAD restore + GRAMMAR_MAX_STRING_LENGTH wiring (7 sites) + partial test edits; do NOT restore again. Step 0 verifies state. RED: test import adds LLAMA_CPP_MAX_REPETITION_THRESHOLD; replace test_grammar_cap_pinned_to_measured_highest_pass with test_grammar_cap_pinned_to_stock_llama_cpp_ceiling (threshold == 2000; HIGHEST_PASS == 1999; cap == HIGHEST_PASS; cap == threshold - 1). GREEN: grader.py block (comment '# Highest per-string maxLength every real grade schema passed' .. 'GRAMMAR_MAX_STRING_LENGTH = 1920') -> exact block in plan md Task 2 Step 2 (LLAMA_CPP_MAX_REPETITION_THRESHOLD = 2000; GRAMMAR_MAXLENGTH_HIGHEST_PASS = 1999; GRAMMAR_MAX_STRING_LENGTH = LLAMA_CPP_MAX_REPETITION_THRESHOLD - 1). Live gate prints 'cap 1999 1999' then 6 OK lines. Exact code: plan md Task 2.",
+      "allowed_files": [
+        "commander/src/ironclaude/grader.py",
+        "commander/tests/test_grade_schema_bounds.py",
+        "commander/src/ironclaude/main.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/src/ironclaude/shadow_grader.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Hook matches HEAD.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude status --short -- worker/hooks/plan-validator.sh",
+          "expected": "no output"
+        },
+        {
+          "description": "Cap wiring present.",
+          "command": "rg -n -F '\"maxLength\": GRAMMAR_MAX_STRING_LENGTH' /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude",
+          "expected": "7 matches: main.py 3 (interaction_block, question, authority_text), orchestrator_mcp.py 3 (feedback, feedback, diagnosis), shadow_grader.py 1 (feedback)"
+        },
+        {
+          "description": "No >=2048 literal bound.",
+          "command": "rg -n -e '\"maxLength\": 2048' -e '\"maxLength\": 4096' /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude",
+          "expected": "no output"
+        },
+        {
+          "description": "RED: plan md Task 2 Step 1 (a)-(b).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_grade_schema_bounds.py",
+          "expected": "Predicted: ERROR at collection: cannot import LLAMA_CPP_MAX_REPETITION_THRESHOLD from ironclaude.grader"
+        },
+        {
+          "description": "GREEN: plan md Task 2 Step 2.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_grade_schema_bounds.py",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Constants as specified.",
+          "command": "rg -n -e \"^LLAMA_CPP_MAX_REPETITION_THRESHOLD = \" -e \"^GRAMMAR_MAX\" /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude/grader.py",
+          "expected": "exactly 3 lines: LLAMA_CPP_MAX_REPETITION_THRESHOLD = 2000 / GRAMMAR_MAXLENGTH_HIGHEST_PASS = 1999 / GRAMMAR_MAX_STRING_LENGTH = LLAMA_CPP_MAX_REPETITION_THRESHOLD - 1"
+        },
+        {
+          "description": "Still no >=2048 literal bound.",
+          "command": "rg -n -e '\"maxLength\": 2048' -e '\"maxLength\": 4096' /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude",
+          "expected": "no output"
+        },
+        {
+          "description": "Regression (Bash timeout 600000).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_grade_schema_bounds.py tests/test_local_grader.py tests/test_shadow_grader.py tests/test_orchestrator_mcp.py tests/test_daemon.py",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Live release-gate probe at 1999 (exact python -c in plan md Task 2 Step 5; Bash timeout 600000).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -c \"<plan md Task 2 Step 5 script>\"",
+          "expected": "first line 'cap 1999 1999', then 6 lines each ending OK; any INFRA_ERROR fails the gate"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/grader.py commander/src/ironclaude/main.py commander/src/ironclaude/orchestrator_mcp.py commander/src/ironclaude/shadow_grader.py commander/tests/test_grade_schema_bounds.py",
+          "expected": "staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Idempotent completion replaces status guard; no-row WORKER_KILLED; seam action in status",
+      "description": "worker_registry.update_worker_status: stamp finished_at only `WHERE id = ? AND status IS NOT ?` (before the status update), comment notes recycled-worker TTL from first completion. kill_worker: delete the `if _prior_status in (\"completed\", \"killed\"):` guard block (incl. has_session try/except) + its comment, keep `_prior_status = _kw.get(\"status\")` with new comment; no-row branch logs WORKER_KILLED after kill_session; worker_finished only if `_completed and not _already_completed`; _seam_result = state or action or 'unknown'; completed+already -> 'Worker X killed; already completed (not re-recorded); seam result: <r>.'; seam_ok branch uses state={_seam_result}; FAILED branch _outcome = 'worker remains completed (it was completed before this call)' if already completed else 'worker NOT completed'. Tests: registry finished_at pair; delete TestKillWorkerAlreadyTerminal + TestKillWorkerGuardLivenessFailure; add TestKillWorkerIdempotentCompletion (4) + TestKillWorkerSeamActionInStatus (1); test_orchestrator_mcp no-row WORKER_KILLED caplog test. Exact code: plan md Task 3.",
+      "allowed_files": [
+        "commander/src/ironclaude/worker_registry.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_worker_registry.py",
+        "commander/tests/test_worker_finalize_release.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "RED: plan md Task 3 Step 1 (a)-(c).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_registry.py tests/test_worker_finalize_release.py tests/test_orchestrator_mcp.py -k \"finished_at or IdempotentCompletion or SeamActionInStatus or no_registry_row_emits or seam_failure_does_not_claim\"",
+          "expected": "Predicted: FAIL keeps_finished_at, 3 completed-worker IdempotentCompletion tests, action_only_seam_result_reported, no_registry_row_emits_worker_killed; PASS completing_running_worker_sets_finished_at, failed_dead_session_worker_still_runs_seam (guard). Record measured line."
+        },
+        {
+          "description": "GREEN: plan md Task 3 Step 2 (a)-(b).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_registry.py tests/test_worker_finalize_release.py tests/test_orchestrator_mcp.py -k \"finished_at or IdempotentCompletion or SeamActionInStatus or no_registry_row_emits or seam_failure_does_not_claim\"",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Guard gone.",
+          "command": "rg -n -F 'if _prior_status in (\"completed\", \"killed\"):' /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude/orchestrator_mcp.py",
+          "expected": "no output"
+        },
+        {
+          "description": "No session-state-unknown path.",
+          "command": "rg -n -F \"session state unknown\" /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude/orchestrator_mcp.py",
+          "expected": "no output"
+        },
+        {
+          "description": "Regression over callers (Bash timeout 600000).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_registry.py tests/test_worker_finalize_release.py tests/test_orchestrator_mcp.py tests/test_idle_enforcement.py tests/test_kill_worker_log_cap.py tests/test_daemon.py",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/worker_registry.py commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_worker_registry.py commander/tests/test_worker_finalize_release.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "staged"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Terminal None outcome neutral for consecutive count",
+      "description": "main.py _drive_finalization_recovery: `if terminal and not counted_failure:` -> `if terminal and outcome is not None and not counted_failure:` + comment line; docstring (wrapped over 2 lines: '...gate; any other' / 'terminal outcome resets the count.') -> 3 lines '...gate; any other' / 'known terminal outcome resets the count; a None' / 'outcome (handle unavailable / seam raised) is neutral.' (exact text plan md Task 4 Step 2). test_daemon: drop None from test_non_counted_terminal_outcome_resets_consecutive_count params; add test_terminal_none_outcome_is_neutral (2 counted failures, then terminal None -> count stays 2).",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_daemon.py"
+      ],
+      "depends_on": [2, 3],
+      "steps": [
+        {
+          "description": "RED: plan md Task 4 Step 1.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_daemon.py -k TestTerminalFinalizeFailureSurface",
+          "expected": "Predicted: test_terminal_none_outcome_is_neutral fails (count popped); others pass"
+        },
+        {
+          "description": "GREEN: plan md Task 4 Step 2.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_daemon.py -k TestTerminalFinalizeFailureSurface",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Stale docstring gone (matches docstring line before the edit).",
+          "command": "rg -n -F \"terminal outcome resets the count.\" /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude/main.py",
+          "expected": "no output"
+        },
+        {
+          "description": "New docstring present.",
+          "command": "rg -n -F \"known terminal outcome resets the count; a None\" /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude/main.py",
+          "expected": "1 match"
+        },
+        {
+          "description": "Regression (Bash timeout 600000).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_daemon.py",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/tests/test_daemon.py",
+          "expected": "staged"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Docs corrections + full suite",
+      "description": "No tests required: documentation only; full pytest is the gate. CHANGELOG ## 1.1.13 kill_worker bullet rewritten per plan md Task 5 Step 1 (i)-(viii): idempotent completion; seam always runs (recycled work integrates); no-row WORKER_KILLED; honest-completion sentence without the '— the daemon will retry —' aside; retry-claim sentence kept + already-completed-with-seam-failure reported as remaining completed; 'session state unknown' dropped; ends (`orchestrator_mcp.py`, `worker_registry.py`); TTL-from-first-completion sentence. Grammar bullet: GRAMMAR_MAX_STRING_LENGTH (1999) + llama.cpp MAX_REPETITION_THRESHOLD 2000 reason (maxLength >= 2000 -> HTTP 500; measured 1999 pass / 2000 fail); 'can no longer be truncated...' -> 'is no longer cut off ... in practice'; prompt-detection-ceiling consequence sentence. README per Step 3 (title, 1999-char llama.cpp grammar ceiling, undetected-long-prompt sentence, kill_worker bullet). Step 3b: CHANGELOG alert-gate bullet reset wording adds 'known' + None-neutral parenthetical; README:20 'resets on any other terminal outcome' -> 'resets on any other known terminal outcome'.",
+      "allowed_files": [
+        "CHANGELOG.md",
+        "README.md"
+      ],
+      "depends_on": [2, 3, 4],
+      "steps": [
+        {
+          "description": "Edit docs (Steps 1-3b); verify README reset wording.",
+          "command": "rg -n -F \"resets on any other known terminal outcome\" /Users/roberthyatt/Code/ironclaude/README.md",
+          "expected": "1 match"
+        },
+        {
+          "description": "Verify no 'session state unknown'.",
+          "command": "rg -n -F \"session state unknown\" /Users/roberthyatt/Code/ironclaude/CHANGELOG.md /Users/roberthyatt/Code/ironclaude/README.md",
+          "expected": "no output"
+        },
+        {
+          "description": "Verify unconditional retry aside gone.",
+          "command": "rg -n -F \"— the daemon will retry —\" /Users/roberthyatt/Code/ironclaude/CHANGELOG.md",
+          "expected": "no output"
+        },
+        {
+          "description": "Verify README no absolute claim.",
+          "command": "rg -n -F \"grader can no longer return truncated JSON\" /Users/roberthyatt/Code/ironclaude/README.md",
+          "expected": "no output (matched README:22 before the change; unrelated 'can no longer' at :20/:191 intentionally untouched)"
+        },
+        {
+          "description": "Verify upstream limit named in CHANGELOG.",
+          "command": "rg -n -F \"MAX_REPETITION_THRESHOLD\" /Users/roberthyatt/Code/ironclaude/CHANGELOG.md",
+          "expected": ">=1 match, all in ## 1.1.13 grammar bullet"
+        },
+        {
+          "description": "Verify prompt-detection disclosure.",
+          "command": "rg -n -F \"is truncated by the grammar and rejected by the prompt validator\" /Users/roberthyatt/Code/ironclaude/CHANGELOG.md",
+          "expected": "1 match"
+        },
+        {
+          "description": "Full pytest (Bash timeout 600000).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q",
+          "expected": "0 failed; record exact pass line"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add CHANGELOG.md README.md",
+          "expected": "staged"
+        }
+      ]
+    }
+  ]
+}

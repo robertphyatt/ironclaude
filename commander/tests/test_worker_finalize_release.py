@@ -903,6 +903,40 @@ class TestProbeFirstRouter:
         cleanup = tools._workspace_client.reconcile.call_args_list[1].args[0]
         assert "rebase_recovery" not in cleanup
 
+    def test_probe_resolved_dead_session_completes_never_finalizes_or_abandons(
+        self, tmp_path,
+    ):
+        # The assignment is already cleaned/abandoned: nothing left to rescue.
+        # A dead worker is completed by the seam; finalize and abandon (which
+        # refuses a cleaned row) are never reached.
+        repo = _make_repo(tmp_path / "wt", new_work=True)
+        tools = _make_tools(_worker(repo))
+        tools._workspace_client.reconcile.return_value = {
+            "state": "resolved",
+            "detail": "Assignment lifecycle is cleaned; nothing left to finalize or rescue.",
+        }
+        out = tools._finalize_and_release_worker("w1", "session ended", terminal=True)
+        assert out["state"] == "resolved"
+        tools.registry.update_worker_status.assert_called_once_with("w1", "completed")
+        tools._workspace_client.finalize.assert_not_called()
+        tools._workspace_client.abandon.assert_not_called()
+        assert tools._workspace_client.reconcile.call_count == 1
+
+    def test_probe_resolved_live_session_never_completes(self, tmp_path):
+        # SAFETY GATE: a resolved assignment but a STILL-ALIVE session is never
+        # completed; nothing is finalized or abandoned.
+        repo = _make_repo(tmp_path / "wt", new_work=True)
+        tools = _make_tools(_worker(repo), has_session=True)
+        tools._workspace_client.reconcile.return_value = {
+            "state": "resolved",
+            "detail": "Assignment lifecycle is abandoned; nothing left to finalize or rescue.",
+        }
+        out = tools._finalize_and_release_worker("w1", "session ended", terminal=True)
+        assert out["state"] == "resolved"
+        tools.registry.update_worker_status.assert_not_called()
+        tools._workspace_client.finalize.assert_not_called()
+        tools._workspace_client.abandon.assert_not_called()
+
     def test_probe_rebase_paused_clean_live_session_never_completes(self, tmp_path):
         # Same safety gate through the _drive_continue_recovery path: the
         # continue reaches a terminal integrated state, but the session is
@@ -985,16 +1019,19 @@ class TestProbeFirstRouter:
 #        or None) is NEVER completed.
 # --------------------------------------------------------------------------
 
-def _unmanaged_kill_tools(*, has_session, spawned_at="2026-01-01T00:00:00+00:00"):
+def _unmanaged_kill_tools(*, has_session, spawned_at="2026-01-01T00:00:00+00:00", status="running"):
     """Minimal tools running the REAL unmanaged carve-out + REAL kill_worker
     predicate (nothing on the finalize seam is mocked)."""
     tools = object.__new__(OrchestratorTools)
     tools.registry = MagicMock()
-    tools.registry.get_worker.return_value = {
+    state = {
         "id": "w9", "machine": None, "tmux_session": "ic-w9",
-        "workspace_guid": None, "spawned_at": spawned_at,
+        "workspace_guid": None, "spawned_at": spawned_at, "status": status,
     }
-    tools.registry.update_worker_status = MagicMock()
+    tools.registry.get_worker.side_effect = lambda _wid: dict(state)
+    tools.registry.update_worker_status = MagicMock(
+        side_effect=lambda _wid, st: state.update(status=st),
+    )
     tools.registry.log_event = MagicMock()
     tools.tmux = MagicMock()
     tools.tmux.list_pane_pid.return_value = "123"
@@ -1138,3 +1175,159 @@ class TestKillWorkerFailureStatusWording:
         assert "NOT completed" in status
         assert "phase=unknown" in status
         assert "no result" in status
+
+
+class TestKillWorkerHonestCompletionStatus:
+    """The 'marked completed' claim and worker_finished key off the registry
+    re-read, not merely 'the seam result has no failure_phase'."""
+
+    def test_success_dict_but_worker_not_completed_is_not_claimed(self):
+        tools = _unmanaged_kill_tools(has_session=False)
+        # The seam returned a probe result with no failure_phase but did NOT
+        # complete the worker (e.g. resolved/integrated with a live session).
+        tools._finalize_and_release_worker = MagicMock(
+            return_value={"state": "resolved", "detail": "nothing left"},
+        )
+
+        result = tools.kill_worker("w9")
+
+        finished = [
+            c for c in tools.registry.log_event.call_args_list
+            if c.args and c.args[0] == "worker_finished"
+        ]
+        assert finished == []
+        assert "marked completed" not in result["status"]
+        assert result["status"] == (
+            "Worker w9 session killed; the seam returned state=resolved but did "
+            "not complete the worker (status=running); daemon will retry."
+        )
+
+    def test_no_registry_row_kills_session_and_claims_nothing(self):
+        tools = _unmanaged_kill_tools(has_session=False)
+        tools.registry.get_worker.side_effect = lambda _wid: None
+        tools._finalize_and_release_worker = MagicMock()
+
+        result = tools.kill_worker("ghost")
+
+        tools.tmux.kill_session.assert_called_once_with("ic-ghost", ssh_host=None)
+        tools._finalize_and_release_worker.assert_not_called()
+        finished = [
+            c for c in tools.registry.log_event.call_args_list
+            if c.args and c.args[0] == "worker_finished"
+        ]
+        assert finished == []
+        assert result["status"] == (
+            "Worker ghost has no registry row; session killed; nothing to finalize."
+        )
+
+
+class TestKillWorkerRetryClause:
+    """'daemon will retry' is claimed only when the post-seam registry status is
+    'running' — the only status the daemon sweeps (get_running_workers). A
+    'failed' worker is never swept; kill_worker is its only integrate path."""
+
+    _CALL_AGAIN = (
+        "worker status is 'failed' (not swept by the daemon); "
+        "call kill_worker again to retry finalization."
+    )
+
+    @staticmethod
+    def _kill(release, status):
+        tools = _unmanaged_kill_tools(has_session=False, status=status)
+        tools._finalize_and_release_worker = MagicMock(return_value=release)
+        return tools.kill_worker("w9")
+
+    def test_failed_branch_failed_worker_says_call_again(self):
+        result = self._kill(
+            {"failure_phase": "probe", "error": "boom", "assignment_preserved": True},
+            status="failed",
+        )
+        assert result["status"].endswith(
+            "NOT completed; work preserved; " + self._CALL_AGAIN
+        )
+        assert "daemon will retry" not in result["status"]
+
+    def test_failed_branch_running_worker_keeps_daemon_retry(self):
+        result = self._kill(
+            {"failure_phase": "probe", "error": "boom", "assignment_preserved": True},
+            status="running",
+        )
+        assert result["status"].endswith(
+            "NOT completed; work preserved; daemon will retry."
+        )
+
+    def test_seam_ok_branch_failed_worker_says_call_again(self):
+        result = self._kill({"state": "resolved", "detail": "x"}, status="failed")
+        assert result["status"] == (
+            "Worker w9 session killed; the seam returned state=resolved but did "
+            "not complete the worker (status=failed); " + self._CALL_AGAIN
+        )
+        assert "daemon will retry" not in result["status"]
+
+
+class TestKillWorkerIdempotentCompletion:
+    """kill_worker has no registry-status guard: the seam always runs (a
+    commit_worker-recycled worker is 'completed' yet may hold new reviewed work).
+    Duplicate completion is prevented by idempotency: no second worker_finished,
+    and the registry does not re-stamp finished_at."""
+
+    def test_already_completed_worker_runs_seam_without_duplicate_finished(self):
+        tools = _unmanaged_kill_tools(has_session=False, status="completed")
+        seam = MagicMock(return_value={"action": "completed"})
+        tools._finalize_and_release_worker = seam
+
+        result = tools.kill_worker("w9")
+
+        seam.assert_called_once()
+        finished = [
+            c for c in tools.registry.log_event.call_args_list
+            if c.args and c.args[0] == "worker_finished"
+        ]
+        assert finished == []
+        assert result["status"] == (
+            "Worker w9 killed; already completed (not re-recorded); "
+            "seam result: completed."
+        )
+
+    def test_recycled_completed_worker_reaches_seam_integrate(self):
+        tools = _unmanaged_kill_tools(has_session=True, status="completed")
+        seam = MagicMock(return_value={"state": "cleaned", "integratedCommit": "a" * 40})
+        tools._finalize_and_release_worker = seam
+
+        result = tools.kill_worker("w9")
+
+        seam.assert_called_once()
+        assert result["status"] == (
+            "Worker w9 killed; already completed (not re-recorded); "
+            "seam result: cleaned."
+        )
+
+    def test_already_completed_worker_seam_failure_does_not_claim_uncompleted(self):
+        tools = _unmanaged_kill_tools(has_session=False, status="completed")
+        tools._finalize_and_release_worker = MagicMock(
+            return_value={"failure_phase": "finalization", "error": "boom"}
+        )
+        result = tools.kill_worker("w9")
+        assert "worker remains completed" in result["status"]
+        assert "NOT completed" not in result["status"]
+        assert not [c for c in tools.registry.log_event.call_args_list
+                    if c.args and c.args[0] == "worker_finished"]
+
+    def test_failed_dead_session_worker_still_runs_seam(self):
+        tools = _unmanaged_kill_tools(has_session=False, status="failed")
+
+        result = tools.kill_worker("w9")
+
+        tools.registry.update_worker_status.assert_called_once_with("w9", "completed")
+        assert result["status"] == "Worker w9 killed and marked completed."
+
+
+class TestKillWorkerSeamActionInStatus:
+    def test_action_only_seam_result_reported(self):
+        tools = _unmanaged_kill_tools(has_session=False, status="running")
+        tools._finalize_and_release_worker = MagicMock(return_value={"action": "surfaced"})
+
+        result = tools.kill_worker("w9")
+
+        assert "state=surfaced" in result["status"]
+        assert "state=unknown" not in result["status"]

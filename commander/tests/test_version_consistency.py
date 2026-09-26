@@ -42,6 +42,11 @@ def _workspace_manager_package_version() -> str:
     return data["version"]
 
 
+def _workspace_manager_lock_versions() -> tuple[str, str]:
+    data = json.loads((REPO_ROOT / "worker" / "mcp-servers" / "workspace-manager" / "package-lock.json").read_text())
+    return data["version"], data["packages"][""]["version"]
+
+
 def _marketplace_version() -> str:
     data = json.loads((REPO_ROOT / ".claude-plugin" / "marketplace.json").read_text())
     return data["plugins"][0]["version"]
@@ -90,6 +95,8 @@ def test_version_sources_match():
         "worker/.claude-plugin/plugin.json": _claude_plugin_json_version(),
         "worker/.codex-plugin/plugin.json": _codex_plugin_json_version(),
         "worker/mcp-servers/workspace-manager/package.json": _workspace_manager_package_version(),
+        "worker/mcp-servers/workspace-manager/package-lock.json": _workspace_manager_lock_versions()[0],
+        "worker/mcp-servers/workspace-manager/package-lock.json#packages['']": _workspace_manager_lock_versions()[1],
         ".claude-plugin/marketplace.json": _marketplace_version(),
     }
     makefile_version = _makefile_pinned_version()

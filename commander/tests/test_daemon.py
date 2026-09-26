@@ -2515,7 +2515,7 @@ class TestRunMaintenance:
         conn.close()
 
     @staticmethod
-    def _commander_conn_with_repo(repo="/repo"):
+    def _commander_conn_with_repo(repo):
         conn = sqlite3.connect(":memory:")
         conn.execute(
             """CREATE TABLE workers (
@@ -2543,7 +2543,10 @@ class TestRunMaintenance:
         """Row-less orphan reap step 7: preservedUnmerged names get posted to
         Slack and tracked on the daemon for the heartbeat."""
         monkeypatch.setenv("WORKSPACE_MANAGER_DB_PATH", str(tmp_path / "ws.db"))
-        daemon._db = self._commander_conn_with_repo()
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        repo = str(repo_dir)
+        daemon._db = self._commander_conn_with_repo(repo)
         orch = MagicMock()
         orch._workspace_client.reap_orphans.return_value = {
             "reaped": [], "preservedDirty": [],
@@ -2555,17 +2558,22 @@ class TestRunMaintenance:
         daemon._last_maintenance = 0
         daemon._run_maintenance()
 
+        orch._workspace_client.reap_orphans.assert_called()
+        assert orch._workspace_client.reap_orphans.call_args.args[0]["repository_path"] == repo
         daemon.slack.post_message.assert_called_once()
         posted = daemon.slack.post_message.call_args.args[0]
-        assert "/repo:ironclaude/y" in posted
-        assert "/repo:ironclaude/z" in posted
+        assert f"{repo}:ironclaude/y" in posted
+        assert f"{repo}:ironclaude/z" in posted
         assert daemon._orphaned_unmerged_count == 2
 
     def test_second_run_with_same_preserved_unmerged_names_does_not_repost(
         self, daemon, tmp_path, monkeypatch
     ):
         monkeypatch.setenv("WORKSPACE_MANAGER_DB_PATH", str(tmp_path / "ws.db"))
-        daemon._db = self._commander_conn_with_repo()
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        repo = str(repo_dir)
+        daemon._db = self._commander_conn_with_repo(repo)
         orch = MagicMock()
         orch._workspace_client.reap_orphans.return_value = {
             "reaped": [], "preservedDirty": [],
@@ -2576,6 +2584,9 @@ class TestRunMaintenance:
 
         daemon._last_maintenance = 0
         daemon._run_maintenance()
+
+        orch._workspace_client.reap_orphans.assert_called()
+        assert orch._workspace_client.reap_orphans.call_args.args[0]["repository_path"] == repo
         daemon.slack.post_message.reset_mock()
 
         daemon._last_maintenance = 0
@@ -2588,7 +2599,10 @@ class TestRunMaintenance:
         self, daemon, tmp_path, monkeypatch
     ):
         monkeypatch.setenv("WORKSPACE_MANAGER_DB_PATH", str(tmp_path / "ws.db"))
-        daemon._db = self._commander_conn_with_repo()
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        repo = str(repo_dir)
+        daemon._db = self._commander_conn_with_repo(repo)
         orch = MagicMock()
         orch._workspace_client.reap_orphans.return_value = {
             "reaped": [], "preservedDirty": [], "preservedUnmerged": [],
@@ -2599,6 +2613,8 @@ class TestRunMaintenance:
         daemon._last_maintenance = 0
         daemon._run_maintenance()
 
+        orch._workspace_client.reap_orphans.assert_called()
+        assert orch._workspace_client.reap_orphans.call_args.args[0]["repository_path"] == repo
         daemon.slack.post_message.assert_not_called()
         assert daemon._orphaned_unmerged_count == 0
 
@@ -5481,6 +5497,69 @@ class TestTerminalFinalizeFailureSurface:
         daemon._finalize_failure_count["w1"] = 2
         daemon.check_workers()
         assert "w1" not in daemon._finalize_failure_count
+
+    def test_prior_recovery_alert_does_not_suppress_terminal_failure_surface(self, daemon):
+        # A conflict/drift/no-mode alert earlier in the worker's life must not
+        # swallow the later terminal-failure surface (separate once-gates).
+        daemon._finalize_recovery_alerted.add("w1")
+        for _ in range(FINALIZE_FAILURE_SURFACE_CAP + 1):
+            daemon._drive_finalization_recovery("w1", self._OUTCOME, terminal=True)
+        assert daemon.slack.post_message.call_count == 1
+        assert "consecutive cycles" in daemon.slack.post_message.call_args[0][0]
+        assert "w1" in daemon._finalize_failure_alerted
+
+    def test_terminal_failure_surface_does_not_suppress_conflict_surface(self, daemon):
+        for _ in range(FINALIZE_FAILURE_SURFACE_CAP + 1):
+            daemon._drive_finalization_recovery("w1", self._OUTCOME, terminal=True)
+        conflict = {
+            "failure_phase": "finalization",
+            "recovery": {"reconcile": {"mode": "conflict"}},
+        }
+        assert daemon._drive_finalization_recovery("w1", conflict, terminal=True) == "surfaced"
+        assert daemon.slack.post_message.call_count == 2
+
+    @pytest.mark.parametrize("interleaved", [
+        {"state": "integrated"},
+        {"failure_phase": "finalization", "recovery": {"reconcile": {"mode": "drift"}}},
+    ])
+    def test_non_counted_terminal_outcome_resets_consecutive_count(self, daemon, interleaved):
+        daemon._get_orchestrator = MagicMock(return_value=None)  # drift arm: no seam call
+        for _ in range(FINALIZE_FAILURE_SURFACE_CAP):
+            daemon._drive_finalization_recovery("w1", self._OUTCOME, terminal=True)
+        daemon._drive_finalization_recovery("w1", interleaved, terminal=True)
+        assert "w1" not in daemon._finalize_failure_count
+        daemon._drive_finalization_recovery("w1", self._OUTCOME, terminal=True)
+        assert daemon._finalize_failure_count["w1"] == 1
+        assert daemon.slack.post_message.call_count == 0
+
+    def test_non_terminal_outcome_neither_counts_nor_resets(self, daemon):
+        for _ in range(2):
+            daemon._drive_finalization_recovery("w1", self._OUTCOME, terminal=True)
+        daemon._drive_finalization_recovery("w1", None)  # idle, non-terminal
+        assert daemon._finalize_failure_count["w1"] == 2
+
+    def test_non_running_sweep_clears_failure_alerted(self, daemon):
+        daemon._finalize_failure_alerted.add("w1")
+        daemon.registry.get_running_workers.return_value = []
+        daemon._last_stuck_check = 0
+        daemon.check_stuck_workers()
+        assert "w1" not in daemon._finalize_failure_alerted
+
+    def test_new_marker_rearms_failure_alerted(self, daemon):
+        _live_worker(daemon)
+        daemon.registry.get_events_for_worker.return_value = [
+            {"id": 4, "event_type": "finalize_integrated", "worker_id": "w1"},
+        ]
+        daemon._finalize_failure_alerted.add("w1")
+        daemon.check_workers()
+        assert "w1" not in daemon._finalize_failure_alerted
+
+    def test_terminal_none_outcome_is_neutral(self, daemon):
+        # None = orchestrator unavailable or seam raised: unknown, not success.
+        for _ in range(2):
+            daemon._drive_finalization_recovery("w1", self._OUTCOME, terminal=True)
+        daemon._drive_finalization_recovery("w1", None, terminal=True)
+        assert daemon._finalize_failure_count["w1"] == 2
 
 
 class TestGradeBoundedInFlightCap:

@@ -937,7 +937,7 @@ def test_grade_openai_thinking_true_omits_suppression(tmp_path):
     assert "chat_template_kwargs" not in sent
     # design item 5 on-case: suppression fields are additive; core fields intact.
     assert sent["model"] == "example-model-a"
-    assert sent["max_tokens"] == 1024
+    assert sent["max_tokens"] == 8192
     assert sent["temperature"] == 0.1
     assert sent["response_format"]["type"] == "json_schema"
 
@@ -957,11 +957,44 @@ def test_grade_openai_thinking_off_preserves_core_payload_fields(tmp_path):
         grader.grade("system prompt", "user prompt", GRADE_SCHEMA)
     sent = mock_post.call_args[1]["json"]
     assert sent["model"] == "example-model-a"
-    assert sent["max_tokens"] == 1024
+    assert sent["max_tokens"] == 8192
     assert sent["temperature"] == 0.1
     assert sent["response_format"]["type"] == "json_schema"
     # system prompt is profiled; only the raw user_prompt tail is asserted.
     assert sent["messages"][0]["content"].endswith("user prompt")
+
+
+def test_grade_openai_schema_call_floors_max_tokens_at_8192(tmp_path):
+    from ironclaude.grader import LocalGrader, GRADER_SCHEMA_MIN_MAX_TOKENS
+    assert GRADER_SCHEMA_MIN_MAX_TOKENS == 8192
+    cfg = tmp_path / "floor.json"
+    cfg.write_text(json.dumps({
+        "backend": "openai",
+        "openai": {"base_url": "http://h/v1", "model": "example-model-a", "max_tokens": 1024},
+    }))
+    grader = LocalGrader(config_path=str(cfg))
+    ok = '{"grade": "A", "approved": true, "feedback": "ok"}'
+    with patch("requests.post", return_value=_openai_post_response(ok)) as mock_post:
+        grader.grade("system prompt", "user prompt", GRADE_SCHEMA)
+    assert mock_post.call_args[1]["json"]["max_tokens"] == 8192
+    with patch("requests.post", return_value=_openai_post_response(ok)) as mock_post:
+        grader.grade("system prompt", "user prompt")
+    # No schema: the configured budget is unchanged.
+    assert mock_post.call_args[1]["json"]["max_tokens"] == 1024
+
+
+def test_grade_openai_schema_call_keeps_larger_configured_max_tokens(tmp_path):
+    from ironclaude.grader import LocalGrader
+    cfg = tmp_path / "big.json"
+    cfg.write_text(json.dumps({
+        "backend": "openai",
+        "openai": {"base_url": "http://h/v1", "model": "example-model-a", "max_tokens": 16384},
+    }))
+    grader = LocalGrader(config_path=str(cfg))
+    ok = '{"grade": "A", "approved": true, "feedback": "ok"}'
+    with patch("requests.post", return_value=_openai_post_response(ok)) as mock_post:
+        grader.grade("system prompt", "user prompt", GRADE_SCHEMA)
+    assert mock_post.call_args[1]["json"]["max_tokens"] == 16384
 
 
 def test_grade_ollama_backend_ignores_thinking_flag(tmp_path):

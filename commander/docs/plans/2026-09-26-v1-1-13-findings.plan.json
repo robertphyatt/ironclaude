@@ -1,0 +1,361 @@
+{
+  "name": "v1.1.13 Findings and Pre-Existing Issues",
+  "goal": "Fix v1.1.13 validation findings, 3 approved carry-over observations, and Fable v1.1.13 review observations; fold into unpushed v1.1.13.",
+  "requirements_file": "docs/plans/2026-09-26-v1-1-13-findings-requirements.md",
+  "design_file": "docs/plans/2026-09-26-v1-1-13-findings-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "kill_worker terminal guard + honest completion status",
+      "description": "Guard kill_worker against already-terminal workers (completed/killed; 'failed' deliberately excluded — set only by dead-session detection at orchestrator_mcp.py:5841/5919/5940/6107 without the seam, so kill_worker is its only integrate path; deviation 6): no grade, no seam, no re-completion, no worker_finished; kill leftover tmux session. No-registry-row branch (before the guard): kill session, return 'Worker X has no registry row; session killed; nothing to finalize.', no seam (deviation 7). Completion claim + worker_finished key off registry re-read (status=='completed') AND seam success; success-shaped-but-not-completed gets its own status string. Code snippets: plan md Task 1. Fixture _unmanaged_kill_tools gains status= kwarg and get_worker reflecting update_worker_status via shared dict.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_worker_finalize_release.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: in test_worker_finalize_release.py make _unmanaged_kill_tools take status='running' and use shared-dict get_worker side_effect + update_worker_status side_effect; append TestKillWorkerAlreadyTerminal (parametrized completed/killed; stale-session case; test_failed_dead_session_worker_still_runs_seam) and TestKillWorkerHonestCompletionStatus (incl. test_no_registry_row_kills_session_and_claims_nothing) exactly as plan md Task 1 Step 1.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_finalize_release.py -k \"AlreadyTerminal or HonestCompletion or PositivePredicate or FailureStatusWording\"",
+          "expected": "FAIL: 2 parametrized test_no_grade_no_seam_no_recompletion + test_stale_session_is_killed + test_success_dict_but_worker_not_completed_is_not_claimed + test_no_registry_row_kills_session_and_claims_nothing fail; test_failed_dead_session_worker_still_runs_seam passes today (guard, deviation 5); existing PositivePredicate/FailureStatusWording cases pass"
+        },
+        {
+          "description": "GREEN: in orchestrator_mcp.py kill_worker insert no-registry-row branch then terminal guard (status in ('completed','killed')) after remote_log_dir block (before directive_completed=False); replace _completed predicate with _wr re-read + _seam_ok + status=='completed'; replace status if/else with completed / seam_ok-not-completed / FAILED three-way block, exactly as plan md Task 1 Step 2.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_finalize_release.py -k \"AlreadyTerminal or HonestCompletion or PositivePredicate or FailureStatusWording\"",
+          "expected": "PASS, 0 failed"
+        },
+        {
+          "description": "Regression over every kill_worker caller test file",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_finalize_release.py tests/test_orchestrator_mcp.py tests/test_idle_enforcement.py tests/test_kill_worker_log_cap.py",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_worker_finalize_release.py",
+          "expected": "staged"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "_classify_finalization_failure resolved arm",
+      "description": "After the 'integrated' arm (orchestrator_mcp.py ~:3121) add `if state == \"resolved\": self._complete_worker_if_session_dead(worker_id, ssh_host); return status` — no cleanup, no finalize_integrated. Tests in TestCommitWorkerFinalizationRecovery using finalize_failure_tools fixture. Snippets: plan md Task 2.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "RED: append test_recovery_probe_resolved_completes_dead_worker_without_cleanup and test_recovery_probe_resolved_live_session_never_completes to TestCommitWorkerFinalizationRecovery (plan md Task 2 Step 1).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_orchestrator_mcp.py -k \"recovery_probe_resolved\"",
+          "expected": "FAIL: both tests fail (result is untagged failure_phase=finalization dict today)"
+        },
+        {
+          "description": "GREEN: insert resolved arm after integrated arm in _classify_finalization_failure (plan md Task 2 Step 2).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_orchestrator_mcp.py -k \"recovery_probe_resolved\"",
+          "expected": "PASS"
+        },
+        {
+          "description": "Regression",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_orchestrator_mcp.py tests/test_worker_finalize_release.py",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "staged"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Grammar-bound every local grade schema + guard test",
+      "description": "Add maxLength to every string and maxItems to every array in schemas passed to LocalGrader.grade: main._BRAIN_MSG_SCHEMA (reason 1024), main._AWAITING_OP_SCHEMA (waiting_on 16, worker_id 128, question 1024), main._PROMPT_WAITING_SCHEMA (interaction_block 4096, question 2048, authority_text 2048, options maxItems 16, value 128, label 512 — equal to validator limits tmux_manager.py:164,:203-205; deviation 8); hoist orchestrator local schemas to class constants _LOCAL_VERDICT_SCHEMA (grade 1, feedback 2048), _LOCAL_CONFIDENCE_SCHEMA (grade 1, feedback 2048, confidence 8), _LOCAL_HEALTH_SCHEMA (diagnosis 2048, severity 8) and replace call sites :4618/:5423(+:5450)/:6065/:5976/:6133/:7111 (keep bounded=True at :5976,:7111); shadow_grader.GRADER_VERDICT_SCHEMA (grade 1, feedback 2048, confidence_in_disagreement 8). _GRADER_VERDICT_SCHEMA (:901) unchanged (CLI-only, not grade()). _PERMISSION_SEEKING_SCHEMA unchanged (boolean only). New guard test tests/test_grade_schema_bounds.py per plan md Task 3 Step 1. Live grammar probe is evidence, not gate.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/src/ironclaude/shadow_grader.py",
+        "commander/tests/test_grade_schema_bounds.py"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "RED: create commander/tests/test_grade_schema_bounds.py exactly as plan md Task 3 Step 1 (walker positive control, parametrized bounded check over 8 schemas, 4096/16 assert, no-inline-literal source scan).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_grade_schema_bounds.py",
+          "expected": "ERROR at collection: OrchestratorTools has no attribute _LOCAL_VERDICT_SCHEMA"
+        },
+        {
+          "description": "GREEN: add bounds to main.py schemas; add 3 class constants after _GRADER_VERDICT_SCHEMA in orchestrator_mcp.py and replace the 6 call sites (delete local confidence_schema/health_schema literals); add bounds to shadow_grader.GRADER_VERDICT_SCHEMA (plan md Task 3 Step 2).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_grade_schema_bounds.py",
+          "expected": "PASS, 0 failed"
+        },
+        {
+          "description": "Regression",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_orchestrator_mcp.py tests/test_shadow_grader.py tests/test_daemon.py tests/test_brain_client.py tests/test_local_grader.py tests/test_grade_schema_bounds.py",
+          "expected": "0 failed; any failing literal-schema assert is reported, not weakened"
+        },
+        {
+          "description": "Live grammar probe (evidence only): resolve base_url, then POST bounded schema (s maxLength 20) with max_tokens 8192 to <base_url>/chat/completions (substitute the jq-printed base_url if it differs from http://100.76.144.47:8080/v1 and note it). Record exact output; if unreachable record UNVERIFIED.",
+          "command": "jq -r '.openai.base_url' /Users/roberthyatt/.claude/ironclaude-hooks-config.json && curl -s --max-time 60 -H 'Content-Type: application/json' -d '{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"Write a 300-word essay as the value of field s.\"}],\"max_tokens\":8192,\"temperature\":0.1,\"reasoning_effort\":\"none\",\"chat_template_kwargs\":{\"enable_thinking\":false},\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"verdict\",\"schema\":{\"type\":\"object\",\"properties\":{\"s\":{\"type\":\"string\",\"maxLength\":20}},\"required\":[\"s\"]}}}}' http://100.76.144.47:8080/v1/chat/completions",
+          "expected": "HTTP 200 JSON; .choices[0].message.content parses to {\"s\": ...} with len(s) <= 20"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/src/ironclaude/orchestrator_mcp.py commander/src/ironclaude/shadow_grader.py commander/tests/test_grade_schema_bounds.py",
+          "expected": "staged"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "8192 token floor on schema-bound OpenAI calls",
+      "description": "grader.py: add GRADER_SCHEMA_MIN_MAX_TOKENS = 8192; grade() openai payload max_tokens = max(openai_max_tokens or 0, floor) when schema is not None else (openai_max_tokens or 1024). shadow_grader.py: import constant; verdict_payload max_tokens = max(self._max_tokens, floor); tool-loop payload (:315) unchanged. plan-validator.sh openai schema branch: schema_maxtok=$(jq -r '[(.openai.max_tokens // 0), 8192] | max' \"$config\" 2>/dev/null) || schema_maxtok=8192, used as --argjson mt for the response_format payload only. Tests per plan md Task 4 Step 1.",
+      "allowed_files": [
+        "commander/src/ironclaude/grader.py",
+        "commander/src/ironclaude/shadow_grader.py",
+        "worker/hooks/plan-validator.sh",
+        "commander/tests/test_local_grader.py",
+        "commander/tests/test_shadow_grader.py",
+        "worker/hooks/tests/test-openai-backend.sh"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {
+          "description": "RED (python): test_local_grader.py change asserts at :940 and :960 to == 8192; append test_grade_openai_schema_call_floors_max_tokens_at_8192 and test_grade_openai_schema_call_keeps_larger_configured_max_tokens; test_shadow_grader.py add `assert verdict_body[\"max_tokens\"] == 8192` after verdict_body assignment (:379). Exact code: plan md Task 4 Step 1.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_local_grader.py tests/test_shadow_grader.py",
+          "expected": "FAIL: test_grade_openai_schema_call_floors_max_tokens_at_8192 + 2 changed asserts (:940,:960) + shadow verdict assert; test_grade_openai_schema_call_keeps_larger_configured_max_tokens passes today (guard, deviation 5)"
+        },
+        {
+          "description": "RED (bash): insert max_tokens floor block after line 72 of test-openai-backend.sh (plan md Task 4 Step 1(c)).",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-openai-backend.sh",
+          "expected": "FAIL on exactly one line: 'schema request max_tokens floored to 8192'; 'schema-less request keeps configured 1024' and 'larger configured max_tokens wins for schema request' pass today (guards, deviation 5)"
+        },
+        {
+          "description": "GREEN: implement grader.py constant + payload, shadow_grader.py import + verdict payload, plan-validator.sh schema_maxtok (plan md Task 4 Step 2).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_local_grader.py tests/test_shadow_grader.py",
+          "expected": "0 failed"
+        },
+        {
+          "description": "GREEN (bash)",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-openai-backend.sh",
+          "expected": "Results: N passed, 0 failed"
+        },
+        {
+          "description": "Realistic-size end-to-end probe (evidence; one blocking outcome): real LocalGrader with deployed config, 8192-char capture + bounded _PROMPT_WAITING_SCHEMA. Connection error -> record UNVERIFIED. HTTP 400 mentioning context length/max_model_len -> STOP and report blocker (server-side context increase needed).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -c \"import ironclaude.main as m; from ironclaude.grader import LocalGrader; tail = ('step output line ok ' * 600)[: m.PROMPT_CAPTURE_CHARS - 64] + chr(10) + 'Proceed with the migration? (y/n)'; r = LocalGrader().grade(m._PROMPT_WAITING_SYSTEM, 'Worker terminal context:' + chr(10) + tail, m._PROMPT_WAITING_SCHEMA); print(sorted(r.keys())); print(r.get('error_detail'))\"",
+          "expected": "key list without infrastructure_error; second line None"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/grader.py commander/src/ironclaude/shadow_grader.py worker/hooks/plan-validator.sh commander/tests/test_local_grader.py commander/tests/test_shadow_grader.py worker/hooks/tests/test-openai-backend.sh",
+          "expected": "staged"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "_managed_repositories normalize / skip vanished / dedupe by git common dir",
+      "description": "main.py _managed_repositories: workers.repo containing '/.ironclaude/worktrees/' -> split(marker)[0]; local (empty machine) entries skipped when not os.path.isdir (DEBUG log); local entries deduped by `git -C <p> rev-parse --path-format=absolute --git-common-dir` (timeout 10, fallback key=path), first seen kept; remote unchanged. Existing tests using fake local paths (/repoA,/repoC,/repo) switched to real tmp dirs. New tests per plan md Task 5. Full function body: plan md Task 5 Step 2.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_worktree_reaper.py"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {
+          "description": "RED: adapt 4 existing tests to real tmp dirs (TestManagedRepositories dedupe test: repoA/repoC; TestReapRowLessOrphans partial-failure test: repoA incl protected path, side_effect compare, calls_by_repo keys; two preserved_detail tests: repo). Append test_worktree_path_repo_maps_to_primary_and_dedupes, test_vanished_local_path_skipped_remote_kept, test_subdirectories_of_one_repo_dedupe_to_first_seen (with explicit spawned_at UPDATEs) per plan md Task 5 Step 1.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worktree_reaper.py -k \"ManagedRepositories or ReapRowLessOrphans\"",
+          "expected": "FAIL: the 3 new tests fail; the 4 adapted tests pass"
+        },
+        {
+          "description": "GREEN: replace _managed_repositories body (keep signature) with plan md Task 5 Step 2 code; append docstring sentence.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worktree_reaper.py -k \"ManagedRepositories or ReapRowLessOrphans\"",
+          "expected": "PASS, 0 failed"
+        },
+        {
+          "description": "Regression",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worktree_reaper.py tests/test_daemon.py",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/tests/test_worktree_reaper.py",
+          "expected": "staged"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "name": "Separate terminal-failure once-gate + consecutive reset",
+      "description": "main.py: new self._finalize_failure_alerted set (init after _finalize_recovery_alerted); _drive_finalization_recovery computes phase/counted_failure at top and pops _finalize_failure_count when terminal and not counted_failure; terminal counter block uses counted_failure and _finalize_failure_alerted (not _finalize_recovery_alerted); prune new set in non-running sweep (~:4210) and marker re-arm (~:4515). Tests in TestTerminalFinalizeFailureSurface per plan md Task 6.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_daemon.py"
+      ],
+      "depends_on": [5],
+      "steps": [
+        {
+          "description": "RED: append 6 tests to TestTerminalFinalizeFailureSurface (prior recovery alert doesn't suppress; terminal surface doesn't suppress conflict; parametrized non-counted reset [None, {state:integrated}, drift-finalization]; non-terminal neither counts nor resets; sweep clears _finalize_failure_alerted; marker re-arms it) per plan md Task 6 Step 1.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_daemon.py -k TestTerminalFinalizeFailureSurface",
+          "expected": "FAIL for 5 of 6 new tests (prior_recovery_alert: post count 0; does_not_suppress_conflict: count 1 not 2; non_counted reset: all 3 params; sweep_clears / marker_rearms: AttributeError _finalize_failure_alerted); test_non_terminal_outcome_neither_counts_nor_resets passes today (guard, deviation 5); existing pass"
+        },
+        {
+          "description": "GREEN: init set, driver top reset, counter-block gate swap + docstring, sweep prune, marker re-arm discard (plan md Task 6 Step 2).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_daemon.py -k TestTerminalFinalizeFailureSurface",
+          "expected": "PASS, 0 failed"
+        },
+        {
+          "description": "Regression",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_daemon.py",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/tests/test_daemon.py",
+          "expected": "staged"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "name": "Detached+usable-origin/HEAD reap test, not-ready wording, dist rebuild",
+      "description": "Coverage-gap vitest (not RED-able; falsifiability via sibling :2202 fail-safe test) inserted after workspace-service.test.ts:2212; integration.ts:2073 comment reworded to: 'not-ready' now covers every other lifecycle (active, reserved, materialized) — anything not integrated, ready_for_integration, or resolved. Rebuild bundles; verify resolved branch still bundled.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts",
+        "worker/mcp-servers/workspace-manager/src/integration.ts",
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/index.js"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Insert test 'reaps when the primary checkout is detached but origin/HEAD resolves to a branch with a local ref' after :2212 (plan md Task 7 Step 1).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/workspace-service.test.ts -t \"detached\"",
+          "expected": "PASS (new test and :2202 sibling)"
+        },
+        {
+          "description": "Reword integration.ts:2073 comment sentence; no code change.",
+          "command": "rg -n -F \"strictly an active row\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/src/integration.ts",
+          "expected": "no output (rg exit 1)"
+        },
+        {
+          "description": "Rebuild",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build",
+          "expected": "exit 0"
+        },
+        {
+          "description": "Verify resolved branch bundled",
+          "command": "rg -n -F 'state: \"resolved\"' /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/index.js",
+          "expected": ">=1 match in each file"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/__tests__/workspace-service.test.ts worker/mcp-servers/workspace-manager/src/integration.ts worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/index.js",
+          "expected": "staged"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "name": "package-lock version drift + version test coverage",
+      "description": "Add _workspace_manager_lock_versions() to test_version_consistency.py and two entries (top-level version, packages[''].version) to test_version_sources_match; set package-lock.json lines 3 and 9 from 1.1.4 to 1.1.13.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/package-lock.json",
+        "commander/tests/test_version_consistency.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: add helper + 2 dict entries (plan md Task 8 Step 1).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_version_consistency.py",
+          "expected": "FAIL: test_version_sources_match mismatch shows 1.1.4"
+        },
+        {
+          "description": "GREEN: package-lock.json \"version\": \"1.1.4\" -> \"1.1.13\" at lines 3 and 9 only.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_version_consistency.py",
+          "expected": "10 passed"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/package-lock.json commander/tests/test_version_consistency.py",
+          "expected": "staged"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "name": "vitest onTaskUpdate RPC timeout — bounded investigation",
+      "description": "Capture verbose full vitest log, locate onTaskUpdate timeout and implicated files, test hypothesis (long spawnSync git sequences block fork past RPC timeout). Config-only fix in vitest.config.ts if found, verified by 2 clean full runs with separate logs; else leave config unchanged. Always write findings note. No product-code tests required: harness config + findings note.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/vitest.config.ts",
+        "commander/docs/plans/2026-09-26-v1-1-13-vitest-ontaskupdate-findings.md"
+      ],
+      "depends_on": [7],
+      "steps": [
+        {
+          "description": "Baseline log",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run --reporter=verbose > /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/vitest-baseline.log 2>&1; echo \"exit=$?\"",
+          "expected": "log written; exit code recorded"
+        },
+        {
+          "description": "Locate error + summary lines",
+          "command": "rg -n -e 'onTaskUpdate' -e 'Unhandled' -e 'Test Files' -e 'Tests ' /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/vitest-baseline.log",
+          "expected": "error line + surrounding test files identified"
+        },
+        {
+          "description": "Diagnose: find the RPC timeout knob in vitest",
+          "command": "rg -n \"onTaskUpdate\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/node_modules/vitest/dist",
+          "expected": "source locations of RPC call/timeout"
+        },
+        {
+          "description": "Fix-or-record: if config-only fix, apply to vitest.config.ts and run 2 clean full runs logged to scratchpad vitest-run1.log / vitest-run2.log (each 0 failed, rg 'onTaskUpdate' empty); else leave config unchanged.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run > /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/vitest-run1.log 2>&1; echo \"exit=$?\"",
+          "expected": "exit=0 and no onTaskUpdate in log (repeat for vitest-run2.log)"
+        },
+        {
+          "description": "Write findings note: exact error line, implicated files, root cause (or UNVERIFIED hypothesis), change made (or none), quoted Test Files/Tests lines of verification runs.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f commander/docs/plans/2026-09-26-v1-1-13-vitest-ontaskupdate-findings.md",
+          "expected": "staged (plus `git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/vitest.config.ts` if changed)"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "name": "v1.1.13 CHANGELOG + README + full suites",
+      "description": "Docs only (no tests required: documentation; full suites are the gate). CHANGELOG: add package-lock.json to versioning-note lockstep list; retitle ## 1.1.13 to '1.1.13: The seam completes a dead worker whose workspace assignment is already resolved, plus v1.1.13 validation fixes'; replace '(`not-ready` again means strictly an active row)' with '(`not-ready` now covers every other lifecycle — active, reserved, materialized)'; append one bullet per items 1-8 (plan md Task 10 Step 1) naming files; end with deploy line. README What's New in v1.1.13: keep bullet, add user-facing bullets for kill_worker guard, grader truncation fix, reaper repo list, plus one line for classify resolved arm + alert gate/reset.",
+      "allowed_files": [
+        "CHANGELOG.md",
+        "README.md"
+      ],
+      "depends_on": [1, 2, 3, 4, 5, 6, 7, 8, 9],
+      "steps": [
+        {
+          "description": "Edit CHANGELOG.md and README.md per task description.",
+          "command": "rg -n -F \"strictly an active row\" /Users/roberthyatt/Code/ironclaude/CHANGELOG.md /Users/roberthyatt/Code/ironclaude/README.md",
+          "expected": "no output (rg exit 1)"
+        },
+        {
+          "description": "Full commander pytest",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q",
+          "expected": "0 failed; record exact pass line (>3324)"
+        },
+        {
+          "description": "Full vitest",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run",
+          "expected": "0 failed; record Tests line"
+        },
+        {
+          "description": "Hook test",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-openai-backend.sh",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add CHANGELOG.md README.md",
+          "expected": "staged"
+        }
+      ]
+    }
+  ]
+}

@@ -147,14 +147,21 @@ class WorkerRegistry:
         return dict(row) if row else None
 
     def update_worker_status(self, worker_id: str, status: str) -> None:
+        # Idempotent terminal stamp: finished_at is set only on a real status
+        # change, so re-completing an already-completed worker is a no-op for
+        # finished_at (no re-stamp on a repeated kill/finalize).
+        # Consequence: a commit_worker-recycled worker's leaked-worktree TTL
+        # (main._find_leaked_worktrees) runs from its FIRST completion; the
+        # reaper's liveness gate still protects a live session.
+        if status in ("completed", "failed", "killed"):
+            self._conn.execute(
+                "UPDATE workers SET finished_at = datetime('now') "
+                "WHERE id = ? AND status IS NOT ?",
+                (worker_id, status),
+            )
         self._conn.execute(
             "UPDATE workers SET status = ? WHERE id = ?", (status, worker_id)
         )
-        if status in ("completed", "failed", "killed"):
-            self._conn.execute(
-                "UPDATE workers SET finished_at = datetime('now') WHERE id = ?",
-                (worker_id,),
-            )
         self._conn.commit()
 
     def get_running_workers(self) -> list[dict]:

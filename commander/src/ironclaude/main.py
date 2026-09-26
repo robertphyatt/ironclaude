@@ -57,7 +57,7 @@ from ironclaude.notifications import (
     format_orphaned_orphans,
     _escape_mrkdwn,
 )
-from ironclaude.grader import LocalGrader, truncate_middle
+from ironclaude.grader import GRAMMAR_MAX_STRING_LENGTH, LocalGrader, truncate_middle
 from ironclaude.fable_availability import (
     resolve_worker_type as _resolve_fable_worker_type,
     resolve_advisor_model as _resolve_fable_advisor_model,
@@ -91,7 +91,7 @@ _BRAIN_MSG_VALIDATION_SYSTEM = (
 )
 _BRAIN_MSG_SCHEMA = {
     "type": "object",
-    "properties": {"valid": {"type": "boolean"}, "reason": {"type": "string"}},
+    "properties": {"valid": {"type": "boolean"}, "reason": {"type": "string", "maxLength": 1024}},
     "required": ["valid"],
 }
 _DIRECTIVE_REF_RE = re.compile(r'(?:#\d+|d\d+|directive\s+\d+)', re.IGNORECASE)
@@ -172,9 +172,9 @@ _AWAITING_OP_SYSTEM = (
 _AWAITING_OP_SCHEMA = {
     "type": "object",
     "properties": {
-        "waiting_on": {"type": "string", "enum": ["operator", "brain", "neither"]},
-        "worker_id": {"type": ["string", "null"]},
-        "question": {"type": ["string", "null"]},
+        "waiting_on": {"type": "string", "enum": ["operator", "brain", "neither"], "maxLength": 16},
+        "worker_id": {"type": ["string", "null"], "maxLength": 128},
+        "question": {"type": ["string", "null"], "maxLength": 1024},
     },
     "required": ["waiting_on"],
 }
@@ -194,20 +194,21 @@ _PROMPT_WAITING_SCHEMA = {
     "type": "object",
     "properties": {
         "kind": {"enum": ["none", "question", "approval", "authority"]},
-        "interaction_block": {"type": ["string", "null"]},
-        "question": {"type": ["string", "null"]},
+        "interaction_block": {"type": ["string", "null"], "maxLength": GRAMMAR_MAX_STRING_LENGTH},
+        "question": {"type": ["string", "null"], "maxLength": GRAMMAR_MAX_STRING_LENGTH},
         "options": {
             "type": "array",
+            "maxItems": 16,
             "items": {
                 "type": "object",
                 "properties": {
-                    "value": {"type": "string"},
-                    "label": {"type": "string"},
+                    "value": {"type": "string", "maxLength": 128},
+                    "label": {"type": "string", "maxLength": 512},
                 },
                 "required": ["value", "label"],
             },
         },
-        "authority_text": {"type": ["string", "null"]},
+        "authority_text": {"type": ["string", "null"], "maxLength": GRAMMAR_MAX_STRING_LENGTH},
     },
     "required": ["kind", "interaction_block", "question", "options", "authority_text"],
 }
@@ -522,19 +523,26 @@ def _managed_repositories(commander_conn, *, workspace_db_path: str | None = Non
     """Distinct (repo_path, representative_worker_or_None) the daemon manages.
     workers rows give every repo ever spawned into (local or remote, keyed by
     (repo, machine)); the local workspace-manager DB adds repos the operator's
-    own sessions used. None worker = local host."""
+    own sessions used. None worker = local host.
+    Local paths are normalized (worktree → primary), vanished ones skipped, and
+    duplicates of one repository (same git common dir) collapsed to the first seen."""
+    marker = "/.ironclaude/worktrees/"
     seen: dict[tuple[str, str], dict | None] = {}
     commander_conn.row_factory = sqlite3.Row
     for row in commander_conn.execute(
         "SELECT * FROM workers WHERE repo IS NOT NULL AND repo != '' ORDER BY spawned_at DESC"
     ).fetchall():
         worker = dict(row)
-        key = (worker["repo"], worker.get("machine") or "")
+        repo = worker["repo"]
+        if marker in repo:
+            # A worktree path recorded as a repo -> its primary repository
+            # (same rule as the workspace-DB branch below).
+            repo = repo.split(marker)[0]
+        key = (repo, worker.get("machine") or "")
         seen.setdefault(key, worker if key[1] else None)
     try:
         ws = sqlite3.connect(workspace_db_path or _workspace_manager_db_path(), timeout=10)
         try:
-            marker = "/.ironclaude/worktrees/"
             for (wt_path,) in ws.execute("SELECT worktree_path FROM assignments").fetchall():
                 if wt_path and marker in wt_path:
                     seen.setdefault((wt_path.split(marker)[0], ""), None)
@@ -542,7 +550,32 @@ def _managed_repositories(commander_conn, *, workspace_db_path: str | None = Non
             ws.close()
     except Exception as exc:
         logger.warning("Orphan reaper: could not read workspace-manager DB: %s", exc)
-    return [(repo, worker) for (repo, _machine), worker in seen.items()]
+    result: list[tuple[str, dict | None]] = []
+    local_common_dirs: set[str] = set()
+    for (repo, machine), worker in seen.items():
+        if machine:
+            result.append((repo, worker))  # remote: unchanged
+            continue
+        if not os.path.isdir(repo):
+            logger.debug("Orphan reaper: skipping vanished local repo path %s", repo)
+            continue
+        # Dedupe subdirectories/worktrees of one repository by git common dir;
+        # an unresolvable path keeps itself as its key (previous behavior).
+        common = repo
+        try:
+            proc = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                common = proc.stdout.strip()
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("Orphan reaper: git common-dir lookup failed for %s: %s", repo, exc)
+        if common in local_common_dirs:
+            continue
+        local_common_dirs.add(common)
+        result.append((repo, worker))
+    return result
 
 
 def _reap_row_less_orphans(commander_conn, workspace_client, tmux, *,
@@ -1598,6 +1631,10 @@ class IroncladeDaemon:
         # non-running cleanup so it neither leaks nor permanently suppresses a
         # re-alert on worker-id reuse.
         self._finalize_recovery_alerted: set[str] = set()
+        # Separate once-per-worker gate for the terminal-failure surface
+        # (FINALIZE_FAILURE_SURFACE_CAP), so an earlier drift/conflict/no-mode
+        # alert never swallows it and vice versa. Pruned with its counter.
+        self._finalize_failure_alerted: set[str] = set()
         # Marker-aware once-per-episode gate for the persistently-failing
         # commit_worker surface and the reopen/integrate re-arm, collapsed
         # into a single episode key: worker_id -> the highest integrate/
@@ -1701,10 +1738,20 @@ class IroncladeDaemon:
                          leave the worker running. A TERMINAL outcome with a
                          non-'finalization' failure_phase is counted; past
                          FINALIZE_FAILURE_SURFACE_CAP consecutive terminal
-                         failures it is surfaced once (never completed).
+                         failures it is surfaced once (never completed) via
+                         its own _finalize_failure_alerted gate; any other
+                         known terminal outcome resets the count; a None
+                         outcome (handle unavailable / seam raised) is neutral.
 
         Mints no commit and never calls _abandon_rescue_worker.
         """
+        phase = outcome.get("failure_phase") if isinstance(outcome, dict) else None
+        counted_failure = bool(phase) and phase != "finalization"
+        if terminal and outcome is not None and not counted_failure:
+            # 'Consecutive' means consecutive: any terminal outcome that is not
+            # a counted (non-finalization) failure breaks the streak.
+            # A None outcome (handle unavailable / seam raised) is unknown: neutral.
+            self._finalize_failure_count.pop(worker_id, None)
         mode = self._finalization_recovery_mode(outcome)
         if mode == "drift":
             attempts = self._finalize_drift_retry.get(worker_id, 0) + 1
@@ -1785,15 +1832,14 @@ class IroncladeDaemon:
         # Count consecutive terminal failures and surface ONCE past the cap.
         # Non-terminal (idle) outcomes are not counted: an idle live worker
         # legitimately returns a preserved failure every cycle.
-        phase = outcome.get("failure_phase") if isinstance(outcome, dict) else None
-        if terminal and phase and phase != "finalization":
+        if terminal and counted_failure:
             failures = self._finalize_failure_count.get(worker_id, 0) + 1
             self._finalize_failure_count[worker_id] = failures
             if (
                 failures > FINALIZE_FAILURE_SURFACE_CAP
-                and worker_id not in self._finalize_recovery_alerted
+                and worker_id not in self._finalize_failure_alerted
             ):
-                self._finalize_recovery_alerted.add(worker_id)
+                self._finalize_failure_alerted.add(worker_id)
                 error = outcome.get("error") or "no error detail"
                 self.slack.post_message(
                     f"Worker {worker_id} terminal finalize has failed {failures} "
@@ -4210,6 +4256,9 @@ class IroncladeDaemon:
         for wid in list(self._finalize_recovery_alerted):
             if wid not in running_ids:
                 self._finalize_recovery_alerted.discard(wid)
+        for wid in list(self._finalize_failure_alerted):
+            if wid not in running_ids:
+                self._finalize_failure_alerted.discard(wid)
         for wid in list(self._commit_failure_alerted):
             if wid not in running_ids:
                 self._commit_failure_alerted.discard(wid)
@@ -4513,6 +4562,7 @@ class IroncladeDaemon:
                 self._finalize_drift_retry.pop(worker_id, None)
                 self._finalize_failure_count.pop(worker_id, None)
                 self._finalize_recovery_alerted.discard(worker_id)
+                self._finalize_failure_alerted.discard(worker_id)
                 self._commit_failure_alerted.discard(worker_id)
             if (
                 _since >= FINALIZE_DRIFT_RETRY_CAP

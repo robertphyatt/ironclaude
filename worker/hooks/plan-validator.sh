@@ -183,7 +183,11 @@ call_validation_llm() {
 
       local payload
       if [ -n "$schema" ] && [ "$schema" != "{}" ]; then
-        payload=$(jq -nc --arg m "$model_o" --arg p "$prompt" --argjson mt "$maxtok" --argjson sc "$schema" \
+        local schema_maxtok
+        # json_schema grammar-bound request: floor the budget at 8192 so the
+        # bounded JSON can never be truncated into non-JSON (config may raise it).
+        schema_maxtok=$(jq -r '[(.openai.max_tokens // 0), 8192] | max' "$config" 2>/dev/null) || schema_maxtok=8192
+        payload=$(jq -nc --arg m "$model_o" --arg p "$prompt" --argjson mt "$schema_maxtok" --argjson sc "$schema" \
           '{model:$m, messages:[{role:"user",content:$p}], max_tokens:$mt, temperature:0.1, response_format:{type:"json_schema",json_schema:{name:"verdict",schema:$sc}}}')
       else
         payload=$(jq -nc --arg m "$model_o" --arg p "$prompt" --argjson mt "$maxtok" \

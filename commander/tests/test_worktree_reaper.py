@@ -816,9 +816,13 @@ class TestLiveWorkerWorktreePaths:
 class TestManagedRepositories:
     def test_dedupes_local_and_remote_and_unions_workspace_manager_repos(self, tmp_path):
         commander = _make_commander_db(tmp_path / "commander.db")
+        repo_a = tmp_path / "repoA"
+        repo_a.mkdir()
+        repo_c = tmp_path / "repoC"
+        repo_c.mkdir()
         # Local group: two workers, same repo, no machine -> deduped, worker=None.
-        _insert_worker(commander, "w1", status="completed", finished_ago="1 hour", repo="/repoA")
-        _insert_worker(commander, "w2", status="completed", finished_ago="2 hours", repo="/repoA")
+        _insert_worker(commander, "w1", status="completed", finished_ago="1 hour", repo=str(repo_a))
+        _insert_worker(commander, "w2", status="completed", finished_ago="2 hours", repo=str(repo_a))
         # Remote group: machine set -> representative worker dict, not None.
         commander.execute(
             "INSERT INTO workers (id, type, repo, machine, tmux_session, status) "
@@ -829,28 +833,86 @@ class TestManagedRepositories:
         ws_conn = _make_workspace_db(ws)
         _insert_assignment(
             ws_conn, _W1, repository_identity="repo-id",
-            worktree_path="/repoC/.ironclaude/worktrees/some-guid",
+            worktree_path=f"{repo_c}/.ironclaude/worktrees/some-guid",
         )
         ws_conn.close()
 
         repos = dict(_managed_repositories(commander, workspace_db_path=str(ws)))
 
-        assert repos["/repoA"] is None
+        assert repos[str(repo_a)] is None
         assert repos["/repoB"] is not None
         assert repos["/repoB"]["id"] == "w3"
         assert repos["/repoB"]["machine"] == "remote-host"
-        assert repos["/repoC"] is None
+        assert repos[str(repo_c)] is None
         assert len(repos) == 3
+
+    def test_worktree_path_repo_maps_to_primary_and_dedupes(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        primary = tmp_path / "primary"
+        subprocess.run(["git", "init", "-q", str(primary)], check=True)
+        # A removed worktree path recorded as a worker's repo maps to its primary.
+        _insert_worker(commander, "w1", status="completed", finished_ago="1 hour",
+                       repo=f"{primary}/.ironclaude/worktrees/gone-guid")
+        _insert_worker(commander, "w2", status="completed", finished_ago="2 hours",
+                       repo=str(primary))
+        commander.commit()
+        ws = tmp_path / "workspaces.db"
+        _make_workspace_db(ws).close()
+
+        repos = dict(_managed_repositories(commander, workspace_db_path=str(ws)))
+
+        assert repos == {str(primary): None}
+
+    def test_vanished_local_path_skipped_remote_kept(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        _insert_worker(commander, "w1", status="completed", finished_ago="1 hour",
+                       repo=str(tmp_path / "does-not-exist"))
+        commander.execute(
+            "INSERT INTO workers (id, type, repo, machine, tmux_session, status) "
+            "VALUES ('w3', 'claude', '/remote/only', 'remote-host', 'ic-worker', 'completed')"
+        )
+        commander.commit()
+        ws = tmp_path / "workspaces.db"
+        _make_workspace_db(ws).close()
+
+        repos = dict(_managed_repositories(commander, workspace_db_path=str(ws)))
+
+        assert list(repos) == ["/remote/only"]
+
+    def test_subdirectories_of_one_repo_dedupe_to_first_seen(self, tmp_path):
+        commander = _make_commander_db(tmp_path / "commander.db")
+        primary = tmp_path / "mono"
+        subprocess.run(["git", "init", "-q", str(primary)], check=True)
+        (primary / "a").mkdir()
+        (primary / "b").mkdir()
+        # spawned_at DESC: w1 (newer) is seen first.
+        _insert_worker(commander, "w1", status="completed", finished_ago="1 hour",
+                       repo=str(primary / "a"))
+        _insert_worker(commander, "w2", status="completed", finished_ago="2 hours",
+                       repo=str(primary / "b"))
+        # _insert_worker (:135) leaves spawned_at at its datetime('now') default;
+        # pin it so ORDER BY spawned_at DESC deterministically sees w1 first.
+        commander.execute("UPDATE workers SET spawned_at=datetime('now', '-1 hours') WHERE id='w1'")
+        commander.execute("UPDATE workers SET spawned_at=datetime('now', '-2 hours') WHERE id='w2'")
+        commander.commit()
+        ws = tmp_path / "workspaces.db"
+        _make_workspace_db(ws).close()
+
+        repos = dict(_managed_repositories(commander, workspace_db_path=str(ws)))
+
+        assert list(repos) == [str(primary / "a")]
 
 
 class TestReapRowLessOrphans:
     def test_partial_repo_failure_does_not_abort_sweep_and_transport_is_remote_only(self, tmp_path):
         commander = _make_commander_db(tmp_path / "commander.db")
+        repo_a = tmp_path / "repoA"
+        repo_a.mkdir()
         # Live worker in repoA: its worktree path must be protected.
-        _insert_worker(commander, "w-live", status="running", repo="/repoA")
+        _insert_worker(commander, "w-live", status="running", repo=str(repo_a))
         commander.execute(
             "UPDATE workers SET workspace_path=? WHERE id='w-live'",
-            ("/repoA/.ironclaude/worktrees/live-guid",),
+            (f"{repo_a}/.ironclaude/worktrees/live-guid",),
         )
         # Remote-group worker anchors repoB as a remote repo.
         commander.execute(
@@ -862,7 +924,7 @@ class TestReapRowLessOrphans:
         _make_workspace_db(ws).close()
 
         def reap_side_effect(payload, **_transport):
-            if payload["repository_path"] == "/repoA":
+            if payload["repository_path"] == str(repo_a):
                 raise RuntimeError("unreachable")
             return {
                 "reaped": [], "preservedDirty": [],
@@ -891,11 +953,11 @@ class TestReapRowLessOrphans:
             call.args[0]["repository_path"]: call
             for call in client.reap_orphans.call_args_list
         }
-        assert set(calls_by_repo) == {"/repoA", "/repoB"}
+        assert set(calls_by_repo) == {str(repo_a), "/repoB"}
         for call in calls_by_repo.values():
-            assert call.args[0]["protected_paths"] == ["/repoA/.ironclaude/worktrees/live-guid"]
+            assert call.args[0]["protected_paths"] == [f"{repo_a}/.ironclaude/worktrees/live-guid"]
         # Transport kwargs applied only to the worker-bearing (remote) group.
-        assert calls_by_repo["/repoA"].kwargs == {}
+        assert calls_by_repo[str(repo_a)].kwargs == {}
         assert calls_by_repo["/repoB"].kwargs == {"ssh_host": "remote-host"}
         resolve_transport.assert_called_once()
 
@@ -906,7 +968,9 @@ class TestReapRowLessOrphans:
         surviving one with the repo it came from, so a multi-repo daemon can
         disambiguate ids that only need to be unique within one repo."""
         commander = _make_commander_db(tmp_path / "commander.db")
-        _insert_worker(commander, "w1", status="completed", repo="/repo")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _insert_worker(commander, "w1", status="completed", repo=str(repo))
         ws = tmp_path / "workspaces.db"
         _make_workspace_db(ws).close()
 
@@ -935,7 +999,7 @@ class TestReapRowLessOrphans:
         preserved_detail = summary["preserved_detail"]
         ids = {d["id"] for d in preserved_detail}
         assert ids == {"d1", "d2"}  # muted d3 excluded
-        assert all(d["repository_path"] == "/repo" for d in preserved_detail)
+        assert all(d["repository_path"] == str(repo) for d in preserved_detail)
 
         # Heartbeat-count semantics: non-squash-merged, non-muted only.
         non_squash = [d for d in preserved_detail if d["category"] != "squash-merged"]
@@ -947,7 +1011,9 @@ class TestReapRowLessOrphans:
         (only preservedUnmerged branch names) must still populate
         preserved_detail so downstream count/surface logic has one shape."""
         commander = _make_commander_db(tmp_path / "commander.db")
-        _insert_worker(commander, "w1", status="completed", repo="/repo")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _insert_worker(commander, "w1", status="completed", repo=str(repo))
         ws = tmp_path / "workspaces.db"
         _make_workspace_db(ws).close()
 
@@ -964,11 +1030,11 @@ class TestReapRowLessOrphans:
 
         preserved_detail = summary["preserved_detail"]
         assert len(preserved_detail) == 2
-        assert {d["repository_path"] for d in preserved_detail} == {"/repo"}
+        assert {d["repository_path"] for d in preserved_detail} == {str(repo)}
         assert all(d.get("category") != "squash-merged" for d in preserved_detail)
         ids = {d["id"] for d in preserved_detail}
-        assert "/repo:ironclaude/y" in ids
-        assert "/repo:ironclaude/z" in ids
+        assert f"{repo}:ironclaude/y" in ids
+        assert f"{repo}:ironclaude/z" in ids
 
 
 class TestSurfacePreservedOrphans:

@@ -29,6 +29,21 @@ _SPECIAL_TOKEN_RE = re.compile(r"<\|[^>]*>")
 # Strip markdown code fences (```json ... ```) that some models wrap JSON in.
 _MARKDOWN_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
+# A schema-bound (json_schema grammar) call requests at least this many output
+# tokens so a grammar-bounded JSON object is never cut off at the token cap
+# into non-JSON. The configured openai.max_tokens may raise it, never lower it.
+GRADER_SCHEMA_MIN_MAX_TOKENS = 8192
+
+# llama.cpp hardcodes MAX_REPETITION_THRESHOLD 2000 in llama-grammar.cpp (stock
+# default, unchanged on master, no runtime flag). A json_schema maxLength compiles
+# to a char{0,N} rule, so N >= 2000 fails to build the grammar: HTTP 500 "Failed
+# to parse input" and unconstrained output. Measured live on the deployed server
+# (grader and shadow models, every real grade schema): 1999 passes, 2000 fails.
+# See docs/plans/2026-09-26-grammar-maxlength-bisect-findings.md.
+LLAMA_CPP_MAX_REPETITION_THRESHOLD = 2000
+# The cap every long schema field uses: the stock ceiling itself.
+GRAMMAR_MAX_STRING_LENGTH = LLAMA_CPP_MAX_REPETITION_THRESHOLD - 1
+
 
 class LocalGrader:
     """Thin wrapper around OllamaClient for LLM-based grading.
@@ -203,7 +218,10 @@ class LocalGrader:
                 "messages": [
                     {"role": "user", "content": f"{profiled_system_prompt}\n\n{user_prompt}"}
                 ],
-                "max_tokens": openai_max_tokens or 1024,
+                "max_tokens": (
+                    max(openai_max_tokens or 0, GRADER_SCHEMA_MIN_MAX_TOKENS)
+                    if schema is not None else (openai_max_tokens or 1024)
+                ),
                 "temperature": 0.1,
             }
             if schema is not None:

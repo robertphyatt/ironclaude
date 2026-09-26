@@ -14,6 +14,7 @@ from ironclaude.communication_profiles import (
     apply_communication_profile,
 )
 from ironclaude.backend_resolver import make_client, resolve_backend
+from ironclaude.grader import GRADER_SCHEMA_MIN_MAX_TOKENS, GRAMMAR_MAX_STRING_LENGTH
 from ironclaude.ollama_client import OllamaClient, OllamaError
 
 logger = logging.getLogger(__name__)
@@ -98,10 +99,12 @@ RULES:
 GRADER_VERDICT_SCHEMA = {
     "type": "object",
     "properties": {
-        "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"]},
+        "grade": {"type": "string", "enum": ["A", "B", "C", "D", "F"], "maxLength": 1},
         "approved": {"type": "boolean"},
-        "feedback": {"type": "string"},
-        "confidence_in_disagreement": {"type": "string", "enum": ["low", "medium", "high"]},
+        "feedback": {"type": "string", "maxLength": GRAMMAR_MAX_STRING_LENGTH},
+        "confidence_in_disagreement": {
+            "type": "string", "enum": ["low", "medium", "high"], "maxLength": 8,
+        },
     },
     "required": ["grade", "approved", "feedback", "confidence_in_disagreement"],
 }
@@ -380,7 +383,7 @@ class ShadowGrader:
             verdict_payload = {
                 "model": self._model,
                 "messages": messages,
-                "max_tokens": self._max_tokens,
+                "max_tokens": max(self._max_tokens, GRADER_SCHEMA_MIN_MAX_TOKENS),
                 "temperature": 0.1,
                 "response_format": {
                     "type": "json_schema",
