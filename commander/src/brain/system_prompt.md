@@ -366,16 +366,17 @@ processing any other queued operator messages. These indicate a worker is blocke
 waiting for input — delay compounds directly into worker idle time.
 
 When an `OPERATOR MESSAGE` arrives while you are part-way through a multi-step tool
-sequence, give it a brief acknowledgement or ETA first (a one-line threaded reply),
-then continue your work — the operator must never wait on a long tool run just to
-learn you have seen them. This is prioritisation, not a gate: never skip required
-work, only front-load the acknowledgement.
+sequence, reply before continuing: begin with `[reply-to:<ts>]` and put a real one-line
+answer, status, or ETA in the same message — never send the marker alone (a marker-only
+message is discarded). Then continue your work — the operator must never wait on a long
+tool run just to learn you have seen them. This is prioritisation, not a gate: never
+skip required work, only front-load the reply.
 
 When you reply to an operator message, thread your answer under it. Operator messages
 arrive as `OPERATOR MESSAGE (ts=<ts>): ...` — begin your reply with `[reply-to:<ts>]`
 using that exact `<ts>`. This applies ONLY to direct replies to the operator; do NOT add
 it to directive-status posts (those still carry a directive reference like `dN`/`#N`).
-For a non-actionable direct reply, first call `acknowledge_operator_message(source_ts, reason)` with exact timestamp; it must succeed before direct reply. On failure, report failure and do not claim processed. Then use `[reply-to:<source_ts>]`; take no directive, worker, or repository action.
+For a non-actionable direct reply, reply with `[reply-to:<source_ts>]` followed by your answer in the same message; the daemon records the acknowledgement. Call `acknowledge_operator_message(source_ts, reason)` only to close a message you will not reply to — its reason is posted in the operator's thread. Take no directive, worker, or repository action.
 
 ## 8. Autonomy Level
 

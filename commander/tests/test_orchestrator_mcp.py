@@ -10917,11 +10917,67 @@ class TestAcknowledgeOperatorMessage:
 
         def persist(conn, source_ts, reason):
             calls.append((conn, source_ts, reason))
-            return expected
+            return expected, False
 
-        monkeypatch.setattr(orchestrator_mcp, "persist_operator_message_acknowledgement", persist)
+        monkeypatch.setattr(orchestrator_mcp, "persist_operator_message_acknowledgement_with_status", persist)
         assert tools.acknowledge_operator_message(self.SOURCE_TS, "no action") == expected
         assert calls == [(db_conn, self.SOURCE_TS, "no action")]
+
+    def _tools_with_slack(self, db_conn, registry, mock_tmux, slack):
+        return OrchestratorTools(registry, mock_tmux, db_conn=db_conn, slack_bot=slack)
+
+    def test_new_acknowledgement_posts_reason_in_thread_and_reacts(self, db_conn, registry, mock_tmux):
+        slack = MagicMock()
+        slack.post_message.return_value = "1785731070.000100"
+        tools = self._tools_with_slack(db_conn, registry, mock_tmux, slack)
+        result = tools.acknowledge_operator_message(self.SOURCE_TS, "No reply needed — informational.")
+        assert result["reason"] == "No reply needed — informational."
+        slack.post_message.assert_called_once_with("No reply needed — informational.", thread_ts=self.SOURCE_TS)
+        slack.add_reaction.assert_called_once_with("white_check_mark", self.SOURCE_TS)
+
+    def test_repeat_acknowledgement_posts_nothing(self, db_conn, registry, mock_tmux):
+        slack = MagicMock()
+        slack.post_message.return_value = "1785731070.000100"
+        tools = self._tools_with_slack(db_conn, registry, mock_tmux, slack)
+        tools.acknowledge_operator_message(self.SOURCE_TS, "first")
+        tools.acknowledge_operator_message(self.SOURCE_TS, "second")
+        assert slack.post_message.call_count == 1
+        assert slack.add_reaction.call_count == 1
+
+    def test_acknowledgement_after_delivered_reply_posts_nothing(self, db_conn, registry, mock_tmux):
+        from ironclaude.db import DIRECT_REPLY_FALLBACK_REASON, persist_operator_message_acknowledgement
+        persist_operator_message_acknowledgement(db_conn, self.SOURCE_TS, DIRECT_REPLY_FALLBACK_REASON)
+        slack = MagicMock()
+        tools = self._tools_with_slack(db_conn, registry, mock_tmux, slack)
+        tools.acknowledge_operator_message(self.SOURCE_TS, "late close")
+        slack.post_message.assert_not_called()
+        slack.add_reaction.assert_not_called()
+
+    def test_slack_error_never_raises_and_ack_is_kept(self, db_conn, registry, mock_tmux):
+        slack = MagicMock()
+        slack.post_message.side_effect = RuntimeError("slack down")
+        tools = self._tools_with_slack(db_conn, registry, mock_tmux, slack)
+        result = tools.acknowledge_operator_message(self.SOURCE_TS, "closing")
+        assert result["reason"] == "closing"
+        slack.add_reaction.assert_not_called()
+        assert db_conn.execute(
+            "SELECT reason FROM operator_message_acknowledgements WHERE source_ts=?",
+            (self.SOURCE_TS,),
+        ).fetchone()[0] == "closing"
+
+    def test_failed_post_skips_reaction(self, db_conn, registry, mock_tmux):
+        slack = MagicMock()
+        slack.post_message.return_value = None
+        tools = self._tools_with_slack(db_conn, registry, mock_tmux, slack)
+        tools.acknowledge_operator_message(self.SOURCE_TS, "closing")
+        slack.add_reaction.assert_not_called()
+
+    def test_mcp_tool_description_says_reason_is_posted(self, db_conn, registry, mock_tmux):
+        from ironclaude.orchestrator_mcp import _create_mcp_server
+        server = _create_mcp_server(self._tools(db_conn, registry, mock_tmux))
+        description = server._tool_manager.get_tool("acknowledge_operator_message").description
+        assert "posted in the operator message's thread" in description
+        assert "with no reply" in description
 
 
 _FINALIZE_OWNER = "11111111-1111-4111-8111-111111111111"

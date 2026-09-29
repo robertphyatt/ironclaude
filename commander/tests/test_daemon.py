@@ -114,12 +114,21 @@ class TestBrainStartupLogging:
         brain.is_alive.assert_not_called()
 
 
-def test_brain_direct_reply_requires_acknowledgement_before_threaded_reply():
+def test_brain_direct_reply_owns_closure_and_ack_is_for_no_reply():
     for text in _brain_instruction_surfaces():
         assert "acknowledge_operator_message(source_ts, reason)" in text
-        assert "must succeed before direct reply" in text
+        assert "only to close a message you will not reply to" in text
+        assert "the daemon records the acknowledgement" in text
         assert "no directive, worker, or repository action" in text
         assert "[reply-to:<source_ts>]" in text
+        assert "must succeed before direct reply" not in text
+
+
+def test_brain_reply_marker_never_sent_alone():
+    text = _brain_instruction_surfaces()[0]
+    assert "brief acknowledgement or ETA first" not in text
+    assert "never send the marker alone" in text
+    assert "in the same message" in text
 
 
 @pytest.fixture

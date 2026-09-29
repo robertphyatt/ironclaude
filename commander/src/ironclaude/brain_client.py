@@ -28,6 +28,8 @@ from ironclaude.provider_config import _semantic_tier
 from ironclaude.grader import LocalGrader
 from ironclaude.signal_forensics import _logged_kill
 from ironclaude.fable_availability import mark_fable_unavailable as _mark_fable_unavailable
+from ironclaude.fable_availability import parse_reset_time
+from ironclaude.slack_interface import parse_reply_to_marker
 
 logger = logging.getLogger("ironclaude.brain")
 
@@ -111,6 +113,24 @@ def _is_usage_limit_text(text: str) -> bool:
     return "hit your limit" in text.lower()
 
 
+# separators seen in the wild: middle-dot, colon, hyphen, em-dash; apostrophe may be straight or curly
+_ACCOUNT_LIMIT_RE = re.compile(r"you['’]?ve hit your limit(?:\s*[·:\-—]\s*(resets[^\n]*))?", re.IGNORECASE)
+_WORKER_LIMIT_RE = re.compile(r"(?<!no )(?:session limit hit|rate-limit menu)", re.IGNORECASE)  # not "no session limit hit"
+
+
+def detect_account_limit(text: str):
+    """Return a human reset string if `text` signals an account/worker usage limit, else None.
+    Shared signal set with the Fable-gate deferred usage detector ('hit your limit')."""
+    if not text:
+        return None
+    m = _ACCOUNT_LIMIT_RE.search(text)
+    if m:
+        return (m.group(1) or "reset time unknown").strip()
+    if _WORKER_LIMIT_RE.search(text):
+        return "reset time unknown"
+    return None
+
+
 class _ModelUnavailableFromMessage(Exception):
     """Raised when the brain's assistant TEXT (not an exception) signals the model
     is unavailable, so the outer handler can fall back to opus — mirroring the
@@ -137,6 +157,11 @@ def _model_needs_1m_beta(model: str) -> bool:
 # directive-ref/reason gate so narration never triggers the [CONTEXT REQUIRED] feedback
 # loop (the d1435 restart-loop bug).
 _NARRATION_PREFIX = "[NARRATION] "
+
+# Tag for an account usage-limit reply received on the opus fallback (nothing higher to
+# fall back to). main.py's poll_brain_responses raises the account-limit alert for it
+# and never relays it as narration or chatter.
+_LIMIT_PREFIX = "[BRAIN-LIMIT] "
 
 
 class BrainClient:
@@ -237,6 +262,16 @@ class BrainClient:
         # Set when the idle Brain is probed instead of restarted; cleared on any
         # SDK activity and on restart(). See needs_restart().
         self._ping_sent_at: float = 0.0
+        # R1: the [reply-to:<ts>] target of the current Brain turn (None = no target).
+        # Carried onto later unmarked text in the same turn; cleared on ResultMessage.
+        self._turn_reply_ts: str | None = None
+        # R3: the usage-limit text of the last bounce on the opus fallback (None = not
+        # limited). While set: no liveness credit, no timeout restart; cleared by the next
+        # real reply and by restart().
+        self._usage_limit: str | None = None
+        # R5.1: epoch after which a usage-limited state stops suppressing liveness checks
+        # (reported reset + 15 min, or 1 h after the bounce when no reset time is given).
+        self._usage_limit_until: float = 0.0
         self._last_restart_time = 0.0
         self._memory_armed: bool = False
         self._wiki_queried: bool = False
@@ -808,51 +843,84 @@ class BrainClient:
                 logger.warning(f"Failed to discover brain subprocess PID: {e}")
 
         async def _run_session(opts: ClaudeAgentOptions) -> None:
+            # A new SDK session starts a new turn: a reply target left by a turn that ended
+            # without a ResultMessage (model fallback, retry) must not carry into it.
+            self._turn_reply_ts = None
             pid_task = asyncio.create_task(_discover_and_write_pid())
             try:
                 async for message in query(prompt=message_generator(), options=opts):
-                    self._note_sdk_activity()
                     if isinstance(message, ResultMessage):
                         self._session_id = message.session_id
                         self._executing_tool = False
+                        self._turn_reply_ts = None
                         if message.usage:
                             self._total_input_tokens += message.usage.get("input_tokens", 0) or 0
                             self._total_output_tokens += message.usage.get("output_tokens", 0) or 0
                         if message.total_cost_usd is not None:
                             self._total_cost_usd += message.total_cost_usd
-                    if isinstance(message, AssistantMessage):
-                        text_parts = []
-                        for block in message.content:
-                            if isinstance(block, TextBlock):
-                                text_parts.append(block.text)
-                        if text_parts:
-                            full_text = "\n\n".join(text_parts)
-                            # Message-shaped model-unavailability OR account usage-limit:
-                            # the SDK returned the error as normal assistant text rather
-                            # than raising, so the exception fallback never fires. Detect
-                            # it and fall back to opus (unless already on opus — nothing
-                            # higher to try). A usage-limit reason is sized to the account
-                            # reset time by fable_availability; a genuine outage to 24h.
-                            if (
-                                (_is_model_unavailable_text(full_text)
-                                 or _is_usage_limit_text(full_text))
-                                and "opus" not in self._model.lower()
-                            ):
-                                raise _ModelUnavailableFromMessage(full_text)
-                            self._executing_tool = False
-                            self._session_log_write(f"MSG_SEND chars={len(full_text)} preview={full_text[:100]!r}")
-                            logger.info(f"Brain response received ({len(full_text)} chars)")
-                            # Thread-only narration relay: operators see the Brain thinking
-                            # under the heartbeat thread. Tagged so poll_brain_responses routes
-                            # it around the directive-ref/reason gate (never [CONTEXT REQUIRED]).
-                            # Skip outage/limit text (belt-and-braces for the opus edge where
-                            # the raise above is bypassed) — that is surfaced separately.
-                            if not (_is_model_unavailable_text(full_text)
-                                    or _is_usage_limit_text(full_text)):
-                                self._response_queue.put(f"{_NARRATION_PREFIX}{full_text}")
-                            correction = await self._maybe_correct_permission_seeking(full_text)
-                            if correction is not None:
-                                await self._message_queue.put(correction)
+                        # R3.3: a turn that ended on a usage-limit bounce is not liveness.
+                        if self._usage_limit is None:
+                            self._note_sdk_activity()
+                        continue
+                    if not isinstance(message, AssistantMessage):
+                        self._note_sdk_activity()
+                        continue
+                    text_parts = []
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            text_parts.append(block.text)
+                    full_text = "\n\n".join(text_parts) if text_parts else ""
+                    # Message-shaped model-unavailability OR account usage-limit:
+                    # the SDK returned the error as normal assistant text rather
+                    # than raising, so the exception fallback never fires. Detect
+                    # it and fall back to opus (unless already on opus — nothing
+                    # higher to try). A usage-limit reason is sized to the account
+                    # reset time by fable_availability; a genuine outage to 24h.
+                    if (
+                        full_text
+                        and (_is_model_unavailable_text(full_text)
+                             or _is_usage_limit_text(full_text))
+                        and "opus" not in self._model.lower()
+                    ):
+                        raise _ModelUnavailableFromMessage(full_text)
+                    if full_text and _is_usage_limit_text(full_text):
+                        # R3.1: on opus there is nothing higher to fall back to. Surface the
+                        # limit for the daemon's account-limit alert; the bounce is NOT
+                        # liveness (no _note_sdk_activity) and suppresses timeout restarts.
+                        self._executing_tool = False
+                        self._usage_limit = full_text
+                        # R6.2: a bounce answers an outstanding [PING] probe without crediting
+                        # liveness, so window expiry never reads it as an unanswered probe.
+                        self._ping_sent_at = 0.0
+                        _now = time.time()
+                        _reset = parse_reset_time(full_text, _now)
+                        if _reset is not None:
+                            # R6.3: same 6 h clamp fable_availability applies to this parse.
+                            _reset = min(_reset, _now + 6 * 3600)
+                        self._usage_limit_until = (_reset + 900) if _reset is not None else _now + 3600
+                        self._session_log_write(f"MSG_LIMIT chars={len(full_text)} preview={full_text[:100]!r}")
+                        logger.warning(f"Brain usage-limited: {full_text[:200]!r}")
+                        self._response_queue.put(f"{_LIMIT_PREFIX}{full_text}")
+                        continue
+                    self._note_sdk_activity()
+                    if not full_text:
+                        continue
+                    self._usage_limit = None
+                    self._executing_tool = False
+                    self._session_log_write(f"MSG_SEND chars={len(full_text)} preview={full_text[:100]!r}")
+                    logger.info(f"Brain response received ({len(full_text)} chars)")
+                    # Thread-only narration relay: operators see the Brain thinking
+                    # under the heartbeat thread. Tagged so poll_brain_responses routes
+                    # it around the directive-ref/reason gate (never [CONTEXT REQUIRED]).
+                    # Skip outage text on the opus edge where the raise above is bypassed;
+                    # a usage limit is surfaced above via _LIMIT_PREFIX.
+                    if not _is_model_unavailable_text(full_text):
+                        self._response_queue.put(
+                            f"{_NARRATION_PREFIX}{self._apply_turn_reply_target(full_text)}"
+                        )
+                    correction = await self._maybe_correct_permission_seeking(full_text)
+                    if correction is not None:
+                        await self._message_queue.put(correction)
             finally:
                 pid_task.cancel()
                 try:
@@ -887,6 +955,24 @@ class BrainClient:
                 await _run_session(_build_options(resolved))
             else:
                 raise
+
+    def _apply_turn_reply_target(self, text: str) -> str:
+        """Carry the turn's [reply-to:<ts>] target onto later unmarked text (R1).
+
+        The Brain may send the marker alone, then the answer after a tool call. The
+        daemon drops the marker-only message (ghost-post guard), so without this the
+        answer loses its thread target and lands in the heartbeat thread. A malformed
+        marker never becomes a target (the daemon drops that message)."""
+        parsed = parse_reply_to_marker(text)
+        if parsed is None:
+            return text
+        _body, ts = parsed
+        if ts is not None:
+            self._turn_reply_ts = ts
+            return text.lstrip()
+        if self._turn_reply_ts is not None:
+            return f"[reply-to:{self._turn_reply_ts}] {text}"
+        return text
 
     def send_message(self, text: str) -> bool:
         """Send a message to the brain. Thread-safe."""
@@ -943,6 +1029,16 @@ class BrainClient:
         if not self.is_alive():
             self._restart_reason = "dead (thread not alive)"
             return True
+        # R3.4: a usage-limited Brain is waiting on an account reset — a restart cannot
+        # cure that, and every attempt would count toward the restart circuit breaker.
+        if self._usage_limit is not None:
+            if time.time() < self._usage_limit_until:
+                return False
+            # R5.1: the reset window has passed — stop suppressing, fall through to the
+            # normal checks (idle PING probe, hard net, timeouts) so a stale state or a
+            # wedged subprocess recovers.
+            logger.info("Brain usage-limit window passed; resuming liveness checks")
+            self._usage_limit = None
         # Hard safety net: fires even during tool execution (1800s)
         if (
             self._executing_tool
@@ -1046,6 +1142,9 @@ class BrainClient:
         self._last_response_time = 0.0
         self._executing_tool = False
         self._ping_sent_at = 0.0
+        self._turn_reply_ts = None
+        self._usage_limit = None
+        self._usage_limit_until = 0.0
         self.start(system_prompt, cwd)
         if self.is_alive():
             self.restart_count += 1
@@ -1068,6 +1167,10 @@ class BrainClient:
             "total_tokens": total,
             "cost_usd": self._total_cost_usd,
             "seconds_since_last_activity": age,
+            "usage_limited": (
+                (detect_account_limit(self._usage_limit) or "reset time unknown")
+                if self._usage_limit is not None else None
+            ),
         }
 
     def _kill_brain_subprocess(self) -> None:

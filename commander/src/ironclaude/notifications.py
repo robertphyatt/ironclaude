@@ -193,7 +193,13 @@ def format_heartbeat(
         out = brain_usage.get("output_tokens", 0)
         total = brain_usage.get("total_tokens", 0)
         line = f"🧠 Brain: {_fmt_tokens(total)} tokens ({_fmt_tokens(inp)} in + {_fmt_tokens(out)} out)"
-        if total == 0:
+        limited = brain_usage.get("usage_limited")
+        if limited:
+            line += (
+                f" — usage-limited ({_escape_mrkdwn(str(limited))}); "
+                "resend urgent messages after reset"
+            )
+        elif total == 0:
             age = brain_usage.get("seconds_since_last_activity")
             if age is not None:
                 line += f" — turn in progress (last activity {_fmt_duration(age)} ago)"

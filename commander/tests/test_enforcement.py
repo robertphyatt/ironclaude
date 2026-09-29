@@ -327,6 +327,21 @@ class TestCheckMessageAging:
         msg = daemon.brain.send_message.call_args[0][0]
         assert "[UNPROCESSED MESSAGE]" in msg
         assert "Fix the login bug" in msg
+        assert "reply with [reply-to:" in msg
+        assert "or acknowledge it" not in msg
+
+    def test_suppressed_while_brain_usage_limited(self, daemon):
+        """R8.3: while the Brain is usage-limited the aging reminder stays quiet (and marks
+        nothing), so it fires normally after recovery."""
+        daemon._last_message_aging_check = 0.0
+        daemon._brain_limited_since = time.time() - 600
+        old_ts = str(time.time() - 2400)
+        daemon.slack.get_recent_messages.return_value = [
+            {"text": "Fix the login bug", "ts": old_ts, "user": "U_OPERATOR"},
+        ]
+        daemon.check_message_aging()
+        daemon.brain.send_message.assert_not_called()
+        assert old_ts not in daemon._message_aging_alerted
 
     def test_no_alert_for_recent_messages(self, daemon):
         """No alert for messages <30min old."""

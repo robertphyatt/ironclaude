@@ -38,6 +38,7 @@ from ironclaude.config import make_opus_command, effort_for_tier
 from ironclaude.db import (
     DIRECT_REPLY_FALLBACK_REASON,
     persist_operator_message_acknowledgement,
+    persist_operator_message_acknowledgement_with_status,
 )
 from ironclaude.brain_client import _model_needs_1m_beta
 from ironclaude.fable_availability import (
@@ -1755,10 +1756,26 @@ class OrchestratorTools:
         return {"id": directive_id, "status": "pending_confirmation"}
 
     def acknowledge_operator_message(self, source_ts: str, reason: str) -> dict:
-        """Persist an immutable no-action disposition for one Slack message."""
+        """Persist an immutable no-action disposition for one Slack message.
+
+        This closes a message with no reply. When this call creates the acknowledgement,
+        the reason is posted in the operator message's thread and the message gets ✅,
+        so a closure is always visible. A repeat call, or a message already closed by a
+        delivered [reply-to] reply, posts nothing. Slack failures never raise."""
         if self._db is None:
             raise RuntimeError("Database connection required for directive operations")
-        return persist_operator_message_acknowledgement(self._db, source_ts, reason)
+        result, created = persist_operator_message_acknowledgement_with_status(
+            self._db, source_ts, reason
+        )
+        if created and self._slack is not None:
+            try:
+                if self._slack.post_message(result["reason"], thread_ts=source_ts) is not None:
+                    self._slack.add_reaction("white_check_mark", source_ts)
+            except Exception:
+                logger.warning(
+                    "Acknowledgement closure post failed | source_ts=%s", source_ts, exc_info=True,
+                )
+        return result
 
     def push_repo(self, repo: str, remote: str = "origin", branch: str = "") -> dict | str:
         """Submit a git push request for operator confirmation via Slack.
@@ -7465,14 +7482,19 @@ def _create_mcp_server(tools: OrchestratorTools, plugin_dirs: list[str] | None =
 
     @mcp.tool()
     def acknowledge_operator_message(source_ts: str, reason: str) -> str:
-        """Record an immutable no-action disposition for one Slack message.
+        """Close one operator Slack message with no reply, recording an immutable disposition.
+
+        Use this only when you will NOT reply; a [reply-to:<ts>] reply records its own
+        acknowledgement. The reason is posted in the operator message's thread (with ✅)
+        when this call creates the acknowledgement, so write it as a short sentence for
+        the operator.
 
         Args:
             source_ts: Exact Slack timestamp string for the operator message.
-            reason: Non-blank reason the message needs no directive.
+            reason: Non-blank reason the message needs no directive and no reply.
 
         Returns JSON with the stored acknowledgement. Repeated calls return the
-        original acknowledgement unchanged.
+        original acknowledgement unchanged and post nothing.
         """
         return json.dumps(tools.acknowledge_operator_message(source_ts, reason))
 

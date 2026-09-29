@@ -1,0 +1,123 @@
+{
+  "name": "v1.1.14 Simplification: Replace the Recovery Sweep with a Notice",
+  "goal": "Remove the usage-limit recovery sweep and replace it with one Slack recovery notice, the aging reminder staying quiet while the Brain is limited, and honest heartbeat and docs wording.",
+  "requirements_file": "docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes-requirements.md",
+  "design_file": "docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes-design.md",
+  "tasks": [
+    {
+      "id": 13,
+      "name": "Remove the sweep; add the recovery notice and aging suppression (R8.1-R8.3)",
+      "description": "main.py: delete the _brain_limited_last field, _sweep_after_usage_limit, and sweep_due with its post-loop call; restore _get_unprocessed_messages to its original single-parameter form; keep _brain_limited_since. On the first non-limit response while limited, post one top-level Slack recovery notice and clear the timestamp. check_message_aging returns early while limited. Tests: remove the sweep tests and helpers; add two notice tests and one aging-suppression test. Code is verbatim in the human plan docs/plans/2026-09-29-v1-1-14-simplify-limit-recovery.md, Task 13.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_main_validate.py",
+        "commander/tests/test_enforcement.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED (human plan Task 13 Step 1): (a) delete d._brain_limited_last = None from _make_poll_daemon; (b) replace the block from _SWEEP_LIMIT through the last sweep test (before test_format_mem_line_skips_unreadable_procs) with _NOTICE_LIMIT, _recovery_notices, test_recovery_notice_posted_once_after_limit and test_recovery_notice_on_ping_ack; (c) add test_suppressed_while_brain_usage_limited to test_enforcement.py TestCheckMessageAging."
+        },
+        {
+          "description": "Run the tests and confirm they fail.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_main_validate.py tests/test_enforcement.py -k \"recovery_notice or suppressed_while_brain_usage_limited\"",
+          "expected": "3 failed"
+        },
+        {
+          "description": "GREEN (human plan Task 13 Step 3): (a) the __init__ fields; (b) restore _get_unprocessed_messages; (c) delete _sweep_after_usage_limit; (d) the aging early return; (e) the recovery notice at the top of the poll loop; (f) the simplified bounce branch; (g) delete the post-loop sweep call."
+        },
+        {
+          "description": "Run the tests and confirm they pass.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_main_validate.py tests/test_enforcement.py tests/test_daemon.py",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Confirm that no sweep code or tests remain.",
+          "command": "rg -n -e \"_sweep_after_usage_limit\" -e \"_brain_limited_last\" -e \"sweep_due\" -e \"USAGE LIMIT RECOVERED\" -e \"oldest: float\" -e \"_SWEEP_LIMIT\" /Users/roberthyatt/Code/ironclaude/commander/src /Users/roberthyatt/Code/ironclaude/commander/tests",
+          "expected": "no output, exit 1"
+        },
+        {
+          "description": "Stage.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/tests/test_main_validate.py commander/tests/test_enforcement.py",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "name": "Honest heartbeat wording (R8.4)",
+      "description": "Change the notifications.py heartbeat string 'unanswered messages retried after reset' to 'resend urgent messages after reset', and update test_notifications. Code is verbatim in human plan Task 14.",
+      "allowed_files": [
+        "commander/src/ironclaude/notifications.py",
+        "commander/tests/test_notifications.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: in test_heartbeat_usage_limited_replaces_turn_in_progress, expect '...; resend urgent messages after reset' and assert 'retried' not in msg (human plan Task 14 Step 1)."
+        },
+        {
+          "description": "Run the test and confirm it fails.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_notifications.py -k usage_limited_replaces",
+          "expected": "1 failed"
+        },
+        {
+          "description": "GREEN: replace the literal \"unanswered messages retried after reset\" with \"resend urgent messages after reset\" in notifications.py."
+        },
+        {
+          "description": "Run the tests and confirm they pass.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_notifications.py",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Stage.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/notifications.py commander/tests/test_notifications.py",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "name": "CHANGELOG, README and full suite (R8.5)",
+      "description": "No tests required: this task edits docs only; the full suite verifies it. Run the full suite; replace the CHANGELOG 1.1.14 third bullet (line 18) with the simplified text; update the suite count; add the multi-day-limit known-issue line after the Deploy line; replace the README line 22 retry sentence. Text is verbatim in human plan Task 15.",
+      "allowed_files": [
+        "CHANGELOG.md",
+        "README.md"
+      ],
+      "depends_on": [13, 14],
+      "steps": [
+        {
+          "description": "Run the full commander suite; record the passed count N.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Edit CHANGELOG per human plan Task 15 Step 2: (a) replace the third bullet; (b) Suites: commander <N>; (c) add the known-issue line after the Deploy line."
+        },
+        {
+          "description": "Edit README line 22: 'Unanswered messages are retried after the reset.' becomes 'When it recovers, a Slack notice tells you so; resend anything urgent.'"
+        },
+        {
+          "description": "Verify the stale wording is gone.",
+          "command": "rg -n -F -e \"USAGE LIMIT RECOVERED\" -e \"retried after\" /Users/roberthyatt/Code/ironclaude/CHANGELOG.md /Users/roberthyatt/Code/ironclaude/README.md",
+          "expected": "no output, exit 1"
+        },
+        {
+          "description": "Verify the new wording is present.",
+          "command": "rg -n -F -e \"Known issue: a multi-day usage limit\" -e \"a Slack notice tells you so\" /Users/roberthyatt/Code/ironclaude/CHANGELOG.md /Users/roberthyatt/Code/ironclaude/README.md",
+          "expected": "2 lines, one in each file"
+        },
+        {
+          "description": "Stage the docs.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add CHANGELOG.md README.md",
+          "expected": "exit 0"
+        },
+        {
+          "description": "Force-stage the plan artifacts.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes-requirements.md docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes-design.md docs/plans/2026-09-29-v1-1-14-simplify-limit-recovery.md docs/plans/2026-09-29-v1-1-14-simplify-limit-recovery.plan.json",
+          "expected": "exit 0"
+        }
+      ]
+    }
+  ]
+}

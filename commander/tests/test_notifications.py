@@ -402,6 +402,23 @@ class TestHeartbeatBrainLine:
         msg = format_heartbeat(workers, brain_usage=brain_usage)
         assert "turn in progress" not in msg
 
+    def test_heartbeat_usage_limited_replaces_turn_in_progress(self):
+        workers = [{"id": "w-1", "description": "Your task: Fix auth", "workflow_stage": "executing"}]
+        brain_usage = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0,
+                       "seconds_since_last_activity": 180,
+                       "usage_limited": "resets 4:10am (America/Chicago)"}
+        msg = format_heartbeat(workers, brain_usage=brain_usage)
+        assert "usage-limited (resets 4:10am (America/Chicago)); resend urgent messages after reset" in msg
+        assert "retried" not in msg
+        assert "turn in progress" not in msg
+
+    def test_heartbeat_usage_limited_escapes_mrkdwn(self):
+        workers = [{"id": "w-1", "description": "Your task: Fix auth", "workflow_stage": "executing"}]
+        brain_usage = {"total_tokens": 10, "input_tokens": 5, "output_tokens": 5,
+                       "usage_limited": "resets <soon> & later"}
+        msg = format_heartbeat(workers, brain_usage=brain_usage)
+        assert "usage-limited (resets &lt;soon&gt; &amp; later)" in msg
+
 
 class TestFmtDuration:
     def test_fmt_duration_seconds(self):

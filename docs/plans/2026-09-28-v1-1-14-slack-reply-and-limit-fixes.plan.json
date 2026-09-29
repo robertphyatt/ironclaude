@@ -1,0 +1,287 @@
+{
+  "name": "v1.1.14 Slack Reply and Usage-Limit Fixes",
+  "goal": "Thread a Brain reply split across messages under the operator's message, make no-reply acknowledgements visible in the operator's thread (reply owns closure), surface an opus-fallback usage limit honestly (alert, no liveness credit, no timeout restarts, heartbeat state), and release v1.1.14.",
+  "requirements_file": "docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes-requirements.md",
+  "design_file": "docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Carry the reply target through a Brain turn (R1.1-R1.5)",
+      "description": "brain_client records a turn's [reply-to:<ts>] target and prefixes it onto later unmarked text in the same turn. It is cleared on ResultMessage and in restart(), and a malformed marker never becomes a target. The daemon's existing marker-led routing threads the text and adds ✅. Code blocks are verbatim in the human plan docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes.md, Task 1. Execution invariants from the human plan apply.",
+      "allowed_files": [
+        "commander/src/ironclaude/brain_client.py",
+        "commander/tests/test_brain_client.py",
+        "commander/tests/test_main_validate.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: insert class TestTurnReplyTarget (helpers _run/_am/_result; tests test_marker_only_then_unmarked_answer_carries_target, test_target_cleared_at_turn_end, test_later_marker_replaces_target, test_malformed_marker_is_not_a_target) immediately before `class TestModelUnavailableFableTransition:` in commander/tests/test_brain_client.py. Use the code exactly as in human plan Task 1 Step 1."
+        },
+        {
+          "description": "RED: add method test_split_reply_turn_threads_answer_under_operator_message to class TestOperatorWaits in commander/tests/test_main_validate.py, right after test_reply_long_text_is_chunked. Use the code exactly as in human plan Task 1 Step 2."
+        },
+        {
+          "description": "Run the new tests and confirm they fail.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_brain_client.py::TestTurnReplyTarget \"tests/test_main_validate.py::TestOperatorWaits::test_split_reply_turn_threads_answer_under_operator_message\"",
+          "expected": "test_marker_only_then_unmarked_answer_carries_target, test_later_marker_replaces_target and test_split_reply_turn_threads_answer_under_operator_message FAIL (AssertionError); test_target_cleared_at_turn_end and test_malformed_marker_is_not_a_target pass (guards)"
+        },
+        {
+          "description": "GREEN: in brain_client.py make edits (a)-(f) from human plan Task 1 Step 4. (a) Import parse_reply_to_marker from ironclaude.slack_interface after the fable_availability import. (b) Add self._turn_reply_ts: str | None = None after self._ping_sent_at in __init__. (c) Add the _apply_turn_reply_target method before send_message. (d) Set self._turn_reply_ts = None in the ResultMessage branch after self._executing_tool = False. (e) Queue f\"{_NARRATION_PREFIX}{self._apply_turn_reply_target(full_text)}\". (f) Reset self._turn_reply_ts = None in restart() after self._ping_sent_at = 0.0."
+        },
+        {
+          "description": "Run the tests and confirm they pass.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_brain_client.py tests/test_main_validate.py",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Stage.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/brain_client.py commander/tests/test_brain_client.py commander/tests/test_main_validate.py",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Honest usage-limit state on the opus fallback (R3.1-R3.5, R3.7)",
+      "description": "Move _ACCOUNT_LIMIT_RE, _WORKER_LIMIT_RE and detect_account_limit verbatim from main.py into brain_client.py (main re-imports them). Add _LIMIT_PREFIX and _usage_limit. On opus, limit text is queued with _LIMIT_PREFIX and gets no liveness credit (for the AssistantMessage and for the ResultMessage while limited). needs_restart returns False while limited, after the dead-thread check. restart() clears the state. get_token_usage gains usage_limited. The daemon alerts on limit-prefixed text (unknown-reset fallback) and never relays it. Code blocks are verbatim in human plan Task 2.",
+      "allowed_files": [
+        "commander/src/ironclaude/brain_client.py",
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_brain_client.py",
+        "commander/tests/test_main_validate.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "RED: (a) In TestTokenUsageAccumulation.test_get_token_usage_initial_zeros, add \"usage_limited\": None to the expected dict. (b) Insert class TestUsageLimitState (LIMIT constant; _run helper; tests test_opus_limit_is_surfaced_and_not_liveness, test_limit_clears_on_next_real_reply, test_limit_without_reset_reports_unknown, test_non_opus_limit_still_falls_back, test_needs_restart_suppressed_while_limited, test_dead_thread_still_restarts_while_limited, test_restart_clears_limit_and_turn_target, test_detector_moved_and_reexported) before `class TestModelUnavailableFableTransition:`. Use the code exactly as in human plan Task 2 Step 1."
+        },
+        {
+          "description": "RED: add module-level test_brain_limit_prefixed_text_alerts_and_is_not_relayed and test_brain_limit_prefixed_text_without_reset_still_alerts to commander/tests/test_main_validate.py after test_limit_alert_fires_even_when_waiting. Use the code exactly as in human plan Task 2 Step 2."
+        },
+        {
+          "description": "Run the tests and confirm they fail.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_brain_client.py::TestUsageLimitState tests/test_brain_client.py::TestTokenUsageAccumulation tests/test_main_validate.py -k \"UsageLimitState or initial_zeros or brain_limit_prefixed\"",
+          "expected": "FAIL: ImportError on _LIMIT_PREFIX, the missing usage_limited key, and the missing _usage_limit attribute"
+        },
+        {
+          "description": "Move the detector (human plan Task 2 Step 4). (a) Add the comment, _ACCOUNT_LIMIT_RE, _WORKER_LIMIT_RE and detect_account_limit to brain_client.py directly after _is_usage_limit_text, verbatim from main.py. (b) Delete them from main.py, keeping _LIMIT_COOLDOWN_S. (c) Change the main.py import to `from ironclaude.brain_client import BrainClient, _LIMIT_PREFIX, _NARRATION_PREFIX, detect_account_limit`."
+        },
+        {
+          "description": "Implement the limit state in brain_client.py (human plan Task 2 Step 5). (a) Add _LIMIT_PREFIX = \"[BRAIN-LIMIT] \" after _NARRATION_PREFIX. (b) Add self._usage_limit: str | None = None after _turn_reply_ts in __init__. (c) Replace the _run_session async-for loop body with the plan's block: ResultMessage branch notes activity only if not limited; non-Assistant messages note activity; opus limit text is queued with _LIMIT_PREFIX, sets _usage_limit, clears _executing_tool and skips _note_sdk_activity; normal text clears _usage_limit and queues narration via _apply_turn_reply_target. (d) Add the needs_restart guard `if self._usage_limit is not None: return False` directly after the dead-thread block. (e) Add `self._usage_limit = None` in restart() after the _turn_reply_ts reset. (f) Add the usage_limited key to get_token_usage: (detect_account_limit(self._usage_limit) or \"reset time unknown\") if self._usage_limit is not None else None."
+        },
+        {
+          "description": "Route limit-prefixed text in main.py poll_brain_responses (human plan Task 2 Step 6). (a) limit = detect_account_limit(text) or (\"reset time unknown\" if text.startswith(_LIMIT_PREFIX) else None). (b) After the `if limit:` block, add `if text.startswith(_LIMIT_PREFIX): continue` with the R3.2 comment."
+        },
+        {
+          "description": "Run the tests and confirm they pass.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_brain_client.py tests/test_main_validate.py tests/test_daemon.py",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Confirm the detector exists in one place only.",
+          "command": "rg -n -e \"def detect_account_limit\" -e \"^_ACCOUNT_LIMIT_RE\" -e \"^_WORKER_LIMIT_RE\" /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude",
+          "expected": "exactly three lines, all in brain_client.py"
+        },
+        {
+          "description": "Stage.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/brain_client.py commander/src/ironclaude/main.py commander/tests/test_brain_client.py commander/tests/test_main_validate.py",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Heartbeat shows the usage-limited state (R3.6)",
+      "description": "format_heartbeat: when brain_usage['usage_limited'] is set, append ' — usage-limited (<escaped reset>); unanswered messages retried after reset' in place of the 'turn in progress' suffix. Code blocks are verbatim in human plan Task 3.",
+      "allowed_files": [
+        "commander/src/ironclaude/notifications.py",
+        "commander/tests/test_notifications.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: add test_heartbeat_usage_limited_replaces_turn_in_progress and test_heartbeat_usage_limited_escapes_mrkdwn after test_heartbeat_nonzero_tokens_unaffected in commander/tests/test_notifications.py. Use the code exactly as in human plan Task 3 Step 1."
+        },
+        {
+          "description": "Run the tests and confirm they fail.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_notifications.py -k usage_limited",
+          "expected": "2 failed"
+        },
+        {
+          "description": "GREEN: in format_heartbeat, replace the `if total == 0:` turn-in-progress block with the limited/elif block from human plan Task 3 Step 3 (uses _escape_mrkdwn(str(limited)))."
+        },
+        {
+          "description": "Run the tests and confirm they pass.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_notifications.py",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Stage.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/notifications.py commander/tests/test_notifications.py",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Acknowledgement closure posted in the operator's thread (R2.1-R2.5)",
+      "description": "db.py gains persist_operator_message_acknowledgement_with_status -> (dict, created). created is True only on the inserting path; persist_operator_message_acknowledgement returns [0], so its dict is unchanged. orchestrator acknowledge_operator_message uses it: when created and Slack is present, it posts the reason with thread_ts=source_ts and adds ✅ only if the post returned non-None, all inside try/except with a logger.warning. The MCP wrapper docstring says the tool closes a message with no reply and that the reason is posted in the operator message's thread. Code blocks are verbatim in human plan Task 4.",
+      "allowed_files": [
+        "commander/src/ironclaude/db.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_db.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: add test_persist_with_status_reports_created_only_for_the_inserting_call after test_persist_operator_message_acknowledgement_is_immutable_with_plain_rows in commander/tests/test_db.py (human plan Task 4 Step 1)."
+        },
+        {
+          "description": "Confirm that MagicMock is imported at module level in test_orchestrator_mcp.py; if the output lacks MagicMock, add it to that import line.",
+          "command": "rg -n \"^from unittest.mock import\" /Users/roberthyatt/Code/ironclaude/commander/tests/test_orchestrator_mcp.py",
+          "expected": "an import line; MagicMock present or added"
+        },
+        {
+          "description": "RED: in TestAcknowledgeOperatorMessage, (a) change test_acknowledge_operator_message_delegates_to_shared_persistence so its fake returns (expected, False) and patches persist_operator_message_acknowledgement_with_status; (b) add _tools_with_slack, test_new_acknowledgement_posts_reason_in_thread_and_reacts, test_repeat_acknowledgement_posts_nothing, test_acknowledgement_after_delivered_reply_posts_nothing, test_slack_error_never_raises_and_ack_is_kept, test_failed_post_skips_reaction and test_mcp_tool_description_says_reason_is_posted. Use the code exactly as in human plan Task 4 Step 2."
+        },
+        {
+          "description": "Run the tests and confirm they fail.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_db.py tests/test_orchestrator_mcp.py -k \"with_status or AcknowledgeOperatorMessage\"",
+          "expected": "FAIL: the missing persist_operator_message_acknowledgement_with_status, and the new posting asserts"
+        },
+        {
+          "description": "GREEN db.py (human plan Task 4 Step 4): persist_operator_message_acknowledgement returns persist_operator_message_acknowledgement_with_status(...)[0]. The new function takes the original body with returns (existing, False), (concurrent, False) and (persisted, True)."
+        },
+        {
+          "description": "GREEN orchestrator_mcp.py (human plan Task 4 Step 5): (a) add persist_operator_message_acknowledgement_with_status to the ironclaude.db import; (b) replace the acknowledge_operator_message method; (c) replace the MCP wrapper docstring."
+        },
+        {
+          "description": "Run the tests and confirm they pass.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_db.py tests/test_orchestrator_mcp.py tests/test_main_validate.py tests/test_codex_brain_client.py",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Stage.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/db.py commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_db.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Brain prompt: full replies, reply owns closure (R1.6, R2.6)",
+      "description": "Rewrite system_prompt.md:368-372 (the reply comes with real text in the same message; never send the marker alone) and :378, plus rules/workflow.md:888 (reply with [reply-to:<source_ts>]; the daemon records the acknowledgement; acknowledge_operator_message is only for closing with no reply). Replace test_daemon.py's old ack-first contract test. Text is verbatim in human plan Task 5.",
+      "allowed_files": [
+        "commander/src/brain/system_prompt.md",
+        "commander/src/brain/rules/workflow.md",
+        "commander/tests/test_daemon.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: replace test_brain_direct_reply_requires_acknowledgement_before_threaded_reply (test_daemon.py:117-122) with test_brain_direct_reply_owns_closure_and_ack_is_for_no_reply and test_brain_reply_marker_never_sent_alone, exactly as in human plan Task 5 Step 1."
+        },
+        {
+          "description": "Run the tests and confirm they fail.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_daemon.py -k \"owns_closure or never_sent_alone\"",
+          "expected": "2 failed"
+        },
+        {
+          "description": "GREEN: replace system_prompt.md lines 368-372 and line 378 with the text in human plan Task 5 Step 3."
+        },
+        {
+          "description": "GREEN: replace workflow.md line 888 with the text in human plan Task 5 Step 4."
+        },
+        {
+          "description": "Run the tests and confirm they pass.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_daemon.py",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Confirm no stale copy remains.",
+          "command": "rg -n -F -e \"must succeed before direct reply\" -e \"brief acknowledgement or ETA\" /Users/roberthyatt/Code/ironclaude/commander/src /Users/roberthyatt/Code/ironclaude/worker",
+          "expected": "no output, exit 1"
+        },
+        {
+          "description": "Stage.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/brain/system_prompt.md commander/src/brain/rules/workflow.md commander/tests/test_daemon.py",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "name": "v1.1.14 version bump, CHANGELOG, README, full suite (R4)",
+      "description": "No tests required: this task edits only versions and docs; test_version_consistency.py and the full suite verify it. Bump the 7 version fields in 6 manifests to 1.1.14 (Codex gets +codex.<fresh UTC stamp>), add the CHANGELOG 1.1.14 section and the README What's New v1.1.14 (v1.1.13 becomes Earlier; the v1.1.12 Earlier section is removed), then stage the release and the plan artifacts. Text is verbatim in human plan Task 6. No commit, tag, push or deploy in this task.",
+      "allowed_files": [
+        ".claude-plugin/marketplace.json",
+        "worker/.claude-plugin/plugin.json",
+        "worker/.codex-plugin/plugin.json",
+        "worker/mcp-servers/workspace-manager/package.json",
+        "worker/mcp-servers/workspace-manager/package-lock.json",
+        "commander/pyproject.toml",
+        "CHANGELOG.md",
+        "README.md"
+      ],
+      "depends_on": [1, 2, 3, 4, 5],
+      "steps": [
+        {
+          "description": "Get the Codex cachebuster stamp; use this literal value as <STAMP>.",
+          "command": "date -u +%Y%m%d%H%M%S",
+          "expected": "14 digits"
+        },
+        {
+          "description": "With the Edit tool, bump: marketplace.json, worker/.claude-plugin/plugin.json and workspace-manager package.json from \"version\": \"1.1.13\", to \"version\": \"1.1.14\",; worker/.codex-plugin/plugin.json from \"1.1.13+codex.20260926152651\" to \"1.1.14+codex.<STAMP>\"; both \"version\": \"1.1.13\", in package-lock.json (lines 3 and 9, not ieee754); commander/pyproject.toml from version = \"1.1.13\" to version = \"1.1.14\"."
+        },
+        {
+          "description": "Verify the 1.1.14 presence.",
+          "command": "rg -n -F 1.1.14 /Users/roberthyatt/Code/ironclaude/.claude-plugin/marketplace.json /Users/roberthyatt/Code/ironclaude/worker/.claude-plugin/plugin.json /Users/roberthyatt/Code/ironclaude/worker/.codex-plugin/plugin.json /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/package.json /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/package-lock.json /Users/roberthyatt/Code/ironclaude/commander/pyproject.toml",
+          "expected": "7 lines"
+        },
+        {
+          "description": "Verify the 1.1.13 absence in the manifests.",
+          "command": "rg -n -F '\"1.1.13' /Users/roberthyatt/Code/ironclaude/.claude-plugin/marketplace.json /Users/roberthyatt/Code/ironclaude/worker/.claude-plugin/plugin.json /Users/roberthyatt/Code/ironclaude/worker/.codex-plugin/plugin.json /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/package.json /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/package-lock.json /Users/roberthyatt/Code/ironclaude/commander/pyproject.toml",
+          "expected": "no output, exit 1"
+        },
+        {
+          "description": "Run the version consistency test.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_version_consistency.py",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Run the full commander suite; record the passed count N.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Insert the CHANGELOG `## 1.1.14: …` section above `## 1.1.13: …`, verbatim from human plan Task 6 Step 5, with <N> replaced by the measured count."
+        },
+        {
+          "description": "README (human plan Task 6 Step 6): add `## What's New in v1.1.14` with its 3 bullets; the v1.1.13 bullets become `### Earlier — v1.1.13`; delete the `### Earlier — v1.1.12` section, keeping the final See-CHANGELOG bullet."
+        },
+        {
+          "description": "Verify the doc headings.",
+          "command": "rg -n -F -e \"## 1.1.14:\" -e \"## What's New in v1.1.14\" -e \"### Earlier — v1.1.13\" /Users/roberthyatt/Code/ironclaude/CHANGELOG.md /Users/roberthyatt/Code/ironclaude/README.md",
+          "expected": "3 lines"
+        },
+        {
+          "description": "Verify that the old Earlier section is gone.",
+          "command": "rg -n -F \"Earlier — v1.1.12\" /Users/roberthyatt/Code/ironclaude/README.md",
+          "expected": "no output, exit 1"
+        },
+        {
+          "description": "Stage the release files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add .claude-plugin/marketplace.json worker/.claude-plugin/plugin.json worker/.codex-plugin/plugin.json worker/mcp-servers/workspace-manager/package.json worker/mcp-servers/workspace-manager/package-lock.json commander/pyproject.toml CHANGELOG.md README.md",
+          "expected": "exit 0"
+        },
+        {
+          "description": "Force-stage the gitignored plan artifacts.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes-requirements.md docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes-design.md docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes.md docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes.plan.json",
+          "expected": "exit 0"
+        }
+      ]
+    }
+  ]
+}

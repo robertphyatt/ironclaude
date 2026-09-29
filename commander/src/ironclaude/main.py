@@ -42,7 +42,7 @@ from ironclaude.tmux_manager import (
     detect_ask_user_menu,
     validate_prompt_candidate,
 )
-from ironclaude.brain_client import BrainClient, _NARRATION_PREFIX
+from ironclaude.brain_client import BrainClient, _LIMIT_PREFIX, _NARRATION_PREFIX, detect_account_limit
 from ironclaude.worker_registry import WorkerRegistry
 from ironclaude.protocol import read_pending_decisions, read_task_ledger, write_decision
 from ironclaude.notifications import (
@@ -859,22 +859,6 @@ def _sync_idle_worktrees(
 
 
 _LIMIT_COOLDOWN_S = 1800  # re-alert the SAME limit signal at most once per ~window
-# separators seen in the wild: middle-dot, colon, hyphen, em-dash; apostrophe may be straight or curly
-_ACCOUNT_LIMIT_RE = re.compile(r"you['’]?ve hit your limit(?:\s*[·:\-—]\s*(resets[^\n]*))?", re.IGNORECASE)
-_WORKER_LIMIT_RE = re.compile(r"(?<!no )(?:session limit hit|rate-limit menu)", re.IGNORECASE)  # not "no session limit hit"
-
-
-def detect_account_limit(text: str):
-    """Return a human reset string if `text` signals an account/worker usage limit, else None.
-    Shared signal set with the Fable-gate deferred usage detector ('hit your limit')."""
-    if not text:
-        return None
-    m = _ACCOUNT_LIMIT_RE.search(text)
-    if m:
-        return (m.group(1) or "reset time unknown").strip()
-    if _WORKER_LIMIT_RE.search(text):
-        return "reset time unknown"
-    return None
 
 
 def log_worker_event(event_type: str, **fields) -> None:
@@ -1593,6 +1577,9 @@ class IroncladeDaemon:
         self._auth_relay = AuthRelay()
         # Usage-limit surfacing: {reset-string: last-alert-epoch} for a per-window cooldown
         self._limit_alerted: dict[str, float] = {}
+        # R8: epoch of the first Brain usage-limit bounce not yet followed by a real response
+        # (None = not limited). Drives the one recovery notice and the aging-reminder pause.
+        self._brain_limited_since: float | None = None
         # Stuck worker detection state
         self._stuck_hash: dict[str, int] = {}
         self._stuck_since: dict[str, float] = {}
@@ -1955,6 +1942,11 @@ class IroncladeDaemon:
             return
         self._last_message_aging_check = now
 
+        # R8.3: while the Brain is usage-limited a nudge would only bounce and burn the
+        # message's one reminder — stay quiet (mark nothing) until it answers again.
+        if self._brain_limited_since is not None:
+            return
+
         unprocessed = self._get_unprocessed_messages()
 
         if self._message_aging_alerted and self._db is not None:
@@ -1973,7 +1965,9 @@ class IroncladeDaemon:
                 f"[UNPROCESSED MESSAGE] Operator message from {minutes_ago} minutes ago "
                 f"has not been processed into a directive. "
                 f'Message: "{msg["text"][:100]}..." '
-                f"(ts: {ts}). Read this message and submit_directive() or acknowledge it."
+                f"(ts: {ts}). Read this message and reply with [reply-to:{ts}] followed by "
+                f"your answer, or submit_directive(); use acknowledge_operator_message only "
+                f"to close it without a reply."
             )
             self._message_aging_alerted.add(ts)
 
@@ -3213,6 +3207,16 @@ class IroncladeDaemon:
         """Drain brain responses, validate context, and post to Slack."""
         for text in self.brain.get_pending_responses():
             logger.info(f"Brain response: {text[:100]}...")
+            # R8.2: the first non-limit response after a usage-limit bounce means the Brain
+            # is answering again (a [PING-ACK] counts) — tell the operator once.
+            if self._brain_limited_since is not None and not text.startswith(_LIMIT_PREFIX):
+                since = datetime.fromtimestamp(self._brain_limited_since).strftime("%H:%M")
+                self.slack.post_message(
+                    f"✅ Brain recovered from its usage limit (limited since {since}). "
+                    "Unanswered messages from that window get the normal aging reminder; "
+                    "resend anything older than 2 hours."
+                )
+                self._brain_limited_since = None
             # R1: the Brain's reply to an idle [PING] health probe is a liveness
             # ack only — never relay it to Slack. Tolerate Brain non-compliance:
             # strip the narration prefix, then an optional leading [reply-to:...]
@@ -3229,7 +3233,9 @@ class IroncladeDaemon:
                     continue
             # Usage-limit surfacing runs BEFORE the operator-wait continue so a limit
             # message that also reads as "waiting" still prompts the operator to /login.
-            limit = detect_account_limit(text)
+            limit = detect_account_limit(text) or (
+                "reset time unknown" if text.startswith(_LIMIT_PREFIX) else None
+            )
             if limit:
                 now = time.time()
                 # prune expired keys so the map can't grow unbounded over the daemon's life (review M3)
@@ -3238,6 +3244,12 @@ class IroncladeDaemon:
                 if last is None or now - last > _LIMIT_COOLDOWN_S:
                     self._limit_alerted[limit] = now
                     self.slack.post_message(f"⚠️ Usage limit hit ({limit}). Send `login` to switch accounts.")
+            if text.startswith(_LIMIT_PREFIX):
+                # R3.2: the Brain's own usage-limit bounce is surfaced by the alert above,
+                # never relayed as narration or chatter. R5.2: remember when the limit began.
+                if self._brain_limited_since is None:
+                    self._brain_limited_since = time.time()
+                continue
             # R2: the Brain prepends _NARRATION_PREFIX to ALL its text
             # (brain_client.py:848), which defeats parse_reply_to_marker's leading
             # [reply-to: check. Strip the prefix ONLY when the text is marker-led,

@@ -1,0 +1,113 @@
+{
+  "name": "v1.1.14 Round-2 Fixes: Sweep Ordering, Bounced Probe, Reset Cap",
+  "goal": "Stop the recovery sweep from handing the Brain messages it is answering or that arrived after the limit, stop a bounced [PING] from causing a restart at window expiry, cap the parsed reset window at 6 hours, and keep the sweep pending when its send fails.",
+  "requirements_file": "docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes-requirements.md",
+  "design_file": "docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes-design.md",
+  "tasks": [
+    {
+      "id": 10,
+      "name": "A bounce clears the pending probe; the reset window is capped (R6.2, R6.3)",
+      "description": "In the brain_client opus bounce branch: set self._ping_sent_at = 0.0 (no liveness credit), and clamp the parsed reset with min(_reset, _now + 6*3600) before adding 900. TestUsageLimitState._run gains a setup= hook. Code is verbatim in the human plan docs/plans/2026-09-29-v1-1-14-sweep-ordering-and-probe-fixes.md, Task 10.",
+      "allowed_files": [
+        "commander/src/ironclaude/brain_client.py",
+        "commander/tests/test_brain_client.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED (human plan Task 10 Step 1): (a) add setup=None to TestUsageLimitState._run and call setup(client) after the grader stub; (b) insert class TestUsageLimitProbeAndCap (test_bounce_clears_pending_ping_without_liveness, test_reset_window_capped_at_six_hours) after TestUsageLimitExpiry."
+        },
+        {
+          "description": "Run the tests and confirm they fail.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_brain_client.py::TestUsageLimitProbeAndCap",
+          "expected": "2 failed"
+        },
+        {
+          "description": "GREEN (human plan Task 10 Step 3): replace the bounce-branch block with the version that clears _ping_sent_at and clamps _reset."
+        },
+        {
+          "description": "Run the tests and confirm they pass.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_brain_client.py",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Stage.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/brain_client.py commander/tests/test_brain_client.py",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "name": "Sweep after the batch, only up to the last bounce, and keep it on a failed send (R6.1, R6.4)",
+      "description": "main.py: add the _brain_limited_last field, set at every _LIMIT_PREFIX bounce. poll_brain_responses sets a local sweep_due inside the loop and calls _sweep_after_usage_limit after the loop. The sweep drops messages with ts > _brain_limited_last (falling back to since), clears both timestamps on an empty result or a successful send, and keeps them when send_message returns False. Code is verbatim in human plan Task 11.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_main_validate.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED (human plan Task 11 Step 1): (a) add d._brain_limited_last = None to _make_poll_daemon; (b) add d._brain_limited_last = 9600.0 after d._brain_limited_since = 9000.0 in test_recovery_sweep_triggered_by_ping_ack and test_recovery_sweep_fetch_failure_retries_next_response; (c) add test_brain_limited_last_tracks_every_bounce, test_recovery_sweep_excludes_messages_after_last_bounce, test_recovery_sweep_runs_after_batch_acks and test_recovery_sweep_keeps_timestamps_when_send_fails."
+        },
+        {
+          "description": "Run the tests and confirm they fail.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_main_validate.py -k \"recovery_sweep or brain_limited_last\"",
+          "expected": "FAIL: the 4 new tests fail; the existing sweep tests pass"
+        },
+        {
+          "description": "GREEN (human plan Task 11 Step 3): (a) the __init__ field; (b) the new _sweep_after_usage_limit body; (c) replace the in-loop sweep with sweep_due; (d) set _brain_limited_last in the _LIMIT_PREFIX branch; (e) after the for loop, `if sweep_due and self._brain_limited_since is not None: self._sweep_after_usage_limit()`."
+        },
+        {
+          "description": "Run the tests and confirm they pass.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_main_validate.py tests/test_enforcement.py tests/test_daemon.py",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Stage.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/tests/test_main_validate.py",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "name": "CHANGELOG update and full suite (R6.5)",
+      "description": "No tests required: this task edits docs only; the full suite verifies it. Run the full commander suite, replace the CHANGELOG 1.1.14 third-bullet sweep sentence with the R6 wording, and update the Deploy suite count. Text is verbatim in human plan Task 12.",
+      "allowed_files": [
+        "CHANGELOG.md"
+      ],
+      "depends_on": [10, 11],
+      "steps": [
+        {
+          "description": "Run the full commander suite; record the passed count N.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Edit CHANGELOG per human plan Task 12 Step 2: (a) the third-bullet sentence replacement; (b) Suites: commander <N>."
+        },
+        {
+          "description": "Verify the new text is present.",
+          "command": "rg -n -F -e \"up to the last bounce\" -e \"capped at six hours\" /Users/roberthyatt/Code/ironclaude/CHANGELOG.md",
+          "expected": "1 line: CHANGELOG.md:18"
+        },
+        {
+          "description": "Verify the old sentence is gone.",
+          "command": "rg -n -F \"arrived during the limit and still has no reply\" /Users/roberthyatt/Code/ironclaude/CHANGELOG.md",
+          "expected": "no output, exit 1"
+        },
+        {
+          "description": "Stage the CHANGELOG.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add CHANGELOG.md",
+          "expected": "exit 0"
+        },
+        {
+          "description": "Force-stage the plan artifacts.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes-requirements.md docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes-design.md docs/plans/2026-09-29-v1-1-14-sweep-ordering-and-probe-fixes.md docs/plans/2026-09-29-v1-1-14-sweep-ordering-and-probe-fixes.plan.json",
+          "expected": "exit 0"
+        }
+      ]
+    }
+  ]
+}

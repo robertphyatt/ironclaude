@@ -281,6 +281,15 @@ def persist_operator_message_acknowledgement(
     conn: sqlite3.Connection, source_ts: str, reason: str
 ) -> dict:
     """Persist, or return, an immutable no-action disposition for one message."""
+    return persist_operator_message_acknowledgement_with_status(conn, source_ts, reason)[0]
+
+
+def persist_operator_message_acknowledgement_with_status(
+    conn: sqlite3.Connection, source_ts: str, reason: str
+) -> tuple[dict, bool]:
+    """Like persist_operator_message_acknowledgement, plus whether THIS call created the
+    row (True only on the inserting path; False for an existing or concurrently-inserted
+    row)."""
     if conn is None:
         raise RuntimeError("Database connection required for operator message acknowledgement")
     if not isinstance(source_ts, str) or not _SLACK_TIMESTAMP_RE.fullmatch(source_ts):
@@ -302,7 +311,7 @@ def persist_operator_message_acknowledgement(
         (source_ts,),
     ).fetchone()
     if existing is not None:
-        return result_from(existing)
+        return result_from(existing), False
 
     try:
         conn.execute(
@@ -318,7 +327,7 @@ def persist_operator_message_acknowledgement(
             (source_ts,),
         ).fetchone()
         if concurrent is not None:
-            return result_from(concurrent)
+            return result_from(concurrent), False
         raise
     except sqlite3.Error:
         conn.rollback()
@@ -329,7 +338,7 @@ def persist_operator_message_acknowledgement(
         "WHERE source_ts=?",
         (source_ts,),
     ).fetchone()
-    return result_from(persisted)
+    return result_from(persisted), True
 
 
 def init_db(db_path: str) -> sqlite3.Connection:

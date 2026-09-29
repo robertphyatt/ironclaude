@@ -489,6 +489,19 @@ def test_persist_operator_message_acknowledgement_is_immutable_with_plain_rows(t
     conn.close()
 
 
+def test_persist_with_status_reports_created_only_for_the_inserting_call(tmp_path):
+    from ironclaude.db import persist_operator_message_acknowledgement_with_status
+    conn = init_db(str(tmp_path / "status.db"))
+    source_ts = "1785731067.460039"
+    first, created = persist_operator_message_acknowledgement_with_status(conn, source_ts, "first reason")
+    again, created_again = persist_operator_message_acknowledgement_with_status(conn, source_ts, "second reason")
+    assert created is True
+    assert created_again is False
+    assert again == first
+    assert persist_operator_message_acknowledgement(conn, source_ts, "third reason") == first
+    conn.close()
+
+
 def test_persist_operator_message_acknowledgement_concurrent_calls_converge(tmp_path):
     db_path = str(tmp_path / "ack-race.db")
     init_db(db_path).close()

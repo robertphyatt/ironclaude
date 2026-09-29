@@ -2100,6 +2100,282 @@ class TestModelUnavailableText:
         assert client.get_pending_responses() == [f"{_NARRATION_PREFIX}{conversational_text}"]
 
 
+class TestTurnReplyTarget:
+    """R1: a [reply-to:<ts>] marker seen in a Brain turn is carried onto later unmarked
+    text in the SAME turn (the Brain may send the marker alone, then the answer after a
+    tool call; the daemon drops the marker-only message as a ghost post)."""
+
+    @staticmethod
+    def _run(messages):
+        import asyncio
+        from unittest.mock import patch, MagicMock
+
+        class CapturingOptions:
+            def __init__(self, **kwargs):
+                pass
+
+        async def fake_query(prompt=None, options=None):
+            for m in messages:
+                yield m
+
+        client = BrainClient()
+        client._grader = MagicMock()
+        client._grader.grade.return_value = {"permission_seeking": False}
+        with patch("claude_agent_sdk.ClaudeAgentOptions", CapturingOptions), \
+             patch("claude_agent_sdk.query", fake_query):
+            client._episodic_memory_path = "/fake/memory.js"
+            asyncio.run(client._brain_session("my-prompt", None, None))
+        return client
+
+    @staticmethod
+    def _am(text):
+        from claude_agent_sdk import AssistantMessage
+        from claude_agent_sdk.types import TextBlock
+        return AssistantMessage(content=[TextBlock(text=text)], model="opus")
+
+    @staticmethod
+    def _result():
+        from unittest.mock import MagicMock
+        from claude_agent_sdk.types import ResultMessage
+        r = MagicMock(spec=ResultMessage)
+        r.session_id = "s"
+        r.usage = None
+        r.total_cost_usd = None
+        return r
+
+    def test_marker_only_then_unmarked_answer_carries_target(self):
+        from ironclaude.brain_client import _NARRATION_PREFIX
+        client = self._run([self._am("[reply-to:1699.5]"), self._am("Here is the answer.")])
+        assert client.get_pending_responses() == [
+            f"{_NARRATION_PREFIX}[reply-to:1699.5]",
+            f"{_NARRATION_PREFIX}[reply-to:1699.5] Here is the answer.",
+        ]
+
+    def test_target_cleared_at_turn_end(self):
+        from ironclaude.brain_client import _NARRATION_PREFIX
+        client = self._run([
+            self._am("[reply-to:1699.5] ack"), self._result(), self._am("unrelated narration"),
+        ])
+        assert client.get_pending_responses()[-1] == f"{_NARRATION_PREFIX}unrelated narration"
+
+    def test_later_marker_replaces_target(self):
+        from ironclaude.brain_client import _NARRATION_PREFIX
+        client = self._run([
+            self._am("[reply-to:1.1] a"), self._am("[reply-to:2.2] b"), self._am("c"),
+        ])
+        assert client.get_pending_responses()[-1] == f"{_NARRATION_PREFIX}[reply-to:2.2] c"
+
+    def test_target_cleared_when_fallback_starts_new_session(self, tmp_path, monkeypatch):
+        """A reply target set before a message-shaped model bounce must not carry into the
+        fallback session's first unmarked text (it would thread an unrelated message under
+        the operator's)."""
+        import asyncio
+        from unittest.mock import patch, MagicMock
+        from ironclaude import fable_availability
+        from ironclaude.brain_client import _NARRATION_PREFIX
+        monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "s.json")
+
+        class CapturingOptions:
+            def __init__(self, **kwargs):
+                pass
+
+        calls = {"n": 0}
+
+        async def fake_query(prompt=None, options=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                yield self._am("[reply-to:1699.5] Checking now")
+                yield self._am("You've hit your limit · resets 4:10am (America/Chicago)")
+            else:
+                yield self._am("Worker d12 finished.")
+
+        client = BrainClient(model="fable")
+        client._grader = MagicMock()
+        client._grader.grade.return_value = {"permission_seeking": False}
+        with patch("claude_agent_sdk.ClaudeAgentOptions", CapturingOptions), \
+             patch("claude_agent_sdk.query", fake_query):
+            client._episodic_memory_path = "/fake/memory.js"
+            asyncio.run(client._brain_session("my-prompt", None, None))
+        assert client._model == "opus"
+        assert client.get_pending_responses()[-1] == f"{_NARRATION_PREFIX}Worker d12 finished."
+
+    def test_malformed_marker_is_not_a_target(self):
+        from ironclaude.brain_client import _NARRATION_PREFIX
+        client = self._run([self._am("[reply-to:abc] x"), self._am("plain")])
+        assert client.get_pending_responses()[-1] == f"{_NARRATION_PREFIX}plain"
+
+
+class TestUsageLimitState:
+    """R3: on the opus fallback a usage-limit reply is surfaced (limit-prefixed), is not
+    liveness, suppresses timeout restarts, and clears on the next real reply."""
+
+    LIMIT = "You've hit your limit · resets 4:10am (America/Chicago)"
+
+    @staticmethod
+    def _run(model, messages, tmp_path=None, monkeypatch=None, setup=None):
+        import asyncio
+        from unittest.mock import patch, MagicMock
+
+        if monkeypatch is not None:
+            from ironclaude import fable_availability
+            monkeypatch.setattr(fable_availability, "_STATE_PATH", tmp_path / "s.json")
+
+        models_built = []
+
+        class CapturingOptions:
+            def __init__(self, **kwargs):
+                models_built.append(kwargs.get("model"))
+
+        calls = {"n": 0}
+
+        async def fake_query(prompt=None, options=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                for m in messages:
+                    yield m
+
+        client = BrainClient(model=model)
+        client._grader = MagicMock()
+        client._grader.grade.return_value = {"permission_seeking": False}
+        if setup is not None:
+            setup(client)
+        with patch("claude_agent_sdk.ClaudeAgentOptions", CapturingOptions), \
+             patch("claude_agent_sdk.query", fake_query):
+            client._episodic_memory_path = "/fake/memory.js"
+            asyncio.run(client._brain_session("my-prompt", None, None))
+        return client, models_built
+
+    def test_opus_limit_is_surfaced_and_not_liveness(self):
+        from ironclaude.brain_client import _LIMIT_PREFIX
+        client, _ = self._run("opus", [
+            TestTurnReplyTarget._am(self.LIMIT), TestTurnReplyTarget._result(),
+        ])
+        assert client.get_pending_responses() == [f"{_LIMIT_PREFIX}{self.LIMIT}"]
+        assert client._last_response_time == 0.0
+        assert client._usage_limit == self.LIMIT
+        assert client._executing_tool is False
+        assert client.get_token_usage()["usage_limited"] == "resets 4:10am (America/Chicago)"
+
+    def test_limit_clears_on_next_real_reply(self):
+        from ironclaude.brain_client import _LIMIT_PREFIX, _NARRATION_PREFIX
+        client, _ = self._run("opus", [
+            TestTurnReplyTarget._am(self.LIMIT), TestTurnReplyTarget._result(),
+            TestTurnReplyTarget._am("Back online."), TestTurnReplyTarget._result(),
+        ])
+        assert client.get_pending_responses() == [
+            f"{_LIMIT_PREFIX}{self.LIMIT}", f"{_NARRATION_PREFIX}Back online.",
+        ]
+        assert client._usage_limit is None
+        assert client._last_response_time > 0.0
+        assert client.get_token_usage()["usage_limited"] is None
+
+    def test_limit_without_reset_reports_unknown(self):
+        client, _ = self._run("opus", [TestTurnReplyTarget._am("Sorry, you hit your limit")])
+        assert client.get_token_usage()["usage_limited"] == "reset time unknown"
+
+    def test_non_opus_limit_still_falls_back(self, tmp_path, monkeypatch):
+        from ironclaude.brain_client import _LIMIT_PREFIX
+        client, models_built = self._run(
+            "fable", [TestTurnReplyTarget._am(self.LIMIT)], tmp_path, monkeypatch,
+        )
+        assert client._model == "opus"
+        assert any(m == "opus[1m]" for m in models_built), models_built
+        assert all(not r.startswith(_LIMIT_PREFIX) for r in client.get_pending_responses())
+
+    def test_needs_restart_suppressed_while_limited(self):
+        client = TestBrainLivenessTimeout._make_alive_client(timeout_seconds=300)
+        client._last_message_time = time.time() - 600
+        client._last_response_time = client._last_message_time - 10
+        client._usage_limit = self.LIMIT
+        client._usage_limit_until = time.time() + 600
+        assert client.needs_restart() is False
+        client._usage_limit = None
+        assert client.needs_restart() is True
+        client._stop_event.set()
+
+    def test_dead_thread_still_restarts_while_limited(self):
+        client = TestBrainLivenessTimeout._make_alive_client(timeout_seconds=300)
+        client._usage_limit = self.LIMIT
+        client._stop_event.set()
+        client._thread.join(timeout=5)
+        assert client.needs_restart() is True
+
+    def test_restart_clears_limit_and_turn_target(self):
+        client = BrainClient()
+        client._usage_limit = self.LIMIT
+        client._turn_reply_ts = "1699.5"
+        client._usage_limit_until = 123.0
+        client.start = lambda *a, **kw: setattr(client, "_running", True)
+        client._kill_brain_subprocess = lambda: None
+        client.restart("test prompt")
+        assert client._usage_limit is None
+        assert client._turn_reply_ts is None
+        assert client._usage_limit_until == 0.0
+
+    def test_detector_moved_and_reexported(self):
+        from ironclaude import brain_client, main
+        assert main.detect_account_limit is brain_client.detect_account_limit
+
+
+class TestUsageLimitExpiry:
+    """R5.1: the usage-limited state lasts until the reported reset + 15 min (or 1 h when no
+    reset time is given); after that needs_restart clears it and normal liveness resumes."""
+
+    LIMIT = TestUsageLimitState.LIMIT
+
+    def test_expiry_is_parsed_reset_plus_margin(self, monkeypatch):
+        from ironclaude import brain_client as bc
+        monkeypatch.setattr(bc, "parse_reset_time", lambda text, now: 50000.0)
+        client, _ = TestUsageLimitState._run("opus", [TestTurnReplyTarget._am(self.LIMIT)])
+        assert client._usage_limit_until == 50900.0
+
+    def test_expiry_without_reset_is_one_hour(self, monkeypatch):
+        from ironclaude import brain_client as bc
+        monkeypatch.setattr(bc, "parse_reset_time", lambda text, now: None)
+        before = time.time()
+        client, _ = TestUsageLimitState._run("opus", [TestTurnReplyTarget._am(self.LIMIT)])
+        after = time.time()
+        assert before + 3600 <= client._usage_limit_until <= after + 3600
+
+    def test_needs_restart_resumes_after_expiry(self):
+        client = TestBrainLivenessTimeout._make_alive_client(timeout_seconds=300)
+        client._last_message_time = time.time() - 600
+        client._last_response_time = client._last_message_time - 10
+        client._usage_limit = self.LIMIT
+        client._usage_limit_until = time.time() + 600
+        assert client.needs_restart() is False
+        assert client._usage_limit == self.LIMIT
+        client._usage_limit_until = time.time() - 1
+        assert client.needs_restart() is True
+        assert client._usage_limit is None
+        client._stop_event.set()
+
+
+class TestUsageLimitProbeAndCap:
+    """R6.2: a limit bounce answers an outstanding [PING] (clears _ping_sent_at) without
+    crediting liveness. R6.3: the parsed reset window is capped at 6 h (+15 min margin)."""
+
+    LIMIT = TestUsageLimitState.LIMIT
+
+    def test_bounce_clears_pending_ping_without_liveness(self):
+        client, _ = TestUsageLimitState._run(
+            "opus",
+            [TestTurnReplyTarget._am(self.LIMIT), TestTurnReplyTarget._result()],
+            setup=lambda c: setattr(c, "_ping_sent_at", 12345.0),
+        )
+        assert client._ping_sent_at == 0.0
+        assert client._last_response_time == 0.0
+        assert client._usage_limit == self.LIMIT
+
+    def test_reset_window_capped_at_six_hours(self, monkeypatch):
+        from ironclaude import brain_client as bc
+        monkeypatch.setattr(bc, "parse_reset_time", lambda text, now: now + 20 * 3600)
+        before = time.time()
+        client, _ = TestUsageLimitState._run("opus", [TestTurnReplyTarget._am(self.LIMIT)])
+        after = time.time()
+        assert before + 6 * 3600 + 900 <= client._usage_limit_until <= after + 6 * 3600 + 900
+
+
 class TestModelUnavailableFableTransition:
     """Fable-specific fallback side effects: mark_fable_unavailable + optional
     Slack callback, wired at BrainClient construction."""
@@ -2710,7 +2986,7 @@ class TestTokenUsageAccumulation:
         usage = client.get_token_usage()
         assert usage == {
             "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0,
-            "seconds_since_last_activity": None,
+            "seconds_since_last_activity": None, "usage_limited": None,
         }
 
     def test_get_token_usage_reflects_accumulated_state(self):

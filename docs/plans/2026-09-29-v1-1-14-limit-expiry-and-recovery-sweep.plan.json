@@ -1,0 +1,114 @@
+{
+  "name": "v1.1.14 Follow-up: Usage-Limit Expiry and Recovery Sweep",
+  "goal": "Make the usage-limited Brain state expire at the reported reset time, hand the Brain every operator message left unanswered during a limit, and make the aging nudge match the reply-owns-closure rule.",
+  "requirements_file": "docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes-requirements.md",
+  "design_file": "docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes-design.md",
+  "tasks": [
+    {
+      "id": 7,
+      "name": "The usage-limited state expires (R5.1)",
+      "description": "brain_client records _usage_limit_until (parse_reset_time + 900 s, or now + 3600 s when there is no reset time) on an opus limit bounce. needs_restart suppresses restarts only until then; after that it clears _usage_limit, logs it, and falls through to the normal checks. restart() resets _usage_limit_until to 0.0. Code is verbatim in the human plan docs/plans/2026-09-29-v1-1-14-limit-expiry-and-recovery-sweep.md, Task 7.",
+      "allowed_files": [
+        "commander/src/ironclaude/brain_client.py",
+        "commander/tests/test_brain_client.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED (human plan Task 7 Step 1): (a) in test_needs_restart_suppressed_while_limited, add client._usage_limit_until = time.time() + 600 after setting _usage_limit; (b) in test_restart_clears_limit_and_turn_target, set _usage_limit_until = 123.0 and assert 0.0 after restart; (c) insert class TestUsageLimitExpiry (test_expiry_is_parsed_reset_plus_margin, test_expiry_without_reset_is_one_hour, test_needs_restart_resumes_after_expiry) after TestUsageLimitState."
+        },
+        {
+          "description": "Run the tests and confirm they fail.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_brain_client.py::TestUsageLimitExpiry tests/test_brain_client.py::TestUsageLimitState",
+          "expected": "FAIL: TestUsageLimitExpiry (no parse_reset_time or _usage_limit_until; no expiry) and test_restart_clears_limit_and_turn_target"
+        },
+        {
+          "description": "GREEN (human plan Task 7 Step 3): (a) import parse_reset_time from ironclaude.fable_availability; (b) add the _usage_limit_until: float = 0.0 field; (c) compute _usage_limit_until in the opus limit branch after _usage_limit = full_text; (d) replace the needs_restart guard with the expiring guard; (e) reset _usage_limit_until = 0.0 in restart()."
+        },
+        {
+          "description": "Run the tests and confirm they pass.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_brain_client.py",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Stage.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/brain_client.py commander/tests/test_brain_client.py",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "name": "Recovery sweep and aging-nudge wording (R5.2, R5.3)",
+      "description": "main.py: add the _brain_limited_since field. _get_unprocessed_messages gains oldest/limit keyword arguments and re-raises when oldest is given. A new _sweep_after_usage_limit sends one [USAGE LIMIT RECOVERED] message listing the undispositioned operator messages since the limit began minus 300 s; it keeps the timestamp on a fetch failure and clears it otherwise. poll_brain_responses triggers the sweep on any non-limit response (before the PING-ACK filter) and records the limit start in the _LIMIT_PREFIX branch. The aging nudge is reworded. Code is verbatim in human plan Task 8.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_main_validate.py",
+        "commander/tests/test_enforcement.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED (human plan Task 8 Step 1): (a) add d._brain_limited_since = None to _make_poll_daemon; (b) add _SWEEP_LIMIT, _sweep_daemon and 4 tests (test_recovery_sweep_sends_unanswered_messages_once, test_recovery_sweep_triggered_by_ping_ack, test_recovery_sweep_with_nothing_unanswered_sends_nothing, test_recovery_sweep_fetch_failure_retries_next_response) after test_brain_limit_prefixed_text_without_reset_still_alerts; (c) add the new-wording and no-old-wording asserts to test_enforcement.py TestCheckMessageAging.test_alerts_on_old_unprocessed."
+        },
+        {
+          "description": "Run the tests and confirm they fail.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_main_validate.py tests/test_enforcement.py -k \"recovery_sweep or alerts_on_old_unprocessed\"",
+          "expected": "5 failed"
+        },
+        {
+          "description": "GREEN (human plan Task 8 Step 3): (a) the __init__ field; (b) the _get_unprocessed_messages signature and fetch/ledger block; (c) the _sweep_after_usage_limit method; (d) the aging-nudge text; (e) the sweep trigger after the 'Brain response:' log line; (f) record _brain_limited_since in the _LIMIT_PREFIX branch."
+        },
+        {
+          "description": "Run the tests and confirm they pass.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_main_validate.py tests/test_enforcement.py tests/test_daemon.py",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Stage.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/tests/test_main_validate.py commander/tests/test_enforcement.py",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "name": "CHANGELOG update and full suite (R5.4)",
+      "description": "No tests required: this task edits docs only; the full suite verifies it. Run the full commander suite, then update CHANGELOG ## 1.1.14: the third bullet gets the expiry and recovery-sweep text, the second bullet gets the aging-reminder sentence, and the Deploy line gets the re-measured suite count. Text is verbatim in human plan Task 9.",
+      "allowed_files": [
+        "CHANGELOG.md"
+      ],
+      "depends_on": [7, 8],
+      "steps": [
+        {
+          "description": "Run the full commander suite; record the passed count N.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Edit CHANGELOG ## 1.1.14 per human plan Task 9 Step 2 (a) the third-bullet replacement, (b) the second-bullet insertion, (c) Suites: commander <N>."
+        },
+        {
+          "description": "Verify the new text is present.",
+          "command": "rg -n -F -e \"USAGE LIMIT RECOVERED\" -e \"plus 15 minutes\" -e \"aging reminder now says the same\" /Users/roberthyatt/Code/ironclaude/CHANGELOG.md",
+          "expected": "2 lines: CHANGELOG.md:17 and CHANGELOG.md:18"
+        },
+        {
+          "description": "Verify the stale claim is gone.",
+          "command": "rg -n -F \"re-sends unanswered messages\" /Users/roberthyatt/Code/ironclaude/CHANGELOG.md",
+          "expected": "no output, exit 1"
+        },
+        {
+          "description": "Stage the CHANGELOG.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add CHANGELOG.md",
+          "expected": "exit 0"
+        },
+        {
+          "description": "Force-stage the plan artifacts.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes-requirements.md docs/plans/2026-09-28-v1-1-14-slack-reply-and-limit-fixes-design.md docs/plans/2026-09-29-v1-1-14-limit-expiry-and-recovery-sweep.md docs/plans/2026-09-29-v1-1-14-limit-expiry-and-recovery-sweep.plan.json",
+          "expected": "exit 0"
+        }
+      ]
+    }
+  ]
+}

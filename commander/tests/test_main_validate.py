@@ -450,6 +450,7 @@ def _make_poll_daemon():
     d._last_heartbeat_ts = None
     d._last_brain_context = None
     d._orphaned_unmerged_count = 0
+    d._brain_limited_since = None
     d._db = init_db(":memory:")
     from ironclaude.auth_relay import AuthRelay
     d._auth_relay = AuthRelay()   # __new__ bypasses __init__; the new tick() needs this
@@ -577,6 +578,41 @@ class TestOperatorWaits:
         for c in d.slack.post_message.call_args_list:
             assert c.kwargs.get("thread_ts") == "1699.5"
             assert len(c.args[0]) <= 39000 + len("*Brain:* ")
+        d.slack.add_reaction.assert_called_once_with("white_check_mark", "1699.5")
+
+    def test_split_reply_turn_threads_answer_under_operator_message(self):
+        """R1 end-to-end: the real BrainClient output for a marker-only message followed by an
+        unmarked answer threads the answer under the operator's message with ✅, while the
+        marker-only message stays dropped (ghost-post guard)."""
+        import asyncio
+        from claude_agent_sdk import AssistantMessage
+        from claude_agent_sdk.types import TextBlock
+        from ironclaude.brain_client import BrainClient
+
+        class CapturingOptions:
+            def __init__(self, **kwargs):
+                pass
+
+        async def fake_query(prompt=None, options=None):
+            yield AssistantMessage(content=[TextBlock(text="[reply-to:1699.5]")], model="opus")
+            yield AssistantMessage(content=[TextBlock(text="Here is the answer.")], model="opus")
+
+        client = BrainClient()
+        client._grader = MagicMock()
+        client._grader.grade.return_value = {"permission_seeking": False}
+        with patch("claude_agent_sdk.ClaudeAgentOptions", CapturingOptions), \
+             patch("claude_agent_sdk.query", fake_query):
+            client._episodic_memory_path = "/fake/memory.js"
+            asyncio.run(client._brain_session("my-prompt", None, None))
+
+        d = _make_poll_daemon()
+        d._last_heartbeat_ts = "1700.1"
+        d.brain.get_pending_responses.return_value = client.get_pending_responses()
+        d.poll_brain_responses()
+        d.slack.post_message.assert_called_once()
+        args, kwargs = d.slack.post_message.call_args
+        assert kwargs.get("thread_ts") == "1699.5"
+        assert "Here is the answer." in args[0]
         d.slack.add_reaction.assert_called_once_with("white_check_mark", "1699.5")
 
     def test_chatter_long_text_is_chunked_under_heartbeat(self):
@@ -1098,6 +1134,85 @@ def test_limit_alert_fires_even_when_waiting(monkeypatch):
     d.brain.get_pending_responses.return_value = ["You've hit your limit · resets 4:10am (America/Chicago)"]
     d.poll_brain_responses()
     assert d.slack.post_message.called                   # alert fired BEFORE the continue
+
+
+def test_brain_limit_prefixed_text_alerts_and_is_not_relayed(monkeypatch):
+    """R3.2: the Brain's own usage-limit bounce (limit-prefixed) raises the account-limit
+    alert once per cooldown and is never posted as narration or chatter."""
+    from ironclaude.brain_client import _LIMIT_PREFIX
+    d = _make_poll_daemon()
+    d._limit_alerted = {}
+    d._last_heartbeat_ts = "1700.1"
+    monkeypatch.setattr("ironclaude.main.time.time", lambda: 1000.0)
+    msg = f"{_LIMIT_PREFIX}You've hit your limit · resets 4:10am (America/Chicago)"
+    d.brain.get_pending_responses.return_value = [msg]
+    d.poll_brain_responses()
+    assert d.slack.post_message.call_count == 1
+    args, kwargs = d.slack.post_message.call_args
+    assert "Usage limit hit (resets 4:10am (America/Chicago))" in args[0]
+    assert kwargs.get("thread_ts") is None
+    d.brain.get_pending_responses.return_value = [msg]
+    d.poll_brain_responses()
+    assert d.slack.post_message.call_count == 1
+    d.brain.send_message.assert_not_called()
+
+
+def test_brain_limit_prefixed_text_without_reset_still_alerts(monkeypatch):
+    from ironclaude.brain_client import _LIMIT_PREFIX
+    d = _make_poll_daemon()
+    d._limit_alerted = {}
+    d._last_heartbeat_ts = "1700.1"
+    monkeypatch.setattr("ironclaude.main.time.time", lambda: 1000.0)
+    d.brain.get_pending_responses.return_value = [f"{_LIMIT_PREFIX}Sorry, you hit your limit"]
+    d.poll_brain_responses()
+    assert d.slack.post_message.call_count == 1
+    assert "Usage limit hit (reset time unknown)" in d.slack.post_message.call_args.args[0]
+
+
+_NOTICE_LIMIT = "You've hit your limit · resets 4:10am (America/Chicago)"
+
+
+def _recovery_notices(d):
+    return [
+        c for c in d.slack.post_message.call_args_list
+        if "Brain recovered from its usage limit" in str(c.args[0])
+    ]
+
+
+def test_recovery_notice_posted_once_after_limit(monkeypatch):
+    """R8.2: the first non-limit Brain response after a usage-limit bounce posts ONE
+    top-level Slack recovery notice and clears the limit timestamp; nothing is re-fed to
+    the Brain."""
+    from ironclaude.brain_client import _LIMIT_PREFIX, _NARRATION_PREFIX
+    d = _make_poll_daemon()
+    d._limit_alerted = {}
+    d._last_heartbeat_ts = "1700.1"
+    monkeypatch.setattr("ironclaude.main.time.time", lambda: 10000.0)
+    d.brain.get_pending_responses.return_value = [f"{_LIMIT_PREFIX}{_NOTICE_LIMIT}"]
+    d.poll_brain_responses()
+    assert d._brain_limited_since == 10000.0
+    assert _recovery_notices(d) == []
+    d.brain.get_pending_responses.return_value = [
+        f"{_NARRATION_PREFIX}Back online.", f"{_NARRATION_PREFIX}Still here.",
+    ]
+    d.poll_brain_responses()
+    notices = _recovery_notices(d)
+    assert len(notices) == 1
+    assert "resend anything older than 2 hours" in notices[0].args[0]
+    assert notices[0].kwargs.get("thread_ts") is None
+    assert d._brain_limited_since is None
+    d.brain.send_message.assert_not_called()
+
+
+def test_recovery_notice_on_ping_ack():
+    """R8.2: a [PING-ACK] is a real response too, so it also ends the limit."""
+    from ironclaude.brain_client import _NARRATION_PREFIX
+    d = _make_poll_daemon()
+    d._brain_limited_since = 9000.0
+    d.brain.get_pending_responses.return_value = [f"{_NARRATION_PREFIX}[PING-ACK]"]
+    d.poll_brain_responses()
+    assert len(_recovery_notices(d)) == 1
+    assert d._brain_limited_since is None
 
 
 def test_format_mem_line_skips_unreadable_procs():
