@@ -5,7 +5,7 @@ import {
   type ChildProcessWithoutNullStreams,
   type SpawnOptionsWithoutStdio,
 } from 'node:child_process';
-import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { access, mkdtemp, readFile, realpath, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -16,6 +16,7 @@ import {
   MAX_PACKET_BYTES,
   MAX_STDOUT_BYTES,
   advisorReviewToolDefinition,
+  parseCodexModel,
   resolveTrustedCodexRequesterModel,
   runCodexAdvisorReview,
   runFixedProcess,
@@ -137,6 +138,21 @@ function agentMessage(text: string) {
   return JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text } }) + '\n';
 }
 
+const LEGACY_CACHE = JSON.stringify({
+  models: ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-6-astra'].map((slug) => ({ slug })),
+});
+const GPT6_CACHE = JSON.stringify({
+  models: [
+    'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-reserve', 'gpt-5.6-sol', 'gpt-5.6-terra',
+    'gpt-5.6-luna', 'gpt-5.5', 'codex-auto-review',
+  ].map((slug) => ({ slug })),
+});
+const MODELS_CACHE_PATH = '/Users/test/.codex/models_cache.json';
+
+function enoent(): Error {
+  return Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+}
+
 function harness(fixtures: ProcessFixture[] = [
   { stdout: healthyPreflight() },
   { stdout: agentMessage('review report') },
@@ -162,6 +178,12 @@ function harness(fixtures: ProcessFixture[] = [
     mkdtemp: vi.fn(async () => '/private/tmp/ironclaude-advisor-fixed'),
     rm,
     access: vi.fn(async () => undefined),
+    readFile: vi.fn(async (target: string) => {
+      if (target === MODELS_CACHE_PATH) return LEGACY_CACHE;
+      throw enoent();
+    }),
+    realpath: vi.fn(async (target: string) => target),
+    stat: vi.fn(async () => ({ isFile: () => true })),
     env: {
       PATH: '/trusted/bin:/usr/bin',
       HOME: '/Users/test',
@@ -216,6 +238,14 @@ describe('run_codex_advisor_review definition', () => {
       idempotentHint: false,
       openWorldHint: true,
     });
+  });
+
+  it('publishes requester_model as a tier-word pattern, not a fixed enum', () => {
+    const requester = advisorReviewToolDefinition.inputSchema.properties.requester_model as Record<string, unknown>;
+    expect(requester).not.toHaveProperty('enum');
+    const pattern = new RegExp(requester.pattern as string);
+    for (const ok of ['gpt-6-sol', 'gpt-5.6-terra', 'gpt-7.1-luna', 'gpt-6-astra']) expect(pattern.test(ok)).toBe(true);
+    for (const bad of ['gpt-6-unknown', 'gpt-6-sol-mini', 'claude-opus', 'gpt--sol']) expect(pattern.test(bad)).toBe(false);
   });
 });
 
@@ -533,6 +563,9 @@ describe('runCodexAdvisorReview', () => {
       mkdtemp,
       rm,
       access,
+      readFile: (target: string, encoding: 'utf8') => readFile(target, encoding),
+      realpath: (target: string) => realpath(target),
+      stat: (target: string) => stat(target),
       env: process.env,
       tmpdir: os.tmpdir(),
       now: Date.now,
@@ -597,5 +630,197 @@ describe('runCodexAdvisorReview', () => {
       success: false,
       reason: 'advisor-cleanup-failed',
     }));
+  });
+
+  it.each([
+    ['gpt-6-sol', 'gpt-6-astra'],
+    ['gpt-6-luna', 'gpt-5.6-terra'],
+    ['gpt-5.6-terra', 'gpt-6-sol'],
+    ['gpt-5.6-sol', 'gpt-6-astra'],
+    ['gpt-6-astra', 'gpt-6-astra'],
+  ])('resolves %s one-up to the newest installed model: %s', async (requester, reviewer) => {
+    const h = harness();
+    h.deps.readFile = vi.fn(async (target: string) => {
+      if (target === MODELS_CACHE_PATH) return GPT6_CACHE;
+      throw enoent();
+    });
+    h.deps.trustedRequesterModel = requester;
+    const result = await runCodexAdvisorReview(
+      { packet: 'packet', requester_model: requester }, identity, session, runtime, h.deps,
+    );
+    expect(payload(result)).toEqual(expect.objectContaining({ success: true, reviewer_model: reviewer }));
+    expect(h.spawn.mock.calls[1][1]).toContain(reviewer);
+    expect(h.deps.readFile).toHaveBeenCalledWith(MODELS_CACHE_PATH, 'utf8');
+  });
+
+  it.each([
+    ['gpt-6-luna', ['gpt-6-sol', 'gpt-6-astra'], 'gpt-6-sol'],
+    ['gpt-6-sol', ['gpt-6-luna'], 'gpt-6-astra'],
+  ])('skips empty installed tiers for %s (installed %j) -> %s', async (requester, installed, reviewer) => {
+    const h = harness();
+    h.deps.readFile = vi.fn(async (target: string) => {
+      if (target === MODELS_CACHE_PATH) return JSON.stringify({ models: installed.map((slug) => ({ slug })) });
+      throw enoent();
+    });
+    h.deps.trustedRequesterModel = requester;
+    const result = await runCodexAdvisorReview(
+      { packet: 'packet', requester_model: requester }, identity, session, runtime, h.deps,
+    );
+    expect(payload(result)).toEqual(expect.objectContaining({ success: true, reviewer_model: reviewer }));
+    expect(h.spawn.mock.calls[1][1]).toContain(reviewer);
+  });
+
+  it('prefers the newest version at a tier', async () => {
+    const h = harness();
+    h.deps.readFile = vi.fn(async () => JSON.stringify({
+      models: ['gpt-6-sol', 'gpt-7-sol', 'gpt-6.5-sol', 'gpt-6-astra'].map((slug) => ({ slug })),
+    }));
+    h.deps.trustedRequesterModel = 'gpt-5.6-terra';
+    const result = await runCodexAdvisorReview(
+      { packet: 'packet', requester_model: 'gpt-5.6-terra' }, identity, session, runtime, h.deps,
+    );
+    expect(payload(result).reviewer_model).toBe('gpt-7-sol');
+  });
+
+  it.each([
+    ['gpt-6-luna', 'gpt-5.6-terra'],
+    ['gpt-6-sol', 'gpt-6-astra'],
+  ])('falls back to the built-in ladder when the models cache is unreadable: %s -> %s', async (requester, reviewer) => {
+    const h = harness();
+    h.deps.readFile = vi.fn(async () => { throw enoent(); });
+    h.deps.trustedRequesterModel = requester;
+    const result = await runCodexAdvisorReview(
+      { packet: 'packet', requester_model: requester }, identity, session, runtime, h.deps,
+    );
+    expect(payload(result).reviewer_model).toBe(reviewer);
+  });
+
+  it('keeps the requester for a same-tier gpt-6 review', async () => {
+    const h = harness();
+    h.deps.trustedRequesterModel = 'gpt-6-sol';
+    const result = await runCodexAdvisorReview(
+      { packet: 'packet', requester_model: 'gpt-6-sol', review_tier: 'same' }, identity, session, runtime, h.deps,
+    );
+    expect(payload(result).reviewer_model).toBe('gpt-6-sol');
+  });
+
+  it.each(['gpt-6-unknown', 'claude-opus', 'gpt-6-sol-mini', 42])(
+    'rejects a non-Codex-shaped requester %s', async (requester) => {
+      const h = harness();
+      const result = await runCodexAdvisorReview(
+        { packet: 'ok', requester_model: requester }, identity, session, runtime, h.deps,
+      );
+      expect(payload(result).reason).toBe('invalid-requester-model');
+      expect(h.spawn).not.toHaveBeenCalled();
+    },
+  );
+
+  it('parses tier and numeric version', () => {
+    expect(parseCodexModel('gpt-6.5-sol')).toEqual({ version: [6, 5], tier: 'sol' });
+    expect(parseCodexModel('gpt-6-terra-x')).toBeNull();
+  });
+
+  function packageHarness(manifest: unknown, extraEnv: Record<string, string> = {}, pathEnv = '/pkg/CodexCLI.app/Contents/MacOS') {
+    const h = harness([
+      { stdout: JSON.stringify({
+        schema_version: 1, mode: 'check', status: 'healthy',
+        invoked_launcher: '/pkg/bin/codex', resolved_launcher: '/pkg/bin/codex',
+        source_companion: '/pkg/bin/codex-code-mode-host', destination_companion: '/pkg/bin/codex-code-mode-host',
+        action: 'none', reason: 'source-is-destination',
+      }) + '\n' },
+      { stdout: agentMessage('review report') },
+    ]);
+    h.deps.env = { ...h.deps.env, PATH: pathEnv, ...extraEnv };
+    h.deps.readFile = vi.fn(async (target: string) => {
+      if (target === MODELS_CACHE_PATH) return LEGACY_CACHE;
+      if (target === '/pkg/codex-package.json') {
+        return typeof manifest === 'string' ? manifest : JSON.stringify(manifest);
+      }
+      throw enoent();
+    });
+    return h;
+  }
+
+  it('launches the package entrypoint when PATH finds the bare CodexCLI binary', async () => {
+    const h = packageHarness({ layoutVersion: 1, entrypoint: 'bin/codex' });
+    const result = await runCodexAdvisorReview(
+      { packet: 'packet', requester_model: 'gpt-5.6-sol' }, identity, session, runtime, h.deps,
+    );
+    expect(payload(result).success).toBe(true);
+    expect(h.spawn.mock.calls[0][1]).toEqual([
+      '/installed/ironclaude/scripts/codex-runtime-preflight.mjs', '--mode', 'check', '--codex-path', '/pkg/bin/codex',
+    ]);
+    expect(h.spawn.mock.calls[1][0]).toBe('/pkg/bin/codex');
+  });
+
+  it('uses CODEX_CLI_PATH when PATH has no codex', async () => {
+    const h = packageHarness(
+      { layoutVersion: 1, entrypoint: 'bin/codex' },
+      { CODEX_CLI_PATH: '/pkg/CodexCLI.app/Contents/MacOS/codex' },
+      '/empty',
+    );
+    h.deps.access = vi.fn(async (target: string) => {
+      if (target.startsWith('/empty')) throw enoent();
+    });
+    const result = await runCodexAdvisorReview(
+      { packet: 'packet', requester_model: 'gpt-5.6-sol' }, identity, session, runtime, h.deps,
+    );
+    expect(payload(result).success).toBe(true);
+    expect(h.spawn.mock.calls[1][0]).toBe('/pkg/bin/codex');
+  });
+
+  it('ignores a relative CODEX_CLI_PATH', async () => {
+    const h = packageHarness({ layoutVersion: 1, entrypoint: 'bin/codex' }, { CODEX_CLI_PATH: 'codex' }, '/empty');
+    // Only the empty PATH entry is missing; a bare 'codex' would pass access() if it were ever consulted.
+    h.deps.access = vi.fn(async (target: string) => {
+      if (target.startsWith('/empty')) throw enoent();
+    });
+    const result = await runCodexAdvisorReview(
+      { packet: 'packet', requester_model: 'gpt-5.6-sol' }, identity, session, runtime, h.deps,
+    );
+    expect(payload(result).reason).toBe('codex-executable-not-found');
+    expect(h.spawn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ layoutVersion: 2, entrypoint: 'bin/codex' }],
+    [{ layoutVersion: 1, entrypoint: '/abs/codex' }],
+    [{ layoutVersion: 1, entrypoint: '../codex' }],
+    ['{not json'],
+  ])('keeps the bare launcher for an unusable package manifest %#', async (manifest) => {
+    const h = packageHarness(manifest);
+    await runCodexAdvisorReview(
+      { packet: 'packet', requester_model: 'gpt-5.6-sol' }, identity, session, runtime, h.deps,
+    );
+    expect(h.spawn.mock.calls[0][1]).toContain('/pkg/CodexCLI.app/Contents/MacOS/codex');
+  });
+
+  it.each(['stat', 'access'] as const)('keeps the bare launcher when the entrypoint fails %s', async (dep) => {
+    const h = packageHarness({ layoutVersion: 1, entrypoint: 'bin/codex' });
+    if (dep === 'stat') {
+      h.deps.stat = vi.fn(async (target: string) => {
+        if (target === '/pkg/bin/codex') throw enoent();
+        return { isFile: () => true };
+      });
+    } else {
+      h.deps.access = vi.fn(async (target: string) => {
+        if (target === '/pkg/bin/codex') throw enoent();
+      });
+    }
+    await runCodexAdvisorReview(
+      { packet: 'packet', requester_model: 'gpt-5.6-sol' }, identity, session, runtime, h.deps,
+    );
+    expect(h.spawn.mock.calls[0][1]).toContain('/pkg/CodexCLI.app/Contents/MacOS/codex');
+  });
+
+  it.each([
+    ['/pkg/a/b/c/d/e', '/pkg/bin/codex'],            // manifest in the 6th directory: found
+    ['/pkg/a/b/c/d/e/f', '/pkg/a/b/c/d/e/f/codex'],  // 7th: ignored
+  ])('bounds the manifest search to six directories from %s', async (pathEnv, expected) => {
+    const h = packageHarness({ layoutVersion: 1, entrypoint: 'bin/codex' }, {}, pathEnv);
+    await runCodexAdvisorReview(
+      { packet: 'packet', requester_model: 'gpt-5.6-sol' }, identity, session, runtime, h.deps,
+    );
+    expect(h.spawn.mock.calls[0][1]).toContain(expected);
   });
 });

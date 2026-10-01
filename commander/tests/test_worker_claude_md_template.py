@@ -97,7 +97,7 @@ class TestWorkerClaudeMdTemplate:
         assert "`requester_model`" in codex
         assert 'review_tier: "one-up"' in codex
         assert "`luna → terra → sol → astra`" in codex
-        assert "`gpt-5.6-luna → gpt-5.6-terra → gpt-5.6-sol → gpt-6-astra`" in codex
+        assert "`gpt-<version>-luna → gpt-<version>-terra → gpt-<version>-sol → gpt-<version>-astra`" in codex
         assert "nested `codex exec`" in codex
         assert "ironclaude:use-fable-subagent" in codex
         assert "Native Codex subagents cannot satisfy" in codex

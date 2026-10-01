@@ -15626,7 +15626,7 @@ function dispatchTool(name, args, db, identity, runtimeFingerprint2) {
 }
 
 // src/tools/advisor-review.ts
-import { access as fsAccess, mkdtemp as fsMkdtemp, rm as fsRm } from "node:fs/promises";
+import { access as fsAccess, mkdtemp as fsMkdtemp, readFile as fsReadFile, realpath as fsRealpath, rm as fsRm, stat as fsStat } from "node:fs/promises";
 import { constants } from "node:fs";
 import { spawn as nodeSpawn } from "node:child_process";
 import os4 from "node:os";
@@ -15638,19 +15638,10 @@ var DEFAULT_REVIEW_TIMEOUT_MS = 15 * 60 * 1e3;
 var PREFLIGHT_TIMEOUT_MS = 15 * 1e3;
 var TERMINATION_GRACE_MS = 1e3;
 var DIAGNOSTIC_LIMIT = 512;
-var REQUESTER_MODELS = [
-  "gpt-5.6-luna",
-  "gpt-5.6-terra",
-  "gpt-5.6-sol",
-  "gpt-6-astra"
-];
+var TIER_ORDER = ["luna", "terra", "sol", "astra"];
+var CODEX_MODEL_RE = /^gpt-(\d+(?:\.\d+)*)-(luna|terra|sol|astra)$/;
+var FALLBACK_CODEX_MODELS = ["gpt-6-luna", "gpt-5.6-terra", "gpt-6-sol", "gpt-6-astra"];
 var REVIEW_TIERS = ["same", "one-up"];
-var REVIEWER_BY_REQUESTER = {
-  "gpt-5.6-luna": "gpt-5.6-terra",
-  "gpt-5.6-terra": "gpt-5.6-sol",
-  "gpt-5.6-sol": "gpt-6-astra",
-  "gpt-6-astra": "gpt-6-astra"
-};
 var ALLOWED_ENV = [
   "PATH",
   "HOME",
@@ -15677,6 +15668,9 @@ var DEFAULT_DEPS = {
   mkdtemp: fsMkdtemp,
   rm: fsRm,
   access: fsAccess,
+  readFile: fsReadFile,
+  realpath: fsRealpath,
+  stat: fsStat,
   env: process.env,
   tmpdir: os4.tmpdir(),
   now: Date.now,
@@ -15705,8 +15699,8 @@ var advisorReviewToolDefinition = {
       },
       requester_model: {
         type: "string",
-        enum: [...REQUESTER_MODELS],
-        description: "Current Codex requester model; the broker maps the reviewer exactly once."
+        pattern: CODEX_MODEL_RE.source,
+        description: "Current Codex requester model (any gpt-<version>-<luna|terra|sol|astra>); the broker maps the reviewer exactly once."
       },
       review_tier: {
         type: "string",
@@ -15743,6 +15737,48 @@ function resolveTrustedCodexRequesterModel(requestMeta) {
   const model = turn.model;
   return typeof model === "string" && model.length > 0 ? model : null;
 }
+function parseCodexModel(slug) {
+  if (typeof slug !== "string") return null;
+  const match = CODEX_MODEL_RE.exec(slug);
+  if (!match) return null;
+  return { version: match[1].split(".").map(Number), tier: match[2] };
+}
+function compareVersions(left, right) {
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const difference = (left[index] ?? 0) - (right[index] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+function newestAtTier(installed, tier) {
+  let best = null;
+  for (const slug of installed) {
+    const parsed = parseCodexModel(slug);
+    if (!parsed || parsed.tier !== tier) continue;
+    if (!best || compareVersions(parsed.version, best.version) > 0) best = { slug, version: parsed.version };
+  }
+  return best?.slug ?? null;
+}
+async function readInstalledCodexModels(deps) {
+  const codexHome = deps.env.CODEX_HOME || path5.join(deps.env.HOME || os4.homedir(), ".codex");
+  try {
+    const parsed = JSON.parse(await deps.readFile(path5.join(codexHome, "models_cache.json"), "utf8"));
+    const slugs = (Array.isArray(parsed?.models) ? parsed.models : []).map((entry) => entry?.slug).filter((slug) => parseCodexModel(slug) !== null);
+    if (slugs.length > 0) return slugs;
+  } catch {
+  }
+  return [...FALLBACK_CODEX_MODELS];
+}
+function resolveCodexReviewer(requester, installed) {
+  const parsed = parseCodexModel(requester);
+  const ceiling = TIER_ORDER.length - 1;
+  const start = parsed ? Math.min(TIER_ORDER.indexOf(parsed.tier) + 1, ceiling) : ceiling;
+  for (let index = start; index <= ceiling; index += 1) {
+    const newest = newestAtTier(installed, TIER_ORDER[index]);
+    if (newest) return newest;
+  }
+  return FALLBACK_CODEX_MODELS[start];
+}
 function sanitizedEnv(source) {
   const clean = {};
   for (const key of ALLOWED_ENV) {
@@ -15751,13 +15787,68 @@ function sanitizedEnv(source) {
   }
   return clean;
 }
+var CODEX_PACKAGE_MANIFEST = "codex-package.json";
+var CODEX_PACKAGE_SEARCH_DEPTH = 6;
+async function isExecutableFile(target, deps) {
+  try {
+    if (!(await deps.stat(target)).isFile()) return false;
+    await deps.access(target, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function resolveCodexPackageEntrypoint(launcher, deps) {
+  let physical;
+  try {
+    physical = await deps.realpath(launcher);
+  } catch {
+    return launcher;
+  }
+  let directory = path5.dirname(physical);
+  for (let depth = 0; depth < CODEX_PACKAGE_SEARCH_DEPTH; depth += 1) {
+    let raw;
+    try {
+      raw = await deps.readFile(path5.join(directory, CODEX_PACKAGE_MANIFEST), "utf8");
+    } catch {
+      raw = null;
+    }
+    if (raw !== null) {
+      let manifest;
+      try {
+        manifest = JSON.parse(raw);
+      } catch {
+        return launcher;
+      }
+      const entrypoint = manifest?.entrypoint;
+      if (manifest?.layoutVersion !== 1 || typeof entrypoint !== "string" || entrypoint.length === 0 || path5.isAbsolute(entrypoint) || entrypoint.split(/[\\/]/).includes("..")) {
+        return launcher;
+      }
+      const candidate = path5.join(directory, entrypoint);
+      return await isExecutableFile(candidate, deps) ? candidate : launcher;
+    }
+    const parent = path5.dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  return launcher;
+}
 async function resolveCodexExecutable(deps) {
   for (const directory of (deps.env.PATH ?? "").split(path5.delimiter)) {
     if (!directory) continue;
     const candidate = path5.resolve(directory, process.platform === "win32" ? "codex.exe" : "codex");
     try {
       await deps.access(candidate, constants.X_OK);
-      return candidate;
+    } catch {
+      continue;
+    }
+    return resolveCodexPackageEntrypoint(candidate, deps);
+  }
+  const cliPath = deps.env.CODEX_CLI_PATH;
+  if (typeof cliPath === "string" && path5.isAbsolute(cliPath)) {
+    try {
+      await deps.access(cliPath, constants.X_OK);
+      return resolveCodexPackageEntrypoint(cliPath, deps);
     } catch {
     }
   }
@@ -15922,7 +16013,7 @@ function validateArgs(args) {
   if (Buffer.byteLength(args.packet, "utf8") > MAX_PACKET_BYTES) {
     return { ok: false, reason: "packet-too-large" };
   }
-  if (!REQUESTER_MODELS.includes(args.requester_model)) {
+  if (parseCodexModel(args.requester_model) === null) {
     return { ok: false, reason: "invalid-requester-model" };
   }
   if (args.review_tier !== void 0 && !REVIEW_TIERS.includes(args.review_tier)) {
@@ -15981,7 +16072,7 @@ async function runCodexAdvisorReview(args, identity, session, runtime, overrides
       diagnostic: diagnostic(preflight.stderr || preflight.stdout || preflight.spawnError || "preflight failed")
     });
   }
-  const reviewerModel = validated.reviewTier === "same" ? validated.requesterModel : REVIEWER_BY_REQUESTER[validated.requesterModel];
+  const reviewerModel = validated.reviewTier === "same" ? validated.requesterModel : resolveCodexReviewer(validated.requesterModel, await readInstalledCodexModels(deps));
   const startedAt = deps.now();
   let privateCwd = null;
   let outcome;

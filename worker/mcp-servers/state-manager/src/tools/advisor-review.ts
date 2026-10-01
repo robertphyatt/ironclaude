@@ -1,4 +1,4 @@
-import { access as fsAccess, mkdtemp as fsMkdtemp, rm as fsRm } from 'node:fs/promises';
+import { access as fsAccess, mkdtemp as fsMkdtemp, readFile as fsReadFile, realpath as fsRealpath, rm as fsRm, stat as fsStat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import os from 'node:os';
@@ -15,23 +15,15 @@ const DEFAULT_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
 const PREFLIGHT_TIMEOUT_MS = 15 * 1000;
 const TERMINATION_GRACE_MS = 1000;
 const DIAGNOSTIC_LIMIT = 512;
-const REQUESTER_MODELS = [
-  'gpt-5.6-luna',
-  'gpt-5.6-terra',
-  'gpt-5.6-sol',
-  'gpt-6-astra',
-] as const;
-type RequesterModel = typeof REQUESTER_MODELS[number];
+const TIER_ORDER = ['luna', 'terra', 'sol', 'astra'] as const;
+type CodexTier = typeof TIER_ORDER[number];
+export const CODEX_MODEL_RE = /^gpt-(\d+(?:\.\d+)*)-(luna|terra|sol|astra)$/;
+// Used when Codex's models_cache.json is missing, unreadable, or has no tier models.
+export const FALLBACK_CODEX_MODELS = ['gpt-6-luna', 'gpt-5.6-terra', 'gpt-6-sol', 'gpt-6-astra'] as const;
+type RequesterModel = string;
 
 const REVIEW_TIERS = ['same', 'one-up'] as const;
 type ReviewTier = typeof REVIEW_TIERS[number];
-
-const REVIEWER_BY_REQUESTER: Record<RequesterModel, RequesterModel> = {
-  'gpt-5.6-luna': 'gpt-5.6-terra',
-  'gpt-5.6-terra': 'gpt-5.6-sol',
-  'gpt-5.6-sol': 'gpt-6-astra',
-  'gpt-6-astra': 'gpt-6-astra',
-};
 
 const ALLOWED_ENV = [
   'PATH',
@@ -77,6 +69,9 @@ export type AdvisorReviewDeps = {
   mkdtemp: (prefix: string) => Promise<string>;
   rm: (target: string, options: { recursive: true; force: true }) => Promise<void>;
   access: (target: string, mode: number) => Promise<void>;
+  readFile: (target: string, encoding: 'utf8') => Promise<string>;
+  realpath: (target: string) => Promise<string>;
+  stat: (target: string) => Promise<{ isFile(): boolean }>;
   env: NodeJS.ProcessEnv;
   tmpdir: string;
   now: () => number;
@@ -102,6 +97,9 @@ const DEFAULT_DEPS: AdvisorReviewDeps = {
   mkdtemp: fsMkdtemp,
   rm: fsRm,
   access: fsAccess,
+  readFile: fsReadFile,
+  realpath: fsRealpath,
+  stat: fsStat,
   env: process.env,
   tmpdir: os.tmpdir(),
   now: Date.now,
@@ -134,8 +132,9 @@ export const advisorReviewToolDefinition = {
       },
       requester_model: {
         type: 'string' as const,
-        enum: [...REQUESTER_MODELS],
-        description: 'Current Codex requester model; the broker maps the reviewer exactly once.',
+        pattern: CODEX_MODEL_RE.source,
+        description:
+          'Current Codex requester model (any gpt-<version>-<luna|terra|sol|astra>); the broker maps the reviewer exactly once.',
       },
       review_tier: {
         type: 'string' as const,
@@ -182,6 +181,65 @@ export function resolveTrustedCodexRequesterModel(requestMeta: unknown): string 
 }
 
 
+export function parseCodexModel(slug: unknown): { version: number[]; tier: CodexTier } | null {
+  if (typeof slug !== 'string') return null;
+  const match = CODEX_MODEL_RE.exec(slug);
+  if (!match) return null;
+  return { version: match[1].split('.').map(Number), tier: match[2] as CodexTier };
+}
+
+
+function compareVersions(left: number[], right: number[]): number {
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const difference = (left[index] ?? 0) - (right[index] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+
+
+function newestAtTier(installed: readonly string[], tier: CodexTier): string | null {
+  let best: { slug: string; version: number[] } | null = null;
+  for (const slug of installed) {
+    const parsed = parseCodexModel(slug);
+    if (!parsed || parsed.tier !== tier) continue;
+    if (!best || compareVersions(parsed.version, best.version) > 0) best = { slug, version: parsed.version };
+  }
+  return best?.slug ?? null;
+}
+
+
+export async function readInstalledCodexModels(
+  deps: Pick<AdvisorReviewDeps, 'env' | 'readFile'>,
+): Promise<string[]> {
+  const codexHome = deps.env.CODEX_HOME || path.join(deps.env.HOME || os.homedir(), '.codex');
+  try {
+    const parsed = JSON.parse(await deps.readFile(path.join(codexHome, 'models_cache.json'), 'utf8')) as {
+      models?: Array<{ slug?: unknown } | null>;
+    };
+    const slugs = (Array.isArray(parsed?.models) ? parsed.models : [])
+      .map((entry) => entry?.slug)
+      .filter((slug): slug is string => parseCodexModel(slug) !== null);
+    if (slugs.length > 0) return slugs;
+  } catch {
+    // Missing, unreadable, or malformed cache: use the built-in fallback below.
+  }
+  return [...FALLBACK_CODEX_MODELS];
+}
+
+
+export function resolveCodexReviewer(requester: string, installed: readonly string[]): string {
+  const parsed = parseCodexModel(requester);
+  const ceiling = TIER_ORDER.length - 1;
+  const start = parsed ? Math.min(TIER_ORDER.indexOf(parsed.tier) + 1, ceiling) : ceiling;
+  for (let index = start; index <= ceiling; index += 1) {
+    const newest = newestAtTier(installed, TIER_ORDER[index]);
+    if (newest) return newest;
+  }
+  return FALLBACK_CODEX_MODELS[start];
+}
+
+
 function sanitizedEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const clean: NodeJS.ProcessEnv = {};
   for (const key of ALLOWED_ENV) {
@@ -192,15 +250,83 @@ function sanitizedEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 }
 
 
+const CODEX_PACKAGE_MANIFEST = 'codex-package.json';
+// The launcher's own directory plus up to five parents, mirroring codex-runtime-preflight.mjs.
+const CODEX_PACKAGE_SEARCH_DEPTH = 6;
+
+
+async function isExecutableFile(target: string, deps: AdvisorReviewDeps): Promise<boolean> {
+  try {
+    if (!(await deps.stat(target)).isFile()) return false;
+    await deps.access(target, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+
+export async function resolveCodexPackageEntrypoint(launcher: string, deps: AdvisorReviewDeps): Promise<string> {
+  let physical: string;
+  try {
+    physical = await deps.realpath(launcher);
+  } catch {
+    return launcher;
+  }
+  let directory = path.dirname(physical);
+  for (let depth = 0; depth < CODEX_PACKAGE_SEARCH_DEPTH; depth += 1) {
+    let raw: string | null;
+    try {
+      raw = await deps.readFile(path.join(directory, CODEX_PACKAGE_MANIFEST), 'utf8');
+    } catch {
+      raw = null;
+    }
+    if (raw !== null) {
+      let manifest: { layoutVersion?: unknown; entrypoint?: unknown } | null;
+      try {
+        manifest = JSON.parse(raw) as { layoutVersion?: unknown; entrypoint?: unknown } | null;
+      } catch {
+        return launcher;
+      }
+      const entrypoint = manifest?.entrypoint;
+      if (
+        manifest?.layoutVersion !== 1 ||
+        typeof entrypoint !== 'string' ||
+        entrypoint.length === 0 ||
+        path.isAbsolute(entrypoint) ||
+        entrypoint.split(/[\\/]/).includes('..')
+      ) {
+        return launcher;
+      }
+      const candidate = path.join(directory, entrypoint);
+      return (await isExecutableFile(candidate, deps)) ? candidate : launcher;
+    }
+    const parent = path.dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  return launcher;
+}
+
+
 async function resolveCodexExecutable(deps: AdvisorReviewDeps): Promise<string | null> {
   for (const directory of (deps.env.PATH ?? '').split(path.delimiter)) {
     if (!directory) continue;
     const candidate = path.resolve(directory, process.platform === 'win32' ? 'codex.exe' : 'codex');
     try {
       await deps.access(candidate, constants.X_OK);
-      return candidate;
     } catch {
-      // Continue to the next PATH entry.
+      continue;
+    }
+    return resolveCodexPackageEntrypoint(candidate, deps);
+  }
+  const cliPath = deps.env.CODEX_CLI_PATH;
+  if (typeof cliPath === 'string' && path.isAbsolute(cliPath)) {
+    try {
+      await deps.access(cliPath, constants.X_OK);
+      return resolveCodexPackageEntrypoint(cliPath, deps);
+    } catch {
+      // Not a usable launcher.
     }
   }
   return null;
@@ -385,7 +511,7 @@ function validateArgs(args: Record<string, unknown>):
   if (Buffer.byteLength(args.packet, 'utf8') > MAX_PACKET_BYTES) {
     return { ok: false, reason: 'packet-too-large' };
   }
-  if (!REQUESTER_MODELS.includes(args.requester_model as RequesterModel)) {
+  if (parseCodexModel(args.requester_model) === null) {
     return { ok: false, reason: 'invalid-requester-model' };
   }
   if (args.review_tier !== undefined && !REVIEW_TIERS.includes(args.review_tier as ReviewTier)) {
@@ -475,7 +601,7 @@ export async function runCodexAdvisorReview(
 
   const reviewerModel = validated.reviewTier === 'same'
     ? validated.requesterModel
-    : REVIEWER_BY_REQUESTER[validated.requesterModel];
+    : resolveCodexReviewer(validated.requesterModel, await readInstalledCodexModels(deps));
   const startedAt = deps.now();
   let privateCwd: string | null = null;
   let outcome: ToolResult;

@@ -314,7 +314,7 @@ Call `<WRITE_INSTRUCTION_FILE>` for root `AGENTS.md` with the complete canonical
 
 9. **Advisor Fallback (advisor unavailable ≠ skip the advisor)**
    - Fire the advisor at natural discretionary points: before substantive work, when stuck, and before declaring done
-   - Call `run_codex_advisor_review` with the complete inline review packet, current `requester_model`, and `review_tier: "one-up"`; omission remains compatibility-only. The broker rejects any mismatch with provider-authenticated Codex turn metadata and applies its fixed `luna → terra → sol → astra` mapping (`gpt-5.6-luna → gpt-5.6-terra → gpt-5.6-sol → gpt-6-astra`) exactly once.
+   - Call `run_codex_advisor_review` with the complete inline review packet, current `requester_model`, and `review_tier: "one-up"`; omission remains compatibility-only. The broker rejects any mismatch with provider-authenticated Codex turn metadata and applies its fixed `luna → terra → sol → astra` mapping (`gpt-<version>-luna → gpt-<version>-terra → gpt-<version>-sol → gpt-<version>-astra`) exactly once.
    - Never run nested `codex exec` for normal advisor work or repeat an operator approval request for this brokered read-only review
    - Reconcile the review with evidence; never proceed unreviewed because an advisor command is unavailable
 
@@ -452,7 +452,7 @@ Call `<WRITE_INSTRUCTION_FILE>` for `.claude/rules/behavioral.md` with the compl
 9. **Advisor Fallback**
    - When the `advisor` tool returns unavailable, do NOT skip the advisor step or just reason it through yourself
    - Spawn a top-tier subagent via the `Agent` tool (`model=fable` if Fable is available, else `model=opus`) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
-   - Client-aware: that is the Claude path; a Codex session calls `run_codex_advisor_review` with a complete inline packet, its current `requester_model`, and `review_tier: "one-up"` (omission is compatibility-only); the broker rejects any mismatch with provider-authenticated Codex turn metadata and owns the one-time `luna→terra→sol→astra` mapping (`gpt-5.6-luna→gpt-5.6-terra→gpt-5.6-sol→gpt-6-astra`) — see the `ironclaude:advisor-fallback` skill
+   - Client-aware: that is the Claude path; a Codex session calls `run_codex_advisor_review` with a complete inline packet, its current `requester_model`, and `review_tier: "one-up"` (omission is compatibility-only); the broker rejects any mismatch with provider-authenticated Codex turn metadata and owns the one-time `luna→terra→sol→astra` mapping (`gpt-<version>-luna→gpt-<version>-terra→gpt-<version>-sol→gpt-<version>-astra`) — see the `ironclaude:advisor-fallback` skill
    - Weight its findings as you would the advisor's; "no advisor" means "use a subagent for the same effect," never "proceed unreviewed"
 
 10. **No Workflow Avoidance Under Stage/Context Restrictions**
@@ -516,7 +516,7 @@ Concept 9 (Advisor Fallback):
 N. **Advisor Fallback**
    - When the `advisor` tool returns unavailable, do NOT skip the advisor step or just reason it through yourself
    - Spawn a top-tier subagent via the `Agent` tool (`model=fable` if Fable is available, else `model=opus`) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
-   - Client-aware: that is the Claude path; a Codex session calls `run_codex_advisor_review` with a complete inline packet, its current `requester_model`, and `review_tier: "one-up"` (omission is compatibility-only); the broker rejects any mismatch with provider-authenticated Codex turn metadata and owns the one-time `luna→terra→sol→astra` mapping (`gpt-5.6-luna→gpt-5.6-terra→gpt-5.6-sol→gpt-6-astra`) — see the `ironclaude:advisor-fallback` skill
+   - Client-aware: that is the Claude path; a Codex session calls `run_codex_advisor_review` with a complete inline packet, its current `requester_model`, and `review_tier: "one-up"` (omission is compatibility-only); the broker rejects any mismatch with provider-authenticated Codex turn metadata and owns the one-time `luna→terra→sol→astra` mapping (`gpt-<version>-luna→gpt-<version>-terra→gpt-<version>-sol→gpt-<version>-astra`) — see the `ironclaude:advisor-fallback` skill
    - Weight its findings as you would the advisor's; "no advisor" means "use a subagent for the same effect," never "proceed unreviewed"
 ```
 

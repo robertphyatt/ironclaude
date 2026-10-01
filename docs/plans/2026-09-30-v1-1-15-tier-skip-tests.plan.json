@@ -1,0 +1,62 @@
+{
+  "name": "v1.1.15 Tier-Skip Test Coverage",
+  "goal": "Add two vitest cases proving the Codex broker skips empty installed tiers and applies the R4 built-in fallback.",
+  "requirements_file": "docs/plans/2026-09-30-v1-1-15-tier-skip-tests-requirements.md",
+  "design_file": "docs/plans/2026-09-30-v1-1-15-tier-skip-tests-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Tier-skip and fallback test cases",
+      "description": "T1-T3. Tests only: add it.each rows ['gpt-6-luna', ['gpt-6-sol','gpt-6-astra'], 'gpt-6-sol'] and ['gpt-6-sol', ['gpt-6-luna'], 'gpt-6-astra'] to advisor-review.test.ts directly before \"  it('prefers the newest version at a tier', async () => {\". Prove T1 falsifiable via temporary collapsed-loop mutant in advisor-review.ts:235-239, then revert to byte-identical HEAD. Exact code: human plan Task 1.",
+      "allowed_files": [
+        "worker/mcp-servers/state-manager/src/tools/advisor-review.test.ts",
+        "worker/mcp-servers/state-manager/src/tools/advisor-review.ts",
+        "docs/plans/2026-09-30-v1-1-15-tier-skip-tests-requirements.md",
+        "docs/plans/2026-09-30-v1-1-15-tier-skip-tests-design.md",
+        "docs/plans/2026-09-30-v1-1-15-tier-skip-tests.md",
+        "docs/plans/2026-09-30-v1-1-15-tier-skip-tests.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Insert the it.each block verbatim from human plan Task 1 Step 1 before the 'prefers the newest version at a tier' test."
+        },
+        {
+          "description": "Run tests (RED impossible: behavior exists; falsifiability proven next)",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/tools/advisor-review.test.ts",
+          "expected": "67 passed, 0 failed"
+        },
+        {
+          "description": "Temporary mutant: replace the 4-line for-loop in resolveCodexReviewer with 'return newestAtTier(installed, TIER_ORDER[start]) ?? FALLBACK_CODEX_MODELS[start];' then run tests",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/tools/advisor-review.test.ts",
+          "expected": "exactly 1 failed: 'skips empty installed tiers for gpt-6-luna ...' (got gpt-5.6-terra); all others pass"
+        },
+        {
+          "description": "Revert the mutant (restore original loop) and confirm byte-identical to HEAD",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --exit-code -- worker/mcp-servers/state-manager/src/tools/advisor-review.ts",
+          "expected": "no output, exit 0"
+        },
+        {
+          "description": "Re-verify tests after revert",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/tools/advisor-review.test.ts",
+          "expected": "67 passed, 0 failed"
+        },
+        {
+          "description": "Typecheck",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx tsc --noEmit",
+          "expected": "exit 0, no output"
+        },
+        {
+          "description": "Stage test",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/state-manager/src/tools/advisor-review.test.ts",
+          "expected": "exit 0"
+        },
+        {
+          "description": "Stage plan artifacts",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-09-30-v1-1-15-tier-skip-tests-requirements.md docs/plans/2026-09-30-v1-1-15-tier-skip-tests-design.md docs/plans/2026-09-30-v1-1-15-tier-skip-tests.md docs/plans/2026-09-30-v1-1-15-tier-skip-tests.plan.json",
+          "expected": "exit 0"
+        }
+      ]
+    }
+  ]
+}

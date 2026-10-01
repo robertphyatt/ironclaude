@@ -15,7 +15,7 @@ FALLBACK = "model=opus"   # required fallback when Fable is unavailable
 BRAIN_MARKER = "Independent Review (no advisor tool, no subagents)"
 CODEX_MARKER = "run_codex_advisor_review"
 CODEX_SEMANTIC_LADDER = "luna (haiku) → terra (sonnet) → sol (opus) → astra (fable)"
-CODEX_MODEL_LADDER = "gpt-5.6-luna → gpt-5.6-terra → gpt-5.6-sol → gpt-6-astra"
+CODEX_MODEL_LADDER = "gpt-<version>-luna → gpt-<version>-terra → gpt-<version>-sol → gpt-<version>-astra"
 ONE_UP_TIER = 'review_tier: "one-up"'
 
 
@@ -81,7 +81,7 @@ def test_directive_in_activation_skill():
     assert PRIMARY in text and FALLBACK in text                # tier-relative fallback named
     assert text.count(CODEX_MARKER) >= 3
     assert text.count("luna→terra→sol→astra") >= 2
-    assert "gpt-5.6-luna→gpt-5.6-terra→gpt-5.6-sol→gpt-6-astra" in text
+    assert "gpt-<version>-luna→gpt-<version>-terra→gpt-<version>-sol→gpt-<version>-astra" in text
     assert text.count(ONE_UP_TIER) >= 3
 
 
@@ -90,7 +90,8 @@ def test_codex_advisor_ladder_names_astra_requester_and_ceiling_without_claiming
     assert "`gpt-6-astra`" in text
     assert CODEX_SEMANTIC_LADDER in text
     assert CODEX_MODEL_LADDER in text
-    assert "`gpt-5.6-sol` → `gpt-6-astra`" in text
+    assert "`gpt-6-sol` → `gpt-6-astra`" in text
     assert "`gpt-6-astra` → `gpt-6-astra`" in text
     assert "Astra remains a Codex model and does not satisfy an actual Claude Fable request." in text
     assert ONE_UP_TIER in text
+    assert "gpt-<version>-<luna|terra|sol|astra>" in text

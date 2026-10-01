@@ -194,7 +194,7 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    Resolve the reviewer model on the trusted client's ladder:
    - Claude Code: Haiku→`sonnet`, Sonnet→`opus`, Opus→`fable` unless Fable is
      unavailable→`opus`; Fable is the ceiling.
-   - Codex: Luna→`gpt-5.6-terra`, Terra→`gpt-5.6-sol`, Sol→`gpt-6-astra`, and Astra→`gpt-6-astra`; Astra is the ceiling and uses a fresh same-tier `gpt-6-astra` reviewer.
+   - Codex: Luna→Terra→Sol→Astra, each resolved by the broker to the newest installed `gpt-<version>-<tier>` model (today Luna→`gpt-5.6-terra`, Terra→`gpt-6-sol`, Sol→`gpt-6-astra`, and Astra→`gpt-6-astra`); Astra is the ceiling and uses a fresh same-tier `gpt-6-astra` reviewer.
 
    **Same-tier** means the current model on that same client; never cross clients
    for reviewer tiering. To check Claude Fable availability, read the state flag at
@@ -373,7 +373,7 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    The advisor exists to make this response correct the first time.
    - **Tier:** one above your current model on the trusted client's ladder (Claude:
      Opus→`fable`, Fable unavailable→`opus`, Fable ceiling→same-tier Fable; Codex:
-     Luna→`gpt-5.6-terra`, Terra→`gpt-5.6-sol`, Sol→`gpt-6-astra`, Astra ceiling→same-tier Astra).
+     Luna→Terra→Sol→Astra, each the newest installed `gpt-<version>-<tier>` model, Astra ceiling→same-tier Astra).
      Always a **subagent** — never swap
      the main-loop model, because prompt caches are model-scoped and a swap re-establishes
      the entire context before producing a single token.
@@ -665,7 +665,7 @@ For an IronClaude self-update:
 1. Finish all planned source tests and plugin validation.
 2. Run `make codex-plugin-release`. Its first step is the idempotent launcher
    repair; require exit `0` and preflight `status` equal to `healthy` or
-   `repaired`. The target then applies the plugin-creator cachebuster before the
+   `repaired`. The target then applies the IronClaude cachebuster before the
    final build, validates the cachebusted source, and reinstalls through the
    confirmed local marketplace. A pre-cachebuster bundle cannot certify the
    installed runtime.

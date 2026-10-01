@@ -30,6 +30,12 @@ The preflight is idempotent and fail-closed. It creates only a missing equivalen
 FIFO, dangling link, or link to different bytes. IronClaude self-updates run the
 same repair before cachebusting, building, reinstalling, and restarting Codex.
 
+When the ChatGPT app ships Codex as a `codex-cli/` package (`codex-package.json`, `layoutVersion` 1),
+IronClaude launches the package's declared entrypoint (`codex-cli/bin/codex`), whose
+`codex-code-mode-host` companion sits beside it, so no symlink is needed and nothing inside the signed
+`CodexCLI.app` is touched. If an older `~/.local/bin/codex` or `~/.local/bin/codex-code-mode-host`
+symlink still points at the removed `Resources/codex`, re-point it to `codex-cli/bin/` (or delete it).
+
 ## Model tiers
 
 IronClaude maps its tier names to codex models
@@ -41,6 +47,9 @@ IronClaude maps its tier names to codex models
 | sonnet | gpt-5.6-terra   |
 | opus   | gpt-5.6-sol     |
 | fable  | gpt-6-astra     |
+
+These are the defaults. Any `gpt-<version>-<tier>` model whose tier word matches is accepted
+(haiku→luna, sonnet→terra, opus→sol, fable→astra), for example `gpt-6-sol` for opus.
 
 `fable` / `gpt-6-astra` is the hardest Codex tier, not the default. Select it only
 when lower tiers cannot reliably handle the assigned work.

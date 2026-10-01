@@ -27,6 +27,19 @@ EXPECTED_MODELS = {
         "fable": "gpt-6-astra",
     },
 }
+# Codex model names change with each release; accept any version whose tier word matches.
+CODEX_TIER_WORDS = {"haiku": "luna", "sonnet": "terra", "opus": "sol", "fable": "astra"}
+CODEX_MODEL_RE = re.compile(r"^gpt-(\d+(?:\.\d+)*)-(luna|terra|sol|astra)$")
+
+
+def _codex_models_valid(models: Mapping[str, object]) -> bool:
+    if set(models) != set(TIER_NAMES):
+        return False
+    for tier, value in models.items():
+        match = CODEX_MODEL_RE.fullmatch(value) if isinstance(value, str) else None
+        if match is None or match.group(2) != CODEX_TIER_WORDS[tier]:
+            return False
+    return True
 
 
 class ProviderConfigError(ValueError):
@@ -119,7 +132,14 @@ def parse_provider_config(
         if not isinstance(enabled, bool):
             raise ProviderConfigError(f"providers.clients.{name}.enabled must be boolean")
         model_values = dict(models)
-        if model_values != EXPECTED_MODELS[name]:
+        if name == "codex":
+            if not _codex_models_valid(model_values):
+                raise ProviderConfigError(
+                    "providers.clients.codex.models must map each tier to a "
+                    "gpt-<version>-<tier-word> model (haiku→luna, sonnet→terra, "
+                    "opus→sol, fable→astra)"
+                )
+        elif model_values != EXPECTED_MODELS[name]:
             raise ProviderConfigError(
                 f"providers.clients.{name}.models must exactly match approved models"
             )

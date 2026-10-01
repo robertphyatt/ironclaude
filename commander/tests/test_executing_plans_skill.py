@@ -137,7 +137,7 @@ def test_plan_review_dispatch_is_provider_native_with_shared_contract():
     assert "complete current artifact contents inline" in normalized
     assert "same authority order" in normalized
     assert "same materiality" in normalized
-    assert "Luna→`gpt-5.6-terra`, Terra→`gpt-5.6-sol`, Sol→`gpt-6-astra`, and Astra→`gpt-6-astra`" in text
+    assert "Luna→Terra→Sol→Astra, each resolved by the broker to the newest installed `gpt-<version>-<tier>` model" in text
     assert "`gpt-6-astra`" in text
     assert 'review_tier: "same"' in text
     assert 'review_tier: "one-up"' in text
@@ -146,7 +146,7 @@ def test_plan_review_dispatch_is_provider_native_with_shared_contract():
 def test_fix_advisor_uses_complete_codex_ladder_and_astra_ceiling():
     text = _read()
     assert (
-        "Luna→`gpt-5.6-terra`, Terra→`gpt-5.6-sol`, Sol→`gpt-6-astra`, "
+        "Luna→Terra→Sol→Astra, each the newest installed `gpt-<version>-<tier>` model, "
         "Astra ceiling→same-tier Astra"
     ) in text
     assert "Sol ceiling→same-tier Sol" not in text
@@ -226,7 +226,7 @@ def test_self_update_boundary_requires_same_task_runtime_and_behavioral_proof():
     section = _normalized(_self_update_section())
     for concept in (
         "installs or updates its own codex plugin",
-        "cachebuster before the final build",
+        "ironclaude cachebuster before the final build",
         "make codex-plugin-release",
         "exit `0`",
         "`healthy` or `repaired`",
@@ -262,6 +262,7 @@ def test_codex_install_and_release_use_runtime_preflight_before_plugin_install()
         assert "make codex-plugin-install" in text
     assert "codex-runtime-preflight:" in makefile
     assert "worker/scripts/codex-runtime-preflight.mjs --mode repair" in makefile
+    assert "plugin-creator" not in makefile
     install = subprocess.run(
         ["make", "-n", "codex-plugin-install"],
         cwd=REPO_ROOT,
@@ -281,9 +282,9 @@ def test_codex_install_and_release_use_runtime_preflight_before_plugin_install()
     ).stdout
     ordered = (
         "codex-runtime-preflight.mjs --mode repair",
-        "update_plugin_cachebuster.py worker",
+        "worker/scripts/codex-plugin-cachebuster.mjs worker",
         "npm run bundle",
-        "validate_plugin.py worker",
+        "worker/scripts/validate-codex-plugin.mjs worker",
         "codex plugin add ironclaude@ironclaude --json",
     )
     positions = [release.index(token) for token in ordered]

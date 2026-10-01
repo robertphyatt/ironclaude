@@ -1,5 +1,6 @@
 import json
 import os
+import pytest
 import shutil
 import stat
 import subprocess
@@ -335,3 +336,123 @@ def test_unexpected_filesystem_error_still_emits_one_sanitized_json_result():
     assert payload["reason"] == "unexpected-filesystem-error"
     assert "sensitive filesystem detail" not in completed.stdout
     assert "sensitive filesystem detail" not in completed.stderr
+
+
+def package_layout(tmp_path: Path, manifest=None, binary_dirs=("CodexCLI.app", "Contents", "MacOS")):
+    package = tmp_path / "Resources" / "codex-cli"
+    wrapper = executable(package / "bin" / "codex")
+    companion = executable(package / "bin" / "codex-code-mode-host")
+    binary = executable(package.joinpath(*binary_dirs) / "codex")
+    body = {"layoutVersion": 1, "entrypoint": "bin/codex"} if manifest is None else manifest
+    (package / "codex-package.json").write_text(body if isinstance(body, str) else json.dumps(body))
+    return package, wrapper, companion, binary
+
+
+def test_package_binary_uses_declared_entrypoint(tmp_path: Path):
+    _, wrapper, companion, binary = package_layout(tmp_path)
+
+    completed, payload = run_preflight(binary)
+
+    assert completed.returncode == 0
+    assert payload["status"] == "healthy"
+    assert payload["reason"] == "source-is-destination"
+    assert payload["invoked_launcher"] == str(wrapper.resolve())
+    assert payload["source_companion"] == str(companion.resolve())
+    assert not (binary.parent / "codex-code-mode-host").exists()
+
+
+def test_package_binary_found_on_path_uses_entrypoint(tmp_path: Path):
+    _, wrapper, _, binary = package_layout(tmp_path)
+
+    completed, payload = run_preflight(None, env={"PATH": str(binary.parent)})
+
+    assert completed.returncode == 0
+    assert payload["invoked_launcher"] == str(wrapper.resolve())
+    assert payload["status"] == "healthy"
+
+
+def test_symlink_to_package_wrapper_uses_entrypoint(tmp_path: Path):
+    _, wrapper, _, _ = package_layout(tmp_path)
+    local = tmp_path / "local" / "bin"
+    local.mkdir(parents=True)
+    (local / "codex").symlink_to(wrapper)
+
+    completed, payload = run_preflight(local / "codex")
+
+    assert completed.returncode == 0
+    assert payload["invoked_launcher"] == str(wrapper.resolve())
+    assert payload["reason"] == "source-is-destination"
+    assert not (local / "codex-code-mode-host").exists()
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {"layoutVersion": 2, "entrypoint": "bin/codex"},
+        {"layoutVersion": 1, "entrypoint": "bin/missing"},
+        {"layoutVersion": 1},
+        "{not json",
+    ],
+)
+def test_unusable_package_manifest_keeps_old_behavior(tmp_path: Path, manifest):
+    _, _, _, binary = package_layout(tmp_path, manifest=manifest)
+
+    completed, payload = run_preflight(binary)
+
+    assert completed.returncode == 3
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "source-missing"
+    assert payload["invoked_launcher"] == str(binary)
+
+
+def test_escaping_entrypoint_is_ignored_even_when_its_target_exists(tmp_path: Path):
+    cases = [
+        ("../bin/codex", ("Resources", "bin", "codex")),
+        ("bin/../../bin/codex", ("Resources", "bin", "codex")),
+        ("/abs/bin/codex", ("Resources", "codex-cli", "abs", "bin", "codex")),  # path.join form
+        ("<absolute>", ("escape", "codex")),  # path.resolve form
+    ]
+    for index, (entrypoint, escape) in enumerate(cases):
+        root = tmp_path / str(index)
+        target = root.joinpath(*escape)
+        if entrypoint == "<absolute>":
+            entrypoint = str(target)
+        _, _, _, binary = package_layout(root, manifest={"layoutVersion": 1, "entrypoint": entrypoint})
+        executable(target)
+        executable(target.parent / "codex-code-mode-host")
+
+        completed, payload = run_preflight(binary)
+
+        assert completed.returncode == 3
+        assert payload["status"] == "blocked"
+        assert payload["reason"] == "source-missing"
+        assert payload["invoked_launcher"] == str(binary)
+
+
+def test_non_executable_entrypoint_keeps_old_behavior(tmp_path: Path):
+    package, _, _, binary = package_layout(tmp_path, manifest={"layoutVersion": 1, "entrypoint": "bin/plain"})
+    (package / "bin" / "plain").write_text("#!/bin/sh\nexit 0\n")
+
+    completed, payload = run_preflight(binary)
+
+    assert completed.returncode == 3
+    assert payload["reason"] == "source-missing"
+    assert payload["invoked_launcher"] == str(binary)
+
+
+def test_package_manifest_in_sixth_directory_is_used(tmp_path: Path):
+    _, wrapper, _, binary = package_layout(tmp_path, binary_dirs=("a", "b", "c", "d", "e"))
+
+    completed, payload = run_preflight(binary)
+
+    assert payload["status"] == "healthy"
+    assert payload["invoked_launcher"] == str(wrapper.resolve())
+
+
+def test_package_manifest_beyond_search_depth_is_ignored(tmp_path: Path):
+    _, _, _, binary = package_layout(tmp_path, binary_dirs=("a", "b", "c", "d", "e", "f"))
+
+    completed, payload = run_preflight(binary)
+
+    assert payload["reason"] == "source-missing"
+    assert payload["invoked_launcher"] == str(binary)

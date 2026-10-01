@@ -53,8 +53,8 @@ treat Fable as available). This is the existing behavior — `model=fable`, else
 
 Call `run_codex_advisor_review` with exactly three fields:
 
-- `requester_model`: your current full Codex model name: `gpt-5.6-luna`, `gpt-5.6-terra`,
-  `gpt-5.6-sol`, or `gpt-6-astra`. Do not pre-map it; the broker rejects any mismatch with
+- `requester_model`: your current full Codex model name, any `gpt-<version>-<luna|terra|sol|astra>`
+  model (for example `gpt-6-sol`). Do not pre-map it; the broker rejects any mismatch with
   provider-authenticated `x-codex-turn-metadata.model`, then maps the reviewer exactly once.
 - `packet`: the complete inline, lossless review packet. Include the adversarial-review instruction,
   task and decision, operator constraints, evidence, specific questions, and every code/diff or artifact
@@ -74,8 +74,10 @@ approve the broker or its fixed read-only review again: IronClaude's broker is t
 surface. If the broker fails, report its bounded error and fail closed rather than bypassing it.
 
 **Codex tier ladder (broker-owned, one mapping only):** `luna (haiku) → terra (sonnet) → sol (opus) → astra (fable)`
-(`gpt-5.6-luna → gpt-5.6-terra → gpt-5.6-sol → gpt-6-astra`). The broker maps
-**`gpt-5.6-sol` → `gpt-6-astra`**. At the Astra ceiling it runs
+(`gpt-<version>-luna → gpt-<version>-terra → gpt-<version>-sol → gpt-<version>-astra`). The broker
+resolves each tier to the newest installed model in `$CODEX_HOME/models_cache.json` (built-in
+fallback `gpt-6-luna`, `gpt-5.6-terra`, `gpt-6-sol`, `gpt-6-astra`), so today it maps
+**`gpt-6-sol` → `gpt-6-astra`**. At the Astra ceiling it runs
 **`gpt-6-astra` → `gpt-6-astra`**, a same-tier blind pass. The reviewer stays a Codex model;
 do not cross to a Claude model. Astra remains a Codex model and does not satisfy an actual Claude Fable request.
 

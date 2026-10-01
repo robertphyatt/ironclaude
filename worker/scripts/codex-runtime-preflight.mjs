@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { access, lstat, realpath, stat, symlink } from 'node:fs/promises';
+import { access, lstat, readFile, realpath, stat, symlink } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -9,6 +9,9 @@ import { pathToFileURL } from 'node:url';
 export const SCHEMA_VERSION = 1;
 export const EXIT = Object.freeze({ ok: 0, repairable: 2, blocked: 3 });
 const COMPANION = 'codex-code-mode-host';
+const PACKAGE_MANIFEST = 'codex-package.json';
+// The launcher's own directory plus up to five parents (codex-cli/CodexCLI.app/Contents/MacOS/codex is 4).
+const PACKAGE_SEARCH_DEPTH = 6;
 
 
 async function pathKind(candidate) {
@@ -68,13 +71,56 @@ function baseObservation(mode, invokedLauncher = '', resolvedLauncher = '') {
 }
 
 
+export async function resolvePackageEntrypoint(launcher) {
+  let physical;
+  try {
+    physical = await realpath(launcher);
+  } catch {
+    return launcher;
+  }
+  let directory = path.dirname(physical);
+  for (let depth = 0; depth < PACKAGE_SEARCH_DEPTH; depth += 1) {
+    let raw = null;
+    try {
+      raw = await readFile(path.join(directory, PACKAGE_MANIFEST), 'utf8');
+    } catch {
+      raw = null;
+    }
+    if (raw !== null) {
+      let manifest;
+      try {
+        manifest = JSON.parse(raw);
+      } catch {
+        return launcher;
+      }
+      const entrypoint = manifest?.entrypoint;
+      if (
+        manifest?.layoutVersion !== 1 ||
+        typeof entrypoint !== 'string' ||
+        entrypoint.length === 0 ||
+        path.isAbsolute(entrypoint) ||
+        entrypoint.split(/[\\/]/).includes('..')
+      ) {
+        return launcher;
+      }
+      const candidate = path.join(directory, entrypoint);
+      return (await isExecutableRegularFile(candidate)) ? candidate : launcher;
+    }
+    const parent = path.dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  return launcher;
+}
+
+
 export async function resolveCodexPath(options = {}) {
   const explicit = options.codexPath;
   if (explicit !== undefined) {
     if (typeof explicit !== 'string' || !path.isAbsolute(explicit)) {
       return { error: 'invalid-codex-path', invokedLauncher: '' };
     }
-    return { invokedLauncher: path.normalize(explicit) };
+    return { invokedLauncher: await resolvePackageEntrypoint(path.normalize(explicit)) };
   }
 
   const searchPath = options.pathEnv ?? process.env.PATH ?? '';
@@ -85,7 +131,7 @@ export async function resolveCodexPath(options = {}) {
       await access(candidate, constants.X_OK);
       const kind = await pathKind(candidate);
       if (kind === 'file' || kind === 'symlink') {
-        return { invokedLauncher: candidate };
+        return { invokedLauncher: await resolvePackageEntrypoint(candidate) };
       }
     } catch {
       // Continue to the next PATH entry.

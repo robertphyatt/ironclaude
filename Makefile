@@ -22,9 +22,9 @@ codex-plugin-install: codex-runtime-preflight
 # Supported source self-update entry point. Ordering is intentional: repair the
 # host companion, cachebust, build, validate, then install the same bytes.
 codex-plugin-release: codex-runtime-preflight
-	python3 $(HOME)/.codex/skills/.system/plugin-creator/scripts/update_plugin_cachebuster.py worker
+	node worker/scripts/codex-plugin-cachebuster.mjs worker
 	cd worker/mcp-servers/state-manager && npm exec -- tsc --noEmit && npm run bundle
-	python3 $(HOME)/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py worker
+	node worker/scripts/validate-codex-plugin.mjs worker
 	codex plugin add ironclaude@ironclaude --json
 
 

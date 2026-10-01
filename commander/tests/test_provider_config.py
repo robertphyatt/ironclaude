@@ -117,9 +117,56 @@ def test_model_contracts_are_validated_at_startup(client, mutate, base_config):
         parse_provider_config(raw)
 
 
-def test_codex_model_values_are_exact(base_config):
+def test_codex_model_values_must_match_tier_word(base_config):
     raw = base_config()
     raw["clients"]["codex"]["models"]["opus"] = "wrong-model"
+    with pytest.raises(ProviderConfigError, match="gpt-<version>-<tier-word>"):
+        parse_provider_config(raw)
+
+
+def test_codex_accepts_gpt6_models(base_config):
+    raw = base_config()
+    raw["clients"]["codex"]["models"] = {
+        "haiku": "gpt-6-luna", "sonnet": "gpt-5.6-terra", "opus": "gpt-6-sol", "fable": "gpt-6-astra",
+    }
+    cfg = parse_provider_config(raw)
+    assert cfg.model_for("codex", "opus") == "gpt-6-sol"
+    assert cfg.model_for("codex", "haiku") == "gpt-6-luna"
+
+
+def test_codex_accepts_future_versions(base_config):
+    raw = base_config()
+    raw["clients"]["codex"]["models"]["opus"] = "gpt-7.1-sol"
+    assert parse_provider_config(raw).model_for("codex", "opus") == "gpt-7.1-sol"
+
+
+@pytest.mark.parametrize(
+    ("tier", "value"),
+    [
+        ("sonnet", "gpt-6-sol"),
+        ("opus", "gpt-6-sol-mini"),
+        ("opus", "GPT-6-sol"),
+        ("haiku", "gpt--luna"),
+        ("fable", None),
+    ],
+)
+def test_codex_rejects_wrong_tier_word_or_shape(tier, value, base_config):
+    raw = base_config()
+    raw["clients"]["codex"]["models"][tier] = value
+    with pytest.raises(ProviderConfigError, match="gpt-<version>-<tier-word>"):
+        parse_provider_config(raw)
+
+
+def test_codex_rejects_extra_tier(base_config):
+    raw = base_config()
+    raw["clients"]["codex"]["models"]["mega"] = "gpt-6-astra"
+    with pytest.raises(ProviderConfigError, match="gpt-<version>-<tier-word>"):
+        parse_provider_config(raw)
+
+
+def test_claude_models_remain_exact(base_config):
+    raw = base_config()
+    raw["clients"]["claude"]["models"]["opus"] = "claude-opus-4-8"
     with pytest.raises(ProviderConfigError, match="approved models"):
         parse_provider_config(raw)
 

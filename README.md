@@ -15,18 +15,16 @@ You can use the Worker alone for single-session discipline, or add the Commander
 
 ---
 
-## What's New in v1.1.14
+## What's New in v1.1.15
+
+- **Codex's new models just work.** IronClaude accepts any `gpt-<version>-<tier>` Codex model (for example `gpt-6-sol`) and picks the reviewer one tier up from the models Codex actually has installed, so a new Codex model family no longer blocks plan review.
+- **Works with the new ChatGPT app layout.** When Codex ships as a `codex-cli/` package, IronClaude launches its declared entrypoint, so the advisor review no longer fails with `source-missing`.
+
+### Earlier — v1.1.14
 
 - **Brain replies reach your thread.** When the Brain answered in two pieces — the reply marker alone, then the answer after a tool call — the answer used to land in the heartbeat thread and your message never got ✅. The Brain now carries the reply target through the whole turn, and its prompt requires a real answer alongside the marker.
 - **No-reply closures are visible.** A conversational message now gets a threaded reply that closes it. When the Brain closes a message without replying, its reason is posted in your thread with ✅, so nothing is silently buried.
 - **A usage-limited Brain says so.** On the opus fallback, a usage-limit reply now raises the "Usage limit hit" Slack alert, isn't mistaken for a live Brain, doesn't trigger pointless restarts, and the heartbeat shows "usage-limited (resets …)" instead of "turn in progress". When it recovers, a Slack notice tells you so; resend anything urgent.
-
-### Earlier — v1.1.13
-
-- **A dead worker whose workspace assignment is already resolved is now completed.** When a worker's session had died but its assignment was already cleaned or abandoned, the daemon kept retrying an abandon that refuses a cleaned row — on every tick, forever. The finalization status probe now reports `resolved` for such an assignment, and the seam completes the worker (only when its session is confirmed dead) instead of retrying; a live worker is never completed. A finalize probe that finds the assignment already cleaned or abandoned now completes cleanly the same way, a terminal-finalize-failure alert can no longer be swallowed by (or swallow) an unrelated recovery alert, and its consecutive-failure count now resets on any other known terminal outcome instead of climbing forever.
-- **`kill_worker` no longer re-completes an already-finished worker.** Repeated calls against an already-completed worker no longer re-stamp its finish time or log a duplicate completion event. The finalization step always runs regardless of the worker's prior status, so a `commit_worker`-recycled worker's new reviewed work still gets integrated. If the worker isn't finished yet, the reply says the daemon will retry only when it's still actively running; otherwise it names the current status and asks for another `kill_worker` call — and if the worker was already finished before this call and finalization fails this time, the reply says it remains finished rather than claiming it isn't.
-- **The Commander's local grader no longer returns truncated JSON in practice.** Every schema it sends now caps each long text field at 1999 characters (llama.cpp's grammar ceiling) in the sampling grammar, and every schema-bound call requests at least 8192 output tokens. That closes the failure mode where a response was cut off mid-object and came back unparseable. A worker prompt whose final block is longer than that is detected only when the grader returns its short tail, so very long prompts are detected unreliably. The Bash plan-validator hook's schema-bound calls also get the 8192-token floor, but their schemas have no per-field length caps and they stay bounded by the hook's transport time budget.
-- **The orphan reaper no longer fails on a vanished repo path, and no longer sweeps one repository more than once when it is reached through different subdirectories or a worktree path.**
 - See [CHANGELOG.md](CHANGELOG.md) for full details, and `git log` / [CHANGELOG.md](CHANGELOG.md) for earlier releases.
 
 ---
@@ -126,6 +124,12 @@ The preflight is idempotent and fail-closed: it creates only a missing equivalen
 FIFO, dangling link, or link to different bytes. `make codex-plugin-release` is
 the supported source self-update target; it runs repair before cachebusting,
 building, validating, and reinstalling the plugin.
+
+When the ChatGPT app ships Codex as a `codex-cli/` package (`codex-package.json`, `layoutVersion` 1),
+IronClaude launches the package's declared entrypoint (`codex-cli/bin/codex`), whose
+`codex-code-mode-host` companion sits beside it, so no symlink is needed and nothing inside the signed
+`CodexCLI.app` is touched. If an older `~/.local/bin/codex` or `~/.local/bin/codex-code-mode-host`
+symlink still points at the removed `Resources/codex`, re-point it to `codex-cli/bin/` (or delete it).
 
 After initial installation or any update, preserve the current native task ID,
 fully quit and relaunch Codex, then reopen the same task so Codex loads the

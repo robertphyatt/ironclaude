@@ -1,0 +1,268 @@
+{
+  "name": "v1.1.15 Forgiving Codex Model Ladder and Package Layout",
+  "goal": "Accept any Codex gpt-<version>-<luna|terra|sol|astra> model, pick broker reviewers from Codex's installed model list, launch Codex through the codex-cli package entrypoint, and ship v1.1.15.",
+  "requirements_file": "docs/plans/2026-09-30-v1-1-15-forgiving-codex-model-ladder-requirements.md",
+  "design_file": "docs/plans/2026-09-30-v1-1-15-forgiving-codex-model-ladder-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Broker tier-word ladder, installed-model reviewer, schema pattern",
+      "description": "R1-R4, R3a. advisor-review.ts: replace REQUESTER_MODELS/REVIEWER_BY_REQUESTER with TIER_ORDER, exported CODEX_MODEL_RE /^gpt-(\\d+(?:\\.\\d+)*)-(luna|terra|sol|astra)$/, exported FALLBACK_CODEX_MODELS ['gpt-6-luna','gpt-5.6-terra','gpt-6-sol','gpt-6-astra'], type RequesterModel = string; add readFile dep; exported parseCodexModel, compareVersions, newestAtTier, exported readInstalledCodexModels (CODEX_HOME || HOME/.codex + models_cache.json, fallback on error/empty), exported resolveCodexReviewer; schema requester_model uses pattern not enum; validateArgs uses parseCodexModel; reviewer via resolveCodexReviewer(requester, await readInstalledCodexModels(deps)). Exact code: human plan Task 1.",
+      "allowed_files": [
+        "worker/mcp-servers/state-manager/src/tools/advisor-review.ts",
+        "worker/mcp-servers/state-manager/src/tools/advisor-review.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: in advisor-review.test.ts import parseCodexModel; add LEGACY_CACHE, GPT6_CACHE, MODELS_CACHE_PATH='/Users/test/.codex/models_cache.json', enoent() above harness(); add harness deps readFile (returns LEGACY_CACHE for MODELS_CACHE_PATH, else throws ENOENT) after access; add readFile: (target: string, encoding: 'utf8') => readFile(target, encoding) to the real-process AdvisorReviewDeps literal (~:531); add schema pattern test, gpt-6 mapping it.each (6-sol->6-astra, 6-luna->5.6-terra, 5.6-terra->6-sol, 5.6-sol->6-astra, 6-astra->6-astra, asserts readFile called with MODELS_CACHE_PATH,'utf8'), newest-version test (gpt-7-sol), unreadable-cache fallback it.each (6-luna->5.6-terra, 6-sol->6-astra), same-tier gpt-6-sol test, non-Codex requester rejects ('gpt-6-unknown','claude-opus','gpt-6-sol-mini',42 -> invalid-requester-model, no spawn), parseCodexModel unit test. Exact code: human plan Task 1 Step 1."
+        },
+        {
+          "description": "Confirm RED",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/tools/advisor-review.test.ts",
+          "expected": "FAIL (parseCodexModel import missing, or new tests fail)"
+        },
+        {
+          "description": "GREEN: implement in advisor-review.ts per human plan Task 1 Step 3 (a)-(g): import readFile as fsReadFile; replace ladder constants keeping REVIEW_TIERS/ReviewTier; readFile dep + DEFAULT_DEPS readFile: fsReadFile; schema pattern CODEX_MODEL_RE.source; add parse/compare/newest/readInstalled/resolveCodexReviewer after resolveTrustedCodexRequesterModel; validateArgs parseCodexModel check; reviewerModel via resolveCodexReviewer."
+        },
+        {
+          "description": "Verify GREEN",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/tools/advisor-review.test.ts",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Typecheck",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx tsc --noEmit",
+          "expected": "exit 0, no output"
+        },
+        {
+          "description": "Old constants gone",
+          "command": "rg -n -e \"REQUESTER_MODELS\" -e \"REVIEWER_BY_REQUESTER\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager/src",
+          "expected": "no output, exit 1"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/state-manager/src/tools/advisor-review.ts worker/mcp-servers/state-manager/src/tools/advisor-review.test.ts",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Commander Codex model validation by tier word",
+      "description": "R5, R6. provider_config.py: add CODEX_TIER_WORDS, CODEX_MODEL_RE, _codex_models_valid after EXPECTED_MODELS; codex branch validates key set == TIER_NAMES and each value fullmatches with matching tier word, error 'providers.clients.codex.models must map each tier to a gpt-<version>-<tier-word> model (haiku→luna, sonnet→terra, opus→sol, fable→astra)'; claude stays exact ('approved models'). Defaults unchanged. Exact code: human plan Task 2.",
+      "allowed_files": [
+        "commander/src/ironclaude/provider_config.py",
+        "commander/tests/test_provider_config.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: replace test_codex_model_values_are_exact (test_provider_config.py:120-124) with test_codex_model_values_must_match_tier_word, test_codex_accepts_gpt6_models, test_codex_accepts_future_versions (gpt-7.1-sol), parametrized test_codex_rejects_wrong_tier_word_or_shape (sonnet gpt-6-sol, opus gpt-6-sol-mini, opus GPT-6-sol, haiku gpt--luna, fable None), test_codex_rejects_extra_tier (mega), test_claude_models_remain_exact (match 'approved models'). New-message tests match 'gpt-<version>-<tier-word>'. Exact code: human plan Task 2 Step 1."
+        },
+        {
+          "description": "Confirm RED",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_provider_config.py",
+          "expected": "FAIL (acceptance tests and new-message tests)"
+        },
+        {
+          "description": "GREEN: implement per human plan Task 2 Step 3 (a) constants+helper after EXPECTED_MODELS block, (b) replace exact-match check at provider_config.py:121-125 with codex/claude branches."
+        },
+        {
+          "description": "Verify GREEN",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_provider_config.py tests/test_provider_router.py tests/test_grader_routing.py tests/test_worker_adapter.py",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/provider_config.py commander/tests/test_provider_config.py",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Preflight resolves codex-cli package entrypoint",
+      "description": "R9.1, R9.2, R9.4, R9.5. codex-runtime-preflight.mjs: import readFile; PACKAGE_MANIFEST='codex-package.json', PACKAGE_SEARCH_DEPTH=6 (launcher dir + up to 5 parents); exported resolvePackageEntrypoint(launcher): realpath, walk for manifest, first manifest found decides: layoutVersion===1, non-empty relative entrypoint without '..' segment, executable regular file -> return path.join(dir, entrypoint); else launcher. Apply in both resolveCodexPath branches. Exact code: human plan Task 3.",
+      "allowed_files": [
+        "worker/scripts/codex-runtime-preflight.mjs",
+        "commander/tests/test_codex_runtime_preflight.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: add 'import pytest' after 'import os' (line 2) in test_codex_runtime_preflight.py; append package_layout() helper and tests: test_package_binary_uses_declared_entrypoint, test_package_binary_found_on_path_uses_entrypoint, test_symlink_to_package_wrapper_uses_entrypoint (positive: healthy/source-is-destination, invoked_launcher == wrapper.resolve()), parametrized test_unusable_package_manifest_keeps_old_behavior (layoutVersion 2, bin/missing, no entrypoint, '{not json' -> returncode 3, blocked, source-missing, invoked_launcher == str(binary)), test_escaping_entrypoint_is_ignored_even_when_its_target_exists (entrypoints '../bin/codex', 'bin/../../bin/codex', '/abs/bin/codex' (join form), absolute target path (resolve form); each creates executable + companion at the unguarded target; asserts returncode 3, blocked, source-missing, invoked_launcher == str(binary)), test_non_executable_entrypoint_keeps_old_behavior (bin/plain non-executable), test_package_manifest_in_sixth_directory_is_used (binary_dirs a-e -> healthy, invoked == wrapper.resolve()), test_package_manifest_beyond_search_depth_is_ignored (binary_dirs a-f). Exact code: human plan Task 3 Step 1."
+        },
+        {
+          "description": "Confirm RED",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_codex_runtime_preflight.py",
+          "expected": "FAIL (4 positive tests fail incl. test_package_manifest_in_sixth_directory_is_used; negative, escape, non-executable and beyond-depth tests pass)"
+        },
+        {
+          "description": "GREEN: per human plan Task 3 Step 3: fs import adds readFile; constants after COMPANION; resolvePackageEntrypoint before resolveCodexPath; replace 'return { invokedLauncher: path.normalize(explicit) };' and 'return { invokedLauncher: candidate };' with awaited resolvePackageEntrypoint forms."
+        },
+        {
+          "description": "Verify GREEN",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_codex_runtime_preflight.py tests/test_codex_brain_client.py",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/scripts/codex-runtime-preflight.mjs commander/tests/test_codex_runtime_preflight.py",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Broker launches package entrypoint; CODEX_CLI_PATH fallback",
+      "description": "R9.1, R9.3-R9.5. advisor-review.ts: realpath and stat deps; CODEX_PACKAGE_MANIFEST, CODEX_PACKAGE_SEARCH_DEPTH=6, isExecutableFile, exported resolveCodexPackageEntrypoint(launcher, deps) mirroring the preflight rule; resolveCodexExecutable returns resolveCodexPackageEntrypoint(PATH candidate) and, when PATH yields none, an absolute X_OK CODEX_CLI_PATH through the same rule. Preflight equality checks unchanged. Exact code: human plan Task 4.",
+      "allowed_files": [
+        "worker/mcp-servers/state-manager/src/tools/advisor-review.ts",
+        "worker/mcp-servers/state-manager/src/tools/advisor-review.test.ts"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "RED: harness deps add realpath (identity) and stat ({isFile:()=>true}) after readFile; real-process literal adds realpath/stat and test file imports realpath, stat from node:fs/promises; add packageHarness() and tests: bare CodexCLI binary on PATH -> preflight --codex-path and exec use /pkg/bin/codex; CODEX_CLI_PATH used when PATH '/empty' has none; relative CODEX_CLI_PATH (access throws only for '/empty' prefix) -> codex-executable-not-found, no spawn; it.each unusable manifests (layoutVersion 2, absolute, '..', '{not json') -> preflight invoked with bare '/pkg/CodexCLI.app/Contents/MacOS/codex'; it.each stat/access failing for '/pkg/bin/codex' -> bare launcher; it.each depth edges (PATH '/pkg/a/b/c/d/e' -> '/pkg/bin/codex'; '/pkg/a/b/c/d/e/f' -> '/pkg/a/b/c/d/e/f/codex'). Exact code: human plan Task 4 Step 1."
+        },
+        {
+          "description": "Confirm RED",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/tools/advisor-review.test.ts",
+          "expected": "FAIL (new positive tests)"
+        },
+        {
+          "description": "GREEN: per human plan Task 4 Step 3 (a) fs import adds realpath as fsRealpath, stat as fsStat; (b) deps type + DEFAULT_DEPS; (c) constants, isExecutableFile, resolveCodexPackageEntrypoint before resolveCodexExecutable; (d) replace resolveCodexExecutable body."
+        },
+        {
+          "description": "Verify GREEN",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run src/tools/advisor-review.test.ts",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Typecheck",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx tsc --noEmit",
+          "expected": "exit 0, no output"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/state-manager/src/tools/advisor-review.ts worker/mcp-servers/state-manager/src/tools/advisor-review.test.ts",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Docs, skills, templates and contract tests",
+      "description": "R7, R9.6. Canonical replacements OLD1->NEW1 (spaced chain to gpt-<version>-luna → gpt-<version>-terra → gpt-<version>-sol → gpt-<version>-astra), OLD2->NEW2 (no-space chain), OLD3->NEW3 (executing-plans SKILL:197), OLD4->NEW4 (executing-plans SKILL:376); advisor-fallback SKILL lines 56-57 and 77-78 rewritten; CODEX_SETUP tier-word note after line 43 and layout paragraph after line 31; README layout paragraph after line 128. Exact text: human plan Task 5.",
+      "allowed_files": [
+        "AGENTS.md",
+        "CODEX_SETUP.md",
+        "README.md",
+        "commander/src/ironclaude/templates/worker_agents.md",
+        "commander/src/ironclaude/templates/worker_claude_md.md",
+        "worker/skills/activate-professional-mode/SKILL.md",
+        "worker/skills/advisor-fallback/SKILL.md",
+        "worker/skills/executing-plans/SKILL.md",
+        "commander/tests/test_worker_claude_md_template.py",
+        "commander/tests/test_activation_client_parity.py",
+        "commander/tests/test_advisor_fallback_directive.py",
+        "commander/tests/test_executing_plans_skill.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: update contract tests per human plan Task 5 Step 1: test_advisor_fallback_directive.py CODEX_MODEL_LADDER (line 18) -> NEW1, line 84 OLD2 -> NEW2, line 93 assert '`gpt-6-sol` → `gpt-6-astra`', add assert 'gpt-<version>-<luna|terra|sol|astra>' in advisor-fallback test; test_worker_claude_md_template.py:100 OLD1 -> NEW1; test_activation_client_parity.py lines 122, 135, 423 OLD1/OLD2 -> NEW1/NEW2; test_executing_plans_skill.py line 140 and 148-151 substrings -> NEW3/NEW4 fragments."
+        },
+        {
+          "description": "Confirm RED",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_advisor_fallback_directive.py tests/test_worker_claude_md_template.py tests/test_activation_client_parity.py tests/test_executing_plans_skill.py",
+          "expected": "FAIL (docs still carry old strings)"
+        },
+        {
+          "description": "GREEN: apply doc edits per human plan Task 5 Step 2 (AGENTS.md:66, worker_agents.md:52, activate SKILL:317, advisor-fallback SKILL:77 OLD1->NEW1; worker_claude_md.md:53, activate SKILL:455 and :519 OLD2->NEW2; executing-plans SKILL:197 OLD3->NEW3, :376 OLD4->NEW4; advisor-fallback 56-57 and 77-78 blocks; CODEX_SETUP and README paragraphs)."
+        },
+        {
+          "description": "Verify GREEN",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_advisor_fallback_directive.py tests/test_worker_claude_md_template.py tests/test_activation_client_parity.py tests/test_executing_plans_skill.py",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Absence check of old ladder strings",
+          "command": "rg -n -e \"gpt-5.6-luna → gpt-5.6-terra\" -e \"gpt-5.6-luna→gpt-5.6-terra\" -e \"Terra→.gpt-5.6-sol\" -e \"gpt-5.6-sol. → .gpt-6-astra\" /Users/roberthyatt/Code/ironclaude/AGENTS.md /Users/roberthyatt/Code/ironclaude/CODEX_SETUP.md /Users/roberthyatt/Code/ironclaude/README.md /Users/roberthyatt/Code/ironclaude/worker/skills /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude/templates /Users/roberthyatt/Code/ironclaude/commander/tests",
+          "expected": "no output, exit 1"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add AGENTS.md CODEX_SETUP.md README.md commander/src/ironclaude/templates/worker_agents.md commander/src/ironclaude/templates/worker_claude_md.md worker/skills/activate-professional-mode/SKILL.md worker/skills/advisor-fallback/SKILL.md worker/skills/executing-plans/SKILL.md commander/tests/test_worker_claude_md_template.py commander/tests/test_activation_client_parity.py commander/tests/test_advisor_fallback_directive.py commander/tests/test_executing_plans_skill.py",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "name": "v1.1.15 version bump, CHANGELOG, README, full suites",
+      "description": "R8. No tests required: version and docs only; full suites verify. Bump 7 version fields (marketplace.json, worker/.claude-plugin/plugin.json, workspace-manager package.json, package-lock.json lines 3 and 9, commander/pyproject.toml to 1.1.15; worker/.codex-plugin/plugin.json to 1.1.15+codex.<STAMP>); CHANGELOG '## 1.1.15: Forgiving Codex model ladder and the codex-cli package layout' above 1.1.14; README What's New v1.1.15, v1.1.14 becomes Earlier, drop Earlier v1.1.13. Exact text: human plan Task 6.",
+      "allowed_files": [
+        ".claude-plugin/marketplace.json",
+        "worker/.claude-plugin/plugin.json",
+        "worker/.codex-plugin/plugin.json",
+        "worker/mcp-servers/workspace-manager/package.json",
+        "worker/mcp-servers/workspace-manager/package-lock.json",
+        "commander/pyproject.toml",
+        "CHANGELOG.md",
+        "README.md",
+        "commander/docs/plans/2026-09-30-v1-1-15-forgiving-codex-model-ladder-requirements.md",
+        "commander/docs/plans/2026-09-30-v1-1-15-forgiving-codex-model-ladder-design.md",
+        "commander/docs/plans/2026-09-30-v1-1-15-forgiving-codex-model-ladder.md",
+        "commander/docs/plans/2026-09-30-v1-1-15-forgiving-codex-model-ladder.plan.json"
+      ],
+      "depends_on": [1, 2, 3, 4, 5],
+      "steps": [
+        {
+          "description": "Fresh codex stamp; use literal value as <STAMP>",
+          "command": "date -u +%Y%m%d%H%M%S",
+          "expected": "14 digits"
+        },
+        {
+          "description": "Bump versions with Edit tool per human plan Task 6 Step 2, then verify",
+          "command": "rg -n -F 1.1.15 /Users/roberthyatt/Code/ironclaude/.claude-plugin/marketplace.json /Users/roberthyatt/Code/ironclaude/worker/.claude-plugin/plugin.json /Users/roberthyatt/Code/ironclaude/worker/.codex-plugin/plugin.json /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/package.json /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/package-lock.json /Users/roberthyatt/Code/ironclaude/commander/pyproject.toml",
+          "expected": "7 lines"
+        },
+        {
+          "description": "Full state-manager suite; record passed count V",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npx vitest run",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Full commander suite; record passed count N",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q",
+          "expected": "0 failed"
+        },
+        {
+          "description": "Insert CHANGELOG 1.1.15 entry above '## 1.1.14:' with V and N filled (text: human plan Task 6 Step 4); update README What's New per Task 6 Step 5"
+        },
+        {
+          "description": "Verify docs present",
+          "command": "rg -n -F -e \"## 1.1.15:\" -e \"## What's New in v1.1.15\" -e \"### Earlier — v1.1.14\" /Users/roberthyatt/Code/ironclaude/CHANGELOG.md /Users/roberthyatt/Code/ironclaude/README.md",
+          "expected": "3 lines"
+        },
+        {
+          "description": "Verify v1.1.13 Earlier section removed",
+          "command": "rg -n -F \"Earlier — v1.1.13\" /Users/roberthyatt/Code/ironclaude/README.md",
+          "expected": "no output, exit 1"
+        },
+        {
+          "description": "Stage release files",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add .claude-plugin/marketplace.json worker/.claude-plugin/plugin.json worker/.codex-plugin/plugin.json worker/mcp-servers/workspace-manager/package.json worker/mcp-servers/workspace-manager/package-lock.json commander/pyproject.toml CHANGELOG.md README.md",
+          "expected": "exit 0"
+        },
+        {
+          "description": "Stage plan artifacts (gitignored docs)",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f commander/docs/plans/2026-09-30-v1-1-15-forgiving-codex-model-ladder-requirements.md commander/docs/plans/2026-09-30-v1-1-15-forgiving-codex-model-ladder-design.md commander/docs/plans/2026-09-30-v1-1-15-forgiving-codex-model-ladder.md commander/docs/plans/2026-09-30-v1-1-15-forgiving-codex-model-ladder.plan.json",
+          "expected": "exit 0"
+        }
+      ]
+    }
+  ]
+}

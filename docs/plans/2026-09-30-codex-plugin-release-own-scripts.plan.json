@@ -1,0 +1,129 @@
+{
+  "name": "Repo-Owned Codex Plugin Release Scripts",
+  "goal": "Make `make codex-plugin-release` work again by replacing the two removed Codex plugin-creator scripts with repo-owned Node scripts (cachebuster + validator).",
+  "requirements_file": "docs/plans/2026-09-30-codex-plugin-release-own-scripts-requirements.md",
+  "design_file": "docs/plans/2026-09-30-codex-plugin-release-own-scripts-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Cachebuster script",
+      "description": "R1. Create worker/scripts/codex-plugin-cachebuster.mjs <pluginDir> [--stamp 14digits]: requires version ^\\d+\\.\\d+\\.\\d+(\\+codex\\.\\d{14})?$, rewrites only the exact text '\"version\": \"<prev>\"' (must occur exactly once) to <X.Y.Z>+codex.<UTC YYYYMMDDHHMMSS|--stamp>, prints {previous,version}; any error -> stderr {error}, exit 1, no write. Never run against real worker/. Exact code + tests: human plan Task 1.",
+      "allowed_files": [
+        "worker/scripts/codex-plugin-cachebuster.mjs",
+        "commander/tests/test_codex_plugin_cachebuster.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: create commander/tests/test_codex_plugin_cachebuster.py verbatim from human plan Task 1 Step 1 (plain release stamped, existing stamp replaced with every other byte incl. \\u2014 unchanged, default stamp within UTC now window, 6 parametrized rejects without write, missing manifest, malformed JSON, compact version form rejected)."
+        },
+        {
+          "description": "Confirm RED",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_codex_plugin_cachebuster.py",
+          "expected": "FAIL (script missing)"
+        },
+        {
+          "description": "GREEN: create worker/scripts/codex-plugin-cachebuster.mjs verbatim from human plan Task 1 Step 3."
+        },
+        {
+          "description": "Verify GREEN",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_codex_plugin_cachebuster.py",
+          "expected": "12 passed, 0 failed"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/scripts/codex-plugin-cachebuster.mjs commander/tests/test_codex_plugin_cachebuster.py",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Validator script",
+      "description": "R2. Create worker/scripts/validate-codex-plugin.mjs <pluginDir>: collects all errors; checks manifest parses, name==='ironclaude', version ^\\d+\\.\\d+\\.\\d+\\+codex\\.\\d{14}$, skills relative inside plugin + directory + >=1 */SKILL.md, mcpServers object with each args[0] relative inside plugin to existing file, mcp-servers/state-manager/dist/index.js exists; prints {valid,errors}; exit 0 iff valid. Exact code + tests: human plan Task 2.",
+      "allowed_files": [
+        "worker/scripts/validate-codex-plugin.mjs",
+        "commander/tests/test_validate_codex_plugin.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: create commander/tests/test_validate_codex_plugin.py verbatim from human plan Task 2 Step 1 (good fixture valid; 12 parametrized single-error cases incl. skills '/tmp' and '../outside', args[0] '/usr/bin/env' and '../escape.js'; multi-error; malformed manifest; argument count)."
+        },
+        {
+          "description": "Confirm RED",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_validate_codex_plugin.py",
+          "expected": "FAIL (script missing; empty stdout)"
+        },
+        {
+          "description": "GREEN: create worker/scripts/validate-codex-plugin.mjs verbatim from human plan Task 2 Step 3."
+        },
+        {
+          "description": "Verify GREEN",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_validate_codex_plugin.py",
+          "expected": "16 passed, 0 failed"
+        },
+        {
+          "description": "Validate the real plugin (read-only)",
+          "command": "node /Users/roberthyatt/Code/ironclaude/worker/scripts/validate-codex-plugin.mjs /Users/roberthyatt/Code/ironclaude/worker",
+          "expected": "{\"valid\":true,\"errors\":[]} exit 0"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/scripts/validate-codex-plugin.mjs commander/tests/test_validate_codex_plugin.py",
+          "expected": "exit 0"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Makefile, skill wording and ordering test",
+      "description": "R3-R5. Makefile codex-plugin-release: replace the two python3 $(HOME)/.codex/skills/.system/plugin-creator/scripts/... lines with 'node worker/scripts/codex-plugin-cachebuster.mjs worker' and 'node worker/scripts/validate-codex-plugin.mjs worker' (keep tabs, order unchanged). executing-plans SKILL:668 'plugin-creator cachebuster' -> 'IronClaude cachebuster'. Update test_executing_plans_skill.py concept + ordering tokens + assert 'plugin-creator' not in makefile. Exact text: human plan Task 3.",
+      "allowed_files": [
+        "Makefile",
+        "worker/skills/executing-plans/SKILL.md",
+        "commander/tests/test_executing_plans_skill.py",
+        "docs/plans/2026-09-30-codex-plugin-release-own-scripts-requirements.md",
+        "docs/plans/2026-09-30-codex-plugin-release-own-scripts-design.md",
+        "docs/plans/2026-09-30-codex-plugin-release-own-scripts.md",
+        "docs/plans/2026-09-30-codex-plugin-release-own-scripts.plan.json"
+      ],
+      "depends_on": [1, 2],
+      "steps": [
+        {
+          "description": "RED: in test_executing_plans_skill.py concept 'cachebuster before the final build' -> 'ironclaude cachebuster before the final build'; ordering tokens 'update_plugin_cachebuster.py worker' -> 'worker/scripts/codex-plugin-cachebuster.mjs worker' and 'validate_plugin.py worker' -> 'worker/scripts/validate-codex-plugin.mjs worker'; add 'assert \"plugin-creator\" not in makefile' after the preflight-repair makefile assert.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_executing_plans_skill.py",
+          "expected": "FAIL (ordering + self-update tests)"
+        },
+        {
+          "description": "GREEN: apply Makefile and SKILL.md replacements per human plan Task 3 Step 2."
+        },
+        {
+          "description": "Verify tests",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_executing_plans_skill.py tests/test_codex_plugin_cachebuster.py tests/test_validate_codex_plugin.py tests/test_version_consistency.py",
+          "expected": "all pass, 0 failed"
+        },
+        {
+          "description": "Verify make ordering",
+          "command": "make -n -C /Users/roberthyatt/Code/ironclaude codex-plugin-release",
+          "expected": "preflight repair, codex-plugin-cachebuster.mjs worker, tsc+bundle, validate-codex-plugin.mjs worker, codex plugin add, in that order; no plugin-creator"
+        },
+        {
+          "description": "Absence of plugin-creator",
+          "command": "rg -n -F \"plugin-creator\" /Users/roberthyatt/Code/ironclaude/Makefile /Users/roberthyatt/Code/ironclaude/worker/skills /Users/roberthyatt/Code/ironclaude/README.md /Users/roberthyatt/Code/ironclaude/CODEX_SETUP.md",
+          "expected": "no output, exit 1"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add Makefile worker/skills/executing-plans/SKILL.md commander/tests/test_executing_plans_skill.py",
+          "expected": "exit 0"
+        },
+        {
+          "description": "Stage plan artifacts",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-09-30-codex-plugin-release-own-scripts-requirements.md docs/plans/2026-09-30-codex-plugin-release-own-scripts-design.md docs/plans/2026-09-30-codex-plugin-release-own-scripts.md docs/plans/2026-09-30-codex-plugin-release-own-scripts.plan.json",
+          "expected": "exit 0"
+        }
+      ]
+    }
+  ]
+}
