@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import sqlite3
+import time
+from datetime import datetime, timezone
 
 # Probe failures that self-heal. A later successful observation clears these, and the
 # local probe guard re-runs for them. Everything else (not_configured, unsupported,
@@ -13,8 +15,27 @@ TRANSIENT_UNAVAILABLE_REASONS = (
     "not_authenticated",
     "executable_probe_failed",
 )
+USAGE_QUARANTINE_CATEGORIES = ("usage", "quota", "rate_limit")
+WORKER_USAGE_ACCOUNT_TIER = "__worker_usage_account__"
+# H9: a usage quarantine without a native reset time expires after this default.
+DEFAULT_USAGE_QUARANTINE_SECONDS = 18000
 
 MAX_BRAIN_CAPABILITY_PROBE_BACKOFF = 900.0
+
+
+def _normalized_timestamp(value: str | None) -> str | None:
+    """Return a canonical UTC timestamp only for explicit timezone-aware evidence."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError("native usage event timestamp must be timezone-aware")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("native usage event timestamp must be timezone-aware") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("native usage event timestamp must be timezone-aware")
+    return parsed.astimezone(timezone.utc).isoformat()
 
 
 class ProviderState:
@@ -81,15 +102,46 @@ class ProviderState:
             for row in rows
         ]
 
-    def is_available(self, host: str, client: str, role: str, tier: str) -> bool:
+    def is_available(self, host: str, client: str, role: str, tier: str, *,
+                     now: float | None = None) -> bool:
+        current = time.time() if now is None else now
         row = self._conn.execute(
             """
-            SELECT available FROM provider_capability_state
+            SELECT available, category, usage_expires_at, updated_at FROM provider_capability_state
             WHERE host=? AND client=? AND role=? AND tier=?
             """,
             (host, client, role, tier),
         ).fetchone()
-        return row is None or bool(row[0])
+        if row is not None and not bool(row[0]) and not self._usage_expired(row[1], row[2], row[3], current):
+            return False
+        if role != "worker" or tier == WORKER_USAGE_ACCOUNT_TIER:
+            return True
+        account_row = self._conn.execute(
+            """SELECT available, category, usage_expires_at, updated_at FROM provider_capability_state
+               WHERE host=? AND client=? AND role=? AND tier=?
+                 AND category IN ('usage', 'quota', 'rate_limit')""",
+            (host, client, role, WORKER_USAGE_ACCOUNT_TIER),
+        ).fetchone()
+        return (account_row is None or bool(account_row[0])
+                or self._usage_expired(account_row[1], account_row[2], account_row[3], current))
+
+    @staticmethod
+    def _usage_expired(category, expires_at, updated_at, now: float) -> bool:
+        """An expired usage quarantine only re-enables trying the client (H9)."""
+        if category not in USAGE_QUARANTINE_CATEGORIES:
+            return False
+        if expires_at is not None:
+            return float(expires_at) <= now
+        try:
+            updated = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return False
+        return updated.timestamp() + DEFAULT_USAGE_QUARANTINE_SECONDS <= now
+
+    @staticmethod
+    def worker_usage_scope_tier(role: str, tier: str) -> str:
+        """Accepted account-wide native worker quota evidence spans model tiers."""
+        return WORKER_USAGE_ACCOUNT_TIER if role == "worker" else tier
 
     def record_capability(
         self, host, client, role, tier, *, configured, supported,
@@ -110,16 +162,19 @@ class ProviderState:
                     installed=excluded.installed,
                     authenticated=excluded.authenticated,
                     available=CASE
+                        WHEN provider_capability_state.category IN ('usage', 'quota', 'rate_limit') THEN 0
                         WHEN excluded.available=0 THEN 0
                         WHEN provider_capability_state.reason IN ({transient})
                             THEN 1
                         ELSE provider_capability_state.available END,
                     category=CASE
+                        WHEN provider_capability_state.category IN ('usage', 'quota', 'rate_limit') THEN provider_capability_state.category
                         WHEN excluded.available=0 THEN excluded.category
                         WHEN provider_capability_state.reason IN ({transient})
                             THEN NULL
                         ELSE provider_capability_state.category END,
                     reason=CASE
+                        WHEN provider_capability_state.category IN ('usage', 'quota', 'rate_limit') THEN provider_capability_state.reason
                         WHEN excluded.available=0 THEN excluded.reason
                         WHEN provider_capability_state.reason IN ({transient})
                             THEN NULL
@@ -163,21 +218,149 @@ class ProviderState:
         tier: str,
         category: str,
         reason: str,
+        *,
+        usage_generation: str | None = None,
+        usage_cursor: int | None = None,
+        usage_event_key: str | None = None,
+        usage_event_timestamp: str | None = None,
+        usage_expires_at: float | None = None,
     ) -> None:
+        usage_event_timestamp = _normalized_timestamp(usage_event_timestamp)
+        expires_at = None
+        if category in USAGE_QUARANTINE_CATEGORIES:
+            expires_at = (float(usage_expires_at) if usage_expires_at is not None
+                          else time.time() + DEFAULT_USAGE_QUARANTINE_SECONDS)
+        if category in USAGE_QUARANTINE_CATEGORIES and usage_generation is not None:
+            if not usage_generation or usage_cursor is None or usage_cursor < 0 or not usage_event_key:
+                raise ValueError("native usage evidence requires generation, cursor, and event key")
         with self._conn:
             self._conn.execute(
                 """
                 INSERT INTO provider_capability_state
-                    (host, client, role, tier, available, category, reason)
-                VALUES (?, ?, ?, ?, 0, ?, ?)
+                    (host, client, role, tier, available, category, reason,
+                     usage_generation, usage_cursor, usage_event_key, usage_event_timestamp,
+                     usage_expires_at)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(host, client, role, tier) DO UPDATE SET
-                    available=0,
-                    category=excluded.category,
-                    reason=excluded.reason,
+                    available=CASE WHEN excluded.category IN ('usage', 'quota', 'rate_limit')
+                                        AND excluded.usage_generation IS NOT NULL
+                                        AND provider_capability_state.usage_event_timestamp IS NOT NULL
+                                        AND (excluded.usage_event_timestamp IS NULL
+                                             OR excluded.usage_event_timestamp <= provider_capability_state.usage_event_timestamp)
+                                   THEN provider_capability_state.available ELSE 0 END,
+                    category=CASE WHEN provider_capability_state.category IN ('usage', 'quota', 'rate_limit')
+                                  AND excluded.category NOT IN ('usage', 'quota', 'rate_limit')
+                                  THEN provider_capability_state.category
+                                  WHEN excluded.category IN ('usage', 'quota', 'rate_limit')
+                                       AND excluded.usage_generation IS NOT NULL
+                                       AND provider_capability_state.usage_event_timestamp IS NOT NULL
+                                       AND (excluded.usage_event_timestamp IS NULL
+                                            OR excluded.usage_event_timestamp <= provider_capability_state.usage_event_timestamp)
+                                  THEN provider_capability_state.category
+                                  ELSE excluded.category END,
+                    reason=CASE WHEN provider_capability_state.category IN ('usage', 'quota', 'rate_limit')
+                                AND excluded.category NOT IN ('usage', 'quota', 'rate_limit')
+                                THEN provider_capability_state.reason
+                                WHEN excluded.category IN ('usage', 'quota', 'rate_limit')
+                                     AND excluded.usage_generation IS NOT NULL
+                                     AND provider_capability_state.usage_event_timestamp IS NOT NULL
+                                     AND (excluded.usage_event_timestamp IS NULL
+                                          OR excluded.usage_event_timestamp <= provider_capability_state.usage_event_timestamp)
+                                THEN provider_capability_state.reason
+                                ELSE excluded.reason END,
+                    usage_generation=CASE WHEN excluded.category IN ('usage', 'quota', 'rate_limit')
+                                                AND excluded.usage_generation IS NOT NULL
+                                                AND (provider_capability_state.usage_event_timestamp IS NULL
+                                                     OR (excluded.usage_event_timestamp IS NOT NULL
+                                                         AND excluded.usage_event_timestamp > provider_capability_state.usage_event_timestamp))
+                                          THEN excluded.usage_generation ELSE provider_capability_state.usage_generation END,
+                    usage_cursor=CASE WHEN excluded.category IN ('usage', 'quota', 'rate_limit')
+                                            AND excluded.usage_generation IS NOT NULL
+                                            AND (provider_capability_state.usage_event_timestamp IS NULL
+                                                 OR (excluded.usage_event_timestamp IS NOT NULL
+                                                     AND excluded.usage_event_timestamp > provider_capability_state.usage_event_timestamp))
+                                      THEN excluded.usage_cursor ELSE provider_capability_state.usage_cursor END,
+                    usage_event_key=CASE WHEN excluded.category IN ('usage', 'quota', 'rate_limit')
+                                               AND excluded.usage_generation IS NOT NULL
+                                               AND (provider_capability_state.usage_event_timestamp IS NULL
+                                                    OR (excluded.usage_event_timestamp IS NOT NULL
+                                                        AND excluded.usage_event_timestamp > provider_capability_state.usage_event_timestamp))
+                                         THEN excluded.usage_event_key ELSE provider_capability_state.usage_event_key END,
+                    usage_event_timestamp=CASE WHEN excluded.category IN ('usage', 'quota', 'rate_limit')
+                                                     AND excluded.usage_generation IS NOT NULL
+                                                     AND (provider_capability_state.usage_event_timestamp IS NULL
+                                                          OR (excluded.usage_event_timestamp IS NOT NULL
+                                                              AND excluded.usage_event_timestamp > provider_capability_state.usage_event_timestamp))
+                                               THEN excluded.usage_event_timestamp ELSE provider_capability_state.usage_event_timestamp END,
+                    usage_expires_at=CASE WHEN excluded.category NOT IN ('usage', 'quota', 'rate_limit')
+                                          THEN provider_capability_state.usage_expires_at
+                                          WHEN excluded.usage_generation IS NOT NULL
+                                               AND provider_capability_state.usage_event_timestamp IS NOT NULL
+                                               AND (excluded.usage_event_timestamp IS NULL
+                                                    OR excluded.usage_event_timestamp <= provider_capability_state.usage_event_timestamp)
+                                          THEN provider_capability_state.usage_expires_at
+                                          ELSE excluded.usage_expires_at END,
                     updated_at=datetime('now')
                 """,
-                (host, client, role, tier, category, reason),
+                (host, client, role, tier, category, reason, usage_generation, usage_cursor,
+                 usage_event_key, usage_event_timestamp, expires_at),
             )
+
+    def recover_usage_quarantine(
+        self, host: str, client: str, role: str, tier: str, *,
+        operator_authorized: bool = False,
+        native_generation: str | None = None,
+        native_cursor: int | None = None,
+        native_event_key: str | None = None,
+        native_state: str | None = None,
+        native_event_timestamp: str | None = None,
+    ) -> bool:
+        """Clear usage hold only on explicit operator authority or newer native recovery."""
+        native_event_timestamp = _normalized_timestamp(native_event_timestamp)
+        if not operator_authorized and (not native_generation or native_cursor is None or not native_event_key or native_state != "available"):
+            raise ValueError("newer native availability or explicit operator recovery required")
+        with self._conn:
+            cursor = self._conn.execute(
+                """UPDATE provider_capability_state
+                       SET available=1, category=NULL, reason=NULL,
+                       usage_generation=NULL, usage_cursor=NULL, usage_event_key=NULL,
+                       usage_expires_at=NULL,
+                       usage_event_timestamp=CASE WHEN ? IS NOT NULL
+                                                        AND (usage_event_timestamp IS NULL
+                                                             OR ? > usage_event_timestamp)
+                                                    THEN ? ELSE usage_event_timestamp END,
+                       updated_at=datetime('now')
+                   WHERE host=? AND client=? AND role=? AND tier=?
+                     AND category IN ('usage', 'quota', 'rate_limit')
+                     AND (? OR (usage_generation=? AND usage_cursor IS NOT NULL
+                                AND ? > usage_cursor AND ? != usage_event_key
+                                AND (tier != ? OR ? IS NOT NULL)
+                                AND (? IS NULL OR usage_event_timestamp IS NULL
+                                     OR ? >= usage_event_timestamp))
+                              OR (usage_generation != ? AND usage_event_timestamp IS NOT NULL
+                                  AND ? IS NOT NULL AND ? > usage_event_timestamp))""",
+                (native_event_timestamp, native_event_timestamp, native_event_timestamp,
+                 host, client, role, tier, int(operator_authorized), native_generation,
+                 native_cursor, native_event_key, WORKER_USAGE_ACCOUNT_TIER,
+                 native_event_timestamp, native_event_timestamp,
+                 native_event_timestamp, native_generation,
+                 native_event_timestamp, native_event_timestamp),
+            )
+            if native_state == "available" and native_event_timestamp is not None:
+                self._conn.execute(
+                    """INSERT INTO provider_capability_state
+                           (host, client, role, tier, available, usage_event_timestamp)
+                       VALUES (?, ?, ?, ?, 1, ?)
+                       ON CONFLICT(host, client, role, tier) DO UPDATE SET
+                           usage_event_timestamp=CASE
+                               WHEN provider_capability_state.usage_event_timestamp IS NULL
+                                    OR excluded.usage_event_timestamp > provider_capability_state.usage_event_timestamp
+                               THEN excluded.usage_event_timestamp
+                               ELSE provider_capability_state.usage_event_timestamp END,
+                           updated_at=datetime('now')""",
+                    (host, client, role, tier, native_event_timestamp),
+                )
+            return cursor.rowcount == 1
 
     def mark_available(self, host: str, client: str, role: str, tier: str) -> None:
         with self._conn:
@@ -186,6 +369,7 @@ class ProviderState:
                 UPDATE provider_capability_state
                 SET available=1, category=NULL, reason=NULL, updated_at=datetime('now')
                 WHERE host=? AND client=? AND role=? AND tier=?
+                  AND (category IS NULL OR category NOT IN ('usage', 'quota', 'rate_limit'))
                 """,
                 (host, client, role, tier),
             )
@@ -200,9 +384,17 @@ class ProviderState:
             """,
             (host, client, role, tier),
         ).fetchone()
-        if not row:
+        if row:
+            return {"category": row[0], "reason": row[1]}
+        if role != "worker" or tier == WORKER_USAGE_ACCOUNT_TIER:
             return None
-        return {"category": row[0], "reason": row[1]}
+        account_row = self._conn.execute(
+            """SELECT category, reason FROM provider_capability_state
+               WHERE host=? AND client=? AND role=? AND tier=? AND available=0
+                 AND category IN ('usage', 'quota', 'rate_limit')""",
+            (host, client, role, WORKER_USAGE_ACCOUNT_TIER),
+        ).fetchone()
+        return None if not account_row else {"category": account_row[0], "reason": account_row[1]}
 
     def record_brain_capability_block(
         self,

@@ -155,7 +155,7 @@ def test_wait_for_ready_codex_trust_hooks_and_marker(tmp_path):
     tools = _tools_with_tmux(tmp_path, tmux)
     assert tools._wait_for_ready("ic-w", timeout=5, client="codex") is True
     assert tmux.sent == [""]
-    assert tmux.raw_sent == [["2"]]
+    assert tmux.raw_sent == [["2", "Enter"]]
     assert tmux.read_count == 5
     assert tmux._outputs == []
 
@@ -223,6 +223,65 @@ def test_wait_for_ready_claude_unchanged(tmp_path):
     tools = _tools_with_tmux(tmp_path, tmux)
     assert tools._wait_for_ready("ic-w", timeout=5, client="claude") is True
     assert tmux.sent == [""]   # claude trust dismissal unchanged
+
+
+from ironclaude.communication_profiles import PROFILE_READY_MARKER
+
+_CODEX_BANNER = ">_ OpenAI Codex (v0.162.0-alpha.17.2)\n› Ask Codex to do anything\n"
+# Codex 0.162 "Folder access" modal. Cursor moves split its words in the pane
+# log, as in the 2026-10-09 probe's pane.log.
+_FOLDER_ACCESS_MODAL = (
+    "\x1b[30;3HFolder\x1b[30;10Haccess\n"
+    "\x1b[32;3HTrust\x1b[32;9Hthis\x1b[32;14Hfolder?"
+    "\x1b[32;22HCodex can read files here.\n"
+    "\x1b[35;1H› 1. Trust and continue\n  2. Quit\n"
+    "  enter continue · esc quit\n"
+)
+
+
+def test_wait_for_ready_marker_matches_whitespace_split_marker(tmp_path):
+    split = "• IC_LOSSLESS_AI_MESSAGES\n  _ACTIVE\n"
+    tools = _tools_with_tmux(tmp_path, _FakeTmux([split], sanitize=True))
+    assert tools._wait_for_ready(
+        "ic-w", timeout=2, client="codex", marker=PROFILE_READY_MARKER,
+    ) is True
+
+
+def test_wait_for_ready_marker_absent_does_not_match(tmp_path):
+    partial = "IC_LOSSLESS_AI_MESSAGES IC LOSSLESS AI MESSAGES ACTIVE\n"
+    tools = _tools_with_tmux(tmp_path, _FakeTmux([partial] * 5, sanitize=True))
+    assert tools._wait_for_ready(
+        "ic-w", timeout=2, client="codex", marker=PROFILE_READY_MARKER,
+    ) is False
+
+
+def test_wait_for_ready_marker_mode_ignores_codex_banner(tmp_path):
+    tools = _tools_with_tmux(
+        tmp_path, _FakeTmux([_CODEX_BANNER] * 5, sanitize=True),
+    )
+    assert tools._wait_for_ready(
+        "ic-w", timeout=2, client="codex", marker=PROFILE_READY_MARKER,
+    ) is False
+
+
+def test_wait_for_ready_codex_answers_folder_access_then_waits_for_redraw(tmp_path):
+    modal = _CODEX_BANNER + _FOLDER_ACCESS_MODAL
+    tmux = _FakeTmux([modal, modal, modal + _CODEX_BANNER], sanitize=True)
+    tools = _tools_with_tmux(tmp_path, tmux)
+    assert tools._wait_for_ready("ic-w", timeout=10, client="codex") is True
+    assert tmux.sent == [""]
+    assert tmux.raw_sent == []
+    assert tmux.read_count == 3
+
+
+def test_wait_for_ready_codex_folder_access_enables_hooks_answer(tmp_path):
+    modal = _CODEX_BANNER + _FOLDER_ACCESS_MODAL
+    hooks = modal + "Hooks need review\n2. Trust all and continue\n"
+    tmux = _FakeTmux([modal, hooks, hooks + _CODEX_BANNER], sanitize=True)
+    tools = _tools_with_tmux(tmp_path, tmux)
+    assert tools._wait_for_ready("ic-w", timeout=10, client="codex") is True
+    assert tmux.sent == [""]
+    assert tmux.raw_sent == [["2", "Enter"]]
 
 
 import sqlite3 as _sqlite3

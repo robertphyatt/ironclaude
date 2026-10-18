@@ -28,7 +28,9 @@ SESSION_TAG="${CLAUDE_SESSION_ID:-none}"
 # Database path (shared across all hooks)
 DB_PATH="$HOME/.claude/ironclaude.db"
 
-# Error sideband log (MCP tool errors written here, surfaced by hooks)
+# Error sideband log: the state-manager appends MCP tool errors here for the operator to
+# read; no hook delivers it to a model (each error is already the tool result).
+# session-init.sh truncates it at session start.
 MCP_ERROR_LOG="$HOME/.claude/ironclaude-errors.log"
 
 # Per-invocation DB validation sentinel — avoids redundant WAL + session checks on repeated db calls.
@@ -98,6 +100,44 @@ init_session_id() {
   SESSION_TAG="${CLAUDE_SESSION_ID:-none}"
 }
 
+# ic_real_ppid - Print the PID of the client process that runs this hook: the
+# parent whose PID MCP wrappers see as process.ppid and key their files by.
+# On MSYS2/Git Bash, $PPID=1 because the client isn't an MSYS process, and it
+# spawns bash through an intermediate bash layer (bash → bash → claude.exe), so
+# walk up the process tree skipping bash.exe intermediaries. Uses PowerShell
+# Get-CimInstance (always available on Windows 10/11; wmic was removed on
+# Windows 11 24H2+), with a wmic fallback for older Windows.
+ic_real_ppid() {
+  local bash_winpid real_ppid
+  if [ -f /proc/$$/winpid ]; then
+    bash_winpid=$(cat /proc/$$/winpid)
+    # Guard: validate bash_winpid is an integer before interpolating into PowerShell/wmic
+    if [[ ! "$bash_winpid" =~ ^[0-9]+$ ]]; then
+      real_ppid="$PPID"
+    else
+      # Single PowerShell invocation to minimize startup latency (~1-2s).
+      real_ppid=$(powershell.exe -NoProfile -Command '
+        $cur = '"$bash_winpid"'
+        do {
+          $proc = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $cur)
+          if (-not $proc) { break }
+          $cur = $proc.ParentProcessId
+          $parent = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $cur)
+        } while ($parent -and $parent.Name -eq "bash.exe")
+        Write-Output $cur
+      ' 2>/dev/null | tr -d '\r\n') || true
+      if [ -z "$real_ppid" ]; then
+        # Fallback: try wmic for older Windows (pre-24H2) where PowerShell may lack Get-CimInstance
+        real_ppid=$(MSYS_NO_PATHCONV=1 wmic process where "ProcessId=$bash_winpid" get ParentProcessId /value 2>/dev/null | sed -n 's/ParentProcessId=//p' | tr -d '\r\n') || true
+      fi
+      real_ppid="${real_ppid:-$PPID}"
+    fi
+  else
+    real_ppid="$PPID"
+  fi
+  printf '%s' "$real_ppid"
+}
+
 # Client detection + skill-invocation rendering, shared by the enforcement hooks so
 # remediation guidance names the invocation form the CURRENT client actually has:
 # Claude Code's Skill(...) tool vs Codex's $ironclaude:<skill> markdown links.
@@ -125,6 +165,90 @@ ic_skill_ref() {
   else
     printf 'Skill(skill="%s", args="%s")' "$_skill" "$_args"
   fi
+}
+
+# _ic_transcript_last_assistant_text TRANSCRIPT_PATH
+# Claude transcript fallback (moved from get-back-to-work-impl.sh): the text blocks
+# of the last assistant requestId; if that yields nothing, recent assistant text
+# (capped at 200 lines). Prints nothing when the file is unset, missing,
+# unreadable or not Claude JSONL.
+_ic_transcript_last_assistant_text() {
+  local transcript="${1:-}" req_id text=""
+  if [ -z "$transcript" ] || [ ! -f "$transcript" ]; then
+    return 0
+  fi
+  req_id=$(tail -n 500 "$transcript" 2>/dev/null | \
+    jq -r 'select(.type == "assistant") | .requestId // empty' 2>/dev/null | \
+    tail -1 || true)
+  if [ -n "$req_id" ]; then
+    text=$(tail -n 500 "$transcript" 2>/dev/null | grep -F "\"$req_id\"" | \
+      jq -r '.message.content[]? | select(.type == "text") | .text // empty' 2>/dev/null || true)
+  fi
+  if [ -z "$text" ]; then
+    text=$(tail -n 500 "$transcript" 2>/dev/null | \
+      jq -r 'select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text // empty' \
+      2>/dev/null | tail -n 200 || true)
+  fi
+  printf '%s' "$text"
+}
+
+# ic_last_assistant_text HOOK_INPUT_JSON
+# The last assistant text for a Stop/SubagentStop event. Prefers
+# .last_assistant_message (sent by Codex, observed in L2a; documented for Claude
+# Code), then falls back to the Claude transcript at .transcript_path. Prints
+# nothing only when both sources are absent.
+ic_last_assistant_text() {
+  local input="${1:-}" text transcript
+  text=$(printf '%s' "$input" | jq -r 'if type == "object" and (.last_assistant_message | type) == "string" then .last_assistant_message else empty end' 2>/dev/null || true)
+  if [ -n "$text" ]; then
+    printf '%s' "$text"
+    return 0
+  fi
+  transcript=$(printf '%s' "$input" | jq -r 'if type == "object" then (.transcript_path // "") else "" end' 2>/dev/null || true)
+  transcript=$(normalize_path "$transcript")
+  _ic_transcript_last_assistant_text "$transcript"
+}
+
+# ic_queue_warning SESSION_ID MESSAGE
+# Appends one non-blocking warning to the session's queue file. A UserPromptSubmit
+# hook drains it as next-turn context on both clients (ic_drain_warnings). Writes
+# only to the file, never to stdout, so a Stop hook's output stays one JSON object.
+# I/O errors are ignored: warnings fail open.
+ic_queue_warning() {
+  local safe msg
+  safe=$(printf '%s' "${1:-}" | tr -cd 'a-zA-Z0-9_-')
+  if [ -z "$safe" ] || [ "$safe" = "none" ]; then
+    return 0
+  fi
+  msg="${2:-}"
+  msg="${msg//$'\n'/ }"
+  msg="${msg//$'\r'/ }"
+  [ -n "$msg" ] || return 0
+  mkdir -p "$HOME/.claude" 2>/dev/null || return 0
+  printf '%s\n' "$msg" >> "$HOME/.claude/ironclaude-warnings-${safe}.queue" 2>/dev/null || true
+  return 0
+}
+
+# ic_drain_warnings SESSION_ID
+# Prints the queued warnings as one UserPromptSubmit hookSpecificOutput.additionalContext
+# JSON object and empties the queue (rename, read, delete). Prints nothing when the
+# queue is empty or unreadable.
+ic_drain_warnings() {
+  local safe file tmp text
+  safe=$(printf '%s' "${1:-}" | tr -cd 'a-zA-Z0-9_-')
+  if [ -z "$safe" ] || [ "$safe" = "none" ]; then
+    return 0
+  fi
+  file="$HOME/.claude/ironclaude-warnings-${safe}.queue"
+  [ -s "$file" ] || return 0
+  tmp="${file}.draining.$$"
+  mv "$file" "$tmp" 2>/dev/null || return 0
+  text=$(cat "$tmp" 2>/dev/null || true)
+  rm -f "$tmp" 2>/dev/null || true
+  [ -n "$text" ] || return 0
+  jq -cn --arg ctx "IronClaude warnings from your previous turn (address them):
+$text" '{hookSpecificOutput: {hookEventName: "UserPromptSubmit", additionalContext: $ctx}}' 2>/dev/null || true
+  return 0
 }
 
 # json_escape VALUE
@@ -513,27 +637,6 @@ db_audit_log() {
     "INSERT INTO audit_log (created_at, terminal_session, actor, action, old_value, new_value, context) VALUES (datetime('now'), '${safe_session}', '${actor}', '${action}', '${old_val}', '${new_val}', '${context}');" 2>/dev/null || true
 }
 
-# surface_mcp_errors - Read and display MCP error sideband log
-# Called from UserPromptSubmit hooks (which have visible stdout).
-# Atomically moves the file to prevent concurrent read/write issues.
-surface_mcp_errors() {
-  if [ ! -s "$MCP_ERROR_LOG" ]; then
-    return 0
-  fi
-
-  # Atomic move to temp file (prevents concurrent write during read)
-  local tmp_file
-  tmp_file=$(mktemp /tmp/.claude-mcp-errors-XXXXXX)
-  if mv "$MCP_ERROR_LOG" "$tmp_file" 2>/dev/null; then
-    while IFS= read -r line; do
-      if [ -n "$line" ]; then
-        log_hook "MCP-ERROR" "Error" "$line"
-      fi
-    done < "$tmp_file"
-    rm -f "$tmp_file"
-  fi
-}
-
 # _hook_error_handler - Internal function for ERR trap
 # Logs stack trace on unexpected failures
 _hook_error_handler() {
@@ -560,8 +663,15 @@ _hook_error_handler() {
 # Call at start of hook - enables strict mode and sets up error trap
 # NOTE: Hooks that need to handle grep failures explicitly should NOT call this
 #       and should instead add a comment explaining why.
+# Exits 0 for worker hooks in the Commander's Codex Brain (see body).
 run_hook() {
   local hook="$1"
+
+  # Worker hooks do not apply to the Commander's Codex Brain, which runs the
+  # Brain restriction set instead (codex-brain-hooks.sh sets IC_BRAIN_HOOK=1).
+  if [ "${IC_ROLE:-}" = "brain" ] && [ "${IRONCLAUDE_CLIENT:-}" = "codex" ] && [ "${IC_BRAIN_HOOK:-}" != "1" ]; then
+    exit 0
+  fi
 
   # Enable strict mode
   set -euo pipefail

@@ -5,9 +5,17 @@ description: Execute implementation plans wave-by-wave via MCP state management
 
 # Executing Plans
 
+## Client-native skill handoffs
+
+Use the next skill on the current client. Claude invokes the named skill with
+its Skill tool. Codex reads the next skill's `SKILL.md` and applies it in the
+same task with the stated arguments. Both clients perform the same mandatory
+MCP preflight, transitions, and review gates. Reading a skill on Codex is the
+skill invocation; prose about a future handoff does not complete it.
+
 ## Purpose
 
-Execute implementation plans wave-by-wave using MCP tools for state management. The MCP server validates the plan, computes dependency-based waves, tracks task progress, and enforces review gates. Claude calls MCP tools to advance through the plan.
+Execute implementation plans wave-by-wave using MCP tools for state management. The MCP server validates the plan, computes dependency-based waves, tracks task progress, and enforces review gates. Both clients call MCP tools to advance through the plan.
 
 ## When to Use
 
@@ -173,7 +181,11 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
 - `off` → skip this step entirely; proceed to Step 2.
 - `commander-choice` → use AskUserQuestion ("Run a tier-up plan review before
   execution? (default: yes)" / "Yes — run (Recommended)" | "No — skip"). If the user
-  declines, proceed to Step 2. If yes, run the review below.
+  declines, proceed to Step 2. If yes, run the review below. Under delegated
+  authority (`../../rules/scope-fidelity.md` §3), do not ask: record
+  `Predicted answer: Yes — run (delegated)` in the plan's Markdown file (never
+  `.plan.json`; its hash is bound at `create_plan`) and run the review. For a plan
+  labeled `Loop: light`, do not ask either: run the review below at the same tier.
 - `enforced` → always run the review below (no prompt). `start_execution` will
   refuse to advance without it.
 
@@ -187,6 +199,10 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    you judge this plan high-blast-radius/complex enough that a same-tier blind review would miss
    defects a higher tier would catch — weigh, as *judgment* (not a checklist): critical-path or
    widely-shared code, schema/migration, concurrency, security surface, and diff size/spread.
+   From Claude Opus or Codex Sol, one tier up is the client's top tier, so the Top-tier rule below
+   decides: do not surface a tier-up question unless the operator requested the top tier.
+   A light-loop plan (`../../rules/scope-fidelity.md` §2) always uses the same tier — skip
+   this judgment and do not surface a tier-up question.
    - **Autonomous PM loop:** make the call yourself and proceed.
    - **Operator interacting directly:** when you judge a tier-up warranted, do NOT silently
      escalate — SURFACE it via AskUserQuestion ("This plan looks high-blast-radius — run a
@@ -195,6 +211,14 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    - Claude Code: Haiku→`sonnet`, Sonnet→`opus`, Opus→`fable` unless Fable is
      unavailable→`opus`; Fable is the ceiling.
    - Codex: Luna→Terra→Sol→Astra, each resolved by the broker to the newest installed `gpt-<version>-<tier>` model (today Luna→`gpt-5.6-terra`, Terra→`gpt-6-sol`, Sol→`gpt-6-astra`, and Astra→`gpt-6-astra`); Astra is the ceiling and uses a fresh same-tier `gpt-6-astra` reviewer.
+
+   **Top-tier rule (both clients):** a client's top tier — Claude Fable, Codex Astra — is used
+   only when the operator explicitly requested the top tier for this effort, or when a same-tier
+   reviewer at that same step failed to produce a usable result (an error, empty output, or an
+   off-task report). Otherwise, where one tier up would resolve to the top tier (from Claude Opus
+   or Codex Sol), dispatch a fresh same-tier reviewer instead: `model=opus` on Claude,
+   `review_tier: "same"` on Codex. This applies here, to the HAS-ISSUES fix advisor, and to the
+   Step 7.5 end review. A session already on the top tier keeps its fresh same-tier review.
 
    **Same-tier** means the current model on that same client; never cross clients
    for reviewer tiering. To check Claude Fable availability, read the state flag at
@@ -245,8 +269,9 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    verdict rubric:
 
    - **Claude Code:** use a fresh `Agent`
-     (`subagent_type="general-purpose"`, `model=<resolved model>`). Put the complete
-     provenance packet inline and provide current artifact/source paths.
+     (`subagent_type="ironclaude:reviewer"`, `model=<resolved model>`). The reviewer has Read,
+     Grep and Glob only, with no Bash, Skill or MCP tools. Put the complete provenance packet
+     inline, plus any command output it needs, and provide current artifact/source paths.
    - **Codex:** call `run_codex_advisor_review` with the current full Codex model
      in `requester_model`, the already-selected `review_tier: "same"` or
      `review_tier: "one-up"`, and the complete provenance packet plus complete current
@@ -255,9 +280,11 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
      maps the reviewer exactly once. Do not run `codex exec` from the main agent or
      repeat an operator approval request for this brokered read-only review.
 
-   Use `review_tier: "same"` only for the selected same-tier blind plan-review
-   decision. Use `review_tier: "one-up"` for selected tier-up plan review, fix-advisor,
-   and end-of-work review. Omission is compatibility-only, never preferred new usage.
+   Use `review_tier: "same"` for the selected same-tier blind plan-review decision, and
+   for plan review, fix-advisor, and end-of-work review wherever the Top-tier rule above
+   replaces a Sol→Astra step. Otherwise use `review_tier: "one-up"` for selected tier-up
+   plan review, fix-advisor, and end-of-work review. Omission is compatibility-only, never
+   preferred new usage.
 
    For plan review, **blind** means blind to prior reviewer findings, verdicts,
    repair coaching, reviewer identities, diffs, fix rationale, and
@@ -332,7 +359,10 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    - a guard defused by a later step of the same plan — evaluate every check
      against the state after ALL tasks land, not the state where it is introduced;
    - a factual claim (a count, a line number, a symbol) whose
-     provenance is an agent summary rather than a file the author opened.
+     provenance is an agent summary rather than a file the author opened;
+   - a `Loop: light` label the change does not qualify for — it touches DB
+     writes/schema, auth/permission/guard code, concurrency, git/worktree
+     operations, or a public API/MCP schema, or it exceeds ~3 files / ~150 lines.
 
    Classify every candidate finding with this decision test. A finding is
    MATERIAL only if executing the plan exactly as written would:
@@ -341,7 +371,9 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
        catch; or
    (c) make a step, command, or test fail or be unrunnable as written; or
    (d) leave a required verification unable to detect the failure it exists
-       to catch.
+       to catch; or
+   (e) run a plan labeled `Loop: light` that does not qualify for the light
+       loop.
    A MATERIAL finding must cite the artifact and the source evidence you
    personally verified. A suspicion you did not verify is not MATERIAL.
    Everything else is an OBSERVATION: style, redundancy, count or wording
@@ -371,7 +403,8 @@ the MCP server's resolution). Missing/unreadable/invalid ⇒ treat as `enforced`
    MANDATORY tier-up fix advisor.** Review verdicts are chains: when the model that wrote
    the plan also fixes it, it makes correlated mistakes and the next review fails again.
    The advisor exists to make this response correct the first time.
-   - **Tier:** one above your current model on the trusted client's ladder (Claude:
+   - **Tier:** one above your current model on the trusted client's ladder, subject to the
+     Top-tier rule (Step 1.5) (Claude:
      Opus→`fable`, Fable unavailable→`opus`, Fable ceiling→same-tier Fable; Codex:
      Luna→Terra→Sol→Astra, each the newest installed `gpt-<version>-<tier>` model, Astra ceiling→same-tier Astra).
      Always a **subagent** — never swap
@@ -563,7 +596,8 @@ execution. Run inline ONLY when one of these holds:
 
 6. **Invoke code review explicitly:**
    ```
-   [Use Skill tool: skill="ironclaude:code-review", args="--task-boundary"]
+   Use `ironclaude:code-review` with `--task-boundary`: Claude invokes Skill;
+   Codex reads and applies `code-review/SKILL.md`.
    ```
    - The code-review skill runs and displays its full report (files reviewed, findings, PASS/FAIL)
    - The user sees all review findings with file:line references
@@ -585,9 +619,98 @@ execution. Run inline ONLY when one of these holds:
 
 **Step 5: Advance to next wave**
 
-After all tasks in the current wave pass review, call `mcp__plugin_ironclaude_state-manager__get_next_tasks` again.
-- If more tasks: repeat Step 4
-- If complete: proceed to Phase 3
+After all tasks in the current wave pass review (and `mark_executing` has returned the workflow to `executing`):
+
+1. **Re-stage the cumulative allowed_files.** A subagent's `git stash pop` (or any index
+   churn) during execution can silently drop EARLIER tasks' staged content out of the git
+   index, yielding a PARTIAL commit with NO error. At every wave boundary, before calling
+   `get_next_tasks`, re-stage the deduped **union** of every task's `allowed_files` from
+   the plan JSON so the index holds the full intended set regardless of churn. This runs
+   here, while the stage is still `executing`, because the professional-mode guard blocks
+   Bash write commands once `get_next_tasks` moves the workflow to `execution_complete`.
+   It runs in the orchestrator, AFTER the wave's subagents. It accepts absolute or
+   repo-relative file entries, resolves
+   existing ancestors without following the final symlink, and rejects paths
+   outside the repo or directory entries. Existing files and symlinks are staged;
+   missing entries are staged only when tracked, so deletions are included and
+   optional missing files are skipped. Entries already in the index are staged with
+   `git add -f`, so gitignored plan files (such as `docs/plans/*`) refresh; an untracked
+   entry that git ignores is skipped with a notice and never force-added. Validate every entry before staging and
+   leave unrelated index entries alone. Pass repository root and plan JSON as
+   separate arguments:
+   ```bash
+   python3 - "<repo-root>" "<plan-json-path>" <<'PY'
+   # BEGIN EXACT ALLOWED FILES RESTAGING
+   import json
+   import os
+   from pathlib import Path
+   import subprocess
+   import sys
+
+   root = Path(sys.argv[1]).resolve(strict=True)
+   plan = json.loads(Path(sys.argv[2]).read_text())
+   tracked = set(subprocess.run(
+       ["git", "--literal-pathspecs", "-C", str(root), "ls-files", "-z"],
+       check=True, capture_output=True,
+   ).stdout.decode("utf-8", "surrogateescape").split("\0"))
+
+   def resolve_parent(parent):
+       missing = []
+       while True:
+           try:
+               resolved = Path(os.path.realpath(parent, strict=True))
+               return resolved.joinpath(*reversed(missing))
+           except (FileNotFoundError, NotADirectoryError):
+               if parent == parent.parent:
+                   raise
+               missing.append(parent.name)
+               parent = parent.parent
+
+   paths = set()
+   for task in plan["tasks"]:
+       for entry in task.get("allowed_files", []):
+           if not isinstance(entry, str) or not entry:
+               raise ValueError(f"invalid allowed_files entry: {entry!r}")
+           supplied = Path(entry)
+           candidate = supplied if supplied.is_absolute() else root / supplied
+           candidate = Path(os.path.normpath(candidate))
+           # Resolve existing ancestors while preserving the final Git entry.
+           candidate = Path(os.path.normpath(
+               os.path.join(resolve_parent(candidate.parent), candidate.name)
+           ))
+           if os.path.commonpath((str(root), str(candidate))) != str(root):
+               raise ValueError(f"allowed_files path outside repository: {entry!r}")
+           relative = candidate.relative_to(root).as_posix()
+           if (candidate.is_dir() and not candidate.is_symlink()) or relative == ".":
+               raise ValueError(f"allowed_files directory entry: {entry!r}")
+           if candidate.is_file() or candidate.is_symlink() or relative in tracked:
+               paths.add(relative)
+
+   for relative in sorted(paths):
+       if relative in tracked:
+           # Already in the index: -f refreshes it even under a gitignored directory.
+           command = ["git", "--literal-pathspecs", "-C", str(root), "add", "-f", "--", relative]
+       else:
+           # check-ignore takes literal paths and rejects pathspec magic, so no
+           # --literal-pathspecs here (it exits 128 with that flag).
+           ignored = subprocess.run(
+               ["git", "-C", str(root), "check-ignore", "-q", "--", relative],
+           ).returncode
+           if ignored == 0:
+               # Never newly track an ignored file (a secret, say); only an explicit
+               # plan step's `git add -f` may bring one into the index.
+               print(f"skipped gitignored untracked allowed_files entry: {relative}", file=sys.stderr)
+               continue
+           if ignored != 1:
+               raise RuntimeError(f"git check-ignore failed for {relative!r}")
+           command = ["git", "--literal-pathspecs", "-C", str(root), "add", "--", relative]
+       subprocess.run(command, check=True)
+   # END EXACT ALLOWED FILES RESTAGING
+   PY
+   ```
+2. Call `mcp__plugin_ironclaude_state-manager__get_next_tasks` again.
+   - If more tasks: repeat Step 4
+   - If complete: proceed to Phase 3
 
 **Step 6: Handle failures**
 
@@ -696,18 +819,13 @@ boundary.
 
 When `mcp__plugin_ironclaude_state-manager__get_next_tasks` returns `{status: "complete"}`:
 1. The MCP automatically transitions workflow to execution_complete
-2. **Re-stage the cumulative allowed_files.** A subagent's `git stash pop` (or any index
-   churn) during execution can silently drop EARLIER tasks' staged content out of the git
-   index, yielding a PARTIAL commit with NO error. Before suggesting a commit, re-stage the
-   deduped **union** of every task's `allowed_files` from the plan JSON so the index holds
-   the full intended set regardless of churn. This runs in the orchestrator, AFTER the
-   subagents. Only these explicit paths are staged — a working change OUTSIDE allowed_files
-   is never touched. Stage only paths that exist on disk (replace `<plan-json-path>` and
-   `<repo-root>`):
-   ```bash
-   python3 -c "import json,sys; print('\n'.join(sorted({f for t in json.load(open(sys.argv[1]))['tasks'] for f in t.get('allowed_files', [])})))" <plan-json-path> \
-     | while IFS= read -r f; do if [ -e "<repo-root>/$f" ]; then git -C <repo-root> add -- "$f"; fi; done
-   ```
+2. **Verify the index holds every allowed file.** The cumulative re-stage already ran at
+   the final wave boundary (Step 5) while the stage was still `executing`; the
+   professional-mode guard blocks Bash write commands at `execution_complete`, so do not
+   re-run it here. Run `git -C <repo-root> status --short` and confirm every
+   `allowed_files` path with changes shows as staged, with no unstaged (` M`, `AM`) or
+   untracked (`??`) entry for it. If one is not staged, report it to the operator before
+   suggesting a commit.
 3. Suggest a commit message based on the plan's goal and changes:
 
 Review the plan's Goal statement and the staged diff (`git diff --staged --stat`).
@@ -742,9 +860,10 @@ Step 1.5 (critical-path or widely-shared code, schema/migration, concurrency, se
     (Recommended) | No"); if the operator declines, proceed to Step 8.
 
 **Run the review (high-blast-radius + confirmed):** dispatch a fresh, blind, **one-tier-up** reviewer
-(Agent tool, `subagent_type="general-purpose"`, `model=<one tier above your current model>` per the
-Step 1.5 tier-up resolution incl. the Fable-availability fallback) over the staged diff, following the
-`ironclaude:adversarial-review` approach: orientation → deep read → **verify every finding with grep/read
+(Agent tool, `subagent_type="ironclaude:reviewer"`, `model=<one tier above your current model, subject to the Top-tier rule>` per the
+Step 1.5 tier-up resolution incl. the Fable-availability fallback and the Top-tier rule) over the staged diff. The reviewer has
+Read, Grep and Glob only and cannot run git, so paste the full `git diff --staged` output and the relevant test output inline in
+its prompt. It follows the `ironclaude:adversarial-review` approach: orientation → deep read → **verify every finding with grep/read
 evidence (drop unverified)** → report severity-classified findings. The reviewer must evaluate the diff /
 current code as-is — NO git-blame, NO prior-review or issue-tracker context, NO author rationale. Then:
 independently verify each MATERIAL finding against the current source, and fix every verified MATERIAL
@@ -775,7 +894,7 @@ Professional mode remains ACTIVE for next task.
 
 - **MCP manages state**: All plan state (progress, wave computation, review gates) is managed by the MCP server via typed tools. Claude calls `mcp__plugin_ironclaude_state-manager__create_plan`, `mcp__plugin_ironclaude_state-manager__get_next_tasks`, `mcp__plugin_ironclaude_state-manager__submit_task`, and `mcp__plugin_ironclaude_state-manager__retreat` to drive execution.
 - **Wave-based execution**: Tasks are released in dependency-computed waves. All tasks in a wave can run in parallel (if using subagent-parallel mode) because their dependencies are already satisfied.
-- **Explicit review gates**: After calling `mcp__plugin_ironclaude_state-manager__submit_task`, Claude explicitly invokes the code-review skill with `--task-boundary`. The review report is displayed to the user with full findings. The task-completion-validator hook validates and advances.
+- **Explicit review gates**: After calling `mcp__plugin_ironclaude_state-manager__submit_task`, use the client-native handoff to the code-review skill with `--task-boundary`. Display the review report with full findings. The task-completion-validator hook validates and advances.
 - **File-restricted**: Only files listed in the plan's allowed_files for the current wave tasks can be modified.
 - **Precise execution**: Follow plan steps EXACTLY as written.
 - **Stop on failure**: Don't proceed if step fails.

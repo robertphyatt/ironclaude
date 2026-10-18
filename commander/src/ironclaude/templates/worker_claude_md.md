@@ -49,8 +49,8 @@
 
 9. **Advisor Fallback**
    - When the `advisor` tool returns unavailable, do NOT skip the advisor step or just reason it through yourself
-   - Spawn a top-tier subagent via the `Agent` tool (`model=fable` if Fable is available, else `model=opus`) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
-   - Client-aware: that is the Claude path; a Codex session calls `run_codex_advisor_review` with a complete inline packet, its current `requester_model`, and `review_tier: "one-up"` (omission is compatibility-only); the broker rejects any mismatch with provider-authenticated Codex turn metadata and owns the one-time `luna→terra→sol→astra` mapping (`gpt-<version>-luna→gpt-<version>-terra→gpt-<version>-sol→gpt-<version>-astra`) — see the `ironclaude:advisor-fallback` skill
+   - Spawn a fresh Opus-class subagent via the `Agent` tool (`model=opus`; `model=sonnet` from a Haiku session; `model=fable` only when the operator explicitly requests the top tier) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
+   - Client-aware: that is the Claude path; a Codex session calls `run_codex_advisor_review` with a complete inline packet, its current `requester_model`, and `review_tier: "one-up"` below the Opus class or `review_tier: "same"` from Sol (omission is compatibility-only); the broker rejects any mismatch with provider-authenticated Codex turn metadata and owns the one-time `luna→terra→sol→astra` mapping (`gpt-<version>-luna→gpt-<version>-terra→gpt-<version>-sol→gpt-<version>-astra`), so Astra is used only on explicit operator request — see the `ironclaude:advisor-fallback` skill
    - Weight its findings as you would the advisor's; "no advisor" means "use a subagent for the same effect," never "proceed unreviewed"
 
 10. **No Workflow Avoidance Under Stage/Context Restrictions**

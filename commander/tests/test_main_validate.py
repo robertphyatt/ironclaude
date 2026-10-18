@@ -1,4 +1,5 @@
 """Tests for IroncladeDaemon._validate_brain_message and _detect_prompt_waiting."""
+import copy
 import logging
 import sqlite3
 import threading
@@ -10,6 +11,7 @@ from ironclaude.db import init_db
 
 from ironclaude import fable_availability as fa
 from ironclaude import main as main_module
+from ironclaude.config import DEFAULTS
 from ironclaude.communication_profiles import CommunicationProfileError
 from ironclaude.main import IroncladeDaemon, PROMPT_WAITING_CACHE_TTL
 
@@ -346,7 +348,7 @@ class TestSpawnWorkerAdvisorTiering:
     @patch("ironclaude.main.format_worker_spawned", return_value="spawned")
     @patch("ironclaude.main.ensure_worker_trusted")
     @patch("ironclaude.main.make_opus_command", return_value="OPUS_CMD")
-    def test_claude_opus_advisor_is_fable(self, mock_make, mock_trust, mock_fmt, mock_logev):
+    def test_claude_opus_explicit_fable_advisor_is_honored(self, mock_make, mock_trust, mock_fmt, mock_logev):
         config = {
             "effort_level": "high",
             "advisor": {
@@ -360,6 +362,18 @@ class TestSpawnWorkerAdvisorTiering:
         decision = {"worker_id": "w-opus", "type": "claude-opus", "repo": "/tmp", "objective": "task"}
         daemon._handle_spawn_worker(decision)
         assert self._advisor_sends(daemon) == ["/advisor fable"]
+
+    @patch("ironclaude.main.log_worker_event")
+    @patch("ironclaude.main.format_worker_spawned", return_value="spawned")
+    @patch("ironclaude.main.ensure_worker_trusted")
+    @patch("ironclaude.main.make_opus_command", return_value="OPUS_CMD")
+    def test_claude_opus_default_advisor_is_opus(self, mock_make, mock_trust, mock_fmt, mock_logev):
+        config = {"effort_level": "high", "advisor": copy.deepcopy(DEFAULTS["advisor"]),
+                  "dispatch": {"use_goal": False}}
+        daemon = self._spawn_daemon(config)
+        daemon._handle_spawn_worker({"worker_id": "w-opus-default", "type": "claude-opus",
+                                     "repo": "/tmp", "objective": "task"})
+        assert self._advisor_sends(daemon) == ["/advisor opus"]
 
     @patch("ironclaude.main.log_worker_event")
     @patch("ironclaude.main.format_worker_spawned", return_value="spawned")

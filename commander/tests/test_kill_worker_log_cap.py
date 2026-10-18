@@ -156,4 +156,5 @@ def test_kill_worker_grades_when_log_read_fails(tools, registry):
     tools.kill_worker("w2", original_objective="do the thing", evidence="done")
 
     tools._call_grader.assert_called_once()
+    assert tools._call_grader.call_args.kwargs.get("tier") is None
     assert "log unavailable" in grader_prompts["user"]

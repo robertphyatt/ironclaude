@@ -1,0 +1,57 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`formatConversationAsMarkdown on Codex rollouts > leaves Claude transcripts on the existing renderer, byte for byte 1`] = `
+"# Conversation
+
+## Metadata
+
+**Session ID:** 22222222-2222-4222-8222-222222222222
+
+**Git Branch:** main
+
+**Working Directory:** /Users/alice/Code/app
+
+**Claude Code Version:** 2.1.90
+
+---
+
+## Messages
+
+### **User** (9/30/2026, 6:00:01 PM) {#u1}
+
+Plan the KIWI migration
+
+### **Agent** (9/30/2026, 6:00:02 PM) {#a1}
+
+I need one decision first.
+
+**Tool Use:** \`AskUserQuestion\`
+
+- **questions:**
+\`\`\`json
+[
+  {
+    "question": "Which scope?",
+    "header": "Scope",
+    "options": [
+      {
+        "label": "Retrieval only"
+      },
+      {
+        "label": "Everything"
+      }
+    ],
+    "multiSelect": false
+  }
+]
+\`\`\`
+
+**Result:**
+User has answered your questions.
+
+### **Agent** (9/30/2026, 6:00:04 PM) {#a2}
+
+Proceeding with retrieval only.
+
+"
+`;

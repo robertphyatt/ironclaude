@@ -11,6 +11,80 @@
 > `vX.Y.Z`. Land changes under `## [Unreleased]` as you go, then rename that
 > heading to the new version at release time so the entry matches what shipped.
 
+## 1.2.0: One IronClaude for Claude and Codex, right-sized model checks, and tool-free children
+
+A minor release: IronClaude now behaves the same way on both clients and runs its checks on the model class each one needs.
+
+- **The hooks, instructions and memory-search gate are the same on both clients.**
+  - **Stop-hook text and warnings.** Both clients read Stop-hook text from `last_assistant_message`. On Codex, a warning that a Stop message cannot show is queued and delivered as next-prompt context.
+  - **Context and errors.** `state-activator` emits a single context-only object, and the MCP error sideband no longer reaches any session.
+  - **Matchers.** They cover Codex `apply_patch` and `EnterPlanMode`, and `active_skill` follows MCP workflow transitions.
+  - **Shared instructions.** `AGENTS.md`, `CLAUDE.md` and `behavioral.md` carry the same 15 directives under a parity test.
+  - **Codex brainstorming.** Codex gets a real brainstorming entry.
+  - **Memory-search gate.** The brainstorming gate arms only on a new effort and clears on either client's search. The writing-plans gate becomes an unenforced pre-drafting search.
+
+  Also fixed: Codex hook context, path guards and judge-failure warnings. (`worker/hooks/*`, `worker/rules/*`; covered by the hook tests and `test_instruction_surface_parity.py`.)
+- **The Commander's Codex Brain runs under the same restrictions as the Claude Brain.**
+  - **Brain rule set.** It uses the Brain hooks (block-push, the pin and attention-sweep enforcers, the orchestrator guard, the task gate and a hooks canary) through a dispatcher that acts only for the Codex Brain. Hook trust is warmed up before start, and the Brain is stopped if its canary does not fire.
+  - **Tools.** Subagents are off, and tools are trimmed to the Claude Brain's set through per-start overrides that never write `~/.codex/config.toml`.
+- **Commander-spawned Codex workers start reliably.**
+  - **Start-up order.** The profile skill turn is sent before professional mode activates.
+  - **Thread binding.** The worker binds only to its own Codex thread, and sessions no longer stamp each other's pending markers.
+  - **Failed spawns.** A spawn that fails before it starts releases its reservation.
+- **The Claude/Codex worker capacity handoff is safe to run.**
+  - **Detection.** Native quota detection only starts a handoff and never blocks normal worker handling.
+  - **Paused handoffs.** Every paused handoff ends running, moving forward, or preserved.
+  - **Locks.** Stale locks are reclaimed by PID plus start time.
+  - **Limits.** Both Claude limit windows count, and usage quarantines expire.
+  - **`abort_handoff`.** It covers the one undecidable case.
+- **Every harness LLM check runs on the model class its difficulty needs.**
+  - **Hook and Commander checks** try the local box, then Claude Haiku or the newest Codex Luna, and only then fail open. They use lean children with no session files.
+  - **Continuation judge and worker health** use Sonnet or Terra, and blocking gates step up one class.
+  - **Plan approval and kill-worker** stay on the Opus class, and Opus workers get an Opus or Sol advisor.
+  - **Reviews.** The plan review, the HAS-ISSUES fix advisor and the end review use a fresh same-tier reviewer (Opus or Sol). Fable or Astra is used only when the operator asks, or when a same-tier reviewer gives no usable result.
+  - **Codex fast-model calls** send a fully strict schema.
+- **Every one-shot child that reads untrusted text has the same minimal tool surface on both clients.**
+  - **Codex children.** The Codex grader, the Commander's fast child, the hook's Codex child and the Codex advisor broker share one no-tools set, `fast_model.CODEX_NO_TOOLS_ARGS`. It turns off every listed tool feature, goals, tool suggestions, agents and web search, and parity tests keep the Commander, hook and broker copies in step. The broker could read files outside its cwd before. It can no longer: review packets must be self-contained.
+  - **Claude children.** The Claude grader, fast and hook children run with `--restricted` (no advisor tool, plugins or auto-memory). The grader drops `--dangerously-skip-permissions`.
+  - **Effort and routing.** The fast and hook children add `--effort low` and drop the provider-routing variables and an inherited `CLAUDE_CODE_EFFORT_LEVEL`, which was measured to override `--effort`.
+  - **Rubric.** Both graders get the rubric in their prompt.
+  - **Codex model.** IronClaude pins no Codex model. The Codex defaults are the family words `luna`, `terra`, `sol` and `astra`, mirroring Claude's `haiku`, `sonnet`, `opus` and `fable` aliases. A word resolves to the newest installed `gpt-<version>-<word>` where Codex runs: this Mac's `$CODEX_HOME/models_cache.json` for local roles, or the remote worker box's own cache, read over SSH. An explicit slug in config is used as-is, locally and remotely. If no model of the family is installed, Codex is unavailable for that call: routing falls to the next client, hooks and graders fail open, a resume is refused, the Codex Brain does not start (its log names the family and the cache path), and the advisor broker returns `codex-reviewer-model-unavailable`. `ProviderConfig.model_for` requires `host`, and a parity test reads the broker's runtime bundle.
+  - **Smaller fixes.** The hook's Codex schema is strict at every level, and Codex worker resume passes `--model` and `--no-daemon`.
+
+  (`fast_model.py`, `orchestrator_mcp.py`, `provider_config.py`, `plan-validator.sh`, `advisor-review.ts`; covered by `test_fast_model.py`, `test_grader_routing.py`, `test_provider_config.py`, `test-fast-model-fallback.sh` and `advisor-review.test.ts`.)
+- **Claude reviewers use the locked `ironclaude:reviewer` agent.** The advisor fallback, the plan review and the end review dispatch a report-only plugin agent that has Read, Grep and Glob only (no Bash, Edit, Write, Skill or MCP tools); the orchestrator puts the diff and test output in its prompt.
+- **The Brain gate root moved to `~/.ironclaude/state/brain-gate`.** The Commander creates it with mode 0700 and passes it to both Brains as `IRONCLAUDE_BRAIN_GATE_ROOT`. `brain-gated-actions.sh` and the hooks canary fail closed unless it is a real directory owned by the user with no group or other access. The rest of `/tmp/ic` is unchanged.
+- **Both Brains refuse git file writes and branch changes, and the Codex Brain runs only its own MCP servers.** The Claude Brain's tool guard, the Codex Brain's command approval and `brain-orchestrator-guard.sh` refuse `git log`, `git diff` and `git show` with `--output`, which writes a file. Both Brains and the worker read-only check refuse brace groups the shell would expand (a comma or `..`), and Brain git commands refuse glob characters, because the shell rewrites an approved command before git sees it; `@{u}` and `HEAD@{1}` still work. Both Brains' Python checks allow `git branch` only for listing, never to create, delete, rename, copy or force a branch. The Codex Brain refuses to start when its MCP inventory holds a running server outside its own set (`orchestrator`, `episodic-memory`, `research`, `ollama`; servers Codex reports as disabled do not count), and its tool trim keeps `research` and `ollama` only when IronClaude's own server file exists. A worker's usage quarantine ends at most 7 days after the limit event, however late the reported reset.
+- **Read-only git status never takes the index lock.** `execution-drift-check.sh` and `subagent-drift-detector.sh` run `git --no-optional-locks status`, and workspace-manager (`runGit`, `runGitEnv`) and the Commander (`push_repo`'s diff stat, the shadow grader's `git_diff`) run with `GIT_OPTIONAL_LOCKS=0`. A `git status` killed mid-read can no longer leave a stale `.git/index.lock` that blocks `git add` for every session sharing a checkout; writes still take the lock for one short command. Read-only `git diff` still refreshes the index under the lock, because turning that refresh off would change which files it reports.
+- **Local-box backoff.** If you run your own local box (Ollama or an OpenAI-compatible server), a box failure makes the hooks and the Commander's local grader skip that box for `local_backoff_minutes` and ask the Haiku-class model instead (Claude Haiku, or the newest Luna on Codex). A box failure is a connect failure (refused or connect timeout), an HTTP error, an empty answer, invalid JSON, or a read timeout at the box's own configured read timeout (`timeout_seconds`). The hooks also count their own budget timeout (`hook_validation_budget_seconds`, default 8 s) as a failure, so a box too slow for the hooks is skipped by the hooks and the Commander alike. The only timeout that does not trip the backoff is a Commander caller deadline shorter than the box's configured timeout, such as the fast lane's `fast_lane_grade_timeout_seconds` (default 5 s): nothing is recorded, so the Commander keeps asking a box that is slow but within its timeout. The default is 15 minutes; set `local_backoff_minutes` top-level or per backend (`ollama.local_backoff_minutes`, `openai.local_backoff_minutes`) in `~/.claude/ironclaude-hooks-config.json`, and `0` turns it off. The hooks and the Commander share one marker, `~/.ironclaude/state/local-backoff/local-box-backoff.json`, which holds the endpoint URL and the time it expires, in a 0700 directory owned by the user; delete it to try the box again at once. The next call after expiry tries the box again; a success clears the marker, and a failure renews it. The marker is the only thing that makes IronClaude skip your box, so with `0` your box is tried on every call.
+- **PM loops stay proportionate to the request.** A shared scope-fidelity rule covers:
+  - side quests;
+  - a light or full loop, gated by risk and verified by the blind plan reviewer;
+  - auto-answers only under explicit delegation;
+  - an operator bans file at `docs/operator-prohibitions.md`.
+
+  Review findings are labeled blocks-requirement or hardening. Only blockers fail a task, and every critical check stays blocking. (`worker/rules/scope-fidelity.md`)
+- **Workflow guard fixes.**
+  - **Execution drift check.** A new check blocks `submit_task` and Stop when files outside the plan's `allowed_files` changed since the task was claimed. It counts only this session's own shell commands. It also leaves out files another live session wrote. The guard logs the writer of every file-tool write it allows (`~/.claude/ironclaude-drift-writers.tsv`). The check then drops a path another session wrote recently, or one that a live session's in-progress task lists in its own ledger for the same repository. A session in a shared checkout is no longer blocked by files another session wrote with its file tools or lists in an in-progress task, and its own side quests still block. Ledger roots compare by file identity, so a `code`/`Code` or symlinked spelling of the same repository still matches.
+  - **Codex in a primary checkout.** With no managed worktree, Codex `apply_patch` and `exec_command` skipped the stage and `allowed_files` gates. They are now gated like Claude's tools, and every patch target is checked.
+  - **`/commit` scoping.** It handles absolute `allowed_files` inside the repository.
+  - **Cumulative re-stage.** It now runs at each wave boundary and force-stages only tracked paths.
+- **Commander reliability.**
+  - **Config file.** It is found regardless of the working directory, so the spawn gate uses the tuned memory limits, and Claude is preferred for workers and graders.
+  - **Workspace CLI timeout.** It is configurable, defaulting to 900 s.
+  - **Heartbeat.** It lists blocked ledger tasks from the Brain's wiki ledger, and pinned decisions get a 4-hour reminder.
+- **Episodic memory.**
+  - **Leaner and lossless.** The unused tool-call table is gone. A guarded `episodic-memory maintain` slims, backfills and compacts with zstd.
+  - **Codex rendering.** Read and show render Codex conversations.
+  - **Sync.** It no longer launches while a sync is already running.
+- **Known issues.**
+  - **Codex `functions.exec`.** Codex children keep it, because `features.unified_exec=false` has no effect.
+  - **Codex broker MCP resources.** The broker can still list MCP resources, though none are configured under `--ignore-user-config`.
+  - **Execution subagents.** `general-purpose` execution subagents still have Skill and MCP tools; a Skill call from one can move the parent session's stage. This is on the backlog.
+  - **Drift ledgers.** Ledgers are never pruned.
+  - **Another session's shell writes.** A file another session changes with a shell command is not recognized as that session's when that session has no drift ledger, so a session sharing the checkout can still be blocked for it. Seen 2026-10-18: the writing session had started before this release's hook registrations and never reloaded them; run `/reload-plugins` in it (see Deploy).
+- Deploy: `claude plugin update ironclaude@ironclaude`, `make codex-plugin-release`, `make deploy-hooks`, then restart Commander and ChatGPT, and run `/reload-plugins` in every open Claude Code session: hook scripts update in place, but a session keeps the hook registrations it started with until it reloads (the conversation is kept). Codex may ask to re-approve the IronClaude hooks under Settings → Hooks. Suites: commander 4156, state-manager 273, hooks 61 (`make test-hooks`).
+
 ## 1.1.15: Forgiving Codex model ladder and the codex-cli package layout
 
 - **Codex model names no longer have to match a hard-coded list.** Codex moved to gpt-6 (`gpt-6-sol` by default, and gpt-6 has no terra), and the advisor broker rejected every requester outside `gpt-5.6-luna/terra/sol` and `gpt-6-astra`, blocking enforced plan review. The broker now accepts any `gpt-<version>-<luna|terra|sol|astra>` model (its tool schema publishes that pattern instead of an enum), rejects anything else, and resolves the one-tier-up reviewer to the newest installed model at the next tier from Codex's own `$CODEX_HOME/models_cache.json`, skipping a tier that has no model and falling back to a built-in `gpt-6-luna`, `gpt-5.6-terra`, `gpt-6-sol`, `gpt-6-astra` ladder when the cache is unreadable. Commander's provider config accepts any Codex model whose tier word matches its tier; its defaults are unchanged. (`advisor-review.ts`, `provider_config.py`; covered by `advisor-review.test.ts` / `test_provider_config.py`.)

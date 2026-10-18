@@ -1,0 +1,42 @@
+{
+  "name": "Complete hook path and retry safeguards",
+  "goal": "Close exact-path drift ambiguity and align bounded Codex Stop retry detection.",
+  "requirements_file": "docs/plans/2026-10-04-codex-hook-corrections-requirements.md",
+  "design_file": "docs/plans/2026-10-04-codex-hook-corrections-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Preserve exact drift boundaries and bounded Stop retries",
+      "description": "Reject LF-containing current dirty Git paths as unsupported before line-based allowed/baseline comparison; propagate distinct status 2 through submit and Stop as visible block, never generic fail-open. Scan current dirty paths before baseline/allowed lookup so pre-existing or missing-baseline cases cannot suppress this guard. Preserve normal baseline files, copy destination-only handling and both rename paths. Do not mutate user filenames. In wrapper _run_codex_stop, mirror implementation precedence: if stop_hook_active non-null use it, else loop_count > 0, else false. Keep native JSON/exit semantics. Update validation artifact with measured results. Scope remains subject to existing professional-mode/root/task eligibility and bounded three-block Stop escape. Distinct status2 must survive collector pipeline and command substitution; capture actual exit status before any ! negation. Other Git/read failures retain prior fail-open policy.",
+      "allowed_files": [
+        "worker/hooks/execution-drift-check.sh",
+        "worker/hooks/get-back-to-work-impl.sh",
+        "worker/hooks/tests/test-execution-drift-check.sh",
+        "worker/hooks/get-back-to-work-claude.sh",
+        "worker/hooks/test-stop-wrapper.sh",
+        "docs/reviews/2026-10-04-codex-hook-corrections-validation.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: extend test-execution-drift-check.sh: temporary Git filename allowed.txt\\nother.txt with two separate allowed entries must block submit and Stop with unsupported-path message; test with existing baseline and missing baseline, and rename source case. Real ordinary filenames continue passing. Extend test-stop-wrapper.sh failing-impl runner cases: loop_count 1 with absent stop_hook_active terminates, loop_count0 requests initial retry, explicit stop_hook_active false overrides loop_count1, true overrides loop_count0. Include LF dirt before claim; missing baseline; LF rename source and destination; reject LF copy destination but ignore copy source metadata. Require unsupported-path diagnostic, not generic task block, and clear only fixture throttle state between independent cases. Wrapper includes stop_hook_active:null plus loop_count1."
+        },
+        {
+          "description": "Run focused tests, record concrete RED; no predicted counts. Execute each command separately and record each exit; never infer combined success from final command.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-check.sh\nbash /Users/roberthyatt/Code/ironclaude/worker/hooks/test-stop-wrapper.sh"
+        },
+        {
+          "description": "GREEN: implement described status propagation and retry precedence. Preserve pipeline status so sort or command substitution cannot swallow unsupported-path detection. Error message identifies unsupported newline Git paths without printing split misleading names. Do not add broad staging, new schema or baseline migration."
+        },
+        {
+          "description": "Run focused tests and affected regressions, record measured output in validation artifact. Run full hooks after these changes if affected regressions expose broader coupling. Execute each command separately, require every suite exit0; adjust fixed fixture assertion totals with added cases.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-check.sh\nbash /Users/roberthyatt/Code/ironclaude/worker/hooks/test-stop-wrapper.sh\nbash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-identity.sh\nbash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-roots.sh\nbash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-gbtw-continuation-judge.sh"
+        },
+        {
+          "description": "Parent reviews and stages exact five source/test paths; force-add only validation artifact.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -- worker/hooks/execution-drift-check.sh worker/hooks/get-back-to-work-impl.sh worker/hooks/tests/test-execution-drift-check.sh worker/hooks/get-back-to-work-claude.sh worker/hooks/test-stop-wrapper.sh\ngit -C /Users/roberthyatt/Code/ironclaude add -f -- docs/reviews/2026-10-04-codex-hook-corrections-validation.md"
+        }
+      ]
+    }
+  ]
+}

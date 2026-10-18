@@ -55,6 +55,41 @@ CREATE TABLE IF NOT EXISTS workers (
     workspace_integration_target TEXT
 );
 
+CREATE TABLE IF NOT EXISTS worker_handoffs (
+    worker_id TEXT NOT NULL REFERENCES workers(id),
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    phase TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    pause_reason TEXT,
+    notification_claimed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    PRIMARY KEY(worker_id, generation)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_handoffs_active
+ON worker_handoffs(worker_id) WHERE completed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS worker_operations (
+    worker_id TEXT PRIMARY KEY REFERENCES workers(id),
+    nonce TEXT NOT NULL UNIQUE,
+    operation TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    owner_token TEXT NOT NULL,
+    owner_pid INTEGER,
+    owner_started REAL,
+    phase TEXT NOT NULL DEFAULT 'effects_started',
+    recovery_warning_claimed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS worker_quota_evidence (
+    worker_id TEXT PRIMARY KEY REFERENCES workers(id), generation INTEGER NOT NULL,
+    cursor INTEGER NOT NULL, event_key TEXT, verdict TEXT NOT NULL,
+    evidence_json TEXT, updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL DEFAULT (datetime('now')),
@@ -194,6 +229,11 @@ CREATE TABLE IF NOT EXISTS provider_capability_state (
     available INTEGER NOT NULL DEFAULT 0,
     category TEXT,
     reason TEXT,
+    usage_generation TEXT,
+    usage_cursor INTEGER,
+    usage_event_key TEXT,
+    usage_event_timestamp TEXT,
+    usage_expires_at REAL,
     observed_at TEXT,
     capability_fingerprint TEXT,
     notification_state TEXT NOT NULL DEFAULT 'pending',
@@ -269,6 +309,11 @@ _DIRECTIVES_MIGRATION_COLUMNS = [
 ]
 
 _PROVIDER_CAPABILITY_MIGRATION_COLUMNS = [
+    ("usage_generation", "TEXT"),
+    ("usage_cursor", "INTEGER"),
+    ("usage_event_key", "TEXT"),
+    ("usage_event_timestamp", "TEXT"),
+    ("usage_expires_at", "REAL"),
     ("capability_fingerprint", "TEXT"),
     ("notification_state", "TEXT NOT NULL DEFAULT 'pending'"),
     ("last_probe_at", "REAL"),
@@ -405,6 +450,20 @@ def init_db(db_path: str) -> sqlite3.Connection:
             if "duplicate column name" in msg or "already has column" in msg:
                 logger.debug("workers.%s already present, skipping migration: %s", _wcol, exc)
             else:
+                raise
+    # Old operation leases have unknown effects and must never be recovered as
+    # pre-effect claims merely because their original owner is gone.
+    for column_name, column_def in (
+        ("owner_pid", "INTEGER"),
+        ("owner_started", "REAL"),
+        ("phase", "TEXT NOT NULL DEFAULT 'effects_started'"),
+        ("recovery_warning_claimed", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE worker_operations ADD COLUMN {column_name} {column_def}")
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if "duplicate column name" not in msg and "already has column" not in msg:
                 raise
     for stmt in _POST_MIGRATION_INDEXES:
         try:

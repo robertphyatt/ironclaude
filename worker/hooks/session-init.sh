@@ -328,42 +328,8 @@ rm -f "$HOME/.claude/.hook-port" "$HOME/.claude/.hook-token" 2>/dev/null || true
 # Write session ID to PPID-keyed file so MCP servers can resolve their session.
 # MCP servers read this via process.ppid — both share the claude process as parent.
 # NOTE: Hooks do NOT use this file. They read session_id from the JSON payload.
-#
-# On MSYS2/Git Bash, $PPID=1 because Claude Code isn't an MSYS process.
-# Claude Code spawns bash through an intermediate bash layer
-# (bash → bash → claude.exe), so we walk up the process tree skipping
-# bash.exe intermediaries to find claude.exe's PID. This matches what
-# Node.js process.ppid returns in the MCP wrapper.
-#
-# Uses PowerShell Get-CimInstance (always available on Windows 10/11).
-# wmic was removed on Windows 11 24H2+.
-if [ -f /proc/$$/winpid ]; then
-  BASH_WINPID=$(cat /proc/$$/winpid)
-  # Guard: validate BASH_WINPID is an integer before interpolating into PowerShell/wmic
-  if [[ ! "$BASH_WINPID" =~ ^[0-9]+$ ]]; then
-    REAL_PPID="$PPID"
-  else
-    # Walk up process tree, skipping bash.exe intermediaries, to find Claude Code PID.
-    # Single PowerShell invocation to minimize startup latency (~1-2s).
-    REAL_PPID=$(powershell.exe -NoProfile -Command '
-      $cur = '"$BASH_WINPID"'
-      do {
-        $proc = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $cur)
-        if (-not $proc) { break }
-        $cur = $proc.ParentProcessId
-        $parent = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $cur)
-      } while ($parent -and $parent.Name -eq "bash.exe")
-      Write-Output $cur
-    ' 2>/dev/null | tr -d '\r\n') || true
-    if [ -z "$REAL_PPID" ]; then
-      # Fallback: try wmic for older Windows (pre-24H2) where PowerShell may lack Get-CimInstance
-      REAL_PPID=$(MSYS_NO_PATHCONV=1 wmic process where "ProcessId=$BASH_WINPID" get ParentProcessId /value 2>/dev/null | sed -n 's/ParentProcessId=//p' | tr -d '\r\n') || true
-    fi
-    REAL_PPID="${REAL_PPID:-$PPID}"
-  fi
-else
-  REAL_PPID="$PPID"
-fi
+# ic_real_ppid (hook-logger.sh) resolves that parent, including on MSYS2/Git Bash.
+REAL_PPID=$(ic_real_ppid)
 
 # ═══ Capture-then-adjudicate PPID file write ═══
 # Claude Code fires two concurrent SessionStart events on resume:

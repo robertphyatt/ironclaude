@@ -1,4 +1,4 @@
-import fs from 'fs';
+import { openArchiveStream } from './archive-io.js';
 import readline from 'readline';
 import { ConversationExchange, ToolCall } from './types.js';
 import crypto from 'crypto';
@@ -17,11 +17,32 @@ interface JSONLMessage {
   cwd?: string;
   gitBranch?: string;
   version?: string;
+  entrypoint?: string;
+  toolUseResult?: unknown;
   thinkingMetadata?: {
     level?: string;
     disabled?: boolean;
     triggers?: Array<any>;
   };
+}
+
+/**
+ * AskUserQuestion answers: the user record's content is only a tool_result, and the
+ * human's words live in toolUseResult.answers ({ "<question>": "<answer>" }).
+ * Returns "Q: …\nA: …" pairs joined by a blank line, or '' for anything else.
+ */
+export function formatAnswers(toolUseResult: unknown): string {
+  if (!toolUseResult || typeof toolUseResult !== 'object') return '';
+  const answers = (toolUseResult as { answers?: unknown }).answers;
+  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) return '';
+  return Object.entries(answers as Record<string, unknown>)
+    .map(([question, answer]) => {
+      const text = typeof answer === 'string' ? answer
+        : Array.isArray(answer) ? answer.map(String).join(', ')
+        : JSON.stringify(answer);
+      return `Q: ${question}\nA: ${text}`;
+    })
+    .join('\n\n');
 }
 
 export async function parseConversation(
@@ -30,13 +51,17 @@ export async function parseConversation(
   archivePath: string
 ): Promise<ConversationExchange[]> {
   const exchanges: ConversationExchange[] = [];
-  const fileStream = fs.createReadStream(filePath);
+  const fileStream = openArchiveStream(filePath);
   const rl = readline.createInterface({
     input: fileStream,
     crlfDelay: Infinity
   });
+  // A damaged .zst (or any read error) must reject, never hang or return a partial parse (R2).
+  const failure: { error?: Error } = {};
+  fileStream.once('error', (error: Error) => { failure.error = error; rl.close(); });
 
   let lineNumber = 0;
+  let sessionEntrypoint: string | undefined;
   let currentExchange: {
     userMessage: string;
     userLine: number;
@@ -52,6 +77,7 @@ export async function parseConversation(
     thinkingLevel?: string;
     thinkingDisabled?: boolean;
     thinkingTriggers?: string;
+    isAnswer?: boolean;
     toolCalls: ToolCall[];
   } | null = null;
 
@@ -86,6 +112,7 @@ export async function parseConversation(
         thinkingLevel: currentExchange.thinkingLevel,
         thinkingDisabled: currentExchange.thinkingDisabled,
         thinkingTriggers: currentExchange.thinkingTriggers,
+        isAnswer: currentExchange.isAnswer,
         toolCalls: toolCalls.length > 0 ? toolCalls : undefined
       };
       exchanges.push(exchange);
@@ -97,6 +124,11 @@ export async function parseConversation(
 
     try {
       const parsed: JSONLMessage = JSON.parse(line);
+
+      // The entrypoint (cli, sdk-py, sdk-cli) is per session; take the first one seen.
+      if (!sessionEntrypoint && typeof parsed.entrypoint === 'string') {
+        sessionEntrypoint = parsed.entrypoint;
+      }
 
       // Skip non-message types
       if (parsed.type !== 'user' && parsed.type !== 'assistant') {
@@ -149,6 +181,13 @@ export async function parseConversation(
         }
       }
 
+      // AskUserQuestion answers become the user side of a new exchange, so the
+      // operator's decisions are searchable in their own words.
+      const answerText = parsed.message.role === 'user' ? formatAnswers(parsed.toolUseResult) : '';
+      if (answerText) {
+        text = answerText;
+      }
+
       // Skip empty messages
       if (!text.trim() && toolCalls.length === 0) {
         continue;
@@ -174,6 +213,7 @@ export async function parseConversation(
           thinkingLevel: parsed.thinkingMetadata?.level,
           thinkingDisabled: parsed.thinkingMetadata?.disabled,
           thinkingTriggers: parsed.thinkingMetadata?.triggers ? JSON.stringify(parsed.thinkingMetadata.triggers) : undefined,
+          isAnswer: answerText ? true : undefined,
           toolCalls: []
         };
       } else if (parsed.message.role === 'assistant' && currentExchange) {
@@ -205,8 +245,14 @@ export async function parseConversation(
     }
   }
 
+  if (failure.error) throw failure.error;
+
   // Finalize last exchange
   finalizeExchange();
+
+  if (sessionEntrypoint) {
+    for (const exchange of exchanges) exchange.entrypoint = sessionEntrypoint;
+  }
 
   return exchanges;
 }

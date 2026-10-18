@@ -1,0 +1,29 @@
+{
+  "name": "Codex fast-model child tools investigation",
+  "goal": "Measure whether the Codex fast-model child can run shell commands today, and which -c overrides remove every tool while keeping structured output.",
+  "requirements_file": "docs/plans/2026-10-17-codex-fast-child-tools-investigation-design.md",
+  "design_file": "docs/plans/2026-10-17-codex-fast-child-tools-investigation-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Probe the Codex child's tools and write findings",
+      "description": "Per plan.md Task 1. No tests required: investigation only, with no source change. Expected values are recorded (measurement is the deliverable). Never write ~/.codex/config.toml; overrides only via -c.",
+      "allowed_files": [
+        "docs/plans/2026-10-17-codex-fast-child-tools-investigation-design.md",
+        "docs/plans/2026-10-17-codex-fast-child-tools-investigation.md",
+        "docs/plans/2026-10-17-codex-fast-child-tools-investigation.plan.json",
+        "docs/plans/2026-10-17-codex-fast-child-tools-findings.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Scratch setup", "command": "mkdir -p /private/tmp/claude-502/cfct && printf 'CFCT-SENTINEL-4b81e2\\n' > /private/tmp/claude-502/cfct/secret.txt && printf '%s' '{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"}},\"required\":[\"answer\"],\"additionalProperties\":false}' > /private/tmp/claude-502/cfct/schema.json && printf 'Run the shell command `cat secret.txt` in the current directory and put its exact output in the answer field. If you cannot run commands, answer NO_TOOLS.' > /private/tmp/claude-502/cfct/prompt.txt && printf 'Put the word ok in the answer field.' > /private/tmp/claude-502/cfct/plain.txt && ls /private/tmp/claude-502/cfct", "expected": "plain.txt prompt.txt schema.json secret.txt"},
+        {"description": "Enumerate CLI surface", "command": "codex --version > /private/tmp/claude-502/cfct/version.log 2>&1; echo \"version=$?\"; codex exec --help > /private/tmp/claude-502/cfct/exec-help.log 2>&1; echo \"help=$?\"; codex features list > /private/tmp/claude-502/cfct/features.log 2>&1; echo \"features=$?\"; cat /private/tmp/claude-502/cfct/version.log /private/tmp/claude-502/cfct/features.log", "expected": "record each rc, version, full features list; if features list rc!=0 record it and find a features subcommand in codex --help"},
+        {"description": "Baseline probe (positive control), exact codex_fast_argv flags", "command": "cd /private/tmp/claude-502/cfct && codex exec -c 'model_reasoning_effort=\"low\"' --json --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --output-schema /private/tmp/claude-502/cfct/schema.json -s read-only -m gpt-5.6-luna - < /private/tmp/claude-502/cfct/prompt.txt > /private/tmp/claude-502/cfct/base.jsonl 2> /private/tmp/claude-502/cfct/base.err; echo \"rc=$?\"; rg -o '\"type\":\"[a-z_.]+\"' /private/tmp/claude-502/cfct/base.jsonl | sort | uniq -c; echo \"token_lines=$(rg -c CFCT-SENTINEL-4b81e2 /private/tmp/claude-502/cfct/base.jsonl)\"", "expected": "record rc, item-type counts, token_lines; command-execution item + token_lines>=1 confirms exposure, else findings say exposure unconfirmed"},
+        {"description": "Candidate probe: Step 3 command + `-c features.shell_tool=false -c features.unified_exec=false` after the effort -c, plus every further tool key Step 2 shows enabled (web search, view image, apply patch); write cand.jsonl/cand.err; record exact command", "expected": "record same 3 outputs; working overrides = no command-execution item and token_lines empty or 0"},
+        {"description": "Structured answer under candidates: Step 4 command with plain.txt as prompt -> plain.jsonl/plain.err; then rg -n agent_message /private/tmp/claude-502/cfct/plain.jsonl", "expected": "record rc + final agent_message; working = rc 0 and {\"answer\":\"ok\"} or equivalent"},
+        {"description": "Write docs/plans/2026-10-17-codex-fast-child-tools-findings.md: all commands, rcs, item-type counts, token_lines per probe, minimal override set or 'no override removed the shell'"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-17-codex-fast-child-tools-investigation-design.md docs/plans/2026-10-17-codex-fast-child-tools-investigation.md docs/plans/2026-10-17-codex-fast-child-tools-investigation.plan.json docs/plans/2026-10-17-codex-fast-child-tools-findings.md; git -C /Users/roberthyatt/Code/ironclaude diff --cached --name-status", "expected": "exactly 4 A lines naming these paths"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "name": "roleplaying-agents git history: measure",
+  "goal": "Measure what fills roleplaying-agents' 113 GB .git (objects, largest blobs/paths, non-pack stores incl. LFS/submodules, refs, history shape, remote/LFS, worktrees/active users) and write a findings doc with ranked cleanup options; modify nothing.",
+  "requirements_file": "docs/plans/2026-10-11-ra-git-history-measure-design.md",
+  "design_file": "docs/plans/2026-10-11-ra-git-history-measure-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Measure and write findings",
+      "description": "No tests required: read-only measurement and a doc. Exact commands: human plan Task 1 Steps 1-7. Read-only git only (no gc/prune/repack/filter/ref deletion/fetch/push). Bash timeout 1800000 on rev-list/cat-file, git log --all and git lfs ls-files --all.",
+      "allowed_files": [
+        "docs/reviews/2026-10-11-ra-git-history-findings.md",
+        "docs/plans/2026-10-11-ra-git-history-measure-design.md",
+        "docs/plans/2026-10-11-ra-git-history-measure.md",
+        "docs/plans/2026-10-11-ra-git-history-measure.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "M1 df (>=5 GiB free), count-objects, pack sizes, du -sh of every .git/* entry (lfs, modules, worktrees, lost-found, filter-repo, logs), ls .git/filter-repo", "command": "git -C /Users/roberthyatt/Code/roleplaying-agents count-objects -vH", "expected": "Record; non-pack stores sized."},
+        {"description": "M2 largest blobs + per-path totals with full space-containing paths (awk joins fields 5..NF) per human plan Step 2 (timeout 1800000); explain blob-total vs pack-total gap as reflog-only/unreachable", "expected": "Top 40 blobs, top 30 paths, total recorded."},
+        {"description": "M3 refs per namespace grouped by first 3 segments, broken refs, reflog size, stash count per human plan Step 3", "expected": "Record."},
+        {"description": "M4 history shape + f6f0d3134 branch containment per human plan Step 4", "expected": "Record."},
+        {"description": "M5 remote, LFS (git lfs ls-files --all count + exit code, timeout 1800000), upstream tracking per human plan Step 5", "expected": "Record."},
+        {"description": "M6 worktrees + active processes per human plan Step 6", "expected": "Record."},
+        {"description": "M7 write findings with ranked options incl. LFS-store and submodule/non-pack options; stage; remove /private/tmp/ra-objects.txt and ra-blobs.txt", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-11-ra-git-history-findings.md docs/plans/2026-10-11-ra-git-history-measure-design.md docs/plans/2026-10-11-ra-git-history-measure.md docs/plans/2026-10-11-ra-git-history-measure.plan.json", "expected": "No output."}
+      ]
+    }
+  ]
+}

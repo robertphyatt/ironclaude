@@ -3,7 +3,266 @@ import sqlite3
 import pytest
 
 from ironclaude.db import init_db
-from ironclaude.provider_state import ProviderState
+from ironclaude.provider_state import ProviderState, WORKER_USAGE_ACCOUNT_TIER
+
+
+def test_native_usage_quarantine_expires_at_reset_time_and_requarantines(tmp_path):
+    state = ProviderState(init_db(str(tmp_path / "state.db")))
+    account = ("local", "claude", "worker", WORKER_USAGE_ACCOUNT_TIER)
+    worker = ("local", "claude", "worker", "opus")
+    state.mark_unavailable(*account, "usage", "native_usage_exhausted", usage_generation="g:f:1",
+                           usage_cursor=10, usage_event_key="e1",
+                           usage_event_timestamp="2026-10-06T12:00:00Z", usage_expires_at=1_000.0)
+    assert not state.is_available(*worker, now=999.0)
+    assert state.is_available(*worker, now=1_000.0)
+    state.mark_unavailable(*account, "usage", "native_usage_exhausted", usage_generation="g:f:2",
+                           usage_cursor=20, usage_event_key="e2",
+                           usage_event_timestamp="2026-10-06T13:00:00Z", usage_expires_at=5_000.0)
+    assert not state.is_available(*worker, now=1_001.0)
+    state.mark_unavailable(*account, "usage", "native_usage_exhausted", usage_generation="g:f:0",
+                           usage_cursor=5, usage_event_key="e0",
+                           usage_event_timestamp="2026-10-06T11:00:00Z", usage_expires_at=99_999.0)
+    assert state.is_available(*worker, now=5_000.0)
+
+
+def test_usage_quarantine_without_reset_uses_default(tmp_path, monkeypatch):
+    import ironclaude.provider_state as provider_state_module
+    monkeypatch.setattr(provider_state_module.time, "time", lambda: 10_000.0)
+    state = ProviderState(init_db(str(tmp_path / "state.db")))
+    account = ("local", "codex", "worker", WORKER_USAGE_ACCOUNT_TIER)
+    state.mark_unavailable(*account, "usage", "native_usage_exhausted", usage_generation="g:f:1",
+                           usage_cursor=10, usage_event_key="e1",
+                           usage_event_timestamp="2026-10-06T12:00:00Z")
+    assert not state.is_available("local", "codex", "worker", "opus", now=10_000.0 + 17_999)
+    assert state.is_available("local", "codex", "worker", "opus", now=10_000.0 + 18_000)
+
+
+def test_legacy_usage_row_without_expiry_expires_after_default(tmp_path):
+    state = ProviderState(init_db(str(tmp_path / "state.db")))
+    state._conn.execute(
+        "INSERT INTO provider_capability_state (host, client, role, tier, available, category, reason, updated_at) "
+        "VALUES ('local', 'claude', 'worker', ?, 0, 'usage', 'legacy quota', '2000-01-01 00:00:00')",
+        (WORKER_USAGE_ACCOUNT_TIER,))
+    state._conn.commit()
+    assert state.is_available("local", "claude", "worker", "opus")
+    state._conn.execute("UPDATE provider_capability_state SET updated_at=datetime('now')")
+    state._conn.commit()
+    assert not state.is_available("local", "claude", "worker", "opus")
+
+
+def test_expiry_never_reopens_non_usage_unavailability(tmp_path):
+    state = ProviderState(init_db(str(tmp_path / "state.db")))
+    state.mark_unavailable("local", "claude", "worker", "opus", "auth", "probe failed")
+    assert not state.is_available("local", "claude", "worker", "opus", now=10**12)
+
+
+def test_usage_quarantine_survives_failed_probe_and_auth_success(tmp_path):
+    state = ProviderState(init_db(str(tmp_path / "state.db")))
+    state.mark_unavailable("local", "claude", "worker", "opus", "usage", "native quota")
+    state.record_capability("local", "claude", "worker", "opus", configured=True, supported=True, installed=True, authenticated=False, available=False, reason="probe_timeout")
+    state.record_capability("local", "claude", "worker", "opus", configured=True, supported=True, installed=True, authenticated=True, available=True, reason=None)
+    assert state.unavailable_reason("local", "claude", "worker", "opus") == {"category": "usage", "reason": "native quota"}
+
+
+def test_usage_quarantine_requires_newer_native_recovery_or_operator(tmp_path):
+    state = ProviderState(init_db(str(tmp_path / "state.db")))
+    key = ("local", "claude", "worker", "opus")
+    state.mark_unavailable(*key, "usage", "native quota", usage_generation="session-1", usage_cursor=10, usage_event_key="event-10")
+    state.mark_unavailable(*key, "auth", "probe failed")
+    state.mark_available(*key)
+    assert state.unavailable_reason(*key) == {"category": "usage", "reason": "native quota"}
+    assert not state.recover_usage_quarantine(*key, native_generation="session-1", native_cursor=10, native_event_key="event-10", native_state="available")
+    assert not state.recover_usage_quarantine(*key, native_generation="session-2", native_cursor=11, native_event_key="event-11", native_state="available")
+    assert state.recover_usage_quarantine(*key, native_generation="session-1", native_cursor=11, native_event_key="event-11", native_state="available")
+    assert state.is_available(*key)
+
+
+def test_cross_generation_recovery_persists_watermark_and_rejects_late_quota(tmp_path):
+    db_path = str(tmp_path / "state.db")
+    key = ("local", "claude", "worker", "opus")
+    state = ProviderState(init_db(db_path))
+    state.mark_unavailable(
+        *key, "usage", "quota at T2", usage_generation="native-old",
+        usage_cursor=10, usage_event_key="quota-T2",
+        usage_event_timestamp="2026-10-06T12:00:02Z",
+    )
+    state._conn.close()
+
+    state = ProviderState(init_db(db_path))
+    assert state.recover_usage_quarantine(
+        *key, native_generation="native-fresh", native_cursor=1,
+        native_event_key="success-T3", native_state="available",
+        native_event_timestamp="2026-10-06T12:00:03+00:00",
+    )
+    state.mark_unavailable(
+        *key, "usage", "late quota at T1", usage_generation="native-late",
+        usage_cursor=1, usage_event_key="quota-T1",
+        usage_event_timestamp="2026-10-06T12:00:01Z",
+    )
+    assert state.unavailable_reason(*key) is None
+    state.mark_unavailable(
+        *key, "usage", "quota at T4", usage_generation="native-new",
+        usage_cursor=1, usage_event_key="quota-T4",
+        usage_event_timestamp="2026-10-06T12:00:04Z",
+    )
+    assert state.unavailable_reason(*key) == {"category": "usage", "reason": "quota at T4"}
+
+
+def test_healthy_native_success_persists_watermark_before_any_quarantine(tmp_path):
+    db_path = str(tmp_path / "state.db")
+    first = ProviderState(init_db(db_path))
+    key = ("local", "claude", "worker", first.worker_usage_scope_tier("worker", "opus"))
+    assert not first.recover_usage_quarantine(
+        *key, native_generation="native-success", native_cursor=1,
+        native_event_key="success-T3", native_state="available",
+        native_event_timestamp="2026-10-06T12:00:03Z",
+    )
+    first._conn.close()
+
+    second = ProviderState(init_db(db_path))
+    second.mark_unavailable(
+        *key, "usage", "late quota at T2", usage_generation="native-late",
+        usage_cursor=1, usage_event_key="quota-T2",
+        usage_event_timestamp="2026-10-06T12:00:02Z",
+    )
+    assert second.unavailable_reason(*key) is None
+    assert second.is_available("local", "claude", "worker", "fable")
+    second.mark_unavailable(
+        *key, "usage", "fresh quota at T4", usage_generation="native-new",
+        usage_cursor=1, usage_event_key="quota-T4",
+        usage_event_timestamp="2026-10-06T12:00:04Z",
+    )
+    assert second.unavailable_reason(*key) == {"category": "usage", "reason": "fresh quota at T4"}
+    assert not second.is_available("local", "claude", "worker", "fable")
+
+
+def test_native_success_watermark_preserves_nonusage_unavailability(tmp_path):
+    state = ProviderState(init_db(str(tmp_path / "state.db")))
+    key = ("local", "claude", "worker", "opus")
+    state.mark_unavailable(*key, "auth", "login required")
+
+    assert not state.recover_usage_quarantine(
+        *key, native_generation="native-success", native_cursor=1,
+        native_event_key="success-T3", native_state="available",
+        native_event_timestamp="2026-10-06T12:00:03Z",
+    )
+
+    assert state.unavailable_reason(*key) == {"category": "auth", "reason": "login required"}
+    assert state._conn.execute(
+        "SELECT usage_event_timestamp FROM provider_capability_state "
+        "WHERE host=? AND client=? AND role=? AND tier=?", key,
+    ).fetchone()[0] == "2026-10-06T12:00:03+00:00"
+
+
+def test_worker_usage_account_scope_blocks_tier_fallback_and_requires_fresh_native_recovery(tmp_path):
+    state = ProviderState(init_db(str(tmp_path / "state.db")))
+    account_tier = state.worker_usage_scope_tier("worker", "fable")
+    state.mark_unavailable(
+        "host-a", "claude", "worker", account_tier, "usage", "account quota",
+        usage_generation="native-old", usage_cursor=10, usage_event_key="quota-T2",
+        usage_event_timestamp="2026-10-06T12:00:02Z",
+    )
+    assert not state.is_available("host-a", "claude", "worker", "fable")
+    assert not state.is_available("host-a", "claude", "worker", "opus")
+    assert state.is_available("host-a", "codex", "worker", "opus")
+    assert state.is_available("host-b", "claude", "worker", "opus")
+    assert state.is_available("host-a", "claude", "brain", "opus")
+    state.record_capability(
+        "host-a", "claude", "worker", "opus", configured=True, supported=True,
+        installed=True, authenticated=True, available=True, reason=None,
+    )
+    assert not state.is_available("host-a", "claude", "worker", "opus")
+    recovery = dict(native_generation="native-fresh", native_cursor=1,
+                    native_event_key="success-T3", native_state="available")
+    assert not state.recover_usage_quarantine(
+        "host-a", "claude", "worker", account_tier, **recovery,
+        native_event_timestamp="2026-10-06T12:00:02Z",
+    )
+    assert not state.recover_usage_quarantine(
+        "host-a", "claude", "worker", account_tier, **recovery,
+    )
+    assert state.recover_usage_quarantine(
+        "host-a", "claude", "worker", account_tier, **recovery,
+        native_event_timestamp="2026-10-06T12:00:03Z",
+    )
+    assert state.is_available("host-a", "claude", "worker", "fable")
+    assert state.is_available("host-a", "claude", "worker", "opus")
+
+
+def test_worker_usage_account_same_generation_rejects_older_timestamp(tmp_path):
+    state = ProviderState(init_db(str(tmp_path / "state.db")))
+    account_tier = state.worker_usage_scope_tier("worker", "opus")
+    state.mark_unavailable(
+        "local", "claude", "worker", account_tier, "usage", "account quota",
+        usage_generation="native-1", usage_cursor=10, usage_event_key="quota-T2",
+        usage_event_timestamp="2026-10-06T12:00:02Z",
+    )
+    assert not state.recover_usage_quarantine(
+        "local", "claude", "worker", account_tier, native_generation="native-1",
+        native_cursor=11, native_event_key="success-missing", native_state="available",
+    )
+    assert not state.recover_usage_quarantine(
+        "local", "claude", "worker", account_tier, native_generation="native-1",
+        native_cursor=11, native_event_key="success-T1", native_state="available",
+        native_event_timestamp="2026-10-06T12:00:01Z",
+    )
+    assert state.recover_usage_quarantine(
+        "local", "claude", "worker", account_tier, native_generation="native-1",
+        native_cursor=11, native_event_key="success-T2", native_state="available",
+        native_event_timestamp="2026-10-06T12:00:02Z",
+    )
+
+
+def test_operator_recovery_can_clear_worker_usage_account_scope(tmp_path):
+    state = ProviderState(init_db(str(tmp_path / "state.db")))
+    account_tier = state.worker_usage_scope_tier("worker", "opus")
+    state.mark_unavailable(
+        "local", "claude", "worker", account_tier, "usage", "account quota",
+        usage_generation="native-1", usage_cursor=1, usage_event_key="quota",
+        usage_event_timestamp="2026-10-06T12:00:02Z",
+    )
+    assert state.recover_usage_quarantine(
+        "local", "claude", "worker", account_tier, operator_authorized=True
+    )
+    assert state.is_available("local", "claude", "worker", "fable")
+
+
+def test_cross_generation_recovery_requires_strict_timestamp_and_exact_scope(tmp_path):
+    state = ProviderState(init_db(str(tmp_path / "state.db")))
+    key = ("local", "claude", "worker", "opus")
+    state.mark_unavailable(
+        *key, "usage", "quota", usage_generation="native-old", usage_cursor=1,
+        usage_event_key="quota", usage_event_timestamp="2026-10-06T12:00:02Z",
+    )
+    common = dict(native_generation="native-new", native_cursor=1,
+                  native_event_key="success", native_state="available")
+    assert not state.recover_usage_quarantine(
+        *key, **common, native_event_timestamp="2026-10-06T12:00:02Z"
+    )
+    assert not state.recover_usage_quarantine(*key, **common)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        state.recover_usage_quarantine(*key, **common, native_event_timestamp="not-a-timestamp")
+    assert not state.recover_usage_quarantine(
+        "other-host", "claude", "worker", "opus", **common,
+        native_event_timestamp="2026-10-06T12:00:03Z",
+    )
+    assert state.unavailable_reason(*key) == {"category": "usage", "reason": "quota"}
+
+
+def test_init_db_migrates_usage_event_timestamp(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """CREATE TABLE provider_capability_state (
+            host TEXT NOT NULL, client TEXT NOT NULL, role TEXT NOT NULL, tier TEXT NOT NULL,
+            PRIMARY KEY (host, client, role, tier))"""
+    )
+    conn.commit()
+    conn.close()
+
+    migrated = init_db(str(db_path))
+    columns = {row[1] for row in migrated.execute("PRAGMA table_info(provider_capability_state)")}
+    assert "usage_event_timestamp" in columns
 
 
 def make_state(tmp_path):

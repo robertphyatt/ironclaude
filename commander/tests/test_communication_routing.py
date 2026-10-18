@@ -1,6 +1,6 @@
 """Task 3 integration coverage for communication-profile routing."""
 import inspect
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -166,6 +166,101 @@ def test_worker_profile_rejects_stale_marker_from_before_dispatch(tmp_path, monk
         "ic-w", "claude",
     )
     tmux.read_log_tail.assert_not_called()
+
+
+_CODEX_INVOCATION = "$ironclaude:write-lossless-ai-messages"
+_CODEX_PICKER_SCREEN = (
+    "› write-lossless-ai-message...  [Skill] Make AI-to-AI messages efficient\n\n"
+    "  enter insert · esc close\n\n"
+    f"› {_CODEX_INVOCATION}\n\n"
+    "  GPT-5.6-Terra high · /repo\n"
+)
+_CODEX_UNSUBMITTED_SCREEN = (
+    ">_ OpenAI Codex (v0.162.0-alpha.17.2)\n\n"
+    f"› {_CODEX_INVOCATION}\n\n"
+    "  GPT-5.6-Terra high · /repo\n"
+)
+# After submission the mention stays in the transcript; the composer is empty.
+_CODEX_SUBMITTED_SCREEN = (
+    f"› {_CODEX_INVOCATION}\n\n"
+    f"• {PROFILE_READY_MARKER}\n\n"
+    "  Worked for 6s\n\n"
+    "› Ask Codex to do anything\n\n"
+    "  GPT-5.6-Terra high · /repo · Write lossless AI messages\n"
+)
+_CODEX_FOLDER_ACCESS_SCREEN = (
+    "  Folder access\n  /repo\n\n"
+    "  Trust this folder? Codex can read, edit, and run files here.\n\n"
+    "› 1. Trust and continue\n  2. Quit\n\n  enter continue · esc quit\n"
+)
+
+
+def _profile_tmux(screens):
+    tmux = MagicMock()
+    tmux.get_log_size.return_value = 17
+    tmux.send_keys.return_value = True
+    tmux.send_raw_keys.return_value = True
+    tmux.capture_pane.side_effect = list(screens)
+    tmux.read_log_since.return_value = f"new output\n{PROFILE_READY_MARKER}\n"
+    return tmux
+
+
+def _no_wait(monkeypatch):
+    clock = iter((0, 1))
+    monkeypatch.setattr(orchestrator_module.time, "time", lambda: next(clock))
+    monkeypatch.setattr(orchestrator_module.time, "sleep", lambda _: None)
+
+
+@pytest.mark.parametrize(
+    "screen",
+    [_CODEX_PICKER_SCREEN, _CODEX_UNSUBMITTED_SCREEN],
+    ids=["picker", "mention"],
+)
+def test_codex_profile_sends_second_enter_while_unsubmitted(
+    tmp_path, monkeypatch, screen,
+):
+    tmux = _profile_tmux(["", screen])
+    tools = _tools(tmp_path, tmux)
+    _no_wait(monkeypatch)
+
+    assert tools._dispatch_worker_communication_profile("ic-w", "codex") is None
+    tmux.send_keys.assert_called_once_with("ic-w", _CODEX_INVOCATION, ssh_host=None)
+    tmux.send_raw_keys.assert_called_once_with("ic-w", ["Enter"], ssh_host=None)
+
+
+def test_codex_profile_skips_second_enter_once_submitted(tmp_path, monkeypatch):
+    tmux = _profile_tmux(["", _CODEX_SUBMITTED_SCREEN])
+    tools = _tools(tmp_path, tmux)
+    _no_wait(monkeypatch)
+
+    assert tools._dispatch_worker_communication_profile("ic-w", "codex") is None
+    tmux.send_raw_keys.assert_not_called()
+
+
+def test_claude_profile_keeps_single_enter(tmp_path, monkeypatch):
+    tmux = _profile_tmux([])
+    tools = _tools(tmp_path, tmux)
+    _no_wait(monkeypatch)
+
+    assert tools._dispatch_worker_communication_profile("ic-w", "claude") is None
+    tmux.send_keys.assert_called_once_with(
+        "ic-w", "/write-lossless-ai-messages", ssh_host=None,
+    )
+    tmux.capture_pane.assert_not_called()
+    tmux.send_raw_keys.assert_not_called()
+
+
+def test_codex_profile_answers_folder_access_before_invocation(tmp_path, monkeypatch):
+    tmux = _profile_tmux([_CODEX_FOLDER_ACCESS_SCREEN, _CODEX_SUBMITTED_SCREEN])
+    tools = _tools(tmp_path, tmux)
+    _no_wait(monkeypatch)
+
+    assert tools._dispatch_worker_communication_profile("ic-w", "codex") is None
+    assert tmux.send_keys.call_args_list == [
+        call("ic-w", "", ssh_host=None),
+        call("ic-w", _CODEX_INVOCATION, ssh_host=None),
+    ]
+    tmux.send_raw_keys.assert_not_called()
 
 
 def test_profile_load_failure_returns_before_objective_delivery(tmp_path, monkeypatch):

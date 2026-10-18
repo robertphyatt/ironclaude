@@ -3,6 +3,7 @@
 # arm and the _resolve_spot() pure helper against the shared resolution-cases.json
 # fixture. Mirrors test-config-guard.sh assert_eq style. Do NOT set -e.
 PASS=0; FAIL=0
+export IRONCLAUDE_LOCAL_BACKOFF_DIR=/dev/null  # local-box backoff off (not a directory): each call tests its own chain; nothing touches the real ~/.ironclaude
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # shellcheck disable=SC1090

@@ -1,0 +1,28 @@
+{
+  "name": "Codex strict schema for the fast model",
+  "goal": "Codex Luna/Terra fast-model children accept every Commander schema: the Codex arm sends a strict copy (every object node closed, every property required, formerly optional properties nullable), and answers are restored to the original shape.",
+  "requirements_file": "docs/plans/2026-10-17-codex-strict-schema-fast-model-design.md",
+  "design_file": "docs/plans/2026-10-17-codex-strict-schema-fast-model-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Strict Codex schema in call_fast_model",
+      "description": "TDD per plan.md Task 1 Steps 1-7: tests (RED), strict_codex_schema + _nullable + Codex-arm use + post-parse None strip (GREEN), real Luna probe, full Commander suite, findings, stage.",
+      "allowed_files": [
+        "commander/src/ironclaude/fast_model.py",
+        "commander/tests/test_fast_model.py",
+        "docs/plans/2026-10-17-codex-strict-schema-fast-model-findings.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Append the plan.md Step 1 test block (STRICT_IN, STRICT_OUT, seven tests) to commander/tests/test_fast_model.py; run RED.", "command": "mkdir -p /private/tmp/claude-502/csfm && cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_fast_model.py -q > /private/tmp/claude-502/csfm/red.log 2>&1; echo \"red=$?\"; grep -E \"^(FAILED|ERROR)\" /private/tmp/claude-502/csfm/red.log; tail -n 3 /private/tmp/claude-502/csfm/red.log", "expected": "red=1; AttributeError: the three strict_codex_schema tests; AssertionError: test_codex_child_gets_strict_schema_and_claude_child_the_original, test_codex_answer_drops_null_optional_keys_only; passing: test_codex_answer_keeps_null_for_a_required_key, test_claude_answer_is_returned_unchanged_positive_control"},
+        {"description": "fast_model.py: add _nullable and strict_codex_schema after codex_fast_argv (plan.md Step 2 item 1, verbatim); Codex arm uses strict_codex_schema(schema) (item 2); after the `if out is None` block add the codex-only None strip for keys outside the original required (item 3); update the CODEX_SCHEMA_STRICT comment (item 4)."},
+        {"description": "GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_fast_model.py tests/test_fast_model_chain.py -q > /private/tmp/claude-502/csfm/green.log 2>&1; echo \"green=$?\"; grep -E \"^(FAILED|ERROR)\" /private/tmp/claude-502/csfm/green.log; tail -n 3 /private/tmp/claude-502/csfm/green.log", "expected": "green=0, 0 failed"},
+        {"description": "Real Luna probe (R5): the plan.md Step 4 command verbatim, log /private/tmp/claude-502/csfm/probe.log.", "expected": "probe=0; the _BRAIN_MSG_SCHEMA, _AWAITING_OP_SCHEMA and _PROMPT_WAITING_SCHEMA lines each read OK; no INFRA_ERROR"},
+        {"description": "Full Commander suite", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/ -q > /private/tmp/claude-502/csfm/suite.log 2>&1; echo \"suite=$?\"; grep -E \"^(FAILED|ERROR)\" /private/tmp/claude-502/csfm/suite.log; tail -n 3 /private/tmp/claude-502/csfm/suite.log", "expected": "suite=0, 0 failed, no FAILED/ERROR lines"},
+        {"description": "Write docs/plans/2026-10-17-codex-strict-schema-fast-model-findings.md: reproduction + positive control (design Evidence), RED list, GREEN/suite summary lines, probe log, and the operator-carried non-goals (_GRADER_VERDICT_SCHEMA/_call_grader Codex arm, Advisor Fallback Astra parity, remaining end-review observations)."},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/fast_model.py commander/tests/test_fast_model.py; git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-17-codex-strict-schema-fast-model-findings.md docs/plans/2026-10-17-codex-strict-schema-fast-model-design.md docs/plans/2026-10-17-codex-strict-schema-fast-model.md docs/plans/2026-10-17-codex-strict-schema-fast-model.plan.json", "expected": "no output"}
+      ]
+    }
+  ]
+}

@@ -17,8 +17,10 @@ import subprocess
 import sys
 import queue
 import re
+import shlex
 import threading
 import time
+import uuid
 from glob import glob
 from pathlib import Path
 from typing import Callable, Optional
@@ -188,6 +190,13 @@ class BrainClient:
     # Git subcommands allowed via Bash (read + staging/commit operations)
     GIT_ALLOWED_COMMANDS = {"log", "diff", "show", "status", "ls-files", "blame", "branch", "add", "commit"}
 
+    # git branch flags that delete, rename, copy or force. With any of them, or with an argument that
+    # is not a flag (a branch name), git branch changes branches, so only listing forms pass (design
+    # 2026-10-18 v120-security-fixes 1c). codex_brain_client._GIT_BRANCH_CHANGE_FLAGS is the same set.
+    GIT_BRANCH_CHANGE_FLAGS = frozenset(
+        {"-d", "-D", "-m", "-M", "-c", "-C", "-f", "--delete", "--move", "--copy", "--force"}
+    )
+
     MAX_PERMISSION_CORRECTIONS = 3
     PERMISSION_CORRECTION_WINDOW = 600  # seconds (10 minutes)
     COMPACTION_DEADLINE = 1800  # seconds — max time compaction-resume may run before force-restart
@@ -277,6 +286,7 @@ class BrainClient:
         self._wiki_queried: bool = False
         self._lookback_slack: bool = False
         self._lookback_ledger: bool = False
+        self._brain_gate_session = uuid.uuid4().hex
         self._system_prompt: str = ""
         self._cwd: str | None = None
         self._episodic_memory_path: str | None = None
@@ -317,14 +327,24 @@ class BrainClient:
         self._expected_kill = False
         self._lookback_slack = False
         self._lookback_ledger = False
-        for f in glob("/tmp/ic/lookback-slack-*") + glob("/tmp/ic/lookback-ledger-*"):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
         self._system_prompt = system_prompt
         self._cwd = cwd
         os.environ["IC_ROLE"] = "brain"
+        os.environ["IRONCLAUDE_BRAIN_GATE_SESSION"] = self._brain_gate_session
+        # Design 2026-10-17 v120-completeness R3: one gate root for both Brains and both hooks.
+        gate_root = paths.brain_gate_root()
+        os.environ["IRONCLAUDE_BRAIN_GATE_ROOT"] = str(gate_root)
+        try:
+            paths.ensure_brain_gate_root()
+        except OSError as exc:
+            logger.warning("Brain gate root %s could not be prepared: %s", gate_root, exc)
+        for marker in ("lookback-slack", "lookback-ledger"):
+            try:
+                (gate_root / self._brain_gate_session / marker).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning("Failed to reset Brain gate marker %s: %s", marker, exc)
         # Resolve episodic memory MCP server path (fail hard if not found)
         self._episodic_memory_path = self.discover_episodic_memory_path()
         # Resolve orchestrator MCP server path (optional — may not be installed yet)
@@ -422,6 +442,12 @@ class BrainClient:
             _SHELL_METACHARACTERS = (";", "|", "&", "&&", "||", "$(", "`", "\n", "\r", ">", "<", "$")
             if any(c in cmd for c in _SHELL_METACHARACTERS):
                 return (False, "Shell metacharacters are not allowed in git commands.")
+            # The shell expands these after the check approves the command (design 2026-10-18
+            # v120-security-fixes-remediation); @{u} and HEAD@{1} do not expand and stay allowed.
+            if re.search(r"\{[^{}]*(?:,|\.\.)[^{}]*\}", cmd):
+                return (False, "Shell brace expansion is not allowed in git commands.")
+            if any(c in cmd for c in ("*", "?", "[")):
+                return (False, "Glob characters are not allowed in git commands.")
             if "-c " in cmd:
                 return (False, "git -c flag is not allowed in git commands.")
             if not cmd.startswith("git "):
@@ -431,8 +457,26 @@ class BrainClient:
             subcommand = parts[1] if len(parts) > 1 else ""
             if subcommand not in self.GIT_ALLOWED_COMMANDS:
                 return (False, f"Only allowed git commands permitted: {', '.join(sorted(self.GIT_ALLOWED_COMMANDS))}")
-            # Block git commit --amend (prevents rewriting previous commits)
-            if subcommand == "commit" and "--amend" in cmd:
+            # Parse the arguments the way the shell passes them to git, so a quoted or
+            # backslash-escaped option ("--output=x", --\output=x, --am""end) is seen as git sees it.
+            try:
+                args = shlex.split(cmd)[2:]
+            except ValueError:
+                return (False, "Unbalanced quotes are not allowed in git commands.")
+            # --output=<file> / --output <file> writes a file (design 2026-10-18 v120-security-fixes 1b)
+            if any(arg == "--output" or arg.startswith("--output=") for arg in args):
+                return (False, "git --output writes a file and is not allowed for the Brain.")
+            # git branch: listing forms only, the brain-orchestrator-guard.sh rule (1c)
+            if subcommand == "branch" and any(
+                not arg.startswith("-") or arg in self.GIT_BRANCH_CHANGE_FLAGS for arg in args
+            ):
+                return (False, "git branch changes are not allowed for the Brain. Only listing is permitted.")
+            # Block git commit --amend (prevents rewriting previous commits); the substring check
+            # stays, and the parsed-args check also catches quoted forms such as --am""end.
+            if subcommand == "commit" and (
+                "--amend" in cmd
+                or any(arg == "--amend" or arg.startswith("--amend=") for arg in args)
+            ):
                 return (False, "git commit --amend is not allowed. Create new commits only.")
             return (True, None)
 

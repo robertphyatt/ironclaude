@@ -9,7 +9,7 @@
  * all growth automatically. This command is for historical backfill only.
  */
 
-import fs from 'fs';
+import { archiveExists, readArchiveText } from './archive-io.js';
 import { initDatabase, insertExchange } from './db.js';
 import { parseConversation } from './parser.js';
 import { initEmbeddings, generateExchangeEmbedding } from './embeddings.js';
@@ -58,12 +58,12 @@ async function repair(): Promise<void> {
     const { archive_path, max_line } = row;
     filesChecked++;
 
-    if (!fs.existsSync(archive_path)) {
+    if (!archiveExists(archive_path)) {
       console.warn(`  Skipping missing file: ${archive_path}`);
       continue;
     }
 
-    const content = fs.readFileSync(archive_path, 'utf-8');
+    const content = readArchiveText(archive_path);
     const currentLines = content.split('\n').length;
 
     if (max_line >= currentLines) {

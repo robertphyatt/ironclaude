@@ -17,7 +17,9 @@ from ironclaude.communication_profiles import (
     apply_communication_profile,
 )
 from ironclaude.backend_resolver import make_client, resolve_backend
-from ironclaude.ollama_client import OllamaClient, OllamaError
+from ironclaude import fast_model
+from ironclaude import local_backoff
+from ironclaude.ollama_client import OllamaClient, OllamaError, OllamaTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +56,10 @@ class LocalGrader:
     """
 
     def __init__(self, config_path: str | None = None, timeout: int | None = None,
-                 keep_alive: str | None = None) -> None:
+                 keep_alive: str | None = None, commander_config=None) -> None:
         self._config_path = config_path or paths.hooks_config()
+        self._commander_config = commander_config
+        self._full_cfg: dict = {}
         self._client: OllamaClient | None = None
         self._cfg: dict = {}
         self._timeout_override = timeout
@@ -107,8 +111,13 @@ class LocalGrader:
         Pure — does not touch `self`, so it is safe to share between the normal
         (cached self._client) and fast (per-call read_timeout) paths.
         """
+        if resolved.backend == "haiku":
+            return None, "haiku", None, None, cfg
+        # One skip rule (design 2026-10-17 v120-completeness R4c amendment 2026-10-18): the shared
+        # local-box marker is the only skip decision, so both clients bypass the transport breaker's
+        # allow() gate. They still record every outcome for the heartbeat and the other callers.
         if resolved.backend == "openai":
-            client = make_client(resolved, timeout=timeout)
+            client = make_client(resolved, timeout=timeout, use_breaker=False)
             return client, "openai", resolved.model, resolved.max_tokens, cfg.get("openai", {})
         # Ollama path — construct OllamaClient directly (by name) so the
         # existing test seams that patch `grader.OllamaClient` stay intact.
@@ -119,6 +128,7 @@ class LocalGrader:
             timeout=timeout,
             connect_timeout=(resolved.connect_timeout or 3),
             probe_timeout=(resolved.probe_timeout or 3),
+            use_breaker=False,
         )
         return client, "ollama", None, None, ollama_cfg
 
@@ -131,6 +141,7 @@ class LocalGrader:
         # changed. A deleted config keeps the last client (no per-call rebuild spam).
         if self._client is None or (mtime is not None and mtime != self._client_mtime):
             cfg = self._read_config()
+            self._full_cfg = cfg
             resolved, self._spot_model, self._spot_thinking = self._resolve_for_grader(cfg)
             timeout = (
                 self._timeout_override if self._timeout_override is not None
@@ -158,6 +169,7 @@ class LocalGrader:
         key = (mtime, read_timeout)
         if self._fast_client is None or self._fast_client_key != key:
             cfg = self._read_config()
+            self._full_cfg = cfg
             resolved, spot_model, spot_thinking = self._resolve_for_grader(cfg)
             client, backend, openai_model, openai_max_tokens, eff_cfg = self._build_client(
                 cfg, resolved, read_timeout
@@ -174,6 +186,8 @@ class LocalGrader:
         schema: dict | None = None,
         *,
         read_timeout: float | None = None,
+        on_fast_model=None,
+        tier: str = "haiku",
     ) -> dict:
         """Grade content using a local Ollama model.
 
@@ -183,6 +197,16 @@ class LocalGrader:
         abandon a stalled call and have the daemon thread it left running end
         near that bound instead of the full (e.g. 600s) inference read timeout.
         Omitting it uses the normal cached client, unchanged.
+
+        `on_fast_model`, when given, is called with no arguments just before the
+        Haiku-class fast model is asked (backend "haiku", no usable local client,
+        or a local infrastructure_error), so a bounded caller can extend its wait.
+
+        `tier` is the call's model class (design T1/T2). "haiku" (default) is the
+        chain above. "sonnet" never uses the local box: no local client is built and
+        no local request is made; the Sonnet class is asked once under
+        `sonnet_model_timeout_seconds`, and its failure is returned as an
+        infrastructure_error with no further step-up.
 
         Returns parsed JSON dict on success, or
         {"infrastructure_error": True, "error_detail": "..."} on failure.
@@ -195,22 +219,68 @@ class LocalGrader:
         except CommunicationProfileError as exc:
             return self._build_infrastructure_error(str(exc))
 
+        if tier == "sonnet":
+            if on_fast_model is not None:
+                on_fast_model()
+            return fast_model.call_fast_model(
+                profiled_system_prompt, user_prompt, schema,
+                timeout=fast_model.sonnet_model_timeout(self._read_config()),
+                commander_config=self._commander_config, tier="sonnet")
+
         try:
             if read_timeout is None:
                 client = self._get_client()
-                backend = self._backend
-                openai_model = self._openai_model
-                openai_max_tokens = self._openai_max_tokens
-                cfg = self._cfg
-                spot_model = self._spot_model
-                spot_thinking = self._spot_thinking
+                state = (self._backend, self._openai_model, self._openai_max_tokens,
+                         self._cfg, self._spot_model, self._spot_thinking)
             else:
-                (
-                    client, backend, openai_model, openai_max_tokens, cfg,
-                    spot_model, spot_thinking,
-                ) = self._get_fast_client_state(read_timeout)
+                client, *state = self._get_fast_client_state(read_timeout)
         except OllamaError as e:
-            return self._build_infrastructure_error(str(e))
+            # No usable local client (e.g. backend "openai" with no base_url,
+            # openai_client.py:47-48). Nothing else is bound yet: go straight to the
+            # Haiku-class step, keeping this detail for the both-failed case.
+            return self._fast_model_step(profiled_system_prompt, user_prompt, schema,
+                                         read_timeout, on_fast_model, str(e))
+        backend, openai_model, openai_max_tokens, cfg, spot_model, spot_thinking = state
+        if backend == "haiku":
+            return self._fast_model_step(profiled_system_prompt, user_prompt, schema,
+                                         read_timeout, on_fast_model, None)
+        # Local-box backoff (design 2026-10-17 v120-completeness R4c): the same marker the hooks
+        # use. A backed-off box is not asked; a box failure renews the marker; a usable answer
+        # clears it. A read timeout under a per-call read_timeout shorter than the box's own read
+        # timeout is the caller's deadline, not a box failure: it writes no marker and clears none
+        # (R4c amendment).
+        endpoint = local_backoff.endpoint_for(backend, cfg)
+        minutes = local_backoff.backoff_minutes(self._full_cfg, backend)
+        if local_backoff.is_backed_off(endpoint, minutes):
+            return self._fast_model_step(
+                profiled_system_prompt, user_prompt, schema, read_timeout, on_fast_model,
+                f"local box {endpoint} backed off (local_backoff_minutes={minutes})")
+        local = self._grade_local(client, backend, openai_model, openai_max_tokens, cfg,
+                                  spot_model, spot_thinking, profiled_system_prompt,
+                                  user_prompt, schema)
+        if not local.get("infrastructure_error"):
+            local_backoff.record_success(endpoint)
+            return local
+        if not (local.get("read_timeout") and self._caller_deadline_shorter(read_timeout)):
+            local_backoff.record_failure(endpoint, minutes)
+        return self._fast_model_step(profiled_system_prompt, user_prompt, schema,
+                                     read_timeout, on_fast_model, local["error_detail"])
+
+    def _caller_deadline_shorter(self, read_timeout: float | None) -> bool:
+        """True when a per-call read_timeout is shorter than the box's own read timeout, the one
+        the normal client uses (_get_client: the constructor timeout, else timeout_seconds, else 120)."""
+        if read_timeout is None:
+            return False
+        box_timeout = self._timeout_override
+        if box_timeout is None:
+            box_timeout = resolve_backend(self._full_cfg, "grader").timeout
+        return read_timeout < (box_timeout if box_timeout is not None else 120)
+
+    def _grade_local(self, client, backend, openai_model, openai_max_tokens, cfg,
+                     spot_model, spot_thinking, profiled_system_prompt, user_prompt,
+                     schema) -> dict:
+        """One call to the local box (Ollama or OpenAI-compatible). Returns the parsed
+        verdict, or an infrastructure_error dict on any handled failure."""
         if backend == "openai":
             model = openai_model or _DEFAULT_MODEL
             payload = {
@@ -251,7 +321,10 @@ class LocalGrader:
         except OllamaError as e:
             detail = str(e)
             logger.warning(detail)
-            return self._build_infrastructure_error(detail)
+            error = self._build_infrastructure_error(detail)
+            if isinstance(e, OllamaTimeoutError):
+                error["read_timeout"] = True  # connected, then the read timed out
+            return error
 
         if not result_text:
             detail = "Ollama returned empty response"
@@ -286,6 +359,19 @@ class LocalGrader:
                 return self._build_infrastructure_error(detail)
 
         return parsed
+
+    def _fast_model_step(self, system_prompt, user_prompt, schema, read_timeout, on_fast_model, local_detail):
+        """R1 chain step: the Haiku-class model after the local box (or instead of it
+        under backend "haiku"). Keeps the local failure detail when both fail."""
+        if on_fast_model is not None:
+            on_fast_model()
+        timeout = (fast_model.FAST_LANE_FAST_MODEL_SECONDS if read_timeout is not None
+                   else fast_model.fast_model_timeout(self._full_cfg))
+        result = fast_model.call_fast_model(system_prompt, user_prompt, schema, timeout=timeout,
+                                            commander_config=self._commander_config)
+        if result.get("infrastructure_error") and local_detail is not None:
+            return self._build_infrastructure_error(f"{local_detail}; {result['error_detail']}")
+        return result
 
 
 def truncate_middle(text: str, head: int = 1500, tail: int = 500) -> str:

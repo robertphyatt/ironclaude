@@ -5,6 +5,14 @@ description: Create detailed step-by-step implementation plans
 
 # Writing Plans
 
+## Client-native skill handoffs
+
+Use the next skill on the current client. Claude invokes the named skill with
+its Skill tool. Codex reads the next skill's `SKILL.md` and applies it in the
+same task with the stated arguments. Both clients perform the same mandatory
+MCP preflight, transitions, and review gates. Reading a skill on Codex is the
+skill invocation; prose about a future handoff does not complete it.
+
 ## Purpose
 
 Create comprehensive implementation plans with bite-sized tasks (2-5 minutes each), exact file paths, complete code snippets, and expected output. Plans assume the implementer has zero context and needs mechanical instructions.
@@ -56,13 +64,13 @@ Using writing-plans skill. Professional mode is ACTIVE - architect mode enforced
 
 ### Before You Begin: Episodic Memory Search
 
-Episodic memory search is REQUIRED before plan writing (see Step 0.5). Relevant when:
+Search episodic memory before drafting the plan (see Step 0.5). It matters most when:
 - Design relates to past work in this project
 - Similar features were implemented before
 - User references "last time", "like we did before"
 - Context feels incomplete (after compaction)
 
-To search: dispatch the `ironclaude:search-conversations` agent with relevant query.
+To search: on Claude, dispatch the `ironclaude:search-conversations` agent; on Codex, search with the `episodic-memory` MCP server's search capability.
 
 ### Phase 0: Validate Design Doc Argument
 
@@ -87,18 +95,19 @@ If design doc path is provided:
 3. Read the design doc for context
 4. Proceed to Phase 1
 
-### Step 0.5: Search Episodic Memory (REQUIRED)
+### Step 0.5: Search Episodic Memory Before Drafting
 
-Before creating the implementation plan:
+Before drafting the implementation plan, search episodic memory for implementation
+specifics. Brainstorming already searched the design topic; do not repeat that query.
 
-1. Dispatch ironclaude:search-conversations agent with query based on design topic
-2. Look for:
-   - Similar implementations done before
-   - Patterns that worked or failed
-   - Integration gotchas
-3. Incorporate relevant learnings into plan
+1. Search: on Claude, dispatch the `ironclaude:search-conversations` agent; on Codex, search with the `episodic-memory` MCP server's search capability.
+2. Query implementation specifics:
+   - gotchas in the files this plan will touch
+   - prior decisions on how this code was built
+   - patterns that worked or failed when it was last changed
+3. Carry relevant findings into the plan's tasks and execution invariants.
 
-This is REQUIRED, not optional. Do not skip.
+No hook enforces this step. Do it before drafting tasks.
 
 ### Phase 1: Read Design Document
 
@@ -189,6 +198,9 @@ the blind reviewer can check the commands against a declared standard:
   and confirm the check would NOT hold in that state. A check that holds against the
   ambient environment, against the default value, or against a hardcoded constant verifies
   nothing — prefer a non-default value and an equality that fails on any deviation.
+  This applies to the checks the task already needs. It never authorizes new
+  verification tooling, receipts, extra suites, or independent rebuilds
+  (`../../rules/scope-fidelity.md` §1).
 - **A step's own edits must not perturb its own measurement.** If the change adds or
   removes text that a guard counts or greps for, the expected value moves with the change;
   anchor the guard on a form the change does not touch.
@@ -246,6 +258,11 @@ Step 5: Stage changes (1 min)
 5. Stage changes
 
 If a task genuinely does not need tests (pure config, documentation, version bump, hook script with no test framework), document why: "No tests required: [reason]" in the task description.
+
+**Light-loop plans** (classified in brainstorming per `../../rules/scope-fidelity.md` §2): one
+task, same JSON schema, steps limited to the requested change and the checks it already
+needs. A light design note with a `## Requirements` section may serve as `requirements_file`.
+Read the target repository's `docs/operator-prohibitions.md`, if present, and plan nothing it forbids.
 
 ### Phase 4: Write Plan Document
 
@@ -472,7 +489,7 @@ Three execution options:
 
 Which approach? (1/2/3)
 
-SUGGESTED_NEXT_ACTION: Skill(skill="ironclaude:executing-plans", args="docs/plans/YYYY-MM-DD-<feature-name>.plan.json --mode=subagent-sequential")
+SUGGESTED_NEXT_ACTION: use ironclaude:executing-plans with docs/plans/YYYY-MM-DD-<feature-name>.plan.json --mode=subagent-sequential through the client-native handoff
 ```
 
 (Move the "(Recommended)" label to whichever option is recommended for this specific plan.)
@@ -481,18 +498,18 @@ Wait for user choice.
 
 **If option 1 chosen (subagent tasks, sequential):**
 
-Invoke executing-plans skill:
-[Use Skill tool: skill="ironclaude:executing-plans", args="<plan-path> --mode=subagent-sequential"]
+Use `ironclaude:executing-plans` with `<plan-path> --mode=subagent-sequential`:
+Claude invokes Skill; Codex reads and applies `executing-plans/SKILL.md`.
 
 **If option 2 chosen (subagent tasks, parallel):**
 
-Invoke executing-plans skill:
-[Use Skill tool: skill="ironclaude:executing-plans", args="<plan-path> --mode=subagent-parallel"]
+Use `ironclaude:executing-plans` with `<plan-path> --mode=subagent-parallel`:
+Claude invokes Skill; Codex reads and applies `executing-plans/SKILL.md`.
 
 **If option 3 chosen (no subagents, main session):**
 
-Invoke executing-plans skill:
-[Use Skill tool: skill="ironclaude:executing-plans", args="<plan-path> --mode=inline"]
+Use `ironclaude:executing-plans` with `<plan-path> --mode=inline`:
+Claude invokes Skill; Codex reads and applies `executing-plans/SKILL.md`.
 
 ## Key Principles
 
@@ -502,5 +519,5 @@ Invoke executing-plans skill:
 - **Exact commands**: Full command with all flags and expected output
 - **TDD cycle**: Write test → run to fail → implement → run to pass → stage
 - **Professional mode aware**: All steps use "git add" to stage, never commit
-- **Explicit skill invocation**: Use Skill tool for executing-plans
+- **Explicit skill handoff**: Use the client-native rule above for executing-plans
 - **No review history in plan artifacts**: A plan (human or machine) MUST NOT contain prior-review findings, verdicts, fix rationale, reviewer-drift audits, or round-by-round obligation tables. Because the human plan is a mandatory plan-review input, any such content anchors the fresh reviewer and breaks review-history blindness (MP-W02, MP-R07). Full scoped operator/brainstorming provenance is supplied separately at review dispatch; it is not review history. Prior review content already has durable homes — `tier_up_reviews` rows, `retreat` reasons, and workflow-private session state. Never record it in the plan.

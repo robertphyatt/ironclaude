@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // src/cli.ts
-import path6 from "node:path";
+import path7 from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/db.ts
@@ -264,6 +264,40 @@ function migrateSchema(db) {
         );
 
         INSERT OR IGNORE INTO schema_migrations(version) VALUES (6);
+      `);
+    })();
+  }
+  if (!db.prepare("SELECT 1 FROM schema_migrations WHERE version = 7").get()) {
+    db.transaction(() => {
+      db.exec(`
+        -- A Commander-only grant is inserted as phase=granted.  No plaintext
+        -- capability is stored here; handoff.ts compares its SHA-256 hash.
+        CREATE TABLE IF NOT EXISTS workspace_handoffs (
+          workspace_guid TEXT PRIMARY KEY REFERENCES assignments(workspace_guid),
+          generation INTEGER NOT NULL,
+          capability_token_hash TEXT NOT NULL,
+          grant_expires_at TEXT,
+          source_owner_session_id TEXT NOT NULL,
+          target_owner_session_id TEXT,
+          repository_identity TEXT NOT NULL,
+          worker_id TEXT NOT NULL,
+          worktree_path TEXT NOT NULL,
+          branch TEXT NOT NULL,
+          base_commit TEXT NOT NULL,
+          current_head TEXT NOT NULL,
+          integration_target TEXT NOT NULL,
+          phase TEXT NOT NULL CHECK (phase IN ('granted', 'begun', 'transferred', 'finished')),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS workspace_mutations (
+          workspace_guid TEXT PRIMARY KEY REFERENCES assignments(workspace_guid) ON DELETE CASCADE,
+          operation TEXT NOT NULL,
+          nonce TEXT NOT NULL,
+          process_identity TEXT NOT NULL,
+          acquired_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (7);
       `);
     })();
   }
@@ -560,11 +594,11 @@ function consumeMatchingHumanIntent(db, input, clock = () => /* @__PURE__ */ new
 }
 
 // src/integration.ts
-import { spawnSync as spawnSync2 } from "node:child_process";
-import { createHash } from "node:crypto";
+import { spawnSync as spawnSync3 } from "node:child_process";
+import { createHash as createHash2 } from "node:crypto";
 import {
   closeSync,
-  existsSync as existsSync2,
+  existsSync as existsSync3,
   mkdtempSync,
   openSync,
   readSync,
@@ -574,7 +608,7 @@ import {
   writeFileSync as writeFileSync2
 } from "node:fs";
 import { tmpdir } from "node:os";
-import path4 from "node:path";
+import path5 from "node:path";
 
 // src/git.ts
 import { spawnSync } from "node:child_process";
@@ -1045,9 +1079,30 @@ function contentMergedInto(cwd, tip, targetRef2, scratchDir) {
 }
 
 // src/scoped-tree.ts
-import { rmSync as rmSync2 } from "node:fs";
+import { realpathSync as realpathSync2, rmSync as rmSync2 } from "node:fs";
 import os2 from "node:os";
 import path3 from "node:path";
+function repoRelativeFromAbsolute(realRoot, entry) {
+  const absolute = path3.resolve(entry);
+  const remainder = [path3.basename(absolute)];
+  let ancestor = path3.dirname(absolute);
+  for (; ; ) {
+    try {
+      const resolved = path3.join(realpathSync2.native(ancestor), ...remainder);
+      if (!resolved.startsWith(realRoot + path3.sep)) return null;
+      return path3.relative(realRoot, resolved).split(path3.sep).join("/");
+    } catch (error) {
+      const code = error.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        throw new Error(`Cannot scope commit: cannot resolve ancestor '${ancestor}' for allowed_files entry '${entry}' (${code ?? "unknown error"})`, { cause: error });
+      }
+      const parent = path3.dirname(ancestor);
+      if (parent === ancestor) return null;
+      remainder.unshift(path3.basename(ancestor));
+      ancestor = parent;
+    }
+  }
+}
 function buildScopedStagedTree(repoPath, parentOid, allowedFiles) {
   const raw = runGit(repoPath, ["ls-files", "--stage", "-z"]);
   const index = /* @__PURE__ */ new Map();
@@ -1065,9 +1120,17 @@ function buildScopedStagedTree(repoPath, parentOid, allowedFiles) {
   const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
   try {
     runGitEnv(repoPath, ["read-tree", parentOid], env);
-    for (const rel of allowedFiles) {
+    let realRoot;
+    for (const entry of allowedFiles) {
+      let rel = entry;
+      if (path3.posix.isAbsolute(entry)) {
+        realRoot ??= realpathSync2.native(repoPath);
+        const inside = repoRelativeFromAbsolute(realRoot, entry);
+        if (inside === null) continue;
+        rel = inside;
+      }
       if (rel === "" || rel.endsWith("/") || path3.posix.isAbsolute(rel) || rel !== path3.posix.normalize(rel)) {
-        throw new Error(`Cannot scope commit: allowed_files entry '${rel}' is not a canonical repo-relative path (no leading ./, no .., no //, no absolute path, no trailing slash)`);
+        throw new Error(`Cannot scope commit: allowed_files entry '${rel}' is not a canonical repo-relative path (no leading ./, no .., no //, no trailing slash)`);
       }
       const entries = index.get(rel);
       if (entries && entries.some((e) => e.stage !== "0")) {
@@ -1091,6 +1154,224 @@ function buildScopedStagedTree(repoPath, parentOid, allowedFiles) {
 
 // src/plan-scope.ts
 import Database2 from "better-sqlite3";
+
+// src/handoff.ts
+import { spawnSync as spawnSync2 } from "node:child_process";
+import { createHash, randomUUID as randomUUID2, timingSafeEqual } from "node:crypto";
+import { existsSync as existsSync2 } from "node:fs";
+import path4 from "node:path";
+var UUID_PATTERN2 = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+var localClaims = /* @__PURE__ */ new Map();
+var hash = (token) => createHash("sha256").update(token).digest("hex");
+function equalHash(expected, token) {
+  const actual = hash(token);
+  return expected.length === actual.length && timingSafeEqual(Buffer.from(expected), Buffer.from(actual));
+}
+var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+var cachedProcessIdentity;
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = error.code;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
+    throw error;
+  }
+}
+function processStartEpoch(pid) {
+  if (!processExists(pid)) return null;
+  const result = spawnSync2("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: { ...process.env, LC_ALL: "C", TZ: "UTC" } });
+  if (result.error) throw result.error;
+  const text = String(result.stdout ?? "").trim();
+  if (text === "") {
+    if (!processExists(pid)) return null;
+    throw new Error(`Process ${pid} start time is unavailable`);
+  }
+  const match = /^[A-Z][a-z]{2}\s+([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})$/.exec(text);
+  const month = match ? MONTHS.indexOf(match[1]) : -1;
+  if (!match || month < 0) throw new Error(`Process ${pid} start time is unparseable: ${text}`);
+  return Math.floor(Date.UTC(Number(match[6]), month, Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5])) / 1e3);
+}
+function currentProcessIdentity() {
+  if (cachedProcessIdentity === void 0) {
+    let started = null;
+    try {
+      started = processStartEpoch(process.pid);
+    } catch {
+      started = null;
+    }
+    cachedProcessIdentity = started === null ? `${process.pid}` : `${process.pid}:${started}`;
+  }
+  return cachedProcessIdentity;
+}
+function mutationOwnerStatus(identity) {
+  const match = /^(\d+)(?::(\d+))?$/.exec(identity);
+  if (!match) return "unproved";
+  const pid = Number(match[1]);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return "unproved";
+  let started;
+  try {
+    started = processStartEpoch(pid);
+  } catch {
+    return "unproved";
+  }
+  if (started === null) return "dead";
+  if (match[2] === void 0) return "unproved";
+  return started === Number(match[2]) ? "live" : "dead";
+}
+function row(db, guid) {
+  return db.prepare("SELECT * FROM workspace_handoffs WHERE workspace_guid = ?").get(guid);
+}
+function assertEvidence(db, input, handoff, phase, allowDescendantHead = false) {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.workspaceGuid) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.sourceOwnerSessionId) || !Number.isInteger(input.generation) || input.generation <= 0 || input.capabilityToken.length === 0) throw new Error("Malformed handoff capability input");
+  if (handoff.phase !== phase || handoff.generation !== input.generation || !equalHash(handoff.capability_token_hash, input.capabilityToken)) throw new Error("Handoff capability or generation is invalid");
+  const assignment = db.prepare("SELECT * FROM assignments WHERE workspace_guid = ?").get(input.workspaceGuid);
+  const expectedOwner = phase === "transferred" ? handoff.target_owner_session_id : input.sourceOwnerSessionId;
+  if (!assignment || assignment.owner_session_id !== expectedOwner || assignment.lifecycle_status !== "active") throw new Error("Handoff source assignment is not active owner");
+  const fields = [
+    ["repository_identity", input.repositoryIdentity],
+    ["worker_id", input.workerId],
+    ["worktree_path", input.expectedWorktreePath],
+    ["branch", input.expectedBranch],
+    ["base_commit", input.expectedBaseCommit],
+    ["current_head", input.expectedCurrentHead],
+    ["integration_target", input.expectedIntegrationTarget]
+  ];
+  for (const [key, expected] of fields) if (handoff[key] !== expected || assignment[key] !== expected && !(allowDescendantHead && key === "current_head")) throw new Error("Handoff durable evidence mismatch");
+  if (handoff.source_owner_session_id !== input.sourceOwnerSessionId) throw new Error("Handoff source owner mismatch");
+  const repository = discoverRepository(input.repositoryPath);
+  if (repository.repositoryIdentity !== input.repositoryIdentity) throw new Error("Handoff repository identity mismatch");
+  if (input.expectedWorktreePath !== path4.join(repository.primaryCheckoutPath, ".ironclaude", "worktrees", input.workspaceGuid) || input.expectedBranch !== `ironclaude/${input.workspaceGuid}`) throw new Error("Handoff managed identity is not canonical");
+  const observed = listWorktrees(repository.primaryCheckoutPath).find((candidate) => candidate.path === input.expectedWorktreePath);
+  const liveHead = observed ? worktreeHead(input.expectedWorktreePath) : "";
+  if (!observed || observed.branch !== `refs/heads/${input.expectedBranch}` || liveHead !== input.expectedCurrentHead && !(allowDescendantHead && isAncestor(input.expectedWorktreePath, input.expectedCurrentHead, liveHead))) throw new Error("Handoff live Git evidence mismatch");
+  for (const directory of ["rebase-merge", "rebase-apply"]) {
+    const rebasePath = path4.resolve(input.expectedWorktreePath, runGitPath(input.expectedWorktreePath, directory));
+    if (existsSync2(rebasePath)) throw new Error("Handoff cannot transfer a worktree with rebase in progress");
+  }
+  if (db.prepare("SELECT 1 FROM primary_checkout_owners WHERE repository_identity = ? AND workspace_guid = ?").get(input.repositoryIdentity, input.workspaceGuid)) throw new Error("Handoff cannot transfer primary checkout owner");
+  if (db.prepare("SELECT 1 FROM integration_locks WHERE repository_identity = ? AND workspace_guid = ?").get(input.repositoryIdentity, input.workspaceGuid)) throw new Error("Handoff cannot transfer integration-locked assignment");
+}
+function runGitPath(worktreePath, name) {
+  return runGit(worktreePath, ["rev-parse", "--git-path", name]).trim();
+}
+function beginHandoffOnce(db, input) {
+  db.transaction(() => {
+    const handoff = row(db, input.workspaceGuid);
+    if (!handoff) throw new Error("Commander handoff grant not found");
+    if (db.prepare("SELECT 1 FROM workspace_mutations WHERE workspace_guid = ?").get(input.workspaceGuid)) throw new Error("Handoff cannot begin during assignment mutation");
+    assertEvidence(db, input, handoff, "granted");
+    const expiresAt = handoff.grant_expires_at ? Date.parse(handoff.grant_expires_at) : NaN;
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) throw new Error("Commander handoff grant is expired");
+    if (db.prepare("UPDATE workspace_handoffs SET phase = 'begun', updated_at = datetime('now') WHERE workspace_guid = ? AND phase = 'granted'").run(input.workspaceGuid).changes !== 1) throw new Error("Handoff grant changed concurrently");
+  }).immediate();
+}
+function beginHandoff(db, input) {
+  try {
+    beginHandoffOnce(db, input);
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== "Handoff cannot begin during assignment mutation" || !reapDeadAssignmentMutation(db, input.workspaceGuid)) throw error;
+    beginHandoffOnce(db, input);
+  }
+}
+function transferHandoff(db, input) {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.targetOwnerSessionId) || input.targetOwnerSessionId === input.sourceOwnerSessionId) throw new Error("Handoff target owner is invalid");
+  db.transaction(() => {
+    const handoff = row(db, input.workspaceGuid);
+    if (!handoff) throw new Error("Handoff not found");
+    assertEvidence(db, input, handoff, "begun");
+    if (handoff.target_owner_session_id !== input.targetOwnerSessionId) throw new Error("Handoff target is not Commander-authorized");
+    const changed = db.prepare(`UPDATE assignments SET owner_session_id = ?, updated_at = datetime('now')
+      WHERE workspace_guid = ? AND owner_session_id = ? AND repository_identity = ? AND worker_id = ? AND worktree_path = ? AND branch = ? AND base_commit = ? AND current_head = ? AND integration_target = ? AND lifecycle_status = 'active'`).run(input.targetOwnerSessionId, input.workspaceGuid, input.sourceOwnerSessionId, input.repositoryIdentity, input.workerId, input.expectedWorktreePath, input.expectedBranch, input.expectedBaseCommit, input.expectedCurrentHead, input.expectedIntegrationTarget);
+    if (changed.changes !== 1) throw new Error("Handoff ownership compare-and-swap failed");
+    db.prepare("UPDATE human_intents SET consumed_at = datetime('now') WHERE workspace_guid = ? AND provider_root_session_id = ? AND consumed_at IS NULL").run(input.workspaceGuid, input.sourceOwnerSessionId);
+    db.prepare("UPDATE preserved_work SET owner_session_id = ? WHERE workspace_guid = ? AND owner_session_id = ? AND resolved_at IS NULL").run(input.targetOwnerSessionId, input.workspaceGuid, input.sourceOwnerSessionId);
+    if (db.prepare("UPDATE workspace_handoffs SET target_owner_session_id = ?, phase = 'transferred', updated_at = datetime('now') WHERE workspace_guid = ? AND phase = 'begun'").run(input.targetOwnerSessionId, input.workspaceGuid).changes !== 1) throw new Error("Handoff transfer changed concurrently");
+  }).immediate();
+}
+function finishHandoffAfterTarget(db, input) {
+  db.transaction(() => {
+    const handoff = row(db, input.workspaceGuid);
+    if (!handoff) throw new Error("Handoff not found");
+    assertEvidence(db, input, handoff, "transferred", true);
+    if (db.prepare("UPDATE workspace_handoffs SET phase = 'finished', updated_at = datetime('now') WHERE workspace_guid = ? AND phase = 'transferred'").run(input.workspaceGuid).changes !== 1) throw new Error("Handoff finish changed concurrently");
+  }).immediate();
+}
+function finishHandoff(db, input) {
+  db.transaction(() => {
+    const handoff = row(db, input.workspaceGuid);
+    if (!handoff) throw new Error("Handoff not found");
+    assertEvidence(db, input, handoff, "transferred");
+    if (db.prepare("UPDATE workspace_handoffs SET phase = 'finished', updated_at = datetime('now') WHERE workspace_guid = ? AND phase = 'transferred'").run(input.workspaceGuid).changes !== 1) throw new Error("Handoff finish changed concurrently");
+  }).immediate();
+}
+function releaseHandoff(db, input) {
+  if (!UUID_PATTERN2.test(input.workspaceGuid) || !UUID_PATTERN2.test(input.sourceOwnerSessionId) || !Number.isInteger(input.generation) || input.generation <= 0 || input.capabilityToken.length === 0) throw new Error("Malformed handoff release input");
+  db.transaction(() => {
+    const handoff = row(db, input.workspaceGuid);
+    if (!handoff || handoff.generation !== input.generation) {
+      if (handoff && handoff.phase !== "finished") throw new Error("Handoff capability or generation is invalid");
+      return;
+    }
+    if (!equalHash(handoff.capability_token_hash, input.capabilityToken)) throw new Error("Handoff capability or generation is invalid");
+    if (handoff.source_owner_session_id !== input.sourceOwnerSessionId) throw new Error("Handoff source owner mismatch");
+    if (handoff.phase === "finished") return;
+    const assignment = db.prepare("SELECT owner_session_id FROM assignments WHERE workspace_guid = ?").get(input.workspaceGuid);
+    if (!assignment || assignment.owner_session_id !== input.sourceOwnerSessionId) throw new Error("Handoff source no longer owns assignment; release refused");
+    if (handoff.phase !== "granted" && handoff.phase !== "begun") throw new Error("Handoff phase cannot be released");
+    if (db.prepare("UPDATE workspace_handoffs SET phase = 'finished', updated_at = datetime('now') WHERE workspace_guid = ? AND generation = ? AND phase IN ('granted', 'begun')").run(input.workspaceGuid, input.generation).changes !== 1) throw new Error("Handoff release changed concurrently");
+  }).immediate();
+}
+function assertNoPendingHandoff(db, workspaceGuid) {
+  if (db.prepare("SELECT 1 FROM workspace_handoffs WHERE workspace_guid = ? AND phase <> 'finished'").get(workspaceGuid)) throw new Error("Assignment handoff is pending");
+}
+function insertMutationClaim(db, workspaceGuid, operation, nonce) {
+  let inserted = false;
+  db.transaction(() => {
+    assertNoPendingHandoff(db, workspaceGuid);
+    try {
+      db.prepare("INSERT INTO workspace_mutations(workspace_guid, operation, nonce, process_identity) VALUES (?, ?, ?, ?)").run(workspaceGuid, operation, nonce, currentProcessIdentity());
+      inserted = true;
+    } catch {
+      inserted = false;
+    }
+  }).immediate();
+  return inserted;
+}
+function reapDeadAssignmentMutation(db, workspaceGuid) {
+  const claim = db.prepare("SELECT nonce, process_identity FROM workspace_mutations WHERE workspace_guid = ?").get(workspaceGuid);
+  if (!claim || mutationOwnerStatus(claim.process_identity) !== "dead") return false;
+  return db.prepare("DELETE FROM workspace_mutations WHERE workspace_guid = ? AND nonce = ? AND process_identity = ?").run(workspaceGuid, claim.nonce, claim.process_identity).changes === 1;
+}
+function reapStaleMutations(db) {
+  const claims = db.prepare("SELECT workspace_guid FROM workspace_mutations ORDER BY workspace_guid").all();
+  return claims.filter((claim) => reapDeadAssignmentMutation(db, claim.workspace_guid)).map((claim) => claim.workspace_guid);
+}
+function withAssignmentMutation(db, workspaceGuid, operation, fn) {
+  const nested = localClaims.get(workspaceGuid);
+  if (nested) {
+    if (nested.db !== db) throw new Error("Assignment mutation token belongs to another database");
+    nested.depth++;
+    try {
+      return fn();
+    } finally {
+      nested.depth--;
+    }
+  }
+  const nonce = randomUUID2();
+  if (!insertMutationClaim(db, workspaceGuid, operation, nonce) && !(reapDeadAssignmentMutation(db, workspaceGuid) && insertMutationClaim(db, workspaceGuid, operation, nonce))) {
+    throw new Error("Assignment mutation is already claimed");
+  }
+  localClaims.set(workspaceGuid, { db, nonce, depth: 1 });
+  try {
+    return fn();
+  } finally {
+    localClaims.delete(workspaceGuid);
+    db.prepare("DELETE FROM workspace_mutations WHERE workspace_guid = ? AND nonce = ?").run(workspaceGuid, nonce);
+  }
+}
 
 // src/integration.ts
 function encodePushDisposition(value) {
@@ -1140,13 +1421,13 @@ function pushPendingSummary(disposition) {
   return decoded && (decoded.phase === "push-pending" || decoded.phase === "push-failed") ? { candidateCommit: decoded.candidateCommit, remoteUrl: decoded.remoteUrl, destinationRef: decoded.destinationRef } : void 0;
 }
 function cumulativeBinaryEffect(cwd, base, head) {
-  const dir = mkdtempSync(path4.join(tmpdir(), "ic-finalize-diff-"));
-  const file = path4.join(dir, "diff.bin");
+  const dir = mkdtempSync(path5.join(tmpdir(), "ic-finalize-diff-"));
+  const file = path5.join(dir, "diff.bin");
   let wfd;
   try {
     wfd = openSync(file, "w");
     const args = ["diff", "--binary", "--full-index", base, head];
-    const result = spawnSync2("git", ["-C", cwd, ...args], { stdio: ["ignore", wfd, "pipe"], maxBuffer: GIT_MAX_BUFFER });
+    const result = spawnSync3("git", ["-C", cwd, ...args], { stdio: ["ignore", wfd, "pipe"], maxBuffer: GIT_MAX_BUFFER });
     closeSync(wfd);
     wfd = void 0;
     if (result.error) {
@@ -1154,16 +1435,16 @@ function cumulativeBinaryEffect(cwd, base, head) {
       throw overflow ?? result.error;
     }
     if (result.status !== 0) throw gitError(cwd, args, (result.stderr || "").toString());
-    const hash = createHash("sha256");
+    const hash2 = createHash2("sha256");
     const rfd = openSync(file, "r");
     try {
       const buf = Buffer.allocUnsafe(1 << 20);
       let n;
-      while ((n = readSync(rfd, buf, 0, buf.length, null)) > 0) hash.update(buf.subarray(0, n));
+      while ((n = readSync(rfd, buf, 0, buf.length, null)) > 0) hash2.update(buf.subarray(0, n));
     } finally {
       closeSync(rfd);
     }
-    return hash.digest("hex");
+    return hash2.digest("hex");
   } finally {
     if (wfd !== void 0) {
       try {
@@ -1256,9 +1537,10 @@ function exactAssignment(db, repositoryPath, workspaceGuid, providerRootSessionI
   if (!assignment || assignment.repository_identity !== repository.repositoryIdentity || assignment.owner_session_id !== providerRootSessionId) {
     throw new Error("Finalization assignment binding does not match repository and provider root");
   }
+  assertNoPendingHandoff(db, workspaceGuid);
   return { assignment, primaryCheckoutPath: repository.primaryCheckoutPath };
 }
-function syncWorktreeToTarget(db, input) {
+function syncWorktreeToTargetCore(db, input) {
   const exact = exactAssignment(db, input.repositoryPath, input.workspaceGuid, input.providerRootSessionId);
   const assignment = exact.assignment;
   if (assignment.lifecycle_status !== "active") {
@@ -1386,7 +1668,7 @@ function markIntegrated(db, assignment, integratedCommit, ref, hooks) {
   })();
   return getAssignment(db, assignment.workspace_guid);
 }
-function recycleFinalized(db, repositoryPath, assignment) {
+function recycleFinalizedCore(db, repositoryPath, assignment) {
   const current = getAssignment(db, assignment.workspace_guid);
   if (!current || current.lifecycle_status !== "integrated" || !current.integrated_commit) {
     throw new Error("Recycle requires a durable integrated assignment; preserving worktree");
@@ -1412,7 +1694,7 @@ function recycleFinalized(db, repositoryPath, assignment) {
   } catch {
   }
 }
-function releaseFinalized(db, repositoryPath, assignment) {
+function releaseFinalizedCore(db, repositoryPath, assignment) {
   const current = getAssignment(db, assignment.workspace_guid);
   if (!current || current.lifecycle_status !== "integrated" || !current.integrated_commit) {
     throw new Error("Release requires a durable integrated assignment; preserving worktree");
@@ -1640,7 +1922,7 @@ function snapshotResidualIfDirty(db, exact) {
   const worktree = exact.assignment.worktree_path;
   if (worktreeIsClean(worktree)) return void 0;
   const residualFiles = runGit(worktree, ["status", "--porcelain=v1", "--untracked-files=all"]).split("\n").filter((line) => line.trim() !== "").length;
-  const tmpIndex = path4.join(tmpdir(), `ironclaude-closeout-index-${exact.assignment.workspace_guid}-${process.pid}`);
+  const tmpIndex = path5.join(tmpdir(), `ironclaude-closeout-index-${exact.assignment.workspace_guid}-${process.pid}`);
   const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
   let snapshot;
   try {
@@ -1659,7 +1941,7 @@ function snapshotResidualIfDirty(db, exact) {
   runGit(worktree, ["clean", "-fd"]);
   return { ref: recoveryRef, residualFiles };
 }
-function finalizeCommanderLocalCommit(db, input, hooks) {
+function finalizeCommanderLocalCommitCore(db, input, hooks) {
   requireCommanderFinalizationInput(input);
   requireMessage(input.message);
   const exact = exactAssignment(db, input.repositoryPath, input.workspaceGuid, input.providerRootSessionId);
@@ -1746,7 +2028,7 @@ function recoverRebaseInProgress(db, exact, mode) {
     throw error;
   }
   const stillRebaseDir = runGit(worktree, ["rev-parse", "--git-path", "rebase-merge"]).trim();
-  if (existsSync2(path4.resolve(worktree, stillRebaseDir))) {
+  if (existsSync3(path5.resolve(worktree, stillRebaseDir))) {
     const reconflict = runGit(worktree, ["diff", "--name-only", "--diff-filter=U"]).trim();
     throw new Error(`Rebase recovery stopped: rebase still in progress after continue; preserving worktree.${reconflict ? ` Unmerged paths: ${reconflict.split("\n").join(", ")}` : ""}`);
   }
@@ -1766,31 +2048,31 @@ function recoverRebaseInProgress(db, exact, mode) {
 function classifyRebaseConflicts(worktree) {
   const unmerged = runGit(worktree, ["diff", "--name-only", "--diff-filter=U"]).trim();
   if (unmerged === "") return [];
-  return unmerged.split("\n").map((path7) => {
-    const xy = runGit(worktree, ["status", "--porcelain=v1", "--", path7]).slice(0, 2);
+  return unmerged.split("\n").map((path8) => {
+    const xy = runGit(worktree, ["status", "--porcelain=v1", "--", path8]).slice(0, 2);
     let binary = false;
     try {
-      binary = /^-\t-/.test(runGit(worktree, ["diff", "--numstat", `:2:${path7}`, `:3:${path7}`]).trim());
+      binary = /^-\t-/.test(runGit(worktree, ["diff", "--numstat", `:2:${path8}`, `:3:${path8}`]).trim());
     } catch {
       binary = false;
     }
     const conflictClass = binary ? "binary" : xy === "UU" ? "overlap" : xy === "AA" ? "add-add" : xy === "UD" || xy === "DU" ? "delete-modify" : "other";
     const stageLines = (stage) => {
       try {
-        return runGit(worktree, ["show", `:${stage}:${path7}`]).split("\n").length;
+        return runGit(worktree, ["show", `:${stage}:${path8}`]).split("\n").length;
       } catch {
         return 0;
       }
     };
     const ours = stageLines(2);
     const theirs = stageLines(3);
-    const summary = `${path7}: your reviewed work has ${theirs} line(s) here; the integration target has ${ours} line(s) (${conflictClass}).`;
-    return { path: path7, conflictClass, summary };
+    const summary = `${path8}: your reviewed work has ${theirs} line(s) here; the integration target has ${ours} line(s) (${conflictClass}).`;
+    return { path: path8, conflictClass, summary };
   });
 }
 function classifyRebaseState(worktree) {
   const rebaseDir = runGit(worktree, ["rev-parse", "--git-path", "rebase-merge"]).trim();
-  if (!existsSync2(path4.resolve(worktree, rebaseDir))) return "frozen-no-rebase";
+  if (!existsSync3(path5.resolve(worktree, rebaseDir))) return "frozen-no-rebase";
   const unmerged = runGit(worktree, ["diff", "--name-only", "--diff-filter=U"]).trim();
   return unmerged !== "" ? "rebase-paused-conflict" : "rebase-paused-clean";
 }
@@ -1879,7 +2161,7 @@ function recoverNoPausedRebase(exact, mode) {
   const frozen = runGit(exact.primaryCheckoutPath, ["rev-parse", "--verify", `${freezeRef(assignment.workspace_guid)}^{commit}`]).trim();
   return mode === "rerebase" ? rerebaseFromFrozen(worktree, assignment, frozen) : restoreFrozen(worktree, frozen);
 }
-function reconcileFinalization(db, input) {
+function reconcileFinalizationCore(db, input) {
   const exact = exactAssignment(db, input.repositoryPath, input.workspaceGuid, input.providerRootSessionId);
   const assignment = exact.assignment;
   if (input.rebaseRecovery === "status") {
@@ -1944,7 +2226,7 @@ function reconcileFinalization(db, input) {
   }
   if (input.rebaseRecovery) {
     const rebaseInProgressDir = runGit(assignment.worktree_path, ["rev-parse", "--git-path", "rebase-merge"]).trim();
-    if (!existsSync2(path4.resolve(assignment.worktree_path, rebaseInProgressDir))) {
+    if (!existsSync3(path5.resolve(assignment.worktree_path, rebaseInProgressDir))) {
       throw new Error("Rebase recovery requested but no rebase is in progress; preserving worktree");
     }
   }
@@ -1992,7 +2274,7 @@ function reconcileFinalization(db, input) {
       throw new Error("Crash reconciliation candidate and source HEAD differ; preserving worktree");
     }
     const rebaseDirectory = runGit(assignment.worktree_path, ["rev-parse", "--git-path", "rebase-merge"]).trim();
-    if (existsSync2(path4.resolve(assignment.worktree_path, rebaseDirectory))) {
+    if (existsSync3(path5.resolve(assignment.worktree_path, rebaseDirectory))) {
       if (input.rebaseRecovery) {
         return recoverRebaseInProgress(db, exact, input.rebaseRecovery === "abort" ? "abort" : "continue");
       }
@@ -2095,15 +2377,32 @@ function reconcileFinalization(db, input) {
   recycleFinalized(db, exact.primaryCheckoutPath, integrated);
   return { state: "cleaned", integratedCommit: durableRecord.integrated_commit };
 }
+function syncWorktreeToTarget(db, input) {
+  return withAssignmentMutation(db, input.workspaceGuid, "sync-worktree-to-target", () => syncWorktreeToTargetCore(db, input));
+}
+function recycleFinalized(db, repositoryPath, assignment) {
+  return withAssignmentMutation(db, assignment.workspace_guid, "recycle-finalized", () => recycleFinalizedCore(db, repositoryPath, assignment));
+}
+function releaseFinalized(db, repositoryPath, assignment) {
+  return withAssignmentMutation(db, assignment.workspace_guid, "release-finalized", () => releaseFinalizedCore(db, repositoryPath, assignment));
+}
+function finalizeCommanderLocalCommit(db, input, hooks) {
+  requireCommanderFinalizationInput(input);
+  requireMessage(input.message);
+  return withAssignmentMutation(db, input.workspaceGuid, "finalize-commander-local-commit", () => finalizeCommanderLocalCommitCore(db, input, hooks));
+}
+function reconcileFinalization(db, input) {
+  return withAssignmentMutation(db, input.workspaceGuid, "reconcile-finalization", () => reconcileFinalizationCore(db, input));
+}
 
 // src/workspace-service.ts
-import { spawnSync as spawnSync3 } from "node:child_process";
-import { createHash as createHash2, randomUUID as randomUUID2 } from "node:crypto";
-import { existsSync as existsSync3, mkdtempSync as mkdtempSync2, rmSync as rmSync4 } from "node:fs";
+import { spawnSync as spawnSync4 } from "node:child_process";
+import { createHash as createHash3, randomUUID as randomUUID3 } from "node:crypto";
+import { existsSync as existsSync4, mkdtempSync as mkdtempSync2, rmSync as rmSync4 } from "node:fs";
 import os3 from "node:os";
-import path5 from "node:path";
+import path6 from "node:path";
 function managedWorktreePath(primaryCheckoutPath, workspaceGuid) {
-  return path5.join(primaryCheckoutPath, ".ironclaude", "worktrees", workspaceGuid);
+  return path6.join(primaryCheckoutPath, ".ironclaude", "worktrees", workspaceGuid);
 }
 function managedBranch(workspaceGuid) {
   return `ironclaude/${workspaceGuid}`;
@@ -2111,16 +2410,16 @@ function managedBranch(workspaceGuid) {
 function integrationTargetRef(target) {
   return target.startsWith("refs/") ? target : `refs/heads/${target}`;
 }
-var UUID_PATTERN2 = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+var UUID_PATTERN3 = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function validUuid(value) {
-  return UUID_PATTERN2.test(value);
+  return UUID_PATTERN3.test(value);
 }
 function selectWorkspaceGuid(input) {
   if (input.workspaceGuid !== void 0) {
     if (!validUuid(input.workspaceGuid)) throw new Error("workspaceGuid must be a UUID");
     return input.workspaceGuid;
   }
-  return validUuid(input.ownerSessionId) ? input.ownerSessionId : randomUUID2();
+  return validUuid(input.ownerSessionId) ? input.ownerSessionId : randomUUID3();
 }
 function nonterminal(status) {
   return status !== "integrated" && status !== "abandoned" && status !== "cleaned";
@@ -2176,7 +2475,7 @@ var WorkspaceService = class {
       integrationTarget: input.integrationTarget
     };
     const priorRow = getAssignment(this.db, input.workspaceGuid);
-    const worktreeGone = priorRow !== void 0 && !existsSync3(priorRow.worktree_path) && !worktreeExists(repository.primaryCheckoutPath, priorRow.worktree_path);
+    const worktreeGone = priorRow !== void 0 && !existsSync4(priorRow.worktree_path) && !worktreeExists(repository.primaryCheckoutPath, priorRow.worktree_path);
     const reuseSpent = priorRow !== void 0 && priorRow.lifecycle_status === "cleaned" && worktreeGone;
     let assignment;
     if (reuseSpent) {
@@ -2403,8 +2702,13 @@ var WorkspaceService = class {
   }
   /** Human approval is required before logical ownership of primary checkout. */
   usePrimaryCheckout(input) {
+    if (!getAssignment(this.db, input.workspaceGuid)) this.getWorkspaceAssignment(input);
+    return withAssignmentMutation(this.db, input.workspaceGuid, "use-primary-checkout", () => this.usePrimaryCheckoutCore(input));
+  }
+  usePrimaryCheckoutCore(input) {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if (input.expectedEvidence === void 0 !== (input.nonce === void 0)) {
       throw new Error("Primary checkout switching authority input is malformed");
     }
@@ -2430,8 +2734,13 @@ var WorkspaceService = class {
   }
   /** Human approval is also required to release primary checkout ownership. */
   returnToManagedWorktree(input) {
+    if (!getAssignment(this.db, input.workspaceGuid)) this.getWorkspaceAssignment(input);
+    return withAssignmentMutation(this.db, input.workspaceGuid, "return-to-managed-worktree", () => this.returnToManagedWorktreeCore(input));
+  }
+  returnToManagedWorktreeCore(input) {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if (input.expectedEvidence === void 0 !== (input.nonce === void 0)) {
       throw new Error("Managed worktree switching authority input is malformed");
     }
@@ -2452,8 +2761,13 @@ var WorkspaceService = class {
     return { managedWorktreePath: assignment.worktree_path, assignment };
   }
   abandonWorkspace(input) {
+    if (!getAssignment(this.db, input.workspaceGuid)) this.getWorkspaceAssignment(input);
+    return withAssignmentMutation(this.db, input.workspaceGuid, "abandon-workspace", () => this.abandonWorkspaceCore(input));
+  }
+  abandonWorkspaceCore(input) {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if (assignment.lifecycle_status === "abandoned") return assignment;
     if (!nonterminal(assignment.lifecycle_status)) {
       throw new Error("Only unresolved managed worktrees can be abandoned");
@@ -2478,7 +2792,7 @@ var WorkspaceService = class {
    * delete the branch, and the rescued commit stays reachable through the ref.
    */
   rescueAbandon(repository, assignment) {
-    const worktreePresent = existsSync3(assignment.worktree_path) && worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path);
+    const worktreePresent = existsSync4(assignment.worktree_path) && worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path);
     if (worktreePresent) {
       if (!worktreeIsClean(assignment.worktree_path)) {
         runGit(assignment.worktree_path, ["add", "-A"]);
@@ -2503,12 +2817,17 @@ var WorkspaceService = class {
    * proofs — the moment a worktree actually exists for this row.
    */
   cleanupReservedAssignment(input) {
+    if (!getAssignment(this.db, input.workspaceGuid)) this.getWorkspaceAssignment(input);
+    return withAssignmentMutation(this.db, input.workspaceGuid, "cleanup-reserved-assignment", () => this.cleanupReservedAssignmentCore(input));
+  }
+  cleanupReservedAssignmentCore(input) {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if (assignment.lifecycle_status !== "reserved") {
       throw new Error("Only a reserved, never-materialized assignment is eligible for this carve-out");
     }
-    if (existsSync3(assignment.worktree_path) || worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path)) {
+    if (existsSync4(assignment.worktree_path) || worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path)) {
       throw new Error("Reserved assignment has a materialized worktree; use cleanupWorkspace instead");
     }
     const result = this.db.prepare(`
@@ -2570,7 +2889,7 @@ var WorkspaceService = class {
    * `git branch -D` on a nonexistent branch would otherwise throw).
    */
   tombstoneTerminalAssignment(repository, assignment) {
-    const present = existsSync3(assignment.worktree_path) && worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path);
+    const present = existsSync4(assignment.worktree_path) && worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path);
     if (present && !worktreeIsClean(assignment.worktree_path)) {
       throw new Error("Managed worktree is dirty; preserving it");
     }
@@ -2618,12 +2937,17 @@ var WorkspaceService = class {
    * proof still reaches its actual Git HEAD. Every failed proof preserves work.
    */
   cleanupWorkspace(input) {
+    if (!getAssignment(this.db, input.workspaceGuid)) this.getWorkspaceAssignment(input);
+    return withAssignmentMutation(this.db, input.workspaceGuid, "cleanup-workspace", () => this.cleanupWorkspaceCore(input));
+  }
+  cleanupWorkspaceCore(input) {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if (assignment.lifecycle_status !== "integrated" && assignment.lifecycle_status !== "abandoned") {
       throw new Error("Only integrated or abandoned worktrees are eligible for cleanup");
     }
-    const present = existsSync3(assignment.worktree_path) && worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path);
+    const present = existsSync4(assignment.worktree_path) && worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path);
     if (present) this.validateManagedIdentity(repository, assignment);
     return this.tombstoneTerminalAssignment(repository, assignment);
   }
@@ -2639,16 +2963,24 @@ var WorkspaceService = class {
    * preserved. Only after work is anchored does it tombstone the row.
    */
   reapLeakedAssignment(input) {
+    if (!getAssignment(this.db, input.workspaceGuid)) {
+      discoverRepository(input.repositoryPath);
+      throw new Error("Leaked assignment does not match canonical managed identity for this repository");
+    }
+    return withAssignmentMutation(this.db, input.workspaceGuid, "reap-leaked-assignment", () => this.reapLeakedAssignmentCore(input));
+  }
+  reapLeakedAssignmentCore(input) {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = getAssignment(this.db, input.workspaceGuid);
     if (!assignment || assignment.repository_identity !== repository.repositoryIdentity || assignment.worktree_path !== managedWorktreePath(repository.primaryCheckoutPath, assignment.workspace_guid) || assignment.branch !== managedBranch(assignment.workspace_guid)) {
       throw new Error("Leaked assignment does not match canonical managed identity for this repository");
     }
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if (assignment.lifecycle_status === "cleaned") return assignment;
     if (assignment.lifecycle_status === "reserved") {
       return this.reapReservedAssignment(repository, assignment);
     }
-    const present = existsSync3(assignment.worktree_path) && worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path);
+    const present = existsSync4(assignment.worktree_path) && worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path);
     if (present) this.validateManagedIdentity(repository, assignment);
     if (assignment.lifecycle_status !== "integrated" && assignment.lifecycle_status !== "abandoned") {
       if (present) {
@@ -2673,7 +3005,7 @@ var WorkspaceService = class {
    * the moment a worktree actually exists — that row is not a bare reservation.
    */
   reapReservedAssignment(repository, assignment) {
-    if (existsSync3(assignment.worktree_path) || worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path)) {
+    if (existsSync4(assignment.worktree_path) || worktreeExists(repository.primaryCheckoutPath, assignment.worktree_path)) {
       throw new Error("Reserved assignment has a materialized worktree; use cleanupWorkspace instead");
     }
     const result = this.db.prepare(`
@@ -2691,13 +3023,13 @@ var WorkspaceService = class {
     `).all(repository.repositoryIdentity);
     const observed = listWorktrees(repository.primaryCheckoutPath);
     const observedPaths = new Set(observed.map((worktree) => worktree.path));
-    const knownPaths = new Set(assignments.map((assignment) => path5.resolve(assignment.worktree_path)));
-    const managedRoot = path5.join(repository.primaryCheckoutPath, ".ironclaude", "worktrees") + path5.sep;
+    const knownPaths = new Set(assignments.map((assignment) => path6.resolve(assignment.worktree_path)));
+    const managedRoot = path6.join(repository.primaryCheckoutPath, ".ironclaude", "worktrees") + path6.sep;
     const ambiguousWorktreePaths = observed.filter((worktree) => worktree.path.startsWith(managedRoot) && worktree.branch?.startsWith("refs/heads/ironclaude/") && !knownPaths.has(worktree.path)).map((worktree) => worktree.path).sort();
     return {
       repositoryIdentity: repository.repositoryIdentity,
-      knownWorktreePaths: assignments.map((assignment) => path5.resolve(assignment.worktree_path)).filter((worktreePath) => observedPaths.has(worktreePath)).sort(),
-      missingWorktreePaths: assignments.map((assignment) => path5.resolve(assignment.worktree_path)).filter((worktreePath) => !observedPaths.has(worktreePath)).sort(),
+      knownWorktreePaths: assignments.map((assignment) => path6.resolve(assignment.worktree_path)).filter((worktreePath) => observedPaths.has(worktreePath)).sort(),
+      missingWorktreePaths: assignments.map((assignment) => path6.resolve(assignment.worktree_path)).filter((worktreePath) => !observedPaths.has(worktreePath)).sort(),
       ambiguousWorktreePaths
     };
   }
@@ -2714,7 +3046,7 @@ var WorkspaceService = class {
    */
   reapAmbiguousOrphans(input) {
     const repository = discoverRepository(input.repositoryPath);
-    const protectedSet = new Set((input.protectedPaths ?? []).map((p) => path5.resolve(p)));
+    const protectedSet = new Set((input.protectedPaths ?? []).map((p) => path6.resolve(p)));
     const ttlHours = input.ttlHours ?? 24;
     const cutoffMs = Date.now() - ttlHours * 3600 * 1e3;
     const originHead = originHeadBranchRef(repository.primaryCheckoutPath);
@@ -2732,7 +3064,7 @@ var WorkspaceService = class {
     };
     const ambiguous = /* @__PURE__ */ new Map();
     for (const worktreePath of this.reconcileRepository(input.repositoryPath).ambiguousWorktreePaths) {
-      ambiguous.set(path5.basename(worktreePath), worktreePath);
+      ambiguous.set(path6.basename(worktreePath), worktreePath);
     }
     const guids = /* @__PURE__ */ new Set([...ambiguous.keys()]);
     for (const branch of listManagedBranches(repository.primaryCheckoutPath)) {
@@ -2746,7 +3078,7 @@ var WorkspaceService = class {
         this.deleteOrphanSurface(repository.repositoryIdentity, workspace_guid);
       }
     }
-    const scratchDir = mkdtempSync2(path5.join(os3.tmpdir(), "ironclaude-orphan-"));
+    const scratchDir = mkdtempSync2(path6.join(os3.tmpdir(), "ironclaude-orphan-"));
     try {
       for (const guid of guids) {
         const name = managedBranch(guid);
@@ -2755,8 +3087,8 @@ var WorkspaceService = class {
           const branchRef = `refs/heads/${name}`;
           const hasBranch = this.refResolves(repository.primaryCheckoutPath, branchRef);
           const worktreePath = ambiguous.get(guid);
-          const present = worktreePath !== void 0 && existsSync3(worktreePath);
-          if (present && protectedSet.has(path5.resolve(worktreePath))) {
+          const present = worktreePath !== void 0 && existsSync4(worktreePath);
+          if (present && protectedSet.has(path6.resolve(worktreePath))) {
             result.skippedLive.push(name);
             continue;
           }
@@ -2847,15 +3179,15 @@ var WorkspaceService = class {
       SELECT workspace_guid, short_id, tip, category, muted_tip FROM orphan_surface
       WHERE repository_identity = ?
     `).all(repository.repositoryIdentity);
-    const orphans = rows.filter((row) => row.muted_tip !== row.tip).filter((row) => {
-      const branchRef = `refs/heads/${managedBranch(row.workspace_guid)}`;
-      return this.refResolves(repository.primaryCheckoutPath, branchRef) || existsSync3(managedWorktreePath(repository.primaryCheckoutPath, row.workspace_guid));
-    }).map((row) => ({
-      id: row.short_id,
-      workspace_guid: row.workspace_guid,
-      branch: managedBranch(row.workspace_guid),
-      tip: row.tip,
-      category: row.category
+    const orphans = rows.filter((row2) => row2.muted_tip !== row2.tip).filter((row2) => {
+      const branchRef = `refs/heads/${managedBranch(row2.workspace_guid)}`;
+      return this.refResolves(repository.primaryCheckoutPath, branchRef) || existsSync4(managedWorktreePath(repository.primaryCheckoutPath, row2.workspace_guid));
+    }).map((row2) => ({
+      id: row2.short_id,
+      workspace_guid: row2.workspace_guid,
+      branch: managedBranch(row2.workspace_guid),
+      tip: row2.tip,
+      category: row2.category
     }));
     return { orphans };
   }
@@ -2872,7 +3204,7 @@ var WorkspaceService = class {
    */
   resolveOrphan(input) {
     const repository = discoverRepository(input.repositoryPath);
-    const protectedSet = new Set((input.protectedPaths ?? []).map((p) => path5.resolve(p)));
+    const protectedSet = new Set((input.protectedPaths ?? []).map((p) => path6.resolve(p)));
     const results = [];
     for (const resolution of input.resolutions) {
       const outcome = this.resolveOneOrphan(repository, protectedSet, resolution);
@@ -2916,21 +3248,21 @@ var WorkspaceService = class {
       if (!resolution.id && resolution.guid && (resolution.action === "reap" || resolution.action === "merge-then-reap")) {
         return { id, guid, outcome: "refused-changed" };
       }
-      const row = this.findOrphanSurfaceRow(repository.repositoryIdentity, resolution);
-      if (!row) return { id, guid, outcome: "not-surfaced" };
-      guid = row.workspace_guid;
-      id = row.short_id;
+      const row2 = this.findOrphanSurfaceRow(repository.repositoryIdentity, resolution);
+      if (!row2) return { id, guid, outcome: "not-surfaced" };
+      guid = row2.workspace_guid;
+      id = row2.short_id;
       const name = managedBranch(guid);
       const branchRef = `refs/heads/${name}`;
       const worktreePath = managedWorktreePath(repository.primaryCheckoutPath, guid);
       const registered = worktreeExists(repository.primaryCheckoutPath, worktreePath);
-      const present = registered && existsSync3(worktreePath);
+      const present = registered && existsSync4(worktreePath);
       const hasBranch = this.refResolves(repository.primaryCheckoutPath, branchRef);
       const currentTip = hasBranch ? runGit(repository.primaryCheckoutPath, ["rev-parse", branchRef]).trim() : present ? worktreeHead(worktreePath) : null;
-      if (currentTip === null || currentTip !== row.tip) {
+      if (currentTip === null || currentTip !== row2.tip) {
         return { id, guid, outcome: "refused-changed" };
       }
-      if (this.hasNonCleanedAssignment(repository.repositoryIdentity, guid) || present && protectedSet.has(path5.resolve(worktreePath))) {
+      if (this.hasNonCleanedAssignment(repository.repositoryIdentity, guid) || present && protectedSet.has(path6.resolve(worktreePath))) {
         return { id, guid, outcome: "skipped-live" };
       }
       if (resolution.action === "keep") {
@@ -2941,13 +3273,13 @@ var WorkspaceService = class {
       }
       if (resolution.action === "merge-then-reap") {
         if (present && !worktreeIsClean(worktreePath)) {
-          return { id, guid, outcome: row.category === "dirty" ? "refused-dirty" : "refused-changed" };
+          return { id, guid, outcome: row2.category === "dirty" ? "refused-dirty" : "refused-changed" };
         }
         return this.mergeOrphanThenReap(repository, name, branchRef, worktreePath, present, registered, currentTip, resolution, id, guid);
       }
       let force = false;
       if (present && !worktreeIsClean(worktreePath)) {
-        if (row.category !== "dirty" || resolution.category !== "dirty") {
+        if (row2.category !== "dirty" || resolution.category !== "dirty") {
           return { id, guid, outcome: "refused-changed" };
         }
         force = true;
@@ -3013,7 +3345,7 @@ var WorkspaceService = class {
         return { id, guid, outcome: "needs-manual-merge" };
       }
       const mergeTreeArgs = ["merge-tree", "--write-tree", expected, tip];
-      const mt = spawnSync3("git", ["-C", primary, ...mergeTreeArgs], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
+      const mt = spawnSync4("git", ["-C", primary, ...mergeTreeArgs], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
       if (mt.error) throw mt.error;
       if (mt.status === 1) return { id, guid, outcome: "conflict" };
       if (mt.status !== 0) throw gitError(primary, mergeTreeArgs, mt.stderr || "");
@@ -3026,14 +3358,14 @@ var WorkspaceService = class {
         GIT_COMMITTER_EMAIL: "ironclaude-reaper@localhost"
       };
       const commitTreeArgs = ["commit-tree", tree, "-p", expected, "-p", tip, "-m", `ironclaude: merge orphan ${name} into ${target}`];
-      const ct = spawnSync3("git", ["-C", primary, ...commitTreeArgs], { encoding: "utf8", env: botEnv, maxBuffer: GIT_MAX_BUFFER });
+      const ct = spawnSync4("git", ["-C", primary, ...commitTreeArgs], { encoding: "utf8", env: botEnv, maxBuffer: GIT_MAX_BUFFER });
       if (ct.error) throw ct.error;
       if (ct.status !== 0) throw gitError(primary, commitTreeArgs, ct.stderr || "");
       newCommit = (ct.stdout || "").trim();
     }
     if (newCommit !== expected) {
       assertNoPrimaryOverlap(primary, target, expected, newCommit);
-      const upd = spawnSync3("git", ["-C", primary, "update-ref", target, newCommit, expected], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
+      const upd = spawnSync4("git", ["-C", primary, "update-ref", target, newCommit, expected], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
       if (upd.error) throw upd.error;
       if (upd.status !== 0) return { id, guid, outcome: "target-moved" };
       if (primaryOnRef(primary, target)) {
@@ -3087,9 +3419,9 @@ var WorkspaceService = class {
   }
   /** Upserts the orphan's surface row and builds the reported PreservedOrphan, including `muted`. */
   buildPreservedOrphan(repository, guid, branch, tip, category, evidence, worktreePresent) {
-    const id = createHash2("sha256").update(`${guid}\0${tip}`).digest("hex").slice(0, 8);
-    const row = this.upsertOrphanSurface(repository.repositoryIdentity, guid, id, tip, category);
-    return { id, guid, branch, category, tip, worktreePresent, evidence, muted: row.muted_tip === tip };
+    const id = createHash3("sha256").update(`${guid}\0${tip}`).digest("hex").slice(0, 8);
+    const row2 = this.upsertOrphanSurface(repository.repositoryIdentity, guid, id, tip, category);
+    return { id, guid, branch, category, tip, worktreePresent, evidence, muted: row2.muted_tip === tip };
   }
   /**
    * Upserts the durable orphan_surface row for one (repository, guid), keyed
@@ -3153,18 +3485,21 @@ var WorkspaceService = class {
     const toRelink = [...written.added, ...written.skipped];
     if (toRelink.length > 0) {
       const liveManaged = this.db.prepare(`
-        SELECT worktree_path FROM assignments
+        SELECT workspace_guid, worktree_path FROM assignments
         WHERE repository_identity = ?
           AND lifecycle_status NOT IN ('integrated', 'abandoned', 'cleaned')
       `).all(repository.repositoryIdentity);
-      for (const { worktree_path } of liveManaged) {
-        if (!existsSync3(worktree_path)) continue;
-        const planted = linkSharedResources(
-          repository.primaryCheckoutPath,
-          worktree_path,
-          repository.repositoryIdentity,
-          toRelink
-        );
+      for (const { workspace_guid, worktree_path } of liveManaged) {
+        const planted = withAssignmentMutation(this.db, workspace_guid, "shared-resource-relink", () => {
+          const current = getAssignment(this.db, workspace_guid);
+          if (!current || current.repository_identity !== repository.repositoryIdentity || current.worktree_path !== worktree_path || !nonterminal(current.lifecycle_status) || !existsSync4(worktree_path)) return [];
+          return linkSharedResources(
+            repository.primaryCheckoutPath,
+            worktree_path,
+            repository.repositoryIdentity,
+            toRelink
+          );
+        });
         if (planted.length > 0) relinked[worktree_path] = planted;
       }
     }
@@ -3173,7 +3508,7 @@ var WorkspaceService = class {
 };
 
 // src/cli.ts
-var INTERNAL_COMMAND_NAMES = ["allocate", "bind", "finalize", "abandon", "reconcile", "cleanup", "sync", "reap", "configure-shared-resources", "list-shared-resources", "list-surfaced-orphans", "reap-orphans", "resolve-orphan"];
+var INTERNAL_COMMAND_NAMES = ["allocate", "bind", "finalize", "abandon", "reconcile", "cleanup", "sync", "reap", "configure-shared-resources", "list-shared-resources", "list-surfaced-orphans", "reap-orphans", "resolve-orphan", "begin-handoff", "transfer-handoff", "finish-handoff", "handoff-status", "reap-stale-mutations", "release-handoff", "finish-handoff-after-target"];
 function waitForCliDatabase(milliseconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
@@ -3195,6 +3530,40 @@ function requiredString(args, key) {
   const value = args[key];
   if (typeof value !== "string" || value.length === 0) throw new Error(`${key} must be a non-empty string`);
   return value;
+}
+function requiredPositiveInteger(args, key) {
+  const value = args[key];
+  if (!Number.isInteger(value) || value <= 0) throw new Error(`${key} must be a positive integer`);
+  return value;
+}
+function handoffInput(args) {
+  return {
+    repositoryPath: requiredString(args, "repository_path"),
+    repositoryIdentity: requiredString(args, "repository_identity"),
+    workspaceGuid: requiredString(args, "workspace_guid"),
+    workerId: requiredString(args, "worker_id"),
+    sourceOwnerSessionId: requiredString(args, "source_owner_session_id"),
+    generation: requiredPositiveInteger(args, "generation"),
+    capabilityToken: requiredString(args, "capability_token"),
+    expectedWorktreePath: requiredString(args, "expected_worktree_path"),
+    expectedBranch: requiredString(args, "expected_branch"),
+    expectedBaseCommit: requiredString(args, "expected_base_commit"),
+    expectedCurrentHead: requiredString(args, "expected_current_head"),
+    expectedIntegrationTarget: requiredString(args, "expected_integration_target")
+  };
+}
+function safeHandoffResult(db, input) {
+  const handoff = db.prepare(`SELECT workspace_guid, generation, source_owner_session_id, target_owner_session_id,
+    repository_identity, worker_id, worktree_path, branch, base_commit, current_head, integration_target, phase
+    FROM workspace_handoffs WHERE workspace_guid = ?`).get(input.workspaceGuid);
+  if (!handoff) throw new Error("Handoff state disappeared");
+  return { protocol_version: 1, ...handoff };
+}
+function handoffStatus(db, workspaceGuid) {
+  const handoff = db.prepare(`SELECT workspace_guid, generation, source_owner_session_id, target_owner_session_id,
+    repository_identity, worker_id, worktree_path, branch, base_commit, current_head, integration_target, phase
+    FROM workspace_handoffs WHERE workspace_guid = ?`).get(workspaceGuid);
+  return handoff ? { protocol_version: 1, present: true, ...handoff } : { protocol_version: 1, present: false, workspace_guid: workspaceGuid };
 }
 function optionalString(args, key) {
   const value = args[key];
@@ -3318,6 +3687,34 @@ function dispatchInternalCommand(name, args, dependencies) {
       return dependencies["reap-orphans"](args);
     case "resolve-orphan":
       return dependencies["resolve-orphan"](args);
+    case "begin-handoff":
+      return dependencies["begin-handoff"]?.(args) ?? (() => {
+        throw new Error("begin-handoff dependency is unavailable");
+      })();
+    case "transfer-handoff":
+      return dependencies["transfer-handoff"]?.(args) ?? (() => {
+        throw new Error("transfer-handoff dependency is unavailable");
+      })();
+    case "finish-handoff":
+      return dependencies["finish-handoff"]?.(args) ?? (() => {
+        throw new Error("finish-handoff dependency is unavailable");
+      })();
+    case "handoff-status":
+      return dependencies["handoff-status"]?.(args) ?? (() => {
+        throw new Error("handoff-status dependency is unavailable");
+      })();
+    case "reap-stale-mutations":
+      return dependencies["reap-stale-mutations"]?.(args) ?? (() => {
+        throw new Error("reap-stale-mutations dependency is unavailable");
+      })();
+    case "release-handoff":
+      return dependencies["release-handoff"]?.(args) ?? (() => {
+        throw new Error("release-handoff dependency is unavailable");
+      })();
+    case "finish-handoff-after-target":
+      return dependencies["finish-handoff-after-target"]?.(args) ?? (() => {
+        throw new Error("finish-handoff-after-target dependency is unavailable");
+      })();
     default:
       throw new Error(`Unknown internal workspace command: ${name}`);
   }
@@ -3431,7 +3828,39 @@ function createInternalCommandDependencies(db) {
       repositoryPath: requiredString(args, "repository_path"),
       protectedPaths: optionalStringArray(args, "protected_paths"),
       resolutions: requiredResolutions(args, "resolutions")
-    })
+    }),
+    "begin-handoff": (args) => {
+      const input = handoffInput(args);
+      beginHandoff(db, input);
+      return safeHandoffResult(db, input);
+    },
+    "transfer-handoff": (args) => {
+      const input = { ...handoffInput(args), targetOwnerSessionId: requiredString(args, "target_owner_session_id") };
+      transferHandoff(db, input);
+      return safeHandoffResult(db, input);
+    },
+    "finish-handoff": (args) => {
+      const input = handoffInput(args);
+      finishHandoff(db, input);
+      return safeHandoffResult(db, input);
+    },
+    "handoff-status": (args) => handoffStatus(db, requiredString(args, "workspace_guid")),
+    "reap-stale-mutations": () => ({ protocol_version: 1, reaped: reapStaleMutations(db) }),
+    "release-handoff": (args) => {
+      const input = {
+        workspaceGuid: requiredString(args, "workspace_guid"),
+        generation: requiredPositiveInteger(args, "generation"),
+        capabilityToken: requiredString(args, "capability_token"),
+        sourceOwnerSessionId: requiredString(args, "source_owner_session_id")
+      };
+      releaseHandoff(db, input);
+      return handoffStatus(db, input.workspaceGuid);
+    },
+    "finish-handoff-after-target": (args) => {
+      const input = handoffInput(args);
+      finishHandoffAfterTarget(db, input);
+      return safeHandoffResult(db, input);
+    }
   };
 }
 function runCli(argv = process.argv.slice(2), db = initDb()) {
@@ -3449,7 +3878,7 @@ function runCli(argv = process.argv.slice(2), db = initDb()) {
   }
   return dispatchInternalCommand(command, args, createInternalCommandDependencies(db));
 }
-var invokedPath = process.argv[1] ? path6.resolve(process.argv[1]) : null;
+var invokedPath = process.argv[1] ? path7.resolve(process.argv[1]) : null;
 if (invokedPath === fileURLToPath(import.meta.url)) {
   try {
     process.stdout.write(`${JSON.stringify(runCli(process.argv.slice(2), initCliDb()))}

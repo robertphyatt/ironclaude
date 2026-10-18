@@ -22,6 +22,7 @@ import {
 } from './search.js';
 import { formatConversationAsMarkdown } from './show.js';
 import { getArchiveDir } from './paths.js';
+import { resolveArchiveFile, readArchiveText } from './archive-io.js';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import path from 'path';
@@ -81,6 +82,14 @@ const SearchInputSchema = z
     response_format: ResponseFormatEnum.default('markdown').describe(
       'Output format: "markdown" for human-readable or "json" for machine-readable (default: "markdown")'
     ),
+    session_class: z
+      .enum(['operator', 'brain', 'worker', 'unknown'])
+      .optional()
+      .describe('Only return exchanges from this kind of session: "operator" (interactive), "brain", "worker" (automation), "unknown" (no provenance recorded)'),
+    prefer_operator: z
+      .boolean()
+      .optional()
+      .describe('Rank exchanges from interactive (operator) sessions first'),
   })
   .strict();
 
@@ -154,6 +163,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             after: { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$' },
             before: { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$' },
             response_format: { type: 'string', enum: ['markdown', 'json'], default: 'markdown' },
+            session_class: { type: 'string', enum: ['operator', 'brain', 'worker', 'unknown'] },
+            prefer_operator: { type: 'boolean' },
           },
           required: ['query'],
           additionalProperties: false,
@@ -208,6 +219,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           limit: params.limit,
           after: params.after,
           before: params.before,
+          sessionClass: params.session_class,
+          preferOperator: params.prefer_operator,
         };
 
         const results = await searchMultipleConcepts(params.query, options);
@@ -232,6 +245,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           limit: params.limit,
           after: params.after,
           before: params.before,
+          sessionClass: params.session_class,
+          preferOperator: params.prefer_operator,
         };
 
         const results = await searchConversations(params.query, options);
@@ -268,8 +283,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === 'read') {
       const params = ShowConversationInputSchema.parse(args);
 
-      // Verify file exists (preserve existing not-found handling)
-      if (!fs.existsSync(params.path)) {
+      // Resolve the logical .jsonl to the file on disk (raw, or .jsonl.zst once compacted).
+      const onDisk = resolveArchiveFile(path.resolve(params.path));
+      if (!onDisk) {
         throw new Error(`File not found: ${params.path}`);
       }
 
@@ -277,10 +293,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // indexes untrusted prior-conversation content, so a prompt-injection
       // payload in an indexed exchange could otherwise steer the agent to read
       // an arbitrary local file (SSH keys, .env, etc.) and surface it. Resolve
-      // both the archive base and the requested path through realpathSync to
+      // both the archive base and the file on disk through realpathSync to
       // defeat symlink escapes, then assert containment before reading.
       const archiveDir = fs.realpathSync(getArchiveDir());
-      const resolvedPath = fs.realpathSync(path.resolve(params.path));
+      const resolvedPath = fs.realpathSync(onDisk);
       const relative = path.relative(archiveDir, resolvedPath);
       const isInsideArchive =
         resolvedPath === archiveDir ||
@@ -292,7 +308,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       // Read and format conversation with optional line range
-      const jsonlContent = fs.readFileSync(resolvedPath, 'utf-8');
+      const jsonlContent = readArchiveText(resolvedPath);
       const markdownContent = formatConversationAsMarkdown(
         jsonlContent,
         params.startLine,

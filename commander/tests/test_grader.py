@@ -209,10 +209,13 @@ class TestMarkdownFenceStripping:
 
 
 class TestConfigLoading:
-    def test_config_absent_uses_localhost_defaults(self, tmp_path):
+    def test_ollama_backend_without_url_uses_localhost_defaults(self, tmp_path):
+        import json as _json
+        cfg = tmp_path / "ollama.json"
+        cfg.write_text(_json.dumps({"backend": "ollama"}))
         with patch("ironclaude.grader.OllamaClient") as MockClient:
             MockClient.return_value.post_generate.return_value = '{"valid": true}'
-            grader = LocalGrader(config_path=str(tmp_path / "nonexistent.json"))
+            grader = LocalGrader(config_path=str(cfg))
             grader.grade("sys", "user", SIMPLE_SCHEMA)
         MockClient.assert_called_once_with(
             url="http://localhost:11434",
@@ -220,6 +223,7 @@ class TestConfigLoading:
             timeout=120,
             connect_timeout=3,
             probe_timeout=3,
+            use_breaker=False,
         )
 
 
@@ -227,13 +231,13 @@ class TestTimeoutOverride:
     def test_timeout_override_beats_config(self, tmp_path):
         import json as _json
         cfg = tmp_path / "c.json"
-        cfg.write_text(_json.dumps({"ollama": {"url": "http://x"}, "timeout_seconds": 600}))
+        cfg.write_text(_json.dumps({"backend": "ollama", "ollama": {"url": "http://x"}, "timeout_seconds": 600}))
         assert LocalGrader(config_path=str(cfg), timeout=15)._get_client()._timeout == 15
 
     def test_config_timeout_used_when_no_override(self, tmp_path):
         import json as _json
         cfg = tmp_path / "c.json"
-        cfg.write_text(_json.dumps({"ollama": {"url": "http://x"}, "timeout_seconds": 600}))
+        cfg.write_text(_json.dumps({"backend": "ollama", "ollama": {"url": "http://x"}, "timeout_seconds": 600}))
         assert LocalGrader(config_path=str(cfg))._get_client()._timeout == 600
 
 
@@ -264,11 +268,11 @@ class TestConfigHotReload:
     def test_client_rebuilt_when_config_mtime_changes(self, tmp_path):
         import json as _json, os
         cfg = tmp_path / "c.json"
-        cfg.write_text(_json.dumps({"ollama": {"url": "http://old"}}))
+        cfg.write_text(_json.dumps({"backend": "ollama", "ollama": {"url": "http://old"}}))
         g = LocalGrader(config_path=str(cfg))
         c1 = g._get_client()
         assert c1._url == "http://old"
-        cfg.write_text(_json.dumps({"ollama": {"url": "http://new"}}))
+        cfg.write_text(_json.dumps({"backend": "ollama", "ollama": {"url": "http://new"}}))
         os.utime(str(cfg), (10_000, 10_000))    # bump mtime
         c2 = g._get_client()
         assert c2._url == "http://new" and c2 is not c1
@@ -303,7 +307,9 @@ class TestFastLaneReadTimeout:
                 return c
 
             MockClient.side_effect = _make
-            grader = LocalGrader(config_path=str(tmp_path / "nonexistent.json"))
+            ollama_cfg = tmp_path / "ollama.json"
+            ollama_cfg.write_text('{"backend": "ollama"}')
+            grader = LocalGrader(config_path=str(ollama_cfg))
 
             # Build + use the normal (600s-style) client first.
             normal_client = grader._get_client()
@@ -331,7 +337,9 @@ class TestFastLaneReadTimeout:
                 return c
 
             MockClient.side_effect = _make
-            grader = LocalGrader(config_path=str(tmp_path / "nonexistent.json"))
+            ollama_cfg = tmp_path / "ollama.json"
+            ollama_cfg.write_text('{"backend": "ollama"}')
+            grader = LocalGrader(config_path=str(ollama_cfg))
 
             grader.grade("sys", "user", SIMPLE_SCHEMA, read_timeout=2)
             first_fast_client = grader._fast_client

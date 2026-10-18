@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import collections
 import difflib
+import functools
 import fcntl
 import hashlib
 import json
@@ -34,7 +35,7 @@ import psutil
 import requests
 import shlex
 
-from ironclaude.config import make_opus_command, effort_for_tier
+from ironclaude.config import make_opus_command, effort_for_tier, default_machines_config_path
 from ironclaude.db import (
     DIRECT_REPLY_FALLBACK_REASON,
     persist_operator_message_acknowledgement,
@@ -48,8 +49,9 @@ from ironclaude.fable_availability import (
     clear_fable_unavailable as _clear_fable_unavailable,
 )
 from ironclaude import paths
+from ironclaude import fast_model
 from ironclaude.grader import GRAMMAR_MAX_STRING_LENGTH, LocalGrader
-from ironclaude.provider_config import provider_config_from_commander, _semantic_tier, ProviderConfigError
+from ironclaude.provider_config import provider_config_from_commander, _semantic_tier, ProviderConfigError, CODEX_TIER_WORDS, REMOTE_CODEX_CACHE_ARGV, CodexModelUnavailable, resolve_local_codex_model
 from ironclaude.provider_state import ProviderState, TRANSIENT_UNAVAILABLE_REASONS
 from ironclaude.provider_capabilities import CapabilityRegistry, CapabilityProbe
 from ironclaude.provider_router import ProviderRouter, NoCapabilityAvailable
@@ -204,6 +206,13 @@ _CODEX_ADVISOR_INSTRUCTION = (
     "advisor command is unavailable. Prepend the exact complete "
     "write-lossless-ai-messages skill content to every report-only reviewer prompt "
     "and keep the reviewer report lossless."
+)
+
+# Same-tier variant (design T8). The broker's "one-up" maps Sol to Astra, so an
+# Opus-class worker on Codex whose advisor class is also Opus asks for "same"
+# (Sol reviews Sol). Single line, like the constant above.
+_CODEX_ADVISOR_INSTRUCTION_SAME_TIER = _CODEX_ADVISOR_INSTRUCTION.replace(
+    'review_tier: "one-up"', 'review_tier: "same"'
 )
 
 VALID_DIRECTIVE_STATUSES = frozenset({
@@ -492,7 +501,7 @@ class OrchestratorTools:
         self._advisor_cfg = advisor_cfg or {}
         self._dispatch_cfg = dispatch_cfg or {}
         self._ssh_manager = ssh_manager
-        self._machines_config_path = os.environ.get("IC_MACHINES_CONFIG", "config/machines.yaml")
+        self._machines_config_path = os.environ.get("IC_MACHINES_CONFIG", default_machines_config_path())
         self._ssh_lock = threading.Lock()
         self._config = config or {}
         self._ollama_inventory = ollama_inventory
@@ -505,6 +514,7 @@ class OrchestratorTools:
         self._workspace_client = WorkspaceClient(
             workspace_plugin_root,
             ssh_manager=ssh_manager,
+            timeout=int(self._config.get("workspace_cli_timeout_seconds", 900)),
         )
         brain_cwd = (
             os.environ.get("IC_BRAIN_CWD")
@@ -516,12 +526,13 @@ class OrchestratorTools:
         self._ollama_config_path = paths.hooks_config()
         self._ollama_client: OllamaClient | None = None
         self._ollama_cfg_cache: dict = {}
-        self._local_grader = LocalGrader(config_path=self._ollama_config_path)
+        self._local_grader = LocalGrader(config_path=self._ollama_config_path, commander_config=self._config)
         # R5b: bounded + kept-alive grader for the operator-facing message path only.
         self._message_grader = LocalGrader(
             config_path=self._ollama_config_path,
             timeout=self.MESSAGE_GRADER_TIMEOUT_SECONDS,
             keep_alive="30m",
+            commander_config=self._config,
         )
         self._shadow_grader = ShadowGrader(config_path=self._ollama_config_path)
         self._last_grader_delta: str = ""
@@ -530,10 +541,21 @@ class OrchestratorTools:
     def _advisor_model_for(self, worker_type: str) -> str:
         """Return the tiered advisor model for a given worker type.
 
-        Looks up worker_type in advisor_models (one-tier-up map); falls back
+        Looks up worker_type in advisor_models (advisor class per worker type; design T8: opus class by default, the top tier only by explicit config); falls back
         to the scalar advisor_model default when worker_type is unmapped.
         """
         return self._advisor_cfg.get("advisor_models", {}).get(worker_type) or self._advisor_cfg.get("advisor_model", "opus")
+
+    def _codex_advisor_instruction(self, worker_type: str) -> str:
+        """Codex advisor directive for this worker (design T8). Same rule as Claude:
+        when the worker's class equals its advisor's class (the default for Opus-class
+        workers), ask the broker for review_tier "same" so Sol is not mapped to Astra;
+        otherwise (Sonnet -> Opus, or an explicit top-tier override) keep "one-up"."""
+        worker_class = _WORKER_TYPE_TIER.get(worker_type)
+        advisor_class = _semantic_tier(self._advisor_model_for(worker_type), "advisor_model", "opus")
+        if worker_class is not None and worker_class == advisor_class:
+            return _CODEX_ADVISOR_INSTRUCTION_SAME_TIER
+        return _CODEX_ADVISOR_INSTRUCTION
 
     def _track_failed_base(self, base: str) -> None:
         """Record a worker base for retry escalation, keeping the set bounded.
@@ -565,8 +587,8 @@ class OrchestratorTools:
         `_build_worker_launch_cmd`). No `[1m]` (claude-only); ChatGPT-sub auth via codex CLI."""
         codex_path = (self._config.get("providers", {}).get("clients", {})
                       .get("codex", {}).get("path", "codex"))
-        return (f"exec {codex_path} --model {shlex.quote(model)} "
-                f"--dangerously-bypass-approvals-and-sandbox")
+        return (f"exec {shlex.quote(codex_path)} --model {shlex.quote(model)} "
+                f"--no-daemon --dangerously-bypass-approvals-and-sandbox")
 
     def _resolve_worker_client(self, worker_type: str):
         """ProviderHandle for the worker, or None to use the legacy claude path.
@@ -621,7 +643,23 @@ class OrchestratorTools:
                 ))
         return router.resolve(
             "worker", tier, [machine_cfg.host],
+            codex_cache=lambda _host: self._read_remote_codex_cache(machine_cfg),
         )
+
+    def _read_remote_codex_cache(self, machine_cfg) -> str | None:
+        """The remote box's own Codex models_cache.json (design 2026-10-17 v120-completeness R2:
+        a family word resolves where Codex runs). None when the read fails, so the router treats
+        Codex as unavailable for the call."""
+        argv = list(REMOTE_CODEX_CACHE_ARGV)
+        codex_home = (machine_cfg.env or {}).get("CODEX_HOME")
+        if codex_home:
+            argv = ["env", f"CODEX_HOME={codex_home}", *argv]
+        try:
+            result = self._ssh_manager.run_argv(machine_cfg.host, argv)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("Remote Codex models cache read failed on %s: %s", machine_cfg.host, exc)
+            return None
+        return result.stdout if result.returncode == 0 else None
 
     def _effort_for_tier(self, tier) -> str:
         """Reasoning effort for a tier: the per-tier override else the global level."""
@@ -844,6 +882,26 @@ class OrchestratorTools:
         except OSError:
             logger.warning(f"Could not write brain contact file for {worker_id}")
 
+    def _registered_worker_session(self, worker_id: str, worker: dict | None = None) -> str:
+        """Address successor generation rather than an obsolete source tmux name."""
+        worker = worker if worker is not None else self.registry.get_worker(worker_id)
+        return (worker.get("tmux_session") or f"ic-{worker_id}") if worker else f"ic-{worker_id}"
+
+    def handoff_worker(self, worker_id: str, quota_verdict: dict) -> dict:
+        """Private daemon entry point; no corresponding MCP tool is registered."""
+        from ironclaude.worker_handoff import WorkerHandoffController
+        return WorkerHandoffController(self).handoff(worker_id, quota_verdict)
+
+    def reconcile_worker_handoff(self, worker_id: str) -> dict:
+        """Private restart readback of an unfinished handoff."""
+        from ironclaude.worker_handoff import WorkerHandoffController
+        return WorkerHandoffController(self).reconcile(worker_id)
+
+    def retry_worker_handoff_preflight(self, worker_id: str) -> dict:
+        """Private retry for a known pre-effect hold after external capacity changes."""
+        from ironclaude.worker_handoff import WorkerHandoffController
+        return WorkerHandoffController(self).retry_paused_preflight(worker_id)
+
     def _resolve_ssh_host(self, worker_id: str) -> str | None:
         """Resolve SSH host for a worker from its machine field."""
         worker = self.registry.get_worker(worker_id)
@@ -999,8 +1057,10 @@ class OrchestratorTools:
         )
 
     def _claude_grader_argv(self, schema: dict, sysfile: str, model: str) -> list:
-        """The exact ``claude -p`` grader argv. Kept byte-identical to the historical
-        command; only ``model`` is now a parameter (was self._grader_model)."""
+        """The exact ``claude -p`` grader argv. Historical command plus
+        --no-session-persistence (no session file per grade; safe for every tier
+        because _grader_home is only the cwd); only ``model`` is now a parameter
+        (was self._grader_model)."""
         return [
             "claude", "-p",
             "--system-prompt-file", sysfile,
@@ -1010,20 +1070,17 @@ class OrchestratorTools:
             # unlock 1M context (opus). Fable 5 / Sonnet 5 have 1M natively and
             # REJECT the suffix — `fable[1m]`/`sonnet[1m]` is an invalid model id.
             "--model", (f"{model}[1m]" if _model_needs_1m_beta(model) else model),
-            "--dangerously-skip-permissions",
-            # --dangerously-skip-permissions is required for a non-interactive
-            # run, so the grader must be starved of every mutating/agentic tool
-            # by name (the prompt embeds worker-controlled log text — treat it as
-            # untrusted). --strict-mcp-config drops the plugin MCP servers so no
-            # `mcp__*` state-manager mutators are reachable; the disallow list
-            # removes the built-in file/exec tools AND the agentic ones (Skill,
-            # Workflow, worktree, cron, wakeup, remote-trigger, messaging). The
-            # StructuredOutput verdict tool is intentionally NOT disallowed.
+            "--restricted",
+            # --restricted (which refuses --dangerously-skip-permissions) ignores user, project and
+            # local settings and drops the server-side advisor tool. The grader runs with NO tools
+            # (--tools "", like the fast-model child): the prompt embeds worker-controlled log text,
+            # so treat it as untrusted. --strict-mcp-config drops plugin MCP servers and
+            # disableAllHooks keeps user/IronClaude hooks out; the verdict still arrives through
+            # --json-schema structured output. Effort comes from _grader_env.
             "--strict-mcp-config",
-            "--disallowedTools",
-            "Task,Bash,Read,Edit,Write,NotebookEdit,Grep,Glob,WebFetch,WebSearch,"
-            "Skill,Workflow,ToolSearch,SendMessage,EnterWorktree,ExitWorktree,"
-            "CronCreate,CronDelete,CronList,ScheduleWakeup,RemoteTrigger",
+            "--no-session-persistence",
+            "--tools", "",
+            "--settings", fast_model._DISABLE_HOOKS_SETTINGS,
         ]
 
     def _parse_claude_grader_output(self, proc, batch: bool):
@@ -1081,7 +1138,9 @@ class OrchestratorTools:
         --output-schema takes a FILE; --ephemeral (no session litter) and
         --skip-git-repo-check (grader_home is not a git repo) are required; -s read-only
         pins the sandbox; NO [1m] suffix (claude-only). The concatenated system+user prompt
-        is delivered on stdin via the trailing ``-``."""
+        is delivered on stdin via the trailing ``-``. It runs with the shared no-tools set
+        (fast_model.CODEX_NO_TOOLS_ARGS) and without user config or rules, matching the Claude grader's --tools "" /
+        disableAllHooks: the prompt embeds untrusted worker text."""
         codex_path = (
             self._config.get("providers", {}).get("clients", {})
             .get("codex", {}).get("path", "codex")
@@ -1089,9 +1148,24 @@ class OrchestratorTools:
         return [
             codex_path, "exec",
             "-c", f'model_reasoning_effort="{effort if effort is not None else self._effort_level}"',
-            "--json", "--ephemeral", "--skip-git-repo-check",
+            *fast_model.CODEX_NO_TOOLS_ARGS,
+            "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check",
             "--output-schema", schema_file, "-s", "read-only", "-m", model, "-",
         ]
+
+    def _codex_grader_schema(self, schema: dict) -> dict:
+        """Strict copy for ``codex exec --output-schema``: Codex rejects a schema whose
+        ``required`` omits a property (HTTP 400 invalid_json_schema). The Claude arm keeps
+        the original; _parse_codex_grader_output drops the resulting null optionals."""
+        return fast_model.strict_codex_schema(schema)
+
+    @staticmethod
+    def _drop_null_recommended(verdict):
+        """A strict Codex schema makes recommended_model required-but-nullable; drop a null
+        so callers' .get('recommended_model', default) falls back as it does for Claude."""
+        if isinstance(verdict, dict) and "recommended_model" in verdict and verdict["recommended_model"] is None:
+            return {k: v for k, v in verdict.items() if k != "recommended_model"}
+        return verdict
 
     def _parse_codex_grader_output(self, proc, batch: bool):
         """Parse ``codex exec --json`` grader output. The schema-constrained verdict is the
@@ -1112,13 +1186,13 @@ class OrchestratorTools:
             return self._grader_failure(batch, f"Codex grader produced no verdict JSON: {proc.stdout[:300]}")
         if batch:
             verdicts = out.get("verdicts")
-            return verdicts if isinstance(verdicts, list) else self._grader_failure(
+            return [self._drop_null_recommended(v) for v in verdicts] if isinstance(verdicts, list) else self._grader_failure(
                 True, f"Codex batch output missing 'verdicts' list: {str(out)[:200]}")
         return {
             "grade": out.get("grade", "F"),
             "approved": out.get("approved", False),
             "feedback": out.get("feedback", ""),
-            **({"recommended_model": out["recommended_model"]} if "recommended_model" in out else {}),
+            **({"recommended_model": out["recommended_model"]} if out.get("recommended_model") is not None else {}),
         }
 
     @staticmethod
@@ -1168,7 +1242,18 @@ class OrchestratorTools:
             return None
         return re.sub(r"\s+", " ", stderr.strip()).strip()[-90:]
 
-    def _call_grader(self, system_prompt: str, user_prompt: str, batch: bool = False) -> dict | list:
+    def _grader_rubric(self) -> str:
+        """The grader-home rubric (``CLAUDE.md``, synced and substituted at Commander start-up by
+        main.py), stripped; "" when the file is missing or unreadable. _call_grader prepends it to
+        the system prompt for both clients, so the rubric does not depend on a client loading
+        CLAUDE.md or AGENTS.md from its cwd."""
+        try:
+            with open(os.path.join(self._grader_home, "CLAUDE.md"), encoding="utf-8") as handle:
+                return handle.read().strip()
+        except OSError:
+            return ""
+
+    def _call_grader(self, system_prompt: str, user_prompt: str, batch: bool = False, *, tier: str | None = None) -> dict | list:
         """Grade via a per-call ``claude -p`` headless subprocess with no file/exec tools.
 
         The grading prompt goes on stdin (it may be large — hundreds of KB); the system
@@ -1195,6 +1280,11 @@ class OrchestratorTools:
         (``ProviderRouter``). For a claude-default config the resolved model equals
         ``self._grader_model`` so the ``claude -p`` command stays byte-identical; a
         codex-configured grader routes to the codex client. No usable capability -> grade F.
+
+        ``tier`` requests a model class (haiku|sonnet|opus|fable), resolved per client
+        through the same router: each client's ``models.<tier>`` (Claude ``sonnet``; Codex
+        the ``terra`` family word, resolved to the newest installed Terra). ``None`` keeps the configured grader class
+        (``grader_model``, the opus class by default: Claude Opus, or Codex Sol).
         """
         # Route the grader client + model through the provider foundation. Never raises:
         #  - a config with no provider block (legacy/minimal config) -> byte-identical
@@ -1202,8 +1292,9 @@ class OrchestratorTools:
         #    carries a providers block (config DEFAULTS + load-time validation), so routing
         #    is active there.
         #  - a config whose grader role has no usable client -> grade F (NoCapabilityAvailable).
+        requested_tier = tier
         try:
-            tier = _semantic_tier(self._grader_model, "grader_model", "opus")
+            tier = requested_tier or _semantic_tier(self._grader_model, "grader_model", "opus")
             self._ensure_role_capabilities("grader", tier)
             if tier == "fable":
                 # Every provider has a fable peer plus an opus fallback.
@@ -1216,8 +1307,9 @@ class OrchestratorTools:
             logger.warning("No grader capability available: %s", exc)
             return self._grader_failure(batch, f"No grader capability available: {exc}")
         except ProviderConfigError:
-            # No provider config -> legacy claude grader, byte-identical to pre-routing.
-            grader_client, grader_model = "claude", self._grader_model
+            # No provider config -> legacy claude grader (byte-identical when no class is requested).
+            grader_client = "claude"
+            grader_model = self._grader_model if requested_tier is None else requested_tier
             grader_effort = self._effort_for_tier(tier)
 
         try:
@@ -1227,6 +1319,12 @@ class OrchestratorTools:
             )
         except CommunicationProfileError as exc:
             return self._grader_failure(batch, str(exc))
+
+        # Rubric first, then the profiled prompt: Claude reads it from --system-prompt-file,
+        # Codex from the stdin prompt (design 2026-10-17 tool-audit-fixes R6).
+        rubric = self._grader_rubric()
+        if rubric:
+            profiled_system_prompt = f"{rubric}\n\n{profiled_system_prompt}"
 
         from ironclaude.main import ensure_brain_trusted
         # The Anthropic tool input_schema (what --json-schema becomes) MUST be a
@@ -1251,7 +1349,7 @@ class OrchestratorTools:
                     schema_file = None
                     try:
                         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as scf:
-                            json.dump(schema, scf)
+                            json.dump(self._codex_grader_schema(schema), scf)
                             schema_file = scf.name
                         codex_proc = subprocess.run(
                             self._codex_grader_argv(schema_file, grader_model, grader_effort),
@@ -1311,14 +1409,16 @@ class OrchestratorTools:
             return self._parse_claude_grader_output(proc, batch)
 
     def _call_local_grader(self, system_prompt: str, user_prompt: str, format_schema: dict,
-                           *, bounded: bool = False) -> dict:
+                           *, bounded: bool = False, tier: str = "haiku") -> dict:
         """Call Ollama for local grading. bounded=True routes to the operator-facing
         message grader (R5b: short timeout + keep_alive) so a stalled Ollama cannot
         hang the send_to_worker/post_message path; default False uses the shared
         grader. bounded is keyword-only so the ~50 existing positional mock seams
-        (call_args.args) are unaffected."""
+        (call_args.args) are unaffected. tier is the call's model class (design T1); it is forwarded only when not "haiku", so default calls keep their exact three-argument form."""
         grader = self._message_grader if bounded else self._local_grader
-        return grader.grade(system_prompt, user_prompt, format_schema)
+        if tier == "haiku":
+            return grader.grade(system_prompt, user_prompt, format_schema)
+        return grader.grade(system_prompt, user_prompt, format_schema, tier=tier)
 
     def _provider_router(self):
         """Lazily build + cache (router, config, state, registry) for provider routing.
@@ -1471,6 +1571,12 @@ class OrchestratorTools:
             shadow_result = self._shadow_grader.grade_with_tools(
                 system_prompt, user_prompt, repo_path=repo, test_mode=test_mode
             )
+            if shadow_result.get("skipped") or shadow_result.get("unreachable"):
+                # The shadow is a concordance check of the LOCAL model: with no local box
+                # (backend haiku) or an unreachable one there is nothing to compare.
+                logger.info("Shadow grader skipped for %s/%s: %s", context, worker_id,
+                            shadow_result.get("error_detail"))
+                return
             concordance = self._compute_concordance(opus_result, shadow_result)
             msg = self._format_shadow_slack_message(
                 context, worker_id, opus_result, opus_tool_calls, shadow_result, concordance
@@ -1825,9 +1931,12 @@ class OrchestratorTools:
             ["git", "log", "--oneline", "-5"],
             cwd=repo, capture_output=True, text=True,
         )
+        # GIT_OPTIONAL_LOCKS=0: read without rewriting the index (design 2026-10-18
+        # lock-free-read-git).
         diff_result = subprocess.run(
             ["git", "diff", "--stat", "HEAD"],
             cwd=repo, capture_output=True, text=True,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         )
         commit_summary = log_result.stdout.strip() or "no commits"
         diff_stats = diff_result.stdout.strip() or "no diff"
@@ -2304,10 +2413,14 @@ class OrchestratorTools:
         """Poll tmux log until the worker is ready or timeout exceeded.
 
         Returns True if the client's ready indicator is found (claude: "ironclaude v";
-        codex: the ">_ OpenAI Codex" welcome box), False on timeout. Dismisses the
-        client's trust dialog by sending Enter (codex: only once — its prompt text
-        persists in the tail after acceptance). Codex's subsequent hooks-review
-        prompt selects "Trust all and continue" once with its raw numeric shortcut.
+        codex: the ">_ OpenAI Codex" welcome box drawn after any trust or hooks
+        prompt), False on timeout. Dismisses the client's trust dialog by sending
+        Enter (codex: only once — its prompt text persists in the tail after
+        acceptance; both "Do you trust the contents of this directory?" and the
+        0.162+ "Folder access / Trust this folder?" modal). Codex's subsequent
+        hooks-review prompt selects "Trust all and continue" once with its raw
+        numeric shortcut and confirms it with Enter. With a marker, only the marker (also matched with
+        whitespace removed, since cursor moves can split it) means ready.
         """
         deadline = time.time() + timeout
         codex_trust_dismissed = False
@@ -2322,16 +2435,22 @@ class OrchestratorTools:
                 )
             )
             if output:
-                if marker is not None and marker in output:
+                if marker is not None and (
+                    marker in output or marker in re.sub(r"\s+", "", output)
+                ):
                     return True
                 if client == "codex" and "MCP startup interrupted" in output:
                     return False
                 lower = output.lower()
                 if client == "codex":
                     compact = re.sub(r"\s+", "", lower)
-                    if (
-                        not codex_trust_dismissed
-                        and "doyoutrustthecontentsofthisdirectory" in compact
+                    folder_index = max(
+                        compact.rfind("folderaccess"),
+                        compact.rfind("trustthisfolder"),
+                    )
+                    if not codex_trust_dismissed and (
+                        "doyoutrustthecontentsofthisdirectory" in compact
+                        or folder_index >= 0
                     ):
                         self.tmux.send_keys(session_name, "", ssh_host=ssh_host)  # Enter accepts default "Yes"
                         codex_trust_dismissed = True
@@ -2344,13 +2463,13 @@ class OrchestratorTools:
                         )
                     ):
                         self.tmux.send_raw_keys(
-                            session_name, ["2"], ssh_host=ssh_host,
+                            session_name, ["2", "Enter"], ssh_host=ssh_host,
                         )
                         codex_hooks_trust_dismissed = True
                         continue
                     ready_index = compact.rfind(">_openaicodex")
                     hooks_index = compact.rfind("hooksneedreview")
-                    if ready_index > hooks_index:
+                    if marker is None and ready_index > max(hooks_index, folder_index):
                         return True
                 else:
                     if "trust this folder" in lower:
@@ -2359,6 +2478,29 @@ class OrchestratorTools:
                         return True
             time.sleep(1)
         return False
+
+    def _codex_screen(self, session_name: str, ssh_host: str | None) -> str:
+        """Rendered Codex pane text, or "" when it cannot be captured."""
+        try:
+            screen = self.tmux.capture_pane(session_name, ssh_host=ssh_host)
+        except Exception:  # noqa: BLE001 — no screen means nothing to answer
+            return ""
+        return screen if isinstance(screen, str) else ""
+
+    @staticmethod
+    def _codex_skill_unsubmitted(screen: str, invocation: str) -> bool:
+        """True while Codex shows its skill picker or the unsubmitted mention.
+
+        The submitted mention stays in the transcript, so only the composer —
+        the last line that starts with Codex's "›" prompt — is checked.
+        """
+        if "enter insert" in screen:
+            return True
+        prompts = [
+            line.strip() for line in screen.splitlines()
+            if line.strip().startswith("›")
+        ]
+        return bool(prompts) and invocation in prompts[-1]
 
     def _dispatch_worker_communication_profile(
         self, session_name: str, client: str, *, ssh_host: str | None = None,
@@ -2370,11 +2512,25 @@ class OrchestratorTools:
             invocation = skill_invocation("managed_worker", client)
         except CommunicationProfileError as exc:
             return f"Communication-profile infrastructure error: {exc}"
+        if client == "codex":
+            # Codex 0.162 can draw its "Folder access" trust modal after the
+            # banner that readiness accepts; answer it before typing the turn.
+            screen = self._codex_screen(session_name, ssh_host)
+            if "Folder access" in screen or "Trust this folder?" in screen:
+                self.tmux.send_keys(session_name, "", ssh_host=ssh_host)
+                time.sleep(1)
         log_offset = self.tmux.get_log_size(
             session_name, ssh_host=ssh_host, remote_log_dir=remote_log_dir,
         )
         if not self.tmux.send_keys(session_name, invocation, ssh_host=ssh_host):
             return "Failed to deliver write-lossless-ai-messages activation"
+        # Codex's first Enter only inserts the skill from its picker; a second
+        # Enter submits it. Send it only while the picker or the unsubmitted
+        # mention is still on screen. Claude submits on the first Enter.
+        if client == "codex" and self._codex_skill_unsubmitted(
+            self._codex_screen(session_name, ssh_host), invocation,
+        ):
+            self.tmux.send_raw_keys(session_name, ["Enter"], ssh_host=ssh_host)
         if not self._wait_for_ready(
             session_name, timeout=30, ssh_host=ssh_host, client=client,
             marker=PROFILE_READY_MARKER, log_offset=log_offset,
@@ -2703,12 +2859,42 @@ class OrchestratorTools:
                     frontier.append(child)
         return pids
 
+    def _remote_id_file_mtime(self, ssh_host: str, pid: str) -> float | None:
+        """Remote mtime of ~/.claude/ironclaude-session-<pid>.id, or None.
+
+        run_argv quotes every argument, so ``~`` would not expand; the path is
+        built from $HOME inside ``sh -c``. GNU/busybox ``stat -c %Y`` is tried
+        first (GNU ``-f`` is file-system mode), then BSD/macOS ``stat -f %m``.
+        None — no stat, no file, or unparsable output — means reject the file.
+        """
+        if self._ssh_manager is None:
+            return None
+        script = (
+            'f="$HOME/.claude/ironclaude-session-$1.id"; '
+            'stat -c %Y "$f" 2>/dev/null || stat -f %m "$f"'
+        )
+        try:
+            result = self._ssh_manager.run_argv(
+                ssh_host, ["sh", "-c", script, "sh", str(pid)],
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            return float(result.stdout.strip())
+        except ValueError:
+            return None
+
     def _activate_pm_remote(
         self, session_name: str, ssh_host: str,
         timeout: int = 30, client: str = "claude",
+        not_before: float | None = None,
     ) -> str | None:
         """Activate professional mode on a remote worker via sqlite3 over SSH.
 
+        With ``not_before`` (Codex), an id file is accepted only when its remote
+        mtime is at or after that time; an unstatable file is rejected.
         Returns the validated provider-native UUID on success, or a failure
         reason string.
         """
@@ -2739,6 +2925,12 @@ class OrchestratorTools:
                     session_id_file, ssh_host=ssh_host,
                 )
                 if content and len(content.strip()) == 36:
+                    if not_before is not None:
+                        mtime = self._remote_id_file_mtime(
+                            ssh_host, candidate_pid,
+                        )
+                        if mtime is None or mtime < not_before:
+                            continue
                     session_uuid = content.strip()
                     break
             if session_uuid is not None:
@@ -3006,6 +3198,55 @@ class OrchestratorTools:
             "assignment_preserved": True,
             "recovery": {recovery_name: payload},
         }
+
+    def _release_unstarted_spawn(
+        self,
+        phase: str,
+        repository: str,
+        assignment: dict,
+        error: object,
+        transport: dict,
+    ) -> dict:
+        """Fail a spawn that never registered its worker and free its reservation.
+
+        Callers kill the worker session first. A bound assignment is abandoned
+        in rescue mode by its own owner. An unbound one (owner_session_id None)
+        is released with the owner-free ``reap`` verb, because the CLI's
+        ``abandon`` requires a non-empty owner. A release error is logged and the
+        original failure is returned with the assignment still preserved.
+        """
+        failure = self._workspace_failure(phase, repository, assignment, error)
+        owner = assignment.get("owner_session_id")
+        try:
+            if owner:
+                self._workspace_client.abandon(
+                    {
+                        "repository_path": repository,
+                        "workspace_guid": assignment["workspace_guid"],
+                        "owner_session_id": owner,
+                        "mode": "rescue",
+                    },
+                    **transport,
+                )
+            else:
+                self._workspace_client.reap(
+                    {
+                        "repository_path": repository,
+                        "workspace_guid": assignment["workspace_guid"],
+                    },
+                    **transport,
+                )
+        except Exception as exc:  # noqa: BLE001 — never mask the spawn failure
+            logger.warning(
+                "Releasing workspace %s after %s failure failed: %s",
+                assignment.get("workspace_guid"), phase, exc,
+            )
+            failure["release_error"] = str(exc)
+            return failure
+        failure["assignment_preserved"] = False
+        failure["assignment_released"] = True
+        del failure["recovery"]
+        return failure
 
     # A continued rebase is integrated only when it reaches one of these terminal
     # states (see workspace-manager integration.ts finishLocalIntegration). Any
@@ -4283,12 +4524,17 @@ class OrchestratorTools:
         (non-mutating classification), 'continue'/'abort' (resolve a paused
         rebase), or 'rerebase'/'restore_frozen' (recover a drifted frozen
         worktree), or 'reopen_for_edit' (return a stuck reviewed row to
-        editable 'active', preserving work). Authority — repository, workspace_guid, owner_session_id,
+        editable 'active', preserving work), or 'abort_handoff' (release a paused provider
+        handoff once any recorded target bootstrap is proved gone by PID plus start time).
+        Authority — repository, workspace_guid, owner_session_id,
         transport — is derived from the persisted worker registry exactly as
         commit_worker derives it; no caller-supplied refs/trees/owners are
         accepted. A WorkspaceClientError is returned as a structured dict, never
         raised.
         """
+        if action == "abort_handoff":
+            from ironclaude.worker_handoff import WorkerHandoffController
+            return WorkerHandoffController(self).abort_handoff(worker_id)
         if action not in self._RECOVERY_ACTIONS:
             return {
                 "error": (
@@ -4678,7 +4924,7 @@ objective: {objective}
 
 Does this objective meet {self._operator_name}'s standards? Is the worker type appropriate?"""
 
-        # Hybrid grading: Ollama pre-filter with Opus escalation
+        # Hybrid grading: Haiku-class pre-filter, Sonnet-class escalation (design T3)
         local_result = self._call_local_grader(system_prompt, user_prompt, self._LOCAL_CONFIDENCE_SCHEMA)
 
         confidence_threshold = self._ollama_cfg_cache.get("spawn_confidence_threshold", "high")
@@ -4686,8 +4932,8 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
         threshold_idx = confidence_levels.index(confidence_threshold) if confidence_threshold in confidence_levels else 0
 
         if local_result.get("infrastructure_error"):
-            logger.info(f"Ollama pre-filter for '{worker_id}': infrastructure error, escalating to Opus")
-            grade_result = self._call_grader(system_prompt, user_prompt)
+            logger.info(f"Ollama pre-filter for '{worker_id}': infrastructure error, escalating to the Sonnet class")
+            grade_result = self._call_grader(system_prompt, user_prompt, tier="sonnet")
             _opus_tool_calls = self._parse_tool_calls_from_delta(self._last_grader_delta)
             self._fire_shadow_thread("spawn_worker", worker_id, repo, grade_result, _opus_tool_calls, system_prompt, user_prompt)
         else:
@@ -4695,12 +4941,12 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             confidence_idx = confidence_levels.index(confidence) if confidence in confidence_levels else len(confidence_levels)
 
             if confidence_idx > threshold_idx:
-                logger.info(f"Ollama pre-filter for '{worker_id}': confidence={confidence}, escalating to Opus")
-                grade_result = self._call_grader(system_prompt, user_prompt)
+                logger.info(f"Ollama pre-filter for '{worker_id}': confidence={confidence}, escalating to the Sonnet class")
+                grade_result = self._call_grader(system_prompt, user_prompt, tier="sonnet")
                 _opus_tool_calls = self._parse_tool_calls_from_delta(self._last_grader_delta)
                 self._fire_shadow_thread("spawn_worker", worker_id, repo, grade_result, _opus_tool_calls, system_prompt, user_prompt)
             else:
-                logger.info(f"Ollama pre-filter for '{worker_id}': confidence={confidence}, skipping Opus")
+                logger.info(f"Ollama pre-filter for '{worker_id}': confidence={confidence}, skipping escalation")
                 grade_result = local_result
 
         if not grade_result["approved"]:
@@ -4819,13 +5065,19 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 workspace_cwd, ssh_host, worker_client,
             )
             if instruction_error is not None:
-                return self._workspace_failure("launch", repo, assignment, instruction_error)
+                return self._release_unstarted_spawn(
+                    "launch", repo, assignment, instruction_error,
+                    workspace_transport,
+                )
         else:
             instruction_error = self._ensure_worker_instructions(
                 workspace_cwd, worker_client,
             )
             if instruction_error is not None:
-                return self._workspace_failure("launch", repo, assignment, instruction_error)
+                return self._release_unstarted_spawn(
+                    "launch", repo, assignment, instruction_error,
+                    workspace_transport,
+                )
 
         # Stage 1: ensure trust
         if ssh_host:
@@ -4840,13 +5092,13 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             self.tmux.mkdir_p(remote_log_dir, ssh_host=ssh_host)
 
         # Stage 2: spawn tmux session
-        launch_started_at = time.time() if not ssh_host else None
         success = self.tmux.spawn_session(session_name, cmd, cwd=workspace_cwd,
                                           ssh_host=ssh_host, remote_log_dir=remote_log_dir)
         if not success:
-            return self._workspace_failure(
+            return self._release_unstarted_spawn(
                 "launch", repo, assignment,
                 f"Failed to spawn tmux session for worker '{worker_id}'",
+                workspace_transport,
             )
         remote_cleanup_armed = ssh_host is not None
 
@@ -4867,9 +5119,10 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                     cleanup_remote_session()
                 else:
                     self.tmux.kill_session(session_name, ssh_host=ssh_host)
-                return self._workspace_failure(
+                return self._release_unstarted_spawn(
                     "readiness", repo, assignment,
                     f"Codex MCP startup interrupted for worker '{worker_id}'.\nLast output:\n{log_tail}",
+                    workspace_transport,
                 )
             if not self.tmux.has_session(session_name, ssh_host=ssh_host):
                 if ssh_host:
@@ -4900,7 +5153,10 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                             worker_type, model_name, worker_id, machine_cfg,
                         )
                     except NoCapabilityAvailable as exc:
-                        return {"error": str(exc)}
+                        return self._release_unstarted_spawn(
+                            "readiness", repo, assignment, exc,
+                            workspace_transport,
+                        )
                     worker_client = worker_handle.client if worker_handle is not None else "claude"
                     effective_worker_type = self._effective_worker_type(
                         worker_type, worker_handle,
@@ -4911,8 +5167,9 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                             workspace_cwd, ssh_host, worker_client,
                         )
                         if instruction_error is not None:
-                            return self._workspace_failure(
+                            return self._release_unstarted_spawn(
                                 "readiness", repo, assignment, instruction_error,
+                                workspace_transport,
                             )
                         if worker_client == "claude":
                             self._ensure_worker_trusted_remote(workspace_cwd, ssh_host)
@@ -4921,18 +5178,19 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                             workspace_cwd, worker_client,
                         )
                         if instruction_error is not None:
-                            return self._workspace_failure(
+                            return self._release_unstarted_spawn(
                                 "readiness", repo, assignment, instruction_error,
+                                workspace_transport,
                             )
 
-                    launch_started_at = time.time() if not ssh_host else None
                     retry_success = self.tmux.spawn_session(
                         session_name, cmd, cwd=workspace_cwd, ssh_host=ssh_host, remote_log_dir=remote_log_dir,
                     )
                     if not retry_success:
-                        return self._workspace_failure(
+                        return self._release_unstarted_spawn(
                             "readiness", repo, assignment,
                             f"Failed to spawn tmux session for worker '{worker_id}' (opus retry)",
+                            workspace_transport,
                         )
                     remote_cleanup_armed = ssh_host is not None
 
@@ -4948,16 +5206,18 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                                 self.tmux.kill_session(
                                     session_name, ssh_host=ssh_host,
                                 )
-                            return self._workspace_failure(
+                            return self._release_unstarted_spawn(
                                 "readiness", repo, assignment,
                                 f"Worker '{worker_id}' session died before ready on "
                                 f"{machine or 'local'}.\nLast output:\n{retry_log_tail}",
+                                workspace_transport,
                             )
                         if ssh_host:
                             cleanup_remote_session()
-                            return self._workspace_failure(
+                            return self._release_unstarted_spawn(
                                 "readiness", repo, assignment,
                                 f"Worker '{worker_id}' not ready on {machine}.\nLast output:\n{retry_log_tail}",
+                                workspace_transport,
                             )
                         logger.warning(
                             "Worker '%s' (opus retry) not ready after timeout on %s but "
@@ -4965,17 +5225,19 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                             worker_id, machine or "local", retry_log_tail,
                         )
                 else:
-                    return self._workspace_failure(
+                    return self._release_unstarted_spawn(
                         "readiness", repo, assignment,
                         f"Worker '{worker_id}' session died before ready on "
                         f"{machine or 'local'}.\nLast output:\n{log_tail}",
+                        workspace_transport,
                     )
             else:
                 if ssh_host:
                     cleanup_remote_session()
-                    return self._workspace_failure(
+                    return self._release_unstarted_spawn(
                         "readiness", repo, assignment,
                         f"Worker '{worker_id}' not ready on {machine}.\nLast output:\n{log_tail}",
+                        workspace_transport,
                     )
                 logger.warning(
                     "Worker '%s' not ready after timeout on %s but session alive — "
@@ -5002,11 +5264,36 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 if clear_result == "removed":
                     self._post_slack_safe(format_fable_recovered())
 
+        # Codex runs SessionStart, which writes the worker's own session-id file,
+        # only on its first submitted turn. So for Codex the profile turn goes
+        # first, and identity binding accepts only id files written after it.
+        profile_dispatched_at = None
+        if worker_client == "codex":
+            profile_dispatched_at = time.time()
+            profile_error = self._dispatch_worker_communication_profile(
+                session_name, worker_client, ssh_host=ssh_host,
+                remote_log_dir=remote_log_dir,
+            )
+            if profile_error is not None:
+                if ssh_host:
+                    cleanup_remote_session()
+                else:
+                    self.tmux.kill_session(session_name, ssh_host=ssh_host)
+                return self._release_unstarted_spawn(
+                    "dispatch", repo, assignment, profile_error,
+                    workspace_transport,
+                )
+
         # Stages 4-5: activate professional mode and retain native identity.
         native_session_id = None
         if ssh_host:
+            remote_pm_kwargs = (
+                {"not_before": profile_dispatched_at}
+                if worker_client == "codex" else {}
+            )
             remote_pm_result = self._activate_pm_remote(
                 session_name, ssh_host, client=worker_client,
+                **remote_pm_kwargs,
             )
             if (
                 not isinstance(remote_pm_result, str)
@@ -5018,14 +5305,15 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                     if isinstance(remote_pm_result, str)
                     else "missing provider-native UUID"
                 )
-                return self._workspace_failure(
+                return self._release_unstarted_spawn(
                     "activation", repo, assignment,
                     f"PM activation failed for worker '{worker_id}': {reason}",
+                    workspace_transport,
                 )
             native_session_id = remote_pm_result
         else:
             pm_identity_kwargs = (
-                {"not_before": launch_started_at}
+                {"not_before": profile_dispatched_at}
                 if worker_client == "codex" else {}
             )
             pm_failure = self._activate_pm_via_sqlite(
@@ -5035,9 +5323,10 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
             )
             if pm_failure is not None:
                 self.tmux.kill_session(session_name, ssh_host=ssh_host)
-                return self._workspace_failure(
+                return self._release_unstarted_spawn(
                     "activation", repo, assignment,
                     f"PM activation failed for worker '{worker_id}': {pm_failure}",
+                    workspace_transport,
                 )
 
         if not ssh_host:
@@ -5052,9 +5341,10 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 or not _UUID_RE.fullmatch(native_session_id)
             ):
                 self.tmux.kill_session(session_name, ssh_host=ssh_host)
-                return self._workspace_failure(
+                return self._release_unstarted_spawn(
                     "activation", repo, assignment,
                     f"PM identity verification failed for worker '{worker_id}'",
+                    workspace_transport,
                 )
 
         bind_payload = {
@@ -5089,18 +5379,20 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 recovery_payload=bind_payload,
             )
 
-        profile_error = self._dispatch_worker_communication_profile(
-            session_name, worker_client, ssh_host=ssh_host,
-            remote_log_dir=remote_log_dir,
-        )
-        if profile_error is not None:
-            if ssh_host:
-                cleanup_remote_session()
-            else:
-                self.tmux.kill_session(session_name, ssh_host=ssh_host)
-            return self._workspace_failure(
-                "dispatch", repo, assignment, profile_error,
+        if worker_client != "codex":
+            profile_error = self._dispatch_worker_communication_profile(
+                session_name, worker_client, ssh_host=ssh_host,
+                remote_log_dir=remote_log_dir,
             )
+            if profile_error is not None:
+                if ssh_host:
+                    cleanup_remote_session()
+                else:
+                    self.tmux.kill_session(session_name, ssh_host=ssh_host)
+                return self._release_unstarted_spawn(
+                    "dispatch", repo, assignment, profile_error,
+                    workspace_transport,
+                )
 
         # Stage 5.5: enable advisor if configured (skip actual Claude/Fable — top tier,
         # no higher advisor available). Codex cannot parse `/advisor`, a Claude slash
@@ -5109,7 +5401,7 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
         if self._advisor_cfg.get("enabled") and not launch_used_claude_fable:
             if worker_client == "codex":
                 self.tmux.send_keys(
-                    session_name, _CODEX_ADVISOR_INSTRUCTION, ssh_host=ssh_host,
+                    session_name, self._codex_advisor_instruction(effective_worker_type), ssh_host=ssh_host,
                 )
             else:
                 advisor_model = self._advisor_model_for(effective_worker_type)
@@ -5279,7 +5571,6 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 if instruction_error is not None:
                     return failed("readiness", instruction_error)
 
-                launch_started_at = time.time()
                 retry_success = self.tmux.spawn_session(
                     session_name, retry_cmd, cwd=workspace_cwd,
                 )
@@ -5299,7 +5590,6 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                     "handle": retry_handle,
                     "client": retry_client,
                     "launch_used_claude_fable": False,
-                    "launch_started_at": launch_started_at,
                 }
                 ready = self._wait_for_ready(
                     session_name, timeout=30, client=retry_client,
@@ -5335,8 +5625,17 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                 if clear_result == "removed":
                     self._post_slack_safe(format_fable_recovered())
 
+        # Codex: profile turn before activation (see spawn_worker).
+        profile_dispatched_at = None
+        if item["client"] == "codex":
+            profile_dispatched_at = time.time()
+            profile_error = self._dispatch_worker_communication_profile(
+                session_name, item["client"],
+            )
+            if profile_error is not None:
+                return failed("dispatch", profile_error)
         pm_identity_kwargs = (
-            {"not_before": item["launch_started_at"]}
+            {"not_before": profile_dispatched_at}
             if item["client"] == "codex" else {}
         )
         pm_failure = self._activate_pm_via_sqlite(
@@ -5393,11 +5692,12 @@ Does this objective meet {self._operator_name}'s standards? Is the worker type a
                     recovery_payload=bind_payload,
                 ),
             }
-        profile_error = self._dispatch_worker_communication_profile(
-            session_name, item["client"],
-        )
-        if profile_error is not None:
-            return failed("dispatch", profile_error)
+        if item["client"] != "codex":
+            profile_error = self._dispatch_worker_communication_profile(
+                session_name, item["client"],
+            )
+            if profile_error is not None:
+                return failed("dispatch", profile_error)
         return {
             **item,
             "assignment": bound_assignment,
@@ -5493,7 +5793,7 @@ Tier choice alone never lowers the grade or affects approval — recommend, do n
             local_result = self._call_local_grader(ollama_system_prompt, per_req_prompt, self._LOCAL_CONFIDENCE_SCHEMA)
 
             if local_result.get("infrastructure_error"):
-                logger.info(f"Ollama pre-filter for batch '{req['worker_id']}': infrastructure error, escalating to Opus")
+                logger.info(f"Ollama pre-filter for batch '{req['worker_id']}': infrastructure error, escalating to the Sonnet class")
                 uncertain_indices.append(i)
                 continue
 
@@ -5501,14 +5801,14 @@ Tier choice alone never lowers the grade or affects approval — recommend, do n
             confidence_idx = confidence_levels.index(confidence) if confidence in confidence_levels else len(confidence_levels)
 
             if confidence_idx > threshold_idx:
-                logger.info(f"Ollama pre-filter for batch '{req['worker_id']}': confidence={confidence}, escalating to Opus")
+                logger.info(f"Ollama pre-filter for batch '{req['worker_id']}': confidence={confidence}, escalating to the Sonnet class")
                 uncertain_indices.append(i)
             else:
-                logger.info(f"Ollama pre-filter for batch '{req['worker_id']}': confidence={confidence}, skipping Opus")
+                logger.info(f"Ollama pre-filter for batch '{req['worker_id']}': confidence={confidence}, skipping escalation")
                 local_result.setdefault("recommended_model", req["worker_type"])
                 grade_results[i] = local_result
 
-        # Phase 2: Batch uncertain requests to Opus
+        # Phase 2: Batch uncertain requests to the Sonnet class
         if uncertain_indices:
             # Build batch system prompt for Opus (only uncertain subset)
             grading_criteria = f"""Grading criteria (apply to EACH decision independently):
@@ -5558,7 +5858,7 @@ You are grading a spawn_worker decision. Your verdict is a JSON object:
             # indistinguishable from a grader-failure F list (which would slip past the
             # length check below), so grade a lone decision individually instead.
             if len(uncertain_indices) >= 2:
-                opus_results = self._call_grader(opus_system_prompt, user_prompt, batch=True)
+                opus_results = self._call_grader(opus_system_prompt, user_prompt, batch=True, tier="sonnet")
             else:
                 opus_results = None
 
@@ -5570,7 +5870,7 @@ You are grading a spawn_worker decision. Your verdict is a JSON object:
                     req = requests[idx]
                     individual_result = self._call_grader(opus_single_system_prompt, f"Evaluate this spawn decision:\n\n"
                         f"worker_id: {req['worker_id']}\nworker_type: {req['worker_type']}\n"
-                        f"repo: {req['repo']}\nobjective: {req['objective']}")
+                        f"repo: {req['repo']}\nobjective: {req['objective']}", tier="sonnet")
                     if isinstance(individual_result, dict):
                         opus_results.append(individual_result)
                     else:
@@ -5706,24 +6006,25 @@ You are grading a spawn_worker decision. Your verdict is a JSON object:
             if instruction_error is not None:
                 results[res_idx] = {
                     "worker_id": worker_id,
-                    **self._workspace_failure(
+                    **self._release_unstarted_spawn(
                         "launch", repo, assignment, instruction_error,
+                        reservation["transport"],
                     ),
                 }
                 continue
             self.ensure_worker_trusted(workspace_cwd)
 
             session_name = f"ic-{worker_id}"
-            launch_started_at = time.time()
             success = self.tmux.spawn_session(
                 session_name, cmd, cwd=workspace_cwd,
             )
             if not success:
                 results[res_idx] = {
                     "worker_id": worker_id,
-                    **self._workspace_failure(
+                    **self._release_unstarted_spawn(
                         "launch", repo, assignment,
                         "Failed to spawn tmux session",
+                        reservation["transport"],
                     ),
                 }
                 continue
@@ -5738,7 +6039,6 @@ You are grading a spawn_worker decision. Your verdict is a JSON object:
                 "handle": worker_handle,
                 "client": worker_client,
                 "launch_used_claude_fable": launch_used_claude_fable,
-                "launch_started_at": launch_started_at,
                 "assignment": assignment,
                 "workspace_transport": reservation["transport"],
             })
@@ -5776,9 +6076,16 @@ You are grading a spawn_worker decision. Your verdict is a JSON object:
 
                 if outcome.get("failure"):
                     self.tmux.kill_session(session_name)
+                    failure = outcome["failure"]
+                    if failure["failure_phase"] != "bind":
+                        failure = self._release_unstarted_spawn(
+                            failure["failure_phase"], req["repo"],
+                            outcome["assignment"], failure["error"],
+                            outcome["workspace_transport"],
+                        )
                     results[res_idx] = {
                         "worker_id": worker_id,
-                        **outcome["failure"],
+                        **failure,
                     }
                     continue
 
@@ -5786,7 +6093,7 @@ You are grading a spawn_worker decision. Your verdict is a JSON object:
                 if self._advisor_cfg.get("enabled") and not outcome["launch_used_claude_fable"]:
                     if outcome["client"] == "codex":
                         self.tmux.send_keys(
-                            session_name, _CODEX_ADVISOR_INSTRUCTION,
+                            session_name, self._codex_advisor_instruction(effective_worker_type),
                         )
                     else:
                         advisor_model = self._advisor_model_for(
@@ -5879,7 +6186,7 @@ You are grading a spawn_worker decision. Your verdict is a JSON object:
             raise ValueError(f"Worker '{worker_id}' not found")
 
         ssh_host = self._resolve_ssh_host(worker_id)
-        session_name = f"ic-{worker_id}"
+        session_name = self._registered_worker_session(worker_id, worker)
         if not self.tmux.has_session(session_name, ssh_host=ssh_host):
             self.registry.update_worker_status(worker_id, "failed")
             raise RuntimeError(f"Worker '{worker_id}' tmux session is dead")
@@ -5957,7 +6264,7 @@ Did the Brain act as {self._operator_name}'s avatar during brainstorming? Did it
             raise ValueError(f"Worker '{worker_id}' not found")
 
         ssh_host = self._resolve_ssh_host(worker_id)
-        session_name = f"ic-{worker_id}"
+        session_name = self._registered_worker_session(worker_id, worker)
         if not self.tmux.has_session(session_name, ssh_host=ssh_host):
             self.registry.update_worker_status(worker_id, "failed")
             raise RuntimeError(f"Worker '{worker_id}' tmux session is dead")
@@ -5978,7 +6285,7 @@ Did the Brain act as {self._operator_name}'s avatar during brainstorming? Did it
             raise ValueError(f"Worker '{worker_id}' not found")
 
         ssh_host = self._resolve_ssh_host(worker_id)
-        session_name = f"ic-{worker_id}"
+        session_name = self._registered_worker_session(worker_id, worker)
         if not self.tmux.has_session(session_name, ssh_host=ssh_host):
             self.registry.update_worker_status(worker_id, "failed")
             raise RuntimeError(f"Worker '{worker_id}' tmux session is dead")
@@ -6020,8 +6327,8 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
             system_prompt, user_prompt, self._LOCAL_VERDICT_SCHEMA, bounded=True
         )  # R5b: operator-facing path — bounded grader
         if grade_result.get("infrastructure_error"):
-            logger.info(f"Ollama grader unavailable for send_to_worker '{worker_id}', escalating to Opus")
-            grade_result = self._call_grader(system_prompt, user_prompt)
+            logger.info(f"Ollama grader unavailable for send_to_worker '{worker_id}', escalating to the Sonnet class")
+            grade_result = self._call_grader(system_prompt, user_prompt, tier="sonnet")
         if not grade_result["approved"]:
             return {
                 "error": self._grader_rejection("Message", grade_result),
@@ -6078,7 +6385,7 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
             }
 
         ssh_host = self._resolve_ssh_host(worker_id)
-        session_name = f"ic-{worker_id}"
+        session_name = self._registered_worker_session(worker_id, worker)
 
         if not self.tmux.has_session(session_name, ssh_host=ssh_host):
             return {
@@ -6099,7 +6406,7 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
 
         user_prompt = f"Terminal output from worker '{worker_id}':\n\n{pane_text}"
 
-        result = self._call_local_grader(system_prompt, user_prompt, self._LOCAL_HEALTH_SCHEMA)
+        result = self._call_local_grader(system_prompt, user_prompt, self._LOCAL_HEALTH_SCHEMA, tier="sonnet")
 
         if result.get("infrastructure_error"):
             return {
@@ -6126,7 +6433,7 @@ Does this message respect the ironclaude workflow? Would it block or misdirect t
             raise ValueError(f"Worker '{worker_id}' not found")
 
         ssh_host = self._resolve_ssh_host(worker_id)
-        session_name = f"ic-{worker_id}"
+        session_name = self._registered_worker_session(worker_id, worker)
         if not self.tmux.has_session(session_name, ssh_host=ssh_host):
             self.registry.update_worker_status(worker_id, "failed")
             raise RuntimeError(f"Worker '{worker_id}' tmux session is dead")
@@ -6156,8 +6463,8 @@ Grading criteria:
 
             grade_result = self._call_local_grader(system_prompt, user_prompt, self._LOCAL_VERDICT_SCHEMA)
             if grade_result.get("infrastructure_error"):
-                logger.info(f"Ollama grader unavailable for send_keys '{worker_id}', escalating to Opus")
-                grade_result = self._call_grader(system_prompt, user_prompt)
+                logger.info(f"Ollama grader unavailable for send_keys '{worker_id}', escalating to the Sonnet class")
+                grade_result = self._call_grader(system_prompt, user_prompt, tier="sonnet")
             if not grade_result["approved"]:
                 return {
                     "error": self._grader_rejection("send_keys text", grade_result),
@@ -6260,7 +6567,7 @@ Grading criteria:
         if _w and _w.get("machine"):
             self._ensure_ssh_manager()
         ssh_host = self._resolve_ssh_host(worker_id)
-        session_name = f"ic-{worker_id}"
+        session_name = self._registered_worker_session(worker_id)
         try:
             result = self.tmux.capture_pane(session_name, lines=lines, ssh_host=ssh_host)
             self._write_brain_contact(worker_id)
@@ -6284,6 +6591,33 @@ Grading criteria:
         except FileNotFoundError:
             raise ValueError(f"No log file found for worker '{worker_id}'")
 
+    _SESSION_SUMMARY_SCHEMA = {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}
+
+    @staticmethod
+    def _session_summary_prompt(name: str, sample_large: str) -> str:
+        return (
+            "Summarize this terminal session in 2-4 sentences. "
+            "Describe: what task the session is running, its current state "
+            "(idle/active/blocked), which git repo or directory it's working in, "
+            "and any notable context (error messages, waiting on input, etc.). "
+            "Be concise and factual.\n\n"
+            f"Session name: {name}\n"
+            f"Terminal output (last ~30k chars):\n{sample_large}"
+        )
+
+    def _fast_model_session_summary(self, name: str, sample_large: str, hooks_cfg: dict) -> tuple[str | None, str]:
+        """Haiku-class summary. Returns (summary, "") or (None, error detail)."""
+        try:
+            prompt = apply_communication_profile("session_summarizer", self._session_summary_prompt(name, sample_large))
+        except CommunicationProfileError as e:
+            return None, f"communication-profile infrastructure error — {e}"
+        result = fast_model.call_fast_model("", prompt, self._SESSION_SUMMARY_SCHEMA,
+                                            timeout=fast_model.fast_model_timeout(hooks_cfg),
+                                            commander_config=self._config)
+        if result.get("infrastructure_error"):
+            return None, result.get("error_detail", "unknown")
+        return str(result["summary"]), ""
+
     def list_claude_sessions(self) -> str:
         """List candidate Claude Code tmux sessions available for adoption.
 
@@ -6300,6 +6634,7 @@ Grading criteria:
         ollama_available = False
         summarization_model = _DEFAULT_SUMMARIZATION_MODEL
         summ_backend = "ollama"
+        summ_fast_only = False
         summ_client = None
         summ_max_tokens = None
         try:
@@ -6321,6 +6656,8 @@ Grading criteria:
                 summarization_model = _summ_resolved.model or _DEFAULT_SUMMARIZATION_MODEL
             except OllamaError as e:
                 logger.debug("OpenAI backend unavailable for session summarization: %s", e)
+        elif summ_backend == "haiku":
+            summ_fast_only = True
         else:
             try:
                 client = self._get_ollama_client()
@@ -6350,20 +6687,21 @@ Grading criteria:
             sample = _strip_ansi(raw)[-200:]
             sample_large = _strip_ansi(raw)[-30000:]
 
-            if not ollama_available:
+            if summ_fast_only:
+                if not sample_large:
+                    summary = "ERROR: no pane content to summarize"
+                else:
+                    fast_summary, detail = self._fast_model_session_summary(name, sample_large, _summ_cfg)
+                    summary = fast_summary if fast_summary is not None else f"ERROR: Haiku-class summarization failed — {detail}"
+            elif not ollama_available:
                 summary = "ERROR: Ollama unavailable — summary not generated"
+                if sample_large:
+                    fast_summary, _ = self._fast_model_session_summary(name, sample_large, _summ_cfg)
+                    summary = fast_summary if fast_summary is not None else summary
             elif not sample_large:
                 summary = "ERROR: no pane content to summarize"
             else:
-                prompt = (
-                    "Summarize this terminal session in 2-4 sentences. "
-                    "Describe: what task the session is running, its current state "
-                    "(idle/active/blocked), which git repo or directory it's working in, "
-                    "and any notable context (error messages, waiting on input, etc.). "
-                    "Be concise and factual.\n\n"
-                    f"Session name: {name}\n"
-                    f"Terminal output (last ~30k chars):\n{sample_large}"
-                )
+                prompt = self._session_summary_prompt(name, sample_large)
                 try:
                     # IRONCLAUDE_LLM_PATH: session_summarizer
                     prompt = apply_communication_profile("session_summarizer", prompt)
@@ -6385,6 +6723,8 @@ Grading criteria:
                     summary = f"ERROR: communication-profile infrastructure error — {e}"
                 except OllamaError as e:
                     summary = f"ERROR: Ollama summarization failed — {e}"
+                    fast_summary, _ = self._fast_model_session_summary(name, sample_large, _summ_cfg)
+                    summary = fast_summary if fast_summary is not None else summary
 
             candidates.append({
                 "name": name,
@@ -6394,6 +6734,42 @@ Grading criteria:
                 "summary": summary,
             })
         return json.dumps(candidates)
+
+    def _managed_session_conflict(
+        self, *, session_name: str | None = None,
+        native_session_id: str | None = None, repo: str | None = None,
+    ) -> str | None:
+        """Refuse manual adoption of any live managed runtime or handoff scope."""
+        canonical_repo = os.path.realpath(repo) if repo else None
+
+        def conflicts(*, session=None, native=None, path=None):
+            return bool(
+                (session_name and session_name == session)
+                or (native_session_id and native_session_id == native)
+                or (canonical_repo and path and canonical_repo == os.path.realpath(path))
+            )
+
+        rows = self.registry._conn.execute(
+            "SELECT id, tmux_session, native_session_id, workspace_path "
+            "FROM workers WHERE status NOT IN ('completed', 'failed', 'killed')"
+        ).fetchall()
+        for row in rows:
+            if conflicts(session=row["tmux_session"], native=row["native_session_id"],
+                         path=row["workspace_path"]):
+                return "session or workspace belongs to an active managed worker"
+        for handoff in self.registry.list_pending_worker_handoffs():
+            source = json.loads(handoff["snapshot_json"])
+            evidence = json.loads(handoff["evidence_json"])
+            scope = evidence.get("scope") or {}
+            if conflicts(session=source.get("tmux_session"), native=source.get("native_session_id"),
+                         path=source.get("workspace_path")):
+                return "session or workspace belongs to an active worker handoff"
+            if conflicts(path=scope.get("expected_worktree_path"), native=evidence.get("target_id")):
+                return "session or workspace belongs to an active worker handoff"
+            for key in ("bootstrap_intent", "bootstrap_session", "resume_intent", "target_session"):
+                if conflicts(session=evidence.get(key)):
+                    return "session belongs to an active worker handoff"
+        return None
 
     def adopt_session(
         self, session_name: str, worker_id: str,
@@ -6407,6 +6783,9 @@ Grading criteria:
         target = f"ic-{worker_id}"
         if self.registry.get_worker(worker_id):
             return {"error": f"worker_id '{worker_id}' already exists"}
+        conflict = self._managed_session_conflict(session_name=session_name, repo=repo)
+        if conflict:
+            return {"error": conflict}
         if self.tmux.has_session(target):
             return {"error": f"target session '{target}' already exists"}
         if not self.tmux.has_session(session_name):
@@ -6459,6 +6838,9 @@ Grading criteria:
         target = f"ic-{worker_id}"
         if self.registry.get_worker(worker_id):
             return {"error": f"worker_id '{worker_id}' already exists"}
+        conflict = self._managed_session_conflict(native_session_id=session_id, repo=repo)
+        if conflict:
+            return {"error": conflict}
         if self.tmux.has_session(target):
             return {"error": f"target session '{target}' already exists"}
 
@@ -6480,17 +6862,27 @@ Grading criteria:
                 f"--dangerously-skip-permissions"
             )
         else:
-            codex_path = (
+            codex_cfg = (
                 self._config.get("providers", {}).get("clients", {})
-                .get("codex", {}).get("path", "codex")
+                .get("codex", {})
             )
+            codex_path = codex_cfg.get("path", "codex")
+            # Same flags as the fresh spawn (_codex_worker_command) and the handoff resume:
+            # an explicit model and --no-daemon. The configured value (family word by default)
+            # resolves on this Mac; no model of the family -> refuse before anything spawns.
+            tier = _WORKER_TYPE_TIER.get(worker_type, "opus")
+            try:
+                model = resolve_local_codex_model(
+                    codex_cfg.get("models", {}).get(tier) or CODEX_TIER_WORDS[tier])
+            except CodexModelUnavailable as exc:
+                return {"error": str(exc)}
             cmd = (
                 f"{env_prefix}exec {shlex.quote(codex_path)} "
                 f"resume {shlex.quote(session_id)} "
+                f"--model {shlex.quote(model)} --no-daemon "
                 f"--dangerously-bypass-approvals-and-sandbox"
             )
 
-        launch_started_at = time.time()
         success = self.tmux.spawn_session(target, cmd, cwd=repo)
         if not success:
             return {"error": f"Failed to spawn tmux session for worker '{worker_id}'"}
@@ -6521,8 +6913,18 @@ Grading criteria:
                     ),
                 }
 
+            # Codex writes its own id file only on its first submitted turn,
+            # so the profile turn goes first (see spawn_worker).
+            profile_dispatched_at = None
+            if client == "codex":
+                profile_dispatched_at = time.time()
+                profile_error = self._dispatch_worker_communication_profile(
+                    target, client,
+                )
+                if profile_error is not None:
+                    return {"error": profile_error}
             pm_identity_kwargs = (
-                {"not_before": launch_started_at} if client == "codex" else {}
+                {"not_before": profile_dispatched_at} if client == "codex" else {}
             )
             pm_failure = self._activate_pm_via_sqlite(
                 target, timeout=300, max_retries=3, client=client,
@@ -6550,11 +6952,12 @@ Grading criteria:
                     ),
                 }
 
-            profile_error = self._dispatch_worker_communication_profile(
-                target, client,
-            )
-            if profile_error is not None:
-                return {"error": profile_error}
+            if client != "codex":
+                profile_error = self._dispatch_worker_communication_profile(
+                    target, client,
+                )
+                if profile_error is not None:
+                    return {"error": profile_error}
 
             self.registry.register_worker(
                 worker_id,
@@ -6594,7 +6997,7 @@ Grading criteria:
         if _kw and _kw.get("machine"):
             self._ensure_ssh_manager()
         ssh_host = self._resolve_ssh_host(worker_id)
-        session_name = f"ic-{worker_id}"
+        session_name = self._registered_worker_session(worker_id, _kw)
         remote_log_dir = None
         if ssh_host:
             machine = self._ssh_manager.get_machine(_kw["machine"]) if self._ssh_manager and _kw else None
@@ -7110,25 +7513,8 @@ Has the worker genuinely completed its objective based on the evidence?
     @staticmethod
     def _extract_ledger_json(body: str) -> dict:
         """Extract ledger JSON from the ## Data code fence in a wiki page body."""
-        parts = body.split("## Data")
-        if len(parts) < 2:
-            return {"objective": None, "tasks": []}
-        data_section = parts[1]
-        fence_start = data_section.find("```")
-        if fence_start == -1:
-            return {"objective": None, "tasks": []}
-        after_fence = data_section[fence_start + 3:]
-        first_newline = after_fence.find("\n")
-        if first_newline == -1:
-            return {"objective": None, "tasks": []}
-        json_content = after_fence[first_newline + 1:]
-        fence_end = json_content.find("```")
-        if fence_end == -1:
-            return {"objective": None, "tasks": []}
-        try:
-            return json.loads(json_content[:fence_end].strip())
-        except (json.JSONDecodeError, ValueError):
-            return {"objective": None, "tasks": []}
+        from ironclaude.protocol import extract_ledger_json
+        return extract_ledger_json(body)
 
     # ── Wiki tools (delegated to WikiTools — see ironclaude.wiki_tools) ──
 
@@ -7193,8 +7579,8 @@ Does this message report a problem? If so, does it include an action already tak
             system_prompt, user_prompt, self._LOCAL_VERDICT_SCHEMA, bounded=True
         )  # R5b: operator-facing path — bounded grader
         if grade_result.get("infrastructure_error"):
-            logger.info("Ollama grader unavailable for post_message, escalating to Opus")
-            grade_result = self._call_grader(system_prompt, user_prompt)
+            logger.info("Ollama grader unavailable for post_message, escalating to the Sonnet class")
+            grade_result = self._call_grader(system_prompt, user_prompt, tier="sonnet")
         if not grade_result["approved"]:
             return {
                 "error": self._grader_rejection("Message", grade_result),
@@ -7218,6 +7604,52 @@ Does this message report a problem? If so, does it include an action already tak
         if posted_ts is not None:
             self._slack.add_reaction("white_check_mark", reply_ts)
         return posted_ts
+
+
+def _hold_worker_operation(fn):
+    """Keep exact old-runtime lease through grading and every downstream effect."""
+    @functools.wraps(fn)
+    def guarded(self, worker_id, *args, **kwargs):
+        action = kwargs.get("action", args[0] if args else None)
+        if fn.__name__ == "recover_worker_integration" and action == "abort_handoff":
+            # H7: the operator abort is the release path for an active handoff, so the
+            # active-handoff guard below must not refuse it.
+            return fn(self, worker_id, *args, **kwargs)
+        worker = self.registry.get_worker(worker_id)
+        if worker is None:
+            return fn(self, worker_id, *args, **kwargs)
+        held = self.registry.get_worker_handoff(worker_id)
+        if held and held["completed_at"] is None:
+            raise RuntimeError("active handoff blocks worker operation")
+        active = getattr(self, "_worker_operation_local", None)
+        if active is None:
+            active = self._worker_operation_local = threading.local()
+        snapshots = getattr(active, "snapshots", None)
+        if snapshots is None:
+            snapshots = active.snapshots = {}
+        prior = snapshots.get(worker_id)
+        snapshot = prior[0] if prior else worker
+        with self.registry.worker_operation(snapshot, operation="worker_mutation", wait_seconds=5.0):
+            snapshots[worker_id] = (snapshot, prior[1] + 1 if prior else 1)
+            try:
+                return fn(self, worker_id, *args, **kwargs)
+            finally:
+                depth = snapshots[worker_id][1] - 1
+                if depth == 0:
+                    snapshots.pop(worker_id, None)
+                else:
+                    snapshots[worker_id] = (snapshot, depth)
+    return guarded
+
+
+for _held_method_name in (
+    "approve_plan", "reject_plan", "send_to_worker", "send_keys_to_worker",
+    "kill_worker", "commit_worker", "recover_worker_integration",
+    "drive_frozen_reconcile_recovery", "_complete_worker_if_session_dead",
+    "_finalize_and_release_worker", "_abandon_rescue_worker",
+):
+    setattr(OrchestratorTools, _held_method_name,
+            _hold_worker_operation(getattr(OrchestratorTools, _held_method_name)))
 
 
 def _create_mcp_server(tools: OrchestratorTools, plugin_dirs: list[str] | None = None):
@@ -7516,7 +7948,9 @@ def _create_mcp_server(tools: OrchestratorTools, plugin_dirs: list[str] | None =
         (non-mutating classification of the worktree), 'continue'/'abort' (resolve
         a paused integration rebase), or 'rerebase'/'restore_frozen' (recover a
         drifted frozen worktree), or 'reopen_for_edit' (return a stuck reviewed
-        row to editable 'active', preserving work). Authority is derived from the persisted worker
+        row to editable 'active', preserving work), or 'abort_handoff' (release a paused provider
+        handoff after an uncertain external effect, refused while a recorded target bootstrap is
+        alive or unproved). Authority is derived from the persisted worker
         registry; no caller-supplied refs, trees, or owners are accepted.
 
         Returns JSON with the reconcile result, or a structured error dict when

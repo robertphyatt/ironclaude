@@ -1,0 +1,29 @@
+{
+  "name": "Codex worker spawn reproduction",
+  "goal": "Measure why Codex worker PM activation is slow/never completes and whether $skill dispatch submits, via scratch tmux reproduction of the Commander spawn sequence; record a findings note.",
+  "requirements_file": "docs/plans/2026-10-06-codex-spawn-repro-requirements.md",
+  "design_file": "docs/plans/2026-10-06-codex-spawn-repro-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Reproduce, measure and record",
+      "description": "Write the probe script verbatim from human plan Task 1 Step 1 to the scratchpad (bare `codex` as daemon; logs tmux global PATH + both codex resolutions + before/after codex process listing; readiness mirrors _wait_for_ready; 300 s id-file poll where ID_* counts only pane-tree writers and ANY_* records first writer of any provenance; rescan after each dispatch Enter, after one plain prompt, and before kill; logs config.toml rows). Run variant A (no --no-daemon) then B (--no-daemon) sequentially, each one background Bash run (timeout 900000), reading run-<V>/probe.log and snap-*.txt after each; record actual results (investigation: expected = record actual). Kill a SURVIVOR only by exact PID and only if probe-launched codex; new codex processes in codex_procs_after are reported, never killed. Write docs/reviews/2026-10-06-codex-spawn-repro-findings.md per human plan Step 4; stage it with the four loop docs. Hard limits: no Commander process/DB or roleplaying-agents access (read-only sqlite3 -readonly on ~/.claude/ironclaude.db only), no pattern-kill, no project-repo commit/push. Disclosed side effects: config.toml trust/hooks rows, session-init global maintenance, ironclaude.db session rows. No tests required: investigation, no product code.",
+      "allowed_files": [
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-repro/probe.sh",
+        "docs/reviews/2026-10-06-codex-spawn-repro-findings.md",
+        "docs/plans/2026-10-06-codex-spawn-repro-requirements.md",
+        "docs/plans/2026-10-06-codex-spawn-repro-design.md",
+        "docs/plans/2026-10-06-codex-spawn-repro.md",
+        "docs/plans/2026-10-06-codex-spawn-repro.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Write /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-repro/probe.sh verbatim from human plan Task 1 Step 1."},
+        {"description": "Run variant A in background (Bash timeout 900000); on completion read run-A/probe.log and snap-*.txt", "command": "bash /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-repro/probe.sh A", "expected": "record actual; note any SURVIVOR lines and codex_procs_before/after diff"},
+        {"description": "After A completes, run variant B in background (Bash timeout 900000); on completion read run-B/probe.log and snap-*.txt", "command": "bash /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-repro/probe.sh B", "expected": "record actual; note any SURVIVOR lines and codex_procs_before/after diff"},
+        {"description": "Write docs/reviews/2026-10-06-codex-spawn-repro-findings.md per human plan Task 1 Step 4 (per-variant measurements incl. id_* vs any_*, post-dispatch and post-plain-turn rescans, config.toml rows, process diff; conclusions verified/unresolved; spawn-fix inputs; leftover state)."},
+        {"description": "Stage findings and loop docs", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-06-codex-spawn-repro-findings.md docs/plans/2026-10-06-codex-spawn-repro-requirements.md docs/plans/2026-10-06-codex-spawn-repro-design.md docs/plans/2026-10-06-codex-spawn-repro.md docs/plans/2026-10-06-codex-spawn-repro.plan.json", "expected": "no output, exit 0"}
+      ]
+    }
+  ]
+}

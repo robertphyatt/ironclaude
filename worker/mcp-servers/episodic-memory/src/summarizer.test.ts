@@ -153,3 +153,52 @@ describe('resolveBackend against the shared resolution-cases.json fixture', () =
     expect(result.backend).not.toBe('openai');
   });
 });
+
+describe('callClaude fresh calls do not persist sessions', () => {
+  afterEach(() => {
+    delete process.env.EPISODIC_MEMORY_CLAUDE_PATH;
+    vi.doUnmock('@anthropic-ai/claude-agent-sdk');
+  });
+
+  function mockQuery(seen: any[]) {
+    vi.doMock('@anthropic-ai/claude-agent-sdk', () => ({
+      query: ({ options }: any) => {
+        seen.push(options);
+        return (async function* () { yield { type: 'result', result: '<summary>ok</summary>' }; })();
+      },
+    }));
+  }
+
+  it('runs the system claude with --no-session-persistence on a fresh call, not on resume', async () => {
+    vi.resetModules();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'summ-claude-'));
+    const fakeClaude = path.join(dir, 'claude');
+    fs.writeFileSync(fakeClaude, '#!/bin/sh\nexit 0\n');
+    fs.chmodSync(fakeClaude, 0o755);
+    process.env.EPISODIC_MEMORY_CLAUDE_PATH = fakeClaude;
+    const seen: any[] = [];
+    mockQuery(seen);
+    writeIcOllamaConfig({});
+    const { callClaude } = await import('./summarizer.js');
+    await callClaude('fresh');
+    await callClaude('resumed', 'session-1');
+    expect(seen[0].pathToClaudeCodeExecutable).toBe(fakeClaude);
+    expect(seen[0].extraArgs).toEqual({ 'no-session-persistence': null });
+    expect('extraArgs' in seen[1]).toBe(false);
+    expect('pathToClaudeCodeExecutable' in seen[1]).toBe(false);
+  });
+
+  it('keeps the bundled CLI and warns when no system claude is found', async () => {
+    vi.resetModules();
+    process.env.EPISODIC_MEMORY_CLAUDE_PATH = path.join(os.tmpdir(), 'no-such-claude-binary');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const seen: any[] = [];
+    mockQuery(seen);
+    writeIcOllamaConfig({});
+    const { callClaude } = await import('./summarizer.js');
+    await callClaude('fresh');
+    expect('extraArgs' in seen[0]).toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('no system claude'));
+    warn.mockRestore();
+  });
+});

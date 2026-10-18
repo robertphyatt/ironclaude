@@ -21,6 +21,54 @@ def setup_router(tmp_path, base_config, *, dual=False):
     return ProviderRouter(config, state, registry), state, registry
 
 
+def test_resolve_excludes_source_client_without_changing_default(tmp_path, base_config):
+    router, state, registry = setup_router(tmp_path, base_config, dual=True)
+    registry.record(cap("claude", "worker", "opus"))
+    registry.record(cap("codex", "worker", "opus"))
+    assert router.resolve("worker", "opus", ["local"], excluded_clients=("claude",)).client == "codex"
+    assert state.current_client("worker", "claude") == "claude"
+
+
+def test_handoff_exclusion_both_directions_and_fable_fallback(tmp_path, base_config):
+    router, state, registry = setup_router(tmp_path, base_config, dual=True)
+    record(
+        registry,
+        cap("claude", "worker", "fable"),
+        cap("claude", "worker", "opus"),
+        cap("codex", "worker", "opus"),
+    )
+    assert router.resolve(
+        "worker", "fable", ["local"], excluded_clients=("claude",)
+    ).client == "codex"
+    state.set_current_client("worker", "codex")
+    target = router.resolve(
+        "worker", "fable", ["local"], excluded_clients=("codex",)
+    )
+    assert (target.client, target.effective_tier) == ("claude", "fable")
+    assert state.get_current_client("worker") == "codex"
+    with pytest.raises(NoCapabilityAvailable):
+        router.resolve(
+            "worker", "fable", ["local"], excluded_clients=("claude", "codex")
+        )
+
+
+def test_worker_account_usage_quarantine_blocks_fable_opus_fallback(tmp_path, base_config):
+    router, state, registry = setup_router(tmp_path, base_config, dual=True)
+    record(
+        registry,
+        cap("claude", "worker", "fable"),
+        cap("claude", "worker", "opus"),
+        cap("codex", "worker", "opus"),
+    )
+    state.mark_unavailable(
+        "local", "claude", "worker", state.worker_usage_scope_tier("worker", "fable"),
+        "usage", "account quota", usage_generation="native-old", usage_cursor=1,
+        usage_event_key="quota", usage_event_timestamp="2026-10-06T12:00:02Z",
+    )
+    resolved = router.resolve("worker", "fable", ["local"])
+    assert (resolved.client, resolved.effective_tier) == ("codex", "opus")
+
+
 def cap(client, role, tier, *, usable=True, host="local"):
     return ClientCapability(
         host=host,
@@ -368,3 +416,42 @@ def test_capability_role_or_tier_mismatch_is_rejected(tmp_path, base_config):
     record(registry, cap("claude", "grader", "sonnet"))
     with pytest.raises(NoCapabilityAvailable):
         router.resolve("worker", "sonnet", ["local"])
+
+
+# ── Codex family words resolve where Codex runs (design 2026-10-17 v120-completeness R2) ──
+
+def test_codex_family_words_resolve_where_codex_runs_and_unavailable_falls_through(
+    tmp_path, base_config, monkeypatch, caplog,
+):
+    home = tmp_path / "codexhome"
+    home.mkdir()
+    (home / "models_cache.json").write_text('{"models": [{"slug": "gpt-6.1-sol"}, {"slug": "gpt-6-sol"}]}')
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    raw = base_config()
+    raw["clients"]["codex"]["enabled"] = True
+    raw["clients"]["codex"]["models"] = {"haiku": "luna", "sonnet": "terra", "opus": "sol", "fable": "astra"}
+    for role in raw["roles"].values():
+        role["clients"] = ["claude", "codex"]
+    state = ProviderState(init_db(str(tmp_path / "commander.db")))
+    registry = CapabilityRegistry(state)
+    router = ProviderRouter(parse_provider_config(raw), state, registry)
+    state.set_current_client("worker", "codex")
+    state.set_current_client("advisor", "codex")
+    record(
+        registry,
+        cap("codex", "worker", "opus"),
+        cap("codex", "worker", "opus", host="box-1"),
+        cap("codex", "advisor", "opus"),
+        cap("codex", "worker", "sonnet"),
+        cap("claude", "worker", "sonnet"),
+    )
+    local = router.resolve("worker", "opus", ["local"])
+    remote = router.resolve("worker", "opus", ["box-1"],
+                            codex_cache=lambda host: '{"models": [{"slug": "gpt-6-sol"}]}')
+    assert (local.client, local.host, local.model) == ("codex", "local", "gpt-6.1-sol")
+    assert (remote.client, remote.host, remote.model) == ("codex", "box-1", "gpt-6-sol")
+    assert router.resolve("advisor", "opus", ["local"], advisor_worker_type="claude-opus").model == "gpt-6.1-sol"
+    # No Terra installed: Codex is unavailable for the call and routing falls to Claude.
+    fallback = router.resolve("worker", "sonnet", ["local"])
+    assert (fallback.client, fallback.model) == ("claude", "sonnet")
+    assert "'terra'" in caplog.text and str(home / "models_cache.json") in caplog.text

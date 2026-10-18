@@ -5,6 +5,14 @@ description: Turn ideas into fully formed designs through collaborative dialogue
 
 # Brainstorming
 
+## Client-native skill handoffs
+
+Use the next skill on the current client. Claude invokes the named skill with
+its Skill tool. Codex reads the next skill's `SKILL.md` and applies it in the
+same task with the stated arguments. Both clients perform the same mandatory
+MCP preflight, transitions, and review gates. Reading a skill on Codex is the
+skill invocation; prose about a future handoff does not complete it.
+
 ## Purpose
 
 Turn vague ideas into fully-formed designs through systematic collaborative dialogue. This skill guides you through understanding the problem, exploring approaches, and creating a comprehensive design document before any implementation.
@@ -69,6 +77,14 @@ If the user references a specific design document by name, use the Read tool to 
 Using brainstorming skill. Professional mode is ACTIVE - architect mode enforced (no code changes).
 ```
 
+**Enter the brainstorming stage (both clients).**
+Run Mandatory Direct Transition Preflight for target `brainstorming`. Only after
+a different-target result, call `mark_brainstorming` once (Claude:
+`mcp__plugin_ironclaude_state-manager__mark_brainstorming`; Codex: `state-manager`
+`mark_brainstorming`). On Claude, skill activation has already moved the stage, so the
+preflight returns equal-target and skips the call. On Codex, this call is the entry
+into brainstorming; for a new effort it arms the memory search that Step 0.5 performs.
+
 ### Step 0.1: Parse scope mode
 
 Parse `--scope` from skill arguments. Valid values: `hold`, `selective`, `expansion`, `reduction`. Default: `selective` if not provided.
@@ -84,11 +100,24 @@ Where descriptions are:
 - `expansion` — Explore the 10x version alongside as-stated.
 - `reduction` — Minimum viable version. Strip everything else.
 
+### Step 0.2: Apply scope fidelity (REQUIRED)
+
+Read `../../rules/scope-fidelity.md` and, if it exists, the target repository's
+`docs/operator-prohibitions.md`. Then:
+- Classify the change as light or full per the rule, and state it in one line:
+  `Loop: light — <why no risk area; ~N files/~M lines>` or `Loop: full — <risk area or size>`.
+  Record the same line in the design doc.
+- For a light change, the design doc may be one short note with a `## Requirements` section.
+- Honor every operator prohibition; never design a forbidden pattern back in.
+- Design only what was asked. Instrumentation, harnesses, review pages, receipts, and new
+  verification tooling are out of scope unless the operator named them.
+- Note whether delegated authority is in effect (rule §3). It changes Steps 5 and 9.
+
 ### Step 0.5: Search Episodic Memory (REQUIRED)
 
 Before proceeding with any brainstorming:
 
-1. Dispatch ironclaude:search-conversations agent with query based on user's topic
+1. Search episodic memory with a query based on the user's topic: on Claude, dispatch the `ironclaude:search-conversations` agent; on Codex, search with the `episodic-memory` MCP server's search capability
 2. Review results for:
    - Previous designs for similar features
    - Decisions made in past conversations
@@ -139,7 +168,8 @@ Examine current state:
 
 **To invoke debugging:**
 
-1. Use the Skill tool: `skill="ironclaude:systematic-debugging"`
+1. Use `ironclaude:systematic-debugging` through the client-native skill
+   handoff: Claude invokes Skill; Codex reads and applies its `SKILL.md`.
 2. Run the FULL debugging process (all phases including Plan Fix)
 3. Capture the outputs: root cause, evidence, and proposed fix
 
@@ -287,6 +317,10 @@ Does this section look right so far?
 
 Wait for confirmation before continuing to next section.
 
+Under delegated authority (`../../rules/scope-fidelity.md` §3), present each section and
+continue without asking; when Step 7 writes the design doc, put
+`Predicted answer: yes (delegated)` under each section heading.
+
 **Step 6: Handle feedback**
 
 If user says something doesn't look right:
@@ -359,10 +393,8 @@ If `mcp__plugin_ironclaude_state-manager__mark_design_ready` returns an error (w
 **Step 9: Announce completion and prompt for next steps**
 
 <HARD-GATE>
-DO NOT write plan content yourself. DO NOT output task lists, waves, or steps.
-DO NOT say "I'll write the plan now" and then produce plan prose.
-The Skill tool IS the plan-writing process. Invoking it is not optional.
-Anything other than invoking the Skill tool is NOT writing a plan.
+Do not write plan content in brainstorming or substitute plan prose for the
+writing-plans skill. Continue through the client-native skill handoff above.
 </HARD-GATE>
 
 Display design completion status:
@@ -371,7 +403,7 @@ Design complete and saved to docs/plans/YYYY-MM-DD-<topic>-design.md.
 
 Professional mode is ACTIVE - changes staged for your review.
 
-SUGGESTED_NEXT_ACTION: Skill(skill="ironclaude:writing-plans", args="docs/plans/YYYY-MM-DD-<topic>-design.md")
+SUGGESTED_NEXT_ACTION: use ironclaude:writing-plans with docs/plans/YYYY-MM-DD-<topic>-design.md through the client-native handoff
 ```
 
 Use AskUserQuestion tool:
@@ -379,12 +411,16 @@ Use AskUserQuestion tool:
   header: "Next step"
   options: "Yes, invoke writing-plans" | "No, stop here"
 
-If user confirms: invoke Skill tool IMMEDIATELY with:
-  skill: "ironclaude:writing-plans"
-  args: "docs/plans/YYYY-MM-DD-<topic>-design.md"
+If user confirms: immediately use `ironclaude:writing-plans` with the design
+path. Claude invokes Skill with `args: "docs/plans/YYYY-MM-DD-<topic>-design.md"`;
+Codex reads and applies `writing-plans/SKILL.md` with that design path.
 
-Do NOT produce any text output between the confirmation and the Skill invocation.
+Do not produce text output between confirmation and the client-native handoff.
 If user declines: stop here. The design doc is saved; they can invoke /writing-plans later.
+
+Under delegated authority (`../../rules/scope-fidelity.md` §3), skip the question, record
+`Predicted answer: Yes, invoke writing-plans (delegated)` in the design doc, and use the
+client-native handoff immediately as above.
 
 ## Key Principles
 
@@ -395,5 +431,5 @@ If user declines: stop here. The design doc is saved; they can invoke /writing-p
 - **Incremental validation**: Present design in sections, validate each
 - **Be flexible**: Go back and clarify when something doesn't make sense
 - **Always document**: Write to docs/plans/ before proceeding
-- **Explicit skill invocation**: When user confirms at Step 9, invoke `Skill tool { skill: "ironclaude:writing-plans", args: "<design-path>" }` immediately. Never substitute prose, task lists, or step descriptions for the Skill invocation. Writing the plan means CALLING THE SKILL TOOL, not describing what you would write.
+- **Explicit skill handoff**: When user confirms at Step 9, Claude invokes `Skill tool { skill: "ironclaude:writing-plans", args: "<design-path>" }`; Codex reads and applies `writing-plans/SKILL.md` with that path. Never substitute prose, task lists, or step descriptions for the handoff.
 - **Predict before asking**: Before every question, state your prediction with reasoning ("My prediction: You'll say X because..."). This forces thinking from the user's perspective and is enforced by the get-back-to-work hook.

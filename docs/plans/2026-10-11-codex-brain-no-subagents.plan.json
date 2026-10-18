@@ -1,0 +1,128 @@
+{
+  "name": "Codex Brain no subagents (R12) + tool inventory (R13)",
+  "goal": "Codex Brain cannot spawn subagents: app-server never offers the tools (agents.enabled=false) and brain-task-gate blocks namespaced collaborationspawn_agent; then inventory the Brain's tools for the operator.",
+  "requirements_file": "docs/plans/2026-10-10-codex-brain-parity-design.md",
+  "design_file": "docs/plans/2026-10-10-codex-brain-parity-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Brain app-server argv disables agents (R12 A)",
+      "description": "TDD. test_codex_brain_client.py test_app_server_argv_forces_readonly_and_on_request: insert '-c', 'agents.enabled=false' after the model_reasoning_effort pair; class docstring line. codex_brain_client.py _app_server_argv: insert the same pair (with R12 comment) after the effort pair. Exact code: human plan Task 1.",
+      "allowed_files": ["commander/src/ironclaude/codex_brain_client.py", "commander/tests/test_codex_brain_client.py"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: test edit per human plan Task 1 Step 1."},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_codex_brain_client.py -q", "expected": "Exactly 1 failure: TestSpawnHardening::test_app_server_argv_forces_readonly_and_on_request; record summary."},
+        {"description": "GREEN: argv edit per human plan Task 1 Step 3."},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_codex_brain_client.py tests/test_codex_brain_hooks_canary.py -q", "expected": "All pass; record summary."},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/codex_brain_client.py commander/tests/test_codex_brain_client.py", "expected": "No output."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "brain-task-gate catches the namespaced spawn (R12 B)",
+      "description": "TDD. Tests: test-brain-task-gate.sh add 'namespaced collaborationspawn_agent blocked' (feed, after line 56) and 'no-logger: collaborationspawn_agent blocked' (nofeed, after line 74); test-hooks-json-brain-entries.sh:17 matcher -> Agent|Task|spawn_agent|collaborationspawn_agent. Impl: hooks.json:131 matcher same literal; brain-task-gate.sh line 2 comment, line 24 and 46 compares -> *spawn_agent suffix, comment 44-45 replaced. Exact text: human plan Task 2.",
+      "allowed_files": [
+        "worker/hooks/hooks.json",
+        "commander/hooks/brain-task-gate.sh",
+        "commander/hooks/tests/test-brain-task-gate.sh",
+        "worker/hooks/tests/test-hooks-json-brain-entries.sh"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: test edits per human plan Task 2 Step 1."},
+        {"description": "Run RED gate test; then run 'bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-hooks-json-brain-entries.sh' (expected exactly 1 FAIL line: 'FAIL: PreToolUse Brain tail')", "command": "bash /Users/roberthyatt/Code/ironclaude/commander/hooks/tests/test-brain-task-gate.sh", "expected": "13 passed, 2 failed (the two collaborationspawn_agent cases)."},
+        {"description": "GREEN: hooks.json matcher + brain-task-gate.sh per human plan Task 2 Step 3."},
+        {"description": "Run GREEN gate test; then rerun the hooks-json test (no FAIL line, exit 0)", "command": "bash /Users/roberthyatt/Code/ironclaude/commander/hooks/tests/test-brain-task-gate.sh", "expected": "15 passed, 0 failed."},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/hooks.json commander/hooks/brain-task-gate.sh commander/hooks/tests/test-brain-task-gate.sh worker/hooks/tests/test-hooks-json-brain-entries.sh", "expected": "No output."}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Full suites over the whole change set",
+      "description": "No tests required: verification-only task that modifies no files. allowed_files lists the whole parity change set so end-of-plan restage and /commit cover it.",
+      "allowed_files": [
+        "docs/plans/2026-10-10-codex-brain-parity-design.md",
+        "docs/plans/2026-10-10-codex-brain-parity.md",
+        "docs/plans/2026-10-10-codex-brain-parity.plan.json",
+        "docs/plans/2026-10-10-codex-brain-parity-probe-findings.md",
+        "docs/plans/2026-10-10-codex-brain-parity-live-verification.md",
+        "docs/plans/2026-10-11-codex-brain-parity-followup.md",
+        "docs/plans/2026-10-11-codex-brain-parity-followup.plan.json",
+        "docs/plans/2026-10-11-codex-hooks-trust-confirm.md",
+        "docs/plans/2026-10-11-codex-hooks-trust-confirm.plan.json",
+        "docs/plans/2026-10-11-codex-brain-no-subagents.md",
+        "docs/plans/2026-10-11-codex-brain-no-subagents.plan.json",
+        "commander/hooks/block-push.sh",
+        "commander/hooks/block-pin-enforcer.sh",
+        "commander/hooks/attention-sweep-enforcer.sh",
+        "commander/hooks/attention-sweep-arm.sh",
+        "commander/hooks/brain-orchestrator-guard.sh",
+        "commander/hooks/brain-task-gate.sh",
+        "commander/hooks/brain-hooks-canary.sh",
+        "commander/hooks/tests/test-block-push.sh",
+        "commander/hooks/tests/test-attention-sweep.sh",
+        "commander/hooks/tests/test-block-pin-enforcer.sh",
+        "commander/hooks/tests/test-brain-orchestrator-guard.sh",
+        "commander/hooks/tests/test-brain-task-gate.sh",
+        "commander/hooks/tests/test-brain-hooks-canary.sh",
+        "worker/.codex-plugin/plugin.json",
+        "worker/hooks/codex-brain-hooks.sh",
+        "worker/hooks/hook-logger.sh",
+        "worker/hooks/get-back-to-work-claude.sh",
+        "worker/hooks/codex-brain-gated-actions.sh",
+        "worker/hooks/brain-gated-actions.sh",
+        "worker/hooks/test-codex-brain-gated-actions.sh",
+        "worker/hooks/test-brain-gated-actions.sh",
+        "worker/hooks/hooks.json",
+        "worker/hooks/tests/test-codex-brain-stand-down.sh",
+        "worker/hooks/tests/test-hooks-json-brain-entries.sh",
+        "worker/hooks/tests/test-execution-drift-check.sh",
+        "commander/src/ironclaude/codex_brain_client.py",
+        "commander/src/ironclaude/main.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/src/ironclaude/brain_client.py",
+        "commander/src/brain/brain_settings_hooks.json",
+        "commander/tests/test_codex_brain_client.py",
+        "commander/tests/test_daemon.py",
+        "commander/tests/test_brain_client_gate_session.py",
+        "commander/tests/test_brain_hook_provenance.py",
+        "commander/tests/test_codex_brain_hooks_canary.py",
+        "commander/tests/test_codex_hook_trust_warmup.py",
+        "commander/tests/test_worker_adapter.py"
+      ],
+      "depends_on": [1, 2],
+      "steps": [
+        {"description": "Hook suites", "command": "make -C /Users/roberthyatt/Code/ironclaude test-hooks > /private/tmp/ironclaude-no-subagents-hooks.log 2>&1; echo \"test-hooks exit=$?\"", "expected": "test-hooks exit=0."},
+        {"description": "Full Commander suite (background, Bash timeout 1800000); wait with foreground until-loop on the log's last line", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q > /private/tmp/ironclaude-no-subagents-full.log 2>&1; echo \"pytest exit=$?\"", "expected": "Only failure allowed: L-T2 test_execution_complete_restage_command_stages_from_non_root_cwd; record summary."}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Deploy, restart, live acceptance and inventory (R12, R13)",
+      "description": "No unit tests: deploys and verifies live. Exact commands and expectations: human plan Task 4 Steps 1-12. Operator launches the Commander (agent relaunch blocked by safety filter, never re-sent). On canary failure: make stop, record evidence, stop. Kill only by exact name/PID or make stop. Guard false positive: printf 'git p\\165sh', grep 'pu[s]h'. R13 inventory reported to operator via AskUserQuestion; no code changes.",
+      "allowed_files": [
+        "worker/.codex-plugin/plugin.json",
+        "docs/plans/2026-10-10-codex-brain-parity-live-verification.md",
+        "docs/plans/2026-10-10-codex-brain-parity-design.md",
+        "docs/plans/2026-10-11-codex-brain-no-subagents.md",
+        "docs/plans/2026-10-11-codex-brain-no-subagents.plan.json"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {"description": "Release Codex plugin; record plugin root (fallback: newest version dir under /Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/)", "command": "make -C /Users/roberthyatt/Code/ironclaude codex-plugin-release", "expected": "exit 0; plugin root recorded."},
+        {"description": "Cache carries new matcher: grep -c collaborationspawn_agent <plugin root>/hooks/hooks.json", "expected": "1"},
+        {"description": "Deploy worker hooks (worker/hooks/*.sh only, Makefile:61; Brain commander/hooks/*.sh deploy happens at Commander start, main.py:5733-5736). Then record before-values: grep -c '== \\*spawn_agent' /Users/roberthyatt/.claude/ironclaude-hooks/brain-task-gate.sh -> 0; grep -n -A2 \"hooks.json:pre_tool_use:11:0\" /Users/roberthyatt/.codex/config.toml -> record trusted_hash H0", "command": "make -C /Users/roberthyatt/Code/ironclaude deploy-hooks", "expected": "deploy ok; grep count 0; H0 recorded."},
+        {"description": "Stop Commander; pgrep -fl \"ironclaude.main\" (exit 1); wc -l /tmp/ic/daemon.log -> L; record time", "command": "make -C /Users/roberthyatt/Code/ironclaude/commander stop", "expected": "Daemon (PID ...) stopped; pgrep exit 1; record L."},
+        {"description": "Operator launch via AskUserQuestion ('make -C ~/Code/ironclaude/commander run')."},
+        {"description": "Start-up result: until-loop on tail -n +<L+1> /tmp/ic/daemon.log for 'Brain SDK client (started|not started)|hooks are not running', then show it", "expected": "trust_prompt_answered=True; Brain SDK client started client=codex; no 'hooks are not running'; no 'still on screen'. On canary failure: make stop, record, stop."},
+        {"description": "Trust/canary/deploy: find /tmp/ic/codex-brain-gate -name hooks-live -newer /tmp/ic-logs/ic-codex-hook-trust.log (1 path); ls -la config.toml (mtime > Step 4 time); grep -c '== \\*spawn_agent' /Users/roberthyatt/.claude/ironclaude-hooks/brain-task-gate.sh -> 2", "command": "grep -n -A2 \"hooks.json:pre_tool_use:11:0\" /Users/roberthyatt/.codex/config.toml", "expected": "one entry with trusted_hash H1 != H0; one canary path; mtime after launch; gate grep 2."},
+        {"description": "Live Brain rollout BR (newest -newer /tmp/ic-logs/ic-codex-hook-trust.log with \"cwd\":\"/Users/roberthyatt/.ironclaude/brain\"): grep -c 'concurrency slots' BR -> 0; grep -c '\"namespace\":\"collaboration\"' BR -> 0; grep -c professional-mode-guard BR -> 0", "expected": "0, 0, 0."},
+        {"description": "Probe A (agents off + Brain identity, inventory) exactly as human plan Task 4 Step 9 (Bash timeout 600000); then its rollout: collaboration namespace 0, 'concurrency slots' 0, final message has NO_SPAWN_TOOL; record full tool list verbatim. If codex exec rejects -c: plan defect, stop and report", "expected": "exit= line; 0; 0; NO_SPAWN_TOOL; tool list recorded."},
+        {"description": "Probe B (no agents flag) exactly as human plan Task 4 Step 10; then grep -c 'the Brain must not spawn subagents' probe-b.jsonl", "expected": ">= 1; no '\"task_name\":\"/root/' output."},
+        {"description": "Write R12/R13 section in live-verification doc (F1 resolved + Steps 1-10 output + inventory table), then stage; then 'git -C /Users/roberthyatt/Code/ironclaude add worker/.codex-plugin/plugin.json'", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-10-codex-brain-parity-live-verification.md docs/plans/2026-10-10-codex-brain-parity-design.md docs/plans/2026-10-11-codex-brain-no-subagents.md docs/plans/2026-10-11-codex-brain-no-subagents.plan.json", "expected": "No output from either add."},
+        {"description": "Report R13 inventory to operator via AskUserQuestion (which extra tools to remove, if any). No code changes in this plan."}
+      ]
+    }
+  ]
+}

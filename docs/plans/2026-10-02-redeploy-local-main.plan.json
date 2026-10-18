@@ -1,0 +1,26 @@
+{
+  "name": "Redeploy Local Main",
+  "goal": "Redeploy local main (d3dae6a) to both clients and restart Commander and Codex; no push.",
+  "requirements_file": "docs/plans/2026-10-02-redeploy-local-main-design.md",
+  "design_file": "docs/plans/2026-10-02-redeploy-local-main-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Redeploy and restart",
+      "description": "Loop: light (operational, no code change). Follow human plan docs/plans/2026-10-02-redeploy-local-main.md Task 1 Steps 1-9 exactly. Kill only exact verified PIDs; never pattern-kill. No push, no commit. No tests required: operational commands, no code change.",
+      "allowed_files": ["docs/plans/2026-10-02-redeploy-local-main-log.md"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Deploy hooks", "command": "make -C /Users/roberthyatt/Code/ironclaude deploy-hooks", "expected": "last two lines: 'Deployed to plugin cache ...' and 'Deployed 30 hooks to /Users/roberthyatt/.claude/ironclaude-hooks'"},
+        {"description": "Refresh Codex plugin cache", "command": "codex plugin add ironclaude@ironclaude --json", "expected": "JSON with installedPath under /Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/"},
+        {"description": "Verify Codex cache equals worker/", "command": "diff -rq /Users/roberthyatt/Code/ironclaude/worker <installedPath> -x node_modules -x __pycache__ -x .DS_Store", "expected": "no output, exit 0 (rules/scope-fidelity.md present in cache)"},
+        {"description": "Stop Commander", "command": "make -C /Users/roberthyatt/Code/ironclaude/commander stop", "expected": "ps -p 52042 lists no process afterward"},
+        {"description": "Relaunch Commander detached, Claude Code env stripped", "command": "env -u CLAUDE_CODE_BRIDGE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH -u CLAUDE_CODE_MESSAGING_SOCKET -u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_SESSION_ATTENDED -u CLAUDE_CODE_SESSION_ID -u CLAUDE_EFFORT -u CLAUDE_PID -u CLAUDECODE nohup python3 -c \"import os; os.setsid(); os.execvp('make',['make','-C','/Users/roberthyatt/Code/ironclaude/commander','run'])\" >/tmp/ironclaude-restart-launch.log 2>&1 & disown"},
+        {"description": "Verify Commander", "expected": "/tmp/ic-daemon.pid holds a live PID != 52042; a Brain child is running; grep -n -e Traceback -e ERROR /tmp/ironclaude-restart-launch.log finds nothing"},
+        {"description": "Quit Codex gracefully", "command": "osascript -e 'tell application \"ChatGPT\" to quit'", "expected": "PIDs recorded beforehand (pgrep -l -x ChatGPT + app-server descendants) have exited; any survivor killed by exact PID and recorded"},
+        {"description": "Relaunch Codex and verify", "command": "open -a /Applications/ChatGPT.app", "expected": "new ChatGPT main PID and new app-server child running"},
+        {"description": "Write and stage log", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-02-redeploy-local-main-log.md", "expected": "log contains each command result, old/new PIDs, any killed PIDs, diff result; staged, exit 0"}
+      ]
+    }
+  ]
+}

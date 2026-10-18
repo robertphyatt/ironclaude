@@ -1,0 +1,143 @@
+{
+  "name": "v1.2.0 security fixes remediation: disabled Codex servers, expanding braces, Brain git globs, suites, live checks",
+  "goal": "Before deploy and tag: the Codex Brain extra-server start check ignores servers Codex reports as runtimeStatus \"disabled\"; expanding brace groups (containing , or ..) are refused by both Brain git checks, brain-orchestrator-guard.sh (raw command, before research predicate and -C normalization) and bash-readonly-guard.sh _has_blocked_metachars; * ? [ are refused in Brain git commands; rerun suites, update release notes, run post-deploy live checks.",
+  "requirements_file": "docs/plans/2026-10-18-v120-security-fixes-remediation-design.md",
+  "design_file": "docs/plans/2026-10-18-v120-security-fixes-remediation-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Disabled servers, expanding braces and Brain git globs (1a-R, 1b-R, 1c-R)",
+      "description": "Per plan.md Task 1, code verbatim. TDD. codex_brain_client: _EXPANDING_BRACE_RE = re.compile(r\"\\{[^{}]*(?:,|\\.\\.)[^{}]*\\}\") and _GLOB_CHARACTERS = (\"*\", \"?\", \"[\") after _SHELL_METACHARACTERS; _git_command_allowed returns False on either, right after the metacharacter check; _verify_orchestrator_mcp extra skips runtimeStatus == \"disabled\" (missing/other status counts). brain_client Bash branch: after the metacharacter check, (False, 'Shell brace expansion is not allowed in git commands.') and (False, 'Glob characters are not allowed in git commands.'). brain-orchestrator-guard.sh: brace grep -qE '\\{[^{}]*(,|\\.\\.)[^{}]*\\}' exit 2 right after the chaining check; RAW_CMD=\"$CMD\" before '# Normalize: strip -C <path>'; case \"$RAW_CMD\" in *[\\*\\?\\[]*) exit 2 before '# Extract git subcommand'. bash-readonly-guard.sh _has_blocked_metachars gains the brace grep and its header comment (line 12) is replaced per plan.md.",
+      "allowed_files": [
+        "commander/src/ironclaude/codex_brain_client.py",
+        "commander/src/ironclaude/brain_client.py",
+        "commander/hooks/brain-orchestrator-guard.sh",
+        "worker/hooks/bash-readonly-guard.sh",
+        "commander/tests/test_codex_brain_client.py",
+        "commander/tests/test_brain_client.py",
+        "commander/hooks/tests/test-brain-orchestrator-guard.sh",
+        "worker/hooks/tests/test-bash-readonly-guard.sh"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED tests verbatim per plan.md Task 1 Step 1 (a)-(f): Codex _GIT_WRITE_FORMS +7 ('git diff {--output=/tmp/x,}', 'git log {--output=/tmp/x,-1}', 'git diff *', \"git log -- '*.py'\", 'git diff ?', 'git diff [a]', 'git log HEAD~{1..2}') and _GIT_ALLOWED_FORMS +2 ('git log HEAD@{1}', 'git diff @{u}'); reject test gains \"zeta_live\": {\"runtimeStatus\": \"ready\", \"tools\": {}} and expects 'node_repl, zeta_live, zeta_tools'; new test_verify_skips_disabled_servers_outside_brain_set before test_verify_passes_with_every_brain_server; Claude TestBrainGitWriteGuard +7 refused rows (reasons brace, brace, glob, glob, glob, glob, brace) and +2 allowed rows; 8 hook rows before 'claude Bash git diff allowed'; predicate test block rows find /tmp {-delete,}, ls {a,b}, cat f{1..3}, allow cat a{b} before '# Non-allowlisted commands -> BLOCK', and git_block 'git diff {--output=/tmp/x,}' after the git_block() definition line",
+          "expected": "files edited; no command"
+        },
+        {
+          "description": "Run RED",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_codex_brain_client.py::TestGitCommandAllowedWriteForms tests/test_codex_brain_client.py::TestOrchestratorStartupReadiness tests/test_brain_client.py::TestBrainGitWriteGuard -q > /private/tmp/claude-502/taf3/r1-red.log 2>&1; echo \"rc=$?\"; rg -n '^FAILED' /private/tmp/claude-502/taf3/r1-red.log; tail -n 1 /private/tmp/claude-502/taf3/r1-red.log; bash /Users/roberthyatt/Code/ironclaude/commander/hooks/tests/test-brain-orchestrator-guard.sh > /private/tmp/claude-502/taf3/r1-hook-red.log 2>&1; echo \"hook_rc=$?\"; rg -n '^FAIL' /private/tmp/claude-502/taf3/r1-hook-red.log; tail -n 1 /private/tmp/claude-502/taf3/r1-hook-red.log; bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-bash-readonly-guard.sh > /private/tmp/claude-502/taf3/r1-pred-red.log 2>&1; echo \"pred_rc=$?\"; rg -n -e '^FAIL' -e 'ALL PASS' -e '^FAILURES' /private/tmp/claude-502/taf3/r1-pred-red.log",
+          "expected": "derived: rc=1, exactly 15 failed: test_write_forms_declined x7 new refused rows, test_write_forms_refused x7 same rows, test_verify_skips_disabled_servers_outside_brain_set; the edited reject test, test_matches_claude_brain_guard and allowed rows pass; hook_rc=1, FAIL for exactly the 7 new blocked rows, last line '26 passed, 7 failed'; pred_rc=1, 'FAIL expected BLOCK:' for find /tmp {-delete,}, ls {a,b}, cat f{1..3}, git diff {--output=/tmp/x,}, then FAILURES"
+        },
+        {
+          "description": "GREEN code verbatim per plan.md Task 1 Step 3 (a)-(e)",
+          "expected": "files edited; no command"
+        },
+        {
+          "description": "Run GREEN",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_codex_brain_client.py tests/test_codex_brain_tool_trim.py tests/test_brain_client.py -q > /private/tmp/claude-502/taf3/r1-green.log 2>&1; echo \"rc=$?\"; rg -n '^(FAILED|ERROR)' /private/tmp/claude-502/taf3/r1-green.log; tail -n 1 /private/tmp/claude-502/taf3/r1-green.log; bash /Users/roberthyatt/Code/ironclaude/commander/hooks/tests/test-brain-orchestrator-guard.sh > /private/tmp/claude-502/taf3/r1-hook-green.log 2>&1; echo \"hook_rc=$?\"; tail -n 1 /private/tmp/claude-502/taf3/r1-hook-green.log; bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-bash-readonly-guard.sh > /private/tmp/claude-502/taf3/r1-pred-green.log 2>&1; echo \"pred_rc=$?\"; tail -n 1 /private/tmp/claude-502/taf3/r1-pred-green.log",
+          "expected": "rc=0, no FAILED or ERROR lines, 0 failed; hook_rc=0 and '33 passed, 0 failed'; pred_rc=0 and 'ALL PASS'"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/codex_brain_client.py commander/src/ironclaude/brain_client.py commander/hooks/brain-orchestrator-guard.sh worker/hooks/bash-readonly-guard.sh commander/tests/test_codex_brain_client.py commander/tests/test_brain_client.py commander/hooks/tests/test-brain-orchestrator-guard.sh worker/hooks/tests/test-bash-readonly-guard.sh",
+          "expected": "no output"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Full suites, docs and staging",
+      "description": "Per plan.md Task 2. No tests required: regression run and release notes only. Commander suite (derived 4126 + 28 = 4154; a different passed count with 0 failed is recorded, not a STOP), make test-hooks (60), state-manager npm test (273). Findings release paragraph and CHANGELOG 1.2.0 security bullet gain the expansion rule and 'running server ... servers Codex reports as disabled do not count' verbatim per plan.md; findings gets '## Remediation suites'; 'Suites: commander 4126,' -> 'Suites: commander <N>,'. Stage; expected 18 entries (11 M + 7 A); worker/.codex-plugin/plugin.json stays unstaged. Then an Opus end review of the combined staged diff; the operator folds, deploys and restarts.",
+      "allowed_files": [
+        "CHANGELOG.md",
+        "docs/plans/2026-10-18-v120-security-fixes-findings.md",
+        "docs/plans/2026-10-18-v120-security-fixes-remediation-design.md",
+        "docs/plans/2026-10-18-v120-security-fixes-remediation.md",
+        "docs/plans/2026-10-18-v120-security-fixes-remediation.plan.json"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Full Commander suite (Bash timeout 600000)",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/ -q > /private/tmp/claude-502/taf3/r2-suite.log 2>&1; echo \"suite=$?\"; rg -n '^(FAILED|ERROR)' /private/tmp/claude-502/taf3/r2-suite.log; tail -n 1 /private/tmp/claude-502/taf3/r2-suite.log",
+          "expected": "suite=0, no FAILED or ERROR lines; passed derived 4126 + 28 = 4154 (Codex 18 rows + 1 inventory test, Claude 9 rows); record as <N>"
+        },
+        {
+          "description": "Hook suites",
+          "command": "cd /Users/roberthyatt/Code/ironclaude && make test-hooks > /private/tmp/claude-502/taf3/r2-hooks.log 2>&1; echo \"make_rc=$?\"; rg -c '^--- ' /private/tmp/claude-502/taf3/r2-hooks.log; tail -n 3 /private/tmp/claude-502/taf3/r2-hooks.log",
+          "expected": "make_rc=0 and 60 suite headers"
+        },
+        {
+          "description": "State-manager suite",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm test > /private/tmp/claude-502/taf3/r2-npm.log 2>&1; echo \"npm=$?\"; rg -n -e 'Test Files' -e 'Tests  ' -e ' FAIL ' /private/tmp/claude-502/taf3/r2-npm.log",
+          "expected": "npm=0 and 'Tests  273 passed (273)' (load rule only for the SIGTERM-resistant process-group test)"
+        },
+        {
+          "description": "Findings per plan.md Task 2 Step 4 (two replacements in the '## Release commit message addition' paragraph, verbatim; append '## Remediation suites' with Steps 1-3 summaries)",
+          "command": "rg -n -F -e 'refuse brace groups the shell would expand' -e 'servers Codex reports as disabled do not count' -e '## Remediation suites' /Users/roberthyatt/Code/ironclaude/docs/plans/2026-10-18-v120-security-fixes-findings.md",
+          "expected": "exactly two lines: the paragraph line (both phrases) and the '## Remediation suites' heading"
+        },
+        {
+          "description": "CHANGELOG per plan.md Task 2 Step 5 (two replacements in the bullet starting '- **Both Brains refuse git file writes and branch changes', verbatim; 'Suites: commander 4126,' -> 'Suites: commander <N>,')",
+          "command": "rg -n -F -e 'refuse brace groups the shell would expand' -e 'servers Codex reports as disabled do not count' -e 'Suites: commander' /Users/roberthyatt/Code/ironclaude/CHANGELOG.md; rg -n -F 'Suites: commander 4126,' /Users/roberthyatt/Code/ironclaude/CHANGELOG.md; echo \"stale_rc=$?\"",
+          "expected": "four lines from the first rg: 57 (the 1.2.0 bullet, both phrases), 84 'Suites: commander <N>, state-manager 273, hooks 60', and older releases' lines at 98 and 112; then stale_rc=1 (unless <N> is 4126)"
+        },
+        {
+          "description": "Stage and check the staged set",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add CHANGELOG.md; git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-18-v120-security-fixes-findings.md docs/plans/2026-10-18-v120-security-fixes-remediation-design.md docs/plans/2026-10-18-v120-security-fixes-remediation.md docs/plans/2026-10-18-v120-security-fixes-remediation.plan.json; git -C /Users/roberthyatt/Code/ironclaude diff --cached --name-status; git -C /Users/roberthyatt/Code/ironclaude status --short worker/.codex-plugin/plugin.json",
+          "expected": "exactly 18 entries vs HEAD e59359b: M (11) CHANGELOG.md, commander/hooks/brain-orchestrator-guard.sh, commander/hooks/tests/test-brain-orchestrator-guard.sh, commander/src/ironclaude/brain_client.py, commander/src/ironclaude/codex_brain_client.py, commander/src/ironclaude/worker_handoff.py, commander/tests/test_brain_client.py, commander/tests/test_codex_brain_client.py, commander/tests/test_worker_handoff.py, worker/hooks/bash-readonly-guard.sh, worker/hooks/tests/test-bash-readonly-guard.sh; A (7) docs/plans/2026-10-18-v120-security-fixes-design.md, -findings.md, .md, .plan.json, -remediation-design.md, -remediation.md, -remediation.plan.json; last command prints ' M worker/.codex-plugin/plugin.json'; any other staged entry -> STOP"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Post-deploy live verification, operator-assisted",
+      "description": "Per plan.md Task 3: Task 5 of docs/plans/2026-10-18-v120-security-fixes.md with marker r3-start, log r3-grader.log, a cmp of the deployed bash-readonly-guard.sh and a bash brace probe. No tests required: live probes after the operator folds the staged set into the untagged v1.2.0 commit, deploys (claude plugin update + cache sync, make codex-plugin-release, make deploy-hooks) and restarts Commander and ChatGPT. LLM self-reports are evidence, not proof; any miss -> record and STOP, then fix in this loop via a new task; never rerun until it passes. Never write ~/.codex/config.toml. The findings addendum is folded into the v1.2.0 commit before tagging.",
+      "allowed_files": [
+        "docs/plans/2026-10-18-v120-security-fixes-findings.md"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "Deploy precondition (operator-assisted), then cmp deployed files and probe bash brace expansion",
+          "command": "touch /private/tmp/claude-502/taf3/r3-start; cmp /Users/roberthyatt/Code/ironclaude/commander/hooks/brain-orchestrator-guard.sh /Users/roberthyatt/.claude/ironclaude-hooks/brain-orchestrator-guard.sh; echo \"guard_cmp=$?\"; cmp /Users/roberthyatt/Code/ironclaude/worker/hooks/bash-readonly-guard.sh /Users/roberthyatt/.claude/ironclaude-hooks/bash-readonly-guard.sh; echo \"predicate_cmp=$?\"; cmp /Users/roberthyatt/Code/ironclaude/worker/agents/reviewer.md /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.2.0/agents/reviewer.md; echo \"agent_cmp=$?\"; cmp /Users/roberthyatt/Code/ironclaude/worker/hooks/brain-gated-actions.sh /Users/roberthyatt/.claude/ironclaude-hooks/brain-gated-actions.sh; echo \"gate_cmp=$?\"; cmp /Users/roberthyatt/Code/ironclaude/commander/hooks/brain-hooks-canary.sh /Users/roberthyatt/.claude/ironclaude-hooks/brain-hooks-canary.sh; echo \"canary_cmp=$?\"; cmp /Users/roberthyatt/Code/ironclaude/worker/hooks/plan-validator.sh /Users/roberthyatt/.claude/ironclaude-hooks/plan-validator.sh; echo \"validator_cmp=$?\"; cmp /Users/roberthyatt/Code/ironclaude/worker/hooks/execution-drift-check.sh /Users/roberthyatt/.claude/ironclaude-hooks/execution-drift-check.sh; echo \"drift_cmp=$?\"; ls -t /Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude; bash -c 'printf \"%s\\n\" HEAD@{1} {a,b}'",
+          "expected": "every *_cmp=0; record the first ls -t line; the last command prints HEAD@{1}, a, b on three lines; any non-zero cmp -> deploy incomplete, STOP and report which file"
+        },
+        {
+          "description": "A1 (orchestrator step, no shell command; in a fresh Claude Code session if ironclaude:reviewer is not in this session's agent list): model=haiku dispatches per plan.md Task 3 Step 2: reviewer tool list, reviewer shell action probe, general-purpose control",
+          "expected": "reviewer lists exactly Read, Grep, Glob (no Bash, Edit, Write, Skill, Agent or mcp__); reviewer action probe replies NO-SHELL; control names Bash; otherwise record and STOP"
+        },
+        {
+          "description": "Codex grader on the resolved newest model (R6): write grader_probe.py verbatim per plan.md Task 3 Step 3, run it, list Sol slugs",
+          "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python /private/tmp/claude-502/taf3/grader_probe.py > /private/tmp/claude-502/taf3/r3-grader.log 2>&1; echo \"probe=$?\"; cat /private/tmp/claude-502/taf3/r3-grader.log; jq -r '[.models[]?.slug | select(type == \"string\" and test(\"^gpt-[0-9]+(\\\\.[0-9]+)*-sol$\"))] | join(\" \")' /Users/roberthyatt/.codex/models_cache.json",
+          "expected": "probe=0; configured_opus=sol; resolved_opus= the numerically newest Sol slug on the last line; route client=codex model= equals it; result= has a grade and no infrastructure_error; any miss -> record and STOP"
+        },
+        {
+          "description": "Commander on Codex, R4 item 1 (operator-assisted): operator types /ironclaude provider brain codex in Slack (Commander restarts), then asks 'what unfinished work is sitting idle right now?'",
+          "command": "rg -n -e 'Codex hook-trust warm-up finished ready=' -e 'Brain SDK client started client=codex' -e 'Brain SDK client not started client=codex' -e 'Codex Brain hooks are not running' -e 'spawn failed: Codex model family' -e 'servers outside the Brain set' /private/tmp/ic/daemon.log; ls -ld /Users/roberthyatt/.ironclaude/state/brain-gate; find /Users/roberthyatt/.ironclaude/state/brain-gate -name hooks-live -newer /private/tmp/claude-502/taf3/r3-start; find /private/tmp/ic/codex-brain-gate -name hooks-live -newer /private/tmp/claude-502/taf3/r3-start; find /Users/roberthyatt/.codex/sessions -name 'rollout-*.jsonl' -newer /private/tmp/claude-502/taf3/r3-start",
+          "expected": "after the restart: 'Codex hook-trust warm-up finished ready=True trust_prompt_answered=' then 'Brain SDK client started client=codex'; no 'Brain SDK client not started client=codex', 'Codex Brain hooks are not running', 'spawn failed: Codex model family' or 'servers outside the Brain set' line (the last names a live server the start check refused: record the names and STOP); ls -ld shows drwx------; first find prints one .../brain-gate/<session>/hooks-live; old-root find prints nothing; last find lists the Brain's new rollout file(s)"
+        },
+        {
+          "description": "The Codex Brain's rollout has no tool errors (R4 item 1)",
+          "command": "find /Users/roberthyatt/.codex/sessions -name 'rollout-*.jsonl' -newer /private/tmp/claude-502/taf3/r3-start -exec rg -n -i -H -e 'professional mode is unset' -e 'access unavailable' {} +; echo \"scan_done=$?\"",
+          "expected": "no match lines, then scan_done=0; the operator confirms the Brain's Slack answer lists real workers or ledger tasks; a pass closes the 2026-10-10 backlog entry; the operator may switch back with /ironclaude provider brain claude"
+        },
+        {
+          "description": "Owed per-call tiering checks, R4 item 2 (operator-assisted): 1b send_to_worker/post_message to a live worker; 2 evaluate_worker_health on a live worker; 3 spawn a claude-opus worker",
+          "command": "rg -n -e 'fast model answered via' -e 'fast model unavailable' -e 'fast model skips codex' -e 'Provider route skipped' /private/tmp/ic/daemon.log; rg -l -F '/advisor opus' /private/tmp/ic-logs",
+          "expected": "after the start marker: 1b a 'fast model answered via haiku' or 'fast model answered via luna:<slug>' line; 2 a 'fast model answered via sonnet' or 'fast model answered via terra:<slug>' line; 3 the new worker's pane log listed by the second rg; if item 2 does not reach daemon.log, record UNVERIFIED-LIVE: no daemon.log line for evaluate_worker_health; searched daemon.log and the Brain rollout (grep the rollout for evaluate_worker_health as secondary evidence)"
+        },
+        {
+          "description": "Carried R4b live items (operator-assisted, no shell command of its own): defect 2 Codex /commit with nothing staged then the newest human_intents row via sqlite3 -readonly; defect 5 git add in a managed worktree under a workspace-write Codex sandbox on a scratch repo; defect 9 transcript of a fresh /activate-professional-mode",
+          "expected": "each recorded LIVE or FIXED with evidence, or kept UNVERIFIED-LIVE if the operator does not run it"
+        },
+        {
+          "description": "Append '## Post-deploy verification' to docs/plans/2026-10-18-v120-security-fixes-findings.md (every Step 1-7 output and verdict, A1 included); stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-18-v120-security-fixes-findings.md",
+          "expected": "no output; the operator folds this addendum into the v1.2.0 commit before tagging"
+        }
+      ]
+    }
+  ]
+}

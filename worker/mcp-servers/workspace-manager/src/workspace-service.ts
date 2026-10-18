@@ -46,6 +46,7 @@ import {
 } from './git.js';
 import type { RepositoryLocation } from './git.js';
 import type { Assignment, AssignmentLifecycle, HumanIntentReceipt } from './types.js';
+import { assertNoPendingHandoff, withAssignmentMutation } from './handoff.js';
 
 interface RepositoryRequest {
   repositoryPath: string;
@@ -611,8 +612,14 @@ export class WorkspaceService {
 
   /** Human approval is required before logical ownership of primary checkout. */
   usePrimaryCheckout(input: IntentRequest): { primaryCheckoutPath: string; assignment: Assignment } {
+    if (!getAssignment(this.db, input.workspaceGuid)) this.getWorkspaceAssignment(input);
+    return withAssignmentMutation(this.db, input.workspaceGuid, 'use-primary-checkout', () => this.usePrimaryCheckoutCore(input));
+  }
+
+  private usePrimaryCheckoutCore(input: IntentRequest): { primaryCheckoutPath: string; assignment: Assignment } {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if ((input.expectedEvidence === undefined) !== (input.nonce === undefined)) {
       throw new Error('Primary checkout switching authority input is malformed');
     }
@@ -643,8 +650,14 @@ export class WorkspaceService {
 
   /** Human approval is also required to release primary checkout ownership. */
   returnToManagedWorktree(input: IntentRequest): { managedWorktreePath: string; assignment: Assignment } {
+    if (!getAssignment(this.db, input.workspaceGuid)) this.getWorkspaceAssignment(input);
+    return withAssignmentMutation(this.db, input.workspaceGuid, 'return-to-managed-worktree', () => this.returnToManagedWorktreeCore(input));
+  }
+
+  private returnToManagedWorktreeCore(input: IntentRequest): { managedWorktreePath: string; assignment: Assignment } {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     // This must precede intent consumption and ownership release: a malformed
     // durable row cannot turn a primary checkout into an unowned checkout.
     if ((input.expectedEvidence === undefined) !== (input.nonce === undefined)) {
@@ -672,8 +685,14 @@ export class WorkspaceService {
   }
 
   abandonWorkspace(input: AbandonWorkspaceInput): Assignment {
+    if (!getAssignment(this.db, input.workspaceGuid)) this.getWorkspaceAssignment(input);
+    return withAssignmentMutation(this.db, input.workspaceGuid, 'abandon-workspace', () => this.abandonWorkspaceCore(input));
+  }
+
+  private abandonWorkspaceCore(input: AbandonWorkspaceInput): Assignment {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if (assignment.lifecycle_status === 'abandoned') return assignment;
     if (!nonterminal(assignment.lifecycle_status)) {
       throw new Error('Only unresolved managed worktrees can be abandoned');
@@ -730,8 +749,14 @@ export class WorkspaceService {
    * proofs — the moment a worktree actually exists for this row.
    */
   cleanupReservedAssignment(input: AssignmentRequest): Assignment {
+    if (!getAssignment(this.db, input.workspaceGuid)) this.getWorkspaceAssignment(input);
+    return withAssignmentMutation(this.db, input.workspaceGuid, 'cleanup-reserved-assignment', () => this.cleanupReservedAssignmentCore(input));
+  }
+
+  private cleanupReservedAssignmentCore(input: AssignmentRequest): Assignment {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if (assignment.lifecycle_status !== 'reserved') {
       throw new Error('Only a reserved, never-materialized assignment is eligible for this carve-out');
     }
@@ -866,8 +891,14 @@ export class WorkspaceService {
    * proof still reaches its actual Git HEAD. Every failed proof preserves work.
    */
   cleanupWorkspace(input: AssignmentRequest): Assignment {
+    if (!getAssignment(this.db, input.workspaceGuid)) this.getWorkspaceAssignment(input);
+    return withAssignmentMutation(this.db, input.workspaceGuid, 'cleanup-workspace', () => this.cleanupWorkspaceCore(input));
+  }
+
+  private cleanupWorkspaceCore(input: AssignmentRequest): Assignment {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if (assignment.lifecycle_status !== 'integrated' && assignment.lifecycle_status !== 'abandoned') {
       throw new Error('Only integrated or abandoned worktrees are eligible for cleanup');
     }
@@ -889,6 +920,14 @@ export class WorkspaceService {
    * preserved. Only after work is anchored does it tombstone the row.
    */
   reapLeakedAssignment(input: { repositoryPath: string; workspaceGuid: string }): Assignment {
+    if (!getAssignment(this.db, input.workspaceGuid)) {
+      discoverRepository(input.repositoryPath);
+      throw new Error('Leaked assignment does not match canonical managed identity for this repository');
+    }
+    return withAssignmentMutation(this.db, input.workspaceGuid, 'reap-leaked-assignment', () => this.reapLeakedAssignmentCore(input));
+  }
+
+  private reapLeakedAssignmentCore(input: { repositoryPath: string; workspaceGuid: string }): Assignment {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = getAssignment(this.db, input.workspaceGuid);
     if (!assignment
@@ -897,6 +936,7 @@ export class WorkspaceService {
       || assignment.branch !== managedBranch(assignment.workspace_guid)) {
       throw new Error('Leaked assignment does not match canonical managed identity for this repository');
     }
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if (assignment.lifecycle_status === 'cleaned') return assignment;
     if (assignment.lifecycle_status === 'reserved') {
       return this.reapReservedAssignment(repository, assignment);
@@ -1574,18 +1614,23 @@ export class WorkspaceService {
     const toRelink = [...written.added, ...written.skipped];
     if (toRelink.length > 0) {
       const liveManaged = this.db.prepare(`
-        SELECT worktree_path FROM assignments
+        SELECT workspace_guid, worktree_path FROM assignments
         WHERE repository_identity = ?
           AND lifecycle_status NOT IN ('integrated', 'abandoned', 'cleaned')
-      `).all(repository.repositoryIdentity) as { worktree_path: string }[];
-      for (const { worktree_path } of liveManaged) {
-        if (!existsSync(worktree_path)) continue;
-        const planted = linkSharedResources(
-          repository.primaryCheckoutPath,
-          worktree_path,
-          repository.repositoryIdentity,
-          toRelink,
-        );
+      `).all(repository.repositoryIdentity) as { workspace_guid: string; worktree_path: string }[];
+      for (const { workspace_guid, worktree_path } of liveManaged) {
+        const planted = withAssignmentMutation(this.db, workspace_guid, 'shared-resource-relink', () => {
+          const current = getAssignment(this.db, workspace_guid);
+          if (!current || current.repository_identity !== repository.repositoryIdentity
+            || current.worktree_path !== worktree_path || !nonterminal(current.lifecycle_status)
+            || !existsSync(worktree_path)) return [];
+          return linkSharedResources(
+            repository.primaryCheckoutPath,
+            worktree_path,
+            repository.repositoryIdentity,
+            toRelink,
+          );
+        });
         if (planted.length > 0) relinked[worktree_path] = planted;
       }
     }

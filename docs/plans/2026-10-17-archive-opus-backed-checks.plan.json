@@ -1,0 +1,28 @@
+{
+  "name": "Archive abandoned Opus-backed checks design",
+  "goal": "Keep the abandoned Opus-backed checks design as a marked record of the rejected option, delete its unexecuted plan files, and stage the record for commit.",
+  "requirements_file": "docs/plans/2026-10-17-archive-opus-backed-checks-design.md",
+  "design_file": "docs/plans/2026-10-17-archive-opus-backed-checks-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Mark the design Abandoned and drop its plan files",
+      "description": "Doc-only per plan.md Task 1. No tests required: documentation only.",
+      "allowed_files": [
+        "docs/plans/2026-10-16-opus-backed-checks-keep-opus-design.md",
+        "docs/plans/2026-10-16-opus-backed-checks-keep-opus.md",
+        "docs/plans/2026-10-16-opus-backed-checks-keep-opus.plan.json",
+        "docs/plans/2026-10-17-archive-opus-backed-checks-design.md",
+        "docs/plans/2026-10-17-archive-opus-backed-checks.md",
+        "docs/plans/2026-10-17-archive-opus-backed-checks.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Replace line 4 `> **Status:** Design Complete` of docs/plans/2026-10-16-opus-backed-checks-keep-opus-design.md with the plan.md Step 1 block verbatim (Abandoned Status line, blank line, `## Why abandoned` section). Rest of file unchanged."},
+        {"description": "Verify edit", "command": "rg -n -e \"^> \\*\\*Status:\\*\\*\" -e \"^## Why abandoned\" /Users/roberthyatt/Code/ironclaude/docs/plans/2026-10-16-opus-backed-checks-keep-opus-design.md", "expected": "exactly 2 lines: `4:> **Status:** Abandoned — superseded by docs/plans/2026-10-16-per-call-difficulty-tiering-design.md (never executed)` and `6:## Why abandoned` (pre-edit: only `4:> **Status:** Design Complete`)"},
+        {"description": "Delete the two plan files, then list all three", "command": "rm /Users/roberthyatt/Code/ironclaude/docs/plans/2026-10-16-opus-backed-checks-keep-opus.md /Users/roberthyatt/Code/ironclaude/docs/plans/2026-10-16-opus-backed-checks-keep-opus.plan.json; ls /Users/roberthyatt/Code/ironclaude/docs/plans/2026-10-16-opus-backed-checks-keep-opus.md /Users/roberthyatt/Code/ironclaude/docs/plans/2026-10-16-opus-backed-checks-keep-opus.plan.json /Users/roberthyatt/Code/ironclaude/docs/plans/2026-10-16-opus-backed-checks-keep-opus-design.md", "expected": "No such file or directory for .md and .plan.json; -design.md listed; ls exit 1"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-16-opus-backed-checks-keep-opus-design.md docs/plans/2026-10-17-archive-opus-backed-checks-design.md docs/plans/2026-10-17-archive-opus-backed-checks.md docs/plans/2026-10-17-archive-opus-backed-checks.plan.json; git -C /Users/roberthyatt/Code/ironclaude diff --cached --name-status", "expected": "exactly 4 lines, each `A` + one of the 4 paths; deleted untracked files absent"}
+      ]
+    }
+  ]
+}

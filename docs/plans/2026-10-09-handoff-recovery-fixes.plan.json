@@ -1,0 +1,363 @@
+{
+  "name": "Handoff Recovery Fixes (L-H1)",
+  "goal": "Make the staged Claude/Codex worker provider handoff safe to commit: native-evidence detection never blocks ordinary worker handling; every paused handoff returns to running, moves forward, or is preserved through the existing dead-session path (as the source before the transfer, as the target after it); locks left by dead processes are reclaimed; both Claude limit windows count; quarantines expire; stale tests are fixed; everything verified in full (H1-H16, H5a, H5b, H6a, H6b, H7a, H7b, amended H6 and H9; accepted limitations L1, L2 and L3).",
+  "requirements_file": "docs/plans/2026-10-06-handoff-recovery-fixes-requirements.md",
+  "design_file": "docs/plans/2026-10-06-handoff-recovery-fixes-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Native reader skips bad lines, waits on torn lines, short-circuits unchanged logs, counts both Claude windows, reports reset time (H2, H3, H4; H9 reader input)",
+      "description": "worker_quota.py: oversize (>256 KiB) or unparseable complete lines are skipped, advancing cursor and trailing-window line hash and incrementing skipped_records; a torn final line stays unknown without advancing; when the caller supplies expected_file_identity and the log size and identity match the cursor, the file is not opened (native_log_unchanged); CLAUDE_RATE_LIMIT_TYPES = {five_hour, seven_day}; verdicts carry reset_at (Claude resetsAt, Codex primary/secondary resets_at max, else None). Code: human plan Task 1.",
+      "allowed_files": [
+        "commander/src/ironclaude/worker_quota.py",
+        "commander/tests/test_worker_quota.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: replace test_truncated_and_oversized_record_hold_cursor and add the reader tests (human plan Task 1 Step 1 verbatim)"},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_quota.py", "expected": "FAIL: test_oversize_line_is_skipped_and_following_quota_exhausts, test_oversize_skip_cursor_resumes_across_calls, test_unparseable_line_is_skipped_and_counted[*] (unknown, no skip), test_unchanged_log_with_known_identity_is_not_reopened (file opened), test_both_claude_limit_windows_exhaust[five_hour] (unknown), test_claude_exhaustion_reports_native_reset_time and test_codex_exhaustion_reports_latest_window_reset_when_present[*] (KeyError reset_at); torn-line and seven_day cases may already pass as guards; record actual counts"},
+        {"description": "GREEN: worker_quota.py edits 1-10 (human plan Task 1 Step 3 verbatim; edit 7 is replace_all with expected count 2)"},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_quota.py", "expected": "all tests in tests/test_worker_quota.py pass; record actual counts (test_worker_handoff_daemon.py is rewritten in Task 2; do not run it here)"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/worker_quota.py commander/tests/test_worker_quota.py", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Detection only starts a handoff; only an unpaused handoff row suppresses lifecycle (H1)",
+      "description": "main.py: replace _native_handoff_gate with _maybe_start_handoff (never suppresses; remote and path-less workers return before any read; unknown evidence never notifies and only forward progress is persisted) and _handoff_suppresses (durable unpaused unfinished worker_handoffs row); use both in check_workers and _confirm_and_kill_stuck_worker. worker_registry.py: remove record_native_quota_unknown_observation, whose only caller was the old gate. Rewrite test_worker_handoff_daemon.py and update the four gate call sites in test_worker_handoff.py. Code: human plan Task 2.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/src/ironclaude/worker_registry.py",
+        "commander/tests/test_worker_handoff_daemon.py",
+        "commander/tests/test_worker_handoff.py"
+      ],
+      "depends_on": [1, 7],
+      "steps": [
+        {"description": "RED: overwrite commander/tests/test_worker_handoff_daemon.py with the full content in human plan Task 2 Step 1 verbatim"},
+        {"description": "RED: four multi-line call-site edits in commander/tests/test_worker_handoff.py (human plan Task 2 Step 2 verbatim)"},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_daemon.py tests/test_worker_handoff.py", "expected": "FAIL: daemon tests calling _maybe_start_handoff/_handoff_suppresses (AttributeError), including test_unknown_evidence_has_no_incident_recorder; test_missing_native_log_does_not_suppress_dead_session_handling, test_path_less_worker_is_excluded_without_notification, test_rejected_exhaustion_does_not_suppress_dead_session_handling (old gate suppresses); test_full_storage_backed_native_handoff_both_directions[*] (AttributeError); record actual counts"},
+        {"description": "GREEN: main.py gate replacement and the two call-site edits, and deletion of WorkerRegistry.record_native_quota_unknown_observation (human plan Task 2 Step 4 items 1-4 verbatim)"},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_daemon.py tests/test_worker_handoff.py tests/test_worker_quota.py", "expected": "all pass; record actual counts"},
+        {"description": "Confirm no gate or recorder references remain", "command": "grep -rn --include=\"*.py\" -e \"_native_handoff_gate\" -e \"record_native_quota_unknown_observation\" /Users/roberthyatt/Code/ironclaude/commander", "expected": "no output"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/src/ironclaude/worker_registry.py commander/tests/test_worker_handoff_daemon.py commander/tests/test_worker_handoff.py", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "The two hook tests use grep, not rg (H15)",
+      "description": "Replace every rg invocation in worker/hooks/tests/test-gbtw-continuation-judge.sh (16 occurrences via four replace_all patterns) and test-last-assistant-text.sh (1) with grep equivalents; run both suites. Code: human plan Task 3.",
+      "allowed_files": [
+        "worker/hooks/tests/test-gbtw-continuation-judge.sh",
+        "worker/hooks/tests/test-last-assistant-text.sh"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: run judge suite as-is", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-gbtw-continuation-judge.sh", "expected": "with rg absent from PATH: 'rg: command not found' and failures; record actual (if rg is on PATH, record that it passes and continue)"},
+        {"description": "RED: run last-assistant-text suite as-is", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-last-assistant-text.sh", "expected": "with rg absent from PATH: case 5 fails; record actual"},
+        {"description": "GREEN: replace_all edits A-D in the judge suite (counts 4, 2, 8, 2) and the single line edit in test-last-assistant-text.sh (human plan Task 3 Step 2 verbatim)"},
+        {"description": "Verify no rg remains", "command": "grep -c -w rg /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-gbtw-continuation-judge.sh /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-last-assistant-text.sh", "expected": "0 for both files"},
+        {"description": "Run judge suite", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-gbtw-continuation-judge.sh", "expected": "exit 0 with 0 fail; record the actual results line"},
+        {"description": "Run last-assistant-text suite", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-last-assistant-text.sh", "expected": "exit 0, Results: 7 pass, 0 fail; record the actual line"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/tests/test-gbtw-continuation-judge.sh worker/hooks/tests/test-last-assistant-text.sh", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Workspace claims record PID plus start time; dead claims are reaped; reap-stale-mutations (H11 TypeScript, H12 command)",
+      "description": "handoff.ts: processStartEpoch (ps -o lstart= with TZ=UTC LC_ALL=C, integer epoch seconds; null when the PID does not exist), currentProcessIdentity '<pid>:<start>', mutationOwnerStatus (live/dead/unproved; legacy bare PID blocks while alive), withAssignmentMutation and beginHandoff reap a proved-dead claim and retry once, reapDeadAssignmentMutation, reapStaleMutations. cli.ts: internal command reap-stale-mutations. handoff.test.ts: the stale-mutation refusal case is removed (H11 inversion) and replaced by dead/live/legacy/unparseable cases. Code: human plan Task 4.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/handoff.ts",
+        "worker/mcp-servers/workspace-manager/src/cli.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/handoff.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: handoff.test.ts edits 1-5 (human plan Task 4 Step 1 verbatim)"},
+        {"description": "Run RED", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager src/__tests__/handoff.test.ts", "expected": "FAIL: missing exports currentProcessIdentity/processStartEpoch/reapStaleMutations and undefined 'reap-stale-mutations'; reap cases fail with 'already claimed'/'during assignment mutation'; record actual"},
+        {"description": "GREEN: handoff.ts edits 1-6 (human plan Task 4 Step 3 verbatim)"},
+        {"description": "GREEN: cli.ts edits 1-5 (human plan Task 4 Step 4 verbatim)"},
+        {"description": "Run GREEN vitest", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager src/__tests__/handoff.test.ts src/__tests__/cli.test.ts", "expected": "all pass; record actual counts"},
+        {"description": "Type check", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/node_modules/.bin/tsc --noEmit -p /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/tsconfig.json", "expected": "exit 0, no output"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/handoff.ts worker/mcp-servers/workspace-manager/src/cli.ts worker/mcp-servers/workspace-manager/src/__tests__/handoff.test.ts", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 5,
+      "name": "release-handoff finishes a source hold only while the source owns the assignment; finish-handoff-after-target finishes after the target commits (H5, H6a, H6b TypeScript)",
+      "description": "handoff.ts: releaseHandoff moves a granted/begun hold to finished only while the assignment owner is still the source; a target owner recorded by authorization before the transfer does not block it and is left as is; once transferHandoff moved ownership it is refused; finished replay is a no-op; input validated before the DB. H5's pre-stop 'target ever recorded' refusal stays in the Commander controller and registry (Task 12). H6b: finishHandoffAfterTarget (assertEvidence allowDescendantHead) accepts a live HEAD equal to or descending from the granted HEAD via the existing git.ts isAncestor, only in phase transferred where the assignment owner must be the recorded target; finishHandoff keeps the exact-HEAD check. cli.ts: internal commands release-handoff and finish-handoff-after-target. Code: human plan Task 5.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/handoff.ts",
+        "worker/mcp-servers/workspace-manager/src/cli.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/handoff.test.ts"
+      ],
+      "depends_on": [4],
+      "steps": [
+        {"description": "RED: handoff.test.ts import edit and six new tests (human plan Task 5 Step 1 verbatim)"},
+        {"description": "Run RED", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager src/__tests__/handoff.test.ts", "expected": "FAIL: releaseHandoff and finishHandoffAfterTarget not exported and 'release-handoff' dependency undefined; record actual"},
+        {"description": "GREEN: handoff.ts edits 1-7 (human plan Task 5 Step 3 verbatim)"},
+        {"description": "GREEN: cli.ts edits 1-5 (human plan Task 5 Step 4 verbatim)"},
+        {"description": "Run GREEN vitest", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager src/__tests__/handoff.test.ts src/__tests__/cli.test.ts", "expected": "all pass; record actual counts"},
+        {"description": "Type check", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/node_modules/.bin/tsc --noEmit -p /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/tsconfig.json", "expected": "exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/handoff.ts worker/mcp-servers/workspace-manager/src/cli.ts worker/mcp-servers/workspace-manager/src/__tests__/handoff.test.ts", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 6,
+      "name": "Stale workspace tests updated; private CLI input validated before the mutation claim (H14)",
+      "description": "db.test.ts expects migrations [1..7]; tool-dispatch.test.ts command list grows to 20 entries in exact order with fixture dependencies for the seven handoff commands, forbidden-name checks unchanged, plus a test proving malformed finalization input is rejected without touching the database; integration.ts finalizeCommanderLocalCommit validates input before withAssignmentMutation. Code: human plan Task 6.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/integration.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/db.test.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts"
+      ],
+      "depends_on": [5],
+      "steps": [
+        {"description": "RED: db.test.ts replace_all (count 3) and tool-dispatch.test.ts edits 2-4 (human plan Task 6 Step 1 verbatim)"},
+        {"description": "Run RED", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager src/__tests__/db.test.ts src/__tests__/tool-dispatch.test.ts", "expected": "FAIL: 'rejects forged review authority fields at the private CLI boundary' (db.transaction is not a function) and 'validates private finalization input before claiming an assignment mutation' (database touched); db.test.ts and list tests pass; record actual counts"},
+        {"description": "GREEN: integration.ts finalizeCommanderLocalCommit line (human plan Task 6 Step 3 verbatim)"},
+        {"description": "Run GREEN vitest", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager src/__tests__/db.test.ts src/__tests__/tool-dispatch.test.ts src/__tests__/handoff.test.ts src/__tests__/cli.test.ts", "expected": "all pass; record actual counts"},
+        {"description": "Type check", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/node_modules/.bin/tsc --noEmit -p /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/tsconfig.json", "expected": "exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/integration.ts worker/mcp-servers/workspace-manager/src/__tests__/db.test.ts worker/mcp-servers/workspace-manager/src/__tests__/tool-dispatch.test.ts", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 7,
+      "name": "Commander grant reaps a dead claim; the client exposes release-handoff, reap-stale-mutations and finish-handoff-after-target; cross-language identity proof (H11 Python, H5/H6b/H12 transport)",
+      "description": "workspace_handoff_authority.py: mutation_owner_status parses '<pid>:<start>' (int psutil create_time) and grant reaps a proved-dead claim inside its transaction; live, legacy-live and unparseable claims still block. workspace_client.py: release_handoff, reap_stale_mutations and finish_handoff_after_target over the existing argv transport. A vite-node test proves the TypeScript reap command and the Python classifier agree on the same identity representation. Code: human plan Task 7.",
+      "allowed_files": [
+        "commander/src/ironclaude/workspace_handoff_authority.py",
+        "commander/src/ironclaude/workspace_client.py",
+        "commander/tests/test_workspace_handoff_authority.py",
+        "commander/tests/test_workspace_client.py"
+      ],
+      "depends_on": [6],
+      "steps": [
+        {"description": "RED: test edits 1-3 (human plan Task 7 Step 1 verbatim)"},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_workspace_handoff_authority.py tests/test_workspace_client.py", "expected": "FAIL: ImportError mutation_owner_status at collection of test_workspace_handoff_authority.py; test_recovery_handoff_methods_use_exact_private_commands[*] AttributeError; record actual"},
+        {"description": "GREEN: workspace_handoff_authority.py edits 1-3 (human plan Task 7 Step 3 verbatim)"},
+        {"description": "GREEN: workspace_client.py edits 1-2 (human plan Task 7 Step 4 verbatim)"},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_workspace_handoff_authority.py tests/test_workspace_client.py", "expected": "all pass including the vite-node cross-language test; record actual counts"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/workspace_handoff_authority.py commander/src/ironclaude/workspace_client.py commander/tests/test_workspace_handoff_authority.py commander/tests/test_workspace_client.py", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 8,
+      "name": "Dead owners' worker-operation leases are reaped in both phases; startup-sweep registry function (H10, H12 registry)",
+      "description": "worker_registry.py: _reconcile_dead_claimed_operation becomes _reap_dead_owner_operation (claimed or effects_started, owner proved dead by PID plus start time, no snapshot condition, worker_operation_reaped event via raw INSERT inside the transaction); reap_dead_worker_operations for the startup sweep; recovery warnings only for unproved owners. Live and unproved owners still block; the same PID with a different start time counts as dead. The two daemon lease tests are inverted. Code: human plan Task 8.",
+      "allowed_files": [
+        "commander/src/ironclaude/worker_registry.py",
+        "commander/tests/test_worker_handoff_registry.py",
+        "commander/tests/test_worker_handoff_daemon.py"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {"description": "RED: test_worker_handoff_registry.py edits 1-4 (human plan Task 8 Step 1 verbatim)"},
+        {"description": "RED: replace the two daemon lease tests (human plan Task 8 Step 2 verbatim)"},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_registry.py tests/test_worker_handoff_daemon.py", "expected": "FAIL: test_handoff_claim_reaps_dead_owner_operation_in_any_phase[*], test_dead_owner_started_lease_is_reaped_with_event_and_no_warning, test_same_pid_with_different_start_time_is_dead_and_reaped, test_reap_dead_worker_operations_keeps_live_and_unproved_leases (AttributeError), test_dead_owner_lease_with_changed_runtime_is_reaped, and both inverted daemon tests; record actual counts"},
+        {"description": "GREEN: worker_registry.py edits 1-3 (human plan Task 8 Step 4 verbatim; edit 2 is replace_all with expected count 2)"},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_registry.py tests/test_worker_handoff_daemon.py tests/test_worker_handoff.py", "expected": "all pass; record actual counts"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/worker_registry.py commander/tests/test_worker_handoff_registry.py commander/tests/test_worker_handoff_daemon.py", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 9,
+      "name": "Brain-side operations wait briefly on a busy worker (H13)",
+      "description": "worker_registry.py: acquire_worker_operation_waiting polls every 200 ms for up to 5 s only while a live peer process holds the lease, then raises 'worker <id> is busy (daemon cycle in progress); retry shortly'; worker_operation gains wait_seconds. orchestrator_mcp.py _hold_worker_operation passes wait_seconds=5.0. Unproved owners never wait. Code: human plan Task 9.",
+      "allowed_files": [
+        "commander/src/ironclaude/worker_registry.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_worker_handoff_registry.py"
+      ],
+      "depends_on": [8],
+      "steps": [
+        {"description": "RED: test_worker_handoff_registry.py edits 1-2 (human plan Task 9 Step 1 verbatim)"},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_registry.py -k brain_wrapper", "expected": "FAIL: test_brain_wrapper_waits_for_live_daemon_lease_then_proceeds (immediate unreconciled error) and test_brain_wrapper_reports_busy_after_five_seconds (wrong message); test_brain_wrapper_does_not_wait_on_unproved_owner passes as guard; record actual counts"},
+        {"description": "GREEN: worker_registry.py edits 1-3 (human plan Task 9 Step 3 verbatim)"},
+        {"description": "GREEN: orchestrator_mcp.py wait_seconds edit (human plan Task 9 Step 4 verbatim)"},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_registry.py tests/test_worker_handoff.py tests/test_orchestrator_mcp.py", "expected": "all pass; record actual counts"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/worker_registry.py commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_worker_handoff_registry.py", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 10,
+      "name": "The Commander sweeps dead-owner rows at startup (H12)",
+      "description": "main.py: _sweep_dead_owner_leases reaps dead-owner worker_operations via the registry and workspace_mutations via the installed reap-stale-mutations command (best-effort; tolerates an older installed dist); run() calls it once before the loop. test_daemon.py adds it to the TestOperatorFastLane monkeypatch list so no test reaches the real workspace database. Code: human plan Task 10.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_worker_handoff_daemon.py",
+        "commander/tests/test_daemon.py"
+      ],
+      "depends_on": [9],
+      "steps": [
+        {"description": "RED: daemon tests and the test_daemon.py monkeypatch list edit (human plan Task 10 Step 1 verbatim)"},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_daemon.py -k \"startup_sweep or run_sweeps\"", "expected": "FAIL: test_startup_sweep_reaps_dead_owner_rows_and_keeps_live_ones and test_startup_sweep_tolerates_installed_workspace_without_command (AttributeError _sweep_dead_owner_leases); test_run_sweeps_dead_owner_leases_before_first_cycle (mock never called); record actual counts"},
+        {"description": "GREEN: main.py edits 1-2 (human plan Task 10 Step 3 verbatim)"},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_daemon.py tests/test_daemon.py", "expected": "all pass; record actual counts"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/tests/test_worker_handoff_daemon.py commander/tests/test_daemon.py", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 11,
+      "name": "Usage quarantines expire at the native reset or the configured default (H9)",
+      "description": "db.py: provider_capability_state.usage_expires_at REAL (schema and migration). provider_state.py: mark_unavailable records usage_expires_at (given or now + DEFAULT_USAGE_QUARANTINE_SECONDS 18000; stale events keep the existing expiry; fresh exhaustion re-quarantines); is_available(now=) treats an expired usage quarantine as cleared (legacy NULL rows expire 18000 s after updated_at); recovery clears the expiry. worker_handoff.py: _quarantine_validated_source passes the native reset_at when it is later than the event (H9 validity), else worker_usage_quarantine_default_seconds from config (default 18000). Code: human plan Task 11.",
+      "allowed_files": [
+        "commander/src/ironclaude/db.py",
+        "commander/src/ironclaude/provider_state.py",
+        "commander/src/ironclaude/worker_handoff.py",
+        "commander/tests/test_provider_state.py",
+        "commander/tests/test_worker_handoff.py"
+      ],
+      "depends_on": [10],
+      "steps": [
+        {"description": "RED: test_provider_state.py import block plus four tests, and the test_worker_handoff.py expiry test with realistic valid and stale resets (human plan Task 11 Step 1 verbatim)"},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_provider_state.py tests/test_worker_handoff.py -k \"expire or expiry or quarantine\"", "expected": "FAIL: new provider-state tests (unexpected keyword usage_expires_at/now; legacy row unavailable) and test_source_quarantine_expires_at_native_reset_or_configured_default[*] (no such column usage_expires_at); record actual counts"},
+        {"description": "GREEN: db.py edits 1-2 (human plan Task 11 Step 3 verbatim)"},
+        {"description": "GREEN: provider_state.py edits 1-7 (human plan Task 11 Step 4 verbatim)"},
+        {"description": "GREEN: worker_handoff.py edits 1-2 (human plan Task 11 Step 5 verbatim)"},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_provider_state.py tests/test_provider_router.py tests/test_worker_handoff.py tests/test_worker_handoff_daemon.py", "expected": "all pass (fixtures with resetsAt 1 fall back to the 18000 s default and stay unavailable); record actual counts"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/db.py commander/src/ironclaude/provider_state.py commander/src/ironclaude/worker_handoff.py commander/tests/test_provider_state.py commander/tests/test_worker_handoff.py", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 12,
+      "name": "A handoff paused before the source stop releases automatically (H5, H5a)",
+      "description": "worker_registry.py: release_worker_handoff CAS (handoff_pending to running; row phase released, completed_at set, evidence disposition released; refused before the stop once a target, stop intent, stop proof or bootstrap intent is recorded); effective_worker_tier reads only phase='completed' rows. worker_handoff.py: retry_paused_preflight classifies pauses (uncertain stays; pre-stop non-retryable reasons or pending intents release; native_quota_evidence_changed or a positively absent source tmux session during retry releases), release_paused, _release_workspace_hold via release-handoff, _status reports released, _source_preflight accepts a prior generation released by this runtime. The storage-backed late_recovery scenario proves release through the real TypeScript command. Code: human plan Task 12.",
+      "allowed_files": [
+        "commander/src/ironclaude/worker_registry.py",
+        "commander/src/ironclaude/worker_handoff.py",
+        "commander/tests/test_worker_handoff_registry.py",
+        "commander/tests/test_worker_handoff.py"
+      ],
+      "depends_on": [11],
+      "steps": [
+        {"description": "RED: registry tests (human plan Task 12 Step 1 verbatim)"},
+        {"description": "RED: controller test helpers, five controller tests and the storage-backed late_recovery edit (human plan Task 12 Step 2 verbatim)"},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_registry.py tests/test_worker_handoff.py", "expected": "FAIL: registry release tests (AttributeError release_worker_handoff); test_paused_retry_releases_when_source_quota_evidence_changes, test_prestop_retry_releases_when_source_session_is_gone[False] and test_prestop_pause_with_nonretryable_reason_releases_automatically[*] (stay held); test_prestop_release_refused_once_target_recorded (KeyError release_refused); test_released_generation_lets_next_handoff_preflight_proceed accepted cases (workspace_handoff_protocol_unavailable); test_full_storage_backed_native_handoff_both_directions[claude-codex-False-True-late_recovery] (still held); record actual counts"},
+        {"description": "GREEN: worker_registry.py edits 1-2 (human plan Task 12 Step 4 verbatim)"},
+        {"description": "GREEN: worker_handoff.py edits 1-4 (human plan Task 12 Step 5 verbatim)"},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_registry.py tests/test_worker_handoff.py tests/test_worker_handoff_daemon.py", "expected": "all pass including the storage-backed late_recovery scenario via real release-handoff; record actual counts"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/worker_registry.py commander/src/ironclaude/worker_handoff.py commander/tests/test_worker_handoff_registry.py commander/tests/test_worker_handoff.py", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 13,
+      "name": "After the source stop and before the transfer completes, retry forward or stop the bootstrap and preserve; an uncertain effect needs an explicit abort; a deleted worktree is proved by PID plus start time (H6 as amended, H6a pre-transfer, H7, H7a, H7b)",
+      "description": "worker_handoff.py: post-stop pauses retry forward (_retry_forward re-resolves the target allowing the source's own client, never re-reading the stopped source's native log) or, when forward is impossible for good, _release_after_stop runs workspace readback first (only a 'transferred' readback counts as landed and advances to owner_transferred, unpaused, for both the automatic path and abort; a 'finished' row from an earlier release falls through to the source release), then stops and proves gone any recorded or launched read-only bootstrap (_stop_bootstrap mirrors _resume_target; only an unprovable stop holds) and releases as the source with preserve; abort_handoff runs the same readback and keeps H7's proved-gone precondition; _bootstrap_proven_gone uses proved_absent when the worktree directory is gone; _target(allow_source_client). worker_handoff_process.py: NativeProcessAdapter.proved_absent (H7b). worker_registry.py: replace_worker_runtime allows the same client with a new native session on the same host. Code: human plan Task 13.",
+      "allowed_files": [
+        "commander/src/ironclaude/worker_handoff.py",
+        "commander/src/ironclaude/worker_registry.py",
+        "commander/src/ironclaude/worker_handoff_process.py",
+        "commander/tests/test_worker_handoff.py",
+        "commander/tests/test_worker_handoff_registry.py",
+        "commander/tests/test_worker_handoff_process.py"
+      ],
+      "depends_on": [12],
+      "steps": [
+        {"description": "RED: registry same-client runtime test (human plan Task 13 Step 1 verbatim)"},
+        {"description": "RED: controller helpers and tests, and the proved_absent adapter tests (human plan Task 13 Step 2 items 1-3 verbatim)"},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff.py tests/test_worker_handoff_registry.py tests/test_worker_handoff_process.py", "expected": "FAIL: test_post_stop_permanent_failure_releases_for_preservation_not_completion, test_post_stop_preservation_stops_live_bootstrap_then_releases and test_authorized_but_untransferred_handoff_stops_bootstrap_and_releases_as_source (stay held), test_landed_transfer_advances_to_post_transfer_instead_of_releasing[*] (no transfer_landed; row stays at pm_prepared; abort variants AttributeError abort_handoff), test_previously_released_workspace_row_is_not_a_landed_transfer (stays held), test_post_stop_retry_never_rereads_the_stopped_source_log (no forward retry), test_abort_handoff_requires_recorded_bootstrap_proved_gone[*] (AttributeError abort_handoff), test_post_stop_retry_accepts_source_client_once_its_quarantine_expires (no forward retry), test_runtime_replacement_allows_same_client_only_with_new_native_session (same client refused), test_proved_absent_accepts_gone_tree_without_worktree and test_proved_absent_refuses_live_or_unreadable_identity (AttributeError proved_absent); test_uncertain_external_effect_stays_paused_without_release passes as guard; test_post_stop_preservation_holds_when_bootstrap_stop_is_unprovable fails on KeyError preserve_refused; record actual counts"},
+        {"description": "GREEN: worker_handoff_process.py proved_absent and worker_registry.py replace_worker_runtime edits (human plan Task 13 Step 4 items 1-2 verbatim)"},
+        {"description": "GREEN: worker_handoff.py edits 1-7 (human plan Task 13 Step 5 verbatim)"},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff.py tests/test_worker_handoff_registry.py tests/test_worker_handoff_process.py tests/test_worker_handoff_daemon.py", "expected": "all pass; record actual counts"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/worker_handoff.py commander/src/ironclaude/worker_registry.py commander/src/ironclaude/worker_handoff_process.py commander/tests/test_worker_handoff.py commander/tests/test_worker_handoff_registry.py commander/tests/test_worker_handoff_process.py", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 14,
+      "name": "A new controller rebuilds the bootstrap lease from persisted identity (H8)",
+      "description": "worker_handoff_process.py: adopt_readonly_bootstrap re-proves every recorded PID plus start time, the unchanged pane tree and the read-only producer, then seeds the lease. worker_handoff.py: _transfer_owner adopts evidence['bootstrap_process'] before the quiescence proof, so a restart between target_ready and owner_transferred resumes. Code: human plan Task 14.",
+      "allowed_files": [
+        "commander/src/ironclaude/worker_handoff_process.py",
+        "commander/src/ironclaude/worker_handoff.py",
+        "commander/tests/test_worker_handoff_process.py",
+        "commander/tests/test_worker_handoff.py"
+      ],
+      "depends_on": [13],
+      "steps": [
+        {"description": "RED: adapter tests (human plan Task 14 Step 1 verbatim)"},
+        {"description": "RED: controller restart test (human plan Task 14 Step 2 verbatim)"},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_process.py tests/test_worker_handoff.py -k \"adopt or restarted or rebuilds_bootstrap\"", "expected": "FAIL: adapter tests (AttributeError adopt_readonly_bootstrap) and test_restart_after_target_ready_rebuilds_bootstrap_lease_and_transfers (pauses at pm_prepared on 'lacks readonly native ownership proof'); record actual counts"},
+        {"description": "GREEN: worker_handoff_process.py edit (human plan Task 14 Step 4 verbatim)"},
+        {"description": "GREEN: worker_handoff.py _transfer_owner edit (human plan Task 14 Step 5 verbatim)"},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_process.py tests/test_worker_handoff.py", "expected": "all pass; record actual counts"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/worker_handoff_process.py commander/src/ironclaude/worker_handoff.py commander/tests/test_worker_handoff_process.py commander/tests/test_worker_handoff.py", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 15,
+      "name": "After the transfer, retry forward or preserve as the target (H6a post-transfer, H6b)",
+      "description": "worker_handoff.py: post-transfer resume, dispatch and finish failures are retry-forward reasons; _post_transfer_cleanup settles a stale resume session (inspect_resumed true lets _reconcile_intent register and advance, otherwise record a durable stale_resume_stop_intent, snapshot + stop_and_prove and clear resume_intent), replays an undelivered dispatch, and retries a finish whose readback is still transferred through finish_handoff_after_target (H6b) so _reconcile_intent completes; when forward is impossible for good (other reasons, or abort), _release_to_target stops any target session that received no continuation (durable target_session_stop_intent recorded before the signal), adopts the target runtime via replace_worker_runtime exactly as _register_target does, finishes the workspace row through finish_handoff_after_target (accepts a HEAD the target fast-forwarded, H6b), and releases with disposition released_to_target and preserve; an abort whose readback shows a landed transfer advances unpaused to owner_transferred exactly like the automatic path (Task 13); _reconcile_intent gains handlers that resolve a pending stale_resume_stop_intent or target_session_stop_intent by verify_stopped readback, so a crash between intent and proof self-heals. worker_registry.py: release_worker_handoff accepts disposition, no longer refuses after the transfer, and compares the current runtime against {**source, **target_runtime} when the target runtime is registered. Code: human plan Task 15.",
+      "allowed_files": [
+        "commander/src/ironclaude/worker_handoff.py",
+        "commander/src/ironclaude/worker_registry.py",
+        "commander/tests/test_worker_handoff.py",
+        "commander/tests/test_worker_handoff_registry.py"
+      ],
+      "depends_on": [14],
+      "steps": [
+        {"description": "RED: registry tests replacing the post-transfer refusal test (human plan Task 15 Step 1 verbatim)"},
+        {"description": "RED: controller tests (human plan Task 15 Step 2 verbatim)"},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_registry.py tests/test_worker_handoff.py", "expected": "FAIL: test_post_stop_release_after_transfer_adopts_target_runtime (TypeError disposition / release refused; then tier opus instead of sonnet), test_post_transfer_release_refuses_an_unexpected_runtime (TypeError disposition), test_stale_resume_session_is_stopped_then_resumed_forward and test_undelivered_continuation_dispatch_is_retried_forward (not retry reasons; held with post_transfer_release_unavailable), test_permanent_failure_after_transfer_preserves_as_the_target, test_finish_retry_uses_after_target_finish_then_completes and test_target_commit_after_transfer_then_permanent_failure_finishes_and_preserves (held with post_transfer_release_unavailable), test_pending_stale_resume_stop_intent_self_heals_on_reconcile (stale_resume_stop_intent stays True: no reconcile handler); record actual counts"},
+        {"description": "GREEN: worker_registry.py edits 1-5, including effective_worker_tier honouring released_to_target rows (human plan Task 15 Step 4 verbatim)"},
+        {"description": "GREEN: worker_handoff.py edits 1-4, including the _reconcile_intent handlers for stale_resume_stop_intent and target_session_stop_intent (human plan Task 15 Step 5 verbatim)"},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_registry.py tests/test_worker_handoff.py tests/test_worker_handoff_process.py tests/test_worker_handoff_daemon.py", "expected": "all pass; record actual counts"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/worker_handoff.py commander/src/ironclaude/worker_registry.py commander/tests/test_worker_handoff.py commander/tests/test_worker_handoff_registry.py", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 16,
+      "name": "The daemon preserves a released post-stop worker once; a released event is not re-claimed; abort_handoff is reachable (H6 daemon, H5b, H7 MCP)",
+      "description": "main.py: a released result with preserve=True goes through _finalize_and_release_worker(reason='session ended', terminal=True) and the recovery driver with one notification; _maybe_start_handoff does not start a new generation for the exhaustion event a released handoff already consumed (H5b). orchestrator_mcp.py: _hold_worker_operation lets recover_worker_integration(worker_id, 'abort_handoff') through the active-handoff guard; recover_worker_integration routes abort_handoff to WorkerHandoffController.abort_handoff; docstrings name the action. Code: human plan Task 16.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_worker_handoff_daemon.py",
+        "commander/tests/test_worker_handoff.py"
+      ],
+      "depends_on": [15],
+      "steps": [
+        {"description": "RED: daemon tests (human plan Task 16 Step 1 verbatim)"},
+        {"description": "RED: MCP abort test (human plan Task 16 Step 2 verbatim)"},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_daemon.py tests/test_worker_handoff.py -k \"preserve or prestop_release_result or uncertain_effect_pause or not_reclaimed or abort_handoff_is_reachable\"", "expected": "FAIL: test_post_stop_release_routes_through_dead_session_preserve_path_once (finalize never called), test_released_handoff_event_is_not_reclaimed_until_fresh_exhaustion (handoff_worker called for the consumed event), test_abort_handoff_is_reachable_through_wrapped_recovery_tool (active handoff blocks worker operation); the prestop-release and uncertain-notification tests pass as guards; record actual counts"},
+        {"description": "GREEN: main.py edits 1-3 (human plan Task 16 Step 4 verbatim)"},
+        {"description": "GREEN: orchestrator_mcp.py edits 1-4 (human plan Task 16 Step 5 verbatim)"},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_daemon.py tests/test_worker_handoff.py tests/test_orchestrator_mcp.py tests/test_worker_handoff_registry.py", "expected": "all pass; record actual counts"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_worker_handoff_daemon.py commander/tests/test_worker_handoff.py", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 17,
+      "name": "Full verification, dist rebuild, README re-stage, verification record (H16)",
+      "description": "Run every hook suite, the full workspace-manager vitest, tsc, rebuild the workspace-manager dist bundles, run the full Commander pytest; write and force-stage docs/reviews/2026-10-09-handoff-recovery-fixes-verification.md; stage the three dist bundles; re-stage README.md only after confirming nothing of it is already staged and that its diff carries the handoff hunk. No new tests: runs existing checks. The final Fable review (H16) is an orchestrator gate after this task, before any commit.",
+      "allowed_files": [
+        "docs/reviews/2026-10-09-handoff-recovery-fixes-verification.md",
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js",
+        "README.md"
+      ],
+      "depends_on": [3, 16],
+      "steps": [
+        {"description": "Log directory", "command": "mkdir -p /private/tmp/ironclaude-l-h1-verify", "expected": "exit 0"},
+        {"description": "Every hook suite, one log each", "command": "cd /Users/roberthyatt/Code/ironclaude && for s in worker/hooks/test-*.sh worker/hooks/tests/test-*.sh commander/hooks/tests/test-*.sh; do bash \"$s\" > \"/private/tmp/ironclaude-l-h1-verify/hook-$(basename \"$s\").log\" 2>&1; echo \"$s exit=$?\"; done", "expected": "every suite prints exit=0 including test-gbtw-continuation-judge.sh and test-last-assistant-text.sh; record each line; any non-zero suite is recorded with its log tail and resolved before the final review"},
+        {"description": "Full workspace-manager vitest (Bash timeout 600000)", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager > /private/tmp/ironclaude-l-h1-verify/vitest-full.log 2>&1; echo \"exit=$?\"", "expected": "Tests line shows 0 failed; the known vitest-worker 'Timeout calling \"onTaskUpdate\"' error during integration-core.test.ts may still appear as 'Errors 1 error' and make the exit status 1 (backlog, not a regression, recorded separately); anything else fails the step; record the Test Files, Tests and Errors lines and the exit status"},
+        {"description": "tsc", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/node_modules/.bin/tsc --noEmit -p /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/tsconfig.json > /private/tmp/ironclaude-l-h1-verify/tsc.log 2>&1; echo \"exit=$?\"", "expected": "exit=0 and empty log"},
+        {"description": "Rebuild dist bundles", "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager run build > /private/tmp/ironclaude-l-h1-verify/build.log 2>&1; echo \"exit=$?\"", "expected": "exit=0"},
+        {"description": "Bundle carries release-handoff", "command": "grep -c \"release-handoff\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js", "expected": "at least 1"},
+        {"description": "Bundle carries reap-stale-mutations", "command": "grep -c \"reap-stale-mutations\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js", "expected": "at least 1"},
+        {"description": "Bundle carries begin-handoff", "command": "grep -c \"begin-handoff\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js", "expected": "at least 1"},
+        {"description": "Bundle carries finish-handoff-after-target", "command": "grep -c \"finish-handoff-after-target\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js", "expected": "at least 1"},
+        {"description": "Server bundle carries PID plus start-time claim identity", "command": "grep -c \"lstart=\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/index.js", "expected": "at least 1"},
+        {"description": "Full Commander pytest (Bash timeout 600000; about 425 s on 2026-10-06)", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q > /private/tmp/ironclaude-l-h1-verify/pytest-full.log 2>&1; echo \"exit=$?\"", "expected": "the only failure, if any, is the known pre-existing tests/test_executing_plans_skill.py::test_execution_complete_restage_command_stages_from_non_root_cwd (not a regression, tracked as L-T2); record the actual summary line; any other failure is resolved before the final review"},
+        {"description": "Write /Users/roberthyatt/Code/ironclaude/docs/reviews/2026-10-09-handoff-recovery-fixes-verification.md with the content listed in human plan Task 17 Step 8"},
+        {"description": "Force-stage the verification record", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-09-handoff-recovery-fixes-verification.md", "expected": "exit 0"},
+        {"description": "Stage rebuilt bundles", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/hook-intent.js", "expected": "exit 0"},
+        {"description": "README: nothing already staged", "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached -- README.md", "expected": "empty output (the episodic section was committed in f57d69c); if anything prints, stop and report, do not stage"},
+        {"description": "README: inspect remaining diff", "command": "git -C /Users/roberthyatt/Code/ironclaude diff -- README.md", "expected": "only this effort's handoff hunk, containing 'Managed-worker capacity handoff'"},
+        {"description": "README: stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add README.md", "expected": "exit 0"},
+        {"description": "README: verify staged hunk", "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached -- README.md | grep -c \"Managed-worker capacity handoff\"", "expected": "at least 1"},
+        {"description": "Final staged-set check", "command": "git -C /Users/roberthyatt/Code/ironclaude status --short", "expected": "every file this loop touched shows as staged with no unstaged remainder; record output; no commit (final Fable review gates it)"}
+      ]
+    }
+  ]
+}

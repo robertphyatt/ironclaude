@@ -1,0 +1,70 @@
+{
+  "name": "Scope Fidelity and Proportionality (v1.1.16 L1)",
+  "goal": "Add a shared scope-fidelity rule loaded by both clients and hook it into brainstorming, writing-plans, executing-plans, code-review and the review checklist so work stays proportionate to the request and review findings cannot inflate it.",
+  "requirements_file": "docs/plans/2026-10-02-scope-fidelity-requirements.md",
+  "design_file": "docs/plans/2026-10-02-scope-fidelity-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Create shared rule worker/rules/scope-fidelity.md",
+      "description": "Create the rule file with the exact content in human plan docs/plans/2026-10-02-scope-fidelity.md Task 1 Step 1 (sections 1-6, including the reviewer-checked light label paragraph in section 2). No tests required: rule Markdown, no executable code; test_rules_references_resolve.py guards resolution once skills reference it.",
+      "allowed_files": ["worker/rules/scope-fidelity.md"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Write worker/rules/scope-fidelity.md with the exact content of human plan Task 1 Step 1 (verbatim markdown block)."},
+        {"description": "Verify the six section headings exist", "command": "grep -c -e \"^## 1. Deliver what was asked\" -e \"^## 2. Light loop vs full loop\" -e \"^## 3. Delegated authority\" -e \"^## 4. Operator prohibitions\" -e \"^## 5. Experiments\" -e \"^## 6. Review bound\" /Users/roberthyatt/Code/ironclaude/worker/rules/scope-fidelity.md", "expected": "6 (against current HEAD the file is absent; grep exits 2)"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/rules/scope-fidelity.md", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Brainstorming skill applies scope fidelity",
+      "description": "Three exact replacements in worker/skills/brainstorming/SKILL.md per human plan Task 2 Steps 1-3: insert Step 0.2 before '### Step 0.5'; delegation clause after Step 5 'Wait for confirmation before continuing to next section.'; delegation clause after Step 9 'If user declines: stop here...'. No tests required: skill Markdown; guarded by test_rules_references_resolve.py and test_workflow_transition_preflight.py.",
+      "allowed_files": ["worker/skills/brainstorming/SKILL.md"],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Apply human plan Task 2 Step 1 replacement verbatim (insert Step 0.2)."},
+        {"description": "Apply human plan Task 2 Step 2 replacement verbatim (Step 5 delegation clause)."},
+        {"description": "Apply human plan Task 2 Step 3 replacement verbatim (Step 9 delegation clause)."},
+        {"description": "Verify references", "command": "grep -c -F \"../../rules/scope-fidelity.md\" /Users/roberthyatt/Code/ironclaude/worker/skills/brainstorming/SKILL.md", "expected": "3 (current HEAD prints 0)"},
+        {"description": "Run guarding tests (cwd commander/)", "command": "PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_rules_references_resolve.py tests/test_workflow_transition_preflight.py -q", "expected": "0 failed, exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/skills/brainstorming/SKILL.md", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Writing-plans and executing-plans apply scope fidelity",
+      "description": "Exact replacements per human plan Task 3: writing-plans Step 1 (verification-bullet clarifier) and Step 2 (light-loop plan shape); executing-plans Step 3 (commander-choice delegation), Step 4 (light loop same-tier), Step 4a (hunt-list light-label bullet), Step 4b (materiality case (e)). No tests required: skill Markdown; guarded by test_rules_references_resolve.py, test_plan_authoring_invariants.py, test_workflow_transition_preflight.py, test_executing_plans_skill.py.",
+      "allowed_files": ["worker/skills/writing-plans/SKILL.md", "worker/skills/executing-plans/SKILL.md"],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Apply human plan Task 3 Step 1 replacement verbatim in writing-plans/SKILL.md."},
+        {"description": "Apply human plan Task 3 Step 2 replacement verbatim in writing-plans/SKILL.md."},
+        {"description": "Apply human plan Task 3 Step 3 replacement verbatim in executing-plans/SKILL.md."},
+        {"description": "Apply human plan Task 3 Step 4 replacement verbatim in executing-plans/SKILL.md."},
+        {"description": "Apply human plan Task 3 Step 4a replacement verbatim in executing-plans/SKILL.md."},
+        {"description": "Apply human plan Task 3 Step 4b replacement verbatim in executing-plans/SKILL.md."},
+        {"description": "Verify references", "command": "grep -c -F \"../../rules/scope-fidelity.md\" /Users/roberthyatt/Code/ironclaude/worker/skills/writing-plans/SKILL.md /Users/roberthyatt/Code/ironclaude/worker/skills/executing-plans/SKILL.md", "expected": "/Users/roberthyatt/Code/ironclaude/worker/skills/writing-plans/SKILL.md:2\n/Users/roberthyatt/Code/ironclaude/worker/skills/executing-plans/SKILL.md:2 (current HEAD prints 0 for both)"},
+        {"description": "Verify reviewer additions", "command": "grep -c -e \"Loop: light. label the change does not qualify for\" -e \"(e) run a plan labeled .Loop: light.\" /Users/roberthyatt/Code/ironclaude/worker/skills/executing-plans/SKILL.md", "expected": "2 (current HEAD prints 0)"},
+        {"description": "Run guarding tests (cwd commander/)", "command": "PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_rules_references_resolve.py tests/test_plan_authoring_invariants.py tests/test_workflow_transition_preflight.py tests/test_executing_plans_skill.py -q", "expected": "0 failed, exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/skills/writing-plans/SKILL.md worker/skills/executing-plans/SKILL.md", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Code review and checklist: requirement-bound grading; full suite",
+      "description": "Exact replacements per human plan Task 4: code-review Step 1 (blocker/hardening labels in Step 7) and Step 2 (grade from blockers only); checklist Step 3 (Review scope bound section before CRITICAL CHECKS) and Step 4 (Pinned mutable count and Light-loop bound checks after Widened-guard scope). Last task: runs the full Commander suite. No tests required: skill/rule Markdown; guarded by test_review_checklist.py and the full suite.",
+      "allowed_files": ["worker/skills/code-review/SKILL.md", "worker/rules/review-checklist.md"],
+      "depends_on": [2, 3],
+      "steps": [
+        {"description": "Apply human plan Task 4 Step 1 replacement verbatim in code-review/SKILL.md."},
+        {"description": "Apply human plan Task 4 Step 2 replacement verbatim in code-review/SKILL.md."},
+        {"description": "Apply human plan Task 4 Step 3 replacement verbatim in worker/rules/review-checklist.md."},
+        {"description": "Apply human plan Task 4 Step 4 replacement verbatim in worker/rules/review-checklist.md (both new checks)."},
+        {"description": "Verify references, headings, and that the scope bound keeps every CRITICAL check blocking", "command": "grep -c -e \"../../rules/scope-fidelity.md\" -e \"^## Review scope bound\" -e \"^### Pinned mutable count\" -e \"^### Light-loop bound\" -e \"^Every check under CRITICAL CHECKS blocks\" /Users/roberthyatt/Code/ironclaude/worker/skills/code-review/SKILL.md /Users/roberthyatt/Code/ironclaude/worker/rules/review-checklist.md", "expected": "/Users/roberthyatt/Code/ironclaude/worker/skills/code-review/SKILL.md:1\n/Users/roberthyatt/Code/ironclaude/worker/rules/review-checklist.md:4 (current HEAD prints 0 for both)"},
+        {"description": "Run full Commander suite (cwd commander/)", "command": "PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "0 failed, exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/skills/code-review/SKILL.md worker/rules/review-checklist.md", "expected": "no output, exit 0"}
+      ]
+    }
+  ]
+}

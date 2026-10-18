@@ -45,6 +45,13 @@ block "cat <(rm x)"
 # Newline injection -> BLOCK
 block "ls"$'\n'"rm x"
 
+# Expanding brace groups -> BLOCK (design 2026-10-18 v120-security-fixes-remediation 1b-R)
+block "find /tmp {-delete,}"
+block "ls {a,b}"
+block "cat f{1..3}"
+# Braces without , or .. do not expand -> ALLOW (bounds the rule)
+allow "cat a{b}"
+
 # Non-allowlisted commands -> BLOCK
 block "rm -rf /"
 block "git commit -m x"
@@ -55,6 +62,7 @@ block "echo hi"
 # ── is_readonly_git ──────────────────────────────────────────────────────────
 git_allow() { if is_readonly_git "$1"; then :; else echo "FAIL expected ALLOW: $1"; fail=1; fi; }
 git_block() { if is_readonly_git "$1"; then echo "FAIL expected BLOCK: $1"; fail=1; fi; }
+git_block "git diff {--output=/tmp/x,}"
 
 git_allow "git status"
 git_allow "git diff --staged"

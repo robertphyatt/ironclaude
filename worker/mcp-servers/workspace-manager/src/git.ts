@@ -62,9 +62,21 @@ export function gitSupportsMergeTreeWriteTree(): boolean {
   return major > 2 || (major === 2 && minor >= 38);
 }
 
+/**
+ * GIT_OPTIONAL_LOCKS=0: `git status` reads never rewrite the index, so one killed mid-read
+ * cannot leave a stale .git/index.lock. `git diff` still refreshes the index under the lock
+ * (git ignores this variable there). Required locks for writes (add, commit, reset, …) are
+ * unaffected (design 2026-10-18 lock-free-read-git).
+ */
+export const LOCK_FREE_READ_ENV = { GIT_OPTIONAL_LOCKS: '0' } as const;
+
 /** Executes Git through argv only. User-provided paths and refs never enter a shell. */
 export function runGit(cwd: string, args: readonly string[]): string {
-  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER });
+  const result = spawnSync('git', ['-C', cwd, ...args], {
+    encoding: 'utf8',
+    env: { ...process.env, ...LOCK_FREE_READ_ENV },
+    maxBuffer: GIT_MAX_BUFFER,
+  });
   const overflow = gitBufferOverflowError(args, result.error as NodeJS.ErrnoException | undefined);
   if (overflow) throw overflow;
   if (result.error) throw result.error;
@@ -77,7 +89,11 @@ export function runGit(cwd: string, args: readonly string[]): string {
  * index outside the worktree). Same argv-only, no-shell contract as runGit.
  */
 export function runGitEnv(cwd: string, args: readonly string[], env: NodeJS.ProcessEnv): string {
-  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', env, maxBuffer: GIT_MAX_BUFFER });
+  const result = spawnSync('git', ['-C', cwd, ...args], {
+    encoding: 'utf8',
+    env: { ...env, ...LOCK_FREE_READ_ENV },
+    maxBuffer: GIT_MAX_BUFFER,
+  });
   const overflow = gitBufferOverflowError(args, result.error as NodeJS.ErrnoException | undefined);
   if (overflow) throw overflow;
   if (result.error) throw result.error;

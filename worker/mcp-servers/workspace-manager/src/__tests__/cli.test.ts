@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -40,6 +41,92 @@ describe('workspace-manager internal CLI: cleanup command and abandon rescue mod
   it('exposes cleanup as an internal command alongside the existing set', () => {
     expect(INTERNAL_COMMAND_NAMES).toContain('cleanup');
     expect(INTERNAL_COMMAND_NAMES).toContain('abandon');
+    expect(INTERNAL_COMMAND_NAMES).toContain('begin-handoff');
+    expect(INTERNAL_COMMAND_NAMES).toContain('transfer-handoff');
+    expect(INTERNAL_COMMAND_NAMES).toContain('finish-handoff');
+  });
+
+  it('keeps old dependency fixtures compatible while refusing absent private handoff handlers', () => {
+    expect(() => dispatchInternalCommand('begin-handoff', {}, internalDependencies()))
+      .toThrow('begin-handoff dependency is unavailable');
+  });
+
+  it('reports protocol support before a Commander grant exists', () => {
+    const db = initDb(':memory:');
+    const result = createInternalCommandDependencies(db)['handoff-status']!({
+      workspace_guid: '11111111-1111-4111-8111-111111111111',
+    });
+    expect(result).toEqual({ protocol_version: 1, present: false, workspace_guid: '11111111-1111-4111-8111-111111111111' });
+  });
+
+  it('dispatches the scoped private handoff lifecycle against real Git and SQLite without changing dirty work', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ironclaude-cli-handoff-'));
+    const databaseDir = mkdtempSync(join(tmpdir(), 'ironclaude-cli-handoff-db-'));
+    const database = initDb(join(databaseDir, 'state.db'));
+    try {
+      git(root, 'init', '--initial-branch=main'); git(root, 'config', 'user.name', 'CLI Handoff Test');
+      git(root, 'config', 'user.email', 'cli-handoff@example.invalid');
+      writeFileSync(join(root, 'tracked.txt'), 'base\n'); git(root, 'add', 'tracked.txt'); git(root, 'commit', '-m', 'base');
+      const source = '019f7742-abd8-7c62-af7b-fe07189f1ffd';
+      const target = '019f7cdf-023c-74e0-9ead-9c155636885d';
+      const guid = '11111111-1111-4111-8111-111111111111';
+      const service = new WorkspaceService(database);
+      const reserved = service.reserveWorkerWorktree({ repositoryPath: root, workspaceGuid: guid, workerId: 'cli-handoff-worker' });
+      const assignment = service.bindWorkerWorktree({ repositoryPath: root, repositoryIdentity: reserved.repository_identity, workspaceGuid: guid, workerId: reserved.worker_id!, ownerSessionId: source, expectedLifecycle: 'active', expectedWorktreePath: reserved.worktree_path, expectedBranch: reserved.branch, expectedBaseCommit: reserved.base_commit, expectedCurrentHead: reserved.current_head });
+      const worktree = assignment.worktree_path;
+      writeFileSync(join(worktree, 'tracked.txt'), 'staged\n'); git(worktree, 'add', 'tracked.txt');
+      writeFileSync(join(worktree, 'tracked.txt'), 'unstaged\n'); writeFileSync(join(worktree, 'untracked.txt'), 'untracked\n');
+      symlinkSync('untracked.txt', join(worktree, 'shared-link'));
+      const snapshot = () => ({ head: git(worktree, 'rev-parse', 'HEAD'), branch: git(worktree, 'branch', '--show-current'), index: git(worktree, 'write-tree'), staged: git(worktree, 'diff', '--cached', '--binary'), unstaged: git(worktree, 'diff', '--binary'), status: git(worktree, 'status', '--porcelain=v1', '--untracked-files=all'), tracked: readFileSync(join(worktree, 'tracked.txt'), 'utf8'), untracked: readFileSync(join(worktree, 'untracked.txt'), 'utf8'), link: readlinkSync(join(worktree, 'shared-link')), isLink: lstatSync(join(worktree, 'shared-link')).isSymbolicLink(), primaryHead: git(root, 'rev-parse', 'HEAD') });
+      const before = snapshot(); const dependencies = createInternalCommandDependencies(database);
+      const token = 'private-cli-capability'; const tokenHash = createHash('sha256').update(token).digest('hex');
+      const expiresAt = new Date(Date.now() + 60_000).toISOString();
+      const args = { repository_path: root, repository_identity: assignment.repository_identity, workspace_guid: guid, worker_id: assignment.worker_id, source_owner_session_id: source, generation: 7, capability_token: token, expected_worktree_path: worktree, expected_branch: assignment.branch, expected_base_commit: assignment.base_commit, expected_current_head: assignment.current_head, expected_integration_target: assignment.integration_target };
+      const owner = () => (database.prepare('SELECT owner_session_id FROM assignments WHERE workspace_guid = ?').get(guid) as { owner_session_id: string }).owner_session_id;
+      const phase = () => (database.prepare('SELECT phase FROM workspace_handoffs WHERE workspace_guid = ?').get(guid) as { phase: string }).phase;
+      expect(dispatchInternalCommand('handoff-status', { workspace_guid: guid }, dependencies)).toEqual({ protocol_version: 1, present: false, workspace_guid: guid });
+      for (const command of ['begin-handoff', 'transfer-handoff', 'finish-handoff']) {
+        expect(() => dispatchInternalCommand(command, { ...args, target_owner_session_id: target }, dependencies)).toThrow(/grant not found|Handoff not found/);
+        expect(snapshot()).toEqual(before); expect(owner()).toBe(source);
+      }
+      database.prepare(`INSERT INTO workspace_handoffs(workspace_guid,generation,capability_token_hash,grant_expires_at,source_owner_session_id,target_owner_session_id,repository_identity,worker_id,worktree_path,branch,base_commit,current_head,integration_target,phase) VALUES(?,?,?,?,?,NULL,?,?,?,?,?,?,?, 'granted')`).run(guid, 7, tokenHash, expiresAt, source, assignment.repository_identity, assignment.worker_id, worktree, assignment.branch, assignment.base_commit, assignment.current_head, assignment.integration_target);
+      for (const wrong of [
+        { generation: 8 }, { capability_token: 'wrong' }, { source_owner_session_id: target },
+        { repository_identity: 'wrong' }, { worker_id: 'wrong' }, { expected_worktree_path: '/wrong' },
+        { expected_branch: 'wrong' }, { expected_base_commit: '0'.repeat(40) },
+        { expected_current_head: '0'.repeat(40) }, { expected_integration_target: 'wrong' },
+      ]) {
+        expect(() => dispatchInternalCommand('begin-handoff', { ...args, ...wrong }, dependencies)).toThrow();
+        expect(snapshot()).toEqual(before); expect(owner()).toBe(source); expect(phase()).toBe('granted');
+      }
+      const publicTuple = { protocol_version: 1, workspace_guid: guid, generation: 7, source_owner_session_id: source, repository_identity: assignment.repository_identity, worker_id: assignment.worker_id, worktree_path: worktree, branch: assignment.branch, base_commit: assignment.base_commit, current_head: assignment.current_head, integration_target: assignment.integration_target };
+      const responses: unknown[] = [];
+      const begun = dispatchInternalCommand('begin-handoff', args, dependencies);
+      expect(begun).toEqual({ ...publicTuple, target_owner_session_id: null, phase: 'begun' }); responses.push(begun);
+      expect(owner()).toBe(source); expect(phase()).toBe('begun'); expect(snapshot()).toEqual(before);
+      expect(() => dispatchInternalCommand('transfer-handoff', { ...args, target_owner_session_id: target }, dependencies)).toThrow(/authorized/);
+      expect(snapshot()).toEqual(before); expect(owner()).toBe(source);
+      // Private Commander authorization occurs after begin and observed fresh target identity.
+      database.prepare("UPDATE workspace_handoffs SET target_owner_session_id = ? WHERE workspace_guid = ? AND phase = 'begun'").run(target, guid);
+      expect(() => dispatchInternalCommand('transfer-handoff', { ...args, target_owner_session_id: '33333333-3333-4333-8333-333333333333' }, dependencies)).toThrow(/authorized/);
+      expect(snapshot()).toEqual(before); expect(owner()).toBe(source); expect(phase()).toBe('begun');
+      const transferred = dispatchInternalCommand('transfer-handoff', { ...args, target_owner_session_id: target }, dependencies);
+      expect(transferred).toEqual({ ...publicTuple, target_owner_session_id: target, phase: 'transferred' }); responses.push(transferred);
+      expect(owner()).toBe(target); expect(phase()).toBe('transferred'); expect(snapshot()).toEqual(before);
+      expect(() => dispatchInternalCommand('finish-handoff', { ...args, capability_token: 'wrong' }, dependencies)).toThrow(/capability/);
+      expect(snapshot()).toEqual(before); expect(owner()).toBe(target); expect(phase()).toBe('transferred');
+      const finished = dispatchInternalCommand('finish-handoff', args, dependencies);
+      expect(finished).toEqual({ ...publicTuple, target_owner_session_id: target, phase: 'finished' }); responses.push(finished);
+      const status = dispatchInternalCommand('handoff-status', { workspace_guid: guid }, dependencies);
+      expect(status).toEqual({ ...publicTuple, target_owner_session_id: target, phase: 'finished', present: true }); responses.push(status);
+      expect(owner()).toBe(target); expect(phase()).toBe('finished'); expect(snapshot()).toEqual(before);
+      for (const response of responses) {
+        const encoded = JSON.stringify(response);
+        for (const secret of ['capability_token', 'capability_token_hash', 'grant_expires_at', token, tokenHash, expiresAt]) expect(encoded).not.toContain(secret);
+      }
+    } finally {
+      database.close(); rmSync(root, { recursive: true, force: true }); rmSync(databaseDir, { recursive: true, force: true });
+    }
   });
 
   it('dispatches the cleanup command to its handler exactly once', () => {

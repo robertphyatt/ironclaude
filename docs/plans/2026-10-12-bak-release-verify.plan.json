@@ -1,0 +1,26 @@
+{
+  "name": "Verify episodic .bak release",
+  "goal": "Confirm restarting the 4 Claude sessions released the deleted 39 GiB db.sqlite.bak and record the result.",
+  "requirements_file": "docs/plans/2026-10-12-bak-release-verify-design.md",
+  "design_file": "docs/plans/2026-10-12-bak-release-verify-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Check release and record (V1-V4)",
+      "description": "No tests required: two read-only checks + doc append. Exact commands: human plan Task 1 Steps 1-4. stderr to own .err; NOTHING killed/changed.",
+      "allowed_files": [
+        "docs/reviews/2026-10-12-disk-shortfall-findings.md",
+        "docs/plans/2026-10-12-bak-release-verify-design.md",
+        "docs/plans/2026-10-12-bak-release-verify.md",
+        "docs/plans/2026-10-12-bak-release-verify.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "V1: remaining .bak holders", "command": "cd /private/tmp/disk-shortfall && lsof +L1 > verify-lsof-L1.txt 2> verify-lsof-L1.err; echo \"lsof=$?\"; grep -F db.sqlite.bak verify-lsof-L1.txt; echo \"bak-holders-grep=$?\"", "expected": "bak-holders-grep=1 (none). If 0: record each remaining PID's chain via ps -o pid=,ppid=,lstart=,tty=,command= -p <pid> repeated on PPID until 1."},
+        {"description": "V2: free space vs 207Gi baseline", "command": "cd /private/tmp/disk-shortfall && df -h /System/Volumes/Data > verify-df.txt 2> verify-df.err; echo \"df=$?\"; cat df.txt verify-df.txt", "expected": "Avail now vs 207Gi in df.txt; measured delta recorded; ~+39 GiB confirms release."},
+        {"description": "V3: append '## 7. Release check (2026-10-12)' to docs/reviews/2026-10-12-disk-shortfall-findings.md: bak-holders-grep result (+ remaining holders if any), Avail before/after and delta, whether 39 GiB came back; cite verify-lsof-L1.txt and verify-df.txt; non-~39 delta reported as measured, no guessed cause", "expected": "Section appended."},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-12-disk-shortfall-findings.md docs/plans/2026-10-12-bak-release-verify-design.md docs/plans/2026-10-12-bak-release-verify.md docs/plans/2026-10-12-bak-release-verify.plan.json", "expected": "No output."}
+      ]
+    }
+  ]
+}

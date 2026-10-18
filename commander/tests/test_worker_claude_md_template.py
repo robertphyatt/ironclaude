@@ -91,7 +91,10 @@ class TestWorkerClaudeMdTemplate:
             "Actual Claude Fable from Codex",
             "Managed Worktree — Missing Shared Data Is a Blocker to Report, Never to Hand-Fix",
         ]
-        assert "`Agent` tool (`model=fable`" in claude
+        assert "`Agent` tool (`model=opus`" in claude
+        assert "`model=fable` only when the operator explicitly requests the top tier" in claude
+        assert 'review_tier: "same"' in claude
+        assert 'review_tier: "same"' in codex
         assert "`model=opus`" in claude
         assert "`run_codex_advisor_review`" in codex
         assert "`requester_model`" in codex

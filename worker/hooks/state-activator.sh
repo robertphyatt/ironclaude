@@ -4,6 +4,39 @@
 # UserPromptSubmit is one of only two hook types whose stdout is displayed to the user.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/hook-logger.sh"
+
+# ─── Single-object, context-only stdout (v1.1.16 L2b-1b R4, L2b-1c R2) ───
+# Several writers below (log_hook, log_error, log_warning and the
+# warning-queue drain) each print one JSON line. This hook's messages are enforcement
+# failures and queued warnings the model must act on, so the body's stdout is buffered
+# and, on exit, every text (a systemMessage, a drained additionalContext, or a non-JSON
+# line) is newline-joined in buffer order into ONE UserPromptSubmit additionalContext
+# object: the one shape both clients deliver to the model. No systemMessage is
+# emitted. Nothing is printed when there is nothing to say. This hook emits no
+# decisions; the exit code is preserved.
+# This trap replaces hook-logger.sh's EXIT trap, so it also removes _IC_DB_VALIDATED.
+_ic_sa_flush() {
+  local rc=$?
+  exec 1>&3 3>&-
+  if [ -s "$_IC_SA_OUT" ]; then
+    jq -R -s -c '
+      [split("\n")[] | select(length > 0) | . as $line | ((fromjson? | objects) // {"__text": $line})
+        | (.systemMessage // .hookSpecificOutput.additionalContext? // .__text // (if has("hookSpecificOutput") then empty else tojson end))
+        | select(type == "string")]
+      | if length == 0 then empty
+        else {hookSpecificOutput: {hookEventName: "UserPromptSubmit", additionalContext: join("\n")}}
+        end
+    ' "$_IC_SA_OUT" 2>/dev/null || cat "$_IC_SA_OUT"
+  fi
+  rm -f "$_IC_SA_OUT" "${_IC_DB_VALIDATED:-}" 2>/dev/null
+  exit "$rc"
+}
+_IC_SA_OUT=$(mktemp "${TMPDIR:-/tmp}/.ic-state-activator-XXXXXX" 2>/dev/null) || _IC_SA_OUT=""
+if [ -n "$_IC_SA_OUT" ]; then
+  exec 3>&1 1>"$_IC_SA_OUT"
+  trap '_ic_sa_flush' EXIT
+fi
+
 run_hook "state-activator"
 
 INPUT=$(cat)
@@ -12,15 +45,13 @@ init_session_id
 # ═══ Pending PPID marker handshake ═══
 # MCP wrappers write ironclaude-ppid-pending-{PPID} when no session file exists
 # (e.g., after plugin reload). Write the session file so MCP retry loop can bind.
-for marker in "$HOME/.claude"/ironclaude-ppid-pending-*; do
-  [ -f "$marker" ] || continue
-  ppid_val=$(basename "$marker" | sed 's/ironclaude-ppid-pending-//')
-  # Validate ppid_val is numeric (defense against unexpected filenames)
-  if ! [[ "$ppid_val" =~ ^[0-9]+$ ]]; then
-    rm -f "$marker"
-    continue
-  fi
-  ppid_file="$HOME/.claude/ironclaude-session-${ppid_val}.id"
+# Claim only this hook's own client's marker ({PPID} = REAL_PPID, derived as
+# session-init.sh derives it). Another PID's marker belongs to another session;
+# claiming it would stamp this session's id onto that client's PID.
+REAL_PPID=$(ic_real_ppid)
+marker="$HOME/.claude/ironclaude-ppid-pending-${REAL_PPID}"
+if [[ "$REAL_PPID" =~ ^[0-9]+$ ]] && [ -f "$marker" ]; then
+  ppid_file="$HOME/.claude/ironclaude-session-${REAL_PPID}.id"
   if [ ! -f "$ppid_file" ]; then
     TMP_PPID=$(mktemp "$HOME/.claude/.ironclaude-session-XXXXXX")
     printf '%s' "$SESSION_TAG" > "$TMP_PPID"
@@ -28,10 +59,11 @@ for marker in "$HOME/.claude"/ironclaude-ppid-pending-*; do
     log_hook "state-activator" "PPID" "wrote session file from pending marker: $ppid_file"
   fi
   rm -f "$marker"
-done
+fi
 
-# Surface any MCP tool errors from the sideband log
-surface_mcp_errors
+# Deliver warnings queued by earlier hooks (GBTW) as next-turn context on both
+# clients. The exit-time flush joins it into this hook's single context object.
+ic_drain_warnings "$SESSION_TAG"
 
 USER_PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty' 2>/dev/null || true)
 

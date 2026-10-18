@@ -38,7 +38,7 @@ fi
 STAGE_CHANGE=""
 case "$SKILL_NAME" in
   brainstorming)
-    UPDATES="active_skill='brainstorming', workflow_stage='brainstorming', memory_search_required=1"
+    UPDATES="active_skill='brainstorming', workflow_stage='brainstorming'"
     STAGE_CHANGE="workflow_stage=brainstorming"
     ;;
   systematic-debugging)
@@ -46,7 +46,7 @@ case "$SKILL_NAME" in
     STAGE_CHANGE="workflow_stage=debugging"
     ;;
   writing-plans)
-    UPDATES="active_skill='writing-plans', workflow_stage='design_marked_for_use', memory_search_required=1"
+    UPDATES="active_skill='writing-plans', workflow_stage='design_marked_for_use'"
     STAGE_CHANGE="workflow_stage=design_marked_for_use"
     ;;
   executing-plans)
@@ -82,6 +82,16 @@ if [ "$TARGET_FOR_BUDGET" = "brainstorming" ] || [ "$TARGET_FOR_BUDGET" = "debug
     design_ready|design_marked_for_use|plan_ready|plan_marked_for_use|final_plan_prep|executing|reviewing|plan_interrupted)
       UPDATES="${UPDATES}, inherit_review=1" ;;
     # brainstorming | debugging | empty/unknown -> leave inherit_review unchanged
+  esac
+fi
+
+# Brainstorming memory-search gate arm (v1.1.16 L2b-2 R5). Only a new effort arms it:
+# a resume from debugging keeps the search already done, and an equal stage exits
+# below. writing-plans no longer arms (L2b-2 R6).
+if [ "$SKILL_NAME" = "brainstorming" ]; then
+  case "$CURRENT_STAGE" in
+    debugging|brainstorming) ;;
+    *) UPDATES="${UPDATES}, memory_search_required=1" ;;
   esac
 fi
 

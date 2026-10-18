@@ -1,32 +1,14 @@
 {
-  "_comment": "SF2/R5a: repo-declared PreToolUse hooks registered into the Brain's live ~/.ironclaude/brain/.claude/settings.json by _sync_brain_settings_hooks() at daemon start. The Brain loads these via setting_sources=[project,local]; the in-process can_use_tool callback is dead under bypassPermissions, so shell-hook registration is the live enforcement layer. The sync APPENDS each entry if absent (idempotent) and never clobbers existing PreToolUse/PostToolUse entries. Every referenced .sh is deployed from commander/hooks/ to ~/.claude/ironclaude-hooks/ (hook-logger.sh, a shared dependency they source, is deployed there by make deploy-hooks).",
+  "_comment": "Single source of truth for the Claude Brain's IronClaude hooks in ~/.ironclaude/brain/.claude/settings.json. _sync_brain_settings_hooks() runs at daemon start: it deploys every commander/hooks/*.sh to ~/.claude/ironclaude-hooks/, removes every settings entry whose script is listed here or retired (memory-search-enforcer.sh, startup-lookback-enforcer.sh: brain-gated-actions.sh owns those rules), keeps foreign entries, and appends these. brain-orchestrator-guard stays in settings.local.json. The Codex Brain registers the same scripts in worker/hooks/hooks.json behind codex-brain-hooks.sh.",
   "PreToolUse": [
-    {
-      "matcher": "",
-      "hooks": [
-        {
-          "type": "command",
-          "command": "bash $HOME/.claude/ironclaude-hooks/startup-lookback-enforcer.sh"
-        }
-      ]
-    },
-    {
-      "matcher": "Agent|Task",
-      "hooks": [
-        {
-          "type": "command",
-          "command": "bash $HOME/.claude/ironclaude-hooks/brain-task-gate.sh"
-        }
-      ]
-    },
-    {
-      "matcher": "",
-      "hooks": [
-        {
-          "type": "command",
-          "command": "bash $HOME/.claude/ironclaude-hooks/memory-search-enforcer.sh"
-        }
-      ]
-    }
+    {"matcher": "Bash", "hooks": [{"type": "command", "command": "bash $HOME/.claude/ironclaude-hooks/block-push.sh"}]},
+    {"matcher": "", "hooks": [{"type": "command", "command": "bash $HOME/.claude/ironclaude-hooks/wiki-synthesis-enforcer.sh"}]},
+    {"matcher": "", "hooks": [{"type": "command", "command": "bash $HOME/.claude/ironclaude-hooks/attention-sweep-enforcer.sh"}]},
+    {"matcher": "Agent|Task", "hooks": [{"type": "command", "command": "bash $HOME/.claude/ironclaude-hooks/brain-task-gate.sh"}]},
+    {"matcher": "", "hooks": [{"type": "command", "command": "bash $HOME/.claude/ironclaude-hooks/brain-gated-actions.sh"}]}
+  ],
+  "PostToolUse": [
+    {"matcher": "mcp__orchestrator__get_worker_status", "hooks": [{"type": "command", "command": "bash $HOME/.claude/ironclaude-hooks/attention-sweep-arm.sh"}]},
+    {"matcher": "mcp__orchestrator__update_ledger", "hooks": [{"type": "command", "command": "bash $HOME/.claude/ironclaude-hooks/block-pin-enforcer.sh"}]}
   ]
 }

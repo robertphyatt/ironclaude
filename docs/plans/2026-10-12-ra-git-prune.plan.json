@@ -1,0 +1,72 @@
+{
+  "name": "roleplaying-agents git prune",
+  "goal": "Reclaim ~100 GB of unreachable objects in roleplaying-agents .git and trim the local LFS store, with stashes pinned as refs, a verified --no-local mirror backup, operator review of unreachable revisions, and all repo users stopped; gc runs with reflog expiry disabled (keeps stashes); no rewrite, no push.",
+  "requirements_file": "docs/plans/2026-10-12-ra-git-prune-design.md",
+  "design_file": "docs/plans/2026-10-12-ra-git-prune-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Snapshot, pin stashes, mirror backup (P1)",
+      "description": "No tests required: backup with built-in verification; no code. Exact commands: human plan Task 1 Steps 1, 1b, 1c, 2-4. Broken refs removed (1c) BEFORE mirror: first mirror attempt failed 'upload-pack: not our ref 0000…'; operator chose A. Never reflog expire; avoid guard words.",
+      "allowed_files": ["docs/reviews/2026-10-11-ra-git-history-findings.md"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Record refs, stash count (6), worktrees, count-objects, du, df to /private/tmp/ra-prune", "expected": "Stash count 6; 2 broken-ref warnings; recorded."},
+        {"description": "Pin stash@{1..5} as refs/stash-keep/1..5 via update-ref", "expected": "5 refs matching stash list entries."},
+        {"description": "cat + rm the 2 'checkpoints (1)' loose ref files (quoted); find <dir> -type d -empty -delete; for-each-ref stderr has no 'broken name'", "expected": "No warning."},
+        {"description": "git clone --mirror --no-local to /Users/roberthyatt/Backups/roleplaying-agents-mirror-2026-10-12.git (background, timeout 3600000)", "command": "mkdir -p /Users/roberthyatt/Backups && git clone --mirror --no-local /Users/roberthyatt/Code/roleplaying-agents /Users/roberthyatt/Backups/roleplaying-agents-mirror-2026-10-12.git > /private/tmp/ra-prune/mirror.log 2>&1; echo \"mirror exit=$?\" >> /private/tmp/ra-prune/mirror.log", "expected": "mirror exit=0 else stop."},
+        {"description": "Verify mirror: fsck --connectivity-only + per-namespace ref counts equal (heads/tags/ironclaude/stash/stash-keep/original) + du", "expected": "fsck exit 0; counts equal; ~2-4 GB."},
+        {"description": "find -xdev -samefile for the catalog db second hard link in ~/Code and ~/.codex", "expected": "Paths recorded."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Delete broken and catalog-pinning codex refs (P2)",
+      "description": "No tests required: ref deletion verified by listing and blob reachability. Exact commands: human plan Task 2 Steps 1-3. Broken refs already removed in Task 1 Step 1c (confirm only); valid codex refs reaching blob f121f0d2318612b179b7d532a357b773b444fa82 deleted via update-ref -d (set computed at execution time).",
+      "allowed_files": ["docs/reviews/2026-10-11-ra-git-history-findings.md"],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Confirm broken refs gone: for-each-ref stderr has no 'broken name'", "expected": "No warning."},
+        {"description": "Loop refs/codex: DELETE those whose rev-list --objects reaches f121f0d2...; KEEP others", "expected": "DELETE/KEEP lines recorded."},
+        {"description": "rev-list --objects --all | grep -c f121f0d2318612b179b7d532a357b773b444fa82 (timeout 1800000)", "expected": "0; if nonzero and hits come only from refs/stash-keep/* record and continue; any codex ref hit = stop"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Unreachable-object review (P3)",
+      "description": "No tests required: read-only listing + operator decision. Exact commands: human plan Task 3 Steps 1-3. fsck --connectivity-only --unreachable (reflogs count as reachable; matches gc with reflog expiry never); revision objects filtered by /^comm/ prefix.",
+      "allowed_files": ["docs/reviews/2026-10-11-ra-git-history-findings.md"],
+      "depends_on": [2],
+      "steps": [
+        {"description": "fsck --connectivity-only --unreachable to /private/tmp/ra-prune/unreachable.txt; counts by type", "expected": "Recorded."},
+        {"description": "Unreachable revisions with date/author/subject, newest first; head 30 + tail 3", "expected": "Recorded."},
+        {"description": "AskUserQuestion: rescue none/prune (Rec.) | rescue some | stop; rescued -> update-ref refs/rescue/2026-10-12-<n>", "expected": "Operator decision applied."}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Stop users, gc, LFS prune (P4, P5)",
+      "description": "No tests required: operational prune with gates and dry-run. Exact commands: human plan Task 4 Steps 1-4. Operator stops sessions; gates pgrep ChatGPT/git empty, no tmux pane and no lsof -d cwd (all processes, no -c filter) under roleplaying-agents; fresh refs-prestop snapshot. gc with -c gc.reflogExpire=never -c gc.reflogExpireUnreachable=never. NO reflog expire.",
+      "allowed_files": ["docs/reviews/2026-10-11-ra-git-history-findings.md"],
+      "depends_on": [3],
+      "steps": [
+        {"description": "AskUserQuestion stop users; gates (pgrep -lx ChatGPT, pgrep -lx git, tmux list-panes paths, lsof cwd); refs-prestop snapshot", "expected": "All gates pass else wait; snapshot taken."},
+        {"description": "gc with reflog expiry never + --prune=now (background, timeout 7200000); then count-objects, du, df", "command": "git -C /Users/roberthyatt/Code/roleplaying-agents -c gc.reflogExpire=never -c gc.reflogExpireUnreachable=never gc --prune=now > /private/tmp/ra-prune/gc.log 2>&1; echo \"gc exit=$?\" >> /private/tmp/ra-prune/gc.log", "expected": "gc exit=0."},
+        {"description": "git lfs prune --verify-remote --dry-run --verbose", "expected": "Sane summary (<= 6.8 GB) else stop."},
+        {"description": "git lfs prune --verify-remote; du .git/lfs", "expected": "lfs exit 0."}
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Verify, record, release (P6)",
+      "description": "No tests required: verification and documentation. Exact commands: human plan Task 5 Steps 1-3.",
+      "allowed_files": ["docs/reviews/2026-10-11-ra-git-history-findings.md", "docs/plans/2026-10-12-ra-git-prune-design.md", "docs/plans/2026-10-12-ra-git-prune.md", "docs/plans/2026-10-12-ra-git-prune.plan.json"],
+      "depends_on": [4],
+      "steps": [
+        {"description": "fsck --connectivity-only; refs-prestop vs refs-after identical; refs-before vs refs-after recorded (expected: Task 2 deletions, stash-keep/rescue additions, pre-stop codex churn); stash list 6 and stash reflog 6; worktree list unchanged", "expected": "All hold else stop/report."},
+        {"description": "count-objects, du .git, df", "expected": "Recorded."},
+        {"description": "Append 'Prune results'; stage; keep /private/tmp/ra-prune; tell operator to restart sessions", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-11-ra-git-history-findings.md docs/plans/2026-10-12-ra-git-prune-design.md docs/plans/2026-10-12-ra-git-prune.md docs/plans/2026-10-12-ra-git-prune.plan.json", "expected": "No output."}
+      ]
+    }
+  ]
+}

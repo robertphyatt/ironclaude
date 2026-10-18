@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import ctypes
 from dataclasses import dataclass
 import fcntl
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 import psutil
 from datetime import datetime, timezone
@@ -58,6 +60,7 @@ from ironclaude.notifications import (
     _escape_mrkdwn,
 )
 from ironclaude.grader import GRAMMAR_MAX_STRING_LENGTH, LocalGrader, truncate_middle
+from ironclaude import fast_model
 from ironclaude.fable_availability import (
     resolve_worker_type as _resolve_fable_worker_type,
     resolve_advisor_model as _resolve_fable_advisor_model,
@@ -81,6 +84,23 @@ def _render_brain_system_prompt(prompt_path: str, config: dict) -> str:
     return apply_communication_profile("commander_brain", substituted)
 
 logger = logging.getLogger("ironclaude")
+
+
+def _native_availability_matches_worker_model(worker: dict, tier: str, observed: object) -> bool:
+    """Only a success from the concrete worker model can clear its usage incident."""
+    stored = worker.get("model")
+    if not isinstance(stored, str) or not stored or not isinstance(observed, str) or not observed:
+        return False
+    if worker.get("client") == "codex":
+        return observed == stored
+    if worker.get("client") != "claude" or tier not in {"sonnet", "opus", "haiku", "fable"}:
+        return False
+    canonical = rf"claude-{tier}-[0-9]+(?:-[0-9]+)*"
+    if re.fullmatch(canonical, observed) is None:
+        return False
+    if stored in {"sonnet", "opus", "haiku"}:
+        return stored == tier
+    return stored == observed
 
 _BRAIN_MSG_VALIDATION_SYSTEM = (
     "You validate Brain messages before they are posted to Slack.\n\n"
@@ -1542,7 +1562,14 @@ class IroncladeDaemon:
         self._last_heartbeat_ts: str | None = None   # Slack ts of the last heartbeat (threads tactical chatter)
         self._last_brain_context: tuple[str, str] | None = None   # fully delivered top-level (ts, text) eligible for operator-wait links
         self._decisions_dir = os.path.join(config.get("tmp_dir", "/tmp/ic"), "brain-decisions")
-        self._ledger_path = os.path.join(config.get("tmp_dir", "/tmp/ic"), "task-ledger.json")
+        # The Brain's update_ledger writes <brain_cwd>/wiki/tasks.md; read that. Raw test
+        # configs without brain_cwd keep the legacy JSON path (DEFAULTS always set it).
+        _brain_cwd = config.get("brain_cwd")
+        self._ledger_path = (
+            os.path.join(os.path.expanduser(_brain_cwd), "wiki", "tasks.md")
+            if _brain_cwd else os.path.join(config.get("tmp_dir", "/tmp/ic"), "task-ledger.json")
+        )
+        self._blocked_reminded: dict[str, float] = {}
         self._db = db_conn
         self._last_checkin_sent: dict[str, float] = {}
         self._last_checkin_stage: dict[str, str | None] = {}
@@ -1591,7 +1618,7 @@ class IroncladeDaemon:
         # activity is reaped (see _reap_idle_worker).
         self._worker_idle_since: dict[str, float] = {}
         self._last_stuck_check: float = 0.0
-        self._grader = LocalGrader(keep_alive="30m")
+        self._grader = LocalGrader(keep_alive="30m", commander_config=self.config)
         # FIX 2: cap concurrent bounded grades at one. _grade_bounded sets this flag
         # before offloading; a stalled grade that is abandoned keeps the flag set
         # (cleared only by the worker's finally) so later calls fail fast to None
@@ -1667,6 +1694,180 @@ class IroncladeDaemon:
                 logger.warning("Could not build orchestrator handle: %s", exc)
                 return None
         return self._orchestrator
+
+    def _handoff_suppresses(self, worker: dict) -> bool:
+        """Return true only while a durable, unpaused, unfinished handoff row exists (H1)."""
+        if not isinstance(self.registry, WorkerRegistry):
+            return False
+        row = self.registry.get_worker_handoff(worker["id"])
+        return bool(row and row["completed_at"] is None and not row["pause_reason"])
+
+    def _maybe_start_handoff(self, worker: dict) -> None:
+        """Start a provider handoff only on a positive native exhaustion verdict (H1).
+
+        Never suppresses ordinary lifecycle handling and never notifies for
+        unknown evidence. Remote and path-less workers return before any read.
+        """
+        from ironclaude.orchestrator_mcp import _WORKER_TYPE_TIER
+        from ironclaude.worker_quota import read_native_quota
+
+        if (worker.get("client") not in {"claude", "codex"}
+                or worker.get("type") not in _WORKER_TYPE_TIER
+                or not worker.get("model") or not worker.get("workspace_guid")
+                or worker.get("machine") or not worker.get("workspace_path")):
+            return
+        try:
+            uuid.UUID(worker["native_session_id"])
+        except (TypeError, ValueError, AttributeError):
+            return
+        worker_id = worker["id"]
+        latest = self.registry.get_worker_handoff(worker_id)
+        generation = 1 if latest is None else latest["generation"] + 1
+        prior = self.registry.get_native_quota_evidence(worker_id)
+        prior_verdict = prior["verdict"] if prior and prior["generation"] == generation else None
+        native_id = worker["native_session_id"]
+        root = getattr(self, "_native_log_root", Path.home())
+        if worker["client"] == "claude":
+            paths = list((root / ".claude/projects").glob(f"*/{native_id}.jsonl"))
+        else:
+            paths = list((root / ".codex/sessions").glob(f"**/*{native_id}*.jsonl"))
+        if len(paths) != 1 or not paths[0].is_file():
+            return
+        established = prior_verdict and prior_verdict.get("file_identity")
+        prior_state = prior_verdict.get("reader_state") if established else None
+        cursor = prior_verdict.get("cursor", 0) if established else 0
+        identity = prior_verdict.get("file_identity") if established else None
+        started = time.monotonic()
+        while True:
+            verdict = read_native_quota(
+                paths[0], client=worker["client"], native_session_id=native_id,
+                workspace_path=worker["workspace_path"], generation=str(generation),
+                cursor=cursor, reader_state=prior_state,
+                expected_file_identity=identity,
+            )
+            if verdict.get("reason") != "native_log_requires_cursor_continuation":
+                break
+            if time.monotonic() - started > 15:
+                verdict["state"] = "unknown"
+                verdict["reason"] = "native_quota_log_scan_budget_exceeded"
+                break
+            cursor = verdict["cursor"]
+            prior_state = verdict["reader_state"]
+            identity = verdict["file_identity"]
+        effective_tier = self.registry.effective_worker_tier(worker)
+        if effective_tier is None:
+            verdict["state"] = "unknown"
+            verdict["status"] = "unknown"
+            verdict["exhausted"] = False
+            verdict["reason"] = "worker_effective_tier_unproved"
+        if verdict["state"] == "unknown":
+            # Unknown evidence never suppresses and never notifies. Persist only
+            # forward progress on the same file so a trusted cursor never rewinds.
+            if (verdict.get("file_identity")
+                    and isinstance(verdict.get("reader_state"), dict)
+                    and verdict["reader_state"].get("cursor") == verdict.get("cursor")
+                    and (prior_verdict is None or not prior_verdict.get("file_identity")
+                         or (verdict["file_identity"] == prior_verdict.get("file_identity")
+                             and verdict["cursor"] > prior_verdict.get("cursor", -1)))):
+                try:
+                    self.registry.record_native_quota_verdict(
+                        worker_id, generation, verdict, snapshot=worker)
+                except RuntimeError:
+                    return
+            return
+        if verdict["state"] == "exhausted":
+            try:
+                self.registry.record_native_quota_verdict(
+                    worker_id, generation, verdict, snapshot=worker,
+                )
+            except RuntimeError:
+                return
+            tools = self._get_orchestrator()
+            if tools is None:
+                if not prior_verdict or prior_verdict.get("event_key") != verdict.get("event_key"):
+                    message = (f"Worker {worker_id} ({worker['client']} {worker['model']}, native {native_id}) "
+                               "remains unfinished; confirmed native quota exhausted but "
+                               "the handoff controller is unavailable.")
+                    self.slack.post_message(message)
+                    self.brain.send_message(message)
+                return
+            if latest is not None and latest["phase"] == "released":
+                consumed = json.loads(latest["evidence_json"]).get("quota_verdict") or {}
+                if consumed.get("event_key") == verdict.get("event_key"):
+                    # A released handoff already consumed this exhaustion event; only a
+                    # fresh exhaustion record starts the next generation.
+                    return
+            result = tools.handoff_worker(worker_id, verdict)
+            if result.get("status") == "rejected" and result.get("reason") == "operator_paused_pm":
+                return
+            if (result.get("status") == "rejected"
+                    and result.get("reason") not in {
+                        "handoff_claim_failed", "native_quota_evidence_invalid",
+                        "native_quota_evidence_changed",
+                    }):
+                try:
+                    first = self.registry.record_native_handoff_rejection(
+                        worker_id, generation, result.get("reason") or "source_preflight_failed",
+                        snapshot=worker,
+                    )
+                except RuntimeError:
+                    return
+                if first:
+                    message = (f"Worker {worker_id} ({worker['client']} {worker['model']}, native {native_id}) "
+                               f"remains unfinished; handoff readiness unproved: "
+                               f"{result.get('reason') or 'source_preflight_failed'}. "
+                               "Workspace assignment hold is unproved.")
+                    self.slack.post_message(message)
+                    self.brain.send_message(message)
+                return
+            self._notify_worker_handoff(worker, result)
+            return
+        try:
+            self.registry.record_native_quota_verdict(worker_id, generation, verdict, snapshot=worker)
+        except RuntimeError:
+            return
+        if verdict["state"] == "available":
+            if _native_availability_matches_worker_model(
+                    worker, effective_tier, verdict.get("observed_model")):
+                from ironclaude.provider_state import ProviderState
+                provider_state = ProviderState(self.registry._conn)
+                recovery_tiers = (effective_tier, provider_state.worker_usage_scope_tier(
+                    "worker", effective_tier))
+                for recovery_tier in dict.fromkeys(recovery_tiers):
+                    provider_state.recover_usage_quarantine(
+                        "local", worker["client"], "worker", recovery_tier,
+                        native_generation=f"{native_id}:{verdict['file_identity']}:{generation}",
+                        native_cursor=verdict["cursor"], native_event_key=verdict["event_key"],
+                        native_state="available",
+                        native_event_timestamp=verdict.get("event_timestamp"),
+                    )
+
+    def _notify_worker_handoff(self, worker: dict, result: dict) -> None:
+        if result.get("reason") in {"handoff_reconcile_owned", "handoff_reconcile_owner_unproved"}:
+            return
+        row = self.registry.get_worker_handoff(worker["id"])
+        if not row or row["completed_at"] or not self.registry.claim_worker_handoff_notification(worker["id"], row["generation"]):
+            return
+        message = (f"Worker {worker['id']} ({worker['client']} {worker['model']}, "
+                   f"native {worker['native_session_id']}) remains unfinished; "
+                   f"provider handoff {result.get('status')} at {result.get('phase')}: "
+                   f"{result.get('reason') or 'awaiting verified continuation'}.")
+        self.slack.post_message(message)
+        self.brain.send_message(message)
+
+    def _preserve_released_handoff_worker(self, worker_id: str, result: dict) -> None:
+        """H6: route a released post-stop handoff through the dead-session preserve path once."""
+        outcome = self._finalize_and_release_worker(worker_id, reason="session ended", terminal=True)
+        disposition = self._drive_finalization_recovery(worker_id, outcome, terminal=True)
+        if worker_id in self._session_died_notified:
+            return
+        message = (f"Worker {worker_id} provider handoff could not continue after the source stopped "
+                   f"({result.get('reason') or 'handoff_forward_impossible'}); the handoff hold was "
+                   f"released and the work is preserved through the session-ended path "
+                   f"(finalization disposition={disposition}).")
+        self.slack.post_message(message)
+        self.brain.send_message(message)
+        self._session_died_notified.add(worker_id)
 
     def _finalize_and_release_worker(self, worker_id: str, reason: str, terminal: bool):
         """Best-effort delegate to OrchestratorTools' auto-integration seam.
@@ -3063,10 +3264,12 @@ class IroncladeDaemon:
                 return None
             self._grade_in_flight = True
         box: dict = {}
+        fast_started = threading.Event()
 
         def _worker():
             try:
-                box["r"] = self._grader.grade(system, user, schema, read_timeout=timeout)
+                box["r"] = self._grader.grade(system, user, schema, read_timeout=timeout,
+                                              on_fast_model=fast_started.set)
             except Exception as e:  # noqa: BLE001 — surfaced as None, matches prior catch
                 box["e"] = e
             finally:
@@ -3082,6 +3285,11 @@ class IroncladeDaemon:
             logger.warning("bounded grade thread failed to start: %s — not capturing", e)
             return None
         t.join(timeout)
+        if t.is_alive() and fast_started.is_set():
+            # The Haiku-class model is the responder: extend by the measured fast-lane
+            # allowance. If the fast step starts only after this bound expired (a local
+            # stall >= the bound), the result is None exactly as before.
+            t.join(fast_model.FAST_LANE_FAST_MODEL_SECONDS)
         if t.is_alive():
             logger.warning(
                 "awaiting-operator grade exceeded %ss bound; skipping capture (offloaded)",
@@ -3328,7 +3536,10 @@ class IroncladeDaemon:
         running = self.registry.get_running_workers()
         obj = self.registry.get_active_objective()
         ledger = read_task_ledger(self._ledger_path)
-        progress = f"{ledger['current_task']}/{ledger['total_tasks']}" if ledger else "N/A"
+        tasks = ledger.get("tasks") if isinstance(ledger, dict) else None
+        tasks = [t for t in (tasks or []) if isinstance(t, dict)]
+        done = sum(1 for t in tasks if t.get("status") == "completed")
+        progress = f"{done}/{len(tasks)}" if tasks else "N/A"
         status_lines = [
             "*IronClaude Status*",
             f"State: {'paused' if self._paused else 'running'}",
@@ -4231,7 +4442,7 @@ class IroncladeDaemon:
                     continue
                 self._confirm_and_kill_stuck_worker(
                     worker_id, session_name, duration,
-                    stage, prompt_waiting, ssh_host,
+                    stage, prompt_waiting, ssh_host, _expected_worker=worker,
                 )
             elif duration >= alert_threshold and not self._stuck_alert_sent.get(worker_id, False):
                 minutes = int(duration / 60)
@@ -4279,6 +4490,56 @@ class IroncladeDaemon:
                 self._finalize_marker_seen.pop(wid, None)
 
     def _confirm_and_kill_stuck_worker(
+        self, worker_id: str, session_name: str, duration: float,
+        stage: str | None, prompt_waiting: bool, ssh_host: str | None,
+        *, _expected_worker: dict | None = None,
+    ):
+        if isinstance(self.registry, WorkerRegistry):
+            worker = self.registry.get_worker(worker_id)
+            if (not worker or worker["status"] != "running"
+                    or worker["tmux_session"] != session_name
+                    or (_expected_worker is not None and any(
+                        worker.get(field) != _expected_worker.get(field)
+                        for field in self.registry._SNAPSHOT_FIELDS
+                    ))):
+                return
+            self._warn_worker_operation_blocker(worker)
+            self._maybe_start_handoff(worker)
+            if self._handoff_suppresses(worker):
+                return
+            try:
+                with self.registry.worker_operation(worker, operation="worker_mutation"):
+                    return self._confirm_and_kill_stuck_worker_locked(
+                        worker_id, session_name, duration, stage, prompt_waiting, ssh_host,
+                    )
+            except RuntimeError:
+                self._warn_worker_operation_blocker(worker)
+                return
+        return self._confirm_and_kill_stuck_worker_locked(
+            worker_id, session_name, duration, stage, prompt_waiting, ssh_host,
+        )
+
+    def _warn_worker_operation_blocker(self, worker: dict) -> None:
+        if not isinstance(self.registry, WorkerRegistry):
+            return
+        try:
+            blocker = self.registry.claim_worker_operation_recovery_warning(worker)
+        except RuntimeError:
+            return
+        if blocker is None:
+            return
+        scope = blocker["snapshot"]
+        message = (f"Worker {worker['id']} ({scope['client']} {scope['model']}, "
+                   f"native {scope['native_session_id']}, tmux {scope['tmux_session']}, "
+                   f"machine {scope['machine'] or 'local'}) remains unfinished and preserved; "
+                   f"operation {blocker['operation']} lease {blocker['nonce']} is "
+                   f"{blocker['phase']} with disposition {blocker['disposition']}. "
+                   "Read back the exact operation effects before any completion, kill, "
+                   "or replacement.")
+        self.slack.post_message(message)
+        self.brain.send_message(message)
+
+    def _confirm_and_kill_stuck_worker_locked(
         self, worker_id: str, session_name: str, duration: float,
         stage: str | None, prompt_waiting: bool, ssh_host: str | None,
     ):
@@ -4544,295 +4805,337 @@ class IroncladeDaemon:
         """Check running workers for completion signals."""
         running_workers = self.registry.get_running_workers()
         running_ids = {worker["id"] for worker in running_workers}
+        if isinstance(self.registry, WorkerRegistry):
+            running_ids.update(handoff["worker_id"] for handoff in self.registry.list_pending_worker_handoffs())
+        for handoff in (self.registry.list_pending_worker_handoffs()
+                        if isinstance(self.registry, WorkerRegistry) else ()):
+            tools = self._get_orchestrator()
+            if tools is None:
+                break
+            if handoff["pause_reason"]:
+                result = tools.retry_worker_handoff_preflight(handoff["worker_id"])
+            else:
+                result = tools.reconcile_worker_handoff(handoff["worker_id"])
+            source = json.loads(handoff["snapshot_json"])
+            if result.get("status") == "released" and result.get("preserve"):
+                self._preserve_released_handoff_worker(handoff["worker_id"], result)
+                continue
+            self._notify_worker_handoff(source, result)
         for worker in running_workers:
             worker_id = worker["id"]
-            session_name = worker["tmux_session"]
-            ssh_host, remote_log_dir = self._resolve_worker_ssh(worker)
-
-            # Marker-aware persistently-failing commit_worker surface. Runs
-            # every cycle for every running worker (BEFORE the .done-marker /
-            # idle-TTL / dead-session branches below) because a live worker
-            # whose finalize deterministically fails while it keeps retrying
-            # never reaches those seams — commit_worker logs finalize_failed
-            # events directly (see orchestrator_mcp.py), so this counts
-            # failures SINCE the last integrate/reopen marker and fires the
-            # existing one-shot operator surface for a still-running worker.
-            _events = self.registry.get_events_for_worker(worker_id)
-            if not isinstance(_events, list):
-                _events = []
-            _since = count_failed_since_marker(_events)
-            _latest_marker = max_marker_id(_events)
-            # A new integrate/reopen marker re-arms drift/recovery/alert state
-            # so a post-marker re-fail is handled fresh rather than inheriting
-            # stale drift/alert state. Gated to fire at most once per new
-            # marker (via _finalize_marker_seen) so it does not re-arm every
-            # cycle while that marker remains the newest event, which would
-            # defeat the drift cap and re-post the conflict/repair/transient
-            # surfaces.
-            if _latest_marker > self._finalize_marker_seen.get(worker_id, 0):
-                self._finalize_marker_seen[worker_id] = _latest_marker
-                self._finalize_drift_retry.pop(worker_id, None)
-                self._finalize_failure_count.pop(worker_id, None)
-                self._finalize_recovery_alerted.discard(worker_id)
-                self._finalize_failure_alerted.discard(worker_id)
-                self._commit_failure_alerted.discard(worker_id)
-            if (
-                _since >= FINALIZE_DRIFT_RETRY_CAP
-                and worker_id not in self._commit_failure_alerted
-            ):
-                self._commit_failure_alerted.add(worker_id)
-                self.slack.post_message(
-                    f"Worker {worker_id} finalization (commit_worker) has failed "
-                    f"{_since} times since its last integrate/reopen; reviewed work "
-                    f"preserved, not integrated, not completed. Try "
-                    f'recover_worker_integration("{worker_id}", "reopen_for_edit") '
-                    "to hand it back for edits."
-                )
-                self.brain.send_message(
-                    f"Worker {worker_id} finalization via commit_worker is failing "
-                    f"repeatedly ({_since} failures since the last marker). Stop "
-                    "calling commit_worker for this worker; pin a blocker and "
-                    'offer recover_worker_integration("' + worker_id + '", '
-                    '"reopen_for_edit") to hand the reviewed commit back for '
-                    "edits. Not completed, not abandoned."
-                )
-
-            # Primary: check for .done marker from stop hook
-            if ssh_host:
-                log_dir = remote_log_dir or self.tmux.log_dir
-                marker_path = os.path.join(log_dir, f"{session_name}.done")
-                marker_exists = self.tmux.file_exists(marker_path, ssh_host=ssh_host)
-            else:
-                marker_path = os.path.join(self.tmux.log_dir, f"{session_name}.done")
-                marker_exists = os.path.exists(marker_path)
-
-            # Idle-TTL gate: a worker armed idle (a prior .done sighting) that has
-            # written nothing to its pane log past the TTL is reaped. Fresh pane
-            # activity (mtime after arm + grace) disarms; a missing log fails safe.
-            ttl = self.config.get("idle_worker_ttl_seconds", 1800)
-            armed = self._worker_idle_since.get(worker_id)
-            if armed is not None and ttl and ttl > 0:
-                mtime = self.tmux.get_log_mtime(session_name, ssh_host=ssh_host, remote_log_dir=remote_log_dir)
-                if mtime is not None and mtime > armed + IDLE_ACTIVITY_GRACE_SECONDS:
-                    self._worker_idle_since.pop(worker_id, None)
-                elif (mtime is not None and time.time() - armed >= ttl
-                      and not self._routine_prompt_active(worker_id)):
-                    if self._reap_idle_worker(worker_id, session_name, ssh_host, remote_log_dir, armed):
-                        continue
-
-            if marker_exists:
-                self._worker_idle_since.setdefault(worker_id, time.time())
-                self._resolve_worker_prompt(worker_id, now=time.time())
-                log_worker_event("WORKER_IDLE", worker_id=worker_id)
-                self.slack.post_message(format_worker_idle(worker_id))
-                # Idle-but-alive worker: recycle its work in place when gates pass
-                # AND there is genuinely new work. The nothing-new guard stops an
-                # empty commit on repeated Brain-down cycles; runs regardless of
-                # the Brain delivery below (work integrates even when Brain is down).
-                outcome = self._finalize_and_release_worker(
-                    worker_id, reason="idle", terminal=False,
-                )
-                # Route the (previously discarded) idle outcome through the
-                # unified recovery driver so a drift/conflict/repair finalization
-                # is driven/surfaced, not dropped. A live idle worker is never
-                # completed by the daemon.
-                self._drive_finalization_recovery(worker_id, outcome)
-                delivered = self.brain.send_message(
-                    f"Worker {worker_id} idle."
-                )
-                if delivered:
-                    if ssh_host:
-                        self.tmux.remove_file(marker_path, ssh_host=ssh_host)
-                    else:
-                        try:
-                            os.remove(marker_path)
-                        except FileNotFoundError:
-                            pass
-                    logger.info(f"Idle notification delivered for {worker_id}, marker removed")
-                else:
-                    logger.warning(f"Brain unreachable, keeping marker for {worker_id} (will retry)")
-                continue
-
-            # Fallback: session died (crash, OOM, etc.)
-            if not self.tmux.has_session(session_name, ssh_host=ssh_host):
-                self._resolve_worker_prompt(worker_id, now=time.time())
-                # Integrate (or rescue) the dead worker's reviewed work before the
-                # completed-flip. A recoverable finalization failure re-queues.
-                outcome = self._finalize_and_release_worker(
-                    worker_id, reason="session ended", terminal=True,
-                )
-                # The seam owns ALL completion; the daemon completes nothing.
-                # Route the outcome through the unified recovery driver
-                # (drift-retry / surface / transient) which never completes.
-                disposition = self._drive_finalization_recovery(worker_id, outcome, terminal=True)
-                # Log worker_finished ONLY when the worker is actually completed
-                # (re-read the registry after the seam+driver ran). A worker left
-                # running (transient/held/surfaced) logs no finish.
-                _w = self.registry.get_worker(worker_id)
-                _completed = isinstance(_w, dict) and _w.get("status") == "completed"
-                if _completed:
-                    self.registry.log_event("worker_finished", worker_id=worker_id)
-                # Surface the dead session exactly once per worker. A drift worker
-                # re-enters this branch every cycle while it stays running; gating
-                # on the notified set stops the Slack/Brain posts re-firing. The
-                # surface must reflect actual completion: a worker the seam left
-                # NOT completed (transient/drift/held; work preserved) must never
-                # be reported as "Worker Completed".
-                if worker_id not in self._session_died_notified:
-                    log_worker_event("WORKER_DEAD", worker_id=worker_id)
-                    if _completed:
-                        self.slack.post_message(format_worker_completed(worker_id, "Session ended"))
-                        self.brain.send_message(
-                            f"Worker {worker_id} session died (tmux gone)."
-                        )
-                    else:
-                        self.slack.post_message(
-                            format_worker_session_ended_preserved(worker_id, disposition)
-                        )
-                        self.brain.send_message(
-                            f"Worker {worker_id} session died (tmux gone); reviewed work "
-                            f"preserved, NOT completed; finalization disposition={disposition}. "
-                            f'Call recover_worker_integration("{worker_id}", "status") and '
-                            "handle the assignment with Commander-owned recovery/finalization "
-                            "tools. Do not spawn a cleanup worker. Do not request "
-                            "primary-checkout or terminal commands. Ask one natural-language "
-                            "disposition question only if no durable directive or operator "
-                            "instruction already decides integrate versus abandon."
-                        )
-                    self._session_died_notified.add(worker_id)
-                continue
-
-            # Proactive check-in: notify brain when cadence elapses
-            claude_dir = self._claude_dir if self._claude_dir is not None else Path("~/.claude").expanduser()
-            stage = self._get_worker_workflow_stage(session_name, _claude_dir=claude_dir, ssh_host=ssh_host)
-
-            cadence = CHECKIN_CADENCE.get(stage, DEFAULT_CADENCE) if stage else DEFAULT_CADENCE
-
-            # Active prompt episodes are observed every cycle so changed prompt
-            # content dispatches immediately and prompt disappearance resolves
-            # without waiting for ordinary check-in cadence.
-            store = self._prompt_store()
-            try:
-                active_prompt = (
-                    store.active_for_worker(worker_id) if store is not None else None
-                )
-            except sqlite3.Error:
-                logger.exception(
-                    "Prompt incident read failed for %s; holding proactive dispatch",
-                    worker_id,
-                )
-                continue
-            if active_prompt is not None:
+            current = None
+            lease = None
+            if isinstance(self.registry, WorkerRegistry):
+                current = self.registry.get_worker(worker_id)
+                if (not isinstance(current, dict) or any(
+                    current.get(field) != worker.get(field)
+                    for field in self.registry._SNAPSHOT_FIELDS
+                )):
+                    continue
+                self._warn_worker_operation_blocker(current)
+                self._maybe_start_handoff(current)
+                if self._handoff_suppresses(current):
+                    continue
                 try:
-                    active_tail = self.tmux.capture_pane(
-                        session_name, lines=PROMPT_CAPTURE_LINES, ssh_host=ssh_host
+                    lease = self.registry.acquire_worker_operation(current, operation="worker_mutation")
+                except RuntimeError:
+                    self._warn_worker_operation_blocker(current)
+                    continue
+            try:
+                if lease is not None:
+                    self.registry.mark_worker_operation_effects_started(lease, current)
+                worker_id = worker["id"]
+                session_name = worker["tmux_session"]
+                ssh_host, remote_log_dir = self._resolve_worker_ssh(worker)
+
+                # Marker-aware persistently-failing commit_worker surface. Runs
+                # every cycle for every running worker (BEFORE the .done-marker /
+                # idle-TTL / dead-session branches below) because a live worker
+                # whose finalize deterministically fails while it keeps retrying
+                # never reaches those seams — commit_worker logs finalize_failed
+                # events directly (see orchestrator_mcp.py), so this counts
+                # failures SINCE the last integrate/reopen marker and fires the
+                # existing one-shot operator surface for a still-running worker.
+                _events = self.registry.get_events_for_worker(worker_id)
+                if not isinstance(_events, list):
+                    _events = []
+                _since = count_failed_since_marker(_events)
+                _latest_marker = max_marker_id(_events)
+                # A new integrate/reopen marker re-arms drift/recovery/alert state
+                # so a post-marker re-fail is handled fresh rather than inheriting
+                # stale drift/alert state. Gated to fire at most once per new
+                # marker (via _finalize_marker_seen) so it does not re-arm every
+                # cycle while that marker remains the newest event, which would
+                # defeat the drift cap and re-post the conflict/repair/transient
+                # surfaces.
+                if _latest_marker > self._finalize_marker_seen.get(worker_id, 0):
+                    self._finalize_marker_seen[worker_id] = _latest_marker
+                    self._finalize_drift_retry.pop(worker_id, None)
+                    self._finalize_failure_count.pop(worker_id, None)
+                    self._finalize_recovery_alerted.discard(worker_id)
+                    self._finalize_failure_alerted.discard(worker_id)
+                    self._commit_failure_alerted.discard(worker_id)
+                if (
+                    _since >= FINALIZE_DRIFT_RETRY_CAP
+                    and worker_id not in self._commit_failure_alerted
+                ):
+                    self._commit_failure_alerted.add(worker_id)
+                    self.slack.post_message(
+                        f"Worker {worker_id} finalization (commit_worker) has failed "
+                        f"{_since} times since its last integrate/reopen; reviewed work "
+                        f"preserved, not integrated, not completed. Try "
+                        f'recover_worker_integration("{worker_id}", "reopen_for_edit") '
+                        "to hand it back for edits."
                     )
-                except Exception:
+                    self.brain.send_message(
+                        f"Worker {worker_id} finalization via commit_worker is failing "
+                        f"repeatedly ({_since} failures since the last marker). Stop "
+                        "calling commit_worker for this worker; pin a blocker and "
+                        'offer recover_worker_integration("' + worker_id + '", '
+                        '"reopen_for_edit") to hand the reviewed commit back for '
+                        "edits. Not completed, not abandoned."
+                    )
+
+                # Primary: check for .done marker from stop hook
+                if ssh_host:
+                    log_dir = remote_log_dir or self.tmux.log_dir
+                    marker_path = os.path.join(log_dir, f"{session_name}.done")
+                    marker_exists = self.tmux.file_exists(marker_path, ssh_host=ssh_host)
+                else:
+                    marker_path = os.path.join(self.tmux.log_dir, f"{session_name}.done")
+                    marker_exists = os.path.exists(marker_path)
+
+                # Idle-TTL gate: a worker armed idle (a prior .done sighting) that has
+                # written nothing to its pane log past the TTL is reaped. Fresh pane
+                # activity (mtime after arm + grace) disarms; a missing log fails safe.
+                ttl = self.config.get("idle_worker_ttl_seconds", 1800)
+                armed = self._worker_idle_since.get(worker_id)
+                if armed is not None and ttl and ttl > 0:
+                    mtime = self.tmux.get_log_mtime(session_name, ssh_host=ssh_host, remote_log_dir=remote_log_dir)
+                    if mtime is not None and mtime > armed + IDLE_ACTIVITY_GRACE_SECONDS:
+                        self._worker_idle_since.pop(worker_id, None)
+                    elif (mtime is not None and time.time() - armed >= ttl
+                          and not self._routine_prompt_active(worker_id)):
+                        if self._reap_idle_worker(worker_id, session_name, ssh_host, remote_log_dir, armed):
+                            continue
+
+                if marker_exists:
+                    self._worker_idle_since.setdefault(worker_id, time.time())
+                    self._resolve_worker_prompt(worker_id, now=time.time())
+                    log_worker_event("WORKER_IDLE", worker_id=worker_id)
+                    self.slack.post_message(format_worker_idle(worker_id))
+                    # Idle-but-alive worker: recycle its work in place when gates pass
+                    # AND there is genuinely new work. The nothing-new guard stops an
+                    # empty commit on repeated Brain-down cycles; runs regardless of
+                    # the Brain delivery below (work integrates even when Brain is down).
+                    outcome = self._finalize_and_release_worker(
+                        worker_id, reason="idle", terminal=False,
+                    )
+                    # Route the (previously discarded) idle outcome through the
+                    # unified recovery driver so a drift/conflict/repair finalization
+                    # is driven/surfaced, not dropped. A live idle worker is never
+                    # completed by the daemon.
+                    self._drive_finalization_recovery(worker_id, outcome)
+                    delivered = self.brain.send_message(
+                        f"Worker {worker_id} idle."
+                    )
+                    if delivered:
+                        if ssh_host:
+                            self.tmux.remove_file(marker_path, ssh_host=ssh_host)
+                        else:
+                            try:
+                                os.remove(marker_path)
+                            except FileNotFoundError:
+                                pass
+                        logger.info(f"Idle notification delivered for {worker_id}, marker removed")
+                    else:
+                        logger.warning(f"Brain unreachable, keeping marker for {worker_id} (will retry)")
+                    continue
+
+                # Fallback: session died (crash, OOM, etc.)
+                if not self.tmux.has_session(session_name, ssh_host=ssh_host):
+                    self._resolve_worker_prompt(worker_id, now=time.time())
+                    # Integrate (or rescue) the dead worker's reviewed work before the
+                    # completed-flip. A recoverable finalization failure re-queues.
+                    outcome = self._finalize_and_release_worker(
+                        worker_id, reason="session ended", terminal=True,
+                    )
+                    # The seam owns ALL completion; the daemon completes nothing.
+                    # Route the outcome through the unified recovery driver
+                    # (drift-retry / surface / transient) which never completes.
+                    disposition = self._drive_finalization_recovery(worker_id, outcome, terminal=True)
+                    # Log worker_finished ONLY when the worker is actually completed
+                    # (re-read the registry after the seam+driver ran). A worker left
+                    # running (transient/held/surfaced) logs no finish.
+                    _w = self.registry.get_worker(worker_id)
+                    _completed = isinstance(_w, dict) and _w.get("status") == "completed"
+                    if _completed:
+                        self.registry.log_event("worker_finished", worker_id=worker_id)
+                    # Surface the dead session exactly once per worker. A drift worker
+                    # re-enters this branch every cycle while it stays running; gating
+                    # on the notified set stops the Slack/Brain posts re-firing. The
+                    # surface must reflect actual completion: a worker the seam left
+                    # NOT completed (transient/drift/held; work preserved) must never
+                    # be reported as "Worker Completed".
+                    if worker_id not in self._session_died_notified:
+                        log_worker_event("WORKER_DEAD", worker_id=worker_id)
+                        if _completed:
+                            self.slack.post_message(format_worker_completed(worker_id, "Session ended"))
+                            self.brain.send_message(
+                                f"Worker {worker_id} session died (tmux gone)."
+                            )
+                        else:
+                            self.slack.post_message(
+                                format_worker_session_ended_preserved(worker_id, disposition)
+                            )
+                            self.brain.send_message(
+                                f"Worker {worker_id} session died (tmux gone); reviewed work "
+                                f"preserved, NOT completed; finalization disposition={disposition}. "
+                                f'Call recover_worker_integration("{worker_id}", "status") and '
+                                "handle the assignment with Commander-owned recovery/finalization "
+                                "tools. Do not spawn a cleanup worker. Do not request "
+                                "primary-checkout or terminal commands. Ask one natural-language "
+                                "disposition question only if no durable directive or operator "
+                                "instruction already decides integrate versus abandon."
+                            )
+                        self._session_died_notified.add(worker_id)
+                    continue
+
+                # Proactive check-in: notify brain when cadence elapses
+                claude_dir = self._claude_dir if self._claude_dir is not None else Path("~/.claude").expanduser()
+                stage = self._get_worker_workflow_stage(session_name, _claude_dir=claude_dir, ssh_host=ssh_host)
+
+                cadence = CHECKIN_CADENCE.get(stage, DEFAULT_CADENCE) if stage else DEFAULT_CADENCE
+
+                # Active prompt episodes are observed every cycle so changed prompt
+                # content dispatches immediately and prompt disappearance resolves
+                # without waiting for ordinary check-in cadence.
+                store = self._prompt_store()
+                try:
+                    active_prompt = (
+                        store.active_for_worker(worker_id) if store is not None else None
+                    )
+                except sqlite3.Error:
                     logger.exception(
-                        "Active prompt capture failed for %s; retaining episode",
+                        "Prompt incident read failed for %s; holding proactive dispatch",
                         worker_id,
                     )
                     continue
-                active_detection = self._detect_worker_prompt(active_tail)
-                if active_detection.signal is not None:
-                    self._handle_worker_prompt(
+                if active_prompt is not None:
+                    try:
+                        active_tail = self.tmux.capture_pane(
+                            session_name, lines=PROMPT_CAPTURE_LINES, ssh_host=ssh_host
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Active prompt capture failed for %s; retaining episode",
+                            worker_id,
+                        )
+                        continue
+                    active_detection = self._detect_worker_prompt(active_tail)
+                    if active_detection.signal is not None:
+                        self._handle_worker_prompt(
+                            worker,
+                            stage or "unknown",
+                            active_detection.signal,
+                            now=time.time(),
+                        )
+                        self._last_checkin_stage[worker_id] = stage
+                        self._last_checkin_hash[worker_id] = hash(active_tail)
+                        continue
+                    if active_detection.conclusive:
+                        self._resolve_worker_prompt(worker_id, now=time.time())
+                    else:
+                        # Infrastructure/semantic ambiguity cannot prove resolution.
+                        continue
+
+                # Check brain contact file (written by MCP server)
+                contact_path = os.path.join(self.tmux.log_dir, f"{session_name}.brain_contact")
+                last_contact = 0.0
+                if os.path.exists(contact_path):
+                    try:
+                        with open(contact_path) as f:
+                            last_contact = float(f.read().strip())
+                    except (ValueError, OSError):
+                        pass
+
+                # Dedup gate: suppress if brain hasn't acked and heartbeat window hasn't elapsed
+                heartbeat_interval = self.config.get("heartbeat_interval_seconds", 900)
+                last_sent = self._last_checkin_sent.get(worker_id, 0.0)
+                last_stage_sent = self._last_checkin_stage.get(worker_id)
+                stage_changed = (last_stage_sent is not None and stage != last_stage_sent)
+
+                # Track transitions independently of notification sends
+                last_seen = self._last_stage_seen.get(worker_id)
+                if stage != last_seen:
+                    self._stage_history.setdefault(worker_id, []).append((time.time(), stage))
+                    self._last_stage_seen[worker_id] = stage
+                    self._pm_gate_slack_sent.pop(worker_id, None)
+                    self._stage_entered_at[worker_id] = time.time()
+                if self._is_oscillating(worker_id):
+                    stage_changed = False
+                    cadence = OSCILLATION_CADENCE
+
+                if not stage_changed:
+                    if last_sent > 0:
+                        brain_acknowledged = last_contact > last_sent
+                        heartbeat_elapsed = (time.time() - last_sent) >= heartbeat_interval
+                        if not brain_acknowledged and not heartbeat_elapsed:
+                            continue
+                    # Cadence check (applies on first send and after ack)
+                    most_recent = max(last_contact, last_sent)
+                    if time.time() - most_recent < cadence:
+                        continue
+                # stage_changed=True → bypass both gates, fire immediately
+
+                # Cadence expired — send proactive notification
+                try:
+                    log_tail = self.tmux.capture_pane(
+                        session_name, lines=PROMPT_CAPTURE_LINES, ssh_host=ssh_host
+                    )
+                except Exception:
+                    log_tail = "(could not capture output)"
+
+                detection = self._detect_worker_prompt(log_tail)
+                prompt_waiting = detection.waiting
+
+                current_hash = hash(log_tail)
+                if not stage_changed and current_hash == self._last_checkin_hash.get(worker_id):
+                    if not prompt_waiting:
+                        continue
+
+                elapsed = self._worker_elapsed_minutes(worker)
+
+                prompt_evidence = (
+                    detection.signal.evidence if detection.signal is not None else log_tail
+                )
+                brain_message = format_worker_checkin(
+                    worker_id,
+                    elapsed,
+                    stage or "unknown",
+                    prompt_evidence,
+                    prompt_waiting,
+                )
+                handled_prompt = False
+                if detection.signal is not None:
+                    handled_prompt = self._handle_worker_prompt(
                         worker,
                         stage or "unknown",
-                        active_detection.signal,
+                        detection.signal,
                         now=time.time(),
                     )
-                    self._last_checkin_stage[worker_id] = stage
-                    self._last_checkin_hash[worker_id] = hash(active_tail)
-                    continue
-                if active_detection.conclusive:
-                    self._resolve_worker_prompt(worker_id, now=time.time())
-                else:
-                    # Infrastructure/semantic ambiguity cannot prove resolution.
-                    continue
+                if not handled_prompt:
+                    self.brain.send_message(brain_message)
+                self._last_checkin_sent[worker_id] = time.time()
+                self._last_checkin_stage[worker_id] = stage
+                self._last_checkin_hash[worker_id] = current_hash
 
-            # Check brain contact file (written by MCP server)
-            contact_path = os.path.join(self.tmux.log_dir, f"{session_name}.brain_contact")
-            last_contact = 0.0
-            if os.path.exists(contact_path):
-                try:
-                    with open(contact_path) as f:
-                        last_contact = float(f.read().strip())
-                except (ValueError, OSError):
-                    pass
+                # Routine prompt incidents never directly surface through the PM-gate
+                # Slack path. Brain-declared operator wait is the sole escalation.
 
-            # Dedup gate: suppress if brain hasn't acked and heartbeat window hasn't elapsed
-            heartbeat_interval = self.config.get("heartbeat_interval_seconds", 900)
-            last_sent = self._last_checkin_sent.get(worker_id, 0.0)
-            last_stage_sent = self._last_checkin_stage.get(worker_id)
-            stage_changed = (last_stage_sent is not None and stage != last_stage_sent)
-
-            # Track transitions independently of notification sends
-            last_seen = self._last_stage_seen.get(worker_id)
-            if stage != last_seen:
-                self._stage_history.setdefault(worker_id, []).append((time.time(), stage))
-                self._last_stage_seen[worker_id] = stage
-                self._pm_gate_slack_sent.pop(worker_id, None)
-                self._stage_entered_at[worker_id] = time.time()
-            if self._is_oscillating(worker_id):
-                stage_changed = False
-                cadence = OSCILLATION_CADENCE
-
-            if not stage_changed:
-                if last_sent > 0:
-                    brain_acknowledged = last_contact > last_sent
-                    heartbeat_elapsed = (time.time() - last_sent) >= heartbeat_interval
-                    if not brain_acknowledged and not heartbeat_elapsed:
-                        continue
-                # Cadence check (applies on first send and after ack)
-                most_recent = max(last_contact, last_sent)
-                if time.time() - most_recent < cadence:
-                    continue
-            # stage_changed=True → bypass both gates, fire immediately
-
-            # Cadence expired — send proactive notification
-            try:
-                log_tail = self.tmux.capture_pane(
-                    session_name, lines=PROMPT_CAPTURE_LINES, ssh_host=ssh_host
-                )
-            except Exception:
-                log_tail = "(could not capture output)"
-
-            detection = self._detect_worker_prompt(log_tail)
-            prompt_waiting = detection.waiting
-
-            current_hash = hash(log_tail)
-            if not stage_changed and current_hash == self._last_checkin_hash.get(worker_id):
-                if not prompt_waiting:
-                    continue
-
-            elapsed = self._worker_elapsed_minutes(worker)
-
-            prompt_evidence = (
-                detection.signal.evidence if detection.signal is not None else log_tail
-            )
-            brain_message = format_worker_checkin(
-                worker_id,
-                elapsed,
-                stage or "unknown",
-                prompt_evidence,
-                prompt_waiting,
-            )
-            handled_prompt = False
-            if detection.signal is not None:
-                handled_prompt = self._handle_worker_prompt(
-                    worker,
-                    stage or "unknown",
-                    detection.signal,
-                    now=time.time(),
-                )
-            if not handled_prompt:
-                self.brain.send_message(brain_message)
-            self._last_checkin_sent[worker_id] = time.time()
-            self._last_checkin_stage[worker_id] = stage
-            self._last_checkin_hash[worker_id] = current_hash
-
-            # Routine prompt incidents never directly surface through the PM-gate
-            # Slack path. Brain-declared operator wait is the sole escalation.
+            finally:
+                if lease is not None:
+                    self.registry.release_worker_operation(lease["worker_id"], lease["nonce"], current)
 
         # Prune idle-TTL arm times for workers no longer running (completed or
         # reaped) so a recycled worker id never inherits a stale idle clock.
@@ -4873,6 +5176,9 @@ class IroncladeDaemon:
         except sqlite3.OperationalError:
             return
         running_workers = self.registry.get_running_workers()
+        if isinstance(self.registry, WorkerRegistry):
+            running_workers += [json.loads(row["snapshot_json"])
+                                for row in self.registry.list_pending_worker_handoffs()]
         for directive_id, interpretation in rows:
             worker_found = any(_worker_matches_directive(w, directive_id) for w in running_workers)
             if worker_found:
@@ -4979,7 +5285,7 @@ class IroncladeDaemon:
                     f"#{r[0]} ({r[1]}): {r[2][:60]}" for r in unworked_directives
                 )
                 task_list = ", ".join(
-                    t.get("description", "unknown")[:40] for t in pending_tasks[:5]
+                    str(t.get("description") or "unknown")[:40] for t in pending_tasks[:5]
                 )
                 parts = [f"[WARNING] Idle for {int(idle_duration)}s with pending work."]
                 if directive_list:
@@ -5188,6 +5494,61 @@ class IroncladeDaemon:
         for block in self._load_directive_capability_blocks():
             self._process_directive_capability_block(block, observed_at)
 
+    @staticmethod
+    def _parse_iso_epoch(value) -> float | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+
+    def _blocked_ledger_tasks(self, now: float) -> list[dict]:
+        """Ledger tasks with status 'blocked' (R1), with age and escalation permalink."""
+        ledger = read_task_ledger(self._ledger_path)
+        if not ledger:
+            return []
+        blocked = []
+        for task in ledger.get("tasks") or []:
+            if not isinstance(task, dict) or task.get("status") != "blocked":
+                continue
+            since = self._parse_iso_epoch(task.get("status_set_at"))
+            escalation_ts = task.get("escalation_ts")
+            blocked.append({
+                "id": task.get("id"),
+                "description": task.get("description"),
+                "escalation_ts": escalation_ts,
+                "since_epoch": since,
+                "age_seconds": (now - since) if since is not None else None,
+                "permalink": self.slack.get_permalink(escalation_ts) if escalation_ts else None,
+            })
+        return blocked
+
+    def _maybe_remind_blocked(self, blocked_tasks: list[dict], now: float) -> None:
+        """Top-level reminder at most every blocked_reminder_interval_seconds for each
+        blocked task with a pinned escalation (R2). The timer advances on every post
+        attempt: SlackBot.post_message queues a failed post and flush_queue delivers
+        it later, so retrying would duplicate it. Entries for tasks no longer
+        blocked are pruned."""
+        from ironclaude.notifications import format_blocked_reminder
+        interval = float(self.config.get("blocked_reminder_interval_seconds", 14400))
+        escalated = [t for t in blocked_tasks if t.get("escalation_ts")]
+        live = {str(t.get("id")) for t in escalated}
+        for key in list(self._blocked_reminded):
+            if key not in live:
+                del self._blocked_reminded[key]
+        operator_name = self.config.get("operator_name", "Operator")
+        for task in escalated:
+            key = str(task.get("id"))
+            base = self._blocked_reminded.get(key, task.get("since_epoch"))
+            if base is None:
+                self._blocked_reminded[key] = now
+                continue
+            if now - base < interval:
+                continue
+            self.slack.post_message(format_blocked_reminder(task, operator_name))
+            self._blocked_reminded[key] = now
+
     def post_heartbeat(self, now: float | None = None):
         """Post heartbeat to Slack at configured interval."""
         heartbeat_interval = self.config.get("heartbeat_interval_seconds", 900)
@@ -5251,6 +5612,11 @@ class IroncladeDaemon:
         _hooks_cfg_path = os.environ.get("IC_OLLAMA_CONFIG_PATH") or os.path.expanduser(
             "~/.claude/ironclaude-hooks-config.json"
         )
+        try:
+            blocked_tasks = self._blocked_ledger_tasks(now)
+        except Exception as e:
+            logger.warning(f"Heartbeat blocked-task read failed: {e}")
+            blocked_tasks = []
         self._last_heartbeat_ts = self.slack.post_message(
             format_heartbeat(
                 worker_details,
@@ -5264,8 +5630,13 @@ class IroncladeDaemon:
                 degraded_backend_label=resolve_degraded_backend_label(_hooks_cfg_path),
                 orphaned_unmerged=self._orphaned_unmerged_count,
                 mem_line=_format_mem_line(),
+                blocked_tasks=blocked_tasks,
             )
         )
+        try:
+            self._maybe_remind_blocked(blocked_tasks, now)
+        except Exception as e:
+            logger.warning(f"Blocked-task reminder failed: {e}")
 
         # Grader enforcement: if no alive workers but directives exist, nudge the Brain.
         # R4: skip while the Brain is mid-turn on operator work (`is True`; inert for
@@ -5341,6 +5712,35 @@ class IroncladeDaemon:
             if wid not in running_heartbeat_ids:
                 self._heartbeat_stuck_notified.discard(wid)
 
+    def _sweep_dead_owner_leases(self) -> None:
+        """Startup sweep (H12): reap dead-owner worker_operations and workspace_mutations rows.
+
+        Best-effort: the installed workspace-manager dist may predate the
+        reap-stale-mutations command, and the daemon must still start.
+        """
+        if isinstance(self.registry, WorkerRegistry):
+            try:
+                reaped = self.registry.reap_dead_worker_operations()
+            except Exception as exc:  # noqa: BLE001 - startup sweep is best-effort
+                logger.warning("Dead-owner worker operation sweep failed: %s", exc)
+            else:
+                if reaped:
+                    logger.info("Reaped %d dead-owner worker operation lease(s) at startup", reaped)
+        tools = self._get_orchestrator()
+        workspace = getattr(tools, "_workspace_client", None) if tools is not None else None
+        if workspace is None:
+            return
+        for client in ("claude", "codex"):
+            try:
+                root = workspace.discover_installed_plugin_root(client)
+                result = workspace.reap_stale_mutations({}, plugin_root=root)
+            except Exception as exc:  # noqa: BLE001 - startup sweep is best-effort
+                logger.warning("Workspace mutation sweep via %s plugin failed: %s", client, exc)
+                continue
+            if result.get("reaped"):
+                logger.info("Reaped dead workspace mutation claims at startup: %s", result["reaped"])
+            return
+
     def run(self):
         """Main daemon loop.
 
@@ -5355,6 +5755,7 @@ class IroncladeDaemon:
         runs the slow lane immediately (parity with the pre-split loop)."""
         poll_interval = self.config.get("poll_interval_seconds", 15)
         fast_interval = self.config.get("fast_poll_interval_seconds", 3)
+        self._sweep_dead_owner_leases()
         last_slow = time.monotonic() - poll_interval
         while self._running:
             # Fast lane: operator-facing I/O only.
@@ -5380,48 +5781,55 @@ class IroncladeDaemon:
             time.sleep(fast_interval)
 
 
+# Brain hook scripts the settings sync once registered whose rules brain-gated-actions.sh now owns.
+_RETIRED_BRAIN_HOOK_SCRIPTS = frozenset({"memory-search-enforcer.sh", "startup-lookback-enforcer.sh"})
+_HOOK_SCRIPT_RE = re.compile(r"([A-Za-z0-9._-]+\.sh)\s*$")
+
+
+def _hook_script_name(command: str) -> str | None:
+    """The script basename a hook command runs (its trailing *.sh token), else None."""
+    m = _HOOK_SCRIPT_RE.search(command or "")
+    return m.group(1) if m else None
+
+
 def _sync_brain_settings_hooks(template_path: str, settings_path: str,
                                hooks_src_dir: str, hooks_dst_dir: str) -> None:
-    """SF2/R5a: register the repo-declared PreToolUse hooks into the Brain's live
-    settings.json and deploy their scripts. The Brain loads these via
-    setting_sources=[project,local]; the in-process can_use_tool callback is dead
-    under bypassPermissions, so shell-hook registration is the live enforcement
-    layer. The merge APPENDS each entry only if its command is absent (idempotent —
-    running twice yields exactly one), and NEVER rewrites the hooks object, so every
-    existing PreToolUse entry and the entire PostToolUse block (block-pin-enforcer
-    on update_ledger included) are preserved; settings.local.json is untouched.
-    Template-driven: a new hook (e.g. Task 9's Agent gate) is added by editing the
-    template only. hook-logger.sh, which the scripts source, is NOT template-listed
-    — it is deployed to hooks_dst_dir by `make deploy-hooks`."""
+    """Make the template the source of truth for the Claude Brain's IronClaude hooks.
+
+    Deploys every top-level commander/hooks/*.sh to hooks_dst_dir. In settings.json
+    PreToolUse/PostToolUse, removes each handler whose script is in the template or
+    retired (this also repoints legacy ~/.ironclaude/brain/hooks/ commands), drops
+    groups left empty, keeps foreign handlers in place, then appends the template's
+    groups. Idempotent: an unchanged result is not rewritten. A corrupt settings.json
+    is left for a human to repair. settings.local.json is untouched."""
     try:
         with open(template_path) as f:
             template = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError) as e:
         logger.error("brain_settings_hooks template unavailable (%s); skipping sync", e)
         return
-    entries = template.get("PreToolUse", [])
-    if not entries:
+    events = ("PreToolUse", "PostToolUse")
+    if not any(template.get(event) for event in events):
         return
 
-    # Deploy every hook script the template references (bash $HOME/.../<script>.sh).
     os.makedirs(hooks_dst_dir, exist_ok=True)
-    for entry in entries:
-        for hook in entry.get("hooks", []):
-            m = re.search(r"([A-Za-z0-9._-]+\.sh)\s*$", hook.get("command", ""))
-            if not m:
-                continue
-            script = m.group(1)
-            src = os.path.join(hooks_src_dir, script)
-            if os.path.isfile(src):
-                shutil.copy2(src, os.path.join(hooks_dst_dir, script))
-            else:
-                logger.warning("brain settings hook script missing at source: %s", src)
+    for name in sorted(os.listdir(hooks_src_dir)):
+        src = os.path.join(hooks_src_dir, name)
+        if name.endswith(".sh") and os.path.isfile(src):
+            shutil.copy2(src, os.path.join(hooks_dst_dir, name))
 
-    # Merge (append-if-absent) into settings.json PreToolUse — preserve everything else.
-    # A missing file is fine (fresh install → create it). A CORRUPT file must NOT be
-    # clobbered: overwriting it with only the template entries would silently drop the
-    # existing guardrail hooks (memory-search, block-push, the PostToolUse block-pin) —
-    # so log and skip, leaving the file for a human to repair.
+    owned = set(_RETIRED_BRAIN_HOOK_SCRIPTS)
+    for event in events:
+        for entry in template.get(event, []):
+            for hook in entry.get("hooks", []):
+                script = _hook_script_name(hook.get("command", ""))
+                if script is None:
+                    continue
+                owned.add(script)
+                if not (os.path.isfile(os.path.join(hooks_src_dir, script))
+                        or os.path.isfile(os.path.join(hooks_dst_dir, script))):
+                    logger.warning("brain settings hook script missing at source: %s", script)
+
     try:
         with open(settings_path) as f:
             settings = json.load(f)
@@ -5434,21 +5842,142 @@ def _sync_brain_settings_hooks(template_path: str, settings_path: str,
         )
         return
     hooks = settings.setdefault("hooks", {})
-    pre = hooks.setdefault("PreToolUse", [])
-    existing_cmds = {h.get("command") for e in pre for h in e.get("hooks", [])}
-    added = False
-    for entry in entries:
-        entry_cmds = [h.get("command") for h in entry.get("hooks", [])]
-        if entry_cmds and all(c in existing_cmds for c in entry_cmds):
-            continue  # already registered — idempotent
-        pre.append(entry)
-        existing_cmds.update(entry_cmds)
-        added = True
-    if added:
+    changed = False
+    for event in events:
+        current = hooks.get(event, [])
+        kept = []
+        for entry in current:
+            handlers = [
+                h for h in entry.get("hooks", [])
+                if _hook_script_name(h.get("command", "")) not in owned
+            ]
+            if handlers:
+                kept.append({**entry, "hooks": handlers})
+        merged = kept + copy.deepcopy(template.get(event, []))
+        if merged != current:
+            hooks[event] = merged
+            changed = True
+    if changed:
         os.makedirs(os.path.dirname(settings_path), exist_ok=True)
         with open(settings_path, "w") as f:
             json.dump(settings, f, indent=2)
         logger.info("Synced brain settings hooks into %s", settings_path)
+
+
+_CODEX_BRAIN_DISPATCHER = "codex-brain-hooks.sh"
+
+
+def _brain_hook_provenance_errors(settings_paths: list[str], plugin_hooks_path: str,
+                                  repo_hook_dirs: list[str]) -> list[str]:
+    """R9: every Brain hook must run a script shipped from the repo.
+
+    Checks every command in the Claude Brain's settings files (a missing file is fine)
+    and every Codex Brain dispatch in the plugin hooks.json against the *.sh files in
+    repo_hook_dirs. Returns one human-readable error per violation."""
+    shipped = {
+        name for d in repo_hook_dirs if os.path.isdir(d)
+        for name in os.listdir(d) if name.endswith(".sh")
+    }
+    errors: list[str] = []
+
+    def check(source: str, event: str, command: str) -> None:
+        script = _hook_script_name(command)
+        if script is None or script not in shipped:
+            errors.append(f"{source} {event}: {command!r} does not run a script shipped from the repo")
+
+    for path in settings_paths:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            continue
+        except json.JSONDecodeError as e:
+            errors.append(f"{path}: unreadable ({e})")
+            continue
+        for event, entries in (data.get("hooks") or {}).items():
+            for entry in entries:
+                for hook in entry.get("hooks", []):
+                    check(path, event, hook.get("command", ""))
+
+    try:
+        with open(plugin_hooks_path) as f:
+            plugin = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        errors.append(f"{plugin_hooks_path}: unreadable ({e})")
+        return errors
+    for event, entries in (plugin.get("hooks") or {}).items():
+        for entry in entries:
+            for hook in entry.get("hooks", []):
+                command = hook.get("command", "")
+                if f"/{_CODEX_BRAIN_DISPATCHER} " in command:
+                    check(plugin_hooks_path, event, command)
+    return errors
+
+
+def _retire_codex_brain_project_hooks(brain_cwd: str) -> None:
+    """R10: the Codex Brain's project .codex/hooks.json was never trusted and never ran;
+    its hooks now come from the IronClaude plugin. Rename it so a later 'Trust all' in
+    the Brain directory cannot make every Brain hook run twice."""
+    path = os.path.join(brain_cwd, ".codex", "hooks.json")
+    if os.path.isfile(path):
+        os.replace(path, path + ".retired")
+        logger.info("Retired untrusted Codex Brain project hooks: %s", path)
+
+
+_HOOK_TRUST_WARMUP_SESSION = "ic-codex-hook-trust"
+
+
+def _answer_codex_hooks_review(tools, tmux, session: str, settle_seconds: float = 20.0,
+                               clear_seconds: float = 10.0, sleep=time.sleep,
+                               clock=time.monotonic) -> bool:
+    """R7a/R7b: Codex can draw its "Hooks need review" prompt after the start-up banner, and
+    the raw pane log renders it with cursor moves, so read the rendered screen. Press "2"
+    (select "Trust all and continue") and Enter (confirm) once, then wait up to
+    clear_seconds for the prompt to clear. Returns True only when the prompt was answered
+    and left the screen; False when none appeared in settle_seconds or it never cleared."""
+    def prompt_on_screen() -> bool:
+        compact = re.sub(r"\s+", "", tools._codex_screen(session, None).lower())
+        return "hooksneedreview" in compact and "trustallandcontinue" in compact
+
+    deadline = clock() + settle_seconds
+    while clock() < deadline:
+        if prompt_on_screen():
+            tmux.send_raw_keys(session, ["2", "Enter"])
+            clear_deadline = clock() + clear_seconds
+            while clock() < clear_deadline and prompt_on_screen():
+                sleep(0.5)
+            if prompt_on_screen():
+                logger.warning("Codex hooks-review prompt still on screen after answering")
+                return False
+            return True
+        sleep(1.0)
+    return False
+
+
+def _warm_up_codex_hook_trust(tools, tmux, codex_path: str, workdir: str, timeout: int = 90,
+                              settle_seconds: float = 20.0, clear_seconds: float = 10.0) -> None:
+    """R7: Codex runs a plugin hook only once it is trusted, and the Brain's app-server
+    cannot show the trust prompt. Open a throwaway Codex TUI in a dedicated directory
+    (never the Brain's cwd) so _wait_for_ready answers "Trust all and continue" as it
+    does for workers, then kill it by exact session name. Success is proven by the
+    Brain's canary (codex_brain_client._await_hooks_canary), not by readiness here."""
+    if tmux.has_session(_HOOK_TRUST_WARMUP_SESSION):
+        tmux.kill_session(_HOOK_TRUST_WARMUP_SESSION)
+    command = f"exec {shlex.quote(codex_path)} --no-daemon"
+    if not tmux.spawn_session(_HOOK_TRUST_WARMUP_SESSION, command, cwd=workdir):
+        logger.error("Codex hook-trust warm-up could not start")
+        return
+    try:
+        ready = tools._wait_for_ready(_HOOK_TRUST_WARMUP_SESSION, timeout=timeout, client="codex")
+        answered = _answer_codex_hooks_review(
+            tools, tmux, _HOOK_TRUST_WARMUP_SESSION, settle_seconds=settle_seconds,
+            clear_seconds=clear_seconds)
+        logger.info("Codex hook-trust warm-up finished ready=%s trust_prompt_answered=%s",
+                    ready, answered)
+    except Exception as exc:  # noqa: BLE001 — the canary decides; never block start-up here
+        logger.error("Codex hook-trust warm-up failed: %s", exc)
+    finally:
+        tmux.kill_session(_HOOK_TRUST_WARMUP_SESSION)
 
 
 def main():
@@ -5539,10 +6068,12 @@ def main():
                 logger.error(f"Rules file not found at {src_path}")
                 sys.exit(1)
 
-    # SF2/R5a: register the repo-declared Brain PreToolUse hooks (48h-lookback
-    # enforcer, and the Task-9 Agent fan-out gate) into the Brain's live
-    # settings.json and deploy their scripts. can_use_tool is dead under
-    # bypassPermissions, so this shell-hook layer is the real enforcement.
+    # Deploy worker hooks so a daemon restart always implies current hooks
+    # (mirrors `make deploy-hooks`; see _deploy_worker_hooks docstring).
+    _deploy_worker_hooks(repo_root)
+
+    # Claude Brain hook registration: brain_settings_hooks.json is the source of truth
+    # for the Brain's IronClaude hooks in settings.json (see _sync_brain_settings_hooks).
     _sync_brain_settings_hooks(
         template_path=os.path.join(repo_root, "src", "brain", "brain_settings_hooks.json"),
         settings_path=os.path.join(brain_cwd, ".claude", "settings.json"),
@@ -5565,10 +6096,6 @@ def main():
         logger.error(f"Grader CLAUDE.md not found at {grader_claude_md_src}")
         sys.exit(1)
 
-    # Deploy worker hooks so a daemon restart always implies current hooks
-    # (mirrors `make deploy-hooks`; see _deploy_worker_hooks docstring).
-    _deploy_worker_hooks(repo_root)
-
     ensure_brain_trusted(grader_home)
 
     slack_token = config.get("slack_bot_token", "")
@@ -5580,6 +6107,19 @@ def main():
     user_token = config.get("slack_user_token", "")
     operator_user_id = config.get("slack_operator_user_id", "")
     slack = SlackBot(token=slack_token, channel_id=channel_id, user_token=user_token, operator_user_id=operator_user_id)
+    _retire_codex_brain_project_hooks(brain_cwd)
+    provenance_errors = _brain_hook_provenance_errors(
+        [os.path.join(brain_cwd, ".claude", "settings.json"),
+         os.path.join(brain_cwd, ".claude", "settings.local.json")],
+        os.path.join(os.path.dirname(repo_root), "worker", "hooks", "hooks.json"),
+        [os.path.join(repo_root, "hooks"), os.path.join(os.path.dirname(repo_root), "worker", "hooks")],
+    )
+    if provenance_errors:
+        message = ("Commander not started: Brain hooks must run scripts shipped from the repo.\n"
+                   + "\n".join(provenance_errors))
+        logger.error(message)
+        slack.post_message(message)
+        sys.exit(1)
 
     # Plugin system
     plugin_registry = PluginRegistry()
@@ -5627,6 +6167,16 @@ def main():
     # IRONCLAUDE_LLM_PATH: commander_brain
     try:
         system_prompt = _render_brain_system_prompt(prompt_path, config)
+        if getattr(brain, "client_name", None) == "codex":
+            from ironclaude.orchestrator_mcp import OrchestratorTools
+            warmup_dir = os.path.expanduser("~/.ironclaude/codex-hook-trust")
+            os.makedirs(warmup_dir, exist_ok=True)
+            codex_path = (config.get("providers", {}).get("clients", {})
+                          .get("codex", {}).get("path", "codex"))
+            _warm_up_codex_hook_trust(
+                OrchestratorTools(registry, tmux, db_conn=conn, config=config, ssh_manager=ssh_manager),
+                tmux, codex_path, warmup_dir,
+            )
         ensure_brain_trusted(brain_cwd)
         brain.start(system_prompt, cwd=brain_cwd)
         _log_brain_start_result(brain)

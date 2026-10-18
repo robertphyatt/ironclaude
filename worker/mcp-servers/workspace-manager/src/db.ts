@@ -292,6 +292,41 @@ export function migrateSchema(db: Database.Database): void {
       `);
     })();
   }
+
+  if (!db.prepare('SELECT 1 FROM schema_migrations WHERE version = 7').get()) {
+    db.transaction(() => {
+      db.exec(`
+        -- A Commander-only grant is inserted as phase=granted.  No plaintext
+        -- capability is stored here; handoff.ts compares its SHA-256 hash.
+        CREATE TABLE IF NOT EXISTS workspace_handoffs (
+          workspace_guid TEXT PRIMARY KEY REFERENCES assignments(workspace_guid),
+          generation INTEGER NOT NULL,
+          capability_token_hash TEXT NOT NULL,
+          grant_expires_at TEXT,
+          source_owner_session_id TEXT NOT NULL,
+          target_owner_session_id TEXT,
+          repository_identity TEXT NOT NULL,
+          worker_id TEXT NOT NULL,
+          worktree_path TEXT NOT NULL,
+          branch TEXT NOT NULL,
+          base_commit TEXT NOT NULL,
+          current_head TEXT NOT NULL,
+          integration_target TEXT NOT NULL,
+          phase TEXT NOT NULL CHECK (phase IN ('granted', 'begun', 'transferred', 'finished')),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS workspace_mutations (
+          workspace_guid TEXT PRIMARY KEY REFERENCES assignments(workspace_guid) ON DELETE CASCADE,
+          operation TEXT NOT NULL,
+          nonce TEXT NOT NULL,
+          process_identity TEXT NOT NULL,
+          acquired_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (7);
+      `);
+    })();
+  }
 }
 
 export interface PreservedWorkRow {

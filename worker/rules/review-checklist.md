@@ -4,6 +4,19 @@ Specific check procedures for the code-review skill. Each check includes what to
 
 ---
 
+## Review scope bound
+
+Every check under CRITICAL CHECKS blocks when its condition holds in the diff, whether
+or not the plan mentioned it: a diff-introduced injection, race, trust-boundary gap,
+pinned mutable count, or light-loop breach is `blocks requirement` by definition. The
+requirement bound narrows only the three fidelity checks — Falsifiability, Provenance,
+Widened-guard scope — which block only for the requirement's own checks and admitted set.
+Findings outside both sets are `hardening`: report them under "Hardening (backlog)";
+they do not fail the task. Never demand evidence artifacts (receipts, extra suites,
+independent rebuilds, new tooling) that the plan did not declare.
+
+---
+
 ## CRITICAL CHECKS (block on failure)
 
 ### SQL & Data Safety
@@ -57,6 +70,18 @@ DO NOT flag: claims the diff itself demonstrates (a test asserting the value), a
 - [ ] **Widening tested only with positive cases** — Passing examples prove nothing about what the guard still refuses. Require negative cases bounding the newly-admitted set.
 
 DO NOT flag: widenings whose negative cases exist elsewhere in the same suite (say where), pure refactors that preserve the admitted set.
+
+### Pinned mutable count
+
+- [ ] **Acceptance guard pins a count the work is expected to change** — A hardcoded total (tracks, files, rows, windows) in a runner or acceptance gate, where adding the operator's next input changes that total. Each new input then forces a "rebind" loop. Derive the count from the input, or assert a property instead. This is a blocker (D6).
+
+DO NOT flag: counts fixed by specification (a protocol field width, a schema version), counts asserted by a test about a fixed fixture.
+
+### Light-loop bound
+
+- [ ] **Light task outgrew its label** — The plan says `Loop: light`, but the diff touches DB writes/schema, auth/permission/guard code, concurrency, git/worktree operations, or a public API/MCP schema, or it exceeds ~3 files / ~150 lines. This is a blocker: the work must retreat and run as a full loop.
+
+DO NOT flag: full-loop plans, light tasks within the bound.
 
 ---
 

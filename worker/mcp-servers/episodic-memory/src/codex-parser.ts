@@ -1,4 +1,4 @@
-import fs from 'fs';
+import { openArchiveStream } from './archive-io.js';
 import readline from 'readline';
 import crypto from 'crypto';
 import { ConversationExchange, ToolCall } from './types.js';
@@ -24,13 +24,16 @@ export async function parseCodexConversation(
   filePath: string, projectName: string, archivePath: string
 ): Promise<ConversationExchange[]> {
   const exchanges: ConversationExchange[] = [];
-  const rl = readline.createInterface({
-    input: fs.createReadStream(filePath), crlfDelay: Infinity,
-  });
+  const archiveStream = openArchiveStream(filePath);
+  const rl = readline.createInterface({ input: archiveStream, crlfDelay: Infinity });
+  // A damaged .zst (or any read error) must reject, never hang or return a partial parse (R2).
+  const failure: { error?: Error } = {};
+  archiveStream.once('error', (error: Error) => { failure.error = error; rl.close(); });
 
   let sessionId: string | undefined;
   let cwd: string | undefined;
   let cliVersion: string | undefined;
+  let originator: string | undefined;
   let lineNumber = 0;
   let current: {
     userMessage: string; userLine: number; assistantMessages: string[];
@@ -64,6 +67,7 @@ export async function parseCodexConversation(
       sessionId = p.session_id ?? sessionId;
       cwd = p.cwd ?? cwd;
       cliVersion = p.cli_version ?? cliVersion;
+      originator = p.originator ?? originator;
       continue;
     }
     if (rec.type !== 'response_item' || !p) continue;
@@ -91,6 +95,11 @@ export async function parseCodexConversation(
     // Ignored: event_msg/*, reasoning (encrypted), world_state, turn_context,
     // function_call_output, custom_tool_call* (v1 scope).
   }
+  if (failure.error) throw failure.error;
   finalize();
+  // Codex provenance: session_meta.payload.originator ("Codex Desktop" is interactive).
+  if (originator) {
+    for (const exchange of exchanges) exchange.entrypoint = originator;
+  }
   return exchanges;
 }

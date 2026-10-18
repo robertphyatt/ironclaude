@@ -1,0 +1,58 @@
+{
+  "name": "Handoff Final-Review Fixes (L-H1b)",
+  "goal": "Make approved H6a/H7 recovery reachable: once a target may occupy the worktree, prove a gone bootstrap by PID plus start time instead of worktree quiescence (R1); record an already-gone bootstrap instead of re-stopping it (R2); preserve instead of replaying a continuation to a dead target session (R3); test with the real NativeProcessAdapter (R4).",
+  "requirements_file": "docs/plans/2026-10-09-handoff-final-review-fixes-design.md",
+  "design_file": "docs/plans/2026-10-09-handoff-final-review-fixes-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Prove a gone bootstrap by PID plus start time once a target may occupy the worktree, and record an already-gone bootstrap (R1, R2, R4 a-d)",
+      "description": "worker_handoff.py: _bootstrap_proven_gone(evidence, phase=None) gains a target-may-occupy branch (phase in POST_TRANSFER_PHASES, or evidence bootstrap_stopped / resume_intent / target_session) where a recorded bootstrap_process is proved with proved_absent and a launch-intent-only bootstrap by its tmux session being absent; otherwise behavior is unchanged. All four callers pass phase. _stop_bootstrap records bootstrap_process, bootstrap_stop_intent False, bootstrap_stopped True and a proved_absent bootstrap_stop_proof without calling stop_and_prove when the bootstrap is already proved gone. Tests use the real NativeProcessAdapter with fake psutil/tmux. Code: human plan Task 1.",
+      "allowed_files": [
+        "commander/src/ironclaude/worker_handoff.py",
+        "commander/tests/test_worker_handoff.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: helper and five tests (human plan Task 1 Step 1 verbatim)"},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff.py -k \"beside_live_target or does_not_rerecord or live_bootstrap_still_refuses or still_requires_worktree_quiescence\"", "expected": "FAIL: test_post_transfer_preserve_proves_gone_bootstrap_beside_live_target, test_post_transfer_preserve_does_not_rerecord_already_stopped_bootstrap and test_post_transfer_abort_proves_gone_bootstrap_beside_live_target (held: verify_stopped's worktree quiescence fails on the live target process); test_post_transfer_live_bootstrap_still_refuses[*] and test_pre_transfer_gone_bootstrap_still_requires_worktree_quiescence[*] pass as guards; record actual counts"},
+        {"description": "GREEN: worker_handoff.py edits 1-4 (human plan Task 1 Step 3 verbatim; edit 4 is replace_all with expected count 2)"},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff.py tests/test_worker_handoff_process.py tests/test_worker_handoff_registry.py tests/test_worker_handoff_daemon.py", "expected": "all pass; record actual counts"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/worker_handoff.py commander/tests/test_worker_handoff.py", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Preserve instead of replaying a continuation to a dead target session (R3, R4 e-g)",
+      "description": "Tests use the real NativeProcessAdapter with production-shaped evidence (gone, proved-stopped bootstrap; live target process in the worktree). worker_handoff.py retry_paused_preflight: at runtime_registered with pause reason continuation_dispatch_unproved, tmux.has_session(evidence['target_session']) False routes to _preserve_after_stop (adopted target runtime, finish_handoff_after_target, released_to_target with preserve); a tmux error keeps the hold; True keeps the existing replay. Code: human plan Task 2.",
+      "allowed_files": [
+        "commander/src/ironclaude/worker_handoff.py",
+        "commander/tests/test_worker_handoff.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "RED: helper and three tests (human plan Task 2 Step 1 verbatim)"},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff.py -k \"target_session_preserves or keeps_dispatch_replay or session_check_error\"", "expected": "FAIL: test_dead_target_session_preserves_instead_of_replaying_dispatch (_dispatch is called, so the status is not released) and test_target_session_check_error_keeps_the_hold (_dispatch is called, so the status is not held); test_live_target_session_keeps_dispatch_replay passes as guard; record actual counts"},
+        {"description": "GREEN: retry_paused_preflight edit (human plan Task 2 Step 3 verbatim)"},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff.py tests/test_worker_handoff_daemon.py", "expected": "all pass, including the existing test_undelivered_continuation_dispatch_is_retried_forward, whose MagicMock tmux reports a present session; record actual counts"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/worker_handoff.py commander/tests/test_worker_handoff.py", "expected": "exit 0"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Verification (affected suites, full Commander pytest, verification record)",
+      "description": "Run the affected handoff suites and the full Commander pytest, write and force-stage docs/reviews/2026-10-09-handoff-final-review-fixes-verification.md. No new tests: runs existing checks. The final Fable review of the whole staged handoff follows and gates the commit.",
+      "allowed_files": [
+        "docs/reviews/2026-10-09-handoff-final-review-fixes-verification.md"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {"description": "Log directory", "command": "mkdir -p /private/tmp/ironclaude-l-h1b-verify", "expected": "exit 0"},
+        {"description": "Affected suites", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff.py tests/test_worker_handoff_process.py tests/test_worker_handoff_registry.py tests/test_worker_handoff_daemon.py tests/test_orchestrator_mcp.py > /private/tmp/ironclaude-l-h1b-verify/pytest-affected.log 2>&1; echo \"exit=$?\"", "expected": "exit=0; record the summary line"},
+        {"description": "Full Commander pytest (Bash timeout 600000)", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q > /private/tmp/ironclaude-l-h1b-verify/pytest-full.log 2>&1; echo \"exit=$?\"", "expected": "the only failure, if any, is the known pre-existing tests/test_executing_plans_skill.py::test_execution_complete_restage_command_stages_from_non_root_cwd (tracked as L-T2; see docs/reviews/2026-10-09-handoff-recovery-fixes-verification.md); record the actual summary line; any other failure is resolved before the final review"},
+        {"description": "Write /Users/roberthyatt/Code/ironclaude/docs/reviews/2026-10-09-handoff-final-review-fixes-verification.md with the content listed in human plan Task 3 Step 4"},
+        {"description": "Stage the record", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-09-handoff-final-review-fixes-verification.md", "expected": "exit 0"}
+      ]
+    }
+  ]
+}

@@ -40,6 +40,12 @@ _REAL_SET_PM = OrchestratorTools._set_pm_via_sqlite
 _REAL_READ_PM_STATE = OrchestratorTools._read_pm_state_via_sqlite
 _VALID_NATIVE_UUID = "11111111-1111-4111-8111-111111111111"
 
+_REMOTE_CODEX_CACHE_ARGV = ("sh", "-c", 'cat "${CODEX_HOME:-$HOME/.codex}/models_cache.json"')
+
+
+def _cache(*slugs):
+    return json.dumps({"models": [{"slug": slug} for slug in slugs]})
+
 
 def _mock_grader_approve(tools):
     """Mock _call_grader and _call_local_grader to always approve for unit testing."""
@@ -540,6 +546,9 @@ class TestSingleWorkerManagedWorktree:
         mock_tmux.spawn_session.side_effect = lambda *args, **kwargs: (
             order.append("spawn") or True
         )
+        tools._activate_pm_via_sqlite.side_effect = lambda *args, **kwargs: (
+            order.append("activate")
+        )
         tools._read_pm_state_via_sqlite.side_effect = lambda *args, **kwargs: (
             order.append("identity") or {
                 "professional_mode": "on", "workflow_stage": "executing",
@@ -561,8 +570,10 @@ class TestSingleWorkerManagedWorktree:
         )
 
         assert isinstance(result, str)
+        # Codex: the profile turn (first dispatch) precedes PM activation.
         assert order == [
-            "allocate", "spawn", "identity", "bind", "dispatch", "dispatch",
+            "allocate", "spawn", "dispatch", "activate", "identity", "bind",
+            "dispatch",
         ]
         assignment = workspace.allocate.return_value
         spawned = mock_tmux.spawn_session.call_args
@@ -576,20 +587,61 @@ class TestSingleWorkerManagedWorktree:
         assert worker["workspace_path"] == spawned.kwargs["cwd"]
         workspace.discover_installed_plugin_root.assert_called_once_with("codex", ssh_host=None)
 
-    @pytest.mark.parametrize("phase", ["launch", "readiness", "activation", "bind", "dispatch"])
+    def test_claude_spawn_order_is_unchanged(
+        self, tools, registry, mock_tmux, default_workspace_client,
+    ):
+        workspace = default_workspace_client
+        self._prepare(tools, workspace, mock_tmux)
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle(
+            client="claude", model="sonnet",
+        ))
+        order = []
+        mock_tmux.spawn_session.side_effect = lambda *args, **kwargs: (
+            order.append("spawn") or True
+        )
+        tools._activate_pm_via_sqlite.side_effect = lambda *args, **kwargs: (
+            order.append("activate")
+        )
+        tools._read_pm_state_via_sqlite.side_effect = lambda *args, **kwargs: (
+            order.append("identity") or {
+                "professional_mode": "on", "workflow_stage": "executing",
+                "session_uuid": _VALID_NATIVE_UUID,
+            }
+        )
+        workspace.bind.side_effect = lambda payload, **transport: (
+            order.append("bind") or {
+                **self._assignment(payload),
+                "owner_session_id": payload["owner_session_id"],
+            }
+        )
+        mock_tmux.send_keys.side_effect = lambda *args, **kwargs: (
+            order.append(args[1]) or True
+        )
+
+        result = tools.spawn_worker(
+            worker_id="w-claude-order", worker_type="claude-sonnet",
+            repo="/tmp/repo", objective="Task",
+        )
+
+        assert isinstance(result, str)
+        assert order == [
+            "spawn", "activate", "identity", "bind",
+            "/write-lossless-ai-messages", "Task",
+        ]
+        tools._activate_pm_via_sqlite.assert_called_once_with(
+            "ic-w-claude-order", timeout=300, max_retries=3, client="claude",
+        )
+        tools._read_pm_state_via_sqlite.assert_called_once_with(
+            "ic-w-claude-order", client="claude",
+        )
+
+    @pytest.mark.parametrize("phase", ["bind", "dispatch"])
     def test_post_reservation_failures_preserve_assignment_with_one_recovery_payload(
         self, tools, registry, mock_tmux, default_workspace_client, phase,
     ):
         workspace = default_workspace_client
         self._prepare(tools, workspace, mock_tmux)
-        if phase == "launch":
-            mock_tmux.spawn_session.return_value = False
-        elif phase == "readiness":
-            tools._wait_for_ready.return_value = False
-            mock_tmux.has_session.return_value = False
-        elif phase == "activation":
-            tools._activate_pm_via_sqlite.return_value = "activation failed"
-        elif phase == "bind":
+        if phase == "bind":
             workspace.bind.side_effect = RuntimeError("bind failed")
         else:
             # Profile delivery succeeds; only objective delivery fails after
@@ -613,9 +665,151 @@ class TestSingleWorkerManagedWorktree:
         assert len(result["recovery"]) == 1
         assert set(result["recovery"]) <= {"retry_bind", "reconcile", "abandon"}
         workspace.abandon.assert_not_called()
+        workspace.reap.assert_not_called()
         if phase == "dispatch":
             worker = registry.get_worker("w-dispatch")
             assert worker["workspace_guid"] == result["workspace"]["workspace_guid"]
+
+    @pytest.mark.parametrize(
+        ("phase", "failure_phase"),
+        [
+            ("launch", "launch"),
+            ("readiness", "readiness"),
+            ("activation", "activation"),
+            ("identity", "activation"),
+            ("profile", "dispatch"),
+        ],
+    )
+    def test_pre_registration_failures_release_unbound_reservation(
+        self, tools, registry, mock_tmux, default_workspace_client,
+        phase, failure_phase,
+    ):
+        workspace = default_workspace_client
+        self._prepare(tools, workspace, mock_tmux)
+        if phase == "launch":
+            mock_tmux.spawn_session.return_value = False
+        elif phase == "readiness":
+            tools._wait_for_ready.return_value = False
+            mock_tmux.has_session.return_value = False
+        elif phase == "activation":
+            tools._activate_pm_via_sqlite.return_value = "activation failed"
+        elif phase == "identity":
+            tools._read_pm_state_via_sqlite.return_value = {
+                "professional_mode": "off", "workflow_stage": "idle",
+                "session_uuid": _VALID_NATIVE_UUID,
+            }
+        else:
+            tools._dispatch_worker_communication_profile = MagicMock(
+                return_value="profile failed",
+            )
+
+        result = tools.spawn_worker(
+            worker_id=f"w-release-{phase}", worker_type="claude-sonnet",
+            repo="/tmp/repo", objective="Task",
+        )
+
+        assert result["failure_phase"] == failure_phase
+        assert result["assignment_preserved"] is False
+        assert result["assignment_released"] is True
+        assert "recovery" not in result
+        assert "release_error" not in result
+        workspace.reap.assert_called_once_with(
+            {
+                "repository_path": "/tmp/repo",
+                "workspace_guid": result["workspace"]["workspace_guid"],
+            },
+            plugin_root="/installed/codex",
+        )
+        workspace.abandon.assert_not_called()
+        assert registry.get_worker(f"w-release-{phase}") is None
+
+    def test_claude_profile_failure_abandons_bound_reservation_by_owner(
+        self, tools, registry, mock_tmux, default_workspace_client,
+    ):
+        workspace = default_workspace_client
+        self._prepare(tools, workspace, mock_tmux)
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle(
+            client="claude", model="sonnet",
+        ))
+        tools._dispatch_worker_communication_profile = MagicMock(
+            return_value="profile failed",
+        )
+
+        result = tools.spawn_worker(
+            worker_id="w-claude-profile", worker_type="claude-sonnet",
+            repo="/tmp/repo", objective="Task",
+        )
+
+        assert result["failure_phase"] == "dispatch"
+        assert result["assignment_preserved"] is False
+        assert result["assignment_released"] is True
+        workspace.abandon.assert_called_once_with(
+            {
+                "repository_path": "/tmp/repo",
+                "workspace_guid": result["workspace"]["workspace_guid"],
+                "owner_session_id": _VALID_NATIVE_UUID,
+                "mode": "rescue",
+            },
+            plugin_root="/installed/claude",
+        )
+        workspace.reap.assert_not_called()
+
+    def test_release_error_is_logged_and_original_failure_returned(
+        self, tools, mock_tmux, default_workspace_client, caplog,
+    ):
+        workspace = default_workspace_client
+        self._prepare(tools, workspace, mock_tmux)
+        tools._activate_pm_via_sqlite.return_value = "activation failed"
+        workspace.reap.side_effect = RuntimeError("reap failed")
+
+        result = tools.spawn_worker(
+            worker_id="w-release-error", worker_type="claude-sonnet",
+            repo="/tmp/repo", objective="Task",
+        )
+
+        assert result["failure_phase"] == "activation"
+        assert "activation failed" in result["error"]
+        assert result["assignment_preserved"] is True
+        assert result["release_error"] == "reap failed"
+        assert set(result["recovery"]) == {"reconcile"}
+        assert "reap failed" in caplog.text
+
+    def test_same_worker_id_retry_succeeds_after_released_failure(
+        self, tools, registry, mock_tmux, default_workspace_client,
+    ):
+        workspace = default_workspace_client
+        self._prepare(tools, workspace, mock_tmux)
+        live = {}
+
+        def allocate(payload, **transport):
+            # Mirrors reserveWorkerWorktree: one non-terminal row per worker_id.
+            if payload["worker_id"] in live.values():
+                raise RuntimeError(
+                    "Worker is already reserved to a different managed workspace",
+                )
+            live[payload["workspace_guid"]] = payload["worker_id"]
+            return self._assignment(payload)
+
+        def reap(payload, **transport):
+            live.pop(payload["workspace_guid"])
+            return {"lifecycle_status": "cleaned"}
+
+        workspace.allocate.side_effect = allocate
+        workspace.reap.side_effect = reap
+        workspace.reconcile.return_value = {"assignments": []}
+        tools._activate_pm_via_sqlite.side_effect = ["activation failed", None]
+
+        first = tools.spawn_worker(
+            worker_id="w-retry-same", worker_type="claude-sonnet",
+            repo="/tmp/repo", objective="Task",
+        )
+        second = tools.spawn_worker(
+            worker_id="w-retry-same", worker_type="claude-sonnet",
+            repo="/tmp/repo", objective="Task",
+        )
+
+        assert first["failure_phase"] == "activation"
+        assert isinstance(second, str) and "w-retry-same" in second
 
     def test_allocation_failure_recovers_preserved_assignment_without_launch(
         self, tools, mock_tmux, default_workspace_client,
@@ -709,7 +903,7 @@ class TestWorkerInstructionPreflight:
 
         assert result["error"] == "Failed to ensure AGENTS.md"
         assert result["failure_phase"] == "launch"
-        assert result["assignment_preserved"] is True
+        assert result["assignment_preserved"] is False
         tools._ensure_worker_instructions.assert_called_once_with(
             "/tmp/repo", "codex",
         )
@@ -735,7 +929,7 @@ class TestWorkerInstructionPreflight:
 
         assert result["error"] == "Failed to ensure CLAUDE.md"
         assert result["failure_phase"] == "launch"
-        assert result["assignment_preserved"] is True
+        assert result["assignment_preserved"] is False
         mock_tmux.spawn_session.assert_not_called()
 
     def test_spawn_worker_provider_unavailable_fails_closed_without_claude_fallback(
@@ -932,6 +1126,8 @@ class TestRemoteProviderLaunching:
             assert host == "ssh-remote"
             if tuple(argv) == ("/opt/codex", "login", "status"):
                 return ProbeResult(0, "Logged in using ChatGPT\n", "")
+            if tuple(argv) == _REMOTE_CODEX_CACHE_ARGV:
+                return ProbeResult(0, _cache("gpt-5.7-terra", "gpt-5.6-terra"), "")
             return ProbeResult(0, "version\n", "")
 
         ssh.run_argv.side_effect = run_argv
@@ -943,8 +1139,9 @@ class TestRemoteProviderLaunching:
         )
 
         assert handle.client == "codex"
-        assert handle.model == "gpt-5.6-terra"
+        assert handle.model == "gpt-5.7-terra"  # the remote box's own newest Terra
         assert handle.host == "ssh-remote"
+        assert _REMOTE_CODEX_CACHE_ARGV in [tuple(call.args[1]) for call in ssh.run_argv.call_args_list]
         assert state.get_current_client("worker") == "codex"
         assert all(call.args[0] == "ssh-remote" for call in ssh.run_argv.call_args_list)
 
@@ -974,13 +1171,15 @@ class TestRemoteProviderLaunching:
         def run_argv(_host, argv):
             if tuple(argv) == ("/opt/codex", "login", "status"):
                 return ProbeResult(0, "Logged in using ChatGPT\n", "")
+            if tuple(argv) == _REMOTE_CODEX_CACHE_ARGV:
+                return ProbeResult(0, _cache("gpt-6.5-astra", "gpt-6-sol"), "")
             return ProbeResult(0, "version\n", "")
 
         ssh.run_argv.side_effect = run_argv
         handle = tools._resolve_remote_worker_client("claude-fable", machine)
 
         assert (handle.client, handle.requested_tier, handle.effective_tier, handle.model) == (
-            "codex", "fable", "fable", "gpt-6-astra",
+            "codex", "fable", "fable", "gpt-6.5-astra",
         )
         assert ("/opt/codex", "login", "status") in [
             tuple(call.args[1]) for call in ssh.run_argv.call_args_list
@@ -1026,6 +1225,8 @@ class TestRemoteProviderLaunching:
         def run_argv(_host, argv):
             if tuple(argv) == ("/opt/codex", "login", "status"):
                 return ProbeResult(0, "Logged in using ChatGPT\n", "")
+            if tuple(argv) == _REMOTE_CODEX_CACHE_ARGV:
+                return ProbeResult(0, _cache("gpt-5.6-terra"), "")
             return ProbeResult(0, "version\n", "")
 
         ssh.run_argv.side_effect = run_argv
@@ -1042,6 +1243,59 @@ class TestRemoteProviderLaunching:
         assert ("/opt/codex", "login", "status") in [
             tuple(call.args[1]) for call in ssh.run_argv.call_args_list
         ]
+
+    def test_remote_codex_family_missing_falls_back_to_claude(
+        self, registry, mock_tmux, tmp_path, db_conn, caplog,
+    ):
+        """Design 2026-10-17 v120-completeness R2: no Terra on the remote box -> Codex is
+        unavailable for the call and routing falls to Claude, with a log naming family and cache."""
+        config = copy.deepcopy(DEFAULTS)
+        config["providers"]["clients"]["codex"]["enabled"] = True
+        config["providers"]["roles"]["worker"] = {"preferred": "codex", "clients": ["claude", "codex"]}
+        tools = OrchestratorTools(registry, mock_tmux, str(tmp_path / "ledger.json"),
+                                  db_conn=db_conn, config=config)
+        machine = self._machine({
+            "claude": {"enabled": True, "path": "/opt/claude"},
+            "codex": {"enabled": True, "path": "/opt/codex"},
+        })
+        ssh = self._attach_remote(tools, machine)
+
+        def run_argv(_host, argv):
+            if tuple(argv) == ("/opt/codex", "login", "status"):
+                return ProbeResult(0, "Logged in using ChatGPT\n", "")
+            if tuple(argv) == _REMOTE_CODEX_CACHE_ARGV:
+                return ProbeResult(0, _cache("gpt-6-sol"), "")
+            return ProbeResult(0, "version\n", "")
+
+        ssh.run_argv.side_effect = run_argv
+        ProviderState(db_conn).set_current_client("worker", "codex")
+        handle = tools._resolve_remote_worker_client("claude-sonnet", machine)
+        assert (handle.client, handle.model, handle.host) == ("claude", "sonnet", "ssh-remote")
+        assert "'terra'" in caplog.text and "ssh-remote:" in caplog.text
+
+    def test_remote_codex_cache_read_honours_machine_codex_home(
+        self, registry, mock_tmux, tmp_path, db_conn,
+    ):
+        config = copy.deepcopy(DEFAULTS)
+        config["providers"]["clients"]["codex"]["enabled"] = True
+        config["providers"]["roles"]["worker"] = {"preferred": "codex", "clients": ["codex"]}
+        tools = OrchestratorTools(registry, mock_tmux, str(tmp_path / "ledger.json"),
+                                  db_conn=db_conn, config=config)
+        machine = self._machine({"codex": {"enabled": True, "path": "/opt/codex"}},
+                                env={"CODEX_HOME": "/srv/codex"})
+        ssh = self._attach_remote(tools, machine)
+        expected = ("env", "CODEX_HOME=/srv/codex", *_REMOTE_CODEX_CACHE_ARGV)
+
+        def run_argv(_host, argv):
+            if tuple(argv) == ("/opt/codex", "login", "status"):
+                return ProbeResult(0, "Logged in using ChatGPT\n", "")
+            if tuple(argv) == expected:
+                return ProbeResult(0, _cache("gpt-5.8-terra"), "")
+            return ProbeResult(0, "version\n", "")
+
+        ssh.run_argv.side_effect = run_argv
+        handle = tools._resolve_remote_worker_client("claude-sonnet", machine)
+        assert (handle.client, handle.model) == ("codex", "gpt-5.8-terra")
 
     def test_remote_unavailable_provider_fails_before_mutation(
         self, tools, registry, mock_tmux, db_conn,
@@ -1261,6 +1515,82 @@ class TestRemoteProviderLaunching:
         assert worker["model"] == model
         assert worker["native_session_id"] == _VALID_NATIVE_UUID
 
+    @pytest.mark.parametrize(
+        ("client", "model", "expected"),
+        [
+            ("codex", "gpt-5.6-terra", ["profile", "activate"]),
+            ("claude", "sonnet", ["activate", "profile"]),
+        ],
+    )
+    def test_remote_profile_turn_order_by_client(
+        self, tools, registry, client, model, expected,
+    ):
+        order = []
+        machine = self._machine({
+            client: {"enabled": True, "path": f"/opt/{client}"},
+        })
+        self._prepare_remote_success(
+            tools, machine, _provider_handle(client=client, model=model),
+        )
+        tools._activate_pm_remote.side_effect = lambda *args, **kwargs: (
+            order.append("activate") or _VALID_NATIVE_UUID
+        )
+        tools._dispatch_worker_communication_profile = MagicMock(
+            side_effect=lambda *args, **kwargs: order.append("profile"),
+        )
+
+        result = tools.spawn_worker(
+            worker_id=f"w-remote-order-{client}",
+            worker_type="claude-sonnet",
+            repo=self.REPO,
+            objective="Task",
+            machine="remote-worker",
+        )
+
+        assert isinstance(result, str)
+        assert order == expected
+
+    @pytest.mark.parametrize("client", ["codex", "claude"])
+    def test_remote_activation_not_before_is_profile_dispatch_time(
+        self, tools, mock_tmux, client,
+    ):
+        clock = itertools.count(1000.0, 1.0)
+        marks = {}
+        machine = self._machine({
+            client: {"enabled": True, "path": f"/opt/{client}"},
+        })
+        self._prepare_remote_success(tools, machine, _provider_handle(
+            client=client,
+            model="gpt-5.6-terra" if client == "codex" else "sonnet",
+        ))
+        mock_tmux.spawn_session.side_effect = lambda *args, **kwargs: (
+            marks.__setitem__("spawn", next(clock)) or True
+        )
+        tools._dispatch_worker_communication_profile = MagicMock(
+            side_effect=lambda *args, **kwargs: marks.__setitem__(
+                "profile", next(clock),
+            ),
+        )
+
+        with patch(
+            "ironclaude.orchestrator_mcp.time.time",
+            side_effect=lambda: next(clock),
+        ):
+            result = tools.spawn_worker(
+                worker_id=f"w-remote-nb-{client}",
+                worker_type="claude-sonnet",
+                repo=self.REPO,
+                objective="Task",
+                machine="remote-worker",
+            )
+
+        assert isinstance(result, str)
+        kwargs = tools._activate_pm_remote.call_args.kwargs
+        if client == "codex":
+            assert marks["spawn"] < kwargs["not_before"] < marks["profile"]
+        else:
+            assert "not_before" not in kwargs
+
     def test_remote_spawn_failure_preserves_exception_without_cleanup(
         self, tools, registry, mock_tmux,
     ):
@@ -1280,7 +1610,15 @@ class TestRemoteProviderLaunching:
 
         assert "Failed to spawn tmux session" in result["error"]
         assert result["failure_phase"] == "launch"
-        assert result["assignment_preserved"] is True
+        assert result["assignment_preserved"] is False
+        tools._workspace_client.reap.assert_called_once_with(
+            {
+                "repository_path": self.REPO,
+                "workspace_guid": result["workspace"]["workspace_guid"],
+            },
+            ssh_host="ssh-remote",
+            remote_plugin_root="/installed/codex",
+        )
         mock_tmux.kill_session.assert_not_called()
         assert registry.get_worker("w-spawn-fail") is None
         assert not registry.get_events_for_worker(
@@ -1403,8 +1741,11 @@ class TestRemoteProviderLaunching:
             "claude", "codex", "codex",
         ]
         assert tools._wait_for_ready.call_args_list[-1].kwargs["marker"] == PROFILE_READY_MARKER
-        tools._activate_pm_remote.assert_called_once_with(
-            "ic-w-retry", "ssh-remote", client="codex",
+        tools._activate_pm_remote.assert_called_once()
+        assert tools._activate_pm_remote.call_args.args == ("ic-w-retry", "ssh-remote")
+        assert tools._activate_pm_remote.call_args.kwargs["client"] == "codex"
+        assert isinstance(
+            tools._activate_pm_remote.call_args.kwargs["not_before"], float,
         )
         worker = registry.get_worker("w-retry")
         assert worker["client"] == "codex"
@@ -1461,6 +1802,43 @@ class TestRemoteProviderLaunching:
             # The property this test exists to guard: no Claude slash command
             # reaches codex. The advisor text is not one.
             assert not any(message.startswith("/") for message in sent)
+
+    def test_remote_codex_opus_worker_gets_same_tier_advisor_by_default(
+        self, registry, mock_tmux, tmp_path, db_conn,
+    ):
+        client = "codex"
+        tools = OrchestratorTools(
+            registry,
+            mock_tmux,
+            str(tmp_path / "ledger.json"),
+            db_conn=db_conn,
+            advisor_cfg=copy.deepcopy(DEFAULTS["advisor"]),
+            dispatch_cfg={"use_goal": True},
+        )
+        machine = self._machine({
+            client: {"enabled": True, "path": f"/opt/{client}"},
+        })
+        self._prepare_remote_success(
+            tools, machine,
+            _provider_handle(client="codex", requested="opus", effective="opus", model="gpt-5.6-sol"),
+        )
+
+        with patch("ironclaude.orchestrator_mcp.time.sleep"):
+            tools.spawn_worker(
+                worker_id=f"w-gate-{client}",
+                worker_type="claude-opus",
+                repo=self.REPO,
+                objective="Only objective",
+                machine="remote-worker",
+            )
+
+        sent = [call.args[1] for call in mock_tmux.send_keys.call_args_list]
+        import ironclaude.orchestrator_mcp as omcp
+        assert sent == [
+            "$ironclaude:write-lossless-ai-messages",
+            omcp._CODEX_ADVISOR_INSTRUCTION_SAME_TIER,
+            "Only objective",
+        ]
 
     def test_codex_receives_no_advisor_text_when_advisor_disabled(
         self, registry, mock_tmux, tmp_path, db_conn,
@@ -1552,7 +1930,7 @@ class TestSpawnWorker:
         )
 
         assert result["failure_phase"] == "dispatch"
-        assert result["assignment_preserved"] is True
+        assert result["assignment_preserved"] is False
         mock_tmux.kill_session.assert_called_once_with(
             "ic-w-profile-missing", ssh_host=None,
         )
@@ -1669,8 +2047,8 @@ class TestSpawnWorker:
         keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
         assert "/advisor opus" in keys_sent
 
-    def test_spawn_worker_opus_sends_tiered_advisor_fable(self, registry, mock_tmux, tmp_path, db_conn):
-        """A claude-opus worker gets /advisor fable per the advisor_models tier map."""
+    def test_spawn_worker_opus_explicit_fable_advisor_is_honored(self, registry, mock_tmux, tmp_path, db_conn):
+        """An explicit advisor_models override to fable is still honored (design T8)."""
         ledger_path = str(tmp_path / "task-ledger.json")
         tools = OrchestratorTools(
             registry, mock_tmux, ledger_path, db_conn=db_conn,
@@ -1687,6 +2065,21 @@ class TestSpawnWorker:
             )
         keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
         assert "/advisor fable" in keys_sent
+
+    def test_spawn_worker_opus_default_advisor_is_opus(self, registry, mock_tmux, tmp_path, db_conn):
+        """With the default advisor config a claude-opus worker gets /advisor opus (design T8)."""
+        tools = OrchestratorTools(
+            registry, mock_tmux, str(tmp_path / "task-ledger.json"), db_conn=db_conn,
+            advisor_cfg=copy.deepcopy(DEFAULTS["advisor"]),
+        )
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        _mock_grader_approve(tools)
+        with patch("ironclaude.orchestrator_mcp.time.sleep"):
+            tools.spawn_worker(worker_id="w-tier-opus-default", worker_type="claude-opus",
+                               repo="/tmp/repo", objective="Do the thing")
+        keys_sent = [call[0][1] for call in mock_tmux.send_keys.call_args_list]
+        assert "/advisor opus" in keys_sent
+        assert "/advisor fable" not in keys_sent
 
     def test_spawn_worker_fable_skips_advisor_entirely(self, registry, mock_tmux, tmp_path, db_conn):
         """A claude-fable worker sends no /advisor at all — it is the top tier."""
@@ -3720,8 +4113,8 @@ class TestPostMessageGrader:
         assert "pinned escalation" in system_prompt.lower()
         assert "passive reporting" in system_prompt.lower()
 
-    def test_post_message_ollama_failure_escalates_to_opus(self, tools):
-        """Infrastructure error from Ollama triggers Opus fallback."""
+    def test_post_message_ollama_failure_escalates_to_sonnet(self, tools):
+        """Infrastructure error from the Haiku class steps up to the Sonnet class."""
         tools._slack = MagicMock()
         tools._slack.post_message.return_value = "ts"
         tools._call_local_grader = MagicMock(return_value={
@@ -3732,6 +4125,7 @@ class TestPostMessageGrader:
         })
         result = tools.post_message("All workers healthy.")
         tools._call_grader.assert_called_once()
+        assert tools._call_grader.call_args.kwargs.get("tier") == "sonnet"
         tools._slack.post_message.assert_called_once()
 
     def test_post_message_slack_not_configured(self, tools):
@@ -6241,6 +6635,7 @@ class TestBatchSpawn:
         assert len(results) == 1
         # graded individually (no batch of one)
         assert tools._call_grader.call_args.kwargs.get("batch", False) is False
+        assert tools._call_grader.call_args.kwargs.get("tier") == "sonnet"
 
     def test_batch_grader_fallback(self, tools, mock_tmux):
         """Malformed batch response falls back to individual grading.
@@ -6250,7 +6645,9 @@ class TestBatchSpawn:
         """
         tools._call_local_grader = MagicMock(return_value={"grade": "A", "approved": True, "feedback": "ok"})
         call_count = [0]
-        def mock_grader(system_prompt, user_prompt, batch=False):
+        tiers = []
+        def mock_grader(system_prompt, user_prompt, batch=False, tier=None):
+            tiers.append(tier)
             call_count[0] += 1
             if call_count[0] == 1:
                 return "malformed"  # first call is the batch attempt
@@ -6263,6 +6660,7 @@ class TestBatchSpawn:
         ])
         # 1 batch attempt (malformed) + 2 individual re-grades
         assert call_count[0] > 1
+        assert tiers and all(t == "sonnet" for t in tiers)
 
 
 class TestBatchManagedWorktree:
@@ -6350,7 +6748,7 @@ class TestBatchManagedWorktree:
             assert worker["workspace_guid"] in allocation_guids
             assert worker["workspace_path"] == cwd_by_session[f"ic-{worker_id}"]
 
-    def test_batch_worktree_failed_sibling_preserves_only_its_assignment(
+    def test_batch_worktree_failed_sibling_releases_only_its_assignment(
         self, tools, registry, mock_tmux, default_workspace_client,
     ):
         workspace = default_workspace_client
@@ -6367,13 +6765,20 @@ class TestBatchManagedWorktree:
         failed, succeeded = result
         assert failed["worker_id"] == "batch-a"
         assert failed["failure_phase"] == "readiness"
-        assert failed["assignment_preserved"] is True
-        assert len(failed["recovery"]) == 1
-        assert set(failed["recovery"]) <= {"retry_bind", "reconcile", "abandon"}
+        assert failed["assignment_preserved"] is False
+        assert failed["assignment_released"] is True
+        assert "recovery" not in failed
         assert succeeded["worker_id"] == "batch-b"
         assert succeeded["status"] == "spawned"
         assert registry.get_worker("batch-a") is None
         assert registry.get_worker("batch-b")["workspace_guid"] != failed["workspace"]["workspace_guid"]
+        workspace.reap.assert_called_once_with(
+            {
+                "repository_path": "/tmp/repo",
+                "workspace_guid": failed["workspace"]["workspace_guid"],
+            },
+            plugin_root="/installed/codex",
+        )
         workspace.abandon.assert_not_called()
 
     @pytest.mark.parametrize(
@@ -6411,6 +6816,8 @@ class TestBatchManagedWorktree:
         assert result["assignment_preserved"] is True
         assert set(result["recovery"]) == {"retry_bind"}
         assert field in result["error"]
+        workspace.reap.assert_not_called()
+        workspace.abandon.assert_not_called()
         assert registry.get_worker("batch-a") is None
         mock_tmux.kill_session.assert_called_once_with("ic-batch-a")
 
@@ -6465,7 +6872,7 @@ class TestProviderAwareBatchLifecycle:
         result = tools.spawn_workers([self._request()])
 
         assert result[0]["failure_phase"] == "dispatch"
-        assert result[0]["assignment_preserved"] is True
+        assert result[0]["assignment_preserved"] is False
         assert "Objective w1" not in [
             call.args[1] for call in mock_tmux.send_keys.call_args_list
         ]
@@ -6493,8 +6900,44 @@ class TestProviderAwareBatchLifecycle:
         assert result[0]["worker_id"] == "w1"
         assert result[0]["error"] == message
         assert result[0]["failure_phase"] == "launch"
-        assert result[0]["assignment_preserved"] is True
+        assert result[0]["assignment_preserved"] is False
         mock_tmux.spawn_session.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("client", "model", "expected"),
+        [
+            ("codex", "gpt-5.6-terra", ["profile", "activate", "identity", "bind"]),
+            ("claude", "sonnet", ["activate", "identity", "bind", "profile"]),
+        ],
+    )
+    def test_batch_profile_turn_order_by_client(
+        self, tools, default_workspace_client, client, model, expected,
+    ):
+        order = []
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle(
+            client=client, model=model,
+        ))
+        tools._dispatch_worker_communication_profile = MagicMock(
+            side_effect=lambda *args, **kwargs: order.append("profile"),
+        )
+        tools._activate_pm_via_sqlite.side_effect = lambda *args, **kwargs: (
+            order.append("activate")
+        )
+        tools._read_pm_state_via_sqlite.side_effect = lambda *args, **kwargs: (
+            order.append("identity") or {
+                "professional_mode": "on", "workflow_stage": "idle",
+                "session_uuid": _VALID_NATIVE_UUID,
+            }
+        )
+        bind = default_workspace_client.bind.side_effect
+        default_workspace_client.bind.side_effect = lambda payload, **transport: (
+            order.append("bind") or bind(payload, **transport)
+        )
+
+        result = tools.spawn_workers([self._request()])
+
+        assert result[0]["status"] == "spawned"
+        assert order == expected
 
     def test_batch_codex_uses_provider_lifecycle_and_persists_provider(
         self, tools, registry, mock_tmux,
@@ -6537,6 +6980,22 @@ class TestProviderAwareBatchLifecycle:
         assert registry.get_events_for_worker(
             "w1", event_type="worker_spawned",
         )
+
+    def test_batch_codex_opus_worker_gets_same_tier_advisor_by_default(
+        self, tools, registry, mock_tmux,
+    ):
+        import ironclaude.orchestrator_mcp as omcp
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle(
+            requested="opus", effective="opus", model="gpt-5.6-sol"))
+        tools._advisor_cfg = copy.deepcopy(DEFAULTS["advisor"])
+        result = tools.spawn_workers([self._request(worker_type="claude-opus")])
+        messages = [call.args[1] for call in mock_tmux.send_keys.call_args_list]
+        assert messages == [
+            "$ironclaude:write-lossless-ai-messages",
+            omcp._CODEX_ADVISOR_INSTRUCTION_SAME_TIER,
+            "Objective w1",
+        ]
+        assert result[0]["status"] == "spawned"
 
     def test_batch_claude_preserves_tiered_advisor_and_global_goal(
         self, tools, registry, mock_tmux,
@@ -6644,7 +7103,7 @@ class TestProviderAwareBatchLifecycle:
         assert result[0]["worker_id"] == "bad"
         assert result[0]["error"] == "Worker startup failed: readiness exploded"
         assert result[0]["failure_phase"] == "readiness"
-        assert result[0]["assignment_preserved"] is True
+        assert result[0]["assignment_preserved"] is False
         assert result[1]["status"] == "spawned"
         assert registry.get_worker("bad") is None
         assert registry.get_worker("good") is not None
@@ -6684,7 +7143,7 @@ class TestProviderAwareBatchLifecycle:
             ("w2", "second"),
         ]
         assert all(item["failure_phase"] == "launch" for item in result)
-        assert all(item["assignment_preserved"] is True for item in result)
+        assert all(item["assignment_preserved"] is False for item in result)
         mock_tmux.spawn_session.assert_not_called()
 
     def test_batch_alive_readiness_timeout_preserves_single_worker_behavior(
@@ -7551,6 +8010,11 @@ class TestAdvisorModelFor:
         tools._advisor_cfg = {}
         assert tools._advisor_model_for("claude-sonnet") == "opus"
 
+    def test_defaults_give_opus_class_workers_an_opus_class_advisor(self, tools):
+        tools._advisor_cfg = copy.deepcopy(DEFAULTS["advisor"])
+        assert tools._advisor_model_for("claude-opus") == "opus"
+        assert tools._advisor_model_for("claude-sonnet") == "opus"
+
 
 class TestGetWorkerCommand:
     def test_returns_worker_commands_fallback_when_no_advisor(self, tools):
@@ -8407,6 +8871,62 @@ class TestActivatePmRemote:
             ("remote-host", ["pgrep", "-P", "23456"]),
         ]
 
+    @staticmethod
+    def _codex_remote(tools, mock_tmux, stat_result):
+        native_uuid = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+        mock_tmux.list_pane_pid.return_value = "12345"
+        mock_tmux.read_file.return_value = native_uuid
+        mock_tmux.run_sqlite_query.return_value = ""
+        ssh = MagicMock()
+        ssh.run_argv.side_effect = lambda host, argv: (
+            stat_result if argv[0] == "sh" else ProbeResult(1, "", "")
+        )
+        tools._ssh_manager = ssh
+        return native_uuid, ssh
+
+    def test_remote_codex_accepts_id_file_at_or_after_not_before(
+        self, tools, mock_tmux,
+    ):
+        native_uuid, ssh = self._codex_remote(
+            tools, mock_tmux, ProbeResult(0, "300\n", ""),
+        )
+
+        result = tools._activate_pm_remote(
+            "ic-w1", "remote-host", timeout=2, client="codex", not_before=200.0,
+        )
+
+        assert result == native_uuid
+        stat_argvs = [
+            call.args[1] for call in ssh.run_argv.call_args_list
+            if call.args[1][0] == "sh"
+        ]
+        assert stat_argvs[0][:2] == ["sh", "-c"]
+        assert stat_argvs[0][-1] == "12345"
+        assert "stat -c %Y" in stat_argvs[0][2]
+        assert "stat -f %m" in stat_argvs[0][2]
+        mock_tmux.run_sqlite_query.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "stat_result",
+        [
+            ProbeResult(0, "100\n", ""),
+            ProbeResult(127, "", "stat: not found"),
+            ProbeResult(0, "not-a-time\n", ""),
+        ],
+        ids=["older", "no-stat", "garbled"],
+    )
+    def test_remote_codex_rejects_old_or_unstatable_id_file(
+        self, tools, mock_tmux, stat_result,
+    ):
+        self._codex_remote(tools, mock_tmux, stat_result)
+
+        result = tools._activate_pm_remote(
+            "ic-w1", "remote-host", timeout=1, client="codex", not_before=200.0,
+        )
+
+        assert "timeout" in result
+        mock_tmux.run_sqlite_query.assert_not_called()
+
     def test_pane_pid_none_includes_alive_status_and_log(self, tools, mock_tmux):
         """When list_pane_pid returns None, error includes session status and log tail."""
         mock_tmux.list_pane_pid.return_value = None
@@ -8815,6 +9335,17 @@ class TestCallLocalGraderDelegation:
         result = tools._call_local_grader("sys_prompt", "user_prompt", schema)
         mock_grade.assert_called_once_with("sys_prompt", "user_prompt", schema)
         assert result == {"grade": "A", "approved": True}
+
+    def test_forwards_only_a_non_haiku_class(self, tools):
+        mock_grade = MagicMock(return_value={"healthy": True})
+        tools._local_grader = MagicMock()
+        tools._local_grader.grade = mock_grade
+        schema = {"type": "object"}
+        tools._call_local_grader("s", "u", schema, tier="sonnet")
+        mock_grade.assert_called_once_with("s", "u", schema, tier="sonnet")
+        mock_grade.reset_mock()
+        tools._call_local_grader("s", "u", schema, tier="haiku")
+        mock_grade.assert_called_once_with("s", "u", schema)
 
 
 def test_spawn_preconditions_vram_threshold_default_8gb(tools):
@@ -9326,6 +9857,82 @@ class TestCodexLaunchBoundary(TestReadPmState):
             "ic-w-boundary", client="codex", not_before=boundary,
         )
 
+    def test_codex_identity_boundary_is_profile_dispatch_time(
+        self, tools, registry, mock_tmux,
+    ):
+        clock = itertools.count(1000.0, 1.0)
+        marks = {}
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        tools._ensure_ssh_manager = MagicMock()
+        tools._wait_for_ready = MagicMock(return_value=True)
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._read_pm_state_via_sqlite = MagicMock(return_value={
+            "professional_mode": "on",
+            "workflow_stage": "executing",
+            "session_uuid": _VALID_NATIVE_UUID,
+        })
+        mock_tmux.spawn_session.side_effect = lambda *args, **kwargs: (
+            marks.__setitem__("spawn", next(clock)) or True
+        )
+        tools._dispatch_worker_communication_profile = MagicMock(
+            side_effect=lambda *args, **kwargs: marks.__setitem__(
+                "profile", next(clock),
+            ),
+        )
+        _mock_grader_approve(tools)
+
+        with patch(
+            "ironclaude.orchestrator_mcp.time.time",
+            side_effect=lambda: next(clock),
+        ):
+            tools.spawn_worker("w-profile-boundary", "claude-sonnet", "/tmp/repo", "Task")
+
+        not_before = tools._activate_pm_via_sqlite.call_args.kwargs["not_before"]
+        assert marks["spawn"] < not_before < marks["profile"]
+        assert (
+            tools._read_pm_state_via_sqlite.call_args.kwargs["not_before"]
+            == not_before
+        )
+
+    def test_batch_codex_identity_boundary_is_profile_dispatch_time(
+        self, tools, mock_tmux,
+    ):
+        clock = itertools.count(1000.0, 1.0)
+        marks = {}
+        tools._resolve_worker_client = MagicMock(return_value=_provider_handle())
+        tools._wait_for_ready = MagicMock(return_value=True)
+        tools._activate_pm_via_sqlite = MagicMock(return_value=None)
+        tools._read_pm_state_via_sqlite = MagicMock(return_value={
+            "professional_mode": "on",
+            "workflow_stage": "executing",
+            "session_uuid": _VALID_NATIVE_UUID,
+        })
+        mock_tmux.spawn_session.side_effect = lambda *args, **kwargs: (
+            marks.__setitem__("spawn", next(clock)) or True
+        )
+        tools._dispatch_worker_communication_profile = MagicMock(
+            side_effect=lambda *args, **kwargs: marks.__setitem__(
+                "profile", next(clock),
+            ),
+        )
+        _mock_batch_approve(tools)
+
+        with patch(
+            "ironclaude.orchestrator_mcp.time.time",
+            side_effect=lambda: next(clock),
+        ):
+            tools.spawn_workers([{
+                "worker_id": "w-profile-boundary", "worker_type": "claude-sonnet",
+                "repo": "/tmp/repo", "objective": "Task",
+            }])
+
+        not_before = tools._activate_pm_via_sqlite.call_args.kwargs["not_before"]
+        assert marks["spawn"] < not_before < marks["profile"]
+        assert (
+            tools._read_pm_state_via_sqlite.call_args.kwargs["not_before"]
+            == not_before
+        )
+
     def test_resume_launch_boundary_is_shared_by_activation_and_readback(
         self, tools, mock_tmux,
     ):
@@ -9420,8 +10027,11 @@ class TestListClaudeSessions:
         plain = next(c for c in out if c["name"] == "plain")
         assert plain["confidence"] == "low"
 
-    def test_happy_path_returns_sample_and_summary(self, tools, mock_tmux):
+    def test_happy_path_returns_sample_and_summary(self, tools, mock_tmux, tmp_path):
         """Happy path: Ollama available, returns both sample and summary per session."""
+        ollama_cfg = tmp_path / "ollama_backend.json"
+        ollama_cfg.write_text(json.dumps({"backend": "ollama"}))
+        tools._ollama_config_path = str(ollama_cfg)
         mock_tmux.list_sessions.return_value = ["my-session"]
         mock_tmux.list_pane_pid.return_value = "12345"
         mock_tmux.pane_current_command.return_value = "node"
@@ -9443,8 +10053,11 @@ class TestListClaudeSessions:
         assert session["confidence"] == "high"
 
     def test_summarizer_loads_lossless_profile_before_ollama(
-        self, tools, mock_tmux, monkeypatch,
+        self, tools, mock_tmux, monkeypatch, tmp_path,
     ):
+        ollama_cfg = tmp_path / "ollama_backend.json"
+        ollama_cfg.write_text(json.dumps({"backend": "ollama"}))
+        tools._ollama_config_path = str(ollama_cfg)
         mock_tmux.list_sessions.return_value = ["my-session"]
         mock_tmux.list_pane_pid.return_value = "12345"
         mock_tmux.pane_current_command.return_value = "node"
@@ -9466,8 +10079,11 @@ class TestListClaudeSessions:
         )
 
     def test_missing_summarizer_profile_returns_bounded_error_without_ollama(
-        self, tools, mock_tmux, monkeypatch,
+        self, tools, mock_tmux, monkeypatch, tmp_path,
     ):
+        ollama_cfg = tmp_path / "ollama_backend.json"
+        ollama_cfg.write_text(json.dumps({"backend": "ollama"}))
+        tools._ollama_config_path = str(ollama_cfg)
         mock_tmux.list_sessions.return_value = ["my-session"]
         mock_tmux.list_pane_pid.return_value = "12345"
         mock_tmux.pane_current_command.return_value = "node"
@@ -9486,8 +10102,11 @@ class TestListClaudeSessions:
         )
         mock_client.post_generate.assert_not_called()
 
-    def test_ollama_unavailable_all_sessions_get_error(self, tools, mock_tmux):
+    def test_ollama_unavailable_all_sessions_get_error(self, tools, mock_tmux, tmp_path):
         """When Ollama is unreachable at pre-check, all sessions get explicit error string."""
+        ollama_cfg = tmp_path / "ollama_backend.json"
+        ollama_cfg.write_text(json.dumps({"backend": "ollama"}))
+        tools._ollama_config_path = str(ollama_cfg)
         mock_tmux.list_sessions.return_value = ["session-a", "session-b"]
         mock_tmux.list_pane_pid.return_value = "999"
         mock_tmux.pane_current_command.return_value = ""
@@ -9502,8 +10121,11 @@ class TestListClaudeSessions:
             assert session["summary"] == "ERROR: Ollama unavailable — summary not generated"
         mock_client.post_generate.assert_not_called()
 
-    def test_per_session_ollama_error_continues_other_sessions(self, tools, mock_tmux):
+    def test_per_session_ollama_error_continues_other_sessions(self, tools, mock_tmux, tmp_path):
         """Per-session OllamaError: that session gets error string, others still processed."""
+        ollama_cfg = tmp_path / "ollama_backend.json"
+        ollama_cfg.write_text(json.dumps({"backend": "ollama"}))
+        tools._ollama_config_path = str(ollama_cfg)
         mock_tmux.list_sessions.return_value = ["session-fail", "session-ok"]
         mock_tmux.list_pane_pid.return_value = "111"
         mock_tmux.pane_current_command.return_value = ""
@@ -9584,6 +10206,7 @@ class TestListClaudeSessions:
         """spots.summarization.model takes precedence over ollama.summarization_model."""
         cfg_path = tmp_path / "ollama_spot.json"
         cfg_path.write_text(json.dumps({
+            "backend": "ollama",
             "ollama": {"model": "m", "summarization_model": "legacy"},
             "spots": {"summarization": {"model": "spot-x"}},
         }))
@@ -9608,7 +10231,7 @@ class TestListClaudeSessions:
         historical default model literal, NOT ollama.model (byte-identity
         guard against silently promoting ollama.model as the default)."""
         cfg_path = tmp_path / "ollama_no_spot.json"
-        cfg_path.write_text(json.dumps({"ollama": {"model": "X"}}))
+        cfg_path.write_text(json.dumps({"backend": "ollama", "ollama": {"model": "X"}}))
         tools._ollama_config_path = str(cfg_path)
 
         mock_tmux.list_sessions.return_value = ["my-session"]
@@ -9698,7 +10321,51 @@ class TestListClaudeSessions:
         assert mock_make_client.call_args.kwargs["timeout"] == 120
 
 
+def _held_session_fixture(registry, tmp_path):
+    native_id = "e1f6f1c2-627a-4383-ab38-6398940a6c75"
+    worktree = tmp_path / "managed-worktree"
+    worktree.mkdir()
+    registry.register_worker(
+        "held", "claude-opus", "ic-held", repo=str(tmp_path),
+        description="objective", client="claude", model="opus",
+        native_session_id=native_id,
+    )
+    registry.set_worker_workspace("held", {
+        "workspace_guid": "guid-held", "repository_identity": "repository-held",
+        "worktree_path": str(worktree), "branch": "worker/held",
+        "base_commit": "base-held", "integration_target": "main",
+    })
+    registry.claim_worker_handoff(registry.get_worker("held"), generation=1)
+    registry.record_worker_handoff_evidence("held", 1, "claimed", {
+        "scope": {"expected_worktree_path": str(worktree)},
+        "bootstrap_intent": "ic-held-h1-bootstrap",
+    })
+    return native_id, worktree
+
+
 class TestAdoptSession:
+    def test_rejects_running_managed_session_under_new_id(self, tools, registry, mock_tmux):
+        registry.register_worker("running", "claude-opus", "ic-running", repo="/r",
+                                 description="objective")
+
+        out = tools.adopt_session("ic-running", "new-worker", repo="/r")
+
+        assert "error" in out
+        mock_tmux.rename_session.assert_not_called()
+
+    def test_rejects_held_bootstrap_session_under_new_id_before_effects(
+        self, tools, registry, mock_tmux, tmp_path,
+    ):
+        _, worktree = _held_session_fixture(registry, tmp_path)
+        tools._dispatch_worker_communication_profile = MagicMock()
+
+        out = tools.adopt_session("ic-held-h1-bootstrap", "new-worker", repo=str(worktree))
+
+        assert "error" in out
+        mock_tmux.rename_session.assert_not_called()
+        mock_tmux.setup_log_capture.assert_not_called()
+        tools._dispatch_worker_communication_profile.assert_not_called()
+
     def test_rejects_existing_worker_id(self, tools, registry, mock_tmux):
         registry.register_worker("d1", "claude-opus", "ic-d1", repo="/r", description="x")
         out = tools.adopt_session("test-session", "d1", repo="/r")
@@ -9739,6 +10406,20 @@ class TestAdoptSession:
 
 class TestResumeSession:
     UUID = "e6d6a6fb-35ae-4ddf-ba2d-3f098c24b9ec"
+
+    def test_rejects_held_source_uuid_under_new_id_before_effects(
+        self, tools, registry, mock_tmux, tmp_path,
+    ):
+        source_id, _ = _held_session_fixture(registry, tmp_path)
+        tools._ensure_worker_instructions = MagicMock()
+        tools.ensure_worker_trusted = MagicMock()
+
+        out = tools.resume_session(source_id, "claude", "new-worker", repo=str(tmp_path))
+
+        assert "error" in out
+        tools._ensure_worker_instructions.assert_not_called()
+        tools.ensure_worker_trusted.assert_not_called()
+        mock_tmux.spawn_session.assert_not_called()
 
     def _prepare_success(self, tools, mock_tmux, client, observed_uuid=None):
         mock_tmux.has_session.return_value = False
@@ -10000,13 +10681,12 @@ class TestResumeSession:
                 "/Applications/Codex App/codex",
                 (
                     "exec '/Applications/Codex App/codex' "
-                    f"resume {UUID} --dangerously-bypass-approvals-and-sandbox",
+                    f"resume {UUID} --model gpt-5.6-sol --no-daemon --dangerously-bypass-approvals-and-sandbox",
                 ),
                 (
                     "CLAUDE_CODE_EFFORT_LEVEL",
                     "--resume",
                     "--dangerously-skip-permissions",
-                    "--model",
                 ),
             ),
         ],
@@ -10080,6 +10760,90 @@ class TestResumeSession:
         }
         tools._provider_router.assert_not_called()
         assert state.get_current_client("worker") == "codex"
+
+    def test_codex_resume_without_an_installed_family_model_fails_before_spawn(
+        self, tools, mock_tmux, tmp_path, monkeypatch,
+    ):
+        self._prepare_success(tools, mock_tmux, "codex")
+        empty = tmp_path / "empty-codex-home"
+        empty.mkdir()
+        monkeypatch.setenv("CODEX_HOME", str(empty))
+        out = tools.resume_session(self.UUID, "codex", "d6", repo="/r")
+        assert "Codex model family 'sol' has no installed model in" in out["error"]
+        mock_tmux.spawn_session.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("client", "expected"),
+        [
+            ("codex", ["profile", "activate", "identity"]),
+            ("claude", ["activate", "identity", "profile"]),
+        ],
+    )
+    def test_resume_profile_turn_order_by_client(
+        self, tools, mock_tmux, client, expected,
+    ):
+        self._prepare_success(tools, mock_tmux, client)
+        order = []
+        tools._dispatch_worker_communication_profile = MagicMock(
+            side_effect=lambda *args, **kwargs: order.append("profile"),
+        )
+        tools._activate_pm_via_sqlite.side_effect = lambda *args, **kwargs: (
+            order.append("activate")
+        )
+        tools._read_pm_state_via_sqlite.side_effect = lambda *args, **kwargs: (
+            order.append("identity") or {
+                "professional_mode": "on", "workflow_stage": "executing",
+                "session_uuid": self.UUID,
+            }
+        )
+
+        out = tools.resume_session(self.UUID, client, f"d-order-{client}", repo="/r")
+
+        assert out["worker_id"] == f"d-order-{client}"
+        assert order == expected
+
+    def test_codex_resume_identity_boundary_is_profile_dispatch_time(
+        self, tools, mock_tmux,
+    ):
+        clock = itertools.count(1000.0, 1.0)
+        marks = {}
+        self._prepare_success(tools, mock_tmux, "codex")
+        mock_tmux.spawn_session.side_effect = lambda *args, **kwargs: (
+            marks.__setitem__("spawn", next(clock)) or True
+        )
+        tools._dispatch_worker_communication_profile = MagicMock(
+            side_effect=lambda *args, **kwargs: marks.__setitem__(
+                "profile", next(clock),
+            ),
+        )
+
+        with patch(
+            "ironclaude.orchestrator_mcp.time.time",
+            side_effect=lambda: next(clock),
+        ):
+            tools.resume_session(self.UUID, "codex", "d-nb", repo="/r")
+
+        not_before = tools._activate_pm_via_sqlite.call_args.kwargs["not_before"]
+        assert marks["spawn"] < not_before < marks["profile"]
+        assert (
+            tools._read_pm_state_via_sqlite.call_args.kwargs["not_before"]
+            == not_before
+        )
+
+    def test_codex_resume_profile_failure_kills_before_activation(
+        self, tools, registry, mock_tmux,
+    ):
+        self._prepare_success(tools, mock_tmux, "codex")
+        tools._dispatch_worker_communication_profile = MagicMock(
+            return_value="profile failed",
+        )
+
+        out = tools.resume_session(self.UUID, "codex", "d-profile-fail", repo="/r")
+
+        assert out == {"error": "profile failed"}
+        tools._activate_pm_via_sqlite.assert_not_called()
+        mock_tmux.kill_session.assert_called_once_with("ic-d-profile-fail")
+        assert registry.get_worker("d-profile-fail") is None
 
     def test_mcp_wrapper_requires_and_forwards_client(self, tools):
         from ironclaude.orchestrator_mcp import _create_mcp_server
@@ -10677,9 +11441,8 @@ class TestCallGraderSubprocess:
             tools._call_grader("sys", "usr")
         argv = m.call_args.args[0]
         assert "--strict-mcp-config" in argv
-        disallowed = argv[argv.index("--disallowedTools") + 1]
-        for t in ("Skill", "Workflow", "EnterWorktree", "CronCreate", "ScheduleWakeup"):
-            assert t in disallowed
+        assert argv[argv.index("--tools") + 1] == ""
+        assert argv[argv.index("--settings") + 1] == '{"disableAllHooks":true}'
 
     def test_strips_api_key_from_subprocess_env(self, tools, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-remove")
@@ -10758,10 +11521,8 @@ class TestCallGraderSubprocess:
             m.return_value = MagicMock(returncode=0, stdout=self._envelope(verdict), stderr="")
             tools._call_grader("sys", "usr")
         argv = m.call_args.args[0]
-        i = argv.index("--disallowedTools")
-        disallowed = argv[i + 1]
-        for t in ("Task", "Bash", "Read", "Edit", "Write"):
-            assert t in disallowed
+        assert argv[argv.index("--tools") + 1] == ""
+        assert "--disallowedTools" not in argv
 
     def test_temp_system_prompt_file_cleaned_up(self, tools):
         # the --system-prompt-file temp file must not survive the call.
@@ -10858,6 +11619,26 @@ class TestCodexAdvisorInstructionConstant:
         assert "broker rejects any mismatch with provider-authenticated" in _CODEX_ADVISOR_INSTRUCTION
         assert "maps the reviewer exactly once" in _CODEX_ADVISOR_INSTRUCTION
         assert "codex exec" not in _CODEX_ADVISOR_INSTRUCTION
+
+    def test_same_tier_variant_differs_only_in_review_tier(self):
+        import ironclaude.orchestrator_mcp as omcp
+        same = omcp._CODEX_ADVISOR_INSTRUCTION_SAME_TIER
+        assert "\n" not in same
+        assert 'review_tier: "same"' in same
+        assert 'review_tier: "one-up"' not in same
+        assert same == omcp._CODEX_ADVISOR_INSTRUCTION.replace('review_tier: "one-up"', 'review_tier: "same"')
+
+    def test_codex_directive_follows_the_advisor_class(self, tools):
+        import ironclaude.orchestrator_mcp as omcp
+        tools._advisor_cfg = copy.deepcopy(DEFAULTS["advisor"])
+        # Opus-class worker, opus-class advisor: Sol reviews Sol.
+        assert tools._codex_advisor_instruction("claude-opus") == omcp._CODEX_ADVISOR_INSTRUCTION_SAME_TIER
+        # Sonnet-class worker, opus-class advisor: Terra -> Sol is one class up.
+        assert tools._codex_advisor_instruction("claude-sonnet") == omcp._CODEX_ADVISOR_INSTRUCTION
+        # Explicit top-tier override is honored: Sol -> Astra.
+        tools._advisor_cfg = {"enabled": True, "advisor_model": "opus",
+                              "advisor_models": {"claude-opus": "fable"}}
+        assert tools._codex_advisor_instruction("claude-opus") == omcp._CODEX_ADVISOR_INSTRUCTION
 
 
 class TestAcknowledgeOperatorMessage:
@@ -11940,3 +12721,22 @@ class TestListSurfacedOrphans:
         assert result["error"] == "boom"
         assert result["failure_phase"] == "list_surfaced_orphans"
         assert result["repository_path"] == "/repo"
+
+
+def test_workspace_client_timeout_comes_from_config(registry, mock_tmux, monkeypatch):
+    ctor = MagicMock()
+    monkeypatch.setattr("ironclaude.orchestrator_mcp.WorkspaceClient", ctor)
+    OrchestratorTools(
+        registry, mock_tmux, ssh_manager=None,
+        config={"workspace_cli_timeout_seconds": 777},
+    )
+    ctor.assert_called_once()
+    assert ctor.call_args.kwargs["timeout"] == 777
+
+
+def test_workspace_client_timeout_falls_back_to_900(registry, mock_tmux, monkeypatch):
+    ctor = MagicMock()
+    monkeypatch.setattr("ironclaude.orchestrator_mcp.WorkspaceClient", ctor)
+    OrchestratorTools(registry, mock_tmux, ssh_manager=None, config={})
+    ctor.assert_called_once()
+    assert ctor.call_args.kwargs["timeout"] == 900

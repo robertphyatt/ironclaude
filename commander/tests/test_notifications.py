@@ -1042,6 +1042,6 @@ def test_resolve_degraded_backend_label_openai(tmp_path):
     assert resolve_degraded_backend_label(str(cfg)) == "OpenAI"
 
 
-def test_resolve_degraded_backend_label_missing_config_defaults_ollama(tmp_path):
+def test_resolve_degraded_backend_label_missing_config_defaults_haiku(tmp_path):
     from ironclaude.notifications import resolve_degraded_backend_label
-    assert resolve_degraded_backend_label(str(tmp_path / "nope.json")) == "Ollama"
+    assert resolve_degraded_backend_label(str(tmp_path / "nope.json")) == "Haiku"

@@ -98,11 +98,11 @@ class TestLoadConfig:
         assert cfg["advisor"]["advisor_model"] == "opus"
 
     def test_advisor_models_map_default(self):
-        """advisor_models provides a one-tier-up map per worker type."""
+        """advisor_models maps each worker type to its advisor class: opus class for both (design T8)."""
         cfg = load_config("/nonexistent/path.json")
         assert cfg["advisor"]["advisor_models"] == {
             "claude-sonnet": "opus",
-            "claude-opus": "fable",
+            "claude-opus": "opus",
         }
 
     def test_advisor_model_scalar_fallback_retained(self):
@@ -430,3 +430,52 @@ def test_shipped_configuration_examples_parse():
     machines = load_machines_config(str(repo_root / "config/machines.yaml.example"))
     assert machines
     assert any(client["enabled"] for client in machines[0]["clients"].values())
+
+
+def test_workspace_cli_timeout_default_is_900():
+    from ironclaude.config import DEFAULTS
+    assert DEFAULTS["workspace_cli_timeout_seconds"] == 900
+
+
+class TestConfigPathAnchoring:
+    """Defaults resolve from the package location, not the process cwd: the
+    orchestrator MCP runs with cwd ~/.ironclaude/brain and must still read
+    commander/config/ironclaude.json."""
+
+    def test_load_config_default_is_cwd_independent(self, tmp_path, monkeypatch):
+        import ironclaude.config as config_mod
+        root = tmp_path / "commander"
+        (root / "config").mkdir(parents=True)
+        (root / "config" / "ironclaude.json").write_text(
+            json.dumps({"max_swap_used_gb": 42.5, "spawn_block_pressure_level": 3}))
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.setattr(config_mod, "_COMMANDER_ROOT", root)
+        monkeypatch.chdir(elsewhere)
+        cfg = config_mod.load_config()
+        assert cfg["max_swap_used_gb"] == 42.5
+        assert cfg["spawn_block_pressure_level"] == 3
+
+    def test_load_machines_config_default_is_cwd_independent(self, tmp_path, monkeypatch):
+        import ironclaude.config as config_mod
+        root = tmp_path / "commander"
+        (root / "config").mkdir(parents=True)
+        (root / "config" / "machines.yaml").write_text(
+            "machines:\n  - name: anchored\n    host: anchored\n    claude_path: /usr/bin/claude\n    repos:\n      - /opt/anchored\n")
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.setattr(config_mod, "_COMMANDER_ROOT", root)
+        monkeypatch.chdir(elsewhere)
+        machines = config_mod.load_machines_config()
+        assert [m["name"] for m in machines] == ["anchored"]
+        assert config_mod.default_machines_config_path() == str(root / "config" / "machines.yaml")
+
+    def test_shipped_config_prefers_claude_for_workers_and_graders(self):
+        shipped = Path(__file__).resolve().parents[1] / "config" / "ironclaude.json"
+        cfg = load_config(str(shipped))
+        roles = cfg["providers"]["roles"]
+        for role in ("worker", "grader"):
+            assert roles[role]["preferred"] == "claude"
+            assert roles[role]["clients"] == ["claude", "codex"]
+        assert cfg["max_swap_used_gb"] == 50
+        assert cfg["spawn_block_pressure_level"] == 4

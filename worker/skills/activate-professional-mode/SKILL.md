@@ -314,7 +314,7 @@ Call `<WRITE_INSTRUCTION_FILE>` for root `AGENTS.md` with the complete canonical
 
 9. **Advisor Fallback (advisor unavailable ≠ skip the advisor)**
    - Fire the advisor at natural discretionary points: before substantive work, when stuck, and before declaring done
-   - Call `run_codex_advisor_review` with the complete inline review packet, current `requester_model`, and `review_tier: "one-up"`; omission remains compatibility-only. The broker rejects any mismatch with provider-authenticated Codex turn metadata and applies its fixed `luna → terra → sol → astra` mapping (`gpt-<version>-luna → gpt-<version>-terra → gpt-<version>-sol → gpt-<version>-astra`) exactly once.
+   - Call `run_codex_advisor_review` with the complete inline review packet, current `requester_model`, and `review_tier: "one-up"` below the Opus class (from Luna or Terra) or `review_tier: "same"` from Sol, so the reviewer is one class up and capped at the Opus class; omission remains compatibility-only. The broker rejects any mismatch with provider-authenticated Codex turn metadata and applies its fixed `luna → terra → sol → astra` mapping (`gpt-<version>-luna → gpt-<version>-terra → gpt-<version>-sol → gpt-<version>-astra`) exactly once, so Astra is used only on explicit operator request.
    - Never run nested `codex exec` for normal advisor work or repeat an operator approval request for this brokered read-only review
    - Reconcile the review with evidence; never proceed unreviewed because an advisor command is unavailable
 
@@ -385,7 +385,7 @@ Call `<WRITE_INSTRUCTION_FILE>` for root `CLAUDE.md` with the complete compact i
 6. **Search Before Guessing** — After compaction, search episodic memory first. Use `ironclaude:search-conversations`.
 7. **Subagent Discipline** — One task, one deliverable, set max_turns. No orchestration in subagents.
 8. **No Sycophantic Responses** — No performative agreement; push back with evidence; verify corrections.
-9. **Advisor Fallback** — If the `advisor` tool is unavailable, spawn a top-tier subagent (`Agent`, `model=fable` if Fable is available else `model=opus`) to do the same adversarial review; never skip the advisor step.
+9. **Advisor Fallback** — If the `advisor` tool is unavailable, spawn a fresh Opus-class subagent (`Agent`, `model=opus`; `model=fable` only when the operator explicitly requests the top tier) to do the same adversarial review; never skip the advisor step.
 10. **No Workflow Avoidance Under Stage/Context Restrictions** — Plan/task artifacts on disk ARE the checkpoint; do not self-checkpoint. Do not offload read-only queries to the operator when Bash is stage-blocked; open an investigation PM loop.
 11. **Boy Scout Rule** — Never dismiss an evidence-backed defect because it is pre-existing. Clean it up when it is safe, relevant, and within authorized task scope; otherwise describe the finding, evidence, proposed cleanup scope, and risk, then ask permission before proceeding.
 
@@ -451,8 +451,8 @@ Call `<WRITE_INSTRUCTION_FILE>` for `.claude/rules/behavioral.md` with the compl
 
 9. **Advisor Fallback**
    - When the `advisor` tool returns unavailable, do NOT skip the advisor step or just reason it through yourself
-   - Spawn a top-tier subagent via the `Agent` tool (`model=fable` if Fable is available, else `model=opus`) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
-   - Client-aware: that is the Claude path; a Codex session calls `run_codex_advisor_review` with a complete inline packet, its current `requester_model`, and `review_tier: "one-up"` (omission is compatibility-only); the broker rejects any mismatch with provider-authenticated Codex turn metadata and owns the one-time `luna→terra→sol→astra` mapping (`gpt-<version>-luna→gpt-<version>-terra→gpt-<version>-sol→gpt-<version>-astra`) — see the `ironclaude:advisor-fallback` skill
+   - Spawn a fresh Opus-class subagent via the `Agent` tool (`model=opus`; `model=sonnet` from a Haiku session; `model=fable` only when the operator explicitly requests the top tier) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
+   - Client-aware: that is the Claude path; a Codex session calls `run_codex_advisor_review` with a complete inline packet, its current `requester_model`, and `review_tier: "one-up"` below the Opus class or `review_tier: "same"` from Sol (omission is compatibility-only); the broker rejects any mismatch with provider-authenticated Codex turn metadata and owns the one-time `luna→terra→sol→astra` mapping (`gpt-<version>-luna→gpt-<version>-terra→gpt-<version>-sol→gpt-<version>-astra`), so Astra is used only on explicit operator request — see the `ironclaude:advisor-fallback` skill
    - Weight its findings as you would the advisor's; "no advisor" means "use a subagent for the same effect," never "proceed unreviewed"
 
 10. **No Workflow Avoidance Under Stage/Context Restrictions**
@@ -490,7 +490,7 @@ For existing Claude files, semantically check both files together:
 | 6 | Search Before Guessing | Instructions to search episodic memory or conversation history after compaction |
 | 7 | Subagent Discipline | Focused prompts, max_turns, or no orchestration in subagents |
 | 8 | No Sycophantic Responses | Avoid performative agreement, push back with evidence, or verify corrections |
-| 9 | Advisor Fallback | Instructions to use the `Agent` tool with Fable if available else Opus instead of skipping advisor review |
+| 9 | Advisor Fallback | Instructions to use an `Agent`-tool subagent one class up, capped at the Opus class (the top tier only on explicit operator request), instead of skipping advisor review |
 | 10 | No Workflow Avoidance Under Stage/Context Restrictions | Instructions not to self-checkpoint or hand stage-blocked read-only work to the operator; open an investigation PM loop |
 | 11 | Boy Scout Rule | Instructions not to ignore evidence-backed pre-existing or adjacent defects; clean them up when within authorized task scope, ask permission before scope expansion, destructive action, or external-system effects after presenting finding/evidence/scope/risk, and record blocked or unsafe findings instead of suppressing them |
 | 12 | Recipient-Based Communication Profiles | Instructions to load `ironclaude:elements-of-style` for human-facing prose, load `ironclaude:write-lossless-ai-messages` for AI-directed natural language, select by destination rather than model, and preserve machine schemas and protected technical content exactly |
@@ -515,8 +515,8 @@ Concept 9 (Advisor Fallback):
 ```markdown
 N. **Advisor Fallback**
    - When the `advisor` tool returns unavailable, do NOT skip the advisor step or just reason it through yourself
-   - Spawn a top-tier subagent via the `Agent` tool (`model=fable` if Fable is available, else `model=opus`) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
-   - Client-aware: that is the Claude path; a Codex session calls `run_codex_advisor_review` with a complete inline packet, its current `requester_model`, and `review_tier: "one-up"` (omission is compatibility-only); the broker rejects any mismatch with provider-authenticated Codex turn metadata and owns the one-time `luna→terra→sol→astra` mapping (`gpt-<version>-luna→gpt-<version>-terra→gpt-<version>-sol→gpt-<version>-astra`) — see the `ironclaude:advisor-fallback` skill
+   - Spawn a fresh Opus-class subagent via the `Agent` tool (`model=opus`; `model=sonnet` from a Haiku session; `model=fable` only when the operator explicitly requests the top tier) with the same context and a focused, report-only adversarial-review prompt (task, change/decision, evidence, specific questions)
+   - Client-aware: that is the Claude path; a Codex session calls `run_codex_advisor_review` with a complete inline packet, its current `requester_model`, and `review_tier: "one-up"` below the Opus class or `review_tier: "same"` from Sol (omission is compatibility-only); the broker rejects any mismatch with provider-authenticated Codex turn metadata and owns the one-time `luna→terra→sol→astra` mapping (`gpt-<version>-luna→gpt-<version>-terra→gpt-<version>-sol→gpt-<version>-astra`), so Astra is used only on explicit operator request — see the `ironclaude:advisor-fallback` skill
    - Weight its findings as you would the advisor's; "no advisor" means "use a subagent for the same effect," never "proceed unreviewed"
 ```
 

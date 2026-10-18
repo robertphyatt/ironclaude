@@ -43,6 +43,7 @@ COMMANDS:
   show        Display a conversation in readable format
   stats       Show index statistics
   repair      Backfill indexing gaps in grown session files (run once after upgrade)
+  maintain    Reclaim disk space losslessly (slim index, compress archive, optional backup)
 
 Run 'episodic-memory <command> --help' for command-specific help.
 
@@ -60,7 +61,11 @@ EXAMPLES:
   episodic-memory show --format html conversation.jsonl > output.html
 
   # Repair indexing gaps (run once after upgrading)
-  episodic-memory repair`);
+  episodic-memory repair
+
+  # See what maintain would reclaim, then run it
+  episodic-memory maintain --dry-run
+  episodic-memory maintain`);
 }
 
 async function main() {
@@ -90,6 +95,10 @@ async function main() {
 
       case 'repair':
         await runScript(join(distDir, 'repair-cli.js'), args);
+        break;
+
+      case 'maintain':
+        await runScript(join(distDir, 'maintain-cli.js'), args);
         break;
 
       case '--help':

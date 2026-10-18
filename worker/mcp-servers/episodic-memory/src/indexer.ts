@@ -7,6 +7,8 @@ import { initEmbeddings, generateExchangeEmbedding } from './embeddings.js';
 import { summarizeConversation } from './summarizer.js';
 import { ConversationExchange } from './types.js';
 import { getArchiveDir, getExcludedProjects } from './paths.js';
+import { archiveExists, readArchiveText } from './archive-io.js';
+import { loadSettings, isMachineProject, isArchiveOnlyProject } from './settings.js';
 
 // Set max output tokens for Claude SDK (used by summarizer)
 process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = '20000';
@@ -17,7 +19,7 @@ EventEmitter.defaultMaxListeners = 20;
 
 function getFileLineCount(filePath: string): number {
   try {
-    return fs.readFileSync(filePath, 'utf-8').split('\n').length;
+    return readArchiveText(filePath).split('\n').length;
   } catch {
     return 0;
   }
@@ -70,10 +72,11 @@ export async function indexConversations(
   let conversationsProcessed = 0;
 
   const excludedProjects = getExcludedProjects();
+  const settings = loadSettings();
 
   for (const project of projects) {
     // Skip excluded projects
-    if (excludedProjects.includes(project)) {
+    if (excludedProjects.includes(project) || isMachineProject(project, settings) || isArchiveOnlyProject(project, settings)) {
       console.log(`\nSkipping excluded project: ${project}`);
       continue;
     }
@@ -112,8 +115,8 @@ export async function indexConversations(
       const archivePath = path.join(projectArchive, file);
 
       // Copy to archive
-      if (!fs.existsSync(archivePath)) {
-        fs.copyFileSync(sourcePath, archivePath);
+      if (!archiveExists(archivePath)) {
+        fs.copyFileSync(sourcePath, archivePath, fs.constants.COPYFILE_FICLONE);
         console.log(`  Archived: ${file}`);
       }
 
@@ -196,10 +199,11 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
   const ARCHIVE_DIR = getArchiveDir(); // Now uses paths.ts
   const projects = fs.readdirSync(PROJECTS_DIR);
   const excludedProjects = getExcludedProjects();
+  const settings = loadSettings();
   let found = false;
 
   for (const project of projects) {
-    if (excludedProjects.includes(project)) continue;
+    if (excludedProjects.includes(project) || isMachineProject(project, settings) || isArchiveOnlyProject(project, settings)) continue;
 
     const projectPath = path.join(PROJECTS_DIR, project);
     if (!fs.statSync(projectPath).isDirectory()) continue;
@@ -220,8 +224,8 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
       const archivePath = path.join(projectArchive, file);
 
       // Archive
-      if (!fs.existsSync(archivePath)) {
-        fs.copyFileSync(sourcePath, archivePath);
+      if (!archiveExists(archivePath)) {
+        fs.copyFileSync(sourcePath, archivePath, fs.constants.COPYFILE_FICLONE);
       }
 
       // Parse and summarize
@@ -272,6 +276,7 @@ export async function indexUnprocessed(concurrency: number = 1, noSummaries: boo
   const ARCHIVE_DIR = getArchiveDir(); // Now uses paths.ts
   const projects = fs.readdirSync(PROJECTS_DIR);
   const excludedProjects = getExcludedProjects();
+  const settings = loadSettings();
 
   type UnprocessedConv = {
     project: string;
@@ -287,7 +292,7 @@ export async function indexUnprocessed(concurrency: number = 1, noSummaries: boo
 
   // Collect all unprocessed conversations
   for (const project of projects) {
-    if (excludedProjects.includes(project)) continue;
+    if (excludedProjects.includes(project) || isMachineProject(project, settings) || isArchiveOnlyProject(project, settings)) continue;
 
     const projectPath = path.join(PROJECTS_DIR, project);
     if (!fs.statSync(projectPath).isDirectory()) continue;
@@ -313,8 +318,8 @@ export async function indexUnprocessed(concurrency: number = 1, noSummaries: boo
       fs.mkdirSync(projectArchive, { recursive: true });
 
       // Archive if needed
-      if (!fs.existsSync(archivePath)) {
-        fs.copyFileSync(sourcePath, archivePath);
+      if (!archiveExists(archivePath)) {
+        fs.copyFileSync(sourcePath, archivePath, fs.constants.COPYFILE_FICLONE);
       }
 
       // Parse and check — filter to only new exchanges for grown files

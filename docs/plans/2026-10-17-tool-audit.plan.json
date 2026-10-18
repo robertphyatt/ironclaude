@@ -1,0 +1,29 @@
+{
+  "name": "Claude and Codex tool audit per IronClaude role",
+  "goal": "Measure every tool and feature each IronClaude role gets on Claude and on Codex, classify each per role as needed, harmless, conflicting with IronClaude, or unknown, compare the two clients, and rank recommended changes.",
+  "requirements_file": "docs/plans/2026-10-17-tool-audit-design.md",
+  "design_file": "docs/plans/2026-10-17-tool-audit-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Audit and findings",
+      "description": "Per plan.md Task 1 Steps 1-7 over roles 1-20 (plan.md Roles list). No tests required: investigation only, no source change. Expected values are recorded. Never edit source, never write ~/.codex/config.toml, never start a live Brain, interactive worker, or the episodic summarizer SDK; broker measured via literal argv only, never the run_codex_advisor_review MCP tool. Build every one-shot argv from shipped functions or literal source argv; never retype flags.",
+      "allowed_files": [
+        "docs/plans/2026-10-17-tool-audit-design.md",
+        "docs/plans/2026-10-17-tool-audit.md",
+        "docs/plans/2026-10-17-tool-audit.plan.json",
+        "docs/plans/2026-10-17-tool-audit-findings.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Discover launch sites (A1): run plan.md Task 1 Step 1 commands verbatim (launch-sites.txt + skill-scripts.txt); triage every hit; map roles 1-19 to hits with file:line + exact argv; unmapped role = discovery failure (record, widen, never drop); add any new launch site as a role", "expected": "record rg=, line count, rgs=; every role mapped or recorded as discovery failure"},
+        {"description": "Codex surface (A3)", "command": "codex --version > /private/tmp/claude-502/audit/codex-version.txt 2>&1; echo \"v=$?\"; codex features list > /private/tmp/claude-502/audit/codex-features.txt 2>&1; echo \"f=$?\"; codex --help > /private/tmp/claude-502/audit/codex-help.txt 2>&1; echo \"h=$?\"; codex exec --help > /private/tmp/claude-502/audit/codex-exec-help.txt 2>&1; echo \"eh=$?\"; rg -n -i -e tool -e debug /private/tmp/claude-502/audit/codex-help.txt /private/tmp/claude-502/audit/codex-exec-help.txt", "expected": "record each rc; bare features list labelled 'user-config state'; any tool-listing subcommand recorded"},
+        {"description": "Claude one-shot (A2) roles 1,3,5,8 + Claude control per plan.md Task 1 Step 3: (a) init run 'Reply with ok.' (+one-field schema where argv takes --json-schema) -> claude-<role>-init.json, extract system/init tools/mcp_servers/model (JSON array or stream-json lines); (b) self-report run with self-report prompt + schema -> claude-<role>-self.json", "expected": "per role init list and self-report side by side; disagreement -> classify by self-report + evidence caveat; init MISSING / Fable unavailable recorded as measurement failure"},
+        {"description": "Codex one-shot (A3) roles 2,4,6,7 + Codex control per plan.md Task 1 Step 4: (a) `codex <role -c/--ignore flags> features list` -> codex-features-<role>.txt (flag rejected -> record rc + caveat); (b) role's real argv with self-report prompt (+schema except broker; broker in fresh mktemp -d) -> codex-<role>.jsonl, final agent_message", "expected": "per role effective features list + self-reported tools (labelled self-report)"},
+        {"description": "Assessed roles (A4) 10-19 per plan.md Task 1 Step 5: tool surface from source (allowed/disallowed tools, permission mode, sandbox, MCP, hooks, features, setting sources), marked not measured with file:line"},
+        {"description": "Write docs/plans/2026-10-17-tool-audit-findings.md sections 1-5 per plan.md Task 1 Step 6 (inventory roles 1-20 + out-of-scope; evidence; per-role matrices; Claude-vs-Codex comparison incl. advisor, effort, 10 Codex features, batch grading; ranked recommendations)"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-17-tool-audit-design.md docs/plans/2026-10-17-tool-audit.md docs/plans/2026-10-17-tool-audit.plan.json docs/plans/2026-10-17-tool-audit-findings.md; git -C /Users/roberthyatt/Code/ironclaude diff --cached --name-status", "expected": "exactly 4 A lines naming these paths"}
+      ]
+    }
+  ]
+}

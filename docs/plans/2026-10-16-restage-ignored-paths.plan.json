@@ -1,0 +1,28 @@
+{
+  "name": "Re-stage gitignored paths",
+  "goal": "Make the cumulative re-stage script stage plan files under gitignored directories without ever newly tracking an ignored file.",
+  "requirements_file": "docs/plans/2026-10-16-restage-ignored-paths-design.md",
+  "design_file": "docs/plans/2026-10-16-restage-ignored-paths-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Force-stage only already-tracked paths; skip ignored untracked ones",
+      "description": "TDD. Text and code blocks verbatim in docs/plans/2026-10-16-restage-ignored-paths.md Task 1 Steps 1-4; apply exactly. Invariants: literal absolute paths; git -C /Users/roberthyatt/Code/ironclaude; pytest PYTHONUNBUFFERED=1 via commander/.venv/bin/python from /Users/roberthyatt/Code/ironclaude/commander; never stash/commit/push; docs need git add -f; SKILL.md Python block keeps 3-space indent + BEGIN/END markers; execution subagents must not use the Skill tool. Verified: SKILL.md staging loop :673-677 (tracked set from git ls-files -z incl. newly staged); prose line :622 'optional missing files are skipped. Validate every entry before staging and'; hook test helpers git() :40-43, run_snippet() :70-76, heredoc closes with 'PY' at :139; Makefile test-hooks :40-44 runs worker/hooks/tests/test-*.sh; measured 2026-10-16: plain git add of an already-staged docs/plans file exited 1 ('paths are ignored ... docs').",
+      "allowed_files": [
+        "worker/hooks/tests/test-skill-handoffs-restaging.sh",
+        "worker/skills/executing-plans/SKILL.md",
+        "docs/plans/2026-10-16-restage-ignored-paths-design.md",
+        "docs/plans/2026-10-16-restage-ignored-paths.md",
+        "docs/plans/2026-10-16-restage-ignored-paths.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Insert the plan.md Task 1 Step 1 Python block (gitignored-directory scenario) into worker/hooks/tests/test-skill-handoffs-restaging.sh directly before the final 'PY' line, column 0."},
+        {"description": "RED run.", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-skill-handoffs-restaging.sh", "expected": "Existing PASS lines, then AssertionError at 'assert result.returncode == 0' with stderr containing 'paths are ignored by one of your .gitignore files'; non-zero exit; record measured."},
+        {"description": "GREEN per plan.md Task 1 Step 2: replace SKILL.md staging loop :673-677 with the verbatim tracked/-f, check-ignore skip, plain-add loop (3-space indent); replace prose line :622 with the verbatim three lines."},
+        {"description": "GREEN + marker count + all hook tests + commander suite.", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-skill-handoffs-restaging.sh > /private/tmp/claude-502/ri-hook.out 2>&1; echo \"hook=$?\"; tail -n 2 /private/tmp/claude-502/ri-hook.out; grep -c \"BEGIN EXACT ALLOWED FILES RESTAGING\" /Users/roberthyatt/Code/ironclaude/worker/skills/executing-plans/SKILL.md; make -C /Users/roberthyatt/Code/ironclaude test-hooks > /private/tmp/claude-502/ri-hooks-all.out 2>&1; echo \"hooks_all=$?\"; tail -n 2 /private/tmp/claude-502/ri-hooks-all.out; cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/ -q > /private/tmp/claude-502/ri-suite.out 2>&1; echo \"suite=$?\"; tail -n 3 /private/tmp/claude-502/ri-suite.out", "expected": "hook=0 with last line 'PASS gitignored allowed files: tracked staged with -f, never-tracked skipped with notice, unlisted untouched'; count 1; hooks_all=0; suite=0 (0 failed). Any other failure must be shown pre-existing via a temporary git worktree of HEAD (never git stash) or fixed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/skills/executing-plans/SKILL.md worker/hooks/tests/test-skill-handoffs-restaging.sh; git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-16-restage-ignored-paths-design.md docs/plans/2026-10-16-restage-ignored-paths.md docs/plans/2026-10-16-restage-ignored-paths.plan.json", "expected": "No output."}
+      ]
+    }
+  ]
+}

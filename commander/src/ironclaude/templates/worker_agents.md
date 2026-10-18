@@ -49,7 +49,7 @@
 
 9. **Advisor Fallback (advisor unavailable ≠ skip the advisor)**
    - Fire the advisor at natural discretionary points: before substantive work, when stuck, and before declaring done
-   - Call `run_codex_advisor_review` with the complete inline review packet, current `requester_model`, and `review_tier: "one-up"`; omission remains compatibility-only. The broker rejects any mismatch with provider-authenticated Codex turn metadata and applies its fixed `luna → terra → sol → astra` mapping (`gpt-<version>-luna → gpt-<version>-terra → gpt-<version>-sol → gpt-<version>-astra`) exactly once.
+   - Call `run_codex_advisor_review` with the complete inline review packet, current `requester_model`, and `review_tier: "one-up"` below the Opus class (from Luna or Terra) or `review_tier: "same"` from Sol, so the reviewer is one class up and capped at the Opus class; omission remains compatibility-only. The broker rejects any mismatch with provider-authenticated Codex turn metadata and applies its fixed `luna → terra → sol → astra` mapping (`gpt-<version>-luna → gpt-<version>-terra → gpt-<version>-sol → gpt-<version>-astra`) exactly once, so Astra is used only on explicit operator request.
    - Never run nested `codex exec` for normal advisor work or repeat an operator approval request for this brokered read-only review
    - Reconcile the review with evidence; never proceed unreviewed because an advisor command is unavailable
 

@@ -5,6 +5,25 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
+// Fresh summarizer calls must not leave a session file behind (operator, 2026-10-12).
+// SDK 0.1.42 has no persistSession option, and its vendored cli.js lacks the flag, so
+// fresh calls run the system `claude` (which has --no-session-persistence) instead.
+export function resolveSystemClaude(): string | null {
+  const override = process.env.EPISODIC_MEMORY_CLAUDE_PATH;
+  const candidates = override
+    ? [override]
+    : (process.env.PATH || '').split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, 'claude'));
+  for (const candidate of candidates) {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // Not here; try the next PATH entry.
+    }
+  }
+  return null;
+}
+
 type BackendName = 'ollama' | 'openai' | 'haiku';
 
 interface HooksConfig {
@@ -285,6 +304,11 @@ export async function callClaude(prompt: string, sessionId?: string, useFallback
   const fallbackModel = process.env.EPISODIC_MEMORY_API_MODEL_FALLBACK || 'sonnet';
   const model = useFallback ? fallbackModel : primaryModel;
 
+  const systemClaude = sessionId ? null : resolveSystemClaude();
+  if (!sessionId && !systemClaude) {
+    console.warn('summarizer: no system claude found on PATH; fresh call uses the bundled CLI and may persist a session');
+  }
+
   for await (const message of query({
     prompt,
     options: {
@@ -295,7 +319,12 @@ export async function callClaude(prompt: string, sessionId?: string, useFallback
       // Don't override systemPrompt when resuming - it uses the original session's prompt
       // Instead, the prompt itself should provide clear instructions
       ...(sessionId ? {} : {
-        systemPrompt: 'Write concise, factual summaries. Output ONLY the summary - no preamble, no "Here is", no "I will". Your output will be indexed directly.'
+        systemPrompt: 'Write concise, factual summaries. Output ONLY the summary - no preamble, no "Here is", no "I will". Your output will be indexed directly.',
+        // The resume path keeps persistence: it needs the session it resumes.
+        ...(systemClaude ? {
+          pathToClaudeCodeExecutable: systemClaude,
+          extraArgs: { 'no-session-persistence': null },
+        } : {})
       })
     } as any
   })) {

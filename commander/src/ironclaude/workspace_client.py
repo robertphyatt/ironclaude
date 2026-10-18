@@ -17,6 +17,8 @@ _COMMANDS = frozenset({
     "allocate", "bind", "finalize", "abandon", "reconcile", "cleanup", "sync", "reap",
     "reap-orphans", "resolve-orphan", "configure-shared-resources", "list-shared-resources",
     "list-surfaced-orphans",
+    "begin-handoff", "transfer-handoff", "finish-handoff", "handoff-status",
+    "release-handoff", "reap-stale-mutations", "finish-handoff-after-target",
 })
 
 
@@ -255,3 +257,28 @@ class WorkspaceClient:
 
     def list_surfaced_orphans(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
         return self._invoke("list-surfaced-orphans", payload, **transport)
+
+    def begin_handoff(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
+        return self._invoke("begin-handoff", payload, **transport)
+
+    def transfer_handoff(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
+        return self._invoke("transfer-handoff", payload, **transport)
+
+    def finish_handoff(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
+        return self._invoke("finish-handoff", payload, **transport)
+
+    def handoff_status(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
+        """Read held generation after uncertain transport; callers must not replay transfer."""
+        return self._invoke("handoff-status", payload, **transport)
+
+    def release_handoff(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
+        """Finish a source hold while the source still owns the assignment."""
+        return self._invoke("release-handoff", payload, **transport)
+
+    def reap_stale_mutations(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
+        """Startup sweep: reap workspace mutation claims whose owner process is proved dead."""
+        return self._invoke("reap-stale-mutations", payload, **transport)
+
+    def finish_handoff_after_target(self, payload: dict[str, Any], **transport: Any) -> dict[str, Any]:
+        """H6b: finish while the target owns the assignment; HEAD may fast-forward from the grant."""
+        return self._invoke("finish-handoff-after-target", payload, **transport)

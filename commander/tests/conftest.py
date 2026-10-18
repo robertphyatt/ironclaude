@@ -251,6 +251,10 @@ def _isolate_fable_state(tmp_path, monkeypatch):
     )
 
 
+# The fixture Codex models every test sees in $CODEX_HOME/models_cache.json.
+FIXTURE_CODEX_MODELS = ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra")
+
+
 @pytest.fixture(autouse=True)
 def _redirect_home(tmp_path, monkeypatch):
     """Point $HOME at a per-test fake home.
@@ -260,7 +264,7 @@ def _redirect_home(tmp_path, monkeypatch):
 
     IRONCLAUDE_HOME is deliberately NOT set: nothing reads it until paths.py
     exists (step 3), and paths.home() will fall back to Path.home(), which
-    honors HOME.
+    honors HOME. CODEX_HOME holds only the fixture models_cache.json.
     """
     fake_home = tmp_path / "home"
     fake_home.mkdir(exist_ok=True)
@@ -268,6 +272,16 @@ def _redirect_home(tmp_path, monkeypatch):
         "[user]\n\tname = IronClaude Tests\n\temail = tests@ironclaude.invalid\n"
     )
     monkeypatch.setenv("HOME", str(fake_home))
+    # R14: CodexBrainClient reads $CODEX_HOME/config.toml (else ~/.codex); a developer's
+    # CODEX_HOME must not leak their real Codex config or installed models. It points at a
+    # per-test directory whose only file is a fixture models_cache.json, so the Codex family-word
+    # defaults (design 2026-10-17 v120-completeness R2) resolve deterministically.
+    import json as _json
+    codex_home = tmp_path / "ic-codex-home"
+    codex_home.mkdir(exist_ok=True)
+    (codex_home / "models_cache.json").write_text(_json.dumps(
+        {"models": [{"slug": slug} for slug in FIXTURE_CODEX_MODELS]}))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
     return fake_home
 
 
@@ -307,3 +321,18 @@ def base_config():
         }
 
     return make_config
+
+
+@pytest.fixture(autouse=True)
+def _block_fast_model_children(monkeypatch):
+    """Never spawn a real claude/codex fast-model child from the suite. With the hooks
+    config absent in tests (see _redirect_home), the Commander default backend is the
+    Haiku-class fast model; the stub fails like an unavailable model, so the production
+    fail-open path runs. Tests of the helper override _run_child themselves."""
+    from ironclaude import fast_model
+
+    def _unavailable(argv, *, input_text, timeout, env):
+        import subprocess as _subprocess
+        return _subprocess.CompletedProcess(argv, 1, "", "fast model disabled in tests")
+
+    monkeypatch.setattr(fast_model, "_run_child", _unavailable)

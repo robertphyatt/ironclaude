@@ -103,6 +103,7 @@ class TestCallLocalGrader:
     def test_successful_grading(self, tools, ollama_config):
         tools._ollama_config = None
         tools._ollama_config_path = ollama_config
+        tools._local_grader._config_path = ollama_config
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "response": '{"grade": "A", "approved": true, "feedback": "Well-formed objective"}'
@@ -151,6 +152,7 @@ class TestCallLocalGrader:
     def test_http_error_both_urls_returns_infrastructure_error(self, tools, ollama_config):
         tools._ollama_config = None
         tools._ollama_config_path = ollama_config
+        tools._local_grader._config_path = ollama_config
         import requests as req_mod
         error_resp = MagicMock()
         error_resp.raise_for_status.side_effect = req_mod.HTTPError("500 Server Error")
@@ -161,6 +163,7 @@ class TestCallLocalGrader:
     def test_both_urls_unreachable(self, tools, ollama_config):
         tools._ollama_config = None
         tools._ollama_config_path = ollama_config
+        tools._local_grader._config_path = ollama_config
         import requests as req_mod
         with patch("requests.post", side_effect=req_mod.ConnectionError("refused")):
             result = tools._call_local_grader("sys", "usr", GRADE_SCHEMA)
@@ -170,6 +173,7 @@ class TestCallLocalGrader:
     def test_timeout_returns_infrastructure_error(self, tools, ollama_config):
         tools._ollama_config = None
         tools._ollama_config_path = ollama_config
+        tools._local_grader._config_path = ollama_config
         import requests as req_mod
         with patch("requests.post", side_effect=req_mod.Timeout("timed out")) as mock_post:
             result = tools._call_local_grader("sys", "usr", GRADE_SCHEMA)
@@ -179,6 +183,7 @@ class TestCallLocalGrader:
     def test_malformed_response_missing_response_field(self, tools, ollama_config):
         tools._ollama_config = None
         tools._ollama_config_path = ollama_config
+        tools._local_grader._config_path = ollama_config
         mock_response = MagicMock()
         mock_response.json.return_value = {"model": "gemma4", "done": True}
         mock_response.raise_for_status = MagicMock()
@@ -190,6 +195,7 @@ class TestCallLocalGrader:
     def test_non_json_response_content(self, tools, ollama_config):
         tools._ollama_config = None
         tools._ollama_config_path = ollama_config
+        tools._local_grader._config_path = ollama_config
         mock_response = MagicMock()
         mock_response.json.return_value = {"response": "This is not JSON at all"}
         mock_response.raise_for_status = MagicMock()
@@ -198,9 +204,11 @@ class TestCallLocalGrader:
         assert result["infrastructure_error"] is True
         assert "non-json" in result["error_detail"].lower()
 
-    def test_config_file_missing(self, tools, tmp_path):
-        """Missing config file falls back to localhost defaults (no crash); grading still works."""
-        tools._local_grader._config_path = str(tmp_path / "nonexistent.json")
+    def test_ollama_backend_without_url_uses_localhost(self, tools, tmp_path):
+        """Ollama backend with no url falls back to localhost defaults (no crash); grading still works."""
+        ollama_only = tmp_path / "ollama.json"
+        ollama_only.write_text(json.dumps({"backend": "ollama"}))
+        tools._local_grader._config_path = str(ollama_only)
         tools._local_grader._client = None
         mock_response = MagicMock()
         mock_response.json.return_value = {
@@ -230,6 +238,7 @@ class TestCallLocalGrader:
     def test_json_missing_required_fields(self, tools, ollama_config):
         tools._ollama_config = None
         tools._ollama_config_path = ollama_config
+        tools._local_grader._config_path = ollama_config
         mock_response = MagicMock()
         mock_response.json.return_value = {"response": '{"grade": "A"}'}
         mock_response.raise_for_status = MagicMock()
@@ -241,6 +250,7 @@ class TestCallLocalGrader:
     def test_think_tags_stripped_inline(self, tools, ollama_config):
         tools._ollama_config = None
         tools._ollama_config_path = ollama_config
+        tools._local_grader._config_path = ollama_config
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "response": '<think>reasoning here</think>{"grade": "A", "approved": true, "feedback": "ok"}'
@@ -254,6 +264,7 @@ class TestCallLocalGrader:
     def test_multiline_think_tags_stripped(self, tools, ollama_config):
         tools._ollama_config = None
         tools._ollama_config_path = ollama_config
+        tools._local_grader._config_path = ollama_config
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "response": '<think>\nLine 1 of reasoning\nLine 2 of reasoning\n</think>{"grade": "B", "approved": true, "feedback": "ok"}'
@@ -267,6 +278,7 @@ class TestCallLocalGrader:
     def test_options_in_payload(self, tools, ollama_config):
         tools._ollama_config = None
         tools._ollama_config_path = ollama_config
+        tools._local_grader._config_path = ollama_config
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "response": '{"grade": "A", "approved": true, "feedback": "ok"}'
@@ -283,6 +295,7 @@ class TestCallLocalGrader:
         """Verify raw response body appears in warning log when JSON parsing fails."""
         tools._ollama_config = None
         tools._ollama_config_path = ollama_config
+        tools._local_grader._config_path = ollama_config
         mock_response = MagicMock()
         mock_response.json.return_value = {"response": "not json content here"}
         mock_response.raise_for_status = MagicMock()
@@ -297,6 +310,7 @@ class TestCallLocalGrader:
         """After think-tag stripping, remaining text is non-JSON → infrastructure_error."""
         tools._ollama_config = None
         tools._ollama_config_path = ollama_config
+        tools._local_grader._config_path = ollama_config
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "response": "<think>some reasoning</think>not valid json at all"
@@ -348,8 +362,8 @@ class TestP0SendToWorkerRouting:
         assert isinstance(result, dict)
         assert "error" in result
 
-    def test_send_to_worker_infrastructure_error_escalates_to_opus(self, tools, registry, mock_tmux):
-        """Infrastructure error from Ollama escalates to Opus grader for send_to_worker."""
+    def test_send_to_worker_infrastructure_error_escalates_to_sonnet(self, tools, registry, mock_tmux):
+        """Infrastructure error from Ollama escalates to the Sonnet class for send_to_worker."""
         registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
         tools._call_local_grader = MagicMock(return_value={
             "infrastructure_error": True,
@@ -362,6 +376,7 @@ class TestP0SendToWorkerRouting:
         result = tools.send_to_worker("w1", "How is the design going?")
         tools._call_local_grader.assert_called_once()
         tools._call_grader.assert_called_once()
+        assert tools._call_grader.call_args.kwargs.get("tier") == "sonnet"
 
 
 CONFIDENCE_GRADE_SCHEMA = {
@@ -407,8 +422,8 @@ class TestP1SpawnWorkerHybrid:
         assert isinstance(result, dict)
         assert "error" in result
 
-    def test_medium_confidence_escalates_to_opus(self, tools, registry, mock_tmux):
-        """Medium confidence triggers Opus escalation."""
+    def test_medium_confidence_escalates_to_sonnet(self, tools, registry, mock_tmux):
+        """Medium confidence triggers Sonnet-class escalation."""
         self._setup_spawn(tools, mock_tmux)
         tools._call_local_grader = MagicMock(return_value={
             "grade": "B", "approved": True, "feedback": "Probably ok",
@@ -418,9 +433,10 @@ class TestP1SpawnWorkerHybrid:
         result = tools.spawn_worker("w1", "claude-sonnet", "/tmp/repo", "Implement X")
         tools._call_local_grader.assert_called_once()
         tools._call_grader.assert_called_once()
+        assert tools._call_grader.call_args.kwargs.get("tier") == "sonnet"
 
-    def test_low_confidence_escalates_to_opus(self, tools, registry, mock_tmux):
-        """Low confidence triggers Opus escalation."""
+    def test_low_confidence_escalates_to_sonnet(self, tools, registry, mock_tmux):
+        """Low confidence triggers Sonnet-class escalation."""
         self._setup_spawn(tools, mock_tmux)
         tools._call_local_grader = MagicMock(return_value={
             "grade": "C", "approved": False, "feedback": "Unclear",
@@ -429,6 +445,7 @@ class TestP1SpawnWorkerHybrid:
         _mock_grader_approve(tools)
         tools.spawn_worker("w1", "claude-sonnet", "/tmp/repo", "Implement X")
         tools._call_grader.assert_called_once()
+        assert tools._call_grader.call_args.kwargs.get("tier") == "sonnet"
 
     def test_missing_confidence_escalates(self, tools, registry, mock_tmux):
         """Missing confidence field triggers Opus escalation."""
@@ -439,6 +456,7 @@ class TestP1SpawnWorkerHybrid:
         _mock_grader_approve(tools)
         tools.spawn_worker("w1", "claude-sonnet", "/tmp/repo", "Implement X")
         tools._call_grader.assert_called_once()
+        assert tools._call_grader.call_args.kwargs.get("tier") == "sonnet"
 
     def test_invalid_confidence_escalates(self, tools, registry, mock_tmux):
         """Invalid confidence value triggers Opus escalation."""
@@ -450,6 +468,7 @@ class TestP1SpawnWorkerHybrid:
         _mock_grader_approve(tools)
         tools.spawn_worker("w1", "claude-sonnet", "/tmp/repo", "Implement X")
         tools._call_grader.assert_called_once()
+        assert tools._call_grader.call_args.kwargs.get("tier") == "sonnet"
 
     def test_ollama_failure_escalates(self, tools, registry, mock_tmux):
         """Ollama infrastructure error escalates to Opus."""
@@ -463,6 +482,7 @@ class TestP1SpawnWorkerHybrid:
         })
         result = tools.spawn_worker("w1", "claude-sonnet", "/tmp/repo", "Implement X")
         tools._call_grader.assert_called_once()
+        assert tools._call_grader.call_args.kwargs.get("tier") == "sonnet"
 
     def test_configurable_threshold_medium(self, tools, registry, mock_tmux):
         """When threshold is 'medium', medium confidence skips Opus."""
@@ -578,6 +598,7 @@ class TestP1SpawnWorkersBatch:
         assert tools._call_local_grader.call_count == 3
         # _call_grader called once (batch for 2 uncertain)
         tools._call_grader.assert_called_once()
+        assert tools._call_grader.call_args.kwargs.get("tier") == "sonnet"
         # All 3 results present
         assert len(results) == 3
 
@@ -620,6 +641,7 @@ class TestP1SpawnWorkersBatch:
 
         assert tools._call_local_grader.call_count == 2
         tools._call_grader.assert_called_once()
+        assert tools._call_grader.call_args.kwargs.get("tier") == "sonnet"
         call_kwargs = tools._call_grader.call_args
         assert call_kwargs[1].get("batch") is True or (len(call_kwargs[0]) >= 3 and call_kwargs[0][2] is True)
         assert len(results) == 2
@@ -639,6 +661,7 @@ class TestUnchangedBehavior:
             result = tools.approve_plan("w1", "Plan looks good")
 
         tools._call_grader.assert_called_once()
+        assert tools._call_grader.call_args.kwargs.get("tier") is None
         tools._call_local_grader.assert_not_called()
 
     def test_reject_plan_calls_neither_grader(self, tools, registry, mock_tmux):
@@ -876,14 +899,15 @@ def test_grade_strips_leaked_special_tokens(tmp_path):
 
 def test_message_path_graders_drop_hardcoded_timeout_override():
     """The two message-path grader construction sites must not hardcode timeout=15;
-    they honor the resolved config timeout instead (LocalGrader(keep_alive="30m"))."""
+    they honor the resolved config timeout instead (LocalGrader(keep_alive="30m"); main.py
+    also passes commander_config for the Haiku-class fallback's client order)."""
     src = Path(__file__).resolve().parents[1] / "src" / "ironclaude"
     brain_client = (src / "brain_client.py").read_text()
     main = (src / "main.py").read_text()
     assert "LocalGrader(timeout=15" not in brain_client
     assert "LocalGrader(timeout=15" not in main
     assert 'LocalGrader(keep_alive="30m")' in brain_client
-    assert 'LocalGrader(keep_alive="30m")' in main
+    assert 'LocalGrader(keep_alive="30m", commander_config=self.config)' in main
 
 
 def test_grader_no_override_honors_config_timeout(tmp_path):
@@ -1018,3 +1042,44 @@ def test_grade_ollama_backend_ignores_thinking_flag(tmp_path):
     payload = mock_post.call_args[1]["json"]
     assert "reasoning_effort" not in payload
     assert "chat_template_kwargs" not in payload
+
+
+class TestPerCallClasses:
+    """Design T1/T3: each call site asks for its model class; backups step up one class."""
+
+    def test_send_keys_infrastructure_error_steps_up_to_sonnet(self, tools, registry, mock_tmux):
+        """C9: an unavailable Haiku-class grade steps up to the Sonnet class, not Opus."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        tools._call_local_grader = MagicMock(return_value={
+            "infrastructure_error": True, "error_detail": "fast model unavailable"})
+        tools._call_grader = MagicMock(return_value={"grade": "A", "approved": True, "feedback": "ok"})
+        with patch("ironclaude.orchestrator_mcp._load_avatar_skill", return_value="mock avatar"):
+            tools.send_keys_to_worker("w1", list("This is a long message that exceeds twenty characters"))
+        tools._call_grader.assert_called_once()
+        assert tools._call_grader.call_args.kwargs.get("tier") == "sonnet"
+
+    def test_send_keys_haiku_answer_does_not_escalate(self, tools, registry, mock_tmux):
+        """C9 positive control: a Haiku-class answer is final; no grader call."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        _mock_local_grader_approve(tools)
+        _mock_grader_approve(tools)
+        with patch("ironclaude.orchestrator_mcp._load_avatar_skill", return_value="mock avatar"):
+            tools.send_keys_to_worker("w1", list("This is a long message that exceeds twenty characters"))
+        assert tools._call_local_grader.call_args.kwargs.get("tier", "haiku") == "haiku"
+        tools._call_grader.assert_not_called()
+
+    def test_worker_health_asks_the_sonnet_class(self, tools, registry, mock_tmux):
+        """C11: worker health is a Sonnet-level call."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        mock_tmux.capture_pane.return_value = "Editing src/main.py\n"
+        tools._call_local_grader = MagicMock(return_value={
+            "healthy": True, "diagnosis": "ok", "severity": "none"})
+        tools.evaluate_worker_health("w1")
+        assert tools._call_local_grader.call_args.kwargs.get("tier") == "sonnet"
+
+    def test_send_to_worker_first_choice_is_haiku_class(self, tools, registry, mock_tmux):
+        """C8 positive control: the first-choice call stays at the Haiku class."""
+        registry.register_worker("w1", "claude-sonnet", "ic-w1", repo="/tmp")
+        _mock_local_grader_approve(tools)
+        tools.send_to_worker("w1", "How is the design going?")
+        assert tools._call_local_grader.call_args.kwargs.get("tier", "haiku") == "haiku"

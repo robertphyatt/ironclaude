@@ -29,6 +29,7 @@ import os
 import queue
 import re
 import selectors
+import shlex
 import subprocess
 import sys
 import threading
@@ -36,21 +37,22 @@ import time
 import uuid
 from pathlib import Path
 
-from ironclaude.config import DEFAULTS, effort_for_tier
+from ironclaude import paths
+from ironclaude.config import effort_for_tier
+from ironclaude.codex_brain_tool_trim import brain_tool_trim_overrides
+from ironclaude.provider_config import CODEX_MODEL_RE, CODEX_TIER_WORDS, resolve_local_codex_model
 
 logger = logging.getLogger(__name__)
-
-# Codex tier->model map — single source of truth is config.DEFAULTS. A tier name
-# (haiku/sonnet/opus/fable) resolves to its codex model; a value already in codex-model
-# form passes through, so BRAIN_MODEL may be a tier OR a literal codex model.
-_CODEX_TIER_MODELS = DEFAULTS["providers"]["clients"]["codex"]["models"]
 
 # The GATED_TOOLS hook distinguishes the Brain from workers by IC_ROLE. The Claude
 # Brain sets this in-process (brain_client.py); the codex Brain is a subprocess, so the
 # marker is scoped to its spawn — mutating the daemon's own environment would leak
 # IC_ROLE=brain into later worker spawns, which must be IC_ROLE=worker.
 _BRAIN_ROLE_ENV = {"IC_ROLE": "brain"}
-_BRAIN_GATE_ROOT = Path("/tmp/ic/codex-brain-gate")
+# R8: brain-hooks-canary.sh (a UserPromptSubmit Brain hook) writes this marker when the
+# Brain's turn starts; without it the Brain's restriction hooks are untrusted or missing.
+_HOOKS_CANARY_MARKER = "hooks-live"
+_HOOKS_CANARY_TIMEOUT = 30.0
 
 # Optional Brain MCP servers. Claude registers these when their files are present
 # (brain_client.py:279-286); codex reaches them only through -c overrides.
@@ -133,8 +135,19 @@ _RUNTIME_PREFLIGHT_REASONS = frozenset({
 # (:154). Approved codex commands run UNSANDBOXED, so the metachar/`-c `/amend blocks are
 # load-bearing. Returns True ONLY for an allowlisted git command with no shell metacharacters.
 _SHELL_METACHARACTERS = (";", "|", "&", "&&", "||", "$(", "`", "\n", "\r", ">", "<", "$")
+# The shell expands these after the check approves the command (design 2026-10-18
+# v120-security-fixes-remediation): a brace group with , or .. ({--output=x,}) and a glob that
+# matches a file named like an option. @{u} and HEAD@{1} do not expand and stay allowed.
+_EXPANDING_BRACE_RE = re.compile(r"\{[^{}]*(?:,|\.\.)[^{}]*\}")
+_GLOB_CHARACTERS = ("*", "?", "[")
 _GIT_ALLOWED_COMMANDS = frozenset(
     {"log", "diff", "show", "status", "ls-files", "blame", "branch", "add", "commit"}
+)
+# git branch flags that delete, rename, copy or force. With any of them, or with an argument that is
+# not a flag (a branch name), git branch changes branches, so only listing forms pass (design
+# 2026-10-18 v120-security-fixes 1c). Same set as BrainClient.GIT_BRANCH_CHANGE_FLAGS (a test compares).
+_GIT_BRANCH_CHANGE_FLAGS = frozenset(
+    {"-d", "-D", "-m", "-M", "-c", "-C", "-f", "--delete", "--move", "--copy", "--force"}
 )
 
 
@@ -144,6 +157,8 @@ def _git_command_allowed(cmd: str) -> bool:
     cmd = cmd.strip()
     if any(c in cmd for c in _SHELL_METACHARACTERS):
         return False
+    if _EXPANDING_BRACE_RE.search(cmd) or any(c in cmd for c in _GLOB_CHARACTERS):
+        return False
     if "-c " in cmd:
         return False
     if not cmd.startswith("git "):
@@ -152,7 +167,25 @@ def _git_command_allowed(cmd: str) -> bool:
     subcommand = parts[1] if len(parts) > 1 else ""
     if subcommand not in _GIT_ALLOWED_COMMANDS:
         return False
-    if subcommand == "commit" and "--amend" in cmd:
+    # Parse the arguments the way the shell passes them to git, so a quoted or
+    # backslash-escaped option ("--output=x", --\output=x, --am""end) is seen as git sees it.
+    try:
+        args = shlex.split(cmd)[2:]
+    except ValueError:
+        return False
+    # --output=<file> / --output <file> writes a file (design 2026-10-18 v120-security-fixes 1b)
+    if any(arg == "--output" or arg.startswith("--output=") for arg in args):
+        return False
+    # git branch: listing forms only, the brain-orchestrator-guard.sh rule (1c)
+    if subcommand == "branch" and any(
+        not arg.startswith("-") or arg in _GIT_BRANCH_CHANGE_FLAGS for arg in args
+    ):
+        return False
+    # The substring check stays; the parsed-args check also catches quoted forms such as --am""end.
+    if subcommand == "commit" and (
+        "--amend" in cmd
+        or any(arg == "--amend" or arg.startswith("--amend=") for arg in args)
+    ):
         return False
     return True
 
@@ -166,7 +199,7 @@ class CodexBrainClient:
         self,
         timeout_seconds: int = 600,
         operator_name: str = "Operator",
-        model: str = "gpt-5.6-terra",
+        model: str = "sonnet",
         effort_level: str = "high",
         on_fable_unavailable_transition=None,
         effort_levels: dict | None = None,
@@ -255,9 +288,15 @@ class CodexBrainClient:
         return params
 
     def _resolve_model(self) -> str:
-        """Map a tier name (haiku/sonnet/opus/fable) to its codex model; pass a value
-        already in codex-model form through unchanged."""
-        return _CODEX_TIER_MODELS.get(self._model, self._model)
+        """Tier name (haiku/sonnet/opus/fable) -> its Codex family word. A family word resolves to
+        the newest installed model of that family on this Mac; an explicit gpt-<version>-<word>
+        slug is used as-is (design 2026-10-17 v120-completeness R2). Raises CodexModelUnavailable
+        (a ValueError, so start() fails visibly) when no model of the family is installed. Any
+        other value passes through unchanged."""
+        value = CODEX_TIER_WORDS.get(self._model, self._model)
+        if value in CODEX_TIER_WORDS.values():
+            return resolve_local_codex_model(value)
+        return value
 
     def _app_server_argv(self) -> list[str]:
         """Argv for the app-server. Forces read-only sandbox + on-request approval so
@@ -265,15 +304,14 @@ class CodexBrainClient:
         pins the model so the codex Brain runs the operator-ruled tier rather than
         whatever ~/.codex/config.toml defaults to. `-c` is an app-server option
         (codex app-server --help); values are parsed as TOML strings."""
-        # TIER-FIRST reasoning-effort: self._model may be a tier name (a key in
-        # _CODEX_TIER_MODELS) or a concrete codex model (a value). Resolve its tier
-        # — direct when it is a key, inverse-mapped (value->tier) when concrete —
-        # then let effort_levels override the global effort_level per tier.
-        tier = (
-            self._model
-            if self._model in _CODEX_TIER_MODELS
-            else {v: k for k, v in _CODEX_TIER_MODELS.items()}.get(self._model, "")
-        )
+        # TIER-FIRST reasoning-effort: self._model may be a tier name, a family word or a
+        # gpt-<version>-<word> slug. Map it to its family word, then the word to its tier, and let
+        # effort_levels override the global effort_level per tier.
+        word = CODEX_TIER_WORDS.get(self._model, self._model)
+        match = CODEX_MODEL_RE.fullmatch(word) if isinstance(word, str) else None
+        if match is not None:
+            word = match.group(2)
+        tier = {family: name for name, family in CODEX_TIER_WORDS.items()}.get(word, "")
         effort = effort_for_tier(tier, self._effort_level, self._effort_levels)
         return [
             "codex", "app-server",
@@ -281,8 +319,13 @@ class CodexBrainClient:
             "-c", 'approval_policy="on-request"',
             "-c", f'model="{self._resolve_model()}"',
             "-c", f'model_reasoning_effort="{effort}"',
+            # R12: no subagents for the Brain. agents.enabled=false makes Codex's
+            # multi-agent version Disabled ahead of the model catalog (which gives
+            # Terra models the v2 "collaboration" tools), so spawn_agent is never offered.
+            "-c", "agents.enabled=false",
             *self._orchestrator_mcp_overrides(),
             *self._optional_mcp_overrides(),
+            *self._tool_trim_overrides(),
             "--stdio",
         ]
 
@@ -324,7 +367,7 @@ class CodexBrainClient:
         Existence-guarded like brain_client.py:280-286, so a trimmed install degrades the
         same way on both clients. Deliberately NO default_tools_approval_mode: cloning the
         orchestrator arm would auto-approve ollama's pull/remove/create_model, which are the
-        tools codex-brain-gated-actions.sh:63-65 exists to gate.
+        tools brain-gated-actions.sh exists to gate.
         """
         values: list[str] = []
         for name in _OPTIONAL_MCP_SERVERS:
@@ -338,6 +381,34 @@ class CodexBrainClient:
                 f"mcp_servers.{name}.enabled=true",
             ])
         return [part for value in values for part in ("-c", value)]
+
+    def _codex_config_path(self) -> Path:
+        """Where the app-server reads its user config (Codex honors $CODEX_HOME)."""
+        return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
+
+    def _ironclaude_plugin_manifest_path(self) -> Path:
+        """The ironclaude plugin manifest in this source tree (the Commander runs from an editable install); a missing file fails the Brain start closed."""
+        return Path(__file__).parents[3] / "worker" / ".codex-plugin" / "plugin.json"
+
+    def _tool_trim_overrides(self) -> list[str]:
+        """R14: `-c` pairs that give the Brain only the Claude Brain's tool set.
+
+        Raises BrainToolTrimError (a ValueError) when the trim cannot be derived; start()
+        turns that into a failed start rather than an untrimmed Brain."""
+        return brain_tool_trim_overrides(
+            self._codex_config_path(),
+            self._ironclaude_plugin_manifest_path(),
+            # Keep research/ollama only when IronClaude's own source exists (the
+            # _optional_mcp_overrides check), so a user-defined server with either name is
+            # disabled (design 2026-10-18 v120-security-fixes 1a).
+            {
+                "orchestrator",
+                *(
+                    name for name in _OPTIONAL_MCP_SERVERS
+                    if self._optional_mcp_source_path(name).exists()
+                ),
+            },
+        )
 
     def _fail_start(self, reason: str) -> None:
         self._running = False
@@ -894,6 +965,20 @@ class CodexBrainClient:
         # in the inventory is the equivalent evidence to Claude's path glob.
         if "episodic-memory" not in inventory:
             return "episodic-memory MCP inventory missing server"
+        # A server from a project or system Codex config would run with no hook gate, while the
+        # Claude Brain denies unknown mcp__ prefixes (design 2026-10-18 v120-security-fixes 1a).
+        # Codex also lists trim-disabled servers, as runtimeStatus "disabled" with no tools; they run
+        # nothing. A missing or other status still counts (design 2026-10-18
+        # v120-security-fixes-remediation 1a-R).
+        extra = sorted(
+            name for name, server in inventory.items()
+            if name not in _TOOL_SERVERS and server.get("runtimeStatus") != "disabled"
+        )
+        if extra:
+            return (
+                "Codex Brain MCP inventory has servers outside the Brain set: "
+                + ", ".join(extra)
+            )
         return self._install_verified_tool_inventory(inventory)
 
     # ------------------------------------------------------------------
@@ -910,6 +995,7 @@ class CodexBrainClient:
             **_BRAIN_ROLE_ENV,
             "IRONCLAUDE_CLIENT": "codex",
             "IRONCLAUDE_BRAIN_GATE_SESSION": self._brain_gate_session,
+            "IRONCLAUDE_BRAIN_GATE_ROOT": str(paths.brain_gate_root()),
         }
 
     def _runtime_preflight_path(self) -> Path:
@@ -1036,7 +1122,11 @@ class CodexBrainClient:
 
     def _reset_brain_gate_startup_state(self) -> None:
         """Reset startup-only gates while retaining same-client memory/wiki arms."""
-        state_dir = _BRAIN_GATE_ROOT / self._brain_gate_session
+        try:
+            paths.ensure_brain_gate_root()
+        except OSError as exc:
+            logger.warning("Codex Brain gate root could not be prepared: %s", exc)
+        state_dir = paths.brain_gate_root() / self._brain_gate_session
         for marker in ("lookback-slack", "lookback-ledger"):
             try:
                 (state_dir / marker).unlink()
@@ -1159,7 +1249,30 @@ class CodexBrainClient:
         self._last_activity = time.time()
 
         if system_prompt:
+            canary = paths.brain_gate_root() / self._brain_gate_session / _HOOKS_CANARY_MARKER
+            try:
+                canary.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                self._fail_start(f"Codex Brain hooks canary could not be reset: {exc}")
+                return
             self.send_message(system_prompt)
+            if not self._await_hooks_canary(canary):
+                self._fail_start(
+                    "Codex Brain hooks are not running (no UserPromptSubmit canary within "
+                    f"{_HOOKS_CANARY_TIMEOUT:.0f}s): the Brain's restriction hooks are untrusted "
+                    "or missing, so the Brain was stopped. Restart the Commander to re-run the "
+                    "hook-trust warm-up."
+                )
+
+    def _await_hooks_canary(self, canary: Path) -> bool:
+        deadline = time.monotonic() + _HOOKS_CANARY_TIMEOUT
+        while time.monotonic() < deadline:
+            if canary.exists():
+                return True
+            time.sleep(0.1)
+        return canary.exists()
 
     def send_message(self, text: str) -> bool:
         if not self._running:

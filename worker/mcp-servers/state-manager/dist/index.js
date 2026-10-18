@@ -15640,7 +15640,6 @@ var TERMINATION_GRACE_MS = 1e3;
 var DIAGNOSTIC_LIMIT = 512;
 var TIER_ORDER = ["luna", "terra", "sol", "astra"];
 var CODEX_MODEL_RE = /^gpt-(\d+(?:\.\d+)*)-(luna|terra|sol|astra)$/;
-var FALLBACK_CODEX_MODELS = ["gpt-6-luna", "gpt-5.6-terra", "gpt-6-sol", "gpt-6-astra"];
 var REVIEW_TIERS = ["same", "one-up"];
 var ALLOWED_ENV = [
   "PATH",
@@ -15662,6 +15661,38 @@ var ALLOWED_ENV = [
   "http_proxy",
   "https_proxy",
   "no_proxy"
+];
+var CODEX_NO_TOOLS_ARGS = [
+  "-c",
+  "features.shell_tool=false",
+  "-c",
+  "features.unified_exec=false",
+  "-c",
+  "features.view_image=false",
+  "-c",
+  "features.apps=false",
+  "-c",
+  "features.browser_use=false",
+  "-c",
+  "features.computer_use=false",
+  "-c",
+  "features.multi_agent=false",
+  "-c",
+  "features.image_generation=false",
+  "-c",
+  "features.memories=false",
+  "-c",
+  "features.plugins=false",
+  "-c",
+  "features.hooks=false",
+  "-c",
+  "features.goals=false",
+  "-c",
+  "features.tool_suggest=false",
+  "-c",
+  "agents.enabled=false",
+  "-c",
+  'web_search="disabled"'
 ];
 var DEFAULT_DEPS = {
   spawn: nodeSpawn,
@@ -15759,25 +15790,29 @@ function newestAtTier(installed, tier) {
   }
   return best?.slug ?? null;
 }
-async function readInstalledCodexModels(deps) {
-  const codexHome = deps.env.CODEX_HOME || path5.join(deps.env.HOME || os4.homedir(), ".codex");
-  try {
-    const parsed = JSON.parse(await deps.readFile(path5.join(codexHome, "models_cache.json"), "utf8"));
-    const slugs = (Array.isArray(parsed?.models) ? parsed.models : []).map((entry) => entry?.slug).filter((slug) => parseCodexModel(slug) !== null);
-    if (slugs.length > 0) return slugs;
-  } catch {
-  }
-  return [...FALLBACK_CODEX_MODELS];
+function codexModelsCachePath(env) {
+  const codexHome = env.CODEX_HOME || path5.join(env.HOME || os4.homedir(), ".codex");
+  return path5.join(codexHome, "models_cache.json");
 }
-function resolveCodexReviewer(requester, installed) {
+async function readInstalledCodexModels(deps) {
+  try {
+    const parsed = JSON.parse(await deps.readFile(codexModelsCachePath(deps.env), "utf8"));
+    return (Array.isArray(parsed?.models) ? parsed.models : []).map((entry) => entry?.slug).filter((slug) => parseCodexModel(slug) !== null);
+  } catch {
+    return [];
+  }
+}
+function oneUpTierIndex(requester) {
   const parsed = parseCodexModel(requester);
   const ceiling = TIER_ORDER.length - 1;
-  const start = parsed ? Math.min(TIER_ORDER.indexOf(parsed.tier) + 1, ceiling) : ceiling;
-  for (let index = start; index <= ceiling; index += 1) {
+  return parsed ? Math.min(TIER_ORDER.indexOf(parsed.tier) + 1, ceiling) : ceiling;
+}
+function resolveCodexReviewer(requester, installed) {
+  for (let index = oneUpTierIndex(requester); index < TIER_ORDER.length; index += 1) {
     const newest = newestAtTier(installed, TIER_ORDER[index]);
     if (newest) return newest;
   }
-  return FALLBACK_CODEX_MODELS[start];
+  return null;
 }
 function sanitizedEnv(source) {
   const clean = {};
@@ -16072,7 +16107,18 @@ async function runCodexAdvisorReview(args, identity, session, runtime, overrides
       diagnostic: diagnostic(preflight.stderr || preflight.stdout || preflight.spawnError || "preflight failed")
     });
   }
-  const reviewerModel = validated.reviewTier === "same" ? validated.requesterModel : resolveCodexReviewer(validated.requesterModel, await readInstalledCodexModels(deps));
+  let reviewerModel = validated.requesterModel;
+  if (validated.reviewTier !== "same") {
+    const resolved = resolveCodexReviewer(validated.requesterModel, await readInstalledCodexModels(deps));
+    if (resolved === null) {
+      return failure("codex-reviewer-model-unavailable", {
+        diagnostic: diagnostic(
+          `Codex model family ${TIER_ORDER[oneUpTierIndex(validated.requesterModel)]} (or a higher family) has no installed model in ${codexModelsCachePath(deps.env)}`
+        )
+      });
+    }
+    reviewerModel = resolved;
+  }
   const startedAt = deps.now();
   let privateCwd = null;
   let outcome;
@@ -16082,6 +16128,7 @@ async function runCodexAdvisorReview(args, identity, session, runtime, overrides
       codexExecutable,
       [
         "exec",
+        ...CODEX_NO_TOOLS_ARGS,
         "--json",
         "--ephemeral",
         "--ignore-user-config",

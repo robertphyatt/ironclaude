@@ -50,6 +50,14 @@ for tool in Task Agent; do
   assert_eq "$tool missing subagent_type blocked" "2" "$(feed "$tool" OMIT)"
 done
 
+# Codex: the Brain has no memory-search agent type, so every spawn_agent is blocked.
+assert_eq "spawn_agent blocked"                   "2" "$(feed spawn_agent OMIT)"
+assert_eq "spawn_agent search-conversations blocked" "2" "$(feed spawn_agent ironclaude:search-conversations)"
+assert_eq "near-miss spawn_agents not gated"       "0" "$(feed spawn_agents OMIT)"
+# Codex multi-agent v2 tools live in the "collaboration" namespace; Codex hands hooks
+# the flat name namespace+name (registry.rs function_hook_tool_name / flat_tool_name).
+assert_eq "namespaced collaborationspawn_agent blocked" "2" "$(feed collaborationspawn_agent OMIT)"
+
 # a non-subagent tool is not gated at all
 assert_eq "non-subagent tool (Bash) allowed" "0" "$(feed Bash OMIT)"
 
@@ -66,6 +74,8 @@ nofeed() {  # nofeed TOOL SUBAGENT -> exit code, against the logger-less hook
 }
 assert_eq "no-logger: Agent general-purpose blocked"      "2" "$(nofeed Agent general-purpose)"
 assert_eq "no-logger: Agent search-conversations allowed" "0" "$(nofeed Agent ironclaude:search-conversations)"
+assert_eq "no-logger: spawn_agent blocked" "2" "$(nofeed spawn_agent general-purpose)"
+assert_eq "no-logger: collaborationspawn_agent blocked" "2" "$(nofeed collaborationspawn_agent general-purpose)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

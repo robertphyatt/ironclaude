@@ -15,16 +15,20 @@ You can use the Worker alone for single-session discipline, or add the Commander
 
 ---
 
-## What's New in v1.1.15
+## What's New in v1.2.0
 
-- **Codex's new models just work.** IronClaude accepts any `gpt-<version>-<tier>` Codex model (for example `gpt-6-sol`) and picks the reviewer one tier up from the models Codex actually has installed, so a new Codex model family no longer blocks plan review.
+- **One IronClaude for Claude and Codex.** The hooks, instructions, memory-search gate and Commander Brain restrictions now behave the same on both clients. Commander-spawned Codex workers start reliably, and work hands off safely between Claude and Codex when one hits its usage limit.
+- **Checks on the right model.** Hook and Commander checks run on Claude Haiku or the newest Codex Luna (the local box first). Harder judgments step up one class. Reviews use a fresh same-tier reviewer, with Fable or Astra only when you ask.
+- **Tool-free children.** Every grader, fast-model child, hook child and the Codex advisor broker runs with no tools on both clients, so text a worker writes can't make them read or run anything. Graders carry their rubric in the prompt, and Claude reviewers use a locked read-only agent.
+- **No pinned Codex models.** Codex defaults are family words (`luna`, `terra`, `sol`, `astra`) that resolve to the newest model Codex has installed where it runs, just as `haiku` or `opus` does for Claude. A model you name explicitly is used as-is.
+- **Safer Brain gate.** The Brain's gate state lives in a private `~/.ironclaude/state/brain-gate` directory, and the Brain hooks refuse to run from anything else. Both Brains refuse git commands that write a file (`--output`), change branches, or depend on shell brace or glob expansion (`@{u}` and `HEAD@{1}` still work), and the Codex Brain starts only with its own MCP servers.
+- **A down local box costs one try, not every call.** If you run your own Ollama or OpenAI-compatible box, a connect failure, an HTTP error, an empty or invalid answer, or a read timeout at the box's own `timeout_seconds` makes the hooks and the Commander skip it for `local_backoff_minutes` (default 15, `0` turns it off) and ask the Haiku-class model (Haiku, or Luna on Codex) instead. The hooks also count running out their own `hook_validation_budget_seconds` (default 8 s). Only a Commander caller deadline shorter than the box's timeout, such as the fast lane's `fast_lane_grade_timeout_seconds`, does not count. The hooks and the Commander share the marker in `~/.ironclaude/state/local-backoff/`, and it is the only thing that makes IronClaude skip your box, so with `0` your box is tried on every call. The CHANGELOG has the details.
+- **Proportionate loops and a sharper guard.** A scope-fidelity rule keeps PM loops sized to the request. The drift check catches edits outside a task's files and ignores files another live session wrote with its file tools or lists in its active task, so several sessions can share one checkout. IronClaude's own `git status` reads no longer take the index lock, so a hook killed mid-read can't leave a stale `.git/index.lock` that blocks every session's `git add`. Codex file and shell tools are gated the same way as Claude's, with or without a managed worktree.
+
+### Earlier — v1.1.15
+
+- **Codex's new models just work.** IronClaude accepts any `gpt-<version>-<tier>` Codex model (for example `gpt-6-sol`) and resolves the reviewer from the models Codex actually has installed (one class up below the Opus class, a fresh same-class reviewer from Sol), so a new Codex model family no longer blocks plan review.
 - **Works with the new ChatGPT app layout.** When Codex ships as a `codex-cli/` package, IronClaude launches its declared entrypoint, so the advisor review no longer fails with `source-missing`.
-
-### Earlier — v1.1.14
-
-- **Brain replies reach your thread.** When the Brain answered in two pieces — the reply marker alone, then the answer after a tool call — the answer used to land in the heartbeat thread and your message never got ✅. The Brain now carries the reply target through the whole turn, and its prompt requires a real answer alongside the marker.
-- **No-reply closures are visible.** A conversational message now gets a threaded reply that closes it. When the Brain closes a message without replying, its reason is posted in your thread with ✅, so nothing is silently buried.
-- **A usage-limited Brain says so.** On the opus fallback, a usage-limit reply now raises the "Usage limit hit" Slack alert, isn't mistaken for a live Brain, doesn't trigger pointless restarts, and the heartbeat shows "usage-limited (resets …)" instead of "turn in progress". When it recovers, a Slack notice tells you so; resend anything urgent.
 - See [CHANGELOG.md](CHANGELOG.md) for full details, and `git log` / [CHANGELOG.md](CHANGELOG.md) for earlier releases.
 
 ---
@@ -244,9 +248,33 @@ The workflow enforces transitions through named stages visible in the statusline
 
 Each phase transition is enforced by the state machine. Claude cannot skip brainstorming, cannot execute without an approved plan, and cannot move to the next task without passing code review.
 
-### Validation Backend (Recommended)
+### Validation Backend: Haiku-Class Models (Recommended)
 
-Professional mode hooks use an LLM to validate actions in real time. The default backend (using Haiku) works out of the box, but you can use Ollama to run validation locally without adding to your Claude license usage:
+Professional mode hooks and the Commander use a small, fast LLM to validate actions in real time. We recommend a Haiku-class model: Claude Haiku in Claude sessions, and the newest installed Codex Luna in Codex sessions. These models are cheap, good at this job, and need no setup. Running your own local model is optional.
+
+**How the fast-model chain works.** Each call tries these in order:
+
+1. Your local box, if you configured one (Ollama or an OpenAI-compatible endpoint).
+2. A Haiku-class model (Claude Haiku, or the newest Codex Luna).
+3. If both fail, the call fails open. The action is not blocked, and you see a non-blocking "unavailable" note.
+
+The `haiku` backend is the default for both the hooks and the Commander. It skips the local box and goes straight to step 2.
+
+**Speed.** A lean Haiku call takes about 4.4 to 5.0 seconds. A Luna call takes about 2.7 to 3.5 seconds.
+
+**Sessions.** Haiku-class calls leave no session files. Claude children run with `--no-session-persistence`, and Codex children run with `--ephemeral`. They also run without IronClaude hooks or MCP servers.
+
+**Timeout.** The setting `fast_model_timeout_seconds` (default 30) caps each fast-model call.
+
+**Per-call classes.** Each check runs at the class its difficulty needs. Most checks are Haiku-class. The Stop hook's continuation judge and the Commander's worker-health check are Sonnet-class (Claude Sonnet, or the newest Codex Terra) and never use a local box; `sonnet_model_timeout_seconds` (default 30) caps them. Plan approval and the kill-worker completion check use the Opus class (Claude Opus, or Codex Sol). When a blocking gate's first choice cannot answer, it steps up one class (Haiku to Sonnet) instead of jumping to Opus; non-blocking checks fail open. See `worker/config-schema/llm-backend.md` for the full table.
+
+**Shadow grader.** The Commander's shadow grader needs a local box. Under `haiku` it is skipped until you set `spots.shadow.backend`.
+
+For the full schema, see [`worker/config-schema/llm-backend.md`](worker/config-schema/llm-backend.md).
+
+#### Optional: host a local model
+
+If you prefer to validate locally, you can use Ollama and keep this work off your Claude license usage:
 
 ```bash
 # Install Ollama: https://ollama.com/download
@@ -273,20 +301,20 @@ Enforcement is implemented in 15 hooks across 6 lifecycle events (SessionStart, 
 
 8 additional hooks handle episodic memory sync, poll deduplication, MCP state logging, and other internal concerns. Shared libraries (`hook-logger.sh`, `plan-validator.sh`) provide logging, DB access, and LLM validation utilities.
 
-Hooks deploy to `~/.claude/ironclaude-hooks/` via `make deploy-hooks` and run from there at runtime (not from the repo directory).
+Hooks deploy to `~/.claude/ironclaude-hooks/` via `make deploy-hooks` and run from there at runtime (not from the repo directory). After an update, run `/reload-plugins` in each open Claude Code session: the hook scripts change in place, but which events run them is read when a session starts, and reloading keeps the conversation.
 
 ### Model Configuration
 
-The Brain selects worker type per task, and each worker gets an advisor **one tier up** for oversight:
+The Brain selects worker type per task, and each worker gets an **Opus-class** advisor for oversight (Claude Opus, or Codex Sol). The top tier (Fable, or Codex Astra) is used only when you configure it:
 
 | Worker Type | Description | Advisor |
 |-------------|-------------|---------|
 | `claude-sonnet` | Default. Used for most tasks | Opus |
-| `claude-opus` | Full Opus worker for high-complexity tasks | Fable |
+| `claude-opus` | Full Opus worker for high-complexity tasks | Opus (Fable only if configured) |
 | `claude-fable` | Fable model for the hardest, correctness-critical architectural work | — (top tier) |
 | `ollama` | Local LLM routed via `ANTHROPIC_BASE_URL` — see [Ollama Workers](#ollama-workers) | — |
 
-**Model tiering — capability on demand.** The always-on Brain runs on **Sonnet** by default and handles routine orchestration itself. When a directive is harder than it can confidently decide, it doesn't guess: it consults an Opus worker for the approach and the right worker tier, then spawns `claude-opus` or `claude-fable` as advised (the spawn-time grader can recommend `claude-fable`, and an approved Opus spawn escalates to Fable only when the grader explicitly recommends it). Combined with the one-tier-up advisors above — a Sonnet worker gets an Opus advisor, an Opus worker gets a Fable advisor — the system delivers **Fable-level capability on the hardest work without burning Fable tokens continuously**: the persistent component stays cheap, and the top tiers are reached transiently, on demand.
+**Model tiering — capability on demand.** The always-on Brain runs on **Sonnet** by default and handles routine orchestration itself. When a directive is harder than it can confidently decide, it doesn't guess: it consults an Opus worker for the approach and the right worker tier, then spawns `claude-opus` or `claude-fable` as advised (the spawn-time grader can recommend `claude-fable`, and an approved Opus spawn escalates to Fable only when the grader explicitly recommends it). Combined with the Opus-class advisors above — Sonnet and Opus workers both get an Opus advisor, since Opus 5.5 is close to Fable, and Fable is reached only through a `claude-fable` worker or an explicit `advisor.advisor_models` override — the system delivers **near-top capability on the hardest work without burning Fable tokens continuously**: the persistent component stays cheap, and the top tiers are reached transiently, on demand.
 
 > **Opus tier resolves naturally.** IronClaude no longer pins its Opus tier to a specific version:
 > every internal Opus-tier string uses the bare `opus` alias, which the Claude CLI resolves to
@@ -585,6 +613,113 @@ Three convergence mechanisms keep the wiki current:
 
 ---
 
+## Episodic Memory
+
+Episodic memory lets Claude and Codex search past conversations. Its data lives in `~/.config/superpowers/`. `$XDG_CONFIG_HOME/superpowers` or `EPISODIC_MEMORY_CONFIG_DIR` overrides that location; the legacy name is kept on purpose.
+
+### What is stored
+
+| Store | Path | Contents |
+|---|---|---|
+| Archive | `conversation-archive/<project>/` | Copies of Claude (`~/.claude/projects`) and Codex (`~/.codex/sessions`) transcripts, plus `<session>-summary.txt` summaries. Subagent transcripts go to `<project>/<session>/subagents/`; they are archived but not indexed. |
+| Index | `conversation-index/db.sqlite` | One row per exchange: user and assistant text, AskUserQuestion answers as `Q: … / A: …` pairs, the session `entrypoint`, the `session_class`, and a 384-dimension vector. |
+| Settings | `episodic-memory.json` | Optional. Every key has a default (see below). |
+
+Each session gets a `session_class`. Search results show it, and the `search` tool's `session_class` and `prefer_operator` options use it. The class is derived from transcript metadata and never from anyone's name.
+
+| Class | Meaning |
+|---|---|
+| `operator` | an interactive session (Claude `entrypoint: cli`; Codex originator `Codex Desktop` or `codex-tui`) |
+| `brain` | the Commander Brain (`~/.ironclaude/brain`) |
+| `worker` | automation: managed worker worktrees, `sdk-*` entrypoints, Codex `codex_exec` and `ironclaude` |
+| `unknown` | older transcripts that record no entrypoint, or an entrypoint not listed in the settings |
+| `archive-only` | archived and compressed, never indexed or summarized (default: knowledge-base work-chunk pipeline sessions) |
+| `machine` | excluded; see below |
+
+### What is excluded
+
+Machine sessions are never archived or indexed. They are graders, judges, temp and scratch directories, model probes (first message "Output only your exact model id string and nothing else.") and automated security reviews (first message "Review this change for security vulnerabilities."). The default rules match project directory names (`--ironclaude-grader`, `claude-judge-`, `/tmp`, macOS `$TMPDIR`) and those first-message prefixes.
+
+Archive-only projects (`archiveOnlyProjectPatterns`) and subagent transcripts (`archiveSubagents`) are kept in the archive but never indexed.
+
+To change them, edit `episodic-memory.json`. An array you supply **replaces** the default array, so start from the defaults, which are shown here in full:
+
+```json
+{
+  "maintain": { "autoRun": true, "liveWindowHours": 24, "zstdLevel": 3, "maxRuntimeMinutes": 120 },
+  "exclude": {
+    "machineProjectPatterns": ["--(ironclaude|tron)-grader$", "claude-judge-", "^-private-tmp($|-)", "^-tmp($|-)", "^-(private-)?var-folders-"],
+    "machineFirstUserTextPrefixes": ["Output only your exact model id string and nothing else.", "Review this change for security vulnerabilities."],
+    "archiveSubagents": true,
+    "archiveOnlyProjectPatterns": ["-programmatically-control-claude-work-chunk-"]
+  },
+  "classify": {
+    "brainProjectPatterns": ["--(ironclaude|tron)-brain$"],
+    "workerProjectPatterns": ["--ironclaude-worktrees-"],
+    "operatorEntrypoints": ["cli", "Codex Desktop", "codex-tui"],
+    "automationEntrypoints": ["codex_exec", "ironclaude"],
+    "automationEntrypointPrefixes": ["sdk-"]
+  },
+  "backup": { "mirrorDir": null }
+}
+```
+
+The existing `conversation-index/exclude.txt` (exact project names) still works.
+
+### Compressed archive, and how to restore an original
+
+Once an archived transcript has not changed for `liveWindowHours` (24 by default), `maintain` compresses `<session>.jsonl` to `<session>.jsonl.zst`. It removes the original only after three checks pass: the compressed file is decompressed again, its SHA-256 matches the original, and a line is appended to `conversation-archive/manifest.jsonl`. Failures go to `manifest-errors.jsonl` and leave the original in place. Summaries stay uncompressed.
+
+Search and `read` handle `.zst` files transparently. Reading them needs Node 22.15 or later, which has built-in zstd. To restore a byte-identical original:
+
+```bash
+zstd -d ~/.config/superpowers/conversation-archive/<project>/<session>.jsonl.zst
+```
+
+**Superseded copies.** If a transcript's source is rewritten smaller than the archived copy, the archive keeps the old copy beside the new one as `<session>.jsonl.superseded-<mtime>` instead of overwriting it; `maintain` later compresses it to `.zst` and records it in the manifest, so the backup mirror includes it. An old compressed copy that no longer decodes is kept the same way. Superseded copies are never indexed: index rows built from the old content open the current file in `read`. Restore one with `zstd -d <file>.zst`.
+
+### Backup mirror (optional)
+
+Set `"backup": { "mirrorDir": "/Volumes/Backup/episodic-memory" }` to copy every verified `.zst` there, with a checksum check on each copy. If the directory is unavailable, `maintain` logs a warning and continues. There is no remote backup.
+
+### The `maintain` command
+
+```bash
+episodic-memory maintain --dry-run     # report what each phase would do; change nothing
+episodic-memory maintain               # run all phases
+episodic-memory maintain --only=compact
+episodic-memory maintain --keep-bak    # keep db.sqlite.bak even after it verifies
+```
+
+The phases are idempotent; a finished phase is a cheap no-op on later runs.
+
+- **`slim`.** A one-time rebuild of an index that still has the unused `tool_calls` table. It also drops machine-session and archive-only rows.
+  - It refuses unless free disk is at least twice the new index's size.
+  - It verifies row counts, the newest timestamp and a sample search before an atomic swap, and keeps the old index as `db.sqlite.bak`.
+  - A **later** run, automatic or manual, deletes `db.sqlite.bak` after re-verifying the new index. `--keep-bak` and `--dry-run` keep it.
+- **`backfill`.** A one-time pass that indexes past AskUserQuestion answers and session provenance from the archive. Where answers split an old exchange, it replaces the superseded index rows. It only reads the archive and never modifies it.
+- **`compact`.** Compresses the archive, as described above.
+- **`mirror`.** The optional backup mirror.
+
+The background sync runs at every session start and takes the same lock. When `maintain.autoRun` is `true`, the default for every install including existing ones, it runs `maintain` automatically. The guards above still apply. Set it to `false` to opt out.
+
+**Upgrading an existing install:** nothing is required.
+- The first automatic run slims the index once enough disk is free, then backfills and compresses.
+- The next run removes `db.sqlite.bak` after verifying.
+
+To control it by hand instead:
+1. Set `"maintain": {"autoRun": false}` before upgrading.
+2. Run `episodic-memory maintain --dry-run`, then `episodic-memory maintain --keep-bak`.
+3. Check search and `read`.
+4. Set `autoRun` back to `true`.
+
+**Notes:**
+- An MCP server started before the slim keeps reading the old index until it restarts.
+- After upgrading IronClaude, refresh **both** the Claude and Codex plugin caches; an old bundle recreates `tool_calls`, which the next `maintain` drops again.
+- Do not run `episodic-memory index --rebuild` on such an install. It deletes the index and re-indexes only transcripts still under `~/.claude/projects`, losing everything that exists only in the archive.
+
+---
+
 ## Configuration Reference
 
 `config/ironclaude.json` controls Commander runtime behavior. All keys are optional; unset keys use defaults.
@@ -601,9 +736,9 @@ Three convergence mechanisms keep the wiki current:
 | `grader_model` | `"opus"` | Model for the Grader session |
 | `effort_level` | `"high"` | Worker effort level (`CLAUDE_CODE_EFFORT_LEVEL`) |
 | `machines` | `[]` | Named Ollama machine configs — see [Ollama Workers](#ollama-workers) |
-| `advisor.enabled` | `true` | Whether workers get a one-tier-up advisor session |
+| `advisor.enabled` | `true` | Whether workers get an advisor session |
 | `advisor.executor_model` | `"sonnet"` | Default executor worker model |
-| `advisor.advisor_models` | `{"claude-sonnet": "opus", "claude-opus": "fable"}` | One-tier-up advisor model per worker type |
+| `advisor.advisor_models` | `{"claude-sonnet": "opus", "claude-opus": "opus"}` | Advisor class per worker type (opus class by default; set "fable" to use the top tier) |
 | `advisor.advisor_model` | `"opus"` | Fallback advisor model for worker types not in `advisor_models` |
 | `dispatch.use_goal` | `false` | When true, spawned workers are given a `/goal` completion condition for more autonomous execution |
 | `ollama_vram_block_threshold_gb` | `8.0` | Max already-loaded Ollama VRAM (GB) tolerated before a spawn is **blocked** (a ceiling, not a minimum) |
@@ -623,7 +758,24 @@ Three convergence mechanisms keep the wiki current:
 **Environment variable overrides** (take precedence over `ironclaude.json`):
 `POLL_INTERVAL_SECONDS`, `HEARTBEAT_INTERVAL_SECONDS`, `DB_PATH`, `BRAIN_TIMEOUT_SECONDS`, `BRAIN_MODEL`, `GRADER_MODEL`, `EFFORT_LEVEL`
 
-**Codex provider.** To run roles or the Brain on OpenAI Codex, enable the codex client and add `"codex"` to a role's `clients` under the `providers` block in `config/ironclaude.json`, and set `BRAIN_CLIENT=codex` for the Brain. See [CODEX_SETUP.md](CODEX_SETUP.md) for the full guide.
+**Codex provider.** To run roles or the Brain on OpenAI Codex, enable the codex client and add `"codex"` to a role's `clients` under the `providers` block in `config/ironclaude.json`, and set `BRAIN_CLIENT=codex` for the Brain. See [CODEX_SETUP.md](CODEX_SETUP.md) for the full guide, including the guarded automatic capacity handoff for managed workers.
+
+### Managed-worker capacity handoff
+
+IronClaude can hand a managed worker to the other configured provider only after a confirmed,
+provider-native usage limit. A legacy `claude-*` worker label describes its semantic tier; a
+successor can run that same tier on Codex with a new concrete model and native UUID. The handoff
+keeps the workspace GUID, exact worktree and dirty contents, shared links, objective, unfinished PM
+plan, completed review tasks, review attribution, and design-registration checks. In-progress and
+submitted tasks reopen for normal work and review.
+
+The handoff never carries human Git intent or performs an implicit commit, push, reset, cleanup,
+integration, or worktree removal. It waits for source-writer death proof, bootstraps a fresh target
+read-only, and saves the target's native UUID before editing resumes. Unknown quota evidence leaves
+the job unfinished without claiming a transfer. After a confirmed quota, both-provider exhaustion or
+unknown process, transport, or protocol evidence holds the claimed assignment unfinished with one
+bounded warning. See [CODEX_SETUP.md](CODEX_SETUP.md#automatic-capacity-handoff-for-managed-workers)
+for accepted native signals, status recovery, host requirements, and deployment requirements.
 
 ---
 

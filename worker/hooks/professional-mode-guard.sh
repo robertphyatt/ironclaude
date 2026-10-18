@@ -105,6 +105,32 @@ has_command_input_key() {
     >/dev/null 2>&1
 }
 
+# Drift writer log (2026-10-17 cross-session hotfix R1): workspace_allow calls this, in a
+# subshell, for every decision this guard allows. A file-tool write records its writer
+# so execution-drift-check.sh never charges another session's file to this session. The
+# ORIGINAL tool name decides (the adapter renames apply_patch to MultiEdit). Targets:
+# the adapter's resolved WORKSPACE_TARGET_FILES when set, else file_path/notebook_path,
+# else every Add/Update/Delete/Move target of a Codex patch (relative to the cwd). The
+# drift library is sourced in a child bash, so its sourcing never resets WORKSPACE_*.
+ic_guard_record_writer() {
+  local original targets
+  original=$(printf '%s' "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null) || return 0
+  targets="${WORKSPACE_TARGET_FILES:-}"
+  case "$original" in
+    Edit|Write|MultiEdit|NotebookEdit)
+      [ -n "$targets" ] || targets=$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' 2>/dev/null) || return 0
+      ;;
+    apply_patch)
+      [ -n "$targets" ] || targets=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null \
+        | sed -n -E -e 's/^\*\*\* (Add|Update|Delete) File: //p' -e 's/^\*\*\* Move to: //p') || return 0
+      ;;
+    *) return 0 ;;
+  esac
+  [ -n "$targets" ] || return 0
+  printf '%s\n' "$targets" | IC_DRIFT_LIB=1 bash -c 'source "$1/execution-drift-check.sh" && ic_drift_record_writes "$2" "$3"' \
+    _ "$SCRIPT_DIR" "$SESSION_TAG" "$PROJECT_ROOT"
+}
+
 is_safe_codex_agents_patch() {
   local patch_command counts begin_count end_count operation_count move_count
   local operation_line operation target
@@ -442,6 +468,29 @@ FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.notebook
 if [ -n "$WORKSPACE_GUARD_TOOL_NAME" ]; then TOOL_NAME="$WORKSPACE_GUARD_TOOL_NAME"; fi
 if [ -n "$WORKSPACE_GUARD_FILE_PATH" ]; then FILE_PATH="$WORKSPACE_GUARD_FILE_PATH"; fi
 FILE_PATH=$(normalize_path "$FILE_PATH")
+
+# 2026-10-17 drift hotfix R7: with no managed-worktree assignment the adapter returns before
+# it maps native Codex names, and every write gate below matches only Claude names, so
+# apply_patch and exec_command fell through to "tool not handled" (allowed in any stage,
+# outside allowed_files). Map them here whether or not an assignment exists. A patch with no
+# adapter targets has EVERY target resolved by the adapter's own parser against the cwd;
+# only WORKSPACE_TARGET_FILES is set, the patch is not rewritten (no updatedInput).
+if [ "$TOOL_NAME" = "exec_command" ]; then
+  TOOL_NAME="Bash"
+elif [ "$TOOL_NAME" = "apply_patch" ]; then
+  TOOL_NAME="MultiEdit"
+  if [ -z "$WORKSPACE_TARGET_FILES" ]; then
+    _R7_PATCH=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null || true)
+    if ! workspace_rewrite_patch "$_R7_PATCH" "$PROJECT_ROOT"; then
+      block_pretooluse "professional-mode-guard" "BLOCKED — UNCHECKABLE CODEX PATCH
+
+The apply_patch input is malformed, or a target leaves the working directory (${PROJECT_ROOT}) through '..', a symlinked directory, or an absolute path outside it. The guard cannot check its targets against the workflow stage and allowed_files.
+
+Use paths relative to the working directory, or absolute paths inside it."
+    fi
+  fi
+  FILE_PATH=$(printf '%s\n' "$WORKSPACE_TARGET_FILES" | sed -n '1p')
+fi
 
 # Read-only tools: always allow
 case "$TOOL_NAME" in

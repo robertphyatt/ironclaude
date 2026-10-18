@@ -89,6 +89,13 @@ class TestTmuxManager:
         assert len(calls) == 2  # send-keys text + send-keys Enter
 
     @patch("ironclaude.tmux_manager.subprocess.run")
+    def test_send_keys_requires_enter_acknowledgement(self, mock_run):
+        mock_run.side_effect = [MagicMock(returncode=0), MagicMock(returncode=1)]
+        mgr = TmuxManager(log_dir="/tmp/ic-logs")
+        assert mgr.send_keys("worker-1", "continue") is False
+        assert mock_run.call_count == 2
+
+    @patch("ironclaude.tmux_manager.subprocess.run")
     def test_send_keys_enter_uses_list_form_not_shell(self, mock_run):
         """Enter keypress must use list form, not shell=True, to prevent injection."""
         mock_run.return_value = MagicMock(returncode=0)

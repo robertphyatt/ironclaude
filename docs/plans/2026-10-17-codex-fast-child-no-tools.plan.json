@@ -1,0 +1,60 @@
+{
+  "name": "Codex fast-model child without tools",
+  "goal": "Turn off every tool feature for the Codex fast-model child in both the Commander and the hooks, so untrusted prompt text can no longer make it read local files.",
+  "requirements_file": "docs/plans/2026-10-17-codex-fast-child-no-tools-design.md",
+  "design_file": "docs/plans/2026-10-17-codex-fast-child-no-tools-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Commander child without tools",
+      "description": "Per plan.md Task 1: scratch + hooks baseline + probe scripts, pre-change Commander sentinel probe (positive control), RED tests, CODEX_DISABLED_FEATURES + codex_fast_argv, GREEN, post-change probes, stage.",
+      "allowed_files": [
+        "commander/src/ironclaude/fast_model.py",
+        "commander/tests/test_fast_model.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Scratch setup, probe scripts, hooks baseline: run plan.md Task 1 Step 1 block verbatim (writes notes.txt with CFNT-SENTINEL-93d1c7, read-prompt.txt, plain-prompt.txt, cmd_probe.py, hook_probe.sh under /private/tmp/claude-502/cfnt; runs every worker/hooks/tests/test-*.sh to base-<name>.log)", "expected": "scratch files exist; one rc= line per hook test file; record rc lines + per-file ^FAIL counts as baseline"},
+        {"description": "Commander probe BEFORE change (positive control)", "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python /private/tmp/claude-502/cfnt/cmd_probe.py /private/tmp/claude-502/cfnt/read-prompt.txt > /private/tmp/claude-502/cfnt/cmd-before.json 2>&1; echo \"rc=$?\"; cat /private/tmp/claude-502/cfnt/cmd-before.json; echo \"token_lines=$(rg -c CFNT-SENTINEL-93d1c7 /private/tmp/claude-502/cfnt/cmd-before.json)\"", "expected": "rc=0, token_lines=1; if token absent STOP and report"},
+        {"description": "RED: replace expected list in test_codex_argv_is_ephemeral_low_effort (test_fast_model.py:49-53) and add test_codex_argv_disables_every_tool_feature, both verbatim from plan.md Task 1 Step 3; run", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_fast_model.py -q > /private/tmp/claude-502/cfnt/red.log 2>&1; echo \"red=$?\"; rg -n '^(FAILED|ERROR)' /private/tmp/claude-502/cfnt/red.log; tail -n 3 /private/tmp/claude-502/cfnt/red.log", "expected": "red=1; FAILED exactly test_codex_argv_is_ephemeral_low_effort and test_codex_argv_disables_every_tool_feature"},
+        {"description": "GREEN: replace codex_fast_argv (fast_model.py:104-109) with CODEX_DISABLED_FEATURES constant + new codex_fast_argv verbatim from plan.md Task 1 Step 4; run", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_fast_model.py tests/test_fast_model_chain.py -q > /private/tmp/claude-502/cfnt/green.log 2>&1; echo \"green=$?\"; rg -n '^(FAILED|ERROR)' /private/tmp/claude-502/cfnt/green.log; tail -n 3 /private/tmp/claude-502/cfnt/green.log", "expected": "green=0, 0 failed"},
+        {"description": "Commander probes AFTER change", "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python /private/tmp/claude-502/cfnt/cmd_probe.py /private/tmp/claude-502/cfnt/read-prompt.txt > /private/tmp/claude-502/cfnt/cmd-after.json 2>&1; echo \"rc=$?\"; cat /private/tmp/claude-502/cfnt/cmd-after.json; echo \"token_lines=$(rg -c CFNT-SENTINEL-93d1c7 /private/tmp/claude-502/cfnt/cmd-after.json)\"; /Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python /private/tmp/claude-502/cfnt/cmd_probe.py /private/tmp/claude-502/cfnt/plain-prompt.txt > /private/tmp/claude-502/cfnt/cmd-plain.json 2>&1; echo \"plain_rc=$?\"; cat /private/tmp/claude-502/cfnt/cmd-plain.json", "expected": "rc=0; cmd-after.json has answer key, no infrastructure_error; token_lines= empty; plain_rc=0, cmd-plain.json has answer, no infrastructure_error"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/fast_model.py commander/tests/test_fast_model.py", "expected": "no output"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Hook child without tools",
+      "description": "Per plan.md Task 2: pre-change hook sentinel probe, RED argv-head tests, plan-validator.sh flags + comment, llm-backend.md:233 doc, GREEN, post-change probes, stage.",
+      "allowed_files": [
+        "worker/hooks/plan-validator.sh",
+        "worker/hooks/tests/test-fast-model-fallback.sh",
+        "worker/config-schema/llm-backend.md"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Hook probe BEFORE change (positive control)", "command": "bash /private/tmp/claude-502/cfnt/hook_probe.sh /private/tmp/claude-502/cfnt/read-prompt.txt > /private/tmp/claude-502/cfnt/hook-before.txt 2>&1; cat /private/tmp/claude-502/cfnt/hook-before.txt; echo \"token_lines=$(rg -c CFNT-SENTINEL-93d1c7 /private/tmp/claude-502/cfnt/hook-before.txt)\"", "expected": "ends rc=0; token_lines=1; if token absent STOP and report"},
+        {"description": "RED: replace test-fast-model-fallback.sh lines 134-136 and 220-222 with plan.md Task 2 Step 2 blocks (head -n 29, 8 features flags; luna and terra); run", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-fast-model-fallback.sh > /private/tmp/claude-502/cfnt/hook-red.log 2>&1; echo \"rc=$?\"; rg -n '^FAIL' /private/tmp/claude-502/cfnt/hook-red.log", "expected": "exactly 2 FAIL lines: `FAIL: codex isolation flags (argv head)` and `FAIL: codex sonnet isolation flags (argv head)`"},
+        {"description": "GREEN: plan-validator.sh lines 163-164 -> plan.md Task 2 Step 3 block; add comment line above `if ic_is_codex; then` (line 160); update llm-backend.md:233 Codex list per plan.md; run", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-fast-model-fallback.sh > /private/tmp/claude-502/cfnt/hook-green.log 2>&1; echo \"rc=$?\"; rg -c '^FAIL' /private/tmp/claude-502/cfnt/hook-green.log; tail -n 2 /private/tmp/claude-502/cfnt/hook-green.log", "expected": "rc=0; rg -c prints nothing (0 FAIL); summary 0 failed"},
+        {"description": "Hook probes AFTER change", "command": "bash /private/tmp/claude-502/cfnt/hook_probe.sh /private/tmp/claude-502/cfnt/read-prompt.txt > /private/tmp/claude-502/cfnt/hook-after.txt 2>&1; cat /private/tmp/claude-502/cfnt/hook-after.txt; echo \"token_lines=$(rg -c CFNT-SENTINEL-93d1c7 /private/tmp/claude-502/cfnt/hook-after.txt)\"; bash /private/tmp/claude-502/cfnt/hook_probe.sh /private/tmp/claude-502/cfnt/plain-prompt.txt > /private/tmp/claude-502/cfnt/hook-plain.txt 2>&1; cat /private/tmp/claude-502/cfnt/hook-plain.txt", "expected": "hook-after.txt JSON object with answer then rc=0; token_lines= empty; hook-plain.txt JSON object with answer then rc=0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/plan-validator.sh worker/hooks/tests/test-fast-model-fallback.sh worker/config-schema/llm-backend.md", "expected": "no output"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Regression and plan docs",
+      "description": "Full Commander suite, hooks suite vs Task 1 baseline, stage this loop's plan docs.",
+      "allowed_files": [
+        "docs/plans/2026-10-17-codex-fast-child-no-tools-design.md",
+        "docs/plans/2026-10-17-codex-fast-child-no-tools.md",
+        "docs/plans/2026-10-17-codex-fast-child-no-tools.plan.json"
+      ],
+      "depends_on": [1, 2],
+      "steps": [
+        {"description": "Full Commander suite", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/ -q > /private/tmp/claude-502/cfnt/suite.log 2>&1; echo \"suite=$?\"; rg -n '^(FAILED|ERROR)' /private/tmp/claude-502/cfnt/suite.log; tail -n 3 /private/tmp/claude-502/cfnt/suite.log", "expected": "suite=0, 0 failed, no FAILED/ERROR lines"},
+        {"description": "Hooks suite vs baseline", "command": "for t in /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-*.sh; do bash \"$t\" > \"/private/tmp/claude-502/cfnt/after-$(basename \"$t\").log\" 2>&1; echo \"$(basename \"$t\") rc=$?\"; done; rg -c '^FAIL' /private/tmp/claude-502/cfnt/ --glob 'after-*.log'", "expected": "every rc= and per-file ^FAIL count equals Task 1 Step 1 baseline, except test-fast-model-fallback.sh which, if different, now has 0 FAIL"},
+        {"description": "Stage plan docs", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-17-codex-fast-child-no-tools-design.md docs/plans/2026-10-17-codex-fast-child-no-tools.md docs/plans/2026-10-17-codex-fast-child-no-tools.plan.json; git -C /Users/roberthyatt/Code/ironclaude diff --cached --name-status", "expected": "M for the 5 source/test/doc files from Tasks 1-2 and A for these 3 plan docs plus the 4 investigation docs already staged (12 lines)"}
+      ]
+    }
+  ]
+}

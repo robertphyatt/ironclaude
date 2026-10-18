@@ -1,0 +1,283 @@
+{
+  "name": "Episodic Memory: Lean and Useful",
+  "goal": "Stop index/archive bloat at source, capture operator voice + session provenance for any operator, and ship an idempotent guarded maintain routine (auto from the sync worker + CLI) that reclaims existing space losslessly.",
+  "requirements_file": "docs/plans/2026-10-07-episodic-memory-lean-requirements.md",
+  "design_file": "docs/plans/2026-10-07-episodic-memory-lean-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "archive-io helper (L3, L7, L8)",
+      "description": "Execution prerequisite (orchestrator, operator go given, before this task is claimed; not a task): printf '%s\\n' '{\"maintain\":{\"autoRun\":false}}' > /Users/roberthyatt/.config/superpowers/episodic-memory.json then cat it; expected exactly {\"maintain\":{\"autoRun\":false}} (human plan 'Execution prerequisite'). New src/archive-io.ts (human plan Task 1 Step 3 verbatim): zstdAvailable, logicalPath (.jsonl.zst -> .jsonl), resolveArchiveFile (raw .jsonl wins, else .jsonl.zst, else null), archiveExists, archiveStat, openArchiveStream (pipeline into zlib.createZstdDecompress for .zst), readArchiveText (zstdDecompressSync for .zst), ENOENT error naming the logical path, clear error + 'zstd -d' hint when Node lacks zstd, archiveNeedsCopy (dest raw-or-.zst missing or older than src), copyIntoArchive (COPYFILE_FICLONE, temp + rename; Node falls back to a real copy where clone is unsupported). Test src/archive-io.test.ts (human plan Task 1 Step 1 verbatim, 7 cases incl. zstd positive control and FICLONE flag spy).",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/archive-io.ts",
+        "worker/mcp-servers/episodic-memory/src/archive-io.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: create src/archive-io.test.ts with human plan Task 1 Step 1 content verbatim."},
+        {"description": "Run test, see it fail", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/archive-io.test.ts", "expected": "FAIL, non-zero exit: cannot import ./archive-io.js"},
+        {"description": "GREEN: create src/archive-io.ts with human plan Task 1 Step 3 content verbatim."},
+        {"description": "Run test, see it pass (if the zstd positive control fails: stop and report the Node version)", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/archive-io.test.ts", "expected": "exit 0; Tests  7 passed (7)"},
+        {"description": "Type-check (fix errors in this task's allowed_files; report errors elsewhere)", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/tsc --noEmit -p /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/tsconfig.json", "expected": "no output, exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/archive-io.ts worker/mcp-servers/episodic-memory/src/archive-io.test.ts", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Route every archive reader through archive-io (L8)",
+      "description": "Migrate all archive readers to archive-io (human plan Task 2 Steps 3-10 verbatim): parser.ts:1,33 and codex-parser.ts:1,28 -> openArchiveStream; search.ts: countLines + getFileSizeInKB (169-196) replaced by fileMetrics (one openArchiveStream pass counting non-empty lines and DECOMPRESSED bytes, so the size hint does not shrink once compacted; stream.once('error', () => rl.close()) so a read/decode error ends the loop instead of hanging), used in formatResults and formatMultiConceptResults; show-cli.ts:49 and repair-cli.ts:61,66 -> readArchiveText/archiveExists; mcp-server.ts read handler 271-295 -> resolveArchiveFile then realpath containment on the on-disk file then readArchiveText; indexer.ts getFileLineCount -> readArchiveText, three existsSync-then-copy sites -> archiveExists + COPYFILE_FICLONE; verify.ts:50 lists .jsonl and .jsonl.zst by logical path (prevents compacted rows being reported orphaned and deleted by repairIndex), :73-80 archiveStat. Test src/archive-readers.test.ts (human plan Task 2 Step 1 verbatim, 4 cases on .zst-only archive).",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/parser.ts",
+        "worker/mcp-servers/episodic-memory/src/codex-parser.ts",
+        "worker/mcp-servers/episodic-memory/src/search.ts",
+        "worker/mcp-servers/episodic-memory/src/show-cli.ts",
+        "worker/mcp-servers/episodic-memory/src/repair-cli.ts",
+        "worker/mcp-servers/episodic-memory/src/mcp-server.ts",
+        "worker/mcp-servers/episodic-memory/src/indexer.ts",
+        "worker/mcp-servers/episodic-memory/src/verify.ts",
+        "worker/mcp-servers/episodic-memory/src/archive-readers.test.ts"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "RED: create src/archive-readers.test.ts with human plan Task 2 Step 1 content verbatim."},
+        {"description": "Run test, see it fail", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/archive-readers.test.ts", "expected": "FAIL, 4 failed: both parsers ENOENT on missing raw .jsonl; formatResults fails by printing '(0KB, 0 lines)' or timing out; verifyIndex lists row-1 as orphaned"},
+        {"description": "parser.ts edits: human plan Task 2 Step 3 verbatim."},
+        {"description": "codex-parser.ts edits: human plan Task 2 Step 4 verbatim."},
+        {"description": "search.ts edits (fileMetrics): human plan Task 2 Step 5 verbatim."},
+        {"description": "show-cli.ts edits: human plan Task 2 Step 6 verbatim."},
+        {"description": "repair-cli.ts edits: human plan Task 2 Step 7 verbatim."},
+        {"description": "mcp-server.ts edits: human plan Task 2 Step 8 verbatim."},
+        {"description": "indexer.ts edits: human plan Task 2 Step 9 verbatim."},
+        {"description": "verify.ts edits: human plan Task 2 Step 10 verbatim."},
+        {"description": "Run test, see it pass", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/archive-readers.test.ts", "expected": "exit 0; Tests  4 passed (4)"},
+        {"description": "Existing parser/sync tests", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/codex-parser.test.ts src/codex-sync.test.ts", "expected": "exit 0; Tests  6 passed (6)"},
+        {"description": "Type-check (fix errors in this task's allowed_files; report errors elsewhere)", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/tsc --noEmit -p /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/tsconfig.json", "expected": "no output, exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/parser.ts worker/mcp-servers/episodic-memory/src/codex-parser.ts worker/mcp-servers/episodic-memory/src/search.ts worker/mcp-servers/episodic-memory/src/show-cli.ts worker/mcp-servers/episodic-memory/src/repair-cli.ts worker/mcp-servers/episodic-memory/src/mcp-server.ts worker/mcp-servers/episodic-memory/src/indexer.ts worker/mcp-servers/episodic-memory/src/verify.ts worker/mcp-servers/episodic-memory/src/archive-readers.test.ts", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "db.ts: no tool_calls; entrypoint, session_class, meta (L1, L2)",
+      "description": "Replace db.ts whole (human plan Task 3 Step 4 verbatim): applySchema(db, {provenanceIndexes?}) creates exchanges (+ entrypoint, session_class), vec_exchanges vec0, meta(key,value); migrateSchema adds entrypoint + session_class additively; existing indexes; NO tool_calls CREATE/INSERT/indexes; ensureProvenanceIndexes builds idx_session_class + idx_archive_path; initDatabase builds them only for a brand-new DB file (an existing large index gets them from maintain under the sync lock, so concurrent MCP starts never race a long index build); resetDatabaseCache, tableExists, getMeta (null when no meta table), setMeta (upsert); insertExchange writes 20 columns incl. entrypoint/session_class, keeps _toolNames param for call-site compat. types.ts: add entrypoint?, sessionClass?, isAnswer? (human plan Task 3 Step 3). Test src/db.test.ts (human plan Task 3 Step 1 verbatim, 4 cases incl. existing legacy file gets no provenance indexes at startup).",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/db.ts",
+        "worker/mcp-servers/episodic-memory/src/types.ts",
+        "worker/mcp-servers/episodic-memory/src/db.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: create src/db.test.ts with human plan Task 3 Step 1 content verbatim."},
+        {"description": "Run test, see it fail", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/db.test.ts", "expected": "FAIL, 4 failed: tool_calls exists; entrypoint column missing; legacy migration lacks new columns; getMeta is not a function"},
+        {"description": "types.ts: add provenance fields per human plan Task 3 Step 3 verbatim."},
+        {"description": "GREEN: replace db.ts with human plan Task 3 Step 4 content verbatim."},
+        {"description": "Run test, see it pass", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/db.test.ts", "expected": "exit 0; Tests  4 passed (4)"},
+        {"description": "Prove only db.ts ever named the table (L1)", "command": "grep -rn \"tool_calls\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/src '--include=*.ts'", "expected": "matches only in db.test.ts (assertions) and db.ts (applySchema comment); no SQL creates/inserts/indexes tool_calls"},
+        {"description": "Type-check (fix errors in this task's allowed_files; report errors elsewhere)", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/tsc --noEmit -p /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/tsconfig.json", "expected": "no output, exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/db.ts worker/mcp-servers/episodic-memory/src/types.ts worker/mcp-servers/episodic-memory/src/db.test.ts", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Settings file and session classifier (L2, L9, L10, L11, L15)",
+      "description": "New src/settings.ts (human plan Task 4 Step 3 verbatim): settings file <getSuperpowersDir()>/episodic-memory.json (EPISODIC_MEMORY_CONFIG_DIR overrides), deep-merge where file arrays replace defaults, invalid JSON -> defaults with maintain.autoRun=false. DEFAULT_SETTINGS: maintain {autoRun true (boolean; default ON for every install, L16), liveWindowHours 24, zstdLevel 3, maxRuntimeMinutes 120}; exclude.machineProjectPatterns ['--(ironclaude|tron)-grader$','claude-judge-','^-private-tmp($|-)','^-tmp($|-)','^-(private-)?var-folders-'], machineFirstUserTextPrefixes ['Output only your exact model id string and nothing else.','Review this change for security vulnerabilities.'] (model probes + automated security reviews = machine, L16), archiveSubagents true, archiveOnlyProjectPatterns ['-programmatically-control-claude-work-chunk-'] (L16: archived, never indexed); classify.brainProjectPatterns ['--(ironclaude|tron)-brain$'], workerProjectPatterns ['--ironclaude-worktrees-'], operatorEntrypoints ['cli','Codex Desktop','codex-tui'], automationEntrypoints ['codex_exec','ironclaude'], automationEntrypointPrefixes ['sdk-']; backup.mirrorDir null. SessionClass adds 'archive-only'; UNINDEXED_CLASSES ['machine','archive-only']; isArchiveOnlyProject. classifySession order: machine (project regex or first-text prefix) > archive-only > brain > worker (path) > operator (listed entrypoint) > worker (listed automation entrypoint/prefix) > unknown (no entrypoint or unlisted value; never guessed). isMachineProject, hasMachinePrefix, readFirstUserText (first user text within 200 lines). No person name anywhere. Test src/settings.test.ts (human plan Task 4 Step 1 verbatim; CASES typed Array<[string, string | undefined, string]>; 27 cases incl. work-chunk -> archive-only and autoRun default true).",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/settings.ts",
+        "worker/mcp-servers/episodic-memory/src/settings.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: create src/settings.test.ts with human plan Task 4 Step 1 content verbatim."},
+        {"description": "Run test, see it fail", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/settings.test.ts", "expected": "FAIL, non-zero exit: cannot import ./settings.js"},
+        {"description": "GREEN: create src/settings.ts with human plan Task 4 Step 3 content verbatim."},
+        {"description": "Run test, see it pass", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/settings.test.ts", "expected": "exit 0; Tests  27 passed (27)"},
+        {"description": "Type-check (fix errors in this task's allowed_files; report errors elsewhere)", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/tsc --noEmit -p /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/tsconfig.json", "expected": "no output, exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/settings.ts worker/mcp-servers/episodic-memory/src/settings.test.ts", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Parsers capture AskUserQuestion answers and entrypoint (L2)",
+      "description": "parser.ts (human plan Task 5 Step 4 edits 1-9 verbatim): JSONLMessage gains entrypoint?, toolUseResult?; exported formatAnswers(toolUseResult) -> 'Q: <q>\\nA: <a>' pairs joined by blank line (arrays joined ', ', non-strings JSON.stringify, else ''); user record with answers starts a new exchange with that text and isAnswer=true; first seen entrypoint applied to every exchange after parse. codex-parser.ts (Step 5): session_meta.payload.originator -> entrypoint on every exchange; Codex Q->A not implemented (no verified answer-record shape). New fixture src/__fixtures__/claude-askuser-session.jsonl (Step 1, exactly 5 lines). Test src/parser-voice.test.ts (Step 2 verbatim, 5 cases).",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/parser.ts",
+        "worker/mcp-servers/episodic-memory/src/codex-parser.ts",
+        "worker/mcp-servers/episodic-memory/src/__fixtures__/claude-askuser-session.jsonl",
+        "worker/mcp-servers/episodic-memory/src/parser-voice.test.ts"
+      ],
+      "depends_on": [2, 3],
+      "steps": [
+        {"description": "Create fixture src/__fixtures__/claude-askuser-session.jsonl with human plan Task 5 Step 1 content verbatim (5 lines)."},
+        {"description": "RED: create src/parser-voice.test.ts with human plan Task 5 Step 2 content verbatim."},
+        {"description": "Run test, see it fail", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/parser-voice.test.ts", "expected": "FAIL: test 1 gets 1 exchange not 2; test 2 entrypoint undefined; test 3 formatAnswers is not a function; test 5 entrypoint undefined; test 4 passes (correct before and after)"},
+        {"description": "GREEN: parser.ts edits 1-9 per human plan Task 5 Step 4 verbatim."},
+        {"description": "codex-parser.ts edits per human plan Task 5 Step 5 verbatim."},
+        {"description": "Run tests, see them pass", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/parser-voice.test.ts src/codex-parser.test.ts src/archive-readers.test.ts", "expected": "exit 0; Tests  10 passed (10)"},
+        {"description": "Type-check (fix errors in this task's allowed_files; report errors elsewhere)", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/tsc --noEmit -p /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/tsconfig.json", "expected": "no output, exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/parser.ts worker/mcp-servers/episodic-memory/src/codex-parser.ts worker/mcp-servers/episodic-memory/src/__fixtures__/claude-askuser-session.jsonl worker/mcp-servers/episodic-memory/src/parser-voice.test.ts", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 6,
+      "name": "Search returns provenance, excludes machine, can prefer operator (L2, L9)",
+      "description": "search.ts (human plan Task 6 Step 3 verbatim): SearchOptions gains sessionClass ('operator'|'brain'|'worker'|'unknown') and preferOperator; filter always adds (session_class IS NULL OR NOT IN ('machine','archive-only')) (NULL rows kept until backfill); sessionClass -> e.session_class = ?; vector branch over-fetches knnK = sessionClass ? min(limit*10, 500) : limit then slices to limit (vec0 KNN filters are post-filters; date filters unchanged); both SELECTs return e.entrypoint, e.session_class; preferOperator stable-moves operator rows first; exchange carries entrypoint/sessionClass; formatResults adds '   Session: <class> (<entrypoint>)' line. mcp-server.ts (Step 4): zod + JSON schema session_class enum + prefer_operator boolean, passed to single- and multi-concept options. Test src/search-provenance.test.ts (Step 1 verbatim, 5 cases incl. an archive-only row that must not surface; embeddings mocked to unit vector e0; vector case: 12 worker rows at distance 0 + operators farther must still return ['op1','vop']).",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/search.ts",
+        "worker/mcp-servers/episodic-memory/src/mcp-server.ts",
+        "worker/mcp-servers/episodic-memory/src/search-provenance.test.ts"
+      ],
+      "depends_on": [2, 3],
+      "steps": [
+        {"description": "RED: create src/search-provenance.test.ts with human plan Task 6 Step 1 content verbatim."},
+        {"description": "Run test, see it fail", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/search-provenance.test.ts", "expected": "FAIL, 5 failed: mc1 returned; no class filter; no reorder; no Session: line; vector mode returns three vw* rows"},
+        {"description": "GREEN: search.ts edits per human plan Task 6 Step 3 verbatim."},
+        {"description": "mcp-server.ts edits per human plan Task 6 Step 4 verbatim."},
+        {"description": "Run tests, see them pass", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/search-provenance.test.ts src/archive-readers.test.ts", "expected": "exit 0; Tests  9 passed (9)"},
+        {"description": "Type-check (fix errors in this task's allowed_files; report errors elsewhere)", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/tsc --noEmit -p /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/tsconfig.json", "expected": "no output, exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/search.ts worker/mcp-servers/episodic-memory/src/mcp-server.ts worker/mcp-servers/episodic-memory/src/search-provenance.test.ts", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 7,
+      "name": "Sync: clone copies, machine exclusion, subagent archiving, provenance (L3, L9, L10)",
+      "description": "Replace sync.ts and codex-sync.ts whole (human plan Task 7 Steps 3-4 verbatim). SyncResult gains excluded. Claude: machine project (exclude.txt exact names or isMachineProject) -> excluded, not archived; per file archiveNeedsCopy then first-user-text prefix check (machine -> excluded, not archived) then copyIntoArchive (FICLONE; .zst counts as current archive copy); archive-only projects (isArchiveOnlyProject) are copied but never queued for indexing or summaries (L16); archiveSubagents walks <proj>/<session>/subagents/** .jsonl -> archived, never indexed/summarized (toggle exclude.archiveSubagents); index stamps sessionClass from classifySession(project, entrypoint, first userMessage), machine -> excluded, archive-only -> not indexed. Codex: readSessionMeta also returns originator; machine cwd project -> excluded; archive-only -> archived not indexed/summarized; copyIntoArchive; project carried with the file (no readSessionMeta on archive copies); sessionClass from originator. indexer.ts (Step 5): loadSettings + isMachineProject/isArchiveOnlyProject skip in the 3 project loops. codex-sync.test.ts (Step 6): set/delete EPISODIC_MEMORY_CONFIG_DIR. shouldSkipConversation (sync.ts) and shouldSkip (codex-sync.ts) read via readArchiveText (raw or .jsonl.zst) so a compacted DO-NOT-INDEX file is never summarized. Test src/sync-lean.test.ts (Step 1 verbatim, 4 cases incl. security-review session excluded (excluded=4), work-chunk session archived but not indexed, and a .zst-only newer-than-source archive copy with the '<INSTRUCTIONS-TO-EPISODIC-MEMORY>DO NOT INDEX THIS CHAT</INSTRUCTIONS-TO-EPISODIC-MEMORY>' marker -> copied 0, summarized 0, no -summary.txt; embeddings and summarizer (summarizeConversation -> 'SUMMARY') mocked).",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/sync.ts",
+        "worker/mcp-servers/episodic-memory/src/codex-sync.ts",
+        "worker/mcp-servers/episodic-memory/src/indexer.ts",
+        "worker/mcp-servers/episodic-memory/src/codex-sync.test.ts",
+        "worker/mcp-servers/episodic-memory/src/sync-lean.test.ts"
+      ],
+      "depends_on": [1, 4, 5],
+      "steps": [
+        {"description": "RED: create src/sync-lean.test.ts with human plan Task 7 Step 1 content verbatim."},
+        {"description": "Run test, see it fail", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/sync-lean.test.ts", "expected": "FAIL, 3 failed (tests 1, 3, 4): excluded undefined; grader and -private-tmp archived; subagents not archived; NULL class; test 4: raw-file read misses the .zst-only copy so it is summarized. Test 2 passes before the change (toggle-off equals old behaviour; it is the negative pinning the toggle)"},
+        {"description": "GREEN: replace sync.ts with human plan Task 7 Step 3 content verbatim."},
+        {"description": "Replace codex-sync.ts with human plan Task 7 Step 4 content verbatim."},
+        {"description": "indexer.ts machine-project skip per human plan Task 7 Step 5 verbatim."},
+        {"description": "codex-sync.test.ts config-dir isolation per human plan Task 7 Step 6 verbatim."},
+        {"description": "Run tests, see them pass (codex-sync end-to-end loads the real model, up to its 120 s timeout)", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/sync-lean.test.ts src/codex-sync.test.ts", "expected": "exit 0; Tests  9 passed (9)"},
+        {"description": "Type-check (fix errors in this task's allowed_files; report errors elsewhere)", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/tsc --noEmit -p /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/tsconfig.json", "expected": "no output, exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/sync.ts worker/mcp-servers/episodic-memory/src/codex-sync.ts worker/mcp-servers/episodic-memory/src/indexer.ts worker/mcp-servers/episodic-memory/src/codex-sync.test.ts worker/mcp-servers/episodic-memory/src/sync-lean.test.ts", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 8,
+      "name": "maintain.ts: guarded one-time slim (L6, L9 D2)",
+      "description": "New src/maintain.ts (human plan Task 8 Step 4 verbatim): Phase/PhaseReport/MaintainOptions (dryRun, keepBackup, invokedBy cli|sync, dbPath, archiveDir, settings, now, freeBytes seam, failpoint seam after-copy|after-first-rename|corrupt-compressed); estimateSlimBytes via dbstat per object excluding tool_calls objects; slimIndex: resume interrupted swap (finish if .new has slim_verified else roll back .bak), skip when slim_done (drop a tool_calls table recreated by old bundles; .bak removed by any LATER run, auto or manual, when !keepBackup && !dryRun and only after quick_check + (rows + meta.backfill_deleted) >= slim_rows (backfill deletions netted out); the slim run itself never removes it; failed re-verification keeps it), non-legacy -> purgeMachineRows once (machine + archive-only rows; machine_purge_done; applySchema with provenance indexes), legacy -> refuse when free < 2x estimate (detail reports reclaimable bytes), dry-run reports, WAL checkpoint TRUNCATE (busy -> refuse), buildAndSwap: removes newPath + newPath-wal + newPath-shm at start and (unless swap-ready) in finally; fresh .new (journal OFF), applySchema with provenance indexes, ATTACH old, INSERT..SELECT exchanges whose class is not machine/archive-only with session_class via registered ic_session_class, vectors through vec0 interface (never shadow tables), verify row count, vector count, MAX(timestamp), 3-sample KNN (new top 5 vs old k=200 kept hits over common length: distances equal + ids contained), set slim_rows/slim_done/legacy_origin/schema_version/slim_verified, rename db->.bak, remove old -wal/-shm, rename .new->db, resetDatabaseCache. If ATTACH vec0 select fails at runtime: stop and report the exact error. New fixture builder src/__fixtures__/make-legacy-db.ts (Step 1 verbatim; includes work-chunk row w1). Test src/maintain-slim.test.ts (Step 2 verbatim, 9 cases incl. .bak lifecycle and failed re-verification keeps .bak).",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/maintain.ts",
+        "worker/mcp-servers/episodic-memory/src/__fixtures__/make-legacy-db.ts",
+        "worker/mcp-servers/episodic-memory/src/maintain-slim.test.ts"
+      ],
+      "depends_on": [3, 4],
+      "steps": [
+        {"description": "Create src/__fixtures__/make-legacy-db.ts with human plan Task 8 Step 1 content verbatim."},
+        {"description": "RED: create src/maintain-slim.test.ts with human plan Task 8 Step 2 content verbatim."},
+        {"description": "Run test, see it fail", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/maintain-slim.test.ts", "expected": "FAIL, 9 failed: ./maintain.js does not exist"},
+        {"description": "GREEN: create src/maintain.ts with human plan Task 8 Step 4 content verbatim."},
+        {"description": "Run test, see it pass", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/maintain-slim.test.ts", "expected": "exit 0; Tests  9 passed (9)"},
+        {"description": "Type-check (fix errors in this task's allowed_files; report errors elsewhere)", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/tsc --noEmit -p /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/tsconfig.json", "expected": "no output, exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/maintain.ts worker/mcp-servers/episodic-memory/src/__fixtures__/make-legacy-db.ts worker/mcp-servers/episodic-memory/src/maintain-slim.test.ts", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 9,
+      "name": "maintain.ts: lossless compaction and backup mirror (L7, L10, L11)",
+      "description": "Add imports (human plan Task 9 Step 3 verbatim) and append compaction + mirror code (Step 4 verbatim) to maintain.ts. compactArchive: skip if Node lacks zstd; candidates = every .jsonl under archive subdirs (nested subagents included; never root files, never '.tmp.' files) with mtime older than liveWindowHours; dry-run reports count/bytes; one file at a time: sha256 raw, resume (manifest entry with same sha + .zst exists -> remove raw), compress to .zst.tmp (level zstdLevel, checksum flag), stream-decompress sha256 must equal raw and raw unchanged, else remove tmp + append manifest-errors.jsonl and keep raw; fsync, rename to .zst, stamp raw mtime on .zst, append manifest.jsonl {path, sha256, rawBytes, zstBytes, mtimeMs, sessionClass (machine / archive-only tagged), compactedAt}, then remove raw; summaries untouched. mirrorBackup: off when backup.mirrorDir null; unavailable dir -> warn + skipped (fail-soft); copies each manifest .zst via tmp, sha256 src==copy, rename, stamp mtime; current when size+mtime match. Test src/maintain-compact.test.ts (Step 1 verbatim, 12 cases incl. archive-only work-chunk compacted + tagged).",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/maintain.ts",
+        "worker/mcp-servers/episodic-memory/src/maintain-compact.test.ts"
+      ],
+      "depends_on": [1, 8],
+      "steps": [
+        {"description": "RED: create src/maintain-compact.test.ts with human plan Task 9 Step 1 content verbatim."},
+        {"description": "Run test, see it fail", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/maintain-compact.test.ts", "expected": "FAIL, 12 failed: compactArchive / mirrorBackup are not functions"},
+        {"description": "GREEN: maintain.ts import changes per human plan Task 9 Step 3 verbatim."},
+        {"description": "Append human plan Task 9 Step 4 code verbatim to the end of maintain.ts."},
+        {"description": "Run tests, see them pass", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/maintain-compact.test.ts src/maintain-slim.test.ts", "expected": "exit 0; Tests  21 passed (21)"},
+        {"description": "Type-check (fix errors in this task's allowed_files; report errors elsewhere)", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/tsc --noEmit -p /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/tsconfig.json", "expected": "no output, exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/maintain.ts worker/mcp-servers/episodic-memory/src/maintain-compact.test.ts", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 10,
+      "name": "maintain.ts: voice backfill, phase runner, auto-run gate (L5, L9, L12, L15)",
+      "description": "Add imports (human plan Task 10 Step 3 verbatim, incl. ensureProvenanceIndexes) and append Step 4 code verbatim to maintain.ts. backfillVoice: dry-run opens DB read-only (never runs initDatabase migrations on a legacy index) and reports session count; else once (voice_backfill_done), builds provenance indexes under the lock, resumable cursor (voice_backfill_cursor, ascending archive_path): missing archive file -> counted, skipped; parse (Codex for rollout-*), classify; machine or archive-only -> delete that session's rows (archive kept) and noteBackfillDeletions(db, n) in the same transaction (meta.backfill_deleted += n; no-op on 0; superseded-row deletions recorded the same way) so a later .bak re-verification nets them out; else stamp entrypoint + session_class; sessions with answers: insert ids the new parse produces (embedded), delete superseded INDEX rows (same text re-segmented; L16 accepted; backfill only reads the archive, never modifies it). runMaintain: phases slim, backfill, compact, mirror (only filter); slim refused/error -> backfill skipped, compact/mirror still run; other error -> stop. autoRunAllowed(settings) (L16): autoRun true (default, every install incl. legacy-bloated) -> allowed 'maintain.autoRun is true'; false -> 'maintain.autoRun is false'; no legacy-index gate (phase guards still apply). Test src/maintain-run.test.ts (Step 1 verbatim, 7 cases incl. 'a later slim run still verifies and removes .bak after the backfill removed machine rows' (slim_rows '4', backfill detail 'machine sessions removed from the index 1', 3 rows left, second slim removes db.sqlite.bak), auto run on legacy index with low disk refuses slim and leaves index untouched, and opt-out file; embeddings mocked; seed drops idx_archive_path so the index assertion is falsifiable).",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/maintain.ts",
+        "worker/mcp-servers/episodic-memory/src/maintain-run.test.ts"
+      ],
+      "depends_on": [5, 9],
+      "steps": [
+        {"description": "RED: create src/maintain-run.test.ts with human plan Task 10 Step 1 content verbatim."},
+        {"description": "Run test, see it fail", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/maintain-run.test.ts", "expected": "FAIL, 7 failed: backfillVoice / runMaintain / autoRunAllowed are not functions"},
+        {"description": "GREEN: maintain.ts import changes per human plan Task 10 Step 3 verbatim."},
+        {"description": "Append human plan Task 10 Step 4 code verbatim to the end of maintain.ts."},
+        {"description": "Run tests, see them pass", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/maintain-run.test.ts src/maintain-slim.test.ts src/maintain-compact.test.ts", "expected": "exit 0; Tests  28 passed (28)"},
+        {"description": "Type-check (fix errors in this task's allowed_files; report errors elsewhere)", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/tsc --noEmit -p /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/tsconfig.json", "expected": "no output, exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/maintain.ts worker/mcp-servers/episodic-memory/src/maintain-run.test.ts", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 11,
+      "name": "One lock + runtime budget; maintain CLI; sync-cli wiring; bundle (L4, L5)",
+      "description": "New src/sync-lock.ts (human plan Task 11 Step 3 verbatim): getLockPath = <getIndexDir()>/sync.lock; acquireLock(path, maxAgeMs, kind sync|cli) via O_EXCL file {pid, startedAt, kind}; stale = unreadable or dead PID or (kind != cli and age > maxAgeMs) -> reclaimed once; releaseLock only when holder pid == own pid; pidAlive (EPERM = alive); startWatchdog (unref'd timer). New src/maintain-cli.ts (Step 4 verbatim): USAGE; main(argv) -> 2 unknown option, 3 lock held, 1 any phase error, else 0; options --dry-run, --only=PHASE, --keep-bak; lock kind cli (age never steals a live manual run); runs when realpath(argv[1]) is this module. Replace sync-cli.ts whole (Step 5 verbatim): --background fork writes child stdout/stderr to <getIndexDir()>/sync.log (rotate to sync.log.1 when > 5 MB; opened 'a'; stdio ['ignore', out, out]; fd closed after spawn; prints log path); run() first logs '=== sync <ISO> (PID n) ==='; after the fork, acquire lock kind sync (maxAge 2x maxRuntimeMinutes) or exit 0 printing 'holds'; watchdog maxRuntimeMinutes -> release lock + exit 124; sync Claude + Codex (prints Excluded (machine)); autoRunAllowed(settings) gate -> 'Maintain: skipped (<reason>)' or 'Running maintain...' + runMaintain(invokedBy sync); release lock; explicit process.exit(0)/(1). package.json:15 bundle appends maintain-cli esbuild (Step 6). cli/episodic-memory.js help + case 'maintain' -> dist/maintain-cli.js (Step 7). cli/mcp-server-wrapper.js maintainCliFile existence + auto-build block (Step 8). Hook script worker/hooks/episodic-memory-sync.sh unchanged. Build dist in place (gitignored, not staged; parent-death test needs dist/mcp-server.js) and smoke-test bundled CLI on throwaway dirs (Steps 11-12). Tests src/sync-lock.test.ts (7 cases) and src/maintain-cli.test.ts (7 cases incl. sync-cli spawned via node --import tsx with temp HOME/config/db/archive), both Step 1 verbatim.",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/sync-lock.ts",
+        "worker/mcp-servers/episodic-memory/src/maintain-cli.ts",
+        "worker/mcp-servers/episodic-memory/src/sync-cli.ts",
+        "worker/mcp-servers/episodic-memory/package.json",
+        "worker/mcp-servers/episodic-memory/cli/episodic-memory.js",
+        "worker/mcp-servers/episodic-memory/cli/mcp-server-wrapper.js",
+        "worker/mcp-servers/episodic-memory/src/sync-lock.test.ts",
+        "worker/mcp-servers/episodic-memory/src/maintain-cli.test.ts"
+      ],
+      "depends_on": [7, 10],
+      "steps": [
+        {"description": "RED: create src/sync-lock.test.ts and src/maintain-cli.test.ts with human plan Task 11 Step 1 content verbatim."},
+        {"description": "Run tests, see them fail", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/sync-lock.test.ts src/maintain-cli.test.ts", "expected": "FAIL: sync-lock.js and maintain-cli.js missing; sync-cli prints neither 'holds' nor 'Running maintain'; wiring strings absent"},
+        {"description": "GREEN: create src/sync-lock.ts with human plan Task 11 Step 3 content verbatim."},
+        {"description": "Create src/maintain-cli.ts with human plan Task 11 Step 4 content verbatim."},
+        {"description": "Replace src/sync-cli.ts with human plan Task 11 Step 5 content verbatim."},
+        {"description": "package.json bundle script per human plan Task 11 Step 6 verbatim."},
+        {"description": "cli/episodic-memory.js per human plan Task 11 Step 7 verbatim."},
+        {"description": "cli/mcp-server-wrapper.js per human plan Task 11 Step 8 verbatim."},
+        {"description": "Run tests, see them pass", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/sync-lock.test.ts src/maintain-cli.test.ts", "expected": "exit 0; Tests  14 passed (14)"},
+        {"description": "Type-check whole package (fix errors in this task's allowed_files; report errors elsewhere)", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/tsc --noEmit -p /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/tsconfig.json", "expected": "no output, exit 0"},
+        {"description": "Step 10a: confirm the operator's opt-out is still in place before building (the build puts auto-run code into repo dist/); any output other than 1, or a missing file: STOP, do not build, report", "command": "grep -c '\"autoRun\":false' /Users/roberthyatt/.config/superpowers/episodic-memory.json", "expected": "1"},
+        {"description": "Build tsc output + 3 bundles in place (dist gitignored, not staged)", "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory run build", "expected": "exit 0; esbuild lines for dist/mcp-server.js, dist/sync-cli.js, dist/maintain-cli.js"},
+        {"description": "Smoke-test bundled CLI on throwaway dirs (never real ~/.config/superpowers)", "command": "env EPISODIC_MEMORY_CONFIG_DIR=/tmp/ic-em-cli-check/config TEST_DB_PATH=/tmp/ic-em-cli-check/db.sqlite TEST_ARCHIVE_DIR=/tmp/ic-em-cli-check/archive node /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/dist/maintain-cli.js --dry-run", "expected": "exit 0; exactly 4 lines: 'slim: skipped — no index database yet', 'backfill: skipped — no index database yet', 'compact: skipped — nothing to compact', 'mirror: skipped — no backup.mirrorDir configured'"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/sync-lock.ts worker/mcp-servers/episodic-memory/src/maintain-cli.ts worker/mcp-servers/episodic-memory/src/sync-cli.ts worker/mcp-servers/episodic-memory/package.json worker/mcp-servers/episodic-memory/cli/episodic-memory.js worker/mcp-servers/episodic-memory/cli/mcp-server-wrapper.js worker/mcp-servers/episodic-memory/src/sync-lock.test.ts worker/mcp-servers/episodic-memory/src/maintain-cli.test.ts", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 12,
+      "name": "README episodic-memory section (L13)",
+      "description": "Documentation only; no tests required: documentation change. Insert '## Episodic Memory' section (human plan Task 12 Step 1 verbatim) immediately before the '---' preceding '## Configuration Reference' in README.md: what is stored + session classes (operator cli/Codex Desktop/codex-tui; worker sdk-*/codex_exec/ironclaude; archive-only work-chunk pipeline; unknown = none or unlisted), exclusions (machine incl. model probes + security reviews by first-message prefix; archive-only + subagents archived not indexed) + episodic-memory.json example identical to DEFAULT_SETTINGS (arrays replace defaults), compressed archive + zstd -d restore, backup mirror, maintain CLI + autoRun (boolean, default true for every install; false opts out) + .bak removed by a later verified run unless --keep-bak/--dry-run + backfill replaces superseded index rows, never modifies archive + upgrade (nothing required; manual-control path via autoRun false) + notes (stale MCP readers, refresh both caches, never index --rebuild). README.md already has other staged changes; add only this section.",
+      "allowed_files": [
+        "README.md"
+      ],
+      "depends_on": [11],
+      "steps": [
+        {"description": "Insert the section per human plan Task 12 Step 1 verbatim."},
+        {"description": "Verify placement", "command": "grep -n -e \"^## Wiki Knowledge Layer\" -e \"^## Episodic Memory$\" -e \"^## Configuration Reference\" /Users/roberthyatt/Code/ironclaude/README.md", "expected": "exactly 3 lines, in order: ## Wiki Knowledge Layer, ## Episodic Memory, ## Configuration Reference"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add README.md", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 13,
+      "name": "Full verification",
+      "description": "No source changes; no new tests: verification-only task (Task 11 already built dist); results recorded in docs/reviews/2026-10-07-episodic-memory-lean-verification.md. Run full episodic-memory suite, hook suites, Commander pytest, confirm staged set. 'Workspace' suites read as every suite this change can affect (episodic-memory, hooks, Commander); workspace-manager untouched. Record actual result lines (baseline unmeasured at planning: stage blocked node/vitest; static count 19 pre-existing it() cases + 98 new = 117 if all pre-existing remain). Post-loop operator steps (not tasks): human plan 'After the loop' — confirm the opt-out written at the execution prerequisite still reads back exactly {\"maintain\":{\"autoRun\":false}}, cache refresh (check sync.log shows 'Maintain: skipped (maintain.autoRun is false)'), old-sync check, dry run, real run --keep-bak, then autoRun on.",
+      "allowed_files": ["docs/reviews/2026-10-07-episodic-memory-lean-verification.md"],
+      "depends_on": [6, 11, 12],
+      "steps": [
+        {"description": "Full episodic-memory suite; record actual Test Files and Tests lines", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory", "expected": "exit 0, 0 failed; record actual (117 if the 19 statically counted pre-existing cases remain)"},
+        {"description": "Hook suites, one log per suite; record every FAIL line; pre-existing rg-dependency failures (log shows rg not found) are not regressions, any other failure: stop and report", "command": "for s in /Users/roberthyatt/Code/ironclaude/worker/hooks/test-*.sh /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-*.sh /Users/roberthyatt/Code/ironclaude/commander/hooks/tests/test-*.sh; do bash \"$s\" > \"/tmp/ic-em-hooks-$(basename \"$s\").log\" 2>&1 || echo \"FAIL $s\"; done; echo DONE", "expected": "last line DONE; FAIL lines only for pre-existing rg-dependency failures; record actual"},
+        {"description": "Commander pytest; record actual summary line", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "record actual; known pre-existing failure test_executing_plans_skill.py::test_execution_complete_restage_command_stages_from_non_root_cwd (2026-10-06: 1 failed, 3760 passed) is not a regression; any other failure: stop and report"},
+        {"description": "Confirm staged set for this loop", "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached --name-only -- worker/mcp-servers/episodic-memory README.md", "expected": "exactly the 37 paths listed in human plan Task 13 Step 4 (33 under src/, package.json, cli/episodic-memory.js, cli/mcp-server-wrapper.js, README.md); nothing under dist/"},
+        {"description": "Write docs/reviews/2026-10-07-episodic-memory-lean-verification.md recording every command above with its actual result line(s), every FAIL line with pre-existing/regression classification, and the staged-set check result."},
+        {"description": "Stage the verification note", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-07-episodic-memory-lean-verification.md", "expected": "no output, exit 0"}
+      ]
+    }
+  ]
+}

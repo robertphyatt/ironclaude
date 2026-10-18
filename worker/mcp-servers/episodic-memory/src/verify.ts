@@ -3,6 +3,7 @@ import path from 'path';
 import { parseConversation } from './parser.js';
 import { initDatabase, getAllExchanges, getFileLastIndexed } from './db.js';
 import { getArchiveDir, getExcludedProjects } from './paths.js';
+import { archiveStat, logicalPath } from './archive-io.js';
 
 export interface VerificationResult {
   missing: Array<{ path: string; reason: string }>;
@@ -47,7 +48,13 @@ export async function verifyIndex(): Promise<VerificationResult> {
 
     if (!stat.isDirectory()) continue;
 
-    const files = fs.readdirSync(projectPath).filter(f => f.endsWith('.jsonl'));
+    // A compacted transcript exists only as <name>.jsonl.zst; list it by its logical
+    // path so its rows are not reported (and later deleted) as orphans.
+    const files = Array.from(new Set(
+      fs.readdirSync(projectPath)
+        .filter(f => f.endsWith('.jsonl') || f.endsWith('.jsonl.zst'))
+        .map(f => logicalPath(f))
+    ));
 
     for (const file of files) {
       totalChecked++;
@@ -70,8 +77,8 @@ export async function verifyIndex(): Promise<VerificationResult> {
       // Check if file is outdated (modified after last_indexed)
       const lastIndexed = getFileLastIndexed(db, conversationPath);
       if (lastIndexed !== null) {
-        const fileStat = fs.statSync(conversationPath);
-        if (fileStat.mtimeMs > lastIndexed) {
+        const fileStat = archiveStat(conversationPath);
+        if (fileStat && fileStat.mtimeMs > lastIndexed) {
           result.outdated.push({
             path: conversationPath,
             fileTime: fileStat.mtimeMs,

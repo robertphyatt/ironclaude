@@ -1,0 +1,123 @@
+{
+  "name": "Codex Brain tool trim (R14)",
+  "goal": "Codex Brain tool set matches the Claude Brain's: -c overrides (fixed feature flags + per-start derived disables of every non-ironclaude plugin, user MCP servers outside the Brain set, and ironclaude MCP servers except episodic-memory) read from ~/.codex/config.toml and the plugin manifest, never written; fail closed.",
+  "requirements_file": "docs/plans/2026-10-10-codex-brain-parity-design.md",
+  "design_file": "docs/plans/2026-10-10-codex-brain-parity-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Trim-override builder (R14)",
+      "description": "TDD. New module commander/src/ironclaude/codex_brain_tool_trim.py (KEPT_PLUGIN, KEPT_PLUGIN_MCP_SERVERS, FIXED_OVERRIDES, BrainToolTrimError(ValueError), _segment, brain_tool_trim_overrides(config_path, manifest_path, brain_mcp_servers)) and tests/test_codex_brain_tool_trim.py. Exact code: human plan Task 1 Steps 1 and 3.",
+      "allowed_files": ["commander/src/ironclaude/codex_brain_tool_trim.py", "commander/tests/test_codex_brain_tool_trim.py"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: create the test file per human plan Task 1 Step 1."},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_codex_brain_tool_trim.py -q", "expected": "Collection error: ModuleNotFoundError: No module named 'ironclaude.codex_brain_tool_trim'; record summary."},
+        {"description": "GREEN: create the module per human plan Task 1 Step 3."},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_codex_brain_tool_trim.py -q", "expected": "12 passed; record summary."},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/codex_brain_tool_trim.py commander/tests/test_codex_brain_tool_trim.py", "expected": "No output."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Brain argv applies the trim; fail closed (R14)",
+      "description": "TDD. conftest.py _redirect_home: monkeypatch.delenv('CODEX_HOME', raising=False) + docstring sentence (all tests resolve Codex config under the fake HOME). test_codex_brain_client.py: argv pin adds *c._tool_trim_overrides() after optional MCP; append test_app_server_argv_trims_inherited_tools and test_start_fails_closed_when_trim_cannot_be_derived. codex_brain_client.py: import brain_tool_trim_overrides; _app_server_argv adds *self._tool_trim_overrides() before --stdio; new _codex_config_path (CODEX_HOME or ~/.codex)/config.toml, _ironclaude_plugin_manifest_path (repo worker/.codex-plugin/plugin.json), _tool_trim_overrides (brain set {orchestrator, *_OPTIONAL_MCP_SERVERS}). Exact code: human plan Task 2.",
+      "allowed_files": ["commander/src/ironclaude/codex_brain_client.py", "commander/tests/test_codex_brain_client.py", "commander/tests/conftest.py"],
+      "depends_on": [1],
+      "steps": [
+        {"description": "RED: test edits per human plan Task 2 Step 1 (a)-(c)."},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_codex_brain_client.py -q", "expected": "Fail: test_app_server_argv_forces_readonly_and_on_request, test_app_server_argv_trims_inherited_tools, test_start_fails_closed_when_trim_cannot_be_derived (any failure reason; stubbed Popen returns None -> AttributeError on _proc.pid); others pass; record."},
+        {"description": "GREEN: client edits per human plan Task 2 Step 3 (a)-(c)."},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_codex_brain_client.py tests/test_codex_brain_tool_trim.py tests/test_codex_brain_hooks_canary.py -q", "expected": "All pass; record summary."},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/codex_brain_client.py commander/tests/test_codex_brain_client.py commander/tests/conftest.py", "expected": "No output."}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Full suites",
+      "description": "No tests required: verification-only task that modifies no files. allowed_files lists the whole parity change set so end-of-plan restage and /commit cover it.",
+      "allowed_files": [
+        "docs/plans/2026-10-10-codex-brain-parity-design.md",
+        "docs/plans/2026-10-10-codex-brain-parity.md",
+        "docs/plans/2026-10-10-codex-brain-parity.plan.json",
+        "docs/plans/2026-10-10-codex-brain-parity-probe-findings.md",
+        "docs/plans/2026-10-10-codex-brain-parity-live-verification.md",
+        "docs/plans/2026-10-11-codex-brain-parity-followup.md",
+        "docs/plans/2026-10-11-codex-brain-parity-followup.plan.json",
+        "docs/plans/2026-10-11-codex-hooks-trust-confirm.md",
+        "docs/plans/2026-10-11-codex-hooks-trust-confirm.plan.json",
+        "docs/plans/2026-10-11-codex-brain-no-subagents.md",
+        "docs/plans/2026-10-11-codex-brain-no-subagents.plan.json",
+        "docs/plans/2026-10-11-codex-brain-tool-trim.md",
+        "docs/plans/2026-10-11-codex-brain-tool-trim.plan.json",
+        "commander/hooks/block-push.sh",
+        "commander/hooks/block-pin-enforcer.sh",
+        "commander/hooks/attention-sweep-enforcer.sh",
+        "commander/hooks/attention-sweep-arm.sh",
+        "commander/hooks/brain-orchestrator-guard.sh",
+        "commander/hooks/brain-task-gate.sh",
+        "commander/hooks/brain-hooks-canary.sh",
+        "commander/hooks/tests/test-block-push.sh",
+        "commander/hooks/tests/test-attention-sweep.sh",
+        "commander/hooks/tests/test-block-pin-enforcer.sh",
+        "commander/hooks/tests/test-brain-orchestrator-guard.sh",
+        "commander/hooks/tests/test-brain-task-gate.sh",
+        "commander/hooks/tests/test-brain-hooks-canary.sh",
+        "worker/.codex-plugin/plugin.json",
+        "worker/hooks/codex-brain-hooks.sh",
+        "worker/hooks/hook-logger.sh",
+        "worker/hooks/get-back-to-work-claude.sh",
+        "worker/hooks/codex-brain-gated-actions.sh",
+        "worker/hooks/brain-gated-actions.sh",
+        "worker/hooks/test-codex-brain-gated-actions.sh",
+        "worker/hooks/test-brain-gated-actions.sh",
+        "worker/hooks/hooks.json",
+        "worker/hooks/tests/test-codex-brain-stand-down.sh",
+        "worker/hooks/tests/test-hooks-json-brain-entries.sh",
+        "worker/hooks/tests/test-execution-drift-check.sh",
+        "commander/src/ironclaude/codex_brain_client.py",
+        "commander/src/ironclaude/codex_brain_tool_trim.py",
+        "commander/src/ironclaude/main.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/src/ironclaude/brain_client.py",
+        "commander/src/brain/brain_settings_hooks.json",
+        "commander/tests/test_codex_brain_client.py",
+        "commander/tests/test_codex_brain_tool_trim.py",
+        "commander/tests/conftest.py",
+        "commander/tests/test_daemon.py",
+        "commander/tests/test_brain_client_gate_session.py",
+        "commander/tests/test_brain_hook_provenance.py",
+        "commander/tests/test_codex_brain_hooks_canary.py",
+        "commander/tests/test_codex_hook_trust_warmup.py",
+        "commander/tests/test_worker_adapter.py"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {"description": "Hook suites", "command": "make -C /Users/roberthyatt/Code/ironclaude test-hooks > /private/tmp/ironclaude-tool-trim-hooks.log 2>&1; echo \"test-hooks exit=$?\"", "expected": "test-hooks exit=0."},
+        {"description": "Full Commander suite (background, Bash timeout 1800000); wait with foreground until-loop on the log's last line", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q > /private/tmp/ironclaude-tool-trim-full.log 2>&1; echo \"pytest exit=$?\"", "expected": "Only failure allowed: L-T2 tests/test_executing_plans_skill.py::test_execution_complete_restage_command_stages_from_non_root_cwd; record summary."}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Differential probe, restart, live acceptance (R14)",
+      "description": "No unit tests: live verification. Exact commands: human plan Task 4 Steps 1-8. Differential probe U (untrimmed tail removed) vs T (exact Brain argv) via codex exec with Brain identity; marker greps one per marker; operator launches the Commander; canary; operator Slack tool-list question; Brain rollout marker greps. Never write ~/.codex/config.toml. Kill only by make stop / exact PID. Guard false positive: build 'git p'+'ush' text. On failure: make stop, record, stop.",
+      "allowed_files": [
+        "docs/plans/2026-10-10-codex-brain-parity-live-verification.md",
+        "docs/plans/2026-10-10-codex-brain-parity-design.md",
+        "docs/plans/2026-10-11-codex-brain-tool-trim.md",
+        "docs/plans/2026-10-11-codex-brain-tool-trim.plan.json"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {"description": "Differential probe U/T exactly as human plan Task 4 Step 1 (Bash timeout 900000; gate sessions trim-probe-U / trim-probe-T; stdin DEVNULL)", "expected": "U exit 0, T exit 0; T has more pairs than U."},
+        {"description": "Marker greps on trim-U.jsonl and trim-T.jsonl (one grep -c per marker) + ls /tmp/ic/codex-brain-gate/trim-probe-U/hooks-live /tmp/ic/codex-brain-gate/trim-probe-T/hooks-live, per human plan Task 4 Step 2", "expected": "U: codex_apps/cua_repl/node_repl/state_manager/workspace_manager/web__run/image_gen/create_goal/request_plugin_install >=1. T: those 0; episodic_memory, exec_command >=1. Both hooks-live exist (canary under trimmed argv). 'is blocked for Brain session' recorded as secondary (model-dependent). orchestrator checked at Step 7 (absent under codex exec). Any family left in T: stop and report."},
+        {"description": "Stop Commander; pgrep -fl \"ironclaude.main\" (exit 1); wc -l /tmp/ic/daemon.log -> L; date", "command": "make -C /Users/roberthyatt/Code/ironclaude/commander stop", "expected": "Daemon (PID ...) stopped; record L."},
+        {"description": "Operator launch via AskUserQuestion ('make -C ~/Code/ironclaude/commander run')."},
+        {"description": "Start-up result: until-loop on tail -n +<L+1> /tmp/ic/daemon.log for 'Brain SDK client (started|not started)|hooks are not running|spawn failed'", "expected": "Brain SDK client started client=codex; no 'hooks are not running'; no 'spawn failed'. On failure: make stop, record, stop."},
+        {"description": "Canary", "command": "find /tmp/ic/codex-brain-gate -name hooks-live -newer /tmp/ic-logs/ic-codex-hook-trust.log", "expected": "Exactly one path."},
+        {"description": "Operator posts 'List every tool name you have, verbatim, one per line' in Slack (AskUserQuestion); then Brain rollout BR marker greps per human plan Task 4 Step 7", "expected": "Inherited-family markers incl. request_plugin_install 0 (a nonzero count: grep -n and inspect; relayed worker/log text is not a tool); mcp__orchestrator__ >=1; professional-mode-guard 0. If deferred: record 'Step 7 pending operator'."},
+        {"description": "Append 'Attempt 5 (R14 tool trim)' to live-verification doc with Steps 1-7 output verbatim, then stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-10-codex-brain-parity-live-verification.md docs/plans/2026-10-10-codex-brain-parity-design.md docs/plans/2026-10-11-codex-brain-tool-trim.md docs/plans/2026-10-11-codex-brain-tool-trim.plan.json", "expected": "No output."}
+      ]
+    }
+  ]
+}

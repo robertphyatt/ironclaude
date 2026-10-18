@@ -1,0 +1,28 @@
+{
+  "name": "Top-tier review on request",
+  "goal": "Stop reviews escalating to a client's top tier (Claude Fable, Codex Astra) by default; plan review, fix advisor and end review use the top tier only on explicit operator request or after a same-tier reviewer at that step fails.",
+  "requirements_file": "docs/plans/2026-10-16-top-tier-review-on-request-design.md",
+  "design_file": "docs/plans/2026-10-16-top-tier-review-on-request-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Add the shared Top-tier rule and reference it at all review sites",
+      "description": "TDD. Light loop. Test and skill text verbatim in docs/plans/2026-10-16-top-tier-review-on-request.md Task 1 Steps 1-4; apply exactly. Invariants: literal absolute paths; git -C /Users/roberthyatt/Code/ironclaude; pytest PYTHONUNBUFFERED=1 via commander/.venv/bin/python from /Users/roberthyatt/Code/ironclaude/commander; never stash/commit/push; docs need git add -f; execution subagents must not use the Skill tool; keep 3-space list indent; keep intact the asserted strings 'Luna→Terra→Sol→Astra, each resolved by the broker to the newest installed `gpt-<version>-<tier>` model', 'Luna→Terra→Sol→Astra, each the newest installed `gpt-<version>-<tier>` model, Astra ceiling→same-tier Astra', 'fable_unavailable.json', 'review_tier: \"same\"', 'review_tier: \"one-up\"'. Line numbers are pre-edit; locate by quoted text. Verified: SKILL.md :201 ends 'and diff size/spread.', :202 starts 'A light-loop plan'; :211 Codex ladder line ends 'uses a fresh same-tier `gpt-6-astra` reviewer.', :212 blank; :272-274 Codex review_tier sentence ('Use `review_tier: \"same\"` only for the selected same-tier blind plan-review / decision. Use `review_tier: \"one-up\"` for selected tier-up plan review, fix-advisor, / and end-of-work review. Omission is compatibility-only, never preferred new usage.'), the only Codex tier instruction for fix advisor and end review; :393 fix-advisor Tier line; :849 '(Agent tool, `subagent_type=\"general-purpose\"`, `model=<one tier above your current model>` per the'; :850 'Step 1.5 tier-up resolution incl. the Fable-availability fallback) over the staged diff, following the'; anchors once each: 'Decide the reviewer tier' :195, 'Resolve the reviewer model' :208, 'MANDATORY tier-up fix advisor' :390, 'It is NOT blind' :399, 'Step 7.5: Tier-up adversarial end review' :834, 'Step 8: Final summary' :859; 'Top-tier rule' 0 occurrences today; test :143-144 asserts both review_tier literals present; advisor-review.ts:25 REVIEW_TIERS ['same','one-up'] (no broker change).",
+      "allowed_files": [
+        "commander/tests/test_executing_plans_skill.py",
+        "worker/skills/executing-plans/SKILL.md",
+        "docs/plans/2026-10-16-top-tier-review-on-request-design.md",
+        "docs/plans/2026-10-16-top-tier-review-on-request.md",
+        "docs/plans/2026-10-16-top-tier-review-on-request.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Append plan.md Task 1 Step 1 test test_top_tier_reviewer_only_on_request_or_same_tier_failure (all its assertions, incl. 'subject to the Top-tier rule>', the new Codex review_tier sentence, and the negative 'only for the selected same-tier blind plan-review decision' assertion) to end of commander/tests/test_executing_plans_skill.py."},
+        {"description": "RED run.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_executing_plans_skill.py -q -k top_tier_reviewer", "expected": "1 failed; AssertionError on first assert ('Top-tier rule' absent). Record measured."},
+        {"description": "GREEN per plan.md Task 1 Step 2, all verbatim: (1) insert 2-line judgment sentence after :201; (2) insert blank line + 7-line Top-tier rule paragraph after :211; (3) replace :393 Tier line with 2-line 'subject to the Top-tier rule (Step 1.5)' version; (4) replace :849-850 with 'model=<one tier above your current model, subject to the Top-tier rule>' and '...Fable-availability fallback and the Top-tier rule) over the staged diff, following the'; (5) replace :272-274 with the 5-line Codex review_tier sentence ('same' also for plan review, fix-advisor, end-of-work review wherever the Top-tier rule replaces a Sol→Astra step; otherwise 'one-up')."},
+        {"description": "GREEN + focused + suite + restage hook test.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_executing_plans_skill.py tests/test_spawn_tier_bias.py tests/test_writing_plans_skill.py tests/test_workflow_transition_preflight.py -q > /private/tmp/claude-502/tt-focused.out 2>&1; echo \"focused=$?\"; tail -n 3 /private/tmp/claude-502/tt-focused.out; PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/ -q > /private/tmp/claude-502/tt-suite.out 2>&1; echo \"suite=$?\"; tail -n 3 /private/tmp/claude-502/tt-suite.out; bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-skill-handoffs-restaging.sh > /private/tmp/claude-502/tt-hook.out 2>&1; echo \"hook=$?\"", "expected": "focused=0; suite=0 (0 failed); hook=0. Any other failure must be shown pre-existing via a temporary git worktree of HEAD (never git stash) or fixed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/skills/executing-plans/SKILL.md commander/tests/test_executing_plans_skill.py; git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-16-top-tier-review-on-request-design.md docs/plans/2026-10-16-top-tier-review-on-request.md docs/plans/2026-10-16-top-tier-review-on-request.plan.json", "expected": "No output."}
+      ]
+    }
+  ]
+}

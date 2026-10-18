@@ -124,11 +124,13 @@ def format_heartbeat(
     degraded_backend_label: str = "Ollama",
     orphaned_unmerged: int = 0,
     mem_line: str | None = None,
+    blocked_tasks: list[dict] | None = None,
 ) -> str:
     waits = waits or {}
     brain_waits = brain_waits or {}
     blocked_directives = blocked_directives or []
-    if not workers and not waits and not brain_waits and not blocked_directives:
+    blocked_tasks = blocked_tasks or []
+    if not workers and not waits and not brain_waits and not blocked_directives and not blocked_tasks:
         base = "*Heartbeat* | No active workers"
         if ollama_degraded:
             base += f"\n⚠️ validator degraded ({degraded_backend_label} endpoint(s) unreachable/degraded — see logs)"
@@ -148,6 +150,17 @@ def format_heartbeat(
                 f"  • #{block['directive_id']} — {capabilities} "
                 f"({block['denial_scope']}): {_escape_mrkdwn(block.get('reason') or '')}"
             )
+    if blocked_tasks:
+        lines.append(f"🚧 *Blocked tasks (waiting on {operator_name} where pinned):*")
+        for task in blocked_tasks:
+            desc = _escape_mrkdwn(str(task.get("description") or ""))
+            if len(desc) > 120:
+                desc = desc[:120] + "..."
+            age = task.get("age_seconds")
+            age_txt = f" (blocked {_fmt_duration(float(age))})" if age is not None else ""
+            link = task.get("permalink")
+            link_txt = f" — <{link}|decision>" if link else ""
+            lines.append(f"  • {_escape_mrkdwn(str(task.get('id', '?')))} — {desc}{age_txt}{link_txt}")
     if waits or brain_waits:
         # brain_waits is populated by the brain-wait classifier — only render its
         # section when it actually has entries, instead of an always-empty
@@ -215,6 +228,16 @@ def format_heartbeat(
     return "\n".join(lines)
 
 
+def format_blocked_reminder(task: dict, operator_name: str = "Operator") -> str:
+    """Top-level reminder for a ledger task blocked on a pinned operator decision."""
+    desc = _escape_mrkdwn(str(task.get("description") or ""))
+    age = task.get("age_seconds")
+    age_txt = f" (blocked {_fmt_duration(float(age))})" if age is not None else ""
+    link = task.get("permalink")
+    link_txt = f"\nDecision: <{link}|pinned message>" if link else ""
+    return f"⏳ *Still waiting on {operator_name}:* {_escape_mrkdwn(str(task.get('id', '?')))} — {desc}{age_txt}{link_txt}"
+
+
 def format_orphaned_orphans(details: list[dict]) -> str:
     """Slack surface for row-less orphan worktrees/branches the auto-reaper
     preserved (muted entries already excluded by the caller). Each `details`
@@ -253,7 +276,7 @@ def format_orphaned_unmerged(entries: list[str]) -> str:
 def resolve_degraded_backend_label(config_path: str) -> str:
     """Display name of the resolved validator backend (for the degraded heartbeat).
 
-    Fail-safe: a missing/unparseable config resolves to the ollama default -> 'Ollama'.
+    Fail-safe: a missing/unparseable config resolves to the Commander default backend (haiku) -> 'Haiku'.
     """
     import json
 

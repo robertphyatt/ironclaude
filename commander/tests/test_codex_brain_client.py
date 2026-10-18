@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 import pytest
 from unittest.mock import MagicMock
-from ironclaude.codex_brain_client import CodexBrainClient
+from ironclaude.codex_brain_client import CodexBrainClient, _git_command_allowed
 
 DAEMON_TOUCHED = [
     "start", "send_message", "get_pending_responses", "is_alive", "needs_restart",
@@ -39,7 +39,8 @@ class TestThreadSource:
 class TestSpawnHardening:
     """The app-server MUST be launched read-only + on-request so every Brain mutation
     escalates to the approval channel (directive #175). Pinning the argv stops a future
-    edit from silently dropping the flags."""
+    edit from silently dropping the flags.
+    agents.enabled=false keeps Codex's collaboration (subagent) tools away from the Brain (R12)."""
     def test_app_server_argv_forces_readonly_and_on_request(self):
         c = CodexBrainClient()
         assert c._app_server_argv() == [
@@ -48,8 +49,10 @@ class TestSpawnHardening:
             "-c", 'approval_policy="on-request"',
             "-c", 'model="gpt-5.6-terra"',
             "-c", 'model_reasoning_effort="high"',
+            "-c", "agents.enabled=false",
             *c._orchestrator_mcp_overrides(),
             *c._optional_mcp_overrides(),
+            *c._tool_trim_overrides(),
             "--stdio",
         ]
 
@@ -306,6 +309,68 @@ class TestGuardPortApprovesGitEscalations:
         assert sent == [{"jsonrpc": "2.0", "id": 11, "result": {"decision": "denied"}}]
 
 
+_GIT_WRITE_FORMS = [
+    "git diff --output=/tmp/x",
+    "git log --output /tmp/x",
+    "git show --output=/tmp/x",
+    'git diff "--output=/tmp/x"',
+    "git diff --\\output=/tmp/x",
+    "git branch -D x",
+    "git branch new-name",
+    "git branch --delete x",
+    'git commit --am""end -m x',
+    # Shell expansion rewrites an approved command (design 2026-10-18 v120-security-fixes-remediation
+    # 1b-R expanding braces, 1c-R globs).
+    "git diff {--output=/tmp/x,}",
+    "git log {--output=/tmp/x,-1}",
+    "git diff *",
+    "git log -- '*.py'",
+    "git diff ?",
+    "git diff [a]",
+    "git log HEAD~{1..2}",
+]
+_GIT_ALLOWED_FORMS = [
+    "git diff",
+    # Braces without , or .. do not expand (1b-R).
+    "git log HEAD@{1}",
+    "git diff @{u}",
+    "git log --oneline",
+    "git branch",
+    "git branch -a",
+    "git branch --list",
+    "git add x",
+    "git commit -m x",
+]
+
+
+class TestGitCommandAllowedWriteForms:
+    """Design 2026-10-18 v120-security-fixes 1b and 1c. Approved Codex commands run outside the
+    sandbox, so this check is load-bearing: no file writes through git --output, and git branch
+    only in listing forms. Operator decision 2026-03-09: the Brain keeps git add and git commit."""
+
+    @pytest.mark.parametrize("command", _GIT_WRITE_FORMS)
+    def test_write_forms_declined(self, command):
+        assert _git_command_allowed(command) is False
+
+    @pytest.mark.parametrize("command", _GIT_ALLOWED_FORMS)
+    def test_listing_and_staging_allowed(self, command):
+        assert _git_command_allowed(command) is True
+
+    @pytest.mark.parametrize("command", _GIT_WRITE_FORMS + _GIT_ALLOWED_FORMS)
+    def test_matches_claude_brain_guard(self, command):
+        """One IronClaude: the Codex check is a port of the Claude one and must agree on every row."""
+        from ironclaude.brain_client import BrainClient
+
+        allowed, _ = BrainClient()._tool_guard_logic("Bash", {"command": command})
+        assert _git_command_allowed(command) is allowed
+
+    def test_branch_change_flags_match_claude_brain_guard(self):
+        import ironclaude.codex_brain_client as module
+        from ironclaude.brain_client import BrainClient
+
+        assert module._GIT_BRANCH_CHANGE_FLAGS == BrainClient.GIT_BRANCH_CHANGE_FLAGS
+
+
 class TestThreadIdExtraction:
     """start() must read the thread id from the real thread/start response shape
     (result['thread']['id'], verified live); the old result.get('threadId') left it
@@ -488,6 +553,46 @@ class TestModelWiring:
         assert 'model="gpt-5.6-sol"' in argv
         assert argv[-1] == "--stdio"
 
+    def test_brain_family_resolves_to_newest_installed_and_slug_wins(self, tmp_path, monkeypatch):
+        """Design 2026-10-17 v120-completeness R2: the Brain runs on this Mac, so a tier or family
+        word resolves to the newest installed model of the family; an explicit slug is used as-is."""
+        home = tmp_path / "codexhome"
+        home.mkdir()
+        (home / "models_cache.json").write_text(json.dumps(
+            {"models": [{"slug": "gpt-6.1-sol"}, {"slug": "gpt-6-sol"}, {"slug": "gpt-6-luna"}]}))
+        monkeypatch.setenv("CODEX_HOME", str(home))
+        assert CodexBrainClient(model="opus")._resolve_model() == "gpt-6.1-sol"
+        assert CodexBrainClient(model="sol")._resolve_model() == "gpt-6.1-sol"
+        assert CodexBrainClient(model="gpt-5.6-sol")._resolve_model() == "gpt-5.6-sol"
+        assert CodexBrainClient(model="haiku")._resolve_model() == "gpt-6-luna"
+        assert 'model="gpt-6.1-sol"' in CodexBrainClient(model="opus")._app_server_argv()
+
+    def test_brain_family_with_no_installed_model_fails_start_visibly(self, tmp_path, monkeypatch):
+        import ironclaude.codex_brain_client as module
+        from ironclaude.provider_config import CodexModelUnavailable
+        home = tmp_path / "codexhome"
+        home.mkdir()
+        (home / "models_cache.json").write_text(json.dumps({"models": [{"slug": "gpt-6-sol"}]}))
+        monkeypatch.setenv("CODEX_HOME", str(home))
+        client = CodexBrainClient(model="sonnet")
+        with pytest.raises(CodexModelUnavailable):
+            client._resolve_model()
+        monkeypatch.setattr(client, "_runtime_preflight", lambda: {
+            "schema_version": 1, "status": "healthy", "reason": "destination-equivalent",
+            "source_companion": "/s", "destination_companion": "/d",
+        })
+        monkeypatch.setattr(client, "_preflight_orchestrator", lambda: None)
+        popen = MagicMock()
+        monkeypatch.setattr(module.subprocess, "Popen", popen)
+        client.start("system prompt", cwd="/tmp")
+        popen.assert_not_called()
+        assert client._running is False
+        assert "Codex model family 'terra' has no installed model in" in client.restart_reason
+
+    def test_default_model_is_the_sonnet_family(self):
+        import inspect
+        assert inspect.signature(CodexBrainClient).parameters["model"].default == "sonnet"
+
 
 class TestAwaitResponseConcurrencySafety:
     """_await_response must not consume a SHARED cursor: two waiters would then race,
@@ -643,18 +748,18 @@ class TestBrainGateEnvironment:
         monkeypatch.delenv("IC_ROLE", raising=False)
         monkeypatch.delenv("IRONCLAUDE_CLIENT", raising=False)
         monkeypatch.delenv("IRONCLAUDE_BRAIN_GATE_SESSION", raising=False)
+        monkeypatch.delenv("IRONCLAUDE_BRAIN_GATE_ROOT", raising=False)
         CodexBrainClient()._spawn_env()
         assert "IC_ROLE" not in os.environ
         assert "IRONCLAUDE_CLIENT" not in os.environ
         assert "IRONCLAUDE_BRAIN_GATE_SESSION" not in os.environ
+        assert "IRONCLAUDE_BRAIN_GATE_ROOT" not in os.environ
 
     def test_startup_reset_clears_lookback_only(self, tmp_path, monkeypatch):
-        import ironclaude.codex_brain_client as module
-
-        monkeypatch.setattr(module, "_BRAIN_GATE_ROOT", tmp_path)
+        from ironclaude import paths
         client = CodexBrainClient()
-        state_dir = tmp_path / client._brain_gate_session
-        state_dir.mkdir()
+        state_dir = paths.brain_gate_root() / client._brain_gate_session
+        state_dir.mkdir(parents=True)
         for marker in ("lookback-slack", "lookback-ledger", "memory-armed", "wiki-queried"):
             (state_dir / marker).touch()
 
@@ -1065,6 +1170,81 @@ class TestOrchestratorStartupReadiness:
             "episodic-memory": frozenset(),
         }
 
+    def test_verify_rejects_servers_outside_brain_set(self, monkeypatch):
+        """Design 2026-10-18 v120-security-fixes 1a: a server from a project or system Codex
+        config would run with no hook gate, so any server outside the Brain set fails the start."""
+        client = CodexBrainClient()
+        orchestrator = {name: {"name": name} for name in self.REQUIRED}
+        monkeypatch.setattr(client, "_await_orchestrator_ready", lambda timeout: None)
+        monkeypatch.setattr(
+            client,
+            "_list_mcp_server_inventory",
+            lambda: (
+                {
+                    "orchestrator": {"tools": orchestrator},
+                    "episodic-memory": {"tools": {}},
+                    "zeta_tools": {"tools": {}},
+                    "node_repl": {"tools": {"js": {"name": "js"}}},
+                    # Any status other than "disabled" still counts (1a-R).
+                    "zeta_live": {"runtimeStatus": "ready", "tools": {}},
+                },
+                None,
+            ),
+        )
+
+        assert client._verify_orchestrator_mcp() == (
+            "Codex Brain MCP inventory has servers outside the Brain set: "
+            "node_repl, zeta_live, zeta_tools"
+        )
+
+    def test_verify_skips_disabled_servers_outside_brain_set(self, monkeypatch):
+        """Design 2026-10-18 v120-security-fixes-remediation 1a-R: Codex lists trim-disabled servers
+        with runtimeStatus "disabled" and no tools (codex-cli 0.163.0-alpha.10.2). They run nothing,
+        so they are not extras; the rows above with no status or "ready" still fail (fail closed)."""
+        client = CodexBrainClient()
+        orchestrator = {name: {"name": name} for name in self.REQUIRED}
+        monkeypatch.setattr(client, "_await_orchestrator_ready", lambda timeout: None)
+        monkeypatch.setattr(
+            client,
+            "_list_mcp_server_inventory",
+            lambda: (
+                {
+                    "orchestrator": {"tools": orchestrator},
+                    "episodic-memory": {"tools": {}},
+                    "node_repl": {"name": "node_repl", "runtimeStatus": "disabled", "tools": {}},
+                    "computer-use": {"name": "computer-use", "runtimeStatus": "disabled", "tools": {}},
+                },
+                None,
+            ),
+        )
+
+        assert client._verify_orchestrator_mcp() is None
+        assert set(client._verified_tool_inventory) == {"orchestrator", "episodic-memory"}
+
+    def test_verify_passes_with_every_brain_server(self, monkeypatch):
+        """Positive control for the check above: research and ollama are in the Brain set."""
+        client = CodexBrainClient()
+        orchestrator = {name: {"name": name} for name in self.REQUIRED}
+        monkeypatch.setattr(client, "_await_orchestrator_ready", lambda timeout: None)
+        monkeypatch.setattr(
+            client,
+            "_list_mcp_server_inventory",
+            lambda: (
+                {
+                    "orchestrator": {"tools": orchestrator},
+                    "episodic-memory": {"tools": {}},
+                    "research": {"tools": {}},
+                    "ollama": {"tools": {}},
+                },
+                None,
+            ),
+        )
+
+        assert client._verify_orchestrator_mcp() is None
+        assert set(client._verified_tool_inventory) == {
+            "orchestrator", "episodic-memory", "research", "ollama",
+        }
+
     def test_start_failure_occurs_after_thread_start_before_first_turn(self, monkeypatch):
         import ironclaude.codex_brain_client as module
 
@@ -1149,6 +1329,13 @@ class TestCodexEffortByTier:
             model="gpt-5.6-sol", effort_level="high", effort_levels={"fable": "medium"}
         )
         assert 'model_reasoning_effort="high"' in c._app_server_argv()
+
+    def test_any_astra_slug_resolves_per_tier_effort(self):
+        c = CodexBrainClient(
+            model="gpt-7-astra", effort_level="high", effort_levels={"fable": "medium"}
+        )
+        assert 'model_reasoning_effort="medium"' in c._app_server_argv()
+        assert 'model="gpt-7-astra"' in c._app_server_argv()
 
 
 class TestRuntimeCapabilityPreflight:
@@ -1474,8 +1661,44 @@ def test_optional_mcp_overrides_skips_a_missing_server(monkeypatch):
     assert c._optional_mcp_overrides() == []
 
 
+def _captured_trim_keep_set(monkeypatch):
+    import ironclaude.codex_brain_client as module
+
+    captured = {}
+
+    def fake_trim(config_path, manifest_path, keep_servers):
+        captured["keep"] = set(keep_servers)
+        return []
+
+    monkeypatch.setattr(module, "brain_tool_trim_overrides", fake_trim)
+    CodexBrainClient()._tool_trim_overrides()
+    return captured["keep"]
+
+
+def test_tool_trim_keeps_optional_server_only_when_its_source_exists(monkeypatch):
+    """Design 2026-10-18 v120-security-fixes 1a: a user-defined server named research is
+    disabled when IronClaude's own research_mcp.py is absent; ollama's source exists and stays."""
+    import ironclaude.codex_brain_client as module
+
+    shipped = Path(module.__file__).parent
+    monkeypatch.setattr(
+        CodexBrainClient,
+        "_optional_mcp_source_path",
+        lambda self, name: (
+            Path("/nonexistent") / f"{name}_mcp.py" if name == "research"
+            else shipped / f"{name}_mcp.py"
+        ),
+    )
+    assert _captured_trim_keep_set(monkeypatch) == {"orchestrator", "ollama"}
+
+
+def test_tool_trim_keeps_optional_servers_whose_sources_exist(monkeypatch):
+    """Positive control: both shipped sources exist in this tree, so both stay in the keep-set."""
+    assert _captured_trim_keep_set(monkeypatch) == {"orchestrator", "research", "ollama"}
+
+
 def test_optional_mcp_servers_are_not_auto_approved():
-    """ollama's pull/remove/create_model are gated by codex-brain-gated-actions.sh:63-65.
+    """ollama's pull/remove/create_model are gated by brain-gated-actions.sh.
 
     The orchestrator arm sets default_tools_approval_mode="approve"; copying that here
     would auto-approve exactly those destructive tools. This test is what catches a later
@@ -1485,3 +1708,49 @@ def test_optional_mcp_servers_are_not_auto_approved():
     joined = " ".join(c._optional_mcp_overrides())
     assert "mcp_servers.research.default_tools_approval_mode" not in joined
     assert "mcp_servers.ollama.default_tools_approval_mode" not in joined
+
+
+def test_app_server_argv_trims_inherited_tools(monkeypatch, tmp_path):
+    """R14: plugins and user MCP servers from $CODEX_HOME/config.toml are disabled for the Brain."""
+    home = tmp_path / "home2"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        '[plugins."slack@openai-curated"]\nenabled = true\n'
+        '[plugins."ironclaude@ironclaude"]\nenabled = true\n'
+        '[mcp_servers.node_repl]\ncommand = "node"\n'
+    )
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    argv = CodexBrainClient(model="gpt-5.6-terra")._app_server_argv()  # explicit slug: no models cache needed
+    for value in (
+        "features.apps=false",
+        'web_search="disabled"',
+        "plugins.slack@openai-curated.enabled=false",
+        "mcp_servers.node_repl.enabled=false",
+        "plugins.ironclaude@ironclaude.mcp_servers.workspace-manager.enabled=false",
+    ):
+        assert argv[argv.index(value) - 1] == "-c"
+    assert "plugins.ironclaude@ironclaude.enabled=false" not in argv
+    assert "mcp_servers.orchestrator.enabled=false" not in argv
+    assert argv[-1] == "--stdio"
+
+
+def test_start_fails_closed_when_trim_cannot_be_derived(monkeypatch, tmp_path):
+    """R14: an unreadable config must stop the Brain, never start it with an unknown tool set."""
+    import ironclaude.codex_brain_client as module
+
+    home = tmp_path / "home3"
+    home.mkdir()
+    (home / "config.toml").write_text("[plugins\nbroken")
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    client = CodexBrainClient(model="gpt-5.6-terra")  # explicit slug: only the trim can fail
+    monkeypatch.setattr(client, "_runtime_preflight", lambda: {
+        "schema_version": 1, "status": "healthy", "reason": "destination-equivalent",
+        "source_companion": "/source", "destination_companion": "/destination",
+    })
+    monkeypatch.setattr(client, "_preflight_orchestrator", lambda: None)
+    spawned = []
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *a, **k: spawned.append(a))
+    client.start("", cwd="/tmp")
+    assert spawned == []
+    assert "spawn failed" in client.restart_reason
+    assert "cannot read" in client.restart_reason

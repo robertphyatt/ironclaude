@@ -109,6 +109,17 @@ def test_push_submit_success(tools, db_conn, mock_slack, git_repo):
     assert "✅" in msg or "❌" in msg
 
 
+def test_push_diff_stat_reads_without_optional_locks(tools, mock_slack, git_repo):
+    """push_repo's `git diff --stat HEAD` must not rewrite the index (design 2026-10-18
+    lock-free-read-git)."""
+    with patch("ironclaude.orchestrator_mcp.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="abc123 test commit\n", stderr="")
+        tools.push_repo(str(git_repo), "origin", "main")
+    diff_calls = [c for c in mock_run.call_args_list if "diff" in c.args[0] and "--stat" in c.args[0]]
+    assert len(diff_calls) == 1
+    assert diff_calls[0].kwargs["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+
+
 def test_push_rate_limit(tools, db_conn, git_repo):
     """5 completed requests in last hour; 6th returns rate limit error, no new row inserted."""
     for i in range(5):

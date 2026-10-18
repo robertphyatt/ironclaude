@@ -1,0 +1,462 @@
+{
+  "name": "codex-worker-spawn-fix",
+  "goal": "Commander-spawned or resumed Codex workers, local or remote, submit their profile turn, bind professional mode to their own Codex thread, and receive the objective; a spawn that fails before worker registration releases its reservation so a same-id retry succeeds; Claude workers keep today's behaviour.",
+  "requirements_file": "docs/plans/2026-10-10-codex-worker-spawn-fix-design.md",
+  "design_file": "docs/plans/2026-10-10-codex-worker-spawn-fix-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Compacted marker match and Folder-access trust in _wait_for_ready (R3, R4)",
+      "description": "Marker mode matches the whitespace-compacted output and no longer returns on the Codex banner; the Codex path answers 'Folder access'/'Trust this folder?' with Enter once, sets codex_trust_dismissed (so the hooks answer still fires), and reports ready only when the banner is newer than any hooks or folder-modal text. Exact code: human plan Task 1 (Edits 1a-1d; tests in Step 1.1).",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_worker_adapter.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Insert the five tests from human plan Step 1.1 after the last line of test_wait_for_ready_claude_unchanged in commander/tests/test_worker_adapter.py."
+        },
+        {
+          "description": "RED run.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_worker_adapter.py -q -k wait_for_ready",
+          "expected": "FAIL: test_wait_for_ready_marker_matches_whitespace_split_marker (no compacted match), test_wait_for_ready_marker_mode_ignores_codex_banner (banner returns True in marker mode), test_wait_for_ready_codex_answers_folder_access_then_waits_for_redraw and test_wait_for_ready_codex_folder_access_enables_hooks_answer (True on read 1, no Enter). PASS: test_wait_for_ready_marker_absent_does_not_match and the 6 existing wait_for_ready tests. Record the summary line."
+        },
+        {
+          "description": "Apply human plan Edits 1a (docstring), 1b (compacted marker), 1c (folder_index + trust answer), 1d (marker is None and banner newer than max(hooks_index, folder_index)) to _wait_for_ready in commander/src/ironclaude/orchestrator_mcp.py."
+        },
+        {
+          "description": "GREEN run (1/2).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_worker_adapter.py tests/test_communication_routing.py -q",
+          "expected": "All pass, including the four RED tests. Record the summary line."
+        },
+        {
+          "description": "GREEN run (2/2).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -q -k \"WaitForReady or ResumeSession or Codex\"",
+          "expected": "All pass. Record the summary line."
+        },
+        {
+          "description": "Stage exactly this task's files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_worker_adapter.py",
+          "expected": "No output; git diff --cached --stat lists both files."
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Conditional second Enter for the Codex profile turn (R2, R4 at dispatch)",
+      "description": "For Codex, _dispatch_worker_communication_profile answers a visible Folder-access modal with Enter before typing, sends the invocation with send_keys, then sends one raw Enter only while capture_pane shows the picker ('enter insert') or the invocation on the last '›' composer line. Claude keeps one Enter and never captures the pane. New helpers _codex_screen and _codex_skill_unsubmitted. Exact code: human plan Task 2.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_communication_routing.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "Apply human plan Edit 2.1a (import call) and Edit 2.1b (screens, helpers and five tests inserted before test_profile_load_failure_returns_before_objective_delivery) in commander/tests/test_communication_routing.py."
+        },
+        {
+          "description": "RED run.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_communication_routing.py -q",
+          "expected": "FAIL: test_codex_profile_sends_second_enter_while_unsubmitted[picker] and [mention] (no capture, no raw Enter), test_codex_profile_answers_folder_access_before_invocation (no trust Enter). PASS: test_codex_profile_skips_second_enter_once_submitted, test_claude_profile_keeps_single_enter, all existing tests. Record the summary line."
+        },
+        {
+          "description": "Apply human plan Step 2.3: add _codex_screen and _codex_skill_unsubmitted and the Codex pre-check and second-Enter branches in _dispatch_worker_communication_profile."
+        },
+        {
+          "description": "GREEN run (1/2).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_communication_routing.py tests/test_worker_adapter.py -q",
+          "expected": "All pass. Record the summary line."
+        },
+        {
+          "description": "GREEN run (2/2).",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -q -k \"Batch or ManagedWorktree or ResumeSession or AdoptSession\"",
+          "expected": "All pass. Record the summary line."
+        },
+        {
+          "description": "Stage exactly this task's files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_communication_routing.py",
+          "expected": "No output."
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Codex profile turn before PM activation; not_before = dispatch time (R1, R5)",
+      "description": "In spawn_worker (local and remote) and _start_batch_item, Codex workers dispatch the profile turn after readiness and the Fable retry and before PM activation, with the existing kill + 'dispatch' failure. not_before for _activate_pm_via_sqlite and _read_pm_state_via_sqlite is the time.time() taken just before that dispatch. Claude keeps its profile dispatch after bind, unchanged. The now-unused launch_started_at is removed from spawn_worker and the batch path; resume_session is handled in task 6. Exact code: human plan Task 3 (Edits 3.1a-3.1e tests, 3.3a-3.3e spawn_worker, 3.4a-3.4f batch).",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {
+          "description": "Apply human plan Edits 3.1a-3.1e in commander/tests/test_orchestrator_mcp.py: Codex order flip in test_reserves_before_launch_uses_worktree_cwd_then_binds_and_persists; new test_claude_spawn_order_is_unchanged, test_remote_profile_turn_order_by_client, test_batch_profile_turn_order_by_client, test_codex_identity_boundary_is_profile_dispatch_time, test_batch_codex_identity_boundary_is_profile_dispatch_time."
+        },
+        {
+          "description": "RED run.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -q -k \"reserves_before_launch or spawn_order_is_unchanged or profile_turn_order or identity_boundary_is_profile_dispatch_time\"",
+          "expected": "FAIL: test_reserves_before_launch_uses_worktree_cwd_then_binds_and_persists, test_remote_profile_turn_order_by_client[codex], test_batch_profile_turn_order_by_client[codex] (profile after bind/activation); test_codex_identity_boundary_is_profile_dispatch_time and test_batch_codex_identity_boundary_is_profile_dispatch_time (not_before is the pre-spawn launch time). PASS: the [claude] params and test_claude_spawn_order_is_unchanged. Record the summary line."
+        },
+        {
+          "description": "Apply human plan Edits 3.3a (Claude-only profile after bind), 3.3b (Codex profile block before Stages 4-5), 3.3c (not_before = profile_dispatched_at), 3.3d and 3.3e (remove launch_started_at) in spawn_worker, in that order."
+        },
+        {
+          "description": "Apply human plan Edits 3.4a-3.4f in _start_batch_item and spawn_workers."
+        },
+        {
+          "description": "Confirm only resume_session still uses launch_started_at.",
+          "command": "grep -n \"launch_started_at\" /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude/orchestrator_mcp.py",
+          "expected": "Only the resume_session lines (about :6562 and :6594); task 6 removes them."
+        },
+        {
+          "description": "GREEN run.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py tests/test_worker_adapter.py tests/test_communication_routing.py -q",
+          "expected": "All pass, including the five RED tests. Record the summary line. An existing test that asserts the old Codex order (profile after bind, nothing sent before activation, or not_before = launch time) is updated to the new Codex order, named in the evidence, and the run is repeated; Claude-path assertions must not change. Any other failure means stop and report."
+        },
+        {
+          "description": "Stage exactly this task's files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "No output."
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Release the reservation on pre-registration spawn failure (R7)",
+      "description": "New helper _release_unstarted_spawn(phase, repository, assignment, error, transport) builds _workspace_failure, then releases. Owner set: _workspace_client.abandon({repository_path, workspace_guid, owner_session_id, mode:'rescue'}). Owner None: _workspace_client.reap({repository_path, workspace_guid}), because CLI abandon rejects a null owner (cli.ts:66-69, :291-296). Success returns assignment_preserved False, assignment_released True and no recovery. A release error is logged and the original failure is returned plus release_error. Used at every spawn_worker exit after reservation and before registration (launch, readiness incl. the Fable-retry NoCapabilityAvailable exit, activation, identity, profile dispatch), at the batch launch exits, and in spawn_workers after the kill for every non-bind item failure. Bind and Stage 6 (registry/objective) exits keep assignment_preserved True. Exact code: human plan Task 4.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {
+          "description": "Apply human plan Edits 4.1a-4.1k in commander/tests/test_orchestrator_mcp.py: narrow the preserved test to bind/dispatch; add test_pre_registration_failures_release_unbound_reservation, test_claude_profile_failure_abandons_bound_reservation_by_owner, test_release_error_is_logged_and_original_failure_returned, test_same_worker_id_retry_succeeds_after_released_failure (stateful fake mirroring reserveWorkerWorktree); flip the existing pre-registration preserved assertions; rename the batch sibling test; add reap/abandon negatives to the batch bind test."
+        },
+        {
+          "description": "RED run.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -q -k \"ManagedWorktree or InstructionPreflight or remote_spawn_failure or missing_lossless_skill or BatchManagedWorktree or ProviderAwareBatchLifecycle\"",
+          "expected": "FAIL (today every pre-registration failure preserves and never calls reap/abandon; the retry's second allocate raises): test_pre_registration_failures_release_unbound_reservation (5 params), test_claude_profile_failure_abandons_bound_reservation_by_owner, test_release_error_is_logged_and_original_failure_returned, test_same_worker_id_retry_succeeds_after_released_failure, test_spawn_worker_codex_uses_mandatory_instruction_preflight, test_spawn_worker_claude_instruction_preflight_failure_blocks_spawn, test_remote_spawn_failure_preserves_exception_without_cleanup, test_missing_lossless_skill_cleans_single_worker_before_objective, test_batch_worktree_failed_sibling_releases_only_its_assignment, test_batch_missing_lossless_skill_cleans_before_objective, test_batch_instruction_preflight_failure_blocks_spawn (2 params), test_batch_future_exception_isolated_by_result_slot, test_batch_all_pre_spawn_failures_return_ordered_errors. PASS: test_post_reservation_failures_preserve_assignment_with_one_recovery_payload[bind|dispatch], test_batch_worktree_rejects_bind_response_with_changed_assignment_evidence, test_bind_rejects_response_owned_by_different_native_session. Record the summary line."
+        },
+        {
+          "description": "Add _release_unstarted_spawn after _workspace_failure (human plan Step 4.3)."
+        },
+        {
+          "description": "Convert the spawn_worker pre-registration exits (human plan Edits 4.4a-4.4n; 4.4a, 4.4e and 4.4n use replace_all). Leave the bind and Stage 6 exits unchanged."
+        },
+        {
+          "description": "Convert the batch exits (human plan Edits 4.5a-4.5c)."
+        },
+        {
+          "description": "Audit the remaining failure calls.",
+          "command": "grep -n -e \"_release_unstarted_spawn(\" -e \"_workspace_failure(\" /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude/orchestrator_mcp.py",
+          "expected": "Within spawn_worker, _workspace_failure( remains only at the bind and Stage 6 exits; within spawn_workers, only the future-exception wrapper and the Stage 6 exit. Record the output."
+        },
+        {
+          "description": "GREEN run.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py tests/test_worker_adapter.py tests/test_communication_routing.py tests/test_worker_finalize_release.py -q",
+          "expected": "All pass, including every RED test. Record the summary line. Another test that asserts the old preserved contract at a pre-registration (launch/readiness/activation/profile) exit gets the same flip, is named in the evidence, and the run is repeated. Any other failure means stop and report."
+        },
+        {
+          "description": "Stage exactly this task's files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "No output."
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Remote Codex binding by remote mtime (R10)",
+      "description": "_activate_pm_remote gains not_before. With it, a remote ironclaude-session-<pid>.id is accepted only when its remote mtime, from the new _remote_id_file_mtime helper, is >= not_before. The helper calls _ssh_manager.run_argv(host, ['sh','-c', script, 'sh', pid]); the script builds the path from $HOME, because run_argv quotes arguments so ~ would not expand (ssh_manager.py:112-128), and runs 'stat -c %Y' (GNU/busybox) || 'stat -f %m' (BSD/macOS). Non-zero exit, no ssh manager or unparsable output returns None, which rejects the file (fail closed). spawn_worker passes not_before=profile_dispatched_at for remote Codex only; Claude is unchanged. Exact code: human plan Task 5.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [4],
+      "steps": [
+        {
+          "description": "Apply human plan Edits 5.1a (TestActivatePmRemote: _codex_remote helper, test_remote_codex_accepts_id_file_at_or_after_not_before, test_remote_codex_rejects_old_or_unstatable_id_file [older|no-stat|garbled]), 5.1b (TestRemoteProviderLaunching: test_remote_activation_not_before_is_profile_dispatch_time [codex|claude]) and 5.1c (relax test_remote_same_host_retry_carries_new_provider_handle to assert client and a float not_before)."
+        },
+        {
+          "description": "RED run.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -q -k \"ActivatePmRemote or remote_activation_not_before or remote_same_host_retry\"",
+          "expected": "FAIL: test_remote_codex_accepts_id_file_at_or_after_not_before and test_remote_codex_rejects_old_or_unstatable_id_file (3 ids) (TypeError: no not_before parameter); test_remote_activation_not_before_is_profile_dispatch_time[codex] and test_remote_same_host_retry_carries_new_provider_handle (no not_before passed). PASS: the [claude] param and the 4 existing TestActivatePmRemote tests. Record the summary line."
+        },
+        {
+          "description": "Apply human plan Edits 5.3a (_remote_id_file_mtime and the not_before signature), 5.3b (mtime check in the read loop) and 5.3c (spawn_worker passes not_before for remote Codex)."
+        },
+        {
+          "description": "GREEN run.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -q",
+          "expected": "All pass, including the RED tests. Record the summary line. Any other failure means stop and report."
+        },
+        {
+          "description": "Stage exactly this task's files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "No output."
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "name": "Codex resume follows the R1 order (R11)",
+      "description": "resume_session with client codex dispatches the profile turn (R2) after readiness and before _activate_pm_via_sqlite, and uses not_before = the time just before that dispatch for activation and readback. A profile failure returns {'error': ...} and the existing finally kills the session. The existing identity check pm['session_uuid'] == session_id (:6612-6620) stays as the fail-closed check. launch_started_at is removed. Claude resume order is unchanged. Exact code: human plan Task 6.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [5],
+      "steps": [
+        {
+          "description": "Insert the three tests from human plan Step 6.1 into TestResumeSession, before test_mcp_wrapper_requires_and_forwards_client. The existing uuid-mismatch param already covers the fail-closed mismatch."
+        },
+        {
+          "description": "RED run.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py -q -k \"ResumeSession or resume_launch_boundary\"",
+          "expected": "FAIL: test_resume_profile_turn_order_by_client[codex] (profile after identity), test_codex_resume_identity_boundary_is_profile_dispatch_time (not_before is the pre-spawn launch time), test_codex_resume_profile_failure_kills_before_activation (activation runs first). PASS: the [claude] param, all existing TestResumeSession tests and test_resume_launch_boundary_is_shared_by_activation_and_readback. Record the summary line."
+        },
+        {
+          "description": "Apply human plan Edits 6.3a (Claude-only profile after identity), 6.3b (Codex profile block before activation; not_before = profile_dispatched_at) and 6.3c (remove launch_started_at), in that order."
+        },
+        {
+          "description": "Confirm no launch_started_at remains.",
+          "command": "grep -n \"launch_started_at\" /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude/orchestrator_mcp.py",
+          "expected": "No output."
+        },
+        {
+          "description": "GREEN run.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_orchestrator_mcp.py tests/test_communication_routing.py -q",
+          "expected": "All pass. Record the summary line. An existing resume test that asserts the old Codex order is updated to the new order and named in the evidence; Claude assertions must not change. Any other failure means stop and report."
+        },
+        {
+          "description": "Stage exactly this task's files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_orchestrator_mcp.py",
+          "expected": "No output."
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "name": "state-activator.sh claims only its own PPID's marker (R6)",
+      "description": "Factor session-init.sh's REAL_PPID derivation (:340-366) into ic_real_ppid in hook-logger.sh, and use it in session-init.sh and in state-activator.sh. state-activator claims only ironclaude-ppid-pending-<REAL_PPID> and leaves foreign markers untouched. New hook test; single-object test 6 plants the hook's own marker through a wrapper whose PID is the hook's PPID. Exact code: human plan Task 7.",
+      "allowed_files": [
+        "worker/hooks/hook-logger.sh",
+        "worker/hooks/session-init.sh",
+        "worker/hooks/state-activator.sh",
+        "worker/hooks/tests/test-state-activator-ppid-scope.sh",
+        "worker/hooks/tests/test-state-activator-single-object.sh"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Create worker/hooks/tests/test-state-activator-ppid-scope.sh (human plan Step 7.1) and apply Edit 7.1b to test 6 of worker/hooks/tests/test-state-activator-single-object.sh."
+        },
+        {
+          "description": "RED run (new test).",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-state-activator-ppid-scope.sh; echo \"exit=$?\"",
+          "expected": "FAIL 3 foreign marker untouched; FAIL 4 no session file written for the foreign PID (today's loop claims every marker); PASS 1 and 2; Results: 2 pass, 2 fail; exit=1."
+        },
+        {
+          "description": "Guard run (rewritten test 6 already passes).",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-state-activator-single-object.sh; echo \"exit=$?\"",
+          "expected": "Results: 6 pass, 0 fail; exit=0."
+        },
+        {
+          "description": "Apply human plan Edits 7.3a (ic_real_ppid in hook-logger.sh), 7.3b (session-init.sh uses it) and 7.3c (state-activator.sh own-marker handshake)."
+        },
+        {
+          "description": "GREEN run (new test).",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-state-activator-ppid-scope.sh; echo \"exit=$?\"",
+          "expected": "Results: 4 pass, 0 fail; exit=0."
+        },
+        {
+          "description": "GREEN run (single-object).",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-state-activator-single-object.sh; echo \"exit=$?\"",
+          "expected": "Results: 6 pass, 0 fail; exit=0."
+        },
+        {
+          "description": "All hook suites.",
+          "command": "make -C /Users/roberthyatt/Code/ironclaude test-hooks > /private/tmp/ironclaude-codex-spawn-fix-task5-hooks.log 2>&1; echo \"exit=$?\"",
+          "expected": "exit=0; record tail -n 20 of the log."
+        },
+        {
+          "description": "Stage exactly this task's files.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/hook-logger.sh worker/hooks/session-init.sh worker/hooks/state-activator.sh worker/hooks/tests/test-state-activator-ppid-scope.sh worker/hooks/tests/test-state-activator-single-object.sh",
+          "expected": "No output."
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "name": "Correct the repro-v2 findings (R8)",
+      "description": "No tests required: documentation. Correct the headline id-file bullet, conclusions 4 (cross-session stamping by the operator's state-activator; state-manager log :43628-43629), 5 (void), 7 (resolved), the two production-failure sentences that cite them, and Inputs 4 and 5. Exact text: human plan Task 8.",
+      "allowed_files": [
+        "docs/reviews/2026-10-07-codex-spawn-repro-v2-findings.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Apply human plan Steps 8.1-8.4."
+        },
+        {
+          "description": "Verify the corrections.",
+          "command": "grep -n -e \"CORRECTED\" -e \"VOID\" -e \"RESOLVED (2026-10-10)\" -e \"corrected\" /Users/roberthyatt/Code/ironclaude/docs/reviews/2026-10-07-codex-spawn-repro-v2-findings.md",
+          "expected": "At least 7 lines (headline, conclusions 4/5/7, spawn 1, Inputs 4/5); record them."
+        },
+        {
+          "description": "Verify the withdrawn hypothesis remains only as withdrawn.",
+          "command": "grep -c \"node_repl\" /Users/roberthyatt/Code/ironclaude/docs/reviews/2026-10-07-codex-spawn-repro-v2-findings.md",
+          "expected": "1 (conclusion 5's withdrawal). Record the actual count."
+        },
+        {
+          "description": "Stage the doc (docs/ is gitignored).",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-07-codex-spawn-repro-v2-findings.md",
+          "expected": "No output."
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "name": "Full suites (R9)",
+      "description": "Full Commander pytest (background; own log) and make test-hooks; record the summary lines in docs/reviews/2026-10-10-codex-worker-spawn-fix-suites.md. The only acceptable pre-existing failure is tests/test_executing_plans_skill.py::test_execution_complete_restage_command_stages_from_non_root_cwd (L-T2).",
+      "allowed_files": [
+        "docs/reviews/2026-10-10-codex-worker-spawn-fix-suites.md"
+      ],
+      "depends_on": [6, 7, 8],
+      "steps": [
+        {
+          "description": "Create the log directory.",
+          "command": "mkdir -p /private/tmp/ironclaude-codex-spawn-fix",
+          "expected": "No output."
+        },
+        {
+          "description": "Full Commander pytest; run_in_background, then wait for the completion notification.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q > /private/tmp/ironclaude-codex-spawn-fix/pytest-full.log 2>&1; echo \"pytest exit=$?\"",
+          "expected": "Completion notification."
+        },
+        {
+          "description": "Read the summary.",
+          "command": "tail -n 40 /private/tmp/ironclaude-codex-spawn-fix/pytest-full.log",
+          "expected": "The final summary line, recorded verbatim; the only failure allowed is the L-T2 test named in the task description. Any other failure blocks the task."
+        },
+        {
+          "description": "Hook suites.",
+          "command": "make -C /Users/roberthyatt/Code/ironclaude test-hooks > /private/tmp/ironclaude-codex-spawn-fix/test-hooks.log 2>&1; echo \"test-hooks exit=$?\"",
+          "expected": "test-hooks exit=0; record tail -n 20 of the log."
+        },
+        {
+          "description": "Record the staged set.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached --stat",
+          "expected": "Includes the files from tasks 1-8."
+        },
+        {
+          "description": "Write docs/reviews/2026-10-10-codex-worker-spawn-fix-suites.md with the pytest final summary line and exit code, the test-hooks exit code and the last 20 log lines, and the staged-set stat, all verbatim."
+        },
+        {
+          "description": "Force-stage the suite record (docs/ is gitignored).",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-10-codex-worker-spawn-fix-suites.md",
+          "expected": "No output."
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "name": "Live Codex spawn through the product spawn_worker (R9)",
+      "description": "The live script constructs the real OrchestratorTools (as orchestrator_mcp.main does at :8229-8271) with a scratch Commander DB, scratch log dir, real TmuxManager/WorkerRegistry/WorkspaceClient and config/ironclaude.json, which routes workers to Codex. It calls spawn_worker for a Codex worker on a scratch git repo. Gaps: graders are stubbed; discover_installed_plugin_root makes the worker run the installed plugin, so R6 is not live until redeployed; PM state goes to ~/.claude/ironclaude.db as in production; commander/data/db/ironclaude.db is never opened. tmux runs on a fresh server under TMUX_TMPDIR=/private/tmp/ironclaude-codex-spawn-fix/tmux (the scratchpad path exceeds the tmux socket-path limit) with TMUX unset, and CLAUDE* variables are stripped with env -u (and again inside the script). The script kills only ic-codexlive1 and releases its assignment with abandon(rescue) by its bound owner. The script lives in the repo at docs/reviews/2026-10-10-codex-worker-spawn-fix-live_spawn.py and is force-staged with the evidence doc. The scratch repo, run.log, start.ref, scratch DB, logs and pane-final.txt stay under the session scratchpad and are not committed. Exact script and steps: human plan Task 10.",
+      "allowed_files": [
+        "docs/reviews/2026-10-10-codex-worker-spawn-fix-live_spawn.py",
+        "docs/reviews/2026-10-10-codex-worker-spawn-fix-live-verification.md"
+      ],
+      "depends_on": [9],
+      "steps": [
+        {
+          "description": "Create the scratch directories.",
+          "command": "mkdir -p /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-spawn-live/repo /private/tmp/ironclaude-codex-spawn-fix/tmux",
+          "expected": "No output."
+        },
+        {
+          "description": "Init the scratch repo.",
+          "command": "git -C /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-spawn-live/repo init -q",
+          "expected": "No output."
+        },
+        {
+          "description": "Create the initial commit.",
+          "command": "git -C /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-spawn-live/repo -c user.name=live -c user.email=live@local commit -q --allow-empty -m init",
+          "expected": "No output; git log shows one commit."
+        },
+        {
+          "description": "List variable names to strip (names only, never values).",
+          "command": "env | grep -E '^(CLAUDE|TMUX)' | cut -d= -f1",
+          "expected": "A list of names; record it in the evidence doc."
+        },
+        {
+          "description": "Write /Users/roberthyatt/Code/ironclaude/docs/reviews/2026-10-10-codex-worker-spawn-fix-live_spawn.py with the exact content from human plan Step 10.3."
+        },
+        {
+          "description": "Prove the import resolves to the working tree.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && .venv/bin/python -c \"import ironclaude; print(ironclaude.__file__)\"",
+          "expected": "/Users/roberthyatt/Code/ironclaude/commander/src/ironclaude/__init__.py; otherwise stop and report."
+        },
+        {
+          "description": "Mark the run start.",
+          "command": "touch /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-spawn-live/start.ref",
+          "expected": "No output."
+        },
+        {
+          "description": "Run the live spawn with run_in_background, adding one -u NAME for every CLAUDE* name from the listing step, then wait for the completion notification.",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && env -u TMUX -u TMUX_PANE <one -u per CLAUDE* name> TMUX_TMPDIR=/private/tmp/ironclaude-codex-spawn-fix/tmux PYTHONUNBUFFERED=1 .venv/bin/python /Users/roberthyatt/Code/ironclaude/docs/reviews/2026-10-10-codex-worker-spawn-fix-live_spawn.py >/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-spawn-live/run.log 2>&1; echo \"live exit=$?\"",
+          "expected": "Completion notification."
+        },
+        {
+          "description": "Read the evidence lines.",
+          "command": "cat /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-spawn-live/run.log",
+          "expected": "env removed=[]; import path under commander/src; spawn result is the string \"Worker 'codexlive1' spawned (...)\"; worker client=codex with a UUID native_session_id; pm row[0]=on and is_operator_session=false; pane objective_seen=true and marker_seen=true; kill killed=true; release lifecycle abandoned. On an error dict: record it verbatim, do the cleanup steps, stop, and report the failure phase without patching code."
+        },
+        {
+          "description": "Read-only DB check with the printed native_session_id; also confirm it differs from 7c7f63a0-e272-4e34-a05b-3d6ebc128c94 and from the executing session's id.",
+          "command": "sqlite3 -readonly /Users/roberthyatt/.claude/ironclaude.db \"SELECT terminal_session, professional_mode, workflow_stage FROM sessions WHERE terminal_session='<native_session_id>'\"",
+          "expected": "<native_session_id>|on|..."
+        },
+        {
+          "description": "Prove the bound id is a Codex thread created by this run.",
+          "command": "find /Users/roberthyatt/.codex/sessions -name \"*<native_session_id>*\" -newer /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-spawn-live/start.ref",
+          "expected": "Exactly one rollout file; none means another writer bound the id, which is a session-binding failure to record."
+        },
+        {
+          "description": "Confirm the exact session is gone; if alive, run: env -u TMUX TMUX_TMPDIR=/private/tmp/ironclaude-codex-spawn-fix/tmux tmux kill-session -t ic-codexlive1.",
+          "command": "env -u TMUX TMUX_TMPDIR=/private/tmp/ironclaude-codex-spawn-fix/tmux tmux has-session -t ic-codexlive1; echo \"has-session exit=$?\"",
+          "expected": "Non-zero exit."
+        },
+        {
+          "description": "Confirm the scratch tmux server holds no ic- sessions.",
+          "command": "env -u TMUX TMUX_TMPDIR=/private/tmp/ironclaude-codex-spawn-fix/tmux tmux list-sessions; echo \"list exit=$?\"",
+          "expected": "Non-zero (no server running) or no ic- sessions."
+        },
+        {
+          "description": "List (never kill) processes tied to the run; kill a survivor only by exact PID after ps -p <pid> -o pid=,ppid=,command= confirms it belongs to this run.",
+          "command": "pgrep -lf codex-spawn-live",
+          "expected": "No output."
+        },
+        {
+          "description": "Record the Codex trust row left behind.",
+          "command": "grep -n \"codex-spawn-live\" /Users/roberthyatt/.codex/config.toml",
+          "expected": "Record any trust row Codex added."
+        },
+        {
+          "description": "Record the ~/.claude.json trust entry left behind.",
+          "command": "grep -c \"codex-spawn-live\" /Users/roberthyatt/.claude.json",
+          "expected": "Record the count (ensure_worker_trusted entry)."
+        },
+        {
+          "description": "Write docs/reviews/2026-10-10-codex-worker-spawn-fix-live-verification.md with the sections listed in human plan Step 10.8 (date and codex --version; exercised path and gaps; stripped names; every run.log line verbatim; DB row; rollout file; pane facts; cleanup and leftovers; one-line verdict per R9 item)."
+        },
+        {
+          "description": "Force-stage the script and the evidence doc (docs/ is gitignored).",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-10-codex-worker-spawn-fix-live_spawn.py docs/reviews/2026-10-10-codex-worker-spawn-fix-live-verification.md",
+          "expected": "No output; git -C /Users/roberthyatt/Code/ironclaude diff --cached --stat lists both files."
+        }
+      ]
+    }
+  ]
+}

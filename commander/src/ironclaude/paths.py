@@ -42,3 +42,18 @@ def brain_sessions_dir() -> str:
 
 def allowed_log_prefixes() -> tuple[str, ...]:
     return ("/tmp/", "/var/log/", str(home()) + "/")
+
+
+def brain_gate_root() -> Path:
+    """Per-Brain gate state root for brain-gated-actions.sh and brain-hooks-canary.sh (design
+    2026-10-17 v120-completeness R3). Both Brain clients pass it as IRONCLAUDE_BRAIN_GATE_ROOT."""
+    return _ironclaude_dir() / "state" / "brain-gate"
+
+
+def ensure_brain_gate_root() -> Path:
+    """Create the gate root (and parents) and force mode 0700. The Brain hooks fail closed unless
+    it is a real directory owned by this user with no group or other permission bits."""
+    root = brain_gate_root()
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    return root

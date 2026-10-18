@@ -25,6 +25,7 @@ import {
   gitError,
   GIT_MAX_BUFFER,
   isAncestor,
+  LOCK_FREE_READ_ENV,
   removeWorktree,
   runGit,
   runGitEnv,
@@ -40,6 +41,7 @@ import {
   type ReconcileEvidence,
 } from './git-authority.js';
 import type { Assignment } from './types.js';
+import { assertNoPendingHandoff, withAssignmentMutation } from './handoff.js';
 
 export interface FinalizationResult {
   state: 'cleaned' | 'pushed' | 'pushed-only' | 'integrated-local'
@@ -317,7 +319,11 @@ function cumulativeBinaryEffect(cwd: string, base: string, head: string): string
   try {
     wfd = openSync(file, 'w');
     const args = ['diff', '--binary', '--full-index', base, head];
-    const result = spawnSync('git', ['-C', cwd, ...args], { stdio: ['ignore', wfd, 'pipe'], maxBuffer: GIT_MAX_BUFFER });
+    const result = spawnSync('git', ['-C', cwd, ...args], {
+      stdio: ['ignore', wfd, 'pipe'],
+      env: { ...process.env, ...LOCK_FREE_READ_ENV },
+      maxBuffer: GIT_MAX_BUFFER,
+    });
     closeSync(wfd);
     wfd = undefined;
     if (result.error) {
@@ -481,6 +487,7 @@ function exactAssignment(
     || assignment.owner_session_id !== providerRootSessionId) {
     throw new Error('Finalization assignment binding does not match repository and provider root');
   }
+  assertNoPendingHandoff(db, workspaceGuid);
   return { assignment, primaryCheckoutPath: repository.primaryCheckoutPath };
 }
 
@@ -514,7 +521,7 @@ function exactAssignment(
  * current_head update, so a crash between them is healed by an idempotent
  * re-run (the next call sees H already at T and takes the no-op branch).
  */
-export function syncWorktreeToTarget(db: Database.Database, input: SyncWorktreeToTargetInput): SyncResult {
+function syncWorktreeToTargetCore(db: Database.Database, input: SyncWorktreeToTargetInput): SyncResult {
   const exact = exactAssignment(db, input.repositoryPath, input.workspaceGuid, input.providerRootSessionId);
   const assignment = exact.assignment;
   if (assignment.lifecycle_status !== 'active') {
@@ -701,7 +708,7 @@ function markIntegrated(
   return getAssignment(db, assignment.workspace_guid)!;
 }
 
-export function recycleFinalized(db: Database.Database, repositoryPath: string, assignment: Assignment): void {
+function recycleFinalizedCore(db: Database.Database, repositoryPath: string, assignment: Assignment): void {
   // Re-read: several call sites pass an in-memory row whose disposition is stale
   // relative to the DB; the fresh integrated_commit is the recycle base.
   const current = getAssignment(db, assignment.workspace_guid);
@@ -751,7 +758,7 @@ export function recycleFinalized(db: Database.Database, repositoryPath: string, 
  * integration_records row and finalization refs are left in place: 'cleaned'
  * is terminal (never reused), so there is nothing to make room for.
  */
-export function releaseFinalized(db: Database.Database, repositoryPath: string, assignment: Assignment): void {
+function releaseFinalizedCore(db: Database.Database, repositoryPath: string, assignment: Assignment): void {
   // Re-read for the same reason recycleFinalized does: several call sites pass
   // an in-memory row whose fields may be stale relative to the DB.
   const current = getAssignment(db, assignment.workspace_guid);
@@ -1127,7 +1134,7 @@ export function finalizePrimaryUnassignedCommitAndPush(
 }
 
 /** Finalizes only an authority already verified and consumed by Task 3. */
-export function finalizeDirectAuthority(
+function finalizeDirectAuthorityCore(
   db: Database.Database,
   authority: AuthorizedDirectGitOperation,
   message: string,
@@ -1283,7 +1290,7 @@ export function finalizeDirectAuthority(
  * or releases it, and (like every local finalization path in this file)
  * never pushes.
  */
-export function finalizeReconcile(
+function finalizeReconcileCore(
   db: Database.Database,
   authority: AuthorizedDirectGitOperation,
 ): FinalizationResult {
@@ -1326,7 +1333,7 @@ export function finalizeReconcile(
  * The content-pin (registered candidate === authorized HEAD) is what distinguishes
  * this verb from /reconcile: the operator is attesting a specific resolved commit.
  */
-export function finalizeConfirmResolution(
+function finalizeConfirmResolutionCore(
   db: Database.Database,
   authority: AuthorizedDirectGitOperation,
 ): FinalizationResult {
@@ -1549,7 +1556,7 @@ const usedCloseOutAuthorities = new WeakSet<AuthorizedDirectGitOperation>();
  * close_out_worktree handler. Reuses finalizeLocalCommit/finalizeAttestedCandidate
  * unmodified; never modifies finalizeReconcile/reconcileFinalization.
  */
-export function finalizeCloseOut(db: Database.Database, authority: AuthorizedDirectGitOperation): FinalizationResult {
+function finalizeCloseOutCore(db: Database.Database, authority: AuthorizedDirectGitOperation): FinalizationResult {
   if (authority.operation !== 'close-out') throw new Error('Close-out finalization requires close-out authority');
   if (authority.checkoutMode !== 'managed') throw new Error('Close-out is only valid for a managed worktree; there is no primary or unassigned close-out lane');
   if (usedCloseOutAuthorities.has(authority)) throw new Error('Direct Git close-out authority is single-use');
@@ -1596,7 +1603,7 @@ export function finalizeCloseOut(db: Database.Database, authority: AuthorizedDir
 }
 
 /** Reviewed Brain/Commander work follows same local coordinator and never pushes. */
-export function finalizeCommanderLocalCommit(
+function finalizeCommanderLocalCommitCore(
   db: Database.Database,
   input: CommanderLocalCommitInput,
   hooks?: FinalizationHooks,
@@ -1810,7 +1817,7 @@ export interface ResolveConflictHunkResult {
  * the candidate ref registered, exactly mirroring the manual hand-resolve + candidateRef
  * seeding done by land_resolved_conflict's own tests.
  */
-export function resolveConflictHunk(
+function resolveConflictHunkCore(
   db: Database.Database,
   input: ResolveConflictHunkInput,
 ): FinalizationResult | ResolveConflictHunkResult {
@@ -2049,7 +2056,7 @@ function recoverNoPausedRebase(
 }
 
 /** Crash recovery only advances a durable ready row once its record is reachable. */
-export function reconcileFinalization(db: Database.Database, input: ReconcileFinalizationInput): FinalizationResult {
+function reconcileFinalizationCore(db: Database.Database, input: ReconcileFinalizationInput): FinalizationResult {
   const exact = exactAssignment(db, input.repositoryPath, input.workspaceGuid, input.providerRootSessionId);
   const assignment = exact.assignment;
   // A 'status' request is a strictly NON-mutating, lifecycle-aware probe. It must
@@ -2321,3 +2328,14 @@ export function reconcileFinalization(db: Database.Database, input: ReconcileFin
   recycleFinalized(db, exact.primaryCheckoutPath, integrated);
   return { state: 'cleaned', integratedCommit: durableRecord.integrated_commit };
 }
+
+export function syncWorktreeToTarget(db: Database.Database, input: SyncWorktreeToTargetInput): SyncResult { return withAssignmentMutation(db, input.workspaceGuid, 'sync-worktree-to-target', () => syncWorktreeToTargetCore(db, input)); }
+export function recycleFinalized(db: Database.Database, repositoryPath: string, assignment: Assignment): void { return withAssignmentMutation(db, assignment.workspace_guid, 'recycle-finalized', () => recycleFinalizedCore(db, repositoryPath, assignment)); }
+export function releaseFinalized(db: Database.Database, repositoryPath: string, assignment: Assignment): void { return withAssignmentMutation(db, assignment.workspace_guid, 'release-finalized', () => releaseFinalizedCore(db, repositoryPath, assignment)); }
+export function finalizeDirectAuthority(db: Database.Database, authority: AuthorizedDirectGitOperation, message: string, hooks?: FinalizationHooks): FinalizationResult { return withAssignmentMutation(db, authority.workspaceGuid, 'finalize-direct-authority', () => finalizeDirectAuthorityCore(db, authority, message, hooks)); }
+export function finalizeReconcile(db: Database.Database, authority: AuthorizedDirectGitOperation): FinalizationResult { return withAssignmentMutation(db, authority.workspaceGuid, 'finalize-reconcile', () => finalizeReconcileCore(db, authority)); }
+export function finalizeConfirmResolution(db: Database.Database, authority: AuthorizedDirectGitOperation): FinalizationResult { return withAssignmentMutation(db, authority.workspaceGuid, 'finalize-confirm-resolution', () => finalizeConfirmResolutionCore(db, authority)); }
+export function finalizeCloseOut(db: Database.Database, authority: AuthorizedDirectGitOperation): FinalizationResult { return withAssignmentMutation(db, authority.workspaceGuid, 'finalize-close-out', () => finalizeCloseOutCore(db, authority)); }
+export function finalizeCommanderLocalCommit(db: Database.Database, input: CommanderLocalCommitInput, hooks?: FinalizationHooks): FinalizationResult { requireCommanderFinalizationInput(input); requireMessage(input.message); return withAssignmentMutation(db, input.workspaceGuid, 'finalize-commander-local-commit', () => finalizeCommanderLocalCommitCore(db, input, hooks)); }
+export function resolveConflictHunk(db: Database.Database, input: ResolveConflictHunkInput): FinalizationResult | ResolveConflictHunkResult { return withAssignmentMutation(db, input.workspaceGuid, 'resolve-conflict-hunk', () => resolveConflictHunkCore(db, input)); }
+export function reconcileFinalization(db: Database.Database, input: ReconcileFinalizationInput): FinalizationResult { return withAssignmentMutation(db, input.workspaceGuid, 'reconcile-finalization', () => reconcileFinalizationCore(db, input)); }

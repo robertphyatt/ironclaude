@@ -447,6 +447,16 @@ class TestExecuteTool:
         cmd = mock_run.call_args[0][0]
         assert "--no-ext-diff" in cmd
 
+    def test_git_diff_reads_without_optional_locks(self):
+        """git_diff must not rewrite the index: a 10 s kill mid-refresh would leave a stale
+        .git/index.lock (design 2026-10-18 lock-free-read-git)."""
+        grader = ShadowGrader(config_path="/nonexistent/config.json")
+        mock_result = MagicMock()
+        mock_result.stdout = "diff output\n"
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            grader._execute_tool("git_diff", {"repo_path": "/tmp"}, "/tmp")
+        assert mock_run.call_args.kwargs["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+
     def test_validate_path_resolves_tmp_symlink(self):
         """On macOS, /tmp -> /private/tmp; _validate_path must resolve the root too (FW-6)."""
         grader = ShadowGrader(config_path="/nonexistent/config.json")
@@ -552,8 +562,10 @@ class TestExecuteTool:
 
 
 class TestGetClient:
-    def test_default_timeout_is_600_when_config_missing(self):
-        grader = ShadowGrader(config_path="/nonexistent/config.json")
+    def test_default_timeout_is_600_when_ollama_config_has_no_timeout(self, tmp_path):
+        cfg = tmp_path / "hooks.json"
+        cfg.write_text('{"backend": "ollama"}')
+        grader = ShadowGrader(config_path=str(cfg))
         with patch("ironclaude.shadow_grader.OllamaClient") as mock_cls:
             mock_cls.return_value = MagicMock()
             grader._get_client()
@@ -561,7 +573,7 @@ class TestGetClient:
 
     def test_ollama_arm_honors_block_timeout(self, tmp_path):
         cfg = tmp_path / "hooks.json"
-        cfg.write_text('{"ollama": {"timeout_seconds": 300}}')
+        cfg.write_text('{"backend": "ollama", "ollama": {"timeout_seconds": 300}}')
         grader = ShadowGrader(config_path=str(cfg))
         with patch("ironclaude.shadow_grader.OllamaClient") as mock_cls:
             mock_cls.return_value = MagicMock()
@@ -571,7 +583,7 @@ class TestGetClient:
     def test_ollama_arm_honors_connect_and_probe_timeout(self, tmp_path):
         cfg = tmp_path / "hooks.json"
         cfg.write_text(
-            '{"ollama": {"connect_timeout_seconds": 5, "probe_timeout_seconds": 6}}'
+            '{"backend": "ollama", "ollama": {"connect_timeout_seconds": 5, "probe_timeout_seconds": 6}}'
         )
         grader = ShadowGrader(config_path=str(cfg))
         with patch("ironclaude.shadow_grader.OllamaClient") as mock_cls:

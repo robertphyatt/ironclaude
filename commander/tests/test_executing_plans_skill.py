@@ -8,6 +8,7 @@ test_version_consistency.py's approach.
 import json
 import re
 import subprocess
+import textwrap
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -352,21 +353,26 @@ def test_reviewer_archetypes_cover_verification_quality():
         assert marker in text, marker
 
 
-def test_execution_complete_restages_cumulative_allowed_files():
-    """Step 7 (Plan complete) must re-stage the union of every task's allowed_files at
-    execution_complete, before the commit-message suggestion, so a subagent's git stash pop
-    (or any index churn) cannot yield a partial commit
-    (project_stash_pop_unstages_prior_tasks)."""
+def test_wave_boundary_restages_cumulative_allowed_files():
+    """Step 5 (Advance to next wave) must re-stage the union of every task's
+    allowed_files while the stage is still `executing`, before the next
+    get_next_tasks call, so a subagent's git stash pop (or any index churn) cannot
+    yield a partial commit (project_stash_pop_unstages_prior_tasks). It cannot run at
+    execution_complete: the professional-mode guard blocks Bash write commands there.
+    Step 7 then only verifies the index before suggesting a commit."""
     text = _read()
-    assert "Re-stage the cumulative allowed_files" in text, \
-        "Step 7 lost the cumulative allowed_files re-stage step"
+    step5 = text.index("**Step 5: Advance to next wave**")
+    step6 = text.index("**Step 6: Handle failures**", step5)
+    restage = text.index("Re-stage the cumulative allowed_files")
+    advance = text.index("get_next_tasks` again", step5)
+    assert step5 < restage < advance < step6, \
+        "the cumulative re-stage must run in Step 5, before the next get_next_tasks call"
     step7 = text.index("Step 7: Plan complete")
-    restage = text.index("Re-stage the cumulative allowed_files", step7)
+    verify = text.index("git -C <repo-root> status --short", step7)
     suggest = text.index("Suggest a commit message", step7)
-    assert restage < suggest, \
-        "the cumulative allowed_files re-stage must precede the commit-message suggestion"
+    assert verify < suggest, "Step 7 must verify the staged index before suggesting a commit"
     for required in ("git stash pop", "union"):
-        assert required in text, f"Step 7 re-stage lost '{required}'"
+        assert required in text, f"re-stage lost '{required}'"
 
 
 def test_execution_complete_restage_command_stages_from_non_root_cwd(tmp_path):
@@ -375,7 +381,7 @@ def test_execution_complete_restage_command_stages_from_non_root_cwd(tmp_path):
     missing path, and stage nothing outside allowed_files."""
     text = _read()
     start = text.index("Re-stage the cumulative allowed_files")
-    cmd = re.search(r"```bash\n(.*?)```", text[start:], re.DOTALL).group(1)
+    cmd = textwrap.dedent(re.search(r"```bash\n(.*?)```", text[start:], re.DOTALL).group(1))
 
     repo = tmp_path / "repo"
     (repo / "worker").mkdir(parents=True)
@@ -396,3 +402,29 @@ def test_execution_complete_restage_command_stages_from_non_root_cwd(tmp_path):
         ["git", "-C", str(repo), "diff", "--cached", "--name-only"],
         capture_output=True, text=True, check=True).stdout.split()
     assert staged == ["worker/a.md"]
+
+
+def test_top_tier_reviewer_only_on_request_or_same_tier_failure():
+    text = " ".join(_read().split())
+    assert (
+        "**Top-tier rule (both clients):** a client's top tier — Claude Fable, Codex Astra — "
+        "is used only when the operator explicitly requested the top tier for this effort, "
+        "or when a same-tier reviewer at that same step failed to produce a usable result"
+    ) in text
+    assert '`model=opus` on Claude, `review_tier: "same"` on Codex' in text
+    judgment = text[text.index("Decide the reviewer tier"):text.index("Resolve the reviewer model")]
+    assert "the Top-tier rule below decides" in judgment
+    advisor = text[text.index("MANDATORY tier-up fix advisor"):text.index("It is NOT blind")]
+    assert "subject to the Top-tier rule (Step 1.5)" in advisor
+    end_review = text[
+        text.index("Step 7.5: Tier-up adversarial end review"):text.index("Step 8: Final summary")
+    ]
+    assert "and the Top-tier rule" in end_review
+    assert "subject to the Top-tier rule>" in end_review
+    assert (
+        'and for plan review, fix-advisor, and end-of-work review wherever the Top-tier rule '
+        'above replaces a Sol→Astra step. Otherwise use `review_tier: "one-up"`'
+    ) in text
+    assert (
+        'Use `review_tier: "same"` only for the selected same-tier blind plan-review decision'
+    ) not in text

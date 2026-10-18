@@ -27,6 +27,23 @@ def test_fixture_case(case):
     assert resolved.hook_validation_budget == expect.get("hook_validation_budget"), case["name"]
 
 
-def test_unset_backend_defaults_to_ollama_for_grader():
+def test_unset_backend_defaults_to_haiku_for_grader():
     resolved = resolve_backend({}, "grader")
-    assert resolved.backend == "ollama"
+    assert resolved.backend == "haiku"
+    assert resolved.url is None
+
+
+def test_haiku_backend_takes_only_the_spot_model_and_no_local_url():
+    cfg = {"backend": "haiku", "ollama": {"url": "http://x", "model": "m", "fallback_url": "http://y"},
+           "openai": {"base_url": "http://o/v1", "model": "om", "max_tokens": 900},
+           "shadow_model": "legacy", "spots": {"grader": {"model": "spot-m"}}}
+    grader = resolve_backend(cfg, "grader")
+    assert (grader.backend, grader.model, grader.url, grader.fallback_url, grader.max_tokens) == (
+        "haiku", "spot-m", None, None, None)
+    shadow = resolve_backend(cfg, "shadow")
+    assert (shadow.backend, shadow.model, shadow.url) == ("haiku", None, None)
+
+
+def test_explicit_ollama_still_resolves_localhost():
+    resolved = resolve_backend({"backend": "ollama"}, "grader")
+    assert (resolved.backend, resolved.url) == ("ollama", "http://localhost:11434")

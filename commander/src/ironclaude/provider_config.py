@@ -1,10 +1,12 @@
 """Validated static configuration for Claude Code and Codex clients."""
 from __future__ import annotations
 
+import json
+import os
 import re
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Mapping
+from typing import Callable, Mapping
 
 CLIENT_NAMES = ("claude", "codex")
 # Inspected external-client lifecycle roles: Brain, spawned workers, tool-free
@@ -20,24 +22,93 @@ EXPECTED_MODELS = {
     "claude": {
         "haiku": "haiku", "sonnet": "sonnet", "opus": "opus", "fable": "fable"
     },
-    "codex": {
-        "haiku": "gpt-5.6-luna",
-        "sonnet": "gpt-5.6-terra",
-        "opus": "gpt-5.6-sol",
-        "fable": "gpt-6-astra",
-    },
 }
-# Codex model names change with each release; accept any version whose tier word matches.
+# Codex models are family words (design 2026-10-17 v120-completeness R2; operator: "we shouldn't be
+# doing any pinned defaults in ironclaude anymore"). Like Claude's aliases, a word means the newest
+# model of that family where Codex runs; an explicit gpt-<version>-<word> slug is used as-is.
 CODEX_TIER_WORDS = {"haiku": "luna", "sonnet": "terra", "opus": "sol", "fable": "astra"}
 CODEX_MODEL_RE = re.compile(r"^gpt-(\d+(?:\.\d+)*)-(luna|terra|sol|astra)$")
+# Read on a remote worker host through SSHConnectionManager.run_argv, which shell-quotes every
+# argument, so `sh -c` expands the cache path on that host.
+REMOTE_CODEX_CACHE_ARGV = ("sh", "-c", 'cat "${CODEX_HOME:-$HOME/.codex}/models_cache.json"')
+
+
+class CodexModelUnavailable(ValueError):
+    """No installed model of a Codex family word: Codex is unavailable for this call."""
+
+    def __init__(self, word: str, cache_location: str):
+        self.word = word
+        self.cache_location = cache_location
+        super().__init__(
+            f"Codex model family {word!r} has no installed model in {cache_location}; "
+            "Codex is unavailable for this call"
+        )
+
+
+def local_codex_cache_path() -> str:
+    home = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+    return os.path.join(home, "models_cache.json")
+
+
+def remote_codex_cache_location(host: str) -> str:
+    return f"{host}:${{CODEX_HOME:-$HOME/.codex}}/models_cache.json"
+
+
+def read_local_codex_cache() -> str | None:
+    try:
+        with open(local_codex_cache_path(), encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def newest_codex_slug(word: str, cache_text: str | None) -> str | None:
+    """Newest ``gpt-<version>-<word>`` listed in a Codex models_cache.json text, ordered by numeric
+    version like plan-validator.sh ``_newest_codex_model`` and advisor-review.ts ``newestAtTier``.
+    None when the text is missing or malformed or lists no model of the family."""
+    if cache_text is None:
+        return None
+    try:
+        models = json.loads(cache_text).get("models")
+    except (ValueError, AttributeError):
+        return None
+    best = None
+    for entry in models if isinstance(models, list) else ():
+        slug = entry.get("slug") if isinstance(entry, dict) else None
+        match = CODEX_MODEL_RE.fullmatch(slug) if isinstance(slug, str) else None
+        if match is None or match.group(2) != word:
+            continue
+        version = tuple(int(part) for part in match.group(1).split("."))
+        if best is None or version > best[0]:
+            best = (version, slug)
+    return best[1] if best else None
+
+
+def resolve_codex_model(value: str, cache_text: str | None, cache_location: str) -> str:
+    """An explicit ``gpt-<version>-<word>`` slug is used as-is. A family word resolves to the newest
+    installed model of that family in ``cache_text``, else CodexModelUnavailable."""
+    if CODEX_MODEL_RE.fullmatch(value):
+        return value
+    newest = newest_codex_slug(value, cache_text)
+    if newest is None:
+        raise CodexModelUnavailable(value, cache_location)
+    return newest
+
+
+def resolve_local_codex_model(value: str) -> str:
+    """resolve_codex_model against this Mac's ``$CODEX_HOME/models_cache.json`` (default ~/.codex)."""
+    return resolve_codex_model(value, read_local_codex_cache(), local_codex_cache_path())
 
 
 def _codex_models_valid(models: Mapping[str, object]) -> bool:
     if set(models) != set(TIER_NAMES):
         return False
     for tier, value in models.items():
+        word = CODEX_TIER_WORDS[tier]
+        if value == word:
+            continue
         match = CODEX_MODEL_RE.fullmatch(value) if isinstance(value, str) else None
-        if match is None or match.group(2) != CODEX_TIER_WORDS[tier]:
+        if match is None or match.group(2) != word:
             return False
     return True
 
@@ -68,26 +139,42 @@ class ProviderConfig:
     claude_role_models: Mapping[tuple[str, str], str]
     advisor_worker_models: Mapping[str, str]
 
-    def model_for(self, client: str, tier: str, role: str | None = None) -> str:
+    def model_for(
+        self, client: str, tier: str, role: str | None = None, *, host: str,
+        codex_cache: Callable[[str], str | None] | None = None,
+    ) -> str:
         if client == "claude" and role is not None:
             override = self.claude_role_models.get((role, tier))
             if override is not None:
                 return override
         try:
-            return self.clients[client].models[tier]
+            model = self.clients[client].models[tier]
         except KeyError as exc:
             raise ProviderConfigError(
                 f"client {client!r} has no model mapping for tier {tier!r}"
             ) from exc
+        # Design 2026-10-17 v120-completeness R2: Claude aliases and explicit Codex slugs are used
+        # as-is, locally and remotely. A Codex family word resolves where Codex runs: this Mac's
+        # cache on host "local", the remote box's own cache through codex_cache(host) otherwise.
+        # No model of the family -> CodexModelUnavailable (the router tries the next client).
+        if client != "codex" or CODEX_MODEL_RE.fullmatch(model):
+            return model
+        if host == "local":
+            return resolve_local_codex_model(model)
+        return resolve_codex_model(
+            model, codex_cache(host) if codex_cache is not None else None,
+            remote_codex_cache_location(host),
+        )
 
     def advisor_model_for(
-        self, client: str, worker_type: str, tier: str
+        self, client: str, worker_type: str, tier: str, *, host: str,
+        codex_cache: Callable[[str], str | None] | None = None,
     ) -> str:
         if client == "claude":
             override = self.advisor_worker_models.get(worker_type)
             if override is not None:
                 return override
-        return self.model_for(client, tier, "advisor")
+        return self.model_for(client, tier, "advisor", host=host, codex_cache=codex_cache)
 
 
 def parse_provider_config(
@@ -135,8 +222,8 @@ def parse_provider_config(
         if name == "codex":
             if not _codex_models_valid(model_values):
                 raise ProviderConfigError(
-                    "providers.clients.codex.models must map each tier to a "
-                    "gpt-<version>-<tier-word> model (haiku→luna, sonnet→terra, "
+                    "providers.clients.codex.models must map each tier to its Codex family word "
+                    "or a gpt-<version>-<tier-word> model (haiku→luna, sonnet→terra, "
                     "opus→sol, fable→astra)"
                 )
         elif model_values != EXPECTED_MODELS[name]:

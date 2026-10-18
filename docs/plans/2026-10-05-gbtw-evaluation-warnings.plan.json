@@ -1,0 +1,51 @@
+{
+  "name": "Warn when GBTW judge evaluation is unavailable",
+  "goal": "Fail open visibly without misrepresenting unavailable evaluations as passes.",
+  "requirements_file": "docs/plans/2026-10-05-gbtw-evaluation-warnings-requirements.md",
+  "design_file": "docs/plans/2026-10-05-gbtw-evaluation-warnings-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Warn on unavailable judge evaluations",
+      "description": "Preserve fail-open control flow, report unavailable grading through existing session warning queue, and verify native client contracts.",
+      "allowed_files": [
+        "worker/hooks/get-back-to-work-impl.sh",
+        "worker/hooks/tests/test-gbtw-continuation-judge.sh"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED: extend existing isolated wrapper fixture in worker/hooks/tests/test-gbtw-continuation-judge.sh. Stub empty transport failure and nonempty malformed/invalid grade. For Claude and Codex assert approval, one queued warning naming unavailable checks, queue drain additionalContext, and no all-checks-passed claim in Claude output. Add successful/suppressed no-warning controls, mixed valid D plus failed other grader preserving block, and queue-path-as-directory IO failure preserving approval. Assert native Codex {} approval. Run before implementation and report actual failures.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-gbtw-continuation-judge.sh"
+        },
+        {
+          "description": "GREEN: modify worker/hooks/get-back-to-work-impl.sh run_check to represent empty response or invalid grade as result unavailable with fixed bounded reasoning and no raw response disclosure. read_check_result must distinguish fired absent/invalid result from intentional suppression. After joins, aggregate unavailable labels and queue one best-effort warning before any grade decision can exit. Keep unavailable outside A/B/C/D/F so failed grader does not block. Keep all valid grades and deterministic gates unchanged. Build approval reason/systemMessage that explicitly says evaluation unavailable when applicable; successful-only output remains unchanged. No wrapper protocol changes."
+        },
+        {
+          "description": "Verify extended routing suite and existing warning and wrapper regressions; execute commands separately and inspect each exit status. Record actual outcomes, do not claim a predicted pass count.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-gbtw-continuation-judge.sh"
+        },
+        {
+          "description": "Run existing warning regressions.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-gbtw-client-aware.sh"
+        },
+        {
+          "description": "Run existing Stop wrapper regressions.",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/test-stop-wrapper.sh"
+        },
+        {
+          "description": "Check shell syntax.",
+          "command": "bash -n /Users/roberthyatt/Code/ironclaude/worker/hooks/get-back-to-work-impl.sh /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-gbtw-continuation-judge.sh"
+        },
+        {
+          "description": "Check scoped whitespace before submission.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude diff --check -- worker/hooks/get-back-to-work-impl.sh worker/hooks/tests/test-gbtw-continuation-judge.sh"
+        },
+        {
+          "description": "Parent stages exact two task files, reviews implementation and meaningful failure assertions, then submits and records task-boundary verdict.",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -- worker/hooks/get-back-to-work-impl.sh worker/hooks/tests/test-gbtw-continuation-judge.sh"
+        }
+      ]
+    }
+  ]
+}

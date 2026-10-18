@@ -43,6 +43,7 @@ class OpenAiClient:
         timeout: int = 120,
         connect_timeout: int = 3,
         probe_timeout: int = 3,
+        use_breaker: bool = True,
     ) -> None:
         if not base_url:
             raise OllamaConnectionError("OpenAI base_url is empty/missing; cannot construct client")
@@ -54,6 +55,8 @@ class OpenAiClient:
         # read-timeout budget on an unreachable primary.
         self._connect_timeout = connect_timeout
         self._probe_timeout = probe_timeout
+        # use_breaker=False: see OllamaClient (R4c amendment 2026-10-18).
+        self._use_breaker = use_breaker
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -99,7 +102,7 @@ class OpenAiClient:
         last_err = None
         tried = False
         for url in urls:
-            if not _BREAKERS.allow(url):
+            if self._use_breaker and not _BREAKERS.allow(url):
                 continue
             tried = True
             try:

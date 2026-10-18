@@ -18,6 +18,11 @@ if [ "${GBTW_TEST_MODE:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
 fi
 
+# Worker Stop enforcement does not apply to the Commander's Codex Brain.
+if [ "${IC_ROLE:-}" = "brain" ] && [ "${IRONCLAUDE_CLIENT:-}" = "codex" ]; then
+  exit 0
+fi
+
 # Is THIS Stop-hook invocation running under Codex?
 _is_codex() {
   [ "${GBTW_FORCE_CODEX:-0}" = "1" ] && return 0
@@ -93,10 +98,11 @@ _run_codex_stop() {
   local stop_active out impl_rc
 
   stop_active="$(printf '%s' "$input" | jq -r '
-    if type == "object" and .stop_hook_active == true
-    then "true"
-    else "false"
-    end
+    if type == "object" then
+      if .stop_hook_active != null then .stop_hook_active
+      elif .loop_count != null then .loop_count > 0
+      else false end
+    else false end
   ' 2>/dev/null)" || stop_active="false"
 
   out="$(printf '%s' "$input" | bash "$impl_path")"

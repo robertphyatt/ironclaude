@@ -1,0 +1,78 @@
+{
+  "name": "Drift check: foreign-ledger roots by file identity + /reload-plugins deploy note",
+  "goal": "Compare foreign drift-ledger roots by file identity instead of spelling, and make the 1.2.0 deploy steps tell operators to run /reload-plugins in open Claude Code sessions.",
+  "requirements_file": "docs/plans/2026-10-18-drift-foreign-session-design.md",
+  "design_file": "docs/plans/2026-10-18-drift-foreign-session-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Foreign-ledger roots by file identity (R1)",
+      "description": "Per plan.md Task 1, code verbatim. TDD. test-execution-drift-check.sh: EXPECTED_PASSES 53->54 and case 54 (another session's in-progress ledger whose .root is a symlink to this repo does not block) before the Results printf. execution-drift-check.sh _drift_foreign_paths: local gains ledger_root; the string test at :446 becomes ledger_root=$(cat ...) || continue; [ -n \"$ledger_root\" ] && [ \"$ledger_root\" -ef \"$root\" ] || continue; comment 'its <ledger>.root equals' -> 'its <ledger>.root names the same directory as'.",
+      "allowed_files": [
+        "worker/hooks/execution-drift-check.sh",
+        "worker/hooks/tests/test-execution-drift-check.sh"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "RED test verbatim per plan.md Task 1 Step 1",
+          "expected": "file edited; no command"
+        },
+        {
+          "description": "Run RED",
+          "command": "mkdir -p /private/tmp/claude-502/taf5 && bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-check.sh > /private/tmp/claude-502/taf5/t1-red.log 2>&1; echo \"rc=$?\"; rg -n '^FAIL' /private/tmp/claude-502/taf5/t1-red.log; tail -n 1 /private/tmp/claude-502/taf5/t1-red.log",
+          "expected": "derived: rc=1; exactly one FAIL line, case 54; last line 'Results: 53 pass, 1 fail'"
+        },
+        {
+          "description": "GREEN code verbatim per plan.md Task 1 Step 3",
+          "expected": "file edited; no command"
+        },
+        {
+          "description": "Run GREEN and the other drift suites",
+          "command": "cd /Users/roberthyatt/Code/ironclaude && for t in worker/hooks/tests/test-execution-drift-check.sh worker/hooks/tests/test-execution-drift-identity.sh worker/hooks/tests/test-execution-drift-roots.sh worker/hooks/tests/test-execution-drift-writers.sh worker/hooks/tests/test-lock-free-read-git.sh; do bash \"$t\" > \"/private/tmp/claude-502/taf5/t1-green-$(basename \"$t\" .sh).log\" 2>&1; echo \"$t rc=$?\"; tail -n 1 \"/private/tmp/claude-502/taf5/t1-green-$(basename \"$t\" .sh).log\"; done",
+          "expected": "every rc=0; test-execution-drift-check.sh ends 'Results: 54 pass, 0 fail'"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/execution-drift-check.sh worker/hooks/tests/test-execution-drift-check.sh",
+          "expected": "no output"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Deploy note, docs and staging (R2)",
+      "description": "Per plan.md Task 2, text verbatim. No tests required: documentation and a regression run only. CHANGELOG.md line 86 Deploy line gains the /reload-plugins sentence; line 68 drift bullet gains the identity sentence; README.md line 304 gains the /reload-plugins sentence; make test-hooks (61); stage; expected 4 M + 3 A vs HEAD af72c2b.",
+      "allowed_files": [
+        "CHANGELOG.md",
+        "README.md",
+        "docs/plans/2026-10-18-drift-foreign-session-design.md",
+        "docs/plans/2026-10-18-drift-foreign-session.md",
+        "docs/plans/2026-10-18-drift-foreign-session.plan.json"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "CHANGELOG edits verbatim per plan.md Task 2 Step 1",
+          "command": "rg -n -F -e 'run `/reload-plugins` in every open Claude Code session' -e 'Ledger roots compare by file identity' /Users/roberthyatt/Code/ironclaude/CHANGELOG.md",
+          "expected": "two lines, 68 and 86"
+        },
+        {
+          "description": "README edit verbatim per plan.md Task 2 Step 2",
+          "command": "rg -n -F 'run `/reload-plugins` in each open Claude Code session' /Users/roberthyatt/Code/ironclaude/README.md",
+          "expected": "one line, 304"
+        },
+        {
+          "description": "Hook suites",
+          "command": "cd /Users/roberthyatt/Code/ironclaude && make test-hooks > /private/tmp/claude-502/taf5/t2-hooks.log 2>&1; echo \"make_rc=$?\"; rg -c '^--- ' /private/tmp/claude-502/taf5/t2-hooks.log",
+          "expected": "make_rc=0 and 61"
+        },
+        {
+          "description": "Stage and check",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add CHANGELOG.md README.md; git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-18-drift-foreign-session-design.md docs/plans/2026-10-18-drift-foreign-session.md docs/plans/2026-10-18-drift-foreign-session.plan.json; git -C /Users/roberthyatt/Code/ironclaude diff --cached --name-status; git -C /Users/roberthyatt/Code/ironclaude status --short",
+          "expected": "vs HEAD af72c2b: M (4) CHANGELOG.md, README.md, worker/hooks/execution-drift-check.sh, worker/hooks/tests/test-execution-drift-check.sh; A (3) docs/plans/2026-10-18-drift-foreign-session-design.md, .md, .plan.json; nothing unstaged; any other entry -> STOP"
+        }
+      ]
+    }
+  ]
+}

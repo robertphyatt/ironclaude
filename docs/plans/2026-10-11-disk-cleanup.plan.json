@@ -1,0 +1,81 @@
+{
+  "name": "Disk cleanup",
+  "goal": "Free disk and stop roleplaying-agents .git growth per operator decisions C1-C6: delete 8 old catalog snapshots, clear HF/pip/claude-cli caches, run episodic-memory maintain rollout, APFS-clone duplicate build GGUFs, untrack asset_catalog.db + delete git debris, record results.",
+  "requirements_file": "docs/plans/2026-10-11-disk-cleanup-design.md",
+  "design_file": "docs/plans/2026-10-11-disk-cleanup-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Delete 8 old catalog snapshots (C1)",
+      "description": "No tests required: file deletion with before/after listing. Scope ONLY the 9 successor-inventory-* snapshots; the 11 vector-db-* catalog-before.sqlite3 (Sep, ~0.64 GB) are NOT approved and must not be touched. Exact commands: human plan Task 1.",
+      "allowed_files": ["docs/reviews/2026-10-11-disk-usage-findings.md"],
+      "depends_on": [],
+      "steps": [
+        {"description": "List approved set (gate: count must be 9 and newest must be fantasy-battlemaps-20261004-recovered, else stop); also record the vector-db-* count with -path '*/vector-db-*'", "command": "find /Users/roberthyatt/Code/roleplaying-agents/tools/inkarnate_mcp/probe_out -path '*/successor-inventory-*' -name 'catalog-before.sqlite3' -exec ls -la -T {} +", "expected": "Exactly 9 files; newest successor-inventory-fantasy-battlemaps-20261004-recovered (Oct 4 05:52)."},
+        {"description": "Delete approved set except newest", "command": "find /Users/roberthyatt/Code/roleplaying-agents/tools/inkarnate_mcp/probe_out -path '*/successor-inventory-*' -name 'catalog-before.sqlite3' -not -path '*/successor-inventory-fantasy-battlemaps-20261004-recovered/*' -print -delete", "expected": "Exactly 8 successor-inventory-* paths printed."},
+        {"description": "Re-list approved set; re-count vector-db-* (unchanged); df -h /System/Volumes/Data", "command": "find /Users/roberthyatt/Code/roleplaying-agents/tools/inkarnate_mcp/probe_out -path '*/successor-inventory-*' -name 'catalog-before.sqlite3' -exec ls -la -T {} +", "expected": "Exactly 1 file (kept); vector-db-* count equals Step 1; record df."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Clear caches (C5)",
+      "description": "No tests required: cache deletion with recorded listing. Exact commands: human plan Task 2. Keep ~/.cache/huggingface/token, stored_tokens, modules.",
+      "allowed_files": ["docs/reviews/2026-10-11-disk-usage-findings.md"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Record HF model list", "command": "du -sh /Users/roberthyatt/.cache/huggingface/hub/models--* /Users/roberthyatt/.cache/huggingface/xet", "expected": "Record verbatim."},
+        {"description": "Delete HF hub/xet contents; then ls -la /Users/roberthyatt/.cache/huggingface", "command": "find /Users/roberthyatt/.cache/huggingface/hub /Users/roberthyatt/.cache/huggingface/xet -mindepth 1 -delete", "expected": "token, stored_tokens, modules present; hub, xet empty."},
+        {"description": "Delete pip + claude-cli caches; then du -sh of the three dirs + df", "command": "find /Users/roberthyatt/Library/Caches/pip /Users/roberthyatt/Library/Caches/claude-cli-nodejs -mindepth 1 -delete", "expected": "Errors on in-use files recorded; sizes + df recorded."}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Episodic-memory rollout (C2)",
+      "description": "No tests required: operational run of the existing reviewed maintain command with its own verification gates. Exact commands: human plan Task 3. Nonzero exit: stop, record, report; no blind retry.",
+      "allowed_files": ["/Users/roberthyatt/.config/superpowers/episodic-memory.json", "docs/reviews/2026-10-11-disk-usage-findings.md"],
+      "depends_on": [1, 2],
+      "steps": [
+        {"description": "Dry-run again", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/cli/episodic-memory maintain --dry-run", "expected": "slim: would-run. If refused: stop and report."},
+        {"description": "Real run in background (Bash timeout 7200000), wait with foreground until-loop on 'maintain exit='", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/cli/episodic-memory maintain --keep-bak > /private/tmp/episodic-maintain-2026-10-11.log 2>&1; echo \"maintain exit=$?\" >> /private/tmp/episodic-maintain-2026-10-11.log", "expected": "maintain exit=0; slim/backfill/compact done; record log."},
+        {"description": "Verify index + search + show per human plan Task 3 Step 3", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/cli/episodic-memory search \"codex brain parity\"", "expected": "db.sqlite ~7.8 GB + db.sqlite.bak; >=1 search result; show prints the conversation."},
+        {"description": "Write {\"maintain\":{\"autoRun\":true}} to /Users/roberthyatt/.config/superpowers/episodic-memory.json with Write tool; cat it", "expected": "Exactly that JSON."},
+        {"description": "df + du of conversation-index and conversation-archive", "command": "df -h /System/Volumes/Data", "expected": "Record."}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Replace build GGUF copies with APFS clones (C3)",
+      "description": "No tests required: hash-verified file replacement. Exact commands: human plan Task 4. A copy whose hash differs from its original is skipped and reported.",
+      "allowed_files": ["docs/reviews/2026-10-11-disk-usage-findings.md"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Hash 3 originals + 9 build copies exactly as human plan Task 4 Step 1 (Bash timeout 1800000)", "expected": "12 hash lines recorded."},
+        {"description": "For each matching copy: cp -c \"<original>\" \"<copy>.clone-tmp\" && mv -f \"<copy>.clone-tmp\" \"<copy>\" (one copy per command)", "expected": "9 replacements unless a hash mismatched (reported)."},
+        {"description": "Re-hash 9 copies; df -h /System/Volumes/Data", "expected": "All match originals; record df."}
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Stop the .git growth (C4)",
+      "description": "No tests required: git index change + debris deletion verified by checks that fail if the file stays tracked. Exact commands: human plan Task 5. Operator quits ChatGPT.app first; no git process running. Commit built in a TEMP index (GIT_INDEX_FILE=/private/tmp/ra-untrack.index, read-tree HEAD) so neither the modified 3.65 GB working file nor unrelated staged work enters the commit; never `git commit -- <paths>`. Then mirror the 2 changes in the real index. Local commit only, no push, no trailers. If a guard blocks: stop and report exact message.",
+      "allowed_files": ["/Users/roberthyatt/Code/roleplaying-agents/tools/inkarnate_mcp/.gitignore", "docs/reviews/2026-10-11-disk-usage-findings.md"],
+      "depends_on": [1, 2, 3, 4],
+      "steps": [
+        {"description": "AskUserQuestion: operator quits ChatGPT.app; confirm", "command": "pgrep -lx ChatGPT", "expected": "No output (exit 1)."},
+        {"description": "No git process running (pgrep -lx git -> exit 1, else stop and ask); then delete debris (two find commands per human plan Task 5 Step 2); tmp_obj_* leftovers out of scope", "command": "find /Users/roberthyatt/Code/roleplaying-agents/.git/objects/pack -maxdepth 1 -name 'tmp_pack_*' -print -delete", "expected": "Paths printed; then index.stash.* deletion likewise."},
+        {"description": "Record real-index staged set; append .gitignore line (Edit tool); temp-index read-tree HEAD / rm --cached db / add .gitignore / diff --cached (expect exactly D db + M .gitignore, else stop); commit from temp index with no pathspec; mirror rm --cached + add .gitignore in real index; delete temp index. Exact commands: human plan Task 5 Step 3.", "command": "GIT_INDEX_FILE=/private/tmp/ra-untrack.index git -C /Users/roberthyatt/Code/roleplaying-agents read-tree HEAD", "expected": "Commit with exactly 2 changes; no push."},
+        {"description": "Verify per human plan Task 5 Step 4", "command": "git -C /Users/roberthyatt/Code/roleplaying-agents show --stat HEAD", "expected": "asset_catalog.db | Bin 6033408 -> 0 bytes (HEAD blob 2785c415 is 6033408 bytes) + .gitignore only; ls-files --error-unmatch on the db FAILS; check-ignore -v matches; real-index diff --cached equals Step 3(a) record; db still 3654037504 bytes on disk; record .git du + df. Tell operator ChatGPT.app may be restarted."}
+      ]
+    },
+    {
+      "id": 6,
+      "name": "Record results (C6)",
+      "description": "No tests required: documentation. Append 'Results (2026-10-11 cleanup)' to the findings doc with every before/after value; stage.",
+      "allowed_files": ["docs/reviews/2026-10-11-disk-usage-findings.md", "docs/plans/2026-10-11-disk-cleanup-design.md", "docs/plans/2026-10-11-disk-cleanup.md", "docs/plans/2026-10-11-disk-cleanup.plan.json"],
+      "depends_on": [1, 2, 3, 4, 5],
+      "steps": [
+        {"description": "Append results section; stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-11-disk-usage-findings.md docs/plans/2026-10-11-disk-cleanup-design.md docs/plans/2026-10-11-disk-cleanup.md docs/plans/2026-10-11-disk-cleanup.plan.json", "expected": "No output."}
+      ]
+    }
+  ]
+}

@@ -35,7 +35,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash $HOME/.claude/ironclaude-hooks/codex-brain-gated-actions.sh"
+            "command": "bash $HOME/.claude/ironclaude-hooks/codex-brain-hooks.sh brain-gated-actions.sh"
           }
         ],
         "matcher": "mcp__(plugin_ironclaude_)?episodic[-_]memory__.*|mcp__plugin_ironclaude_orchestrator__(wiki_query|get_operator_messages|update_ledger|spawn_worker|spawn_workers|approve_plan|reject_plan|send_to_worker|kill_worker|game_(launch|screenshot|click|type|key|kill))|mcp__orchestrator__(wiki_query|get_operator_messages|update_ledger|spawn_worker|spawn_workers|approve_plan|reject_plan|send_to_worker|kill_worker|game_(launch|screenshot|click|type|key|kill))|mcp__plugin_ironclaude_ollama__(pull_model|remove_model|create_model)|mcp__ollama__(pull_model|remove_model|create_model)"
@@ -56,7 +56,7 @@
             "command": "bash $HOME/.claude/ironclaude-hooks/plan-task-context.sh"
           }
         ],
-        "matcher": "Read|Grep|Glob|Edit|Write|NotebookEdit|MultiEdit|Bash|Task"
+        "matcher": "Read|Grep|Glob|Edit|Write|NotebookEdit|MultiEdit|Bash|Task|apply_patch"
       },
       {
         "hooks": [
@@ -65,7 +65,7 @@
             "command": "bash $HOME/.claude/ironclaude-hooks/professional-mode-guard.sh"
           }
         ],
-        "matcher": "Edit|Write|NotebookEdit|MultiEdit|Bash|Read|Grep|Glob|apply_patch|exec_command"
+        "matcher": "Edit|Write|NotebookEdit|MultiEdit|Bash|Read|Grep|Glob|apply_patch|exec_command|EnterPlanMode"
       },
       {
         "hooks": [
@@ -84,6 +84,60 @@
           }
         ],
         "matcher": "Read|Bash|Grep|Glob"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/execution-drift-check.sh"
+          }
+        ],
+        "matcher": "mcp__(plugin_ironclaude_)?state[-_]manager__submit_task|Bash|exec_command"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/codex-brain-hooks.sh block-push.sh"
+          }
+        ],
+        "matcher": "Bash|exec_command"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/codex-brain-hooks.sh wiki-synthesis-enforcer.sh"
+          }
+        ],
+        "matcher": "mcp__orchestrator__.*"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/codex-brain-hooks.sh attention-sweep-enforcer.sh"
+          }
+        ],
+        "matcher": "mcp__orchestrator__.*"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/codex-brain-hooks.sh brain-task-gate.sh"
+          }
+        ],
+        "matcher": "Agent|Task|spawn_agent|collaborationspawn_agent"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/codex-brain-hooks.sh brain-orchestrator-guard.sh"
+          }
+        ],
+        "matcher": "Edit|Write|NotebookEdit|MultiEdit|Bash|exec_command|apply_patch"
       }
     ],
     "PostToolUse": [
@@ -112,7 +166,7 @@
             "command": "bash $HOME/.claude/ironclaude-hooks/memory-search-tracker.sh"
           }
         ],
-        "matcher": "Task"
+        "matcher": "Task|Agent|mcp__plugin_ironclaude_episodic-memory__search|mcp__episodic_memory__search"
       },
       {
         "hooks": [
@@ -140,6 +194,33 @@
           }
         ],
         "matcher": "Read|Bash|Grep|Glob"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/execution-drift-check.sh"
+          }
+        ],
+        "matcher": "Bash|exec_command"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/codex-brain-hooks.sh attention-sweep-arm.sh"
+          }
+        ],
+        "matcher": "mcp__orchestrator__get_worker_status"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/codex-brain-hooks.sh block-pin-enforcer.sh"
+          }
+        ],
+        "matcher": "mcp__orchestrator__update_ledger"
       }
     ],
     "UserPromptSubmit": [
@@ -158,6 +239,14 @@
             "command": "bash $HOME/.claude/ironclaude-hooks/plan-execution-reminder.sh"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/codex-brain-hooks.sh brain-hooks-canary.sh"
+          }
+        ]
       }
     ],
     "SubagentStop": [
@@ -166,6 +255,14 @@
           {
             "type": "command",
             "command": "bash $HOME/.claude/ironclaude-hooks/subagent-drift-detector.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/ironclaude-hooks/execution-drift-check.sh"
           }
         ]
       }

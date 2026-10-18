@@ -1,0 +1,48 @@
+{
+  "name": "Drift check session attribution",
+  "goal": "Make execution drift count only files changed during this session's own shell commands, so other sessions' work in a shared checkout never blocks submit_task or Stop.",
+  "requirements_file": "docs/plans/2026-10-15-drift-session-attribution-design.md",
+  "design_file": "docs/plans/2026-10-15-drift-session-attribution-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Attribute drift to this session's shell commands",
+      "description": "TDD. Rewrite 3 drift suites (RED), then hook + hooks.json (GREEN). Windows keyed by agent lineage (agent_id|main) + tool_use_id; own PostToolUse closes+deletes; same-lineage next shell PreToolUse closes that lineage's leftovers (R3b); submit_task and Stop checkpoint (append delta, re-snapshot, keep); missing tool_use_id opens nothing. Code blocks are verbatim in docs/plans/2026-10-15-drift-session-attribution.md Task 1 Steps 1-7; apply them exactly. Invariants: literal absolute paths; git -C /Users/roberthyatt/Code/ironclaude; hooks run under set -euo pipefail+ERR trap, so use if/|| forms for expected non-zero; 'LC_ALL=C comm -23' appears exactly once in execution-drift-check.sh; fix hook not assertions unless an assertion contradicts the design (then stop+report). Measured: EXPECTED_PASSES check=22 (becomes 30), roots=8, identity=13 (12 case-sensitive); drift matchers hooks.json:95 submit_task, :205 claim_task.",
+      "allowed_files": [
+        "worker/hooks/execution-drift-check.sh",
+        "worker/hooks/hooks.json",
+        "worker/hooks/get-back-to-work-impl.sh",
+        "worker/hooks/tests/test-execution-drift-check.sh",
+        "worker/hooks/tests/test-execution-drift-roots.sh",
+        "worker/hooks/tests/test-execution-drift-identity.sh"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Replace worker/hooks/tests/test-execution-drift-check.sh with the full file in plan.md Task 1 Step 1 (30 cases, EXPECTED_PASSES=30, shell_event helper, ledger file ironclaude-drift-touched-<session>.1.txt; cases 16-19 = concurrent lineages, same-lineage leftover close, stage gate, missing tool_use_id)."},
+        {"description": "Edit worker/hooks/tests/test-execution-drift-roots.sh per plan.md Task 1 Step 2: line 19 BASELINE -> WINDOW_K1 (ironclaude-drift-window-${SESSION}.main.k1.txt); add shell_event after invoke(); replace cases 1-4 (lines 103-124); wrap case 6 file creation (line 131) in window k6. Cases 5,7,8 and EXPECTED_PASSES=8 unchanged."},
+        {"description": "Edit worker/hooks/tests/test-execution-drift-identity.sh per plan.md Task 1 Step 3: add in_window after invoke(); replace lines 65-67 with a comment; wrap case 1-5 file changes in in_window i1..i5. Cases 6-13 and EXPECTED_PASSES unchanged."},
+        {"description": "RED run of the three suites against the unchanged hook; record measured FAIL labels verbatim (no predicted list).", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-check.sh; echo \"check=$?\"; bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-roots.sh; echo \"roots=$?\"; bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-identity.sh; echo \"identity=$?\"", "expected": "check=1, roots=1, identity=1; each suite runs to completion. If any suite exits 0, stop and report (its new cases would not test the change)."},
+        {"description": "Edit worker/hooks/execution-drift-check.sh per plan.md Task 1 Step 5 sub-steps 1-5: new header (lines 1-27); source bash-readonly-guard.sh after the workspace-path-adapter.sh source; delete _drift_baseline_file (216-220) and ic_drift_record_baseline (231-245), keep _drift_row_id in place, insert after it _drift_safe/_drift_window_file(SESSION LINEAGE KEY)/_drift_ledger_file/_drift_in_progress_rows/ic_drift_open_window/_drift_close_window_file(FILE SESSION MODE delete|checkpoint)/ic_drift_close_window/ic_drift_close_lineage/ic_drift_checkpoint_windows; replace ic_drift_violations/ic_drift_stop_violations (checkpoints first)/ic_drift_block_message; replace dispatch from TOOL_NAME= to EOF."},
+        {"description": "worker/hooks/hooks.json: line 95 matcher -> \"mcp__(plugin_ironclaude_)?state[-_]manager__submit_task|Bash|exec_command\"; line 205 matcher -> \"Bash|exec_command\"."},
+        {"description": "worker/hooks/get-back-to-work-impl.sh: replace comment lines 487-493 with the comment in plan.md Task 1 Step 7; on line 511 change log text '(no plan or baseline)' to '(no plan)'; other code 494-513 unchanged."},
+        {"description": "Syntax checks + GREEN run.", "command": "bash -n /Users/roberthyatt/Code/ironclaude/worker/hooks/execution-drift-check.sh; echo \"n1=$?\"; bash -n /Users/roberthyatt/Code/ironclaude/worker/hooks/get-back-to-work-impl.sh; echo \"n2=$?\"; jq empty /Users/roberthyatt/Code/ironclaude/worker/hooks/hooks.json; echo \"json=$?\"; grep -c -F 'LC_ALL=C comm -23' /Users/roberthyatt/Code/ironclaude/worker/hooks/execution-drift-check.sh; bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-check.sh; echo \"check=$?\"; bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-roots.sh; echo \"roots=$?\"; bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-identity.sh; echo \"identity=$?\"", "expected": "n1=0 n2=0 json=0; grep count 1; 'Results: 30 pass, 0 fail' check=0; 'Results: 8 pass, 0 fail' roots=0; 'Results: 13 pass, 0 fail' (12 case-sensitive) identity=0."},
+        {"description": "Neighbouring suites that read hooks.json or share Bash/exec_command matchers. A failure must be shown pre-existing by running the suite against HEAD's hooks.json in a temp copy (never git stash); else fix the regression.", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-hooks-json-brain-entries.sh; echo \"brain=$?\"; bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-managed-worktree-guard.sh; echo \"mwg=$?\"; bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-pmguard-client-aware.sh; echo \"pmg=$?\"", "expected": "brain=0 mwg=0 pmg=0"},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/execution-drift-check.sh worker/hooks/hooks.json worker/hooks/get-back-to-work-impl.sh worker/hooks/tests/test-execution-drift-check.sh worker/hooks/tests/test-execution-drift-roots.sh worker/hooks/tests/test-execution-drift-identity.sh", "expected": "No output."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Measure per-command cost and record findings",
+      "description": "No tests required: measurement + documentation only, no code. Read-only git status timing in roleplaying-agents; findings note per plan.md Task 2 Step 2.",
+      "allowed_files": [
+        "docs/reviews/2026-10-15-drift-session-attribution-findings.md"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Time git status in the shared checkout (read-only).", "command": "/usr/bin/time -p git -C /Users/roberthyatt/Code/roleplaying-agents status --porcelain=v1 -z --untracked-files=all > /private/tmp/drift-status-timing.out; echo \"status=$?\"; wc -c /private/tmp/drift-status-timing.out", "expected": "status=0; 'real <seconds>' printed; record as measured. If real > 1.0 s, flag in findings as operator decision before deploy."},
+        {"description": "Write docs/reviews/2026-10-15-drift-session-attribution-findings.md: Task 1 Step 8 Results lines; RED FAIL labels; timing+bytes; accepted gaps R3 + R3b (parallel shell commands of one lineage); residual false-block path + 3 ways out (R4); post-deploy live check (Codex exec_command PostToolUse closes its window; tool_name may be Bash); failed Claude Bash fires PostToolUseFailure (not registered; shared hooks.json must stay Codex-valid), closed at next same-lineage PreToolUse; deploy note (plugin cache, redeploy); backlog: linkSubagent no caller (state-manager/src/db.ts:666), stale ironclaude-drift-baseline-* files unused, newline-path block still reads whole-checkout dirt (pre-existing, recorded only)."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-15-drift-session-attribution-findings.md docs/plans/2026-10-15-drift-session-attribution-design.md docs/plans/2026-10-15-drift-session-attribution.md docs/plans/2026-10-15-drift-session-attribution.plan.json", "expected": "No output."}
+      ]
+    }
+  ]
+}

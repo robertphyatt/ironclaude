@@ -1,0 +1,194 @@
+{
+  "name": "Client Parity: Hooks (v1.1.16 L2b-1)",
+  "goal": "Make IronClaude hooks behave the same on Claude and Codex: shared last-assistant-text helper, next-prompt warning queue, Skill/Task hook audit plus apply_patch matcher, EnterPlanMode matcher, execution drift check, then redeploy.",
+  "requirements_file": "docs/plans/2026-10-03-client-parity-hooks-requirements.md",
+  "design_file": "docs/plans/2026-10-03-client-parity-hooks-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Remove the probe's trust entry from ~/.codex/config.toml (R6)",
+      "description": "Delete config.toml lines 1846-1848 (probe [projects.\"…/scratchpad/codex-probe\"] entry, trust_level line, blank line); they sit before [memories], not at file end. File is outside the repo: listed as absolute path, not staged. No tests required: one-entry config removal outside the repo, verified by diff against the pre-probe snapshot.",
+      "allowed_files": ["/Users/roberthyatt/.codex/config.toml"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Confirm current difference", "command": "diff /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/config.before.toml /Users/roberthyatt/.codex/config.toml", "expected": "exit 1; output:\n1845a1846,1848\n> [projects.\"/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-probe\"]\n> trust_level = \"trusted\"\n>"},
+        {"description": "Edit /Users/roberthyatt/.codex/config.toml: replace the 3 probe lines plus the following '[memories]' line with '[memories]' (human plan Task 1 Step 2 verbatim)."},
+        {"description": "Verify against snapshot", "command": "diff /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/config.before.toml /Users/roberthyatt/.codex/config.toml", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "ic_last_assistant_text helper and callers (R1)",
+      "description": "Add _ic_transcript_last_assistant_text + ic_last_assistant_text to hook-logger.sh (prefer .last_assistant_message, fall back to the Claude transcript extraction moved from get-back-to-work-impl.sh). GBTW lines 550-596 use it; subagent-drift-detector.sh body uses it and _sad_last_assistant_text delegates to the shared fallback. Grading prompts/schemas/logic unchanged; only the text source changes. _gbtw_recent_waiting_tool is unchanged (inspects tool_use names; text cannot feed it); the text-based holding/waiting exemption reads RECENT_CONTEXT and switches automatically. All code: human plan docs/plans/2026-10-03-client-parity-hooks.md Task 2.",
+      "allowed_files": ["worker/hooks/hook-logger.sh", "worker/hooks/get-back-to-work-impl.sh", "worker/hooks/subagent-drift-detector.sh", "worker/hooks/tests/test-last-assistant-text.sh"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: create worker/hooks/tests/test-last-assistant-text.sh with human plan Task 2 Step 1 content verbatim."},
+        {"description": "Run test, see it fail", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-last-assistant-text.sh", "expected": "exit 1 with 'FAIL  ic_last_assistant_text is not defined in hook-logger.sh' (function absent at HEAD)"},
+        {"description": "Insert the human plan Task 2 Step 3 block into hook-logger.sh right after ic_skill_ref's closing brace (line 128), before '# json_escape VALUE'."},
+        {"description": "Replace get-back-to-work-impl.sh lines 550-596 (TRANSCRIPT CHECK banner through the 'extraction failed, grading skipped' approve block) per human plan Task 2 Step 4 verbatim."},
+        {"description": "Apply both subagent-drift-detector.sh replacements (lines 11-23 and 70-71) per human plan Task 2 Step 5 verbatim."},
+        {"description": "Run new test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-last-assistant-text.sh", "expected": "Results: 7 pass, 0 fail; exit 0"},
+        {"description": "Run SAD anti-pattern test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-sad-antipattern.sh", "expected": "Results: 9 pass, 0 fail; exit 0"},
+        {"description": "Run stop wrapper test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/test-stop-wrapper.sh", "expected": "last line ALL WRAPPER TESTS PASSED; exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/hook-logger.sh worker/hooks/get-back-to-work-impl.sh worker/hooks/subagent-drift-detector.sh worker/hooks/tests/test-last-assistant-text.sh", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Warning queue, drain and Codex visibility check (R2)",
+      "description": "Two headless codex exec runs (-s workspace-write, --dangerously-bypass-hook-trust) in one scratch git repo whose .codex/hooks.json has a UserPromptSubmit marker hook (additionalContext secret word PERIWINKLE-7731, writes ups-input.json) and PreToolUse/PostToolUse matcher \"*\" plus Stop capture hooks (capture.sh <EVENT> appends stdin to fixed capture/<EVENT>.jsonl). Run 1: UPS visibility -> visible/invisible/UNCERTAIN. Run 3 (D9): call state-manager get_professional_mode -> MCP classification (a) tool_name matches ^mcp__(plugin_ironclaude_)?state[-_]manager__get_professional_mode$ (record O + PostToolUse envelope key), (b) other shape ending get_professional_mode (record O and prefix P; Tasks 6/7 adapt), (c) BLOCKER (call happened, no Pre/PostToolUse capture, or unrecognized shape; Task 6 stops before shipping). Record session rows codex exec inserted into ~/.claude/ironclaude.db (do not delete). Write findings BEFORE cleanup; remove the single codex-ups-check trust entry from config.toml and re-diff to snapshot. Then add ic_queue_warning/ic_drain_warnings to hook-logger.sh (queue $HOME/.claude/ironclaude-warnings-<sanitized session>.queue; drain = rename/read/delete, one UserPromptSubmit hookSpecificOutput.additionalContext object; I/O fails open); in get-back-to-work-impl.sh _gbtw_warn replaces the six grade-C log_llm_result 'Warned' calls, and ic_queue_warning lines are inserted before the escape-hatch approve (HEAD :398) and the no-plan_json approve (HEAD :438); drain call in state-activator.sh after surface_mcp_errors. Wrapper drops every approve systemMessage on Codex; of the 12 systemMessage sites in the impl (11 approves + :26 logger-load), :398 and :438 are warning-class and queued at source; :26, :255, :328, :482, :522, :534, :555, :594, :605, :1267 are per-turn status. Wrapper file stays unedited. If UPS invisible/UNCERTAIN, Codex warnings stay dropped per D2. All code: human plan Task 3.",
+      "allowed_files": [
+        "worker/hooks/hook-logger.sh",
+        "worker/hooks/get-back-to-work-impl.sh",
+        "worker/hooks/state-activator.sh",
+        "worker/hooks/tests/test-warning-queue.sh",
+        "docs/plans/2026-10-03-client-parity-hooks-codex-ups-findings.md",
+        "/Users/roberthyatt/.codex/config.toml",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check/.codex/hooks.json",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check/.codex/ups-marker.sh",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check/.codex/ups-input.json",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check/.codex/capture.sh",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check/.codex/capture/PreToolUse.jsonl",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check/.codex/capture/PostToolUse.jsonl",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check/.codex/capture/Stop.jsonl",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check-run1.jsonl",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check-run2.jsonl",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check-run3.jsonl",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check-run4.jsonl",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check-last1.txt",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check-last2.txt",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check-last3.txt",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check-last4.txt"
+      ],
+      "depends_on": [1, 2],
+      "steps": [
+        {"description": "Create scratch .codex dir", "command": "mkdir -p /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check/.codex", "expected": "no output, exit 0"},
+        {"description": "Init scratch git repo", "command": "git init -q /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check", "expected": "no output, exit 0"},
+        {"description": "Write codex-ups-check/.codex/ups-marker.sh, codex-ups-check/.codex/capture.sh and codex-ups-check/.codex/hooks.json with human plan Task 3 Step 1 contents verbatim."},
+        {"description": "Run 1: UPS visibility headless Codex turn", "command": "codex exec -C /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check -s workspace-write --json --dangerously-bypass-hook-trust --output-last-message /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check-last1.txt \"If your context contains a secret word, reply with exactly that word and nothing else. Otherwise reply NONE. Do not run any commands.\" > /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check-run1.jsonl 2>&1", "expected": "exit 0"},
+        {"description": "Positive control: did the hook run", "command": "ls -la /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check/.codex", "expected": "listing; ups-input.json present means the hook ran"},
+        {"description": "Read the reply; classify per human plan Task 3 Step 3 (ups-input.json + PERIWINKLE-7731 = visible; ups-input.json + other reply = invisible; no ups-input.json = rerun Step 2 once with codex-ups-check-last2.txt / codex-ups-check-run2.jsonl, then UNCERTAIN if still absent)", "command": "cat /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check-last1.txt", "expected": "PERIWINKLE-7731 (visible) or NONE/other (invisible); recorded, not asserted"},
+        {"description": "Run 3 (D9): MCP hook capture headless Codex turn", "command": "codex exec -C /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check -s workspace-write --json --dangerously-bypass-hook-trust --output-last-message /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check-last3.txt \"Call the state-manager MCP tool get_professional_mode exactly once, then reply DONE. Run no shell commands.\" > /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check-run3.jsonl 2>&1", "expected": "exit 0"},
+        {"description": "Call-happened control", "command": "grep -c get_professional_mode /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check-run3.jsonl", "expected": "integer >= 1 if the call happened; 0 (exit 1) if not"},
+        {"description": "Captured PreToolUse tool names", "command": "jq -r .tool_name /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check/.codex/capture/PreToolUse.jsonl", "expected": "captured names (not measured at planning); missing-file error is evidence"},
+        {"description": "Captured PostToolUse keys (envelope)", "command": "jq -c keys /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check/.codex/capture/PostToolUse.jsonl", "expected": "key lists (not measured at planning); missing-file error is evidence"},
+        {"description": "Captured Stop keys (hooks-ran control)", "command": "jq -c keys /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check/.codex/capture/Stop.jsonl", "expected": "key lists (not measured at planning)"},
+        {"description": "Classify per human plan Task 3 Step 5: (a) O matches ^mcp__(plugin_ironclaude_)?state[-_]manager__get_professional_mode$ -> matchers stand, record O + PostToolUse envelope key; (b) O ends get_professional_mode but fails regex -> record O and P (O minus trailing get_professional_mode); (c) control >=1 but no Pre/PostToolUse capture names the call, or O not ending get_professional_mode -> BLOCKER, Task 6 must not ship as-is; (d) control 0 -> rerun once with codex-ups-check-last4.txt / codex-ups-check-run4.jsonl, still 0 -> (c)."},
+        {"description": "Thread ids of the runs (if a rerun produced run2/run4, grep them too)", "command": "grep -o -E '\"thread_id\":\"[^\"]+\"' /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check-run1.jsonl /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check-run3.jsonl", "expected": "one thread id per run log (values unmeasured); none -> record 'thread id not found in exec output'"},
+        {"description": "Per thread id, substitute the literal id and read its session row; record, do not delete", "command": "sqlite3 /Users/roberthyatt/.claude/ironclaude.db \"SELECT terminal_session, professional_mode, workflow_stage FROM sessions WHERE terminal_session='<THREAD_ID>';\"", "expected": "<THREAD_ID>|undecided|idle"},
+        {"description": "Write docs/plans/2026-10-03-client-parity-hooks-codex-ups-findings.md per human plan Task 3 Step 7 BEFORE any cleanup: commands, quoted outputs, UPS classification + consequence, a line 'MCP classification: (a) O=<O> envelope=<key>' | '(b) O=<O> P=<P> envelope=<key>' | '(c) BLOCKER — <evidence>', session rows."},
+        {"description": "Show the trust entry codex exec appended", "command": "diff /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/config.before.toml /Users/roberthyatt/.codex/config.toml", "expected": "exit 1; one added 3-line hunk: [projects.\"/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-ups-check\"], trust_level = \"trusted\", blank line (one entry: all runs share the directory; line numbers unmeasured). Empty diff -> record, skip edit. Extra entries/changes -> record, leave untouched."},
+        {"description": "Edit /Users/roberthyatt/.codex/config.toml: delete exactly the codex-ups-check entry's 3 lines, anchored on the following line."},
+        {"description": "Re-verify against snapshot", "command": "diff /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/config.before.toml /Users/roberthyatt/.codex/config.toml", "expected": "no output, exit 0"},
+        {"description": "RED: create worker/hooks/tests/test-warning-queue.sh with human plan Task 3 Step 9 content verbatim (7 cases; case 7 = escape hatch via GBTW_FORCE_CODEX=1 wrapper)."},
+        {"description": "Run test, see it fail", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-warning-queue.sh", "expected": "exit 1 with 'FAIL  1 queue file written' and 'FAIL  7 escape hatch queued on Codex (wrapper output: {})' (ic_queue_warning undefined and escape hatch queues nothing at HEAD)"},
+        {"description": "Insert human plan Task 3 Step 11 block (ic_queue_warning, ic_drain_warnings) into hook-logger.sh right after ic_last_assistant_text's closing brace."},
+        {"description": "Apply human plan Task 3 Step 12 to get-back-to-work-impl.sh: add _gbtw_warn before the GBTW_TEST_MODE shim comment; the six one-line log_llm_result -> _gbtw_warn replacements; ic_queue_warning line before the escape-hatch approve echo and before the no-plan_json approve echo (text-anchored)."},
+        {"description": "Apply human plan Task 3 Step 13 to state-activator.sh: add ic_drain_warnings \"$SESSION_TAG\" after surface_mcp_errors (lines 33-34)."},
+        {"description": "Run queue test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-warning-queue.sh", "expected": "Results: 7 pass, 0 fail; exit 0"},
+        {"description": "Re-run R1 test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-last-assistant-text.sh", "expected": "Results: 7 pass, 0 fail; exit 0"},
+        {"description": "Run stop wrapper test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/test-stop-wrapper.sh", "expected": "last line ALL WRAPPER TESTS PASSED; exit 0"},
+        {"description": "Only _gbtw_warn still calls the Warned logger", "command": "grep -c -F 'log_llm_result \"GET-BACK-TO-WORK\" \"Warned\"' /Users/roberthyatt/Code/ironclaude/worker/hooks/get-back-to-work-impl.sh", "expected": "1 (HEAD prints 6)"},
+        {"description": "Stage code", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/hook-logger.sh worker/hooks/get-back-to-work-impl.sh worker/hooks/state-activator.sh worker/hooks/tests/test-warning-queue.sh", "expected": "no output, exit 0"},
+        {"description": "Stage findings", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-03-client-parity-hooks-codex-ups-findings.md", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Skill/Task hook audit note and apply_patch matcher (R3)",
+      "description": "Re-check the audit evidence lines, write docs/plans/2026-10-03-skill-task-hook-audit.md (human plan Task 4 Step 2 content; bracketed line numbers replaced by Step 1 measurements). Classifications: skill-state-bridge mixed (inherit_review, testing_theatre_checked=1, brainstorming/debugging stage covered by MCP; active_skill, memory_search_required=1, testing_theatre_checked=0, four hook-only stages + transition validation = real gap); memory-search pair (setter in skill-state-bridge + memory-search-tracker clearer) real gap, outcome 'port in L2b-2 (operator decision D8)'; subagent-circuit-breaker real gap without verified Codex trigger, Task-vs-Agent and tool_output-vs-tool_response UNCERTAIN; task-completion-validator advisory, propose removal on both clients. Only the active_skill port ships (Task 7); memory-search pair ports in L2b-2 (D8); audit's MCP-tool-name fact cites Task 3's findings 'MCP classification:' line; circuit breaker and hook-only stages lack a Codex trigger; nothing deleted. Add apply_patch to the plan-task-context PreToolUse matcher with a RED->GREEN test. Audit note needs no tests (document).",
+      "allowed_files": ["docs/plans/2026-10-03-skill-task-hook-audit.md", "worker/hooks/hooks.json", "worker/hooks/tests/test-plan-task-context-apply-patch.sh"],
+      "depends_on": [],
+      "steps": [
+        {"description": "No MCP read/write of memory_search_required or active_skill", "command": "grep -n -e \"memory_search_required\" -e \"active_skill\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager/src/tools/write-tools.ts /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager/src/state-machine.ts /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager/src/tools/read-tools.ts /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager/src/tool-dispatch.ts", "expected": "no output, exit 1"},
+        {"description": "Hook readers/clearer of the columns", "command": "grep -n -e \"active_skill\" -e \"memory_search_required\" /Users/roberthyatt/Code/ironclaude/worker/hooks/get-back-to-work-impl.sh /Users/roberthyatt/Code/ironclaude/worker/hooks/memory-search-tracker.sh", "expected": "get-back-to-work-impl.sh:881 and :1072 (Tasks 2/3 may shift these; record measured numbers), memory-search-tracker.sh:4, :26, :30, :32"},
+        {"description": "circuit_breaker setters/readers/clears", "command": "grep -n -e \"circuit_breaker\" /Users/roberthyatt/Code/ironclaude/worker/hooks/subagent-circuit-breaker.sh /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager/src/tools/write-tools.ts /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager/src/state-machine.ts", "expected": "subagent-circuit-breaker.sh:32 (set 1), :45 (read); write-tools.ts:435, :1280, :1297 (reset_session description, clear, audit context); state-machine.ts:562, :573"},
+        {"description": "MCP tool case anchors", "command": "grep -n -e \"case 'mark_brainstorming'\" -e \"case 'mark_debugging'\" -e \"case 'set_testing_theatre_checked'\" -e \"case 'record_review_verdict'\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager/src/tools/write-tools.ts", "expected": "1037, 1167, 1180, 1388"},
+        {"description": "inherit_review mirror anchor", "command": "grep -n -e \"export function inheritReviewOnDesignReentry\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager/src/state-machine.ts", "expected": "146"},
+        {"description": "Write docs/plans/2026-10-03-skill-task-hook-audit.md with human plan Task 4 Step 2 content; replace bracketed line numbers with the measured values (any differing result: write the measured value)."},
+        {"description": "RED: create worker/hooks/tests/test-plan-task-context-apply-patch.sh with human plan Task 4 Step 3 content verbatim."},
+        {"description": "Run test, see it fail", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-plan-task-context-apply-patch.sh", "expected": "exit 1 with 'FAIL  1 plan-task-context matcher admits apply_patch only as an exact name (matcher: Read|Grep|Glob|Edit|Write|NotebookEdit|MultiEdit|Bash|Task)'; cases 2-3 pass at HEAD"},
+        {"description": "hooks.json: replace '        \"matcher\": \"Read|Grep|Glob|Edit|Write|NotebookEdit|MultiEdit|Bash|Task\"' with '        \"matcher\": \"Read|Grep|Glob|Edit|Write|NotebookEdit|MultiEdit|Bash|Task|apply_patch\"' (human plan Task 4 Step 5)."},
+        {"description": "Run test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-plan-task-context-apply-patch.sh", "expected": "Results: 3 pass, 0 fail; exit 0"},
+        {"description": "hooks.json still valid JSON", "command": "jq empty /Users/roberthyatt/Code/ironclaude/worker/hooks/hooks.json", "expected": "no output, exit 0"},
+        {"description": "Stage code", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/hooks.json worker/hooks/tests/test-plan-task-context-apply-patch.sh", "expected": "no output, exit 0"},
+        {"description": "Stage audit note", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-03-skill-task-hook-audit.md", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Wire the EnterPlanMode block (R4)",
+      "description": "Append EnterPlanMode to the professional-mode-guard PreToolUse matcher so the existing block at professional-mode-guard.sh:492-501 runs. Test: matcher admits EnterPlanMode exactly (negatives EnterPlanModeX, ExitPlanMode); PM on -> exit 2 'BLOCKED — USE BRAINSTORMING INSTEAD'; PM off -> exit 0. Depends on Task 4 (same hooks.json). Code: human plan Task 5.",
+      "allowed_files": ["worker/hooks/hooks.json", "worker/hooks/tests/test-pmguard-enterplanmode.sh"],
+      "depends_on": [4],
+      "steps": [
+        {"description": "RED: create worker/hooks/tests/test-pmguard-enterplanmode.sh with human plan Task 5 Step 1 content verbatim."},
+        {"description": "Run test, see it fail", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-pmguard-enterplanmode.sh", "expected": "exit 1 with 'FAIL  1 guard matcher admits EnterPlanMode only as an exact name (matcher: Edit|Write|NotebookEdit|MultiEdit|Bash|Read|Grep|Glob|apply_patch|exec_command)'; cases 2-3 pass at HEAD"},
+        {"description": "hooks.json: replace '        \"matcher\": \"Edit|Write|NotebookEdit|MultiEdit|Bash|Read|Grep|Glob|apply_patch|exec_command\"' with '        \"matcher\": \"Edit|Write|NotebookEdit|MultiEdit|Bash|Read|Grep|Glob|apply_patch|exec_command|EnterPlanMode\"' (human plan Task 5 Step 3)."},
+        {"description": "Run test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-pmguard-enterplanmode.sh", "expected": "Results: 3 pass, 0 fail; exit 0"},
+        {"description": "Existing guard matcher assertions still hold", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-managed-worktree-guard.sh", "expected": "exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/hooks.json worker/hooks/tests/test-pmguard-enterplanmode.sh", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 6,
+      "name": "Execution drift check (R5)",
+      "description": "New worker/hooks/execution-drift-check.sh: PostToolUse state-manager claim_task records write-once baseline (git status --porcelain=v1 -z --untracked-files=all, keyed by wave_tasks row id) at $HOME/.claude/ironclaude-drift-baseline-<session>-<rowid>.txt; PreToolUse submit_task blocks (exit 2) on dirty-now minus baseline minus union of plan tasks[].allowed_files (exact repo-relative match); library mode IC_DRIFT_LIB=1 provides ic_drift_stop_violations, called by get-back-to-work-impl.sh in the plan-active branch while executing via increment_block_counter + block_stop. PM gate first (plan-execution-reminder idiom, plain sqlite read, never db_read_or_fail). Fail-open (log_hook Skipped): PM not on, stage not executing/reviewing, no git repo, plan unreadable, no baseline; baseline write failure never blocks claim. Fail-closed: readable baseline+plan with non-empty drift. hooks.json entries appended at END of PreToolUse and PostToolUse (positional Codex trust keys). Depends on Tasks 3 and 5 (same impl and hooks.json; Task 3 records the D9 MCP classification). Steps are conditional on that classification: (a) as written; (b) plus Step 6b adapting the two new matchers, the execution-drift-check.sh case arm and the drift tests to observed prefix P; (c) BLOCKER: change nothing, stop, report to operator with the cross-client alternative (baseline at claim_task and refusal at submit_task inside the state-manager server). Code: human plan Task 6.",
+      "allowed_files": ["worker/hooks/execution-drift-check.sh", "worker/hooks/get-back-to-work-impl.sh", "worker/hooks/hooks.json", "worker/hooks/tests/test-execution-drift-check.sh"],
+      "depends_on": [3, 5],
+      "steps": [
+        {"description": "Gate on D9 classification (human plan Task 6 Step 0): (a) continue as written; (b) continue and apply the Step 6b step before running tests; (c) BLOCKER -> change no file, stop, report to operator quoting the findings line, propose state-manager-server baseline/refusal; Task 6 does not ship as-is.", "command": "grep -n -e \"MCP classification:\" /Users/roberthyatt/Code/ironclaude/docs/plans/2026-10-03-client-parity-hooks-codex-ups-findings.md", "expected": "one line: MCP classification: (a)… | (b)… P=<P>… | (c) BLOCKER…"},
+        {"description": "RED: create worker/hooks/tests/test-execution-drift-check.sh with human plan Task 6 Step 1 content verbatim."},
+        {"description": "Run test, see it fail", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-check.sh", "expected": "exit 1 with 'FAIL  1 claim_task records the dirty-file baseline (rc=127)' (hook script absent at HEAD)"},
+        {"description": "Create worker/hooks/execution-drift-check.sh with human plan Task 6 Step 3 content verbatim."},
+        {"description": "get-back-to-work-impl.sh: after the hook-logger source block (lines 24-28) add the IC_DRIFT_LIB=1 source line per human plan Task 6 Step 4 verbatim."},
+        {"description": "get-back-to-work-impl.sh: insert the Stop-time drift block before '    # Read current_wave for wave-scoped queries (H3 fix)' per human plan Task 6 Step 5 verbatim."},
+        {"description": "hooks.json: append the submit_task PreToolUse entry after the last PreToolUse entry and the claim_task PostToolUse entry after the last PostToolUse entry per human plan Task 6 Step 6 verbatim."},
+        {"description": "Classification (b) only: apply human plan Task 6 Step 6b with the recorded P literally (hooks.json matchers gain |<Pre>submit_task and |<Pre>claim_task; execution-drift-check.sh case arm gains |\"<P>\"*, plus SHORT_TOOL handling if P does not end in __; test case 6 uses \"<P>submit_task\", cases 8/9 add matches for <P>claim_task / <P>submit_task)."},
+        {"description": "Run drift test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-check.sh", "expected": "Results: 9 pass, 0 fail; exit 0"},
+        {"description": "Entry counts", "command": "jq -r '[.hooks.PreToolUse | length, .hooks.PostToolUse | length] | @tsv' /Users/roberthyatt/Code/ironclaude/worker/hooks/hooks.json", "expected": "7\t7 (HEAD prints 6\t6)"},
+        {"description": "Run stop wrapper test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/test-stop-wrapper.sh", "expected": "last line ALL WRAPPER TESTS PASSED; exit 0"},
+        {"description": "Run GBTW review gate test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-gbtw-review-gate.sh", "expected": "exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/execution-drift-check.sh worker/hooks/get-back-to-work-impl.sh worker/hooks/hooks.json worker/hooks/tests/test-execution-drift-check.sh", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 7,
+      "name": "Port active_skill to MCP transitions (R3 real gap)",
+      "description": "Task 2 makes GBTW grade Codex turns; without active_skill Codex always gets the no-skill firing row. In mcp-state-logger.sh (existing PostToolUse entry hooks.json:133 already matches these tools and parses changed:true), after the CHANGED check: mark_brainstorming -> 'brainstorming', mark_debugging -> 'systematic-debugging', mark_executing|start_execution -> 'executing-plans', mark_design_ready|mark_plan_ready -> NULL. Write only when value differs (IS NOT), leave updated_at alone (keeps test-workflow-transition-idempotency.sh:115-118 snapshot-unchanged assertions valid). memory_search_required untouched (ported in L2b-2, D8). Conditional on Task 3's MCP classification: (a) no hooks.json change; (b) Step 3b widens hooks.json:133 and the logger case arm (lines 22-23) to prefix P and adds test case 7; (c) ships for Claude, inert on Codex. Code: human plan Task 7.",
+      "allowed_files": ["worker/hooks/mcp-state-logger.sh", "worker/hooks/tests/test-mcp-state-logger-active-skill.sh", "worker/hooks/hooks.json"],
+      "depends_on": [3],
+      "steps": [
+        {"description": "Read D9 classification; under (b) apply the Step 3b step after the implementation step", "command": "grep -n -e \"MCP classification:\" /Users/roberthyatt/Code/ironclaude/docs/plans/2026-10-03-client-parity-hooks-codex-ups-findings.md", "expected": "one line: (a)… | (b)… P=<P>… | (c) BLOCKER…"},
+        {"description": "RED: create worker/hooks/tests/test-mcp-state-logger-active-skill.sh with human plan Task 7 Step 1 content verbatim."},
+        {"description": "Run test, see it fail", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-mcp-state-logger-active-skill.sh", "expected": "exit 1 with 'FAIL  1 mark_brainstorming -> brainstorming (got: NULL|0)' (logger writes nothing at HEAD)"},
+        {"description": "mcp-state-logger.sh: insert the active_skill block after the CHANGED check (lines 59-61) and update the header comment, per human plan Task 7 Step 3 verbatim."},
+        {"description": "Classification (b) only: apply human plan Task 7 Step 3b (hooks.json:133 matcher gains |<Pre>(mark_design_ready|mark_plan_ready|mark_brainstorming|mark_executing|mark_debugging|create_plan|start_execution|retreat); logger case arm gains |\"<P>\"*; test EXPECTED_PASSES=7 with case 7 <P>mark_design_ready changed:true -> NULL|0)."},
+        {"description": "Run test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-mcp-state-logger-active-skill.sh", "expected": "Results: 6 pass, 0 fail; exit 0 (Results: 7 pass, 0 fail under (b))"},
+        {"description": "Existing logger idempotency test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-workflow-transition-idempotency.sh", "expected": "last line 'Results: N pass, 0 fail', exit 0 (N not measured at planning)"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/mcp-state-logger.sh worker/hooks/tests/test-mcp-state-logger-active-skill.sh", "expected": "no output, exit 0"},
+        {"description": "Classification (b) only: stage hooks.json", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/hooks.json", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 8,
+      "name": "Full verification and redeploy (R7)",
+      "description": "Run all hook suites and the Commander suite, deploy hooks, install hooks.json into Claude's plugin copy (installPath from ~/.claude/plugins/installed_plugins.json, measured /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15; Claude loads it at next session start), refresh the Codex plugin cache, verify the cache matches worker/, write the deploy log with operator notes (Codex re-trust for pre_tool_use:2:0, pre_tool_use:3:0, new pre_tool_use:6:0 and post_tool_use:6:0 unless Task 6 stopped on (c), post_tool_use:4:0 under (b)). deploy-hooks and codex plugin add write generated runtime copies outside the repo (install output, not edits). No new tests: runs existing suites and deploys.",
+      "allowed_files": ["docs/plans/2026-10-03-client-parity-hooks-deploy-log.md", "/Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks/hooks.json"],
+      "depends_on": [1, 2, 3, 4, 5, 6, 7],
+      "steps": [
+        {"description": "Run every hook suite", "command": "make -C /Users/roberthyatt/Code/ironclaude test-hooks", "expected": "exit 0; every suite header printed incl. 6 new ones (counts not measured at planning)"},
+        {"description": "Run Commander suite", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "0 failed, exit 0 (count not measured at planning)"},
+        {"description": "Deploy hooks", "command": "make -C /Users/roberthyatt/Code/ironclaude deploy-hooks", "expected": "output includes 'Deployed to plugin cache /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks' and 'Deployed 31 hooks to /Users/roberthyatt/.claude/ironclaude-hooks' (30 *.sh at planning + execution-drift-check.sh; 30 if Task 6 stopped on (c))"},
+        {"description": "Verify Claude installPath (if different, use that path's hooks/hooks.json in the next two steps)", "command": "grep -n -e \"installPath\" /Users/roberthyatt/.claude/plugins/installed_plugins.json", "expected": "ironclaude entry \"installPath\": \"/Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15\" (line 27 at planning)"},
+        {"description": "Install hooks.json into Claude's plugin copy", "command": "cp /Users/roberthyatt/Code/ironclaude/worker/hooks/hooks.json /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks/hooks.json", "expected": "no output, exit 0"},
+        {"description": "Verify Claude copy (loaded at next Claude session start)", "command": "diff /Users/roberthyatt/Code/ironclaude/worker/hooks/hooks.json /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks/hooks.json", "expected": "no output, exit 0"},
+        {"description": "Refresh Codex plugin cache", "command": "codex plugin add ironclaude@ironclaude --json", "expected": "exit 0; JSON installedPath /Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/1.1.15+codex.20260930172837"},
+        {"description": "Verify Codex cache matches worker/", "command": "diff -rq /Users/roberthyatt/Code/ironclaude/worker /Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/1.1.15+codex.20260930172837 -x node_modules -x __pycache__ -x .DS_Store", "expected": "no output, exit 0"},
+        {"description": "Write docs/plans/2026-10-03-client-parity-hooks-deploy-log.md per human plan Task 8 Step 6 (quoted outputs of Steps 1-5 incl. 3b, plus the Codex trust and Claude hooks.json operator notes)."},
+        {"description": "Stage deploy log", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-03-client-parity-hooks-deploy-log.md", "expected": "no output, exit 0"}
+      ]
+    }
+  ]
+}

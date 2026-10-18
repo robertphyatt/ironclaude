@@ -2158,7 +2158,7 @@ class TestOperatorFastLane:
                      "check_directive_capability_blocks", "check_confirmed_directives",
                      "check_idle_enforcement", "check_post_kill_sweep",
                      "check_message_aging", "post_heartbeat", "_run_maintenance",
-                     "_sweep_expired_push_requests"):
+                     "_sweep_expired_push_requests", "_sweep_dead_owner_leases"):
             monkeypatch.setattr(daemon, name, counter(name))
         daemon.slack.flush_queue = counter("flush_queue")
         daemon._paused = False
@@ -2287,43 +2287,50 @@ class TestBrainSettingsHookSync:
             }
         }
 
-    def test_sync_appends_preserves_all_deploys_and_is_idempotent(self, tmp_path):
+    def test_sync_owns_brain_hooks_repoints_retires_preserves_foreign(self, tmp_path):
         import json as _json
+        import ironclaude.main as _m
         from ironclaude.main import _sync_brain_settings_hooks
 
-        lookback_cmd = "bash $HOME/.claude/ironclaude-hooks/startup-lookback-enforcer.sh"
-        template = {"PreToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": lookback_cmd}]}]}
+        repo_template = (
+            Path(_m.__file__).resolve().parents[2] / "src" / "brain" / "brain_settings_hooks.json"
+        )
         template_path = tmp_path / "brain_settings_hooks.json"
-        template_path.write_text(_json.dumps(template))
-        settings_path = tmp_path / "settings.json"
+        template_path.write_text(repo_template.read_text())
+        template = _json.loads(repo_template.read_text())
         original = self._real_settings()
+        foreign = {"matcher": "Bash", "hooks": [{"type": "command", "command": "bash /opt/foreign/audit.sh"}]}
+        original["hooks"]["PreToolUse"].append(foreign)
+        settings_path = tmp_path / "settings.json"
         settings_path.write_text(_json.dumps(original))
         hooks_src = tmp_path / "src_hooks"
-        hooks_src.mkdir()
-        (hooks_src / "startup-lookback-enforcer.sh").write_text("#!/bin/bash\nexit 0\n")
+        (hooks_src / "tests").mkdir(parents=True)
+        for name in ("block-push.sh", "attention-sweep-enforcer.sh", "brain-hooks-canary.sh"):
+            (hooks_src / name).write_text("#!/bin/bash\nexit 0\n")
+        (hooks_src / "tests" / "test-x.sh").write_text("#!/bin/bash\n")
         hooks_dst = tmp_path / "dst_hooks"
 
         _sync_brain_settings_hooks(str(template_path), str(settings_path), str(hooks_src), str(hooks_dst))
 
         result = _json.loads(settings_path.read_text())
-        pre_cmds = [h["command"] for e in result["hooks"]["PreToolUse"] for h in e["hooks"]]
-        # every original PreToolUse command preserved
-        for e in original["hooks"]["PreToolUse"]:
-            for h in e["hooks"]:
-                assert h["command"] in pre_cmds
-        # lookback appended exactly once
-        assert pre_cmds.count(lookback_cmd) == 1
-        # PostToolUse byte-identical — block-pin-enforcer NOT dropped
-        assert result["hooks"]["PostToolUse"] == original["hooks"]["PostToolUse"]
-        # referenced script deployed
-        assert (hooks_dst / "startup-lookback-enforcer.sh").is_file()
-
-        # idempotent: a second run leaves exactly one lookback entry
+        for event in ("PreToolUse", "PostToolUse"):
+            cmds = [h["command"] for e in result["hooks"][event] for h in e["hooks"]]
+            expected = [h["command"] for e in template[event] for h in e["hooks"]]
+            if event == "PreToolUse":
+                expected = ["bash /opt/foreign/audit.sh"] + expected
+            assert cmds == expected
+        text = settings_path.read_text()
+        assert ".ironclaude/brain/hooks/" not in text
+        assert "memory-search-enforcer.sh" not in text
+        assert "startup-lookback-enforcer.sh" not in text
+        # every top-level commander hook script deployed; tests/ not
+        assert sorted(p.name for p in hooks_dst.iterdir()) == [
+            "attention-sweep-enforcer.sh", "block-push.sh", "brain-hooks-canary.sh",
+        ]
+        # idempotent: a second run leaves the file byte-identical
+        before = settings_path.read_text()
         _sync_brain_settings_hooks(str(template_path), str(settings_path), str(hooks_src), str(hooks_dst))
-        result2 = _json.loads(settings_path.read_text())
-        pre_cmds2 = [h["command"] for e in result2["hooks"]["PreToolUse"] for h in e["hooks"]]
-        assert pre_cmds2.count(lookback_cmd) == 1
-        assert result2["hooks"]["PostToolUse"] == original["hooks"]["PostToolUse"]
+        assert settings_path.read_text() == before
 
     def test_sync_leaves_corrupt_settings_untouched(self, tmp_path):
         """A corrupt settings.json must NOT be clobbered — overwriting it with only
@@ -5635,7 +5642,9 @@ class TestGradeBoundedFastLaneReadTimeout:
             _time.sleep(0.5)
             raise requests.ReadTimeout()
 
-        daemon._grader = LocalGrader(config_path=str(tmp_path / "absent.json"), keep_alive="30m")
+        ollama_cfg = tmp_path / "ollama.json"
+        ollama_cfg.write_text('{"backend": "ollama"}')
+        daemon._grader = LocalGrader(config_path=str(ollama_cfg), keep_alive="30m")
 
         with patch("ironclaude.ollama_client.requests.post", side_effect=fake_post) as mock_post, \
                 patch.object(OllamaClient, "_probe_reachable", return_value=True):
@@ -5692,34 +5701,34 @@ class TestCodexBrainExecutingToolAttr:
         assert d.brain._executing_tool is False
 
 
-def test_brain_settings_hooks_template_lists_all_three_gates():
-    """#1: _sync_brain_settings_hooks only deploys+registers hooks named in this
-    template. All three commander Brain gates must be listed so their scripts reach
-    the stable dir on daemon start (else a source fix — e.g. obs-3's memory-search
-    fail-closed — never reaches prod)."""
+def test_brain_settings_hooks_template_is_the_brain_rule_set():
+    """The template is the single source of truth for the Claude Brain's IronClaude
+    hooks: exactly the Brain rule set, each command under $HOME, retired enforcers absent."""
     import json as _json
     from pathlib import Path
     template = _json.loads(
         (Path(__file__).resolve().parents[1] / "src" / "brain" / "brain_settings_hooks.json").read_text()
     )
-    cmds = "\n".join(
-        h.get("command", "")
-        for e in template.get("PreToolUse", [])
-        for h in e.get("hooks", [])
-    )
-    assert "brain-task-gate.sh" in cmds
-    assert "startup-lookback-enforcer.sh" in cmds
-    assert "memory-search-enforcer.sh" in cmds
-    # obs-6(c): every command must use $HOME, not ~. _sync appends an entry only when its
-    # exact command string is absent, so a ~-vs-$HOME drift would register a SECOND copy of a
-    # gate; memory-search rm -f's its arm flag each pass, so a double-registration blocks every
-    # gated action. Pin the exact deployed prefix.
-    for e in template.get("PreToolUse", []):
-        for h in e.get("hooks", []):
-            cmd = h.get("command", "")
-            assert cmd.startswith("bash $HOME/.claude/ironclaude-hooks/"), (
-                f"template hook command must use $HOME (not ~); got: {cmd!r}"
-            )
+    def scripts(event):
+        return [
+            (e.get("matcher"), h["command"].rsplit("/", 1)[-1])
+            for e in template.get(event, []) for h in e["hooks"]
+        ]
+    assert scripts("PreToolUse") == [
+        ("Bash", "block-push.sh"),
+        ("", "wiki-synthesis-enforcer.sh"),
+        ("", "attention-sweep-enforcer.sh"),
+        ("Agent|Task", "brain-task-gate.sh"),
+        ("", "brain-gated-actions.sh"),
+    ]
+    assert scripts("PostToolUse") == [
+        ("mcp__orchestrator__get_worker_status", "attention-sweep-arm.sh"),
+        ("mcp__orchestrator__update_ledger", "block-pin-enforcer.sh"),
+    ]
+    for event in ("PreToolUse", "PostToolUse"):
+        for e in template[event]:
+            for h in e["hooks"]:
+                assert h["command"].startswith("bash $HOME/.claude/ironclaude-hooks/"), h["command"]
 
 
 class TestOrphanSurfaceStatePersistence:

@@ -1,0 +1,60 @@
+{
+  "name": "Drift-Check Review Fixes (v1.1.16 L2b-1b)",
+  "goal": "Fix the L2b-1 drift check (effective root like the write guard, absolute allowed_files, LC_ALL=C comm) and make state-activator.sh emit at most one JSON object, then verify and redeploy.",
+  "requirements_file": "docs/plans/2026-10-03-drift-check-review-fixes-requirements.md",
+  "design_file": "docs/plans/2026-10-03-drift-check-review-fixes-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Effective root, absolute allowed_files and locale-pinned comm (R1, R2, R3)",
+      "description": "Replace worker/hooks/execution-drift-check.sh (human plan Task 1 Step 3): source workspace-path-adapter.sh at top (top-level only assigns empty WORKSPACE_* globals); new _drift_effective_root SESSION CWD (call directly, never in $(...)) sets _DRIFT_ROOT or _DRIFT_ROOT_ERROR: cwd missing/not git -> fail-open; workspace DB absent or 0 assignment rows -> git toplevel of cwd; adapter missing, non-canonical cwd/common dir, unreadable or >1 rows -> fail-open; 1 row -> local SESSION_TAG=session, workspace_bind_effective_root(workspace_db, canonical git common dir, canonical cwd, sql-quoted session) -> WORKSPACE_EFFECTIVE_ROOT, failure -> fail-open 'managed-worktree binding failed: <WORKSPACE_ADAPTER_ERROR>' (inputs mirror workspace_prepare_input workspace-path-adapter.sh:428-476; heartbeat renewal side effect accepted). Callers (hook claim/submit, GBTW Stop) resolve once and pass ROOT: ic_drift_record_baseline SESSION TASK ROOT, ic_drift_violations SESSION ROOT ROW..., ic_drift_stop_violations SESSION ROOT. _drift_allowed_files SESSION ROOT: entries under \"$root/\" stripped to relative, other absolute dropped, relative unchanged, exact match. ic_drift_violations uses LC_ALL=C comm -23. get-back-to-work-impl.sh:468-484 resolves root via _drift_effective_root (logs reason on fail-open) then calls ic_drift_stop_violations with it; still increment_block_counter + block_stop. Fail-closed only with resolved root, readable plan+baseline, non-empty drift. hooks.json unchanged.",
+      "allowed_files": ["worker/hooks/execution-drift-check.sh", "worker/hooks/get-back-to-work-impl.sh", "worker/hooks/tests/test-execution-drift-roots.sh"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: create worker/hooks/tests/test-execution-drift-roots.sh with human plan Task 1 Step 1 content verbatim (8 cases: F1 baseline root, F1 primary edits ignored, F2 absolute entry, F3 UTF-8 behavioral, F3 static LC_ALL=C comm, worktree drift blocks alone, Stop blocks via block counter, frozen assignment fails open logged)."},
+        {"description": "Run test, see it fail", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-roots.sh", "expected": "exit 1; FAIL lines for cases 1, 2, 3, 5, 6, 7, 8 (current code reads the primary checkout, has no absolute-entry handling, no LC_ALL=C on comm, no binding message). Case 4 may pass on macOS (UTF-8 collation not measured to differ from C); case 5 is the host-independent locale check."},
+        {"description": "Write worker/hooks/execution-drift-check.sh with human plan Task 1 Step 3 content verbatim (full replacement)."},
+        {"description": "get-back-to-work-impl.sh: replace the Stop drift block (lines 468-484) per human plan Task 1 Step 4 verbatim."},
+        {"description": "Run new test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-roots.sh", "expected": "Results: 8 pass, 0 fail; exit 0"},
+        {"description": "Existing drift test (no workspace DB -> cwd toplevel fallback)", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-check.sh", "expected": "Results: 9 pass, 0 fail; exit 0"},
+        {"description": "Stop wrapper test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/test-stop-wrapper.sh", "expected": "last line ALL WRAPPER TESTS PASSED; exit 0"},
+        {"description": "Managed-worktree guard test (adapter unchanged)", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-managed-worktree-guard.sh", "expected": "exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/execution-drift-check.sh worker/hooks/get-back-to-work-impl.sh worker/hooks/tests/test-execution-drift-roots.sh", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "state-activator.sh emits at most one JSON object (R4)",
+      "description": "After sourcing hook-logger.sh and before run_hook, add _ic_sa_flush and redirect stdout to a mktemp buffer (exec 3>&1 1>buffer; trap _ic_sa_flush EXIT). On exit: restore stdout; jq merges buffered lines into one object (systemMessage = newline-joined .systemMessage values and non-JSON lines; hookSpecificOutput {hookEventName:UserPromptSubmit, additionalContext} from the drain); prints nothing if empty; falls back to raw cat if jq fails; removes buffer and _IC_DB_VALIDATED (replaces hook-logger.sh:37 EXIT trap); exits with the original code. Hook emits no decisions (writers: log_hook, log_error, log_warning, surface_mcp_errors, ic_drain_warnings). Code: human plan Task 2.",
+      "allowed_files": ["worker/hooks/state-activator.sh", "worker/hooks/tests/test-state-activator-single-object.sh"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: create worker/hooks/tests/test-state-activator-single-object.sh with human plan Task 2 Step 1 content verbatim (queued warning + '/commit' with PM not on forces log_error)."},
+        {"description": "Run test, see it fail", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-state-activator-single-object.sh", "expected": "exit 1 with 'FAIL  1 exactly one JSON object' and 'FAIL  2 merged object holds the error and the queued warning' (current stdout: drain object + log_error object); cases 3-4 pass at current tree"},
+        {"description": "state-activator.sh: replace lines 5-7 with the buffered-stdout block and update the drain comment, per human plan Task 2 Step 3 verbatim."},
+        {"description": "Run new test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-state-activator-single-object.sh", "expected": "Results: 4 pass, 0 fail; exit 0"},
+        {"description": "Warning queue test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-warning-queue.sh", "expected": "Results: 7 pass, 0 fail; exit 0"},
+        {"description": "Deactivation test (text containment survives merge)", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-professional-mode-deactivation.sh", "expected": "exit 0"},
+        {"description": "Git authority activation test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-git-authority-activation.sh", "expected": "exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/state-activator.sh worker/hooks/tests/test-state-activator-single-object.sh", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Full verification and redeploy (R5)",
+      "description": "Run all hook suites and the Commander suite, deploy hooks, confirm Claude's plugin hooks.json is unchanged (copy skipped unless the diff shows a difference), refresh the Codex cache, verify the cache matches worker/, write the deploy log (hooks.json unchanged -> no Codex trust key changes; per R6 operator commits L2b-1 + L2b-1b together and re-trusts the 4 Codex hooks only after). deploy-hooks and codex plugin add write generated runtime copies outside the repo (install output, not edits). No new tests: runs suites and deploys.",
+      "allowed_files": ["docs/plans/2026-10-03-drift-check-review-fixes-deploy-log.md"],
+      "depends_on": [1, 2],
+      "steps": [
+        {"description": "Run every hook suite", "command": "make -C /Users/roberthyatt/Code/ironclaude test-hooks", "expected": "exit 0; the 2 new suites' headers printed (counts not measured at planning)"},
+        {"description": "Run Commander suite", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "0 failed, exit 0 (count not measured at planning)"},
+        {"description": "Deploy hooks", "command": "make -C /Users/roberthyatt/Code/ironclaude deploy-hooks", "expected": "output includes 'Deployed to plugin cache /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks' and 'Deployed 31 hooks to /Users/roberthyatt/.claude/ironclaude-hooks' (31 *.sh at planning; no new hook script)"},
+        {"description": "Check Claude plugin hooks.json; on no output skip the copy and record 'hooks.json unchanged — copy skipped'; on a difference record it, run cp /Users/roberthyatt/Code/ironclaude/worker/hooks/hooks.json /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks/hooks.json and re-diff", "command": "diff /Users/roberthyatt/Code/ironclaude/worker/hooks/hooks.json /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks/hooks.json", "expected": "no output, exit 0 (measured at planning; hooks.json not in any allowed_files)"},
+        {"description": "Refresh Codex plugin cache", "command": "codex plugin add ironclaude@ironclaude --json", "expected": "exit 0; JSON installedPath /Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/1.1.15+codex.20260930172837"},
+        {"description": "Verify Codex cache matches worker/", "command": "diff -rq /Users/roberthyatt/Code/ironclaude/worker /Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/1.1.15+codex.20260930172837 -x node_modules -x __pycache__ -x .DS_Store", "expected": "no output, exit 0"},
+        {"description": "Write docs/plans/2026-10-03-drift-check-review-fixes-deploy-log.md per human plan Task 3 Step 7 (quoted outputs of Steps 1-6; hooks.json unchanged; R6 commit/re-trust note)."},
+        {"description": "Stage deploy log", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-03-drift-check-review-fixes-deploy-log.md", "expected": "no output, exit 0"}
+      ]
+    }
+  ]
+}

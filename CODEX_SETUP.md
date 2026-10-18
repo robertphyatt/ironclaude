@@ -38,20 +38,24 @@ symlink still points at the removed `Resources/codex`, re-point it to `codex-cli
 
 ## Model tiers
 
-IronClaude maps its tier names to codex models
+IronClaude maps its tier names to Codex model families
 (`config/ironclaude.json` → `providers.clients.codex.models`):
 
-| Tier   | Codex model     |
-|--------|-----------------|
-| haiku  | gpt-5.6-luna    |
-| sonnet | gpt-5.6-terra   |
-| opus   | gpt-5.6-sol     |
-| fable  | gpt-6-astra     |
+| Tier   | Codex default |
+|--------|---------------|
+| haiku  | `luna`        |
+| sonnet | `terra`       |
+| opus   | `sol`         |
+| fable  | `astra`       |
 
-These are the defaults. Any `gpt-<version>-<tier>` model whose tier word matches is accepted
-(haiku→luna, sonnet→terra, opus→sol, fable→astra), for example `gpt-6-sol` for opus.
+IronClaude pins no Codex model. Like Claude's `haiku`/`sonnet`/`opus`/`fable` aliases, a family word
+means the newest `gpt-<version>-<word>` model that Codex lists in `$CODEX_HOME/models_cache.json`
+(default `~/.codex`) on the machine where Codex runs. A remote worker resolves from its own box's
+cache. An explicit `gpt-<version>-<word>` slug whose word matches the tier (for example `gpt-6-sol`
+for opus) is used as-is. If no model of the family is installed, Codex is unavailable for that call:
+routing falls to the next client, and hooks and graders fail open.
 
-`fable` / `gpt-6-astra` is the hardest Codex tier, not the default. Select it only
+`fable` / `astra` is the hardest Codex tier, not the default. Select it only
 when lower tiers cannot reliably handle the assigned work.
 
 ## Enable Codex for workers / grader
@@ -74,6 +78,55 @@ In `config/ironclaude.json` (copy it from `config/ironclaude.json.example` if yo
 IronClaude's provider router then routes that role to codex, falling back to Claude if a codex
 capability is unavailable.
 
+## Automatic capacity handoff for managed workers
+
+This handoff applies only to a managed worker when its own native session records a confirmed
+usage limit. It does not react to a percentage, text pasted into a prompt, generic authentication,
+network, transport, protocol, context, or model errors. A Claude source must record the supported
+`seven_day` 429 rejection with fallback and overage rejected. A Codex source must record either an
+applicable known `rate_limit_reached_type` or the native `usage_limit_exceeded` error.
+
+When that evidence is current and the other configured client is available on the same host,
+IronClaude can replace the source with a fresh native session from the other provider. A worker
+whose semantic tier is recorded with a legacy `claude-*` label keeps that tier; its concrete client,
+model, and native UUID change. The new worker receives the same workspace GUID, worktree path,
+repository and branch identity, HEAD, dirty index and files, untracked files, and shared-resource
+links. It also receives the objective and unfinished PM plan. Completed review tasks stay complete;
+in-progress and submitted tasks reopen for work and review. The PM transfer preserves earlier
+review attribution and transfers the current design registration with compare-and-swap checks.
+
+Before the successor can edit, IronClaude must prove that the source writer and relevant descendants
+have stopped. A fresh target starts read-only, establishes and saves its own native UUID, then gains
+editing authority only after the held assignment transfers. This sequence remains recoverable if the
+source dies during it. It does not copy human commit or push intent, clear a safety block, commit,
+push, reset, clean, stash, integrate, or remove the worktree.
+
+Handoffs use a private workspace protocol that must be installed on the worker host. Its controller
+is not a public MCP takeover or grant command, and this guide does not provide manual CLI or database
+edits for it. New local Codex workers run without a daemon. For a legacy shared Codex source, a tmux
+pane alone cannot prove that the source stopped; automatic remote-process proof is unsupported. In
+either case, missing proof leaves the assignment held with an explicit blocker. IronClaude never
+kills the main app or a shared daemon to force a handoff.
+
+Inspect `get_worker_status` for the worker's status, client, model, and native UUID. Its
+`handoff_pending` status identifies a claimed transfer; the bounded handoff warning supplies the
+blocker. Unknown quota evidence leaves the job unfinished without claiming a transfer. After a
+confirmed quota, both providers unavailable or unknown process, transport, or protocol outcomes leave
+the claimed assignment held. IronClaude emits one bounded warning and does not bounce between
+providers. Authentication or clock events do not clear a usage quarantine. The private controller can
+retry only a known pre-effect hold after fresh capacity and configuration evidence; it never blindly
+replays an unknown launch or dispatch outcome.
+
+Ordinary `kill_worker` and `spawn_worker` still finalize a worker and create a new workspace; they
+are not provider transfer operations. Production client selection and global role preference remain
+unchanged. The handoff uses per-call source exclusion and a sticky usage quarantine for the exhausted
+provider.
+
+This capability requires a matching private workspace protocol on the worker host, a Commander
+deployment and restart, and live verification. Source, tests, and these documents are not deployment
+or live-operation proof. Until those conditions are met, operators must treat automatic handoff as
+unsupported.
+
 ## Run the Codex Brain
 
 The Brain is selected by an environment variable (not the role config):
@@ -82,12 +135,11 @@ The Brain is selected by an environment variable (not the role config):
 BRAIN_CLIENT=codex
 ```
 
-**Model:** the codex Brain runs the codex model mapped from your `brain_model` tier —
-`sonnet → gpt-5.6-terra`, `opus → gpt-5.6-sol`, `haiku → gpt-5.6-luna`, and
-`fable → gpt-6-astra`. Note that
-`config/ironclaude.json.example` ships `brain_model: "opus"` (→ `gpt-5.6-sol`). To run the
-recommended **gpt-5.6-terra**, set `brain_model: "sonnet"` in your config, or override with
-`BRAIN_MODEL=gpt-5.6-terra` (a literal codex model passes through unchanged).
+**Model:** the codex Brain runs the newest installed model of the family mapped from your
+`brain_model` tier (`sonnet` → Terra, `opus` → Sol, `haiku` → Luna, `fable` → Astra). The Commander
+default is `brain_model: "sonnet"`. Override with `BRAIN_MODEL=<gpt-version-word>`; an explicit slug
+is used as-is. If no model of the family is installed, the Brain does not start and the daemon log
+names the family and the cache path.
 
 **Security posture:** the codex Brain's `codex app-server` is launched read-only
 (`sandbox_mode="read-only"`) with `approval_policy="on-request"`, and every command-execution

@@ -2,11 +2,14 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOOK="$SCRIPT_DIR/codex-brain-gated-actions.sh"
+HOOK="$SCRIPT_DIR/brain-gated-actions.sh"
 HOOKS_JSON="$SCRIPT_DIR/hooks.json"
 TOKEN="codex-brain-gate-test-$$"
-STATE_DIR="/tmp/ic/codex-brain-gate/$TOKEN"
 TMP_DIR=$(mktemp -d /tmp/ironclaude-codex-brain-gate-test.XXXXXX)
+# Gate root per design 2026-10-17 v120-completeness R3: a real 0700 directory owned by this user.
+GATE_ROOT="$TMP_DIR/gate-root"
+mkdir -m 700 "$GATE_ROOT"
+STATE_DIR="$GATE_ROOT/$TOKEN"
 PASS=0
 FAIL=0
 
@@ -38,6 +41,7 @@ run_case() {
     '{session_id:"codex-brain-gate-test",tool_name:$tool_name,tool_input:$tool_input,cwd:$cwd}')
   IC_ROLE="$role" \
   IRONCLAUDE_CLIENT="$client" \
+  IRONCLAUDE_BRAIN_GATE_ROOT="$GATE_ROOT" \
   IRONCLAUDE_BRAIN_GATE_SESSION="$token" \
     bash "$HOOK" >"$output_file" 2>"$error_file" <<<"$payload"
   return $?
@@ -71,8 +75,9 @@ arm_action() {
 rm -rf "$STATE_DIR"
 mkdir -p "$TMP_DIR/wiki"
 
-assert_rc "Claude client inactive" 0 run_case \
-  "mcp__plugin_ironclaude_orchestrator__spawn_worker" '{}' "claude" "brain"
+assert_rc "Claude Brain gated before startup" 2 run_case \
+  "mcp__orchestrator__spawn_worker" '{}' "claude" "brain"
+rm -rf "$STATE_DIR"
 assert_rc "worker role inactive" 0 run_case \
   "mcp__plugin_ironclaude_orchestrator__spawn_worker" '{}' "codex" "worker"
 assert_rc "unrelated tool inactive" 0 run_case \
@@ -126,6 +131,17 @@ for action in "${GATED_ACTIONS[@]}"; do
   arm_action
   assert_rc "$action gated and allowed" 0 run_case "$action" '{}'
 done
+
+rm -rf "$STATE_DIR"
+assert_rc "AskUserQuestion needs startup" 2 run_case "AskUserQuestion" '{}' "claude" "brain"
+run_case "mcp__orchestrator__get_operator_messages" '{"hours_back":48}' "claude" "brain"
+run_case "mcp__orchestrator__update_ledger" '{}' "claude" "brain"
+run_case "mcp__episodic-memory__search" '{"query":"parity"}' "claude" "brain"
+run_case "mcp__orchestrator__wiki_query" '{"keywords":"parity"}' "claude" "brain"
+assert_rc "Claude Brain AskUserQuestion allowed after gates" 0 run_case "AskUserQuestion" '{}' "claude" "brain"
+assert_rc "Claude Brain AskUserQuestion consumes arms" 2 run_case "AskUserQuestion" '{}' "claude" "brain"
+rm -rf "$STATE_DIR"
+arm_startup
 
 LOCAL_ORCHESTRATOR_PREFIX="mcp__orchestrator__"
 
@@ -292,9 +308,77 @@ else
   echo "FAIL: concurrent one-action consumption expected rc set {0,2}, got {$FIRST_RC,$SECOND_RC}" >&2
 fi
 
+# ── Brain gate root (design 2026-10-17 v120-completeness R3) ──
+# run_root ROOT TOOL [HOME]: one hook call with an explicit IRONCLAUDE_BRAIN_GATE_ROOT; ROOT "-" leaves it unset.
+run_root() {
+  local root="$1" tool_name="$2" home="${3:-$HOME}" payload
+  payload=$(jq -cn --arg tool_name "$tool_name" --arg cwd "$TMP_DIR" \
+    '{session_id:"codex-brain-gate-test",tool_name:$tool_name,tool_input:{"hours_back":48},cwd:$cwd}')
+  if [ "$root" = "-" ]; then
+    env -u IRONCLAUDE_BRAIN_GATE_ROOT HOME="$home" IC_ROLE=brain IRONCLAUDE_CLIENT=codex \
+      IRONCLAUDE_BRAIN_GATE_SESSION="$TOKEN" bash "$HOOK" >"$TMP_DIR/output" 2>"$TMP_DIR/error" <<<"$payload"
+  else
+    HOME="$home" IC_ROLE=brain IRONCLAUDE_CLIENT=codex IRONCLAUDE_BRAIN_GATE_ROOT="$root" \
+      IRONCLAUDE_BRAIN_GATE_SESSION="$TOKEN" bash "$HOOK" >"$TMP_DIR/output" 2>"$TMP_DIR/error" <<<"$payload"
+  fi
+}
+# assert_root_refused NAME ROOT TEXT: the gate blocks (rc 2) and names why.
+assert_root_refused() {
+  local name="$1" root="$2" text="$3" rc
+  run_root "$root" "mcp__plugin_ironclaude_orchestrator__get_operator_messages"; rc=$?
+  if [ "$rc" -eq 2 ] && grep -Fq "$text" "$TMP_DIR/error"; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL: $name rc=$rc" >&2
+    cat "$TMP_DIR/error" >&2
+  fi
+}
+
+rm -rf "$STATE_DIR"
+run_case "mcp__plugin_ironclaude_orchestrator__get_operator_messages" '{"hours_back":48}'
+if [ -f "$STATE_DIR/lookback-slack" ]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: gate state lands under IRONCLAUDE_BRAIN_GATE_ROOT" >&2
+fi
+
+DEFAULT_HOME="$TMP_DIR/home"
+mkdir -p "$DEFAULT_HOME/.ironclaude/state"
+mkdir -m 700 "$DEFAULT_HOME/.ironclaude/state/brain-gate"
+run_root - "mcp__plugin_ironclaude_orchestrator__get_operator_messages" "$DEFAULT_HOME"
+if [ -f "$DEFAULT_HOME/.ironclaude/state/brain-gate/$TOKEN/lookback-slack" ]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: default gate root is \$HOME/.ironclaude/state/brain-gate" >&2
+fi
+
+mkdir -m 700 "$TMP_DIR/real-root"
+ln -s "$TMP_DIR/real-root" "$TMP_DIR/link-root"
+mkdir "$TMP_DIR/group-root"
+chmod 770 "$TMP_DIR/group-root"
+mkdir "$TMP_DIR/other-root"
+chmod 701 "$TMP_DIR/other-root"
+# The physical /tmp (macOS /private/tmp) is root-owned; the owner check refuses it before the mode check.
+FOREIGN_ROOT=$(cd /tmp && pwd -P)
+assert_root_refused "symlinked root blocks" "$TMP_DIR/link-root" "is a symlink"
+assert_root_refused "missing root blocks" "$TMP_DIR/missing-root" "is not a directory"
+assert_root_refused "foreign-owned root blocks" "$FOREIGN_ROOT" "is not owned by the current user"
+assert_root_refused "group-accessible root blocks" "$TMP_DIR/group-root" "has group or other permission bits"
+assert_root_refused "other-accessible root blocks" "$TMP_DIR/other-root" "has group or other permission bits"
+if [ ! -e "$TMP_DIR/real-root/$TOKEN" ] && [ ! -e "$TMP_DIR/group-root/$TOKEN" ] &&
+   [ ! -e "$TMP_DIR/other-root/$TOKEN" ] && [ ! -e "$FOREIGN_ROOT/$TOKEN" ]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: refused roots receive no gate state" >&2
+fi
+
 EXPECTED_MATCHER='mcp__(plugin_ironclaude_)?episodic[-_]memory__.*|mcp__plugin_ironclaude_orchestrator__(wiki_query|get_operator_messages|update_ledger|spawn_worker|spawn_workers|approve_plan|reject_plan|send_to_worker|kill_worker|game_(launch|screenshot|click|type|key|kill))|mcp__orchestrator__(wiki_query|get_operator_messages|update_ledger|spawn_worker|spawn_workers|approve_plan|reject_plan|send_to_worker|kill_worker|game_(launch|screenshot|click|type|key|kill))|mcp__plugin_ironclaude_ollama__(pull_model|remove_model|create_model)|mcp__ollama__(pull_model|remove_model|create_model)'
 ACTUAL_MATCHER=$(jq -r \
-  '.hooks.PreToolUse[] | select(.hooks[].command | contains("codex-brain-gated-actions.sh")) | .matcher' \
+  '.hooks.PreToolUse[] | select(.hooks[].command | contains("codex-brain-hooks.sh brain-gated-actions.sh")) | .matcher' \
   "$HOOKS_JSON")
 if [ "$ACTUAL_MATCHER" = "$EXPECTED_MATCHER" ]; then
   PASS=$((PASS + 1))
@@ -330,7 +414,7 @@ fi
 # fails open and a gated action exits 0 — this is the RED case.
 NOLOG_DIR="$TMP_DIR/nolog"
 mkdir -p "$NOLOG_DIR"
-cp "$HOOK" "$NOLOG_DIR/codex-brain-gated-actions.sh"
+cp "$HOOK" "$NOLOG_DIR/brain-gated-actions.sh"
 run_nolog() {
   local tool_name="$1"
   local client="${2:-codex}"
@@ -342,20 +426,24 @@ run_nolog() {
     '{session_id:"codex-brain-gate-test",tool_name:$tool_name,tool_input:{},cwd:$cwd}')
   IC_ROLE="$role" \
   IRONCLAUDE_CLIENT="$client" \
+  IRONCLAUDE_BRAIN_GATE_ROOT="$GATE_ROOT" \
   IRONCLAUDE_BRAIN_GATE_SESSION="$TOKEN" \
-    bash "$NOLOG_DIR/codex-brain-gated-actions.sh" >"$TMP_DIR/output" 2>"$TMP_DIR/error" <<<"$payload"
+    bash "$NOLOG_DIR/brain-gated-actions.sh" >"$TMP_DIR/output" 2>"$TMP_DIR/error" <<<"$payload"
   return $?
 }
 assert_rc "no-logger: gated action blocked (codex brain)" 2 run_nolog \
   "mcp__plugin_ironclaude_orchestrator__spawn_worker"
 assert_rc "no-logger: arm tool allowed (codex brain)" 0 run_nolog \
   "mcp__plugin_ironclaude_episodic-memory__search"
-assert_rc "no-logger: gated action allowed (non-codex-brain)" 0 run_nolog \
-  "mcp__plugin_ironclaude_orchestrator__spawn_worker" "claude" "brain"
+assert_rc "no-logger: gated action blocked (claude brain)" 2 run_nolog \
+  "mcp__orchestrator__spawn_worker" "claude" "brain"
+assert_rc "no-logger: AskUserQuestion blocked (brain)" 2 run_nolog "AskUserQuestion"
+assert_rc "no-logger: gated action allowed (worker)" 0 run_nolog \
+  "mcp__plugin_ironclaude_orchestrator__spawn_worker" "codex" "worker"
 
 if [ "$FAIL" -ne 0 ]; then
-  echo "$FAIL CODEX BRAIN GATE TESTS FAILED ($PASS passed)" >&2
+  echo "$FAIL BRAIN GATE TESTS FAILED ($PASS passed)" >&2
   exit 1
 fi
 
-echo "ALL CODEX BRAIN GATE TESTS PASSED"
+echo "ALL BRAIN GATE TESTS PASSED"

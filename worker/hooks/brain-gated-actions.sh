@@ -1,5 +1,7 @@
 #!/bin/bash
-# Codex Brain parity for BrainClient._tool_guard_logic's stateful MCP action gate.
+# Brain parity gate (Claude and Codex Brains) for the intended BrainClient._tool_guard_logic rules: lookback, memory + wiki before each action, ledger staleness, game-tool ban.
+# A Brain hook: exempt from the Codex-Brain worker stand-down in run_hook.
+export IC_BRAIN_HOOK=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if ! source "$SCRIPT_DIR/hook-logger.sh" 2>/dev/null; then
@@ -7,12 +9,13 @@ if ! source "$SCRIPT_DIR/hook-logger.sh" 2>/dev/null; then
   # Mirror obs-3's selective fail-closed for the three Claude gates: still BLOCK the
   # Codex-Brain gated set (the action + game cases, both naming variants) when this is a
   # codex+brain session; ALLOW arm tools, reads, and every non-codex-brain session.
-  if [ "${IC_ROLE:-}" != "brain" ] || [ "${IRONCLAUDE_CLIENT:-}" != "codex" ]; then
+  if [ "${IC_ROLE:-}" != "brain" ]; then
     exit 0
   fi
   _IN=$(cat)
   _TN=$(echo "$_IN" | jq -r '.tool_name // empty' 2>/dev/null || true)
   case "$_TN" in
+    AskUserQuestion|\
     mcp__plugin_ironclaude_orchestrator__spawn_worker|\
     mcp__plugin_ironclaude_orchestrator__spawn_workers|\
     mcp__plugin_ironclaude_orchestrator__approve_plan|\
@@ -43,7 +46,7 @@ if ! source "$SCRIPT_DIR/hook-logger.sh" 2>/dev/null; then
     mcp__orchestrator__game_type|\
     mcp__orchestrator__game_key|\
     mcp__orchestrator__game_kill)
-      echo "✗ [codex-brain-gated-actions]: Blocked - IronClaude hook-logger.sh missing; enforcement cannot run. Run 'make deploy-hooks', then retry." >&2
+      echo "✗ [brain-gated-actions]: Blocked - IronClaude hook-logger.sh missing; enforcement cannot run. Run 'make deploy-hooks', then retry." >&2
       exit 2
       ;;
     *)
@@ -51,7 +54,7 @@ if ! source "$SCRIPT_DIR/hook-logger.sh" 2>/dev/null; then
       ;;
   esac
 fi
-run_hook "codex-brain-gated-actions"
+run_hook "brain-gated-actions"
 
 INPUT=$(cat)
 init_session_id
@@ -60,7 +63,7 @@ TOOL_NAME=$(jq -r '.tool_name // empty' <<<"$INPUT")
 TOOL_INPUT=$(jq -c '.tool_input // {}' <<<"$INPUT")
 EVENT_CWD=$(jq -r '.cwd // empty' <<<"$INPUT")
 
-if [ "${IC_ROLE:-}" != "brain" ] || [ "${IRONCLAUDE_CLIENT:-}" != "codex" ]; then
+if [ "${IC_ROLE:-}" != "brain" ]; then
   exit 0
 fi
 
@@ -94,9 +97,10 @@ case "$TOOL_NAME" in
   mcp__orchestrator__game_type|\
   mcp__orchestrator__game_key|\
   mcp__orchestrator__game_kill)
-    block_pretooluse "codex-brain-gated-actions" \
+    block_pretooluse "brain-gated-actions" \
       "Game tools cannot be used directly by the brain. Use spawn_worker for game operations."
     ;;
+  AskUserQuestion|\
   mcp__plugin_ironclaude_orchestrator__spawn_worker|\
   mcp__plugin_ironclaude_orchestrator__spawn_workers|\
   mcp__plugin_ironclaude_orchestrator__approve_plan|\
@@ -125,15 +129,36 @@ esac
 GATE_SESSION="${IRONCLAUDE_BRAIN_GATE_SESSION:-}"
 case "$GATE_SESSION" in
   ""|*[!A-Za-z0-9._-]*)
-    block_pretooluse "codex-brain-gated-actions" \
+    block_pretooluse "brain-gated-actions" \
       "Codex Brain gate session identity is missing or invalid."
     ;;
 esac
 
-STATE_DIR="/tmp/ic/codex-brain-gate/$GATE_SESSION"
+# Gate root (design 2026-10-17 v120-completeness R3): the Commander creates it 0700 and passes it as
+# IRONCLAUDE_BRAIN_GATE_ROOT. Fail closed unless it is a real directory owned by this user with no
+# group or other permission bits. Keep gate_root_problem identical to brain-hooks-canary.sh (a
+# Commander test compares them).
+gate_root_problem() {
+  local root="$1" perms
+  if [ -L "$root" ]; then echo "is a symlink"; return 0; fi
+  if [ ! -d "$root" ]; then echo "is not a directory"; return 0; fi
+  if [ ! -O "$root" ]; then echo "is not owned by the current user"; return 0; fi
+  perms=$(ls -ld "$root") || { echo "has unreadable permissions"; return 0; }
+  if [ "${perms:4:6}" != "------" ]; then echo "has group or other permission bits"; fi
+  return 0
+}
+GATE_ROOT="${IRONCLAUDE_BRAIN_GATE_ROOT:-$HOME/.ironclaude/state/brain-gate}"
+GATE_ROOT="${GATE_ROOT%/}"
+ROOT_PROBLEM=$(gate_root_problem "$GATE_ROOT")
+if [ -n "$ROOT_PROBLEM" ]; then
+  block_pretooluse "brain-gated-actions" \
+    "Brain gate root $GATE_ROOT $ROOT_PROBLEM; the gate fails closed."
+fi
+
+STATE_DIR="$GATE_ROOT/$GATE_SESSION"
 LOCK_DIR="$STATE_DIR/.lock"
 if ! mkdir -p "$STATE_DIR"; then
-  block_pretooluse "codex-brain-gated-actions" \
+  block_pretooluse "brain-gated-actions" \
     "Codex Brain gate state directory is unavailable."
 fi
 
@@ -157,7 +182,7 @@ acquire_gate_lock() {
 }
 
 if ! acquire_gate_lock; then
-  block_pretooluse "codex-brain-gated-actions" \
+  block_pretooluse "brain-gated-actions" \
     "Codex Brain gate state is busy; action blocked without consuming prerequisites."
 fi
 
@@ -194,7 +219,7 @@ MISSING=()
 [ -f "$STATE_DIR/lookback-ledger" ] || MISSING+=("ledger update")
 if [ "${#MISSING[@]}" -gt 0 ]; then
   MISSING_TEXT=$(IFS=", "; echo "${MISSING[*]}")
-  block_pretooluse "codex-brain-gated-actions" \
+  block_pretooluse "brain-gated-actions" \
     "Required before acting: $MISSING_TEXT. Complete startup lookback first."
 fi
 
@@ -203,7 +228,7 @@ MISSING=()
 [ -f "$STATE_DIR/wiki-queried" ] || MISSING+=("wiki query")
 if [ "${#MISSING[@]}" -gt 0 ]; then
   MISSING_TEXT=$(IFS=", "; echo "${MISSING[*]}")
-  block_pretooluse "codex-brain-gated-actions" \
+  block_pretooluse "brain-gated-actions" \
     "Required before acting: $MISSING_TEXT. What would the Operator do?"
 fi
 
@@ -279,7 +304,7 @@ PY
 
 STALE_AGE=$(ledger_stale_age)
 if [ -n "$STALE_AGE" ]; then
-  block_pretooluse "codex-brain-gated-actions" \
+  block_pretooluse "brain-gated-actions" \
     "Ledger stale (${STALE_AGE}m without update). Call update_ledger to sync current state."
 fi
 

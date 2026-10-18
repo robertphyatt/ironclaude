@@ -1,0 +1,57 @@
+{
+  "name": "Commit Scoping for Absolute allowed_files (v1.1.16 L2c)",
+  "goal": "Make buildScopedStagedTree resolve absolute allowed_files entries (in-repo -> scoped by repo-relative path; outside or equal to the root -> skipped; relative entries unchanged) instead of refusing the whole commit; then rebuild, verify and redeploy.",
+  "requirements_file": "docs/plans/2026-10-03-commit-scoping-absolute-requirements.md",
+  "design_file": "docs/plans/2026-10-03-commit-scoping-absolute-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Absolute-entry resolution in scoped-tree.ts (R1, R2)",
+      "description": "scoped-tree.ts full replacement per human plan Task 1 Step 5: import realpathSync; new repoRelativeFromAbsolute(realRoot, entry) = path.resolve(entry), remainder=[basename], walk ancestor=dirname upward on ENOENT/ENOTDIR (other errors or reaching '/' -> null), resolved = join(realpathSync.native(ancestor), ...remainder); strictly inside realRoot + path.sep -> POSIX path.relative, else null (final component never resolved: git tracks symlinks as entries). Loop: for entry of allowedFiles; absolute -> realRoot ??= realpathSync.native(repoPath); null -> continue (skip); else rel = mapped; existing canonical check on rel (error text drops 'no absolute path'); rest unchanged. All three callers (git-authority.ts:354, :420; integration.ts:443) pass repository.primaryCheckoutPath, the realpath'd primary toplevel (git-authority.ts:347, :583; git.ts:131, :164-167). Tests per human plan Task 1 Steps 1-3 verbatim: fs import adds existsSync, realpathSync, statSync, symlinkSync; makeTempDir helper after makeTempRepo; test at :136-148 replaced by modified test (./a.ts, dir/, a/../a.ts, a//a.ts, '' throw /canonical/; '/abs/a.ts' returns parent tree) plus 5 new tests (in-repo absolute incl. staged deletion under removed dir; out-of-repo + root + sibling-prefix skipped with relative sibling scoped; symlinked root spelling; tracked symlink kept by own path; case-variant root spelling, skipped via ctx skip() on a case-sensitive volume detected by ino/dev identity — if GREEN fails on it, stop and report). '../a.ts' deliberately not asserted (normalize keeps it; R1 keeps relative behavior). Rebuild tracked bundles dist/cli.js, dist/index.js, dist/hook-intent.js (tsc + esbuild) and stage by explicit path.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/scoped-tree.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/scoped-tree.test.ts",
+        "worker/mcp-servers/workspace-manager/dist/cli.js",
+        "worker/mcp-servers/workspace-manager/dist/index.js",
+        "worker/mcp-servers/workspace-manager/dist/hook-intent.js"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: scoped-tree.test.ts line 2 fs import -> add existsSync, realpathSync, statSync, symlinkSync (human plan Task 1 Step 1, exact old/new quoted)."},
+        {"description": "RED: insert makeTempDir helper after makeTempRepo (human plan Task 1 Step 2 verbatim)."},
+        {"description": "RED: replace test at lines 136-148 with the modified test plus five new tests (human plan Task 1 Step 3 verbatim)."},
+        {"description": "Run test file, see it fail", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/scoped-tree.test.ts", "expected": "predicted (case-insensitive APFS): exit 1, 6 failed | 6 passed (12) — modified test (on /abs/a.ts) and the 5 new tests fail because line 33 throws /canonical/ on any absolute entry; 6 unchanged tests pass (case-sensitive volume: 5 failed | 6 passed | 1 skipped (12))"},
+        {"description": "Replace worker/mcp-servers/workspace-manager/src/scoped-tree.ts with human plan Task 1 Step 5 code verbatim."},
+        {"description": "Run test file again", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/scoped-tree.test.ts", "expected": "predicted: exit 0, 12 passed (12) (case-sensitive volume: 11 passed | 1 skipped (12))"},
+        {"description": "Confirm bundles do not yet contain the helper", "command": "grep -c repoRelativeFromAbsolute /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/index.js /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/hook-intent.js", "expected": "predicted: each file reports :0; exit 1"},
+        {"description": "Rebuild (tsc + esbuild bundles)", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npm run build", "expected": "exit 0; tsc reports no type errors; esbuild writes dist/index.js, dist/cli.js, dist/hook-intent.js"},
+        {"description": "Confirm rebuilt bundles contain the helper", "command": "grep -c repoRelativeFromAbsolute /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/index.js /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/hook-intent.js", "expected": "predicted: each file reports a count >= 1; exit 0"},
+        {"description": "Full workspace-manager suite", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run", "expected": "predicted: exit 0, 0 failed (total not measured; a known onTaskUpdate RPC-timeout log line from integration-core.test.ts is benign — judge by failed count)"},
+        {"description": "Stage source, test and tracked bundles by explicit path", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f worker/mcp-servers/workspace-manager/src/scoped-tree.ts worker/mcp-servers/workspace-manager/src/__tests__/scoped-tree.test.ts worker/mcp-servers/workspace-manager/dist/cli.js worker/mcp-servers/workspace-manager/dist/index.js worker/mcp-servers/workspace-manager/dist/hook-intent.js", "expected": "no output, exit 0"},
+        {"description": "Confirm exactly five workspace-manager paths staged", "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached --name-only -- worker/mcp-servers/workspace-manager", "expected": "exactly: worker/mcp-servers/workspace-manager/dist/cli.js, worker/mcp-servers/workspace-manager/dist/hook-intent.js, worker/mcp-servers/workspace-manager/dist/index.js, worker/mcp-servers/workspace-manager/src/__tests__/scoped-tree.test.ts, worker/mcp-servers/workspace-manager/src/scoped-tree.ts; no other dist/ file"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Verify, redeploy and stage the loop docs (R3, R4)",
+      "description": "Run the Commander suite, refresh the Codex cache, verify it matches worker/, record read-only evidence that the Claude plugin cache (~/.claude/plugins/cache/ironclaude/ironclaude/1.1.15) holds a stale dist/index.js with no runtime effect (Claude runs IronClaude MCP servers from the repo: the state-manager wrapper log shows 873 repo launches and 0 from the 1.1.15 cache; nothing copied), write the deploy log (quoted outputs; orchestrator action: Commander restart, not a plan step; stale-cache note; R4 note: final Fable end review CLEAN before operator /commit, no agent commit, no push; this loop's allowed_files are all relative so its /commit does not exercise absolute-entry handling), and git add -f the requirements, design, plan .md, plan .plan.json and deploy log. Requirements, design and plan docs are in allowed_files because the unassigned /commit lane scopes to the union of session allowed_files (plan-scope.ts:9-31). No tests required: runs suites and deploys; codex plugin add writes a generated runtime copy outside the repo.",
+      "allowed_files": [
+        "docs/plans/2026-10-03-commit-scoping-absolute-deploy-log.md",
+        "docs/plans/2026-10-03-commit-scoping-absolute-requirements.md",
+        "docs/plans/2026-10-03-commit-scoping-absolute-design.md",
+        "docs/plans/2026-10-03-commit-scoping-absolute.md",
+        "docs/plans/2026-10-03-commit-scoping-absolute.plan.json"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Run Commander suite (Bash timeout 600000)", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "3460 passed, exit 0"},
+        {"description": "Refresh Codex plugin cache", "command": "codex plugin add ironclaude@ironclaude --json", "expected": "exit 0; JSON installedPath /Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/1.1.15+codex.20260930172837"},
+        {"description": "Verify Codex cache matches worker/", "command": "diff -rq /Users/roberthyatt/Code/ironclaude/worker /Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/1.1.15+codex.20260930172837 -x node_modules -x __pycache__ -x .DS_Store", "expected": "predicted: no output, exit 0"},
+        {"description": "Claude plugin cache evidence (read-only; copy nothing)", "command": "diff -q /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/index.js /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/mcp-servers/workspace-manager/dist/index.js", "expected": "predicted: one 'Files ... differ' line, exit 1; record as a stale copy with no runtime effect"},
+        {"description": "Write docs/plans/2026-10-03-commit-scoping-absolute-deploy-log.md per human plan Task 2 Step 5 (quoted outputs of Task 1 Steps 6, 9, 10 and Task 2 Steps 1-4; orchestrator Commander restart note; stale Claude-cache note; R4 note)."},
+        {"description": "Stage loop docs", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-03-commit-scoping-absolute-requirements.md docs/plans/2026-10-03-commit-scoping-absolute-design.md docs/plans/2026-10-03-commit-scoping-absolute-deploy-log.md docs/plans/2026-10-03-commit-scoping-absolute.md docs/plans/2026-10-03-commit-scoping-absolute.plan.json", "expected": "no output, exit 0"},
+        {"description": "Confirm loop docs staged", "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached --name-only -- docs/plans", "expected": "includes docs/plans/2026-10-03-commit-scoping-absolute-deploy-log.md, docs/plans/2026-10-03-commit-scoping-absolute-design.md, docs/plans/2026-10-03-commit-scoping-absolute-requirements.md, docs/plans/2026-10-03-commit-scoping-absolute.md, docs/plans/2026-10-03-commit-scoping-absolute.plan.json (plus any docs/plans paths the orchestrator staged)"}
+      ]
+    }
+  ]
+}

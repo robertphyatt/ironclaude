@@ -1,0 +1,106 @@
+{
+  "name": "Codex hooks-trust confirm (R7b)",
+  "goal": "Brain trust warm-up and worker spawn confirm Codex's 'Hooks need review' prompt (2 + Enter), so the Codex Brain starts with restriction hooks trusted and the parity live acceptance passes.",
+  "requirements_file": "docs/plans/2026-10-10-codex-brain-parity-design.md",
+  "design_file": "docs/plans/2026-10-10-codex-brain-parity-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Confirm the hooks-review selection in both callers (R7b)",
+      "description": "TDD. main.py _answer_codex_hooks_review: send_raw_keys(session, ['2','Enter']); prompt still on screen after clear_seconds -> warn + return False; cleared -> True. _warm_up_codex_hook_trust gains clear_seconds=10.0, passed to helper. orchestrator_mcp.py:2378-2380 send ['2','Enter']; docstring :2334-2335 adds 'and confirms it with Enter'. Tests: test_codex_hook_trust_warmup.py line 54 -> ['2','Enter'], never-clears test asserts answered is False, append test_warmup_reports_unanswered_when_prompt_stays; test_worker_adapter.py:158,:284 -> [['2','Enter']]. Exact code: human plan Task 1 Steps 1 and 3.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_codex_hook_trust_warmup.py",
+        "commander/tests/test_worker_adapter.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: test edits per human plan Task 1 Step 1."},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_codex_hook_trust_warmup.py tests/test_worker_adapter.py -q", "expected": "Fail: test_prompt_after_banner_is_answered_once, test_prompt_that_never_clears_is_pressed_only_once, test_warmup_reports_unanswered_when_prompt_stays, test_wait_for_ready_codex_trust_hooks_and_marker, test_wait_for_ready_codex_folder_access_enables_hooks_answer; others pass; record summary."},
+        {"description": "GREEN: main.py + orchestrator_mcp.py per human plan Task 1 Step 3 (a)-(c)."},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_codex_hook_trust_warmup.py tests/test_worker_adapter.py tests/test_codex_brain_hooks_canary.py -q", "expected": "All pass; record summary."},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_codex_hook_trust_warmup.py commander/tests/test_worker_adapter.py", "expected": "No output."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Full suites over the whole change set (R11)",
+      "description": "No tests required: verification-only task that modifies no files. allowed_files lists the whole parity change set (parity plan Tasks 1-13, follow-up Tasks 1-2, this plan) so end-of-plan restage and /commit cover it.",
+      "allowed_files": [
+        "docs/plans/2026-10-10-codex-brain-parity-design.md",
+        "docs/plans/2026-10-10-codex-brain-parity.md",
+        "docs/plans/2026-10-10-codex-brain-parity.plan.json",
+        "docs/plans/2026-10-10-codex-brain-parity-probe-findings.md",
+        "docs/plans/2026-10-11-codex-brain-parity-followup.md",
+        "docs/plans/2026-10-11-codex-brain-parity-followup.plan.json",
+        "docs/plans/2026-10-11-codex-hooks-trust-confirm.md",
+        "docs/plans/2026-10-11-codex-hooks-trust-confirm.plan.json",
+        "commander/hooks/block-push.sh",
+        "commander/hooks/block-pin-enforcer.sh",
+        "commander/hooks/attention-sweep-enforcer.sh",
+        "commander/hooks/attention-sweep-arm.sh",
+        "commander/hooks/brain-orchestrator-guard.sh",
+        "commander/hooks/brain-task-gate.sh",
+        "commander/hooks/brain-hooks-canary.sh",
+        "commander/hooks/tests/test-block-push.sh",
+        "commander/hooks/tests/test-attention-sweep.sh",
+        "commander/hooks/tests/test-block-pin-enforcer.sh",
+        "commander/hooks/tests/test-brain-orchestrator-guard.sh",
+        "commander/hooks/tests/test-brain-task-gate.sh",
+        "commander/hooks/tests/test-brain-hooks-canary.sh",
+        "worker/hooks/codex-brain-hooks.sh",
+        "worker/hooks/hook-logger.sh",
+        "worker/hooks/get-back-to-work-claude.sh",
+        "worker/hooks/codex-brain-gated-actions.sh",
+        "worker/hooks/brain-gated-actions.sh",
+        "worker/hooks/test-codex-brain-gated-actions.sh",
+        "worker/hooks/test-brain-gated-actions.sh",
+        "worker/hooks/hooks.json",
+        "worker/hooks/tests/test-codex-brain-stand-down.sh",
+        "worker/hooks/tests/test-hooks-json-brain-entries.sh",
+        "worker/hooks/tests/test-execution-drift-check.sh",
+        "commander/src/ironclaude/codex_brain_client.py",
+        "commander/src/ironclaude/main.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/src/ironclaude/brain_client.py",
+        "commander/src/brain/brain_settings_hooks.json",
+        "commander/tests/test_codex_brain_client.py",
+        "commander/tests/test_daemon.py",
+        "commander/tests/test_brain_client_gate_session.py",
+        "commander/tests/test_brain_hook_provenance.py",
+        "commander/tests/test_codex_brain_hooks_canary.py",
+        "commander/tests/test_codex_hook_trust_warmup.py",
+        "commander/tests/test_worker_adapter.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Hook suites", "command": "make -C /Users/roberthyatt/Code/ironclaude test-hooks > /private/tmp/ironclaude-hooks-trust-confirm-hooks.log 2>&1; echo \"test-hooks exit=$?\"", "expected": "test-hooks exit=0 (on failure: grep -n FAIL on the log and stop)."},
+        {"description": "Full Commander suite (background, Bash timeout 1800000), then tail -n 5 /private/tmp/ironclaude-hooks-trust-confirm-full.log", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q > /private/tmp/ironclaude-hooks-trust-confirm-full.log 2>&1; echo \"pytest exit=$?\"", "expected": "Only failure allowed: tests/test_executing_plans_skill.py::test_execution_complete_restage_command_stages_from_non_root_cwd (L-T2); record summary."}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Commander restart and live acceptance (R11)",
+      "description": "No unit tests: live verification. Commands = follow-up plan (docs/plans/2026-10-11-codex-brain-parity-followup.md) Task 3 Steps 4-13 with deltas: Step 3 is operator launch via AskUserQuestion ('make -C ~/Code/ironclaude/commander run'; agent relaunch blocked by safety filter, never re-sent); -newer anchor /tmp/ic-logs/ic-codex-hook-trust.log; expect trust_prompt_answered=True and no 'still on screen after answering'. On canary failure: make -C /Users/roberthyatt/Code/ironclaude/commander stop immediately, record evidence, stop. Kill only by exact name/PID. Guard false positive: printf 'git p\\165sh ...', grep 'pu[s]h'.",
+      "allowed_files": [
+        "worker/.codex-plugin/plugin.json",
+        "docs/plans/2026-10-10-codex-brain-parity-live-verification.md",
+        "docs/plans/2026-10-10-codex-brain-parity-design.md",
+        "docs/plans/2026-10-11-codex-hooks-trust-confirm.md",
+        "docs/plans/2026-10-11-codex-hooks-trust-confirm.plan.json"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {"description": "Commander stopped", "command": "pgrep -fl \"ironclaude.main\"", "expected": "No output (exit 1)."},
+        {"description": "Record daemon log length L", "command": "wc -l /tmp/ic/daemon.log", "expected": "Record L."},
+        {"description": "Operator launch: AskUserQuestion asking operator to run 'make -C ~/Code/ironclaude/commander run' in their terminal and confirm."},
+        {"description": "Start-up result: tail -n +<L+1> /tmp/ic/daemon.log until Brain start or canary failure", "expected": "'Codex hook-trust warm-up finished ready=True trust_prompt_answered=True'; no 'still on screen after answering'; 'Brain SDK client started client=codex'; no 'hooks are not running'; no provenance failure. On canary failure: make stop, record evidence, stop."},
+        {"description": "Canary marker", "command": "find /tmp/ic/codex-brain-gate -name hooks-live -newer /tmp/ic-logs/ic-codex-hook-trust.log", "expected": "Exactly one path."},
+        {"description": "Trust entries present; then 'ls -la /Users/roberthyatt/.codex/config.toml' (today's mtime)", "command": "grep -n -e \"hooks.json:pre_tool_use:1[01]:0\" -e \"hooks.json:pre_tool_use:[7-9]:0\" -e \"hooks.json:post_tool_use:[78]:0\" -e \"hooks.json:user_prompt_submit:2:0\" /Users/roberthyatt/.codex/config.toml", "expected": "Lines for pre_tool_use:7-11, post_tool_use:7-8, user_prompt_submit:2; record."},
+        {"description": "Steps 7-12 of follow-up plan Task 3 (Claude Brain settings + .codex retired; Brain rollout BR found with -newer /tmp/ic-logs/ic-codex-hook-trust.log; professional-mode-guard count 0; orchestrator tool names; operator Slack question + get_worker_status count; negative codex exec probe + evidence)", "expected": "As in the follow-up plan Task 3 Steps 7-12; record outputs verbatim."},
+        {"description": "Write docs/plans/2026-10-10-codex-brain-parity-live-verification.md (both failed attempts + this attempt Steps 1-12), stage docs; then 'git -C /Users/roberthyatt/Code/ironclaude add worker/.codex-plugin/plugin.json'", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-10-codex-brain-parity-live-verification.md docs/plans/2026-10-10-codex-brain-parity-design.md docs/plans/2026-10-11-codex-hooks-trust-confirm.md docs/plans/2026-10-11-codex-hooks-trust-confirm.plan.json", "expected": "No output from either add."}
+      ]
+    }
+  ]
+}

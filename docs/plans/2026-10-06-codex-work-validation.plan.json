@@ -1,0 +1,54 @@
+{
+  "name": "Validation of Codex's 2026-10-04..06 work",
+  "goal": "Independently validate the three committed Codex loops (55ba8b3..a3d400b) and the staged worker-handoff work with checks, a Fable adversarial review and one findings report; no product changes.",
+  "requirements_file": "docs/plans/2026-10-06-codex-work-validation-requirements.md",
+  "design_file": "docs/plans/2026-10-06-codex-work-validation-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Run and record every check (V1)",
+      "description": "Run every hook suite individually (one failure must not hide later suites), full workspace-manager vitest, focused handoff/CLI vitest, tsc --noEmit, the handoff loop's required pytest selection, and the full Commander pytest; each run logs to its own scratchpad val-* file; record exact commands, exit codes, summary lines, failing suite names with log tails, the known onTaskUpdate RPC timeout limitation, the dist-not-rebuilt note and a statement that every suite ran against the working tree containing the staged handoff source in docs/reviews/2026-10-06-codex-work-check-results.md. Validation loop: expected results are 'record actual'; failures become findings, never fixed here. No tests required: runs existing checks.",
+      "allowed_files": ["docs/reviews/2026-10-06-codex-work-check-results.md"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Hook suites, each individually", "command": "cd /Users/roberthyatt/Code/ironclaude && for s in worker/hooks/test-*.sh worker/hooks/tests/test-*.sh commander/hooks/tests/test-*.sh; do bash \"$s\" > \"/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/val-hook-$(basename \"$s\").log\" 2>&1; echo \"$s exit=$?\"; done", "expected": "one exit= line per suite; record every non-zero suite with its log tail"},
+        {"description": "Full workspace-manager vitest (Bash timeout 600000)", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run > /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/val-vitest-full.log 2>&1; echo \"exit=$?\"", "expected": "record Test Files/Tests/Errors lines and exit; a lone onTaskUpdate RPC timeout from integration-core.test.ts is the known backlog item, recorded separately from failures"},
+        {"description": "Focused handoff/CLI vitest", "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test -- src/__tests__/handoff.test.ts src/__tests__/cli.test.ts > /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/val-vitest-handoff.log 2>&1; echo \"exit=$?\"", "expected": "record summary lines and exit"},
+        {"description": "TypeScript compile check, no emit", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/node_modules/.bin/tsc --noEmit --project /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/tsconfig.json > /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/val-tsc.log 2>&1; echo \"exit=$?\"", "expected": "record exit and any errors"},
+        {"description": "Handoff required pytest selection (Bash timeout 600000)", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q tests/test_worker_handoff_registry.py tests/test_worker_quota.py tests/test_worker_pm_handoff.py tests/test_worker_handoff.py tests/test_worker_handoff_process.py tests/test_worker_handoff_daemon.py tests/test_workspace_handoff_authority.py tests/test_provider_router.py tests/test_worker_registry.py tests/test_lifecycle_logging.py > /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/val-pytest-handoff.log 2>&1; echo \"exit=$?\"", "expected": "record summary line and exit"},
+        {"description": "Full Commander pytest (Bash timeout 600000)", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q > /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/val-pytest-full.log 2>&1; echo \"exit=$?\"", "expected": "record summary line and exit"},
+        {"description": "Write docs/reviews/2026-10-06-codex-work-check-results.md per human plan Task 1 Step 7."},
+        {"description": "Stage results", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-06-codex-work-check-results.md", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Fable adversarial review (V2)",
+      "description": "Orchestrator dispatches a Fable reviewer (Agent model=fable; if Fable unavailable, model=opus with identical prompt, substitution recorded in review header). Reviewer writes only docs/reviews/2026-10-06-codex-work-fable-review.md, runs no tests and no mutating git/shell commands. Blind to Codex's review verdicts/reasoning: must not read docs/reviews/2026-10-04-* or any docs/plans/2026-10-06-codex-work-validation* file; may read the Codex loops' requirements/design/plan docs listed here. Orchestrator prompt passes only scope, commands, requirement files and checklist; it does not quote the operator's or Codex's characterisation of the handoff work. Reviews (1) git -C /Users/roberthyatt/Code/ironclaude diff 55ba8b3..a3d400b -- . ':!docs/reviews' vs 2026-10-04-codex-hook-corrections-requirements.md R1-R10, 2026-10-04-codex-hook-boundary-safeguards.md, 2026-10-05-gbtw-evaluation-warnings-requirements.md (the two docs/plans/2026-10-04-replan-progress-experiment-stage-* docs in the range are L3, out of scope, not reviewed) and (2) git -C /Users/roberthyatt/Code/ironclaude diff --staged -- . ':!docs/reviews' ':!docs/plans/2026-10-06-codex-work-validation*' vs 2026-10-05-worker-provider-handoff-requirements.md R1-R9 and both handoff designs. Checklist: R4 process-stop safety; R5 ownership CAS/rebinding/fail-closed; R7 quota false-trigger/ping-pong; R3 PM progress/review attribution/design-registration transfer; R2 worktree preservation; client parity; bundle/source agreement (committed bundles; staged source without rebuilt bundles as deploy prerequisite); tests that cannot fail. Verify every material finding from source; write per-loop verdicts, Critical/Important/Minor findings with file:line/scenario/evidence, and observations to docs/reviews/2026-10-06-codex-work-fable-review.md. No tests required: review.",
+      "allowed_files": ["docs/reviews/2026-10-06-codex-work-fable-review.md"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Dispatch the Fable reviewer (Opus fallback) per human plan Task 2 Step 1; it writes docs/reviews/2026-10-06-codex-work-fable-review.md."},
+        {"description": "Stage review", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-06-codex-work-fable-review.md", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Findings report (V3, V4)",
+      "description": "Verify every Critical/Important Fable finding against current source (or a scratch reproduction), demoting unverified ones to observations; write docs/reviews/2026-10-06-codex-work-validation-report.md with per-loop verdicts (hook corrections, boundary safeguards, GBTW warnings, worker handoff), check summary, verified findings, per-loop recommendations (keep/commit, named fix loop, backlog) and deploy prerequisites (rebuild workspace bundles before any Commander restart that loads the staged handoff source; refresh the Claude plugin cache, which is behind 59b5ca7/a3d400b); stage it with the loop docs (in allowed_files so /commit scopes them). No tests required: report.",
+      "allowed_files": [
+        "docs/reviews/2026-10-06-codex-work-validation-report.md",
+        "docs/plans/2026-10-06-codex-work-validation-requirements.md",
+        "docs/plans/2026-10-06-codex-work-validation-design.md",
+        "docs/plans/2026-10-06-codex-work-validation.md",
+        "docs/plans/2026-10-06-codex-work-validation.plan.json"
+      ],
+      "depends_on": [1, 2],
+      "steps": [
+        {"description": "Verify each Critical/Important finding from Task 2 against current source or a scratch reproduction; mark verified/unverified."},
+        {"description": "Write docs/reviews/2026-10-06-codex-work-validation-report.md per human plan Task 3 Step 2."},
+        {"description": "Stage report and loop docs", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-06-codex-work-validation-report.md docs/plans/2026-10-06-codex-work-validation-requirements.md docs/plans/2026-10-06-codex-work-validation-design.md docs/plans/2026-10-06-codex-work-validation.md docs/plans/2026-10-06-codex-work-validation.plan.json", "expected": "no output, exit 0"}
+      ]
+    }
+  ]
+}

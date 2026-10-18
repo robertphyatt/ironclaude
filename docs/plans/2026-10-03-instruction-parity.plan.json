@@ -1,0 +1,176 @@
+{
+  "name": "instruction-parity",
+  "goal": "Converge AGENTS.md, CLAUDE.md and .claude/rules/behavioral.md on behavioral.md's 15 directives under a parity test; align the operator's global instruction files and prune Codex standing approvals; give Codex a real brainstorming entry and make the new-effort memory-search gate identical on both clients (arm on mark_brainstorming / brainstorming Skill from a non-debugging, non-brainstorming stage; clear on the measured episodic-memory MCP search names or the search-conversations Agent dispatch); remove the writing-plans gate; verify and redeploy.",
+  "requirements_file": "docs/plans/2026-10-03-instruction-parity-requirements.md",
+  "design_file": "docs/plans/2026-10-03-instruction-parity-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Measure the search tool names and the Claude Task matcher (R7)",
+      "description": "Headless codex exec probe in SCRATCH/codex-memsearch-probe (project .codex/hooks.json PostToolUse '*' capture, --dangerously-bypass-hook-trust) records Codex's PostToolUse tool_name for an episodic-memory MCP search, with a call-happened control (grep '\"type\":\"mcp_tool_call\"'). Headless claude -p probe in SCRATCH/claude-task-probe (project .claude/settings.json PostToolUse hooks on matchers Task, Agent (positive control) and '*') records whether matcher Task receives the Agent call and Claude's episodic search tool_name; Claude Code env vars are unset for the nested run. Findings file carries three column-0 lines CODEX_EPISODIC_SEARCH_TOOL=, CLAUDE_EPISODIC_SEARCH_TOOL=, CLAUDE_TASK_MATCHER_FIRES_FOR_AGENT= (yes|no|INCONCLUSIVE; BLOCKER for a tool name that cannot be classified), written before cleanup. A fresh ~/.codex/config.toml snapshot is taken first (the old SCRATCH/config.before.toml is stale: measured 123,124c123,124 version bump); the trust entry codex exec appends is removed and the diff returns to the snapshot. SCRATCH = /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad. All file contents and classification rules: human plan docs/plans/2026-10-03-instruction-parity.md Task 1. No tests required: measurement only, each probe carries a positive control.",
+      "allowed_files": [
+        "docs/plans/2026-10-03-instruction-parity-findings.md",
+        "/Users/roberthyatt/.codex/config.toml",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/config.before-l2b2.toml",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-memsearch-probe/.codex/capture.sh",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-memsearch-probe/.codex/hooks.json",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-memsearch-probe/.codex/capture/PostToolUse.jsonl",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-memsearch-run1.jsonl",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-memsearch-run2.jsonl",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-memsearch-last1.txt",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-memsearch-last2.txt",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/claude-task-probe/.claude/settings.json",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/claude-task-probe/.claude/capture.sh",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/claude-task-probe/capture/task.jsonl",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/claude-task-probe/capture/agent.jsonl",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/claude-task-probe/capture/all.jsonl",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/claude-task-probe-run1.jsonl",
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/claude-task-probe-run2.jsonl"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Snapshot ~/.codex/config.toml", "command": "cp /Users/roberthyatt/.codex/config.toml /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/config.before-l2b2.toml", "expected": "no output, exit 0"},
+        {"description": "Snapshot equals live file", "command": "diff /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/config.before-l2b2.toml /Users/roberthyatt/.codex/config.toml", "expected": "no output, exit 0"},
+        {"description": "Create Codex scratch repo dir", "command": "mkdir -p /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-memsearch-probe/.codex", "expected": "no output, exit 0"},
+        {"description": "git init Codex scratch repo", "command": "git init -q /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-memsearch-probe", "expected": "no output, exit 0"},
+        {"description": "Write SCRATCH/codex-memsearch-probe/.codex/capture.sh and SCRATCH/codex-memsearch-probe/.codex/hooks.json with human plan Task 1 Step 2 content verbatim."},
+        {"description": "Run one headless Codex turn", "command": "codex exec -C /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-memsearch-probe -s workspace-write --json --dangerously-bypass-hook-trust --output-last-message /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-memsearch-last1.txt \"Call the episodic-memory MCP server's search tool exactly once with the query \\\"instruction parity probe\\\", then reply DONE. Run no shell commands.\" > /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-memsearch-run1.jsonl 2>&1", "expected": "exit 0"},
+        {"description": "Codex call-happened control", "command": "grep -c -e '\"type\":\"mcp_tool_call\"' /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-memsearch-run1.jsonl", "expected": ">= 1 if the call happened (item.started + item.completed gives 2), or 0 (exit 1)"},
+        {"description": "Codex server/tool of the call", "command": "grep -o -E '\"server\":\"[^\"]*\",\"tool\":\"[^\"]*\"' /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-memsearch-run1.jsonl", "expected": "predicted: \"server\":\"episodic-memory\",\"tool\":\"search\" lines"},
+        {"description": "Codex captured PostToolUse tool_name; then classify per human plan Task 1 Step 4 (ok / no call: rerun once as run2+last2 then BLOCKER / blocker)", "command": "jq -r .tool_name /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-memsearch-probe/.codex/capture/PostToolUse.jsonl", "expected": "predicted: mcp__episodic_memory__search (not relied on until classified)"},
+        {"description": "Create Claude scratch project dir", "command": "mkdir -p /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/claude-task-probe/.claude", "expected": "no output, exit 0"},
+        {"description": "Write SCRATCH/claude-task-probe/.claude/capture.sh and SCRATCH/claude-task-probe/.claude/settings.json with human plan Task 1 Step 5 content verbatim (Task, Agent control, and '*' PostToolUse captures)."},
+        {"description": "Run one headless Claude turn with Claude Code env vars unset; on 'cannot be launched inside another Claude Code session' unset every remaining CLAUDE* var and rerun once to claude-task-probe-run2.jsonl; if it still fails record CLAUDE_TASK_MATCHER_FIRES_FOR_AGENT=INCONCLUSIVE and CLAUDE_EPISODIC_SEARCH_TOOL=BLOCKER (human plan Task 1 Step 6)", "command": "cd /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/claude-task-probe && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_MESSAGING_SOCKET -u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_BRIDGE_SESSION_ID -u CLAUDE_CODE_EXECPATH -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ATTENDED -u CLAUDE_PID -u CLAUDE_EFFORT claude -p \"Do exactly two things, in order, then reply DONE. 1. Use the Agent tool to dispatch one general-purpose subagent with the prompt: Reply OK and nothing else. 2. Call the episodic-memory MCP server's search tool once with the query: instruction parity probe. Run no shell commands and edit no files.\" --model sonnet --allowedTools Agent,mcp__plugin_ironclaude_episodic-memory__search --output-format stream-json --verbose > /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/claude-task-probe-run1.jsonl 2>&1", "expected": "predicted: exit 0"},
+        {"description": "Claude Agent call-happened control", "command": "grep -c -E '\"name\": ?\"Agent\"' /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/claude-task-probe-run1.jsonl", "expected": ">= 1, or 0 (exit 1)"},
+        {"description": "Agent-matcher capture (positive control)", "command": "jq -r .tool_name /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/claude-task-probe/capture/agent.jsonl", "expected": "not measured; Agent lines, or No such file or directory (evidence)"},
+        {"description": "Task-matcher capture (the question)", "command": "jq -r .tool_name /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/claude-task-probe/capture/task.jsonl", "expected": "not measured; Agent lines (yes) or absent / no Agent line (no)"},
+        {"description": "All-tools capture; then classify Task matcher (yes/no/INCONCLUSIVE) and Claude search tool (one episodic __search name, else BLOCKER) per human plan Task 1 Step 7", "command": "jq -r .tool_name /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/claude-task-probe/capture/all.jsonl", "expected": "not measured; predicted to include Agent and mcp__plugin_ironclaude_episodic-memory__search"},
+        {"description": "Write docs/plans/2026-10-03-instruction-parity-findings.md per human plan Task 1 Step 8: commands, quoted outputs, the three column-0 classification lines, the subagent-circuit-breaker observation if Task=no, and the kept session-row note. Written before cleanup."},
+        {"description": "Show the trust entry codex exec appended", "command": "diff /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/config.before-l2b2.toml /Users/roberthyatt/.codex/config.toml", "expected": "predicted: exit 1, one added 3-line hunk: [projects.\"/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-memsearch-probe\"], trust_level = \"trusted\", blank line. Empty: record and skip edit. Other changes: record in findings, leave untouched."},
+        {"description": "Edit /Users/roberthyatt/.codex/config.toml: delete exactly the codex-memsearch-probe entry's three lines, matched together with the line that follows them."},
+        {"description": "Verify against snapshot", "command": "diff /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/config.before-l2b2.toml /Users/roberthyatt/.codex/config.toml", "expected": "no output, exit 0 (or only an unrelated change already recorded in the findings file)"},
+        {"description": "Classification lines present", "command": "grep -c -E '^(CODEX_EPISODIC_SEARCH_TOOL|CLAUDE_EPISODIC_SEARCH_TOOL|CLAUDE_TASK_MATCHER_FIRES_FOR_AGENT)=' /Users/roberthyatt/Code/ironclaude/docs/plans/2026-10-03-instruction-parity-findings.md", "expected": "3"},
+        {"description": "Stage findings", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-03-instruction-parity-findings.md", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Converge the repo surfaces and add the parity test (R1, R2)",
+      "description": "New commander/tests/test_instruction_surface_parity.py parses ^(\\d+)\\. \\*\\*(.+?)\\*\\* headings (re.MULTILINE, verified against all three files) and asserts each surface's (number, title) list equals the 15 canonical behavioral.md headings numbered 1-15, plus 16 'Actual Claude Fable from Codex' on AGENTS.md only. behavioral.md:59 ladder gains astra. CLAUDE.md becomes behavioral.md lines 1-89 verbatim plus its unchanged Plan Mode Replacement section (adds directives 10, 11, 14, 15; renumbers Boy Scout 12, Recipient 13). AGENTS.md becomes behavioral.md lines 1-89 except line 3 (Codex title), line 35 (worker_agents.md:35 Codex search line) and lines 57-61 (its existing broker advisor body), then directive 16 Fable and a Codex-correct Plan Mode Replacement section moved to the end. diff checks prove body parity. Worker templates, activation skill and their pinned tests are untouched (L2b-3). Full file contents: human plan Task 2.",
+      "allowed_files": [
+        "commander/tests/test_instruction_surface_parity.py",
+        ".claude/rules/behavioral.md",
+        "CLAUDE.md",
+        "AGENTS.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: create commander/tests/test_instruction_surface_parity.py with human plan Task 2 Step 1 content verbatim."},
+        {"description": "Run parity test, see it fail", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_instruction_surface_parity.py -q", "expected": "predicted: exit 1, 2 failed, 1 passed (AGENTS.md and CLAUDE.md fail at heading 10 = Boy Scout Rule; behavioral.md passes)"},
+        {"description": "behavioral.md line 59: replace '`luna→terra→sol` mapping' line with the '`luna→terra→sol→astra` mapping' line (human plan Task 2 Step 3 verbatim)."},
+        {"description": "Replace CLAUDE.md with human plan Task 2 Step 4 content verbatim."},
+        {"description": "Replace AGENTS.md with human plan Task 2 Step 5 content verbatim."},
+        {"description": "Verify CLAUDE.md body parity", "command": "diff /Users/roberthyatt/Code/ironclaude/.claude/rules/behavioral.md /Users/roberthyatt/Code/ironclaude/CLAUDE.md", "expected": "predicted: exit 1; only hunk header 89a90,105 (blank + Plan Mode Replacement section, all '> ' lines); any other hunk fails the step"},
+        {"description": "Verify AGENTS.md body parity", "command": "diff /Users/roberthyatt/Code/ironclaude/.claude/rules/behavioral.md /Users/roberthyatt/Code/ironclaude/AGENTS.md", "expected": "predicted: exit 1; exactly four hunk headers in order: 3c3, 35c35, 57,61c57,61, 89a90,111; any other hunk fails the step"},
+        {"description": "Run parity test", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_instruction_surface_parity.py -q", "expected": "3 passed, exit 0"},
+        {"description": "Existing suites reading these surfaces", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_communication_instruction_surfaces.py tests/test_boy_scout_directive.py tests/test_advisor_fallback_directive.py tests/test_activation_client_parity.py tests/test_worker_claude_md_template.py -q", "expected": "predicted (5+3+5+16+6 test functions): 35 passed, exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add AGENTS.md CLAUDE.md .claude/rules/behavioral.md commander/tests/test_instruction_surface_parity.py", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Brainstorming entry and memory gate; remove the writing-plans gate (R5, R6)",
+      "description": "Step 0 reads the three findings lines; a missing line, BLOCKER, INCONCLUSIVE or a tool value not matching ^mcp__[A-Za-z0-9_-]+__search$ means change nothing, stop and report. Placeholders @@CLAUDE_EPISODIC_SEARCH_TOOL@@ and @@CODEX_EPISODIC_SEARCH_TOOL@@ (only in the test, the tracker and the hooks.json matcher) are replaced by the measured literals; a grep proves none survive. mcp-state-logger.sh arms memory_search_required=1 (write only when differing, updated_at untouched) on changed:true mark_brainstorming (both spellings reach SHORT_TOOL=mark_brainstorming) when the response's from is present and not debugging/brainstorming, parsing from with the same object/string/content[].text envelope logic as CHANGED. skill-state-bridge.sh drops memory_search_required=1 from :41 and :49 and arms brainstorming only when CURRENT_STAGE is not debugging/brainstorming. memory-search-tracker.sh clears on the two measured search names and keeps the Agent search-conversations clear. hooks.json PostToolUse index 2 matcher becomes Task|Agent|<claude>|<codex> in place (Agent included unconditionally: required if Task does not fire for Agent, harmless in one entry if it does). GBTW: neutral two-client _IC_MSG_MEMORY_SEARCH, new helper _gbtw_memory_gate_applies (brainstorming only) before the test-mode shim, used at :1078. brainstorming/SKILL.md Phase 1 gains the preflight + mark_brainstorming entry and a client-correct Step 0.5 search line; writing-plans/SKILL.md 'Before You Begin' and Step 0.5 become a client-correct, implementation-specific, unenforced search instruction. All code: human plan Task 3.",
+      "allowed_files": [
+        "worker/hooks/mcp-state-logger.sh",
+        "worker/hooks/skill-state-bridge.sh",
+        "worker/hooks/memory-search-tracker.sh",
+        "worker/hooks/hooks.json",
+        "worker/hooks/get-back-to-work-impl.sh",
+        "worker/hooks/tests/test-memory-search-gate.sh",
+        "worker/skills/brainstorming/SKILL.md",
+        "worker/skills/writing-plans/SKILL.md"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Read measured names; stop on a blocker (human plan Task 3 Step 0)", "command": "grep -E '^(CODEX_EPISODIC_SEARCH_TOOL|CLAUDE_EPISODIC_SEARCH_TOOL|CLAUDE_TASK_MATCHER_FIRES_FOR_AGENT)=' /Users/roberthyatt/Code/ironclaude/docs/plans/2026-10-03-instruction-parity-findings.md", "expected": "exactly three lines; both tool values match ^mcp__[A-Za-z0-9_-]+__search$; matcher value yes or no. Otherwise change no file, stop, report."},
+        {"description": "RED: create worker/hooks/tests/test-memory-search-gate.sh with human plan Task 3 Step 1 content verbatim, placeholders replaced by the measured literals."},
+        {"description": "Run new test, see it fail", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-memory-search-gate.sh", "expected": "predicted: exit 1, Results: 9 pass, 10 fail (cases 1, 2, 8, 9, 10, 11, 15, 17, 18, 19 fail)"},
+        {"description": "mcp-state-logger.sh: replace the line-67 comment and insert the arm block after line 81 (human plan Task 3 Step 3 verbatim)."},
+        {"description": "skill-state-bridge.sh: drop memory_search_required=1 from lines 41 and 49 and insert the new-effort arm block after line 86 (human plan Task 3 Step 4 verbatim)."},
+        {"description": "Replace worker/hooks/memory-search-tracker.sh with human plan Task 3 Step 5 content verbatim, placeholders replaced by the measured literals."},
+        {"description": "hooks.json: in the memory-search-tracker.sh entry (PostToolUse index 2) replace '\"matcher\": \"Task\"' with '\"matcher\": \"Task|Agent|<claude value>|<codex value>\"' (human plan Task 3 Step 6); no entry added or moved."},
+        {"description": "No placeholder survives", "command": "grep -rn -F -e '@@CLAUDE_EPISODIC_SEARCH_TOOL@@' -e '@@CODEX_EPISODIC_SEARCH_TOOL@@' /Users/roberthyatt/Code/ironclaude/worker", "expected": "no output, exit 1"},
+        {"description": "hooks.json valid; entry count and tracker matcher", "command": "jq -r '[.hooks.PostToolUse | length, .hooks.PostToolUse[2].matcher] | @tsv' /Users/roberthyatt/Code/ironclaude/worker/hooks/hooks.json", "expected": "7<TAB>Task|Agent|<claude value>|<codex value> (literal Task 1 values); jq exit 0"},
+        {"description": "get-back-to-work-impl.sh: replace _IC_MSG_MEMORY_SEARCH (lines 193-203), insert _gbtw_memory_gate_applies before the test-mode shim comment (line 255), replace lines 1076-1078 with the helper call (human plan Task 3 Step 8 verbatim)."},
+        {"description": "brainstorming/SKILL.md: insert the Phase 1 entry paragraph after line 70 and replace line 104 (human plan Task 3 Step 9 verbatim)."},
+        {"description": "writing-plans/SKILL.md: replace lines 57-65 and lines 90-101 (human plan Task 3 Step 10 verbatim)."},
+        {"description": "Run new test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-memory-search-gate.sh", "expected": "Results: 19 pass, 0 fail; exit 0"},
+        {"description": "Existing logger active_skill test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-mcp-state-logger-active-skill.sh", "expected": "Results: 6 pass, 0 fail; exit 0 (measured 6 at L2b-1d; predicted unchanged: fixtures carry no from)"},
+        {"description": "Existing idempotency test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-workflow-transition-idempotency.sh", "expected": "Results: 44 pass, 0 fail; exit 0 (measured 44 at L2b-1d; predicted unchanged)"},
+        {"description": "GBTW tone test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-gbtw-block-tone.sh", "expected": "---- tone: 14 passed, 0 failed ----; exit 0 (measured 14 at L2b-1d; predicted unchanged)"},
+        {"description": "GBTW client-aware test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-gbtw-client-aware.sh", "expected": "---- client-aware: 9 passed, 0 failed ----; exit 0 (measured 9 at L2b-1d; predicted unchanged)"},
+        {"description": "Bridge inherit_review test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-skill-state-bridge-inherit-review.sh", "expected": "Results: 6 pass, 0 fail; exit 0 (measured 6 at L2b-1d; predicted unchanged)"},
+        {"description": "Commander tests that read the two edited skills", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_workflow_transition_preflight.py tests/test_writing_plans_skill.py tests/test_plan_authoring_invariants.py tests/test_rules_references_resolve.py -q", "expected": "predicted (5+9+4+2 test functions): 20 passed, exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/mcp-state-logger.sh worker/hooks/skill-state-bridge.sh worker/hooks/memory-search-tracker.sh worker/hooks/hooks.json worker/hooks/get-back-to-work-impl.sh worker/hooks/tests/test-memory-search-gate.sh worker/skills/brainstorming/SKILL.md worker/skills/writing-plans/SKILL.md", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Global instruction files and Codex rules (R3, R4)",
+      "description": "Back up ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md and ~/.codex/rules/default.rules to <file>.bak-2026-10-03; re-check the measured starting state (global diff only 3c3; rules file 17 lines with pattern=[\"codex\", \"exec\"] on line 3 only) and stop on any difference. Line 39 of both global files becomes behavioral.md:39 (delegate-by-default). Line 35 of ~/.codex/AGENTS.md only becomes worker_agents.md:35 (Codex search line). default.rules is rewritten to the original lines 1, 2, 4, 5, 6 verbatim. Verified by diff against backups and between the two global files. No tests required: personal config files outside the repo; verified by diff. Text: human plan Task 4.",
+      "allowed_files": [
+        "/Users/roberthyatt/.claude/CLAUDE.md",
+        "/Users/roberthyatt/.claude/CLAUDE.md.bak-2026-10-03",
+        "/Users/roberthyatt/.codex/AGENTS.md",
+        "/Users/roberthyatt/.codex/AGENTS.md.bak-2026-10-03",
+        "/Users/roberthyatt/.codex/rules/default.rules",
+        "/Users/roberthyatt/.codex/rules/default.rules.bak-2026-10-03",
+        "docs/plans/2026-10-03-instruction-parity-globals-log.md"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {"description": "Back up ~/.claude/CLAUDE.md", "command": "cp /Users/roberthyatt/.claude/CLAUDE.md /Users/roberthyatt/.claude/CLAUDE.md.bak-2026-10-03", "expected": "no output, exit 0"},
+        {"description": "Back up ~/.codex/AGENTS.md", "command": "cp /Users/roberthyatt/.codex/AGENTS.md /Users/roberthyatt/.codex/AGENTS.md.bak-2026-10-03", "expected": "no output, exit 0"},
+        {"description": "Back up default.rules", "command": "cp /Users/roberthyatt/.codex/rules/default.rules /Users/roberthyatt/.codex/rules/default.rules.bak-2026-10-03", "expected": "no output, exit 0"},
+        {"description": "Starting state: global files differ only in title (stop on any difference)", "command": "diff /Users/roberthyatt/.claude/CLAUDE.md /Users/roberthyatt/.codex/AGENTS.md", "expected": "measured: exit 1; output exactly:\n3c3\n< # Behavioral Directives for Claude\n---\n> # Behavioral Directives for Codex"},
+        {"description": "Starting state: rules line count (stop on any difference)", "command": "wc -l /Users/roberthyatt/.codex/rules/default.rules", "expected": "measured: 17 /Users/roberthyatt/.codex/rules/default.rules"},
+        {"description": "Starting state: blanket codex exec rule is line 3 only (stop on any difference)", "command": "grep -n -F 'pattern=[\"codex\", \"exec\"]' /Users/roberthyatt/.codex/rules/default.rules", "expected": "measured: 3:prefix_rule(pattern=[\"codex\", \"exec\"], decision=\"allow\")"},
+        {"description": "In /Users/roberthyatt/.claude/CLAUDE.md and /Users/roberthyatt/.codex/AGENTS.md replace line 39 '   - Use inline execution mode when tasks are complex enough to risk context exhaustion spirals' with behavioral.md:39 verbatim (human plan Task 4 Step 3)."},
+        {"description": "In /Users/roberthyatt/.codex/AGENTS.md only replace line 35 '   - Use the ironclaude:search-conversations agent, not raw MCP tools' with '   - Search with the `episodic-memory` MCP server's search capability' (human plan Task 4 Step 4)."},
+        {"description": "Verify ~/.claude/CLAUDE.md change", "command": "diff /Users/roberthyatt/.claude/CLAUDE.md.bak-2026-10-03 /Users/roberthyatt/.claude/CLAUDE.md", "expected": "exit 1; one hunk 39c39 (inline line -> delegate line)"},
+        {"description": "Verify ~/.codex/AGENTS.md change", "command": "diff /Users/roberthyatt/.codex/AGENTS.md.bak-2026-10-03 /Users/roberthyatt/.codex/AGENTS.md", "expected": "exit 1; hunks 35c35 and 39c39 only"},
+        {"description": "Global files differ in title and search line only", "command": "diff /Users/roberthyatt/.claude/CLAUDE.md /Users/roberthyatt/.codex/AGENTS.md", "expected": "exit 1; output exactly:\n3c3\n< # Behavioral Directives for Claude\n---\n> # Behavioral Directives for Codex\n35c35\n<    - Use the ironclaude:search-conversations agent, not raw MCP tools\n---\n>    - Search with the `episodic-memory` MCP server's search capability"},
+        {"description": "Write /Users/roberthyatt/.codex/rules/default.rules with exactly the five original lines 1, 2, 4, 5, 6 (human plan Task 4 Step 6 verbatim)."},
+        {"description": "Verify pruning against backup", "command": "diff /Users/roberthyatt/.codex/rules/default.rules.bak-2026-10-03 /Users/roberthyatt/.codex/rules/default.rules", "expected": "exit 1; exactly two hunk headers 3d2 and 7,17d5, followed by 12 '<' lines (original line 3, then 7-17) and no '>' lines"},
+        {"description": "Pruned line count", "command": "wc -l /Users/roberthyatt/.codex/rules/default.rules", "expected": "5 /Users/roberthyatt/.codex/rules/default.rules"},
+        {"description": "Write docs/plans/2026-10-03-instruction-parity-globals-log.md per human plan Task 4 Step 8 (backup paths, quoted Step 2/5/7 outputs, removed-rule note)."},
+        {"description": "Stage globals log", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-03-instruction-parity-globals-log.md", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Full verification and redeploy (R8)",
+      "description": "Run all hook suites and the Commander suite; deploy-hooks; hooks.json changed this loop, so the Claude plugin cache copy differs before cp (tracker matcher, line 124) and is empty after; codex plugin add then diff -rq of worker/ against the Codex cache; record the pre-existing Claude skill-cache drift without copying; write the deploy log with the R9 note (final Fable end review CLEAN before operator /commit; no agent commit; no push; operator re-trusts Codex hook post_tool_use:2). No tests required: runs existing suites and deploys generated runtime copies outside the repo. Detail: human plan Task 5.",
+      "allowed_files": [
+        "docs/plans/2026-10-03-instruction-parity-deploy-log.md",
+        "/Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks/hooks.json"
+      ],
+      "depends_on": [2, 3, 4],
+      "steps": [
+        {"description": "Run every hook suite", "command": "make -C /Users/roberthyatt/Code/ironclaude test-hooks", "expected": "exit 0; header --- worker/hooks/tests/test-memory-search-gate.sh --- followed by Results: 19 pass, 0 fail; no non-zero fail count (total not measured at planning)"},
+        {"description": "Run Commander suite (timeout 600000)", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "predicted: 3460 passed, exit 0 (3457 measured at L2b-1d + 3 parity cases)"},
+        {"description": "Deploy hooks", "command": "make -C /Users/roberthyatt/Code/ironclaude deploy-hooks", "expected": "output includes 'Deployed to plugin cache /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks' and 'Deployed 31 hooks to /Users/roberthyatt/.claude/ironclaude-hooks'"},
+        {"description": "Verify Claude installPath (if different, use that path's hooks/hooks.json in the next three steps)", "command": "grep -n -e \"installPath\" /Users/roberthyatt/.claude/plugins/installed_plugins.json", "expected": "measured: line 27 \"installPath\": \"/Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15\""},
+        {"description": "hooks.json differs before copy", "command": "diff /Users/roberthyatt/Code/ironclaude/worker/hooks/hooks.json /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks/hooks.json", "expected": "predicted: exit 1; one hunk 124c124: tracker matcher line '\"matcher\": \"Task|Agent|...\"' vs '\"matcher\": \"Task\"' (empty at planning, before Task 3)"},
+        {"description": "Install hooks.json into Claude's plugin copy", "command": "cp /Users/roberthyatt/Code/ironclaude/worker/hooks/hooks.json /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks/hooks.json", "expected": "no output, exit 0"},
+        {"description": "hooks.json identical after copy", "command": "diff /Users/roberthyatt/Code/ironclaude/worker/hooks/hooks.json /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks/hooks.json", "expected": "no output, exit 0"},
+        {"description": "Refresh Codex plugin cache", "command": "codex plugin add ironclaude@ironclaude --json", "expected": "exit 0; JSON installedPath /Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/1.1.15+codex.20260930172837"},
+        {"description": "Verify Codex cache matches worker/", "command": "diff -rq /Users/roberthyatt/Code/ironclaude/worker /Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/1.1.15+codex.20260930172837 -x node_modules -x __pycache__ -x .DS_Store", "expected": "no output, exit 0"},
+        {"description": "Record the pre-existing Claude skill-cache drift (copy nothing)", "command": "diff -rq /Users/roberthyatt/Code/ironclaude/worker/skills /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/skills", "expected": "measured at planning: exit 1; four 'Files ... differ' lines for brainstorming, code-review, executing-plans, writing-plans SKILL.md"},
+        {"description": "Write docs/plans/2026-10-03-instruction-parity-deploy-log.md per human plan Task 5 Step 11 (quoted Step 1-10 outputs; hooks.json change and copy; skill-cache drift; R9 note: Fable end review CLEAN before operator /commit, no agent commit, no push, operator re-trusts post_tool_use:2)."},
+        {"description": "Stage deploy log", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-03-instruction-parity-deploy-log.md", "expected": "no output, exit 0"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "name": "roleplaying-agents: untrack catalog DB on main",
+  "goal": "main stops tracking tools/inkarnate_mcp/asset_catalog_raw/asset_catalog.db and ignores it, via a commit built from main's own tree in a temp index (no checkout, no push); operator runs commit-tree + CAS update-ref.",
+  "requirements_file": "docs/plans/2026-10-11-ra-main-untrack-design.md",
+  "design_file": "docs/plans/2026-10-11-ra-main-untrack-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Untrack on main",
+      "description": "No tests required: git plumbing operation verified by ref/tree inspection. Exact commands: human plan Task 1 Steps 1-6. Never checkout, never touch working tree or real index, never push. Agent commands avoid guard keywords; operator runs commit-tree + update-ref (CAS on OLD_MAIN).",
+      "allowed_files": [
+        "docs/reviews/2026-10-11-ra-git-history-findings.md",
+        "docs/plans/2026-10-11-ra-main-untrack-design.md",
+        "docs/plans/2026-10-11-ra-main-untrack.md",
+        "docs/plans/2026-10-11-ra-main-untrack.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "U1 gate: rev-parse main (OLD_MAIN), ls-tree main -- db path (must show blob), rev-parse origin/main (ORIGIN_MAIN)", "command": "git -C /Users/roberthyatt/Code/roleplaying-agents ls-tree main -- tools/inkarnate_mcp/asset_catalog_raw/asset_catalog.db", "expected": "One blob line; empty -> stop."},
+        {"description": "U2 .gitignore: show main's version to /private/tmp/ra-main-gitignore; append line if absent (newline-safe); hash-object -w -> GI_BLOB", "expected": "GI_BLOB recorded."},
+        {"description": "U2 temp index: read-tree main; update-index --force-remove db; update-index --cacheinfo 100644,GI_BLOB,tools/inkarnate_mcp/.gitignore; diff --cached --name-status main", "expected": "Exactly M .gitignore + D asset_catalog.db; else stop."},
+        {"description": "U3: write-tree -> NEW_TREE; give operator the exact commit-tree + CAS update-ref command per human plan Step 4", "expected": "Operator runs it; main advanced."},
+        {"description": "U4 verify per human plan Step 5; remove temp files", "command": "git -C /Users/roberthyatt/Code/roleplaying-agents show --stat --format='%h %s' main", "expected": "2 paths (db Bin 6033408 -> 0, .gitignore +1); main^ == OLD_MAIN; db not in main tree; .gitignore line present; origin/main unchanged; db file 3654037504 bytes; HEAD branch unchanged."},
+        {"description": "U5 record + stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-11-ra-git-history-findings.md docs/plans/2026-10-11-ra-main-untrack-design.md docs/plans/2026-10-11-ra-main-untrack.md docs/plans/2026-10-11-ra-main-untrack.plan.json", "expected": "No output."}
+      ]
+    }
+  ]
+}

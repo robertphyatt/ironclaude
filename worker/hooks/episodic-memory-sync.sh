@@ -48,6 +48,15 @@ if [ -z "${CLAUDE_PLUGIN_ROOT:-}" ]; then
     exit 0
 fi
 
+# A --background sync detaches from this wrapper (sync-cli.js spawns a detached
+# child and exits), so the PID file above only covers this launch. Check the
+# process table for a live sync before starting another.
+SYNC_PROC_PATTERN="${IRONCLAUDE_SYNC_PROC_PATTERN:-episodic-memory/dist/sync-cli.js}"
+if pgrep -f "$SYNC_PROC_PATTERN" > /dev/null; then
+  log_hook "EPISODIC-MEMORY-SYNC" "Passed" "sync already running"
+  exit 0
+fi
+
 # Run the actual sync
 log_hook "EPISODIC-MEMORY-SYNC" "Started" "syncing..."
 node "${CLAUDE_PLUGIN_ROOT}/mcp-servers/episodic-memory/dist/sync-cli.js" "$@"

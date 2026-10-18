@@ -1,16 +1,16 @@
 ---
 name: advisor-fallback
-description: Client-aware tiered-up adversarial advisor (Claude subagent / fixed-function Codex broker), fired at natural discretionary advisor points
+description: Client-aware adversarial advisor one class up, capped at the Opus class (Claude subagent / fixed-function Codex broker), fired at natural discretionary advisor points
 ---
 
-# Advisor Fallback (manual tiered-up advisor)
+# Advisor Fallback (manual class-capped advisor)
 
 ## Purpose
 
-The reliable advisor is a **tiered-up adversarial reviewer** you invoke yourself — not the
+The reliable advisor is an **adversarial reviewer one class up, capped at the Opus class** you invoke yourself — not the
 `advisor` tool / `/advisor` slash command, which is flaky and, for Codex, does not exist. This skill
 is the standard advisor path for **both** clients: at the moments you would normally consult an advisor,
-dispatch a fresh, blind, one-tier-up reviewer over the work and weigh its findings.
+dispatch a fresh, blind reviewer one class up, capped at the Opus class, over the work (the top tier — Fable or Astra — only when the operator explicitly requests it) and weigh its findings.
 
 This is the same role the `advisor` tool plays, delivered by a subagent (Claude) or the fixed-function
 `run_codex_advisor_review` broker (Codex) so it works regardless of which client you are.
@@ -29,14 +29,15 @@ judgment, not on a fixed cadence.
 
 ## How to invoke it — pick your client's branch
 
-Resolve the **one-tier-up** reviewer model from your OWN client's ladder, then run that branch. Both
+Resolve the reviewer model (one class up, capped at the Opus class) from your OWN client's ladder, then run that branch. Both
 branches are report-only: the reviewer identifies problems with evidence; it does not rewrite the work.
 
 ### If you are a Claude session
 
-Dispatch a fresh, blind subagent with the `Agent` tool (`subagent_type="general-purpose"`,
-`model=<one-tier-up>`), giving it the task, the change/decision, the evidence, and the specific questions
-to pressure-test. Have it follow the `ironclaude:adversarial-review` methodology (orientation → deep read
+Dispatch a fresh, blind subagent with the `Agent` tool (`subagent_type="ironclaude:reviewer"`, IronClaude's locked report-only
+reviewer with Read, Grep and Glob only — no Bash, Edit, Write, Skill or MCP tools — and `model=opus`, or `model=sonnet` from a
+Haiku session — see **Claude reviewer** below), giving it the task, the change/decision, the evidence, and the specific questions
+to pressure-test. The reviewer cannot run commands, so put the diff, test output and any other command evidence in the prompt. Have it follow the `ironclaude:adversarial-review` methodology (orientation → deep read
 → verify every finding with grep/read evidence, drop the unverified → severity-classified, report-only).
 
 Before dispatch, read `worker/skills/write-lossless-ai-messages/SKILL.md`. Prepend its exact complete
@@ -44,10 +45,7 @@ skill content to the reviewer prompt, ahead of task, evidence, and questions. Th
 not activate an interactive worker skill: do not include `IC_LOSSLESS_AI_MESSAGES_ACTIVE` in the prompt or
 report. Keep the report natural-language and lossless; this grants no new tools.
 
-**Claude tier ladder (one tier up):** `sonnet → opus`, `opus → fable`, `fable → (top tier — skip; no
-higher advisor)`. If the resolved model is `fable` and Fable is unavailable, use `opus` (read the flag at
-`IRONCLAUDE_FABLE_STATE_PATH` if set else `~/.ironclaude/state/fable_unavailable.json`; on any read error
-treat Fable as available). This is the existing behavior — `model=fable`, else `model=opus`.
+**Claude reviewer:** `haiku → sonnet`, `sonnet → opus`, `opus → opus` (a fresh, blind same-class pass), `fable → opus`. Use `model=fable` only when the operator explicitly requests the top tier; if Fable is then unavailable, use `opus` (read the flag at `IRONCLAUDE_FABLE_STATE_PATH` if set else `~/.ironclaude/state/fable_unavailable.json`; on any read error treat Fable as available).
 
 ### If you are a Codex session
 
@@ -60,8 +58,7 @@ Call `run_codex_advisor_review` with exactly three fields:
   task and decision, operator constraints, evidence, specific questions, and every code/diff or artifact
   byte needed to review without repository reads. State whether blindness is required, and exclude prior
   findings, verdicts, repair coaching, reviewer identities, and revision history when it is.
-- `review_tier: "one-up"` for normal advisor work. The selector is bounded to
-  `"same"` or `"one-up"`; omission defaults to `"one-up"` only for compatibility.
+- `review_tier: "one-up"` from a Luna or Terra session; `review_tier: "same"` from a Sol or Astra session (Sol reviews Sol); `review_tier: "one-up"` from Sol (Astra) only when the operator explicitly requests the top tier. The selector is bounded to `"same"` or `"one-up"`; omission defaults to `"one-up"` only for compatibility.
 
 Before constructing `packet`, read `worker/skills/write-lossless-ai-messages/SKILL.md` and prepend its
 exact complete skill content ahead of the adversarial-review instruction and inline evidence. Programmatic
@@ -73,12 +70,12 @@ Do not run nested `codex exec` from the main agent for normal advisor work. Do n
 approve the broker or its fixed read-only review again: IronClaude's broker is the approved workflow
 surface. If the broker fails, report its bounded error and fail closed rather than bypassing it.
 
-**Codex tier ladder (broker-owned, one mapping only):** `luna (haiku) → terra (sonnet) → sol (opus) → astra (fable)`
+**Codex broker mapping for `"one-up"` (broker-owned, one mapping only):** `luna (haiku) → terra (sonnet) → sol (opus) → astra (fable)`
 (`gpt-<version>-luna → gpt-<version>-terra → gpt-<version>-sol → gpt-<version>-astra`). The broker
-resolves each tier to the newest installed model in `$CODEX_HOME/models_cache.json` (built-in
-fallback `gpt-6-luna`, `gpt-5.6-terra`, `gpt-6-sol`, `gpt-6-astra`), so today it maps
-**`gpt-6-sol` → `gpt-6-astra`**. At the Astra ceiling it runs
-**`gpt-6-astra` → `gpt-6-astra`**, a same-tier blind pass. The reviewer stays a Codex model;
+resolves each tier to the newest installed model in `$CODEX_HOME/models_cache.json`. It has no pinned
+fallback: with no installed model at the one-up tier or above, it returns `codex-reviewer-model-unavailable`.
+With today's installed models it maps **`gpt-6-sol` → `gpt-6-astra`**. That is why a Sol session asks for
+`"same"`. At the Astra ceiling it runs **`gpt-6-astra` → `gpt-6-astra`**, a same-tier blind pass. The reviewer stays a Codex model;
 do not cross to a Claude model. Astra remains a Codex model and does not satisfy an actual Claude Fable request.
 
 ## Codex broker guarantees

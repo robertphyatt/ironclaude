@@ -1,0 +1,93 @@
+{
+  "name": "Codex grader hardening and fast-model denylist completion",
+  "goal": "Make the Commander's grader and fast-model children run the same way on Claude and Codex, with no tools and no hooks; the Codex grader also stops failing on the schema.",
+  "requirements_file": "docs/plans/2026-10-17-codex-grader-harden-and-denylist-design.md",
+  "design_file": "docs/plans/2026-10-17-codex-grader-harden-and-denylist-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Baseline probes before any change",
+      "description": "Per plan.md Task 1. No tests required: measurements only, no source change. STOP if a positive control (Steps 2, 3) does not show its baseline.",
+      "allowed_files": ["docs/plans/2026-10-17-codex-grader-harden-and-denylist-findings.md"],
+      "depends_on": [],
+      "steps": [
+        {"description": "Scratch setup + grader_probe.py: run plan.md Task 1 Step 1 block verbatim (notes.txt holds CGH-SENTINEL-5e07aa; grade-prompt.txt, read-prompt.txt (no NO_TOOLS escape), grader_probe.py under /private/tmp/claude-502/cgh)", "expected": "ls includes grade-prompt.txt grader_probe.py notes.txt read-prompt.txt"},
+        {"description": "Codex grader schema baseline", "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python /private/tmp/claude-502/cgh/grader_probe.py codex shipped /private/tmp/claude-502/cgh/grade-prompt.txt > /private/tmp/claude-502/cgh/b-codex-schema.log 2>&1; echo \"probe=$?\"; cat /private/tmp/claude-502/cgh/b-codex-schema.log", "expected": "rc= non-zero, parsed= F failure verdict, invalid_json_schema=True; real verdict -> STOP and report"},
+        {"description": "Codex grader file-read baseline (strict schema isolates argv)", "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python /private/tmp/claude-502/cgh/grader_probe.py codex strict /private/tmp/claude-502/cgh/read-prompt.txt > /private/tmp/claude-502/cgh/b-codex-read.log 2>&1; echo \"probe=$?\"; cat /private/tmp/claude-502/cgh/b-codex-read.log; echo \"token_lines=$(rg -c CGH-SENTINEL-5e07aa /private/tmp/claude-502/cgh/b-codex-read.log)\"; echo \"hook_lines=$(rg -c -i -e hook -e 'professional mode' /private/tmp/claude-502/cgh/b-codex-read.log)\"", "expected": "rc=0, token_lines= empty, hook_lines>=1 (shell exists; user-config IronClaude hooks block it; measured 2026-10-17); hook_lines empty and token absent -> STOP and report"},
+        {"description": "Claude grader baseline", "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python /private/tmp/claude-502/cgh/grader_probe.py claude shipped /private/tmp/claude-502/cgh/grade-prompt.txt > /private/tmp/claude-502/cgh/b-claude-grade.log 2>&1; echo \"probe=$?\"; cat /private/tmp/claude-502/cgh/b-claude-grade.log", "expected": "rc=0, parsed= object with grade A-F and non-empty feedback"},
+        {"description": "Write findings 'Baseline (before change)' with full Step 2-4 logs and Step 3 token_lines + hook_lines; stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-17-codex-grader-harden-and-denylist-findings.md", "expected": "no output"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Complete the fast-model denylist",
+      "description": "Per plan.md Task 2: tests (11 names + parity) RED, constant -> parity drift caught, hook test RED, hook + doc GREEN, stage.",
+      "allowed_files": [
+        "commander/src/ironclaude/fast_model.py",
+        "commander/tests/test_fast_model.py",
+        "worker/hooks/plan-validator.sh",
+        "worker/hooks/tests/test-fast-model-fallback.sh",
+        "worker/config-schema/llm-backend.md"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "RED: test_fast_model.py edits + append test_codex_disabled_features_match_hook_list, verbatim per plan.md Task 2 Step 1", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_fast_model.py -q > /private/tmp/claude-502/cgh/t2-red.log 2>&1; echo \"red=$?\"; rg -n '^(FAILED|ERROR)' /private/tmp/claude-502/cgh/t2-red.log; tail -n 1 /private/tmp/claude-502/cgh/t2-red.log", "expected": "red=1; FAILED exactly test_codex_argv_is_ephemeral_low_effort and test_codex_argv_disables_every_tool_feature; parity test passes"},
+        {"description": "Constant -> 11 names per plan.md Task 2 Step 2; prove parity catches drift", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_fast_model.py -q > /private/tmp/claude-502/cgh/t2-drift.log 2>&1; echo \"drift=$?\"; rg -n '^(FAILED|ERROR)' /private/tmp/claude-502/cgh/t2-drift.log", "expected": "drift=1; FAILED exactly test_codex_disabled_features_match_hook_list"},
+        {"description": "Hook RED: both argv-head asserts get memories/plugins/hooks flags inserted after image_generation, head -n 35 (plan.md Task 2 Step 3)", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-fast-model-fallback.sh > /private/tmp/claude-502/cgh/t2-hook-red.log 2>&1; echo \"rc=$?\"; rg -n '^FAIL' /private/tmp/claude-502/cgh/t2-hook-red.log", "expected": "exactly 2 FAIL lines: `FAIL: codex isolation flags (argv head)` and `FAIL: codex sonnet isolation flags (argv head)`"},
+        {"description": "GREEN: plan-validator.sh insert memories/plugins/hooks line; llm-backend.md:233 text per plan.md Task 2 Step 4", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_fast_model.py tests/test_fast_model_chain.py -q > /private/tmp/claude-502/cgh/t2-green.log 2>&1; echo \"green=$?\"; rg -n '^(FAILED|ERROR)' /private/tmp/claude-502/cgh/t2-green.log; tail -n 1 /private/tmp/claude-502/cgh/t2-green.log; bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-fast-model-fallback.sh > /private/tmp/claude-502/cgh/t2-hook-green.log 2>&1; echo \"hook=$?\"; tail -n 1 /private/tmp/claude-502/cgh/t2-hook-green.log", "expected": "green=0, 0 failed; hook=0, `Results: 67 passed, 0 failed`"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/fast_model.py commander/tests/test_fast_model.py worker/hooks/plan-validator.sh worker/hooks/tests/test-fast-model-fallback.sh worker/config-schema/llm-backend.md", "expected": "no output"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Codex grader: isolation flags, strict schema, null stripping",
+      "description": "Per plan.md Task 3: append 4 tests to test_grader_routing.py (RED 3), implement _codex_grader_argv flags, _codex_grader_schema, _drop_null_recommended, schema dump + parser changes (GREEN), stage.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_grader_routing.py"
+      ],
+      "depends_on": [2],
+      "steps": [
+        {"description": "RED: append _ALL_OFF + 4 tests verbatim from plan.md Task 3 Step 1", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_grader_routing.py -q > /private/tmp/claude-502/cgh/t3-red.log 2>&1; echo \"red=$?\"; rg -n '^(FAILED|ERROR)' /private/tmp/claude-502/cgh/t3-red.log; tail -n 1 /private/tmp/claude-502/cgh/t3-red.log", "expected": "red=1; FAILED exactly test_codex_grader_argv_has_no_tools_and_ignores_user_config, test_codex_grader_sends_strict_schema, test_codex_grader_drops_null_recommended_model; test_claude_grader_keeps_original_schema passes"},
+        {"description": "GREEN: orchestrator_mcp.py changes verbatim from plan.md Task 3 Step 2", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_grader_routing.py tests/test_orchestrator_mcp.py -q -k \"grader or Grader\" > /private/tmp/claude-502/cgh/t3-green.log 2>&1; echo \"green=$?\"; rg -n '^(FAILED|ERROR)' /private/tmp/claude-502/cgh/t3-green.log; tail -n 1 /private/tmp/claude-502/cgh/t3-green.log", "expected": "green=0, 0 failed"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_grader_routing.py", "expected": "no output"}
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Claude grader with no tools and no hooks",
+      "description": "Per plan.md Task 4: 3 test edits (RED 3), _claude_grader_argv --tools \"\" + --settings fast_model._DISABLE_HOOKS_SETTINGS + comment (GREEN), stage.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/tests/test_grader_routing.py",
+        "commander/tests/test_orchestrator_mcp.py"
+      ],
+      "depends_on": [3],
+      "steps": [
+        {"description": "RED: test edits verbatim from plan.md Task 4 Step 1", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_grader_routing.py tests/test_orchestrator_mcp.py -q -k \"claude_grader_argv_is_stable or grader_disallows_agentic_and_mcp_tools or disallows_task_and_edit_tools\" > /private/tmp/claude-502/cgh/t4-red.log 2>&1; echo \"red=$?\"; rg -n '^(FAILED|ERROR)' /private/tmp/claude-502/cgh/t4-red.log; tail -n 1 /private/tmp/claude-502/cgh/t4-red.log", "expected": "red=1; exactly 3 failed: test_claude_grader_argv_is_stable, test_grader_disallows_agentic_and_mcp_tools, test_disallows_task_and_edit_tools"},
+        {"description": "GREEN: _claude_grader_argv edits verbatim from plan.md Task 4 Step 2", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_grader_routing.py tests/test_orchestrator_mcp.py -q -k \"grader or Grader\" > /private/tmp/claude-502/cgh/t4-green.log 2>&1; echo \"green=$?\"; rg -n '^(FAILED|ERROR)' /private/tmp/claude-502/cgh/t4-green.log; tail -n 1 /private/tmp/claude-502/cgh/t4-green.log", "expected": "green=0, 0 failed"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/tests/test_grader_routing.py commander/tests/test_orchestrator_mcp.py", "expected": "no output"}
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Probes after the change, regression, findings and staging",
+      "description": "Per plan.md Task 5.",
+      "allowed_files": [
+        "docs/plans/2026-10-17-codex-grader-harden-and-denylist-design.md",
+        "docs/plans/2026-10-17-codex-grader-harden-and-denylist.md",
+        "docs/plans/2026-10-17-codex-grader-harden-and-denylist.plan.json",
+        "docs/plans/2026-10-17-codex-grader-harden-and-denylist-findings.md"
+      ],
+      "depends_on": [4],
+      "steps": [
+        {"description": "Codex grader after", "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python /private/tmp/claude-502/cgh/grader_probe.py codex shipped /private/tmp/claude-502/cgh/grade-prompt.txt > /private/tmp/claude-502/cgh/a-codex-schema.log 2>&1; echo \"probe=$?\"; cat /private/tmp/claude-502/cgh/a-codex-schema.log; /Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python /private/tmp/claude-502/cgh/grader_probe.py codex strict /private/tmp/claude-502/cgh/read-prompt.txt > /private/tmp/claude-502/cgh/a-codex-read.log 2>&1; echo \"probe=$?\"; cat /private/tmp/claude-502/cgh/a-codex-read.log; echo \"token_lines=$(rg -c CGH-SENTINEL-5e07aa /private/tmp/claude-502/cgh/a-codex-read.log)\"; echo \"hook_lines=$(rg -c -i -e hook -e 'professional mode' /private/tmp/claude-502/cgh/a-codex-read.log)\"", "expected": "a-codex-schema: rc=0, invalid_json_schema=False, parsed grade A-F with non-empty feedback; a-codex-read: rc=0, token_lines= empty, hook_lines= empty (no shell command ran; dropping user config is pinned by the argv unit test, not this probe)"},
+        {"description": "Claude grader after", "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python /private/tmp/claude-502/cgh/grader_probe.py claude shipped /private/tmp/claude-502/cgh/grade-prompt.txt > /private/tmp/claude-502/cgh/a-claude-grade.log 2>&1; echo \"probe=$?\"; cat /private/tmp/claude-502/cgh/a-claude-grade.log; /Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python /private/tmp/claude-502/cgh/grader_probe.py claude shipped /private/tmp/claude-502/cgh/read-prompt.txt > /private/tmp/claude-502/cgh/a-claude-read.log 2>&1; echo \"probe=$?\"; cat /private/tmp/claude-502/cgh/a-claude-read.log; echo \"token_lines=$(rg -c CGH-SENTINEL-5e07aa /private/tmp/claude-502/cgh/a-claude-read.log)\"; echo \"hook_lines=$(rg -c -i -e hook -e 'professional mode' /private/tmp/claude-502/cgh/a-claude-read.log)\"", "expected": "a-claude-grade: rc=0, parsed grade A-F, non-empty feedback (not 'no structured_output'); a-claude-read: rc=0, token_lines= empty, hook_lines= empty"},
+        {"description": "Fast-model probes with 11 flags", "command": "/Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python /private/tmp/claude-502/cfnt/cmd_probe.py /private/tmp/claude-502/cfnt/read-prompt.txt > /private/tmp/claude-502/cgh/a-fast-cmd-read.json 2>&1; echo \"rc=$?\"; cat /private/tmp/claude-502/cgh/a-fast-cmd-read.json; echo \"token_lines=$(rg -c CFNT-SENTINEL-93d1c7 /private/tmp/claude-502/cgh/a-fast-cmd-read.json)\"; /Users/roberthyatt/Code/ironclaude/commander/.venv/bin/python /private/tmp/claude-502/cfnt/cmd_probe.py /private/tmp/claude-502/cfnt/plain-prompt.txt > /private/tmp/claude-502/cgh/a-fast-cmd-plain.json 2>&1; echo \"rc=$?\"; cat /private/tmp/claude-502/cgh/a-fast-cmd-plain.json; bash /private/tmp/claude-502/cfnt/hook_probe.sh /private/tmp/claude-502/cfnt/plain-prompt.txt > /private/tmp/claude-502/cgh/a-fast-hook-plain.txt 2>&1; cat /private/tmp/claude-502/cgh/a-fast-hook-plain.txt", "expected": "rc=0; a-fast-cmd-read.json has answer, no infrastructure_error, token_lines= empty; a-fast-cmd-plain.json has answer, no infrastructure_error; a-fast-hook-plain.txt JSON object with answer then rc=0"},
+        {"description": "Full Commander suite", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/ -q > /private/tmp/claude-502/cgh/suite.log 2>&1; echo \"suite=$?\"; rg -n '^(FAILED|ERROR)' /private/tmp/claude-502/cgh/suite.log; tail -n 1 /private/tmp/claude-502/cgh/suite.log", "expected": "suite=0, 0 failed, no FAILED/ERROR lines"},
+        {"description": "Hooks suite", "command": "for t in /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-*.sh; do bash \"$t\" > \"/private/tmp/claude-502/cgh/hooks-$(basename \"$t\").log\" 2>&1; echo \"$(basename \"$t\") rc=$?\"; done; rg -l '^FAIL' /private/tmp/claude-502/cgh/ --glob 'hooks-*.log'; echo \"fail_files_rc=$?\"", "expected": "42 lines all rc=0; no file names printed; fail_files_rc=1"},
+        {"description": "Append 'After change' to findings (Steps 1-3 outputs + suite/hooks summaries); stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-17-codex-grader-harden-and-denylist-design.md docs/plans/2026-10-17-codex-grader-harden-and-denylist.md docs/plans/2026-10-17-codex-grader-harden-and-denylist.plan.json docs/plans/2026-10-17-codex-grader-harden-and-denylist-findings.md; git -C /Users/roberthyatt/Code/ironclaude diff --cached --name-status", "expected": "M for 8 source/test/doc files from Tasks 2-4 and A for the 4 plan docs (12 lines)"}
+      ]
+    }
+  ]
+}

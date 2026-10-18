@@ -9,11 +9,14 @@
 
 # _has_blocked_metachars CMD -> 0 (true) if CMD contains a metacharacter that
 # could chain, substitute, redirect, or inject a second command.
-# Blocks: ; & | ` $(  > <  and newline.
+# Blocks: ; & | ` $(  > <  newline, and brace groups containing , or ..
 _has_blocked_metachars() {
   local cmd="$1"
   case "$cmd" in *$'\n'*) return 0 ;; esac
   if printf '%s' "$cmd" | grep -qE '[;&|`<>]|\$\('; then return 0; fi
+  # A brace group with , or .. expands after the check (find /tmp {-delete,}); design 2026-10-18
+  # v120-security-fixes-remediation 1b-R. Braces without either (HEAD@{1}, -exec … {}) do not.
+  if printf '%s' "$cmd" | grep -qE '\{[^{}]*(,|\.\.)[^{}]*\}'; then return 0; fi
   return 1
 }
 

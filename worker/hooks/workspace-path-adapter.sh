@@ -537,6 +537,12 @@ workspace_prepare_input() {
 }
 
 workspace_allow() {
+  # professional-mode-guard.sh records the writer of an allowed file-tool write (drift
+  # writer log). Isolated: it never prints, never fails the allow, never drops the
+  # updatedInput below.
+  if type ic_guard_record_writer >/dev/null 2>&1; then
+    ( ic_guard_record_writer ) >/dev/null 2>&1 || :
+  fi
   if [ -n "$WORKSPACE_UPDATED_INPUT" ]; then
     jq -cn --argjson updated "$WORKSPACE_UPDATED_INPUT" \
       '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",updatedInput:$updated}}'

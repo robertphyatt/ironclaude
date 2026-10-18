@@ -15,7 +15,7 @@ from ironclaude.communication_profiles import (
 )
 from ironclaude.backend_resolver import make_client, resolve_backend
 from ironclaude.grader import GRADER_SCHEMA_MIN_MAX_TOKENS, GRAMMAR_MAX_STRING_LENGTH
-from ironclaude.ollama_client import OllamaClient, OllamaError
+from ironclaude.ollama_client import OllamaClient, OllamaConnectionError, OllamaError
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +153,8 @@ class ShadowGrader:
             resolved = resolve_backend(cfg, "shadow")
             self._backend = resolved.backend
             self._model = resolved.model or _DEFAULT_SHADOW_MODEL
+            if self._backend == "haiku":
+                return None
             if self._backend == "openai":
                 self._max_tokens = resolved.max_tokens or 1024
                 self._client = make_client(
@@ -208,9 +210,13 @@ class ShadowGrader:
             elif name == "git_diff":
                 rp = arguments.get("repo_path", "")
                 self._validate_path(rp, repo_path)
+                # GIT_OPTIONAL_LOCKS=0 for consistency with IronClaude's other reads; `git diff`
+                # still refreshes the index under the lock, so a 10 s kill mid-refresh can leave
+                # a stale .git/index.lock (design 2026-10-18 lock-free-read-git).
                 result = subprocess.run(
                     ["git", "--no-ext-diff", "-c", "core.fsmonitor=", "-c", "diff.textconv=", "diff"],
                     capture_output=True, text=True, timeout=10, cwd=rp,
+                    env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
                 )
                 return result.stdout[:8000] or "(no changes)"
             else:
@@ -301,6 +307,10 @@ class ShadowGrader:
             client = self._get_client()
         except Exception as e:
             return self._build_error(f"Failed to init Ollama client: {e}")
+        if self._backend == "haiku":
+            return {**self._build_error(
+                "shadow spot resolves to backend 'haiku': the shadow grader needs a local box; "
+                "set spots.shadow.backend"), "skipped": True}
 
         messages = [
             {
@@ -334,7 +344,10 @@ class ShadowGrader:
             try:
                 content, tool_calls = client.post_chat(payload)
             except OllamaError as e:
-                return self._build_error(str(e), recorded_tool_calls)
+                err = self._build_error(str(e), recorded_tool_calls)
+                if isinstance(e, OllamaConnectionError):
+                    err["unreachable"] = True
+                return err
 
             if tool_calls:
                 messages.append(self._assistant_tool_call_msg(content, tool_calls))
@@ -406,7 +419,10 @@ class ShadowGrader:
             try:
                 content, _ = client.post_chat(verdict_payload)
             except OllamaError as e:
-                return self._build_error(str(e), recorded_tool_calls)
+                err = self._build_error(str(e), recorded_tool_calls)
+                if isinstance(e, OllamaConnectionError):
+                    err["unreachable"] = True
+                return err
 
             logger.debug("shadow_grader verdict raw: %r", content[:200])
 

@@ -12,6 +12,7 @@ import {
   type CommanderLocalCommitInput,
 } from './integration.js';
 import { WorkspaceService } from './workspace-service.js';
+import { beginHandoff, finishHandoff, finishHandoffAfterTarget, reapStaleMutations, releaseHandoff, transferHandoff, type HandoffInput, type ReleaseHandoffInput, type TransferHandoffInput } from './handoff.js';
 
 type Args = Record<string, unknown>;
 type InternalDependency = (args: Args) => unknown;
@@ -30,9 +31,16 @@ export interface InternalCommandDependencies {
   listSurfacedOrphans: InternalDependency;
   'reap-orphans': InternalDependency;
   'resolve-orphan': InternalDependency;
+  'begin-handoff'?: InternalDependency;
+  'transfer-handoff'?: InternalDependency;
+  'finish-handoff'?: InternalDependency;
+  'handoff-status'?: InternalDependency;
+  'reap-stale-mutations'?: InternalDependency;
+  'release-handoff'?: InternalDependency;
+  'finish-handoff-after-target'?: InternalDependency;
 }
 
-export const INTERNAL_COMMAND_NAMES = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile', 'cleanup', 'sync', 'reap', 'configure-shared-resources', 'list-shared-resources', 'list-surfaced-orphans', 'reap-orphans', 'resolve-orphan'] as const;
+export const INTERNAL_COMMAND_NAMES = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile', 'cleanup', 'sync', 'reap', 'configure-shared-resources', 'list-shared-resources', 'list-surfaced-orphans', 'reap-orphans', 'resolve-orphan', 'begin-handoff', 'transfer-handoff', 'finish-handoff', 'handoff-status', 'reap-stale-mutations', 'release-handoff', 'finish-handoff-after-target'] as const;
 
 function waitForCliDatabase(milliseconds: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
@@ -59,6 +67,38 @@ function requiredString(args: Args, key: string): string {
   const value = args[key];
   if (typeof value !== 'string' || value.length === 0) throw new Error(`${key} must be a non-empty string`);
   return value;
+}
+
+function requiredPositiveInteger(args: Args, key: string): number {
+  const value = args[key];
+  if (!Number.isInteger(value) || (value as number) <= 0) throw new Error(`${key} must be a positive integer`);
+  return value as number;
+}
+
+function handoffInput(args: Args): HandoffInput {
+  return {
+    repositoryPath: requiredString(args, 'repository_path'), repositoryIdentity: requiredString(args, 'repository_identity'),
+    workspaceGuid: requiredString(args, 'workspace_guid'), workerId: requiredString(args, 'worker_id'),
+    sourceOwnerSessionId: requiredString(args, 'source_owner_session_id'), generation: requiredPositiveInteger(args, 'generation'),
+    capabilityToken: requiredString(args, 'capability_token'), expectedWorktreePath: requiredString(args, 'expected_worktree_path'),
+    expectedBranch: requiredString(args, 'expected_branch'), expectedBaseCommit: requiredString(args, 'expected_base_commit'),
+    expectedCurrentHead: requiredString(args, 'expected_current_head'), expectedIntegrationTarget: requiredString(args, 'expected_integration_target'),
+  };
+}
+
+function safeHandoffResult(db: Database.Database, input: HandoffInput): Record<string, unknown> {
+  const handoff = db.prepare(`SELECT workspace_guid, generation, source_owner_session_id, target_owner_session_id,
+    repository_identity, worker_id, worktree_path, branch, base_commit, current_head, integration_target, phase
+    FROM workspace_handoffs WHERE workspace_guid = ?`).get(input.workspaceGuid) as Record<string, unknown> | undefined;
+  if (!handoff) throw new Error('Handoff state disappeared');
+  return { protocol_version: 1, ...handoff };
+}
+
+function handoffStatus(db: Database.Database, workspaceGuid: string): Record<string, unknown> {
+  const handoff = db.prepare(`SELECT workspace_guid, generation, source_owner_session_id, target_owner_session_id,
+    repository_identity, worker_id, worktree_path, branch, base_commit, current_head, integration_target, phase
+    FROM workspace_handoffs WHERE workspace_guid = ?`).get(workspaceGuid) as Record<string, unknown> | undefined;
+  return handoff ? { protocol_version: 1, present: true, ...handoff } : { protocol_version: 1, present: false, workspace_guid: workspaceGuid };
 }
 
 function optionalString(args: Args, key: string): string | undefined {
@@ -192,6 +232,13 @@ export function dispatchInternalCommand(
     case 'list-surfaced-orphans': return dependencies.listSurfacedOrphans(args);
     case 'reap-orphans': return dependencies['reap-orphans'](args);
     case 'resolve-orphan': return dependencies['resolve-orphan'](args);
+    case 'begin-handoff': return dependencies['begin-handoff']?.(args) ?? (() => { throw new Error('begin-handoff dependency is unavailable'); })();
+    case 'transfer-handoff': return dependencies['transfer-handoff']?.(args) ?? (() => { throw new Error('transfer-handoff dependency is unavailable'); })();
+    case 'finish-handoff': return dependencies['finish-handoff']?.(args) ?? (() => { throw new Error('finish-handoff dependency is unavailable'); })();
+    case 'handoff-status': return dependencies['handoff-status']?.(args) ?? (() => { throw new Error('handoff-status dependency is unavailable'); })();
+    case 'reap-stale-mutations': return dependencies['reap-stale-mutations']?.(args) ?? (() => { throw new Error('reap-stale-mutations dependency is unavailable'); })();
+    case 'release-handoff': return dependencies['release-handoff']?.(args) ?? (() => { throw new Error('release-handoff dependency is unavailable'); })();
+    case 'finish-handoff-after-target': return dependencies['finish-handoff-after-target']?.(args) ?? (() => { throw new Error('finish-handoff-after-target dependency is unavailable'); })();
     default: throw new Error(`Unknown internal workspace command: ${name}`);
   }
 }
@@ -308,6 +355,28 @@ export function createInternalCommandDependencies(
       protectedPaths: optionalStringArray(args, 'protected_paths'),
       resolutions: requiredResolutions(args, 'resolutions'),
     }),
+    'begin-handoff': (args) => {
+      const input = handoffInput(args); beginHandoff(db, input); return safeHandoffResult(db, input);
+    },
+    'transfer-handoff': (args) => {
+      const input: TransferHandoffInput = { ...handoffInput(args), targetOwnerSessionId: requiredString(args, 'target_owner_session_id') };
+      transferHandoff(db, input); return safeHandoffResult(db, input);
+    },
+    'finish-handoff': (args) => {
+      const input = handoffInput(args); finishHandoff(db, input); return safeHandoffResult(db, input);
+    },
+    'handoff-status': (args) => handoffStatus(db, requiredString(args, 'workspace_guid')),
+    'reap-stale-mutations': () => ({ protocol_version: 1, reaped: reapStaleMutations(db) }),
+    'release-handoff': (args) => {
+      const input: ReleaseHandoffInput = {
+        workspaceGuid: requiredString(args, 'workspace_guid'), generation: requiredPositiveInteger(args, 'generation'),
+        capabilityToken: requiredString(args, 'capability_token'), sourceOwnerSessionId: requiredString(args, 'source_owner_session_id'),
+      };
+      releaseHandoff(db, input); return handoffStatus(db, input.workspaceGuid);
+    },
+    'finish-handoff-after-target': (args) => {
+      const input = handoffInput(args); finishHandoffAfterTarget(db, input); return safeHandoffResult(db, input);
+    },
   };
 }
 

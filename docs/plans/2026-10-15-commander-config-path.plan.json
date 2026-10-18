@@ -1,0 +1,27 @@
+{
+  "name": "Commander config path",
+  "goal": "Make Commander config loading independent of the process cwd so the orchestrator MCP reads commander/config/ironclaude.json (swap 50 GB, critical-only), with worker and grader routing set to prefer Claude.",
+  "requirements_file": "docs/plans/2026-10-15-commander-config-path-design.md",
+  "design_file": "docs/plans/2026-10-15-commander-config-path-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Anchor config paths and prefer Claude routing",
+      "description": "TDD. Code blocks verbatim in docs/plans/2026-10-15-commander-config-path.md Task 1 Steps 1-4; apply exactly. Invariants: literal absolute paths; git -C /Users/roberthyatt/Code/ironclaude; pytest with PYTHONUNBUFFERED=1 via commander/.venv/bin/python from /Users/roberthyatt/Code/ironclaude/commander; never stash/commit/push. Verified: config.py has no pathlib import (:4-18); load_config :143; load_machines_config :234; orchestrator_mcp.py :38 imports from ironclaude.config, :496 machines path default 'config/machines.yaml'; test_config.py imports json/os/Path/pytest; shipped ironclaude.json worker/grader preferred codex.",
+      "allowed_files": [
+        "commander/src/ironclaude/config.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/config/ironclaude.json",
+        "commander/tests/test_config.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Tests (RED): append class TestConfigPathAnchoring (plan.md Step 1) to commander/tests/test_config.py; the anchored machines.yaml entry includes claude_path: /usr/bin/claude (normalize_machine_clients requires claude_path or clients, provider_config.py:242-247)."},
+        {"description": "RED run.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_config.py -q -k TestConfigPathAnchoring", "expected": "3 failed (AttributeError on _COMMANDER_ROOT x2; preferred 'codex' != 'claude'); record measured output."},
+        {"description": "GREEN per plan.md Step 2: config.py adds pathlib import, _COMMANDER_ROOT, default_config_path(), default_machines_config_path(); both loaders take config_path: str | None = None and resolve via the defaults; orchestrator_mcp.py :38 import + :496 default; ironclaude.json worker/grader -> preferred claude, clients [claude, codex]."},
+        {"description": "GREEN + commander suite + no relative defaults left.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_config.py -q > /private/tmp/claude-502/cfg-g.out 2>&1; echo \"cfg=$?\"; tail -n 3 /private/tmp/claude-502/cfg-g.out; PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/ -q >/private/tmp/claude-502/cmd-g.out 2>&1; echo \"suite=$?\"; tail -n 3 /private/tmp/claude-502/cmd-g.out; grep -rn -e '\"config/ironclaude.json\"' -e '\"config/machines.yaml\"' /Users/roberthyatt/Code/ironclaude/commander/src/ironclaude; echo \"relative_left=$?\"", "expected": "cfg=0 (0 failed); suite=0 (0 failed); relative_left=1. Each full-suite failure must be shown pre-existing at HEAD (no git stash) or fixed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/config.py commander/src/ironclaude/orchestrator_mcp.py commander/config/ironclaude.json commander/tests/test_config.py; git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-15-commander-config-path-design.md docs/plans/2026-10-15-commander-config-path.md docs/plans/2026-10-15-commander-config-path.plan.json", "expected": "No output."}
+      ]
+    }
+  ]
+}

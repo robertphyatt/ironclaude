@@ -37,7 +37,7 @@ const PUBLIC_TOOLS = [
   'list_preserved_work',
 ] as const;
 
-const INTERNAL_COMMANDS = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile', 'cleanup', 'sync', 'reap', 'configure-shared-resources', 'list-shared-resources', 'list-surfaced-orphans', 'reap-orphans', 'resolve-orphan'] as const;
+const INTERNAL_COMMANDS = ['allocate', 'bind', 'finalize', 'abandon', 'reconcile', 'cleanup', 'sync', 'reap', 'configure-shared-resources', 'list-shared-resources', 'list-surfaced-orphans', 'reap-orphans', 'resolve-orphan', 'begin-handoff', 'transfer-handoff', 'finish-handoff', 'handoff-status', 'reap-stale-mutations', 'release-handoff', 'finish-handoff-after-target'] as const;
 
 function publicDependencies(): PublicToolDependencies {
   return {
@@ -74,6 +74,13 @@ function internalDependencies(): InternalCommandDependencies {
       repositoryIdentity: '/r/.git', reaped: [], reapedWorktreeOnly: [], preservedDirty: [], preservedUnmerged: [], skippedLive: [], skippedYoung: [], errors: [],
     }),
     'resolve-orphan': vi.fn().mockReturnValue({ results: [] }),
+    'begin-handoff': vi.fn().mockReturnValue({ phase: 'begun' }),
+    'transfer-handoff': vi.fn().mockReturnValue({ phase: 'transferred' }),
+    'finish-handoff': vi.fn().mockReturnValue({ phase: 'finished' }),
+    'handoff-status': vi.fn().mockReturnValue({ present: false }),
+    'reap-stale-mutations': vi.fn().mockReturnValue({ reaped: [] }),
+    'release-handoff': vi.fn().mockReturnValue({ phase: 'finished' }),
+    'finish-handoff-after-target': vi.fn().mockReturnValue({ phase: 'finished' }),
   };
 }
 
@@ -300,6 +307,17 @@ describe('workspace-manager entrypoint surfaces', () => {
     const dependencies = createInternalCommandDependencies({} as never);
     expect(() => dependencies.finalize({ command: {}, reviewed_evidence: { forged: true } }))
       .toThrow('Commander finalization input is malformed');
+  });
+
+  it('validates private finalization input before claiming an assignment mutation', () => {
+    const untouchable = new Proxy({}, { get: () => { throw new Error('database touched'); } });
+    const dependencies = createInternalCommandDependencies(untouchable as never);
+    expect(() => dependencies.finalize({ command: { repositoryPath: '/repo' } }))
+      .toThrow('Commander finalization input is malformed');
+    expect(() => dependencies.finalize({ command: {
+      repositoryPath: '/repo', workspaceGuid: 'workspace', providerRootSessionId: 'root', message: 'reviewed',
+      canonicalBranch: 'ironclaude/workspace', localRef: 'refs/heads/ironclaude/workspace', stagedTree: 'tree', parentOid: 'parent',
+    } })).toThrow('database touched');
   });
 
   it('rejects direct-human authority consumption from a Codex subagent identity', () => {

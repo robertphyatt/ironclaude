@@ -4,7 +4,7 @@ Implements the single resolution rule documented in
 `worker/config-schema/llm-backend.md` (steps 1-3). The shared conformance
 fixture `worker/config-schema/resolution-cases.json` pins the deterministic
 cases; per-consumer defaults are applied here for Commander (backend default
-"ollama", ollama url default localhost).
+"haiku" — the Haiku-class fast model, no local box; ollama url default localhost).
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from .ollama_client import OllamaClient
 from .openai_client import OpenAiClient
 
 # Commander's default backend when nothing in the config resolves it (step 1).
-_COMMANDER_DEFAULT_BACKEND = "ollama"
+_COMMANDER_DEFAULT_BACKEND = "haiku"
 _OLLAMA_DEFAULT_URL = "http://localhost:11434"
 
 
@@ -44,7 +44,7 @@ def resolve_backend(cfg: dict, spot: str) -> ResolvedBackend:
     """Resolve backend/model/connection for `spot` from config `cfg`.
 
     Rule (verbatim from llm-backend.md):
-      backend = spots[spot].backend ?? cfg.backend ?? cfg.validation_backend ?? "ollama"
+      backend = spots[spot].backend ?? cfg.backend ?? cfg.validation_backend ?? "haiku"
       model   = spots[spot].model ?? <legacy alias> ?? <resolved-backend-block>.model
       url/fallback/timeout/max_tokens come from the resolved backend block.
     """
@@ -60,18 +60,23 @@ def resolve_backend(cfg: dict, spot: str) -> ResolvedBackend:
 
     ollama_block = cfg.get("ollama") or {}
     openai_block = cfg.get("openai") or {}
-    block = openai_block if backend == "openai" else ollama_block
-
-    model = spot_cfg.get("model") or _legacy_alias(cfg, spot) or block.get("model")
-
-    if backend == "openai":
-        url = openai_block.get("base_url")
-        fallback_url = openai_block.get("fallback_base_url")
-        max_tokens = openai_block.get("max_tokens")
+    if backend == "haiku":
+        # Haiku-class fast model: no local box, so no connection fields and no
+        # backend-block model (mirrors the shell _resolve_spot `*)` arm).
+        block = {}
+        model = spot_cfg.get("model")
+        url = fallback_url = max_tokens = None
     else:
-        url = ollama_block.get("url") or _OLLAMA_DEFAULT_URL
-        fallback_url = ollama_block.get("fallback_url")
-        max_tokens = None
+        block = openai_block if backend == "openai" else ollama_block
+        model = spot_cfg.get("model") or _legacy_alias(cfg, spot) or block.get("model")
+        if backend == "openai":
+            url = openai_block.get("base_url")
+            fallback_url = openai_block.get("fallback_base_url")
+            max_tokens = openai_block.get("max_tokens")
+        else:
+            url = ollama_block.get("url") or _OLLAMA_DEFAULT_URL
+            fallback_url = ollama_block.get("fallback_url")
+            max_tokens = None
 
     timeout = block.get("timeout_seconds") or cfg.get("timeout_seconds")
     connect_timeout = block.get("connect_timeout_seconds") or cfg.get("connect_timeout_seconds")
@@ -99,12 +104,15 @@ def make_client(
     fallback: str | None = None,
     connect_timeout: int | None = None,
     probe_timeout: int | None = None,
+    use_breaker: bool = True,
 ):
     """Build the transport client for a resolved backend.
 
     Returns an OpenAiClient for the openai backend, else an OllamaClient.
     connect_timeout/probe_timeout: explicit value wins; else falls back to the
     resolved backend's config value; else defaults to 3.
+    use_breaker: passed to the client; False skips the transport breaker's allow()
+    gate but still records outcomes (the local grader, R4c one skip rule).
     """
     fallback_url = fallback if fallback is not None else resolved.fallback_url
     ct = connect_timeout if connect_timeout is not None else (resolved.connect_timeout or 3)
@@ -116,6 +124,7 @@ def make_client(
             timeout=timeout,
             connect_timeout=ct,
             probe_timeout=pt,
+            use_breaker=use_breaker,
         )
     return OllamaClient(
         url=resolved.url,
@@ -123,4 +132,5 @@ def make_client(
         timeout=timeout,
         connect_timeout=ct,
         probe_timeout=pt,
+        use_breaker=use_breaker,
     )

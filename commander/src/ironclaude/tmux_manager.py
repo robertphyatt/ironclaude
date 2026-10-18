@@ -369,10 +369,10 @@ class TmuxManager:
             logger.error(f"Failed to send keys to {name}: {result.stderr.decode()}")
             return False
         time.sleep(0.2)
-        self._run(
+        enter_result = self._run(
             ["tmux", "send-keys", "-t", name, "Enter"], ssh_host=ssh_host, capture_output=True
         )
-        return True
+        return enter_result.returncode == 0
 
     def send_raw_keys(self, name: str, keys: list[str], ssh_host: str | None = None) -> bool:
         """Send raw key sequences to a tmux session. No auto-Enter appended."""

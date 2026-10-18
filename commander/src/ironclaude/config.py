@@ -9,6 +9,7 @@ import logging
 import os
 import re as _re
 import shlex
+from pathlib import Path
 
 from ironclaude.provider_config import (
     TIER_NAMES,
@@ -19,6 +20,19 @@ from ironclaude.provider_config import (
 
 logger = logging.getLogger("ironclaude.config")
 
+# commander/ — this file is commander/src/ironclaude/config.py. Defaults resolve
+# from here, not the process cwd: the orchestrator MCP runs with cwd
+# ~/.ironclaude/brain (no config/ dir) and must still read the shipped config.
+_COMMANDER_ROOT = Path(__file__).resolve().parents[2]
+
+
+def default_config_path() -> str:
+    return str(_COMMANDER_ROOT / "config" / "ironclaude.json")
+
+
+def default_machines_config_path() -> str:
+    return str(_COMMANDER_ROOT / "config" / "machines.yaml")
+
 # Allowed effort levels. Interpolated unquoted into make_opus_command's shell
 # string, so an out-of-allowlist value is rejected (defense-in-depth).
 EFFORT_LEVELS = {"low", "medium", "high"}
@@ -27,6 +41,7 @@ DEFAULT_EFFORT_LEVEL = "high"
 DEFAULTS = {
     "poll_interval_seconds": 15,
     "heartbeat_interval_seconds": 900,
+    "blocked_reminder_interval_seconds": 14400,
     "worker_stale_threshold_seconds": 300,
     "idle_worker_ttl_seconds": 1800,
     "brain_heartbeat_timeout_seconds": 60,
@@ -34,6 +49,7 @@ DEFAULTS = {
     "max_worker_retries": 3,
     "min_available_memory_pct": 0.10,
     "max_swap_used_gb": 8.0,
+    "workspace_cli_timeout_seconds": 900,
     "spawn_block_on_pressure": True,
     "spawn_block_pressure_level": 2,
     "ollama_vram_block_threshold_gb": 8.0,
@@ -57,7 +73,7 @@ DEFAULTS = {
         "enabled": True,
         "executor_model": "sonnet",  # CLI routing only — sets --model flag for sonnet workers; not a Brain model selection input
         "advisor_model": "opus",  # scalar fallback for unknown worker types
-        "advisor_models": {"claude-sonnet": "opus", "claude-opus": "fable"},  # one-tier-up map per worker type
+        "advisor_models": {"claude-sonnet": "opus", "claude-opus": "opus"},  # advisor class per worker type (design T8): opus class for both; the top tier (fable) only by explicit config
     },
     "dispatch": {"use_goal": False},
     "providers": {
@@ -76,10 +92,10 @@ DEFAULTS = {
                 "enabled": False,
                 "path": "codex",
                 "models": {
-                    "haiku": "gpt-5.6-luna",
-                    "sonnet": "gpt-5.6-terra",
-                    "opus": "gpt-5.6-sol",
-                    "fable": "gpt-6-astra",
+                    "haiku": "luna",
+                    "sonnet": "terra",
+                    "opus": "sol",
+                    "fable": "astra",
                 },
             },
         },
@@ -139,8 +155,10 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return base
 
 
-def load_config(config_path: str = "config/ironclaude.json") -> dict:
+def load_config(config_path: str | None = None) -> dict:
     """Load config from JSON file, apply env overrides, add env-only vars."""
+    if config_path is None:
+        config_path = default_config_path()
     cfg = copy.deepcopy(DEFAULTS)
 
     # Load JSON if it exists
@@ -230,8 +248,10 @@ def _interpolate_env(value: str) -> str:
     return _ENV_VAR_RE.sub(_replace, value)
 
 
-def load_machines_config(config_path: str = "config/machines.yaml") -> list[dict]:
+def load_machines_config(config_path: str | None = None) -> list[dict]:
     """Load remote machine definitions from YAML. Returns empty list if file missing."""
+    if config_path is None:
+        config_path = default_machines_config_path()
     try:
         import yaml
     except ImportError:

@@ -1,0 +1,34 @@
+{
+  "name": "Episodic memory size measurement",
+  "goal": "Measure where episodic memory's ~80 GB goes (index composition, archive composition, archive-vs-original overlap, compressibility, code paths) so the fix design targets the real bulk.",
+  "requirements_file": "docs/plans/2026-10-07-episodic-memory-size-measure-design.md",
+  "design_file": "docs/plans/2026-10-07-episodic-memory-size-measure-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Measure and record",
+      "description": "Run human plan Task 1 Steps 1-11 exactly. Read-only: every sqlite3 call -readonly; no modification/deletion in ~/.config/superpowers, ~/.claude, ~/.codex; gzip -c | wc -c only. Logs per step in <SP>/epmem/ with timestamps. Steps 2-3 (dbstat, byte sums via length(CAST(text AS BLOB))) as background Bash runs (timeout 3600000); dbstat unavailable -> record and continue. Step 5 greps indexer.ts, paths.ts, sync.ts, codex-sync.ts, codex-paths.ts, sync-cli.ts and confirms mapping by reading (Claude sync.ts:106-110 non-recursive; Codex codex-sync.ts:30-44,102-107 basename index over ~/.codex/sessions + archived_sessions). Step 6 writes overlap.sh with the Write tool exactly as in the human plan (classes ORIG_SAME_SIZE/ORIG_DIFF_SIZE/ORIG_MISSING/GENERATED/UNMAPPED x kinds claude-session/claude-agent/codex-rollout/generated/nested/unknown). Compressibility on 8 named samples + tool_result sample; grep code paths and confirm by reading. Write docs/reviews/2026-10-07-episodic-memory-size-findings.md with measured numbers and per-candidate-fix savings estimates citing their numbers (unmeasured = UNVERIFIED; note -shm read-marks and unarchived current subagent transcripts); stage with loop docs. No tests required: read-only investigation, no product code.",
+      "allowed_files": [
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/epmem/overlap.sh",
+        "docs/reviews/2026-10-07-episodic-memory-size-findings.md",
+        "docs/plans/2026-10-07-episodic-memory-size-measure-design.md",
+        "docs/plans/2026-10-07-episodic-memory-size-measure.md",
+        "docs/plans/2026-10-07-episodic-memory-size-measure.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "File-level sizes, pragmas, object list (human plan Step 1 command)", "expected": "record page_size/page_count/freelist_count and objects"},
+        {"description": "dbstat per-object bytes, background timeout 3600000 (human plan Step 2 command)", "expected": "record per-object bytes or dbstat unavailable"},
+        {"description": "Byte sums (CAST AS BLOB), size bands, top tools, top projects, background timeout 3600000 (human plan Step 3 command)", "expected": "record all result sets"},
+        {"description": "Archive composition (human plan Step 4 command)", "expected": "record per-subdir bytes/files, total, top 20"},
+        {"description": "Confirm original->archive mapping from source (human plan Step 5 grep over six files, then Read)", "expected": "mapping as stated in human plan Step 5 with citations; record any deviation"},
+        {"description": "Write overlap.sh exactly as human plan Step 6 using the Write tool"},
+        {"description": "Run overlap.sh (timeout 600000)", "command": "bash /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/epmem/overlap.sh; tail -30 /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/epmem/s6-overlap.log", "expected": "record per-class and per-class/kind bytes and counts"},
+        {"description": "Compressibility on 8 named archive samples + tool_result sample (human plan Step 8 command)", "expected": "record orig/gzip bytes and ratios"},
+        {"description": "Code paths (human plan Step 9 grep, confirm by reading)", "command": "grep -rn -e \"archive_path\" -e \"line_start\" -e \"readFileSync\" -e \"createReadStream\" -e \"tool_result\" -e \"tool_input\" -e \"embed\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/src '--include=*.ts'", "expected": "readers listed with file:line"},
+        {"description": "Write docs/reviews/2026-10-07-episodic-memory-size-findings.md per human plan Step 10."},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-07-episodic-memory-size-findings.md docs/plans/2026-10-07-episodic-memory-size-measure-design.md docs/plans/2026-10-07-episodic-memory-size-measure.md docs/plans/2026-10-07-episodic-memory-size-measure.plan.json", "expected": "no output, exit 0"}
+      ]
+    }
+  ]
+}

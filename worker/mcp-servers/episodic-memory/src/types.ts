@@ -33,6 +33,14 @@ export interface ConversationExchange {
   thinkingDisabled?: boolean;
   thinkingTriggers?: string; // JSON array
 
+  // Provenance (L2): Claude `entrypoint` (cli, sdk-py, sdk-cli) or Codex
+  // session_meta.payload.originator (Codex Desktop, codex_exec, ironclaude).
+  entrypoint?: string;
+  // operator | brain | worker | machine | archive-only | unknown (settings.ts classifySession)
+  sessionClass?: string;
+  // True when userMessage holds AskUserQuestion answers ("Q: … / A: …").
+  isAnswer?: boolean;
+
   // Tool calls (populated separately)
   toolCalls?: ToolCall[];
 }

@@ -1,0 +1,31 @@
+{
+  "name": "Inkarnate asset catalog backup to Google Drive",
+  "goal": "Put a verified, zstd-compressed SQLite online-backup snapshot of the 3.65 GB inkarnate asset_catalog.db (plus SHA256SUMS) in Google Drive; verify by integrity_check, per-table row counts, scripted hash match, and cloud-side size/md5 via the Google Drive connector.",
+  "requirements_file": "docs/plans/2026-10-11-inkarnate-catalog-backup-design.md",
+  "design_file": "docs/plans/2026-10-11-inkarnate-catalog-backup-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Snapshot, verify, compress, copy to Drive, verify cloud upload",
+      "description": "No tests required: operational backup with built-in verification; no executable code. Exact commands: human plan Task 1 Steps 1-8. Source opened -readonly (sidecars never touched); --long=27 on every zstd step; quote the Drive path; Bash timeout 1800000 on long steps. Temp dir deleted ONLY after Step 7b confirms the upload in the cloud via the Google Drive connector (size match; md5 match if exposed); else stop and keep temp.",
+      "allowed_files": [
+        "docs/reviews/2026-10-11-disk-usage-findings.md",
+        "docs/plans/2026-10-11-inkarnate-catalog-backup-design.md",
+        "docs/plans/2026-10-11-inkarnate-catalog-backup.md",
+        "docs/plans/2026-10-11-inkarnate-catalog-backup.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "df -h /System/Volumes/Data (>= ~10 GiB free); SQLite online backup opening source -readonly", "command": "mkdir -p /private/tmp/inkarnate-catalog-backup && /usr/bin/sqlite3 -readonly /Users/roberthyatt/Code/roleplaying-agents/tools/inkarnate_mcp/asset_catalog_raw/asset_catalog.db \".backup '/private/tmp/inkarnate-catalog-backup/asset_catalog-2026-10-11.db'\" && ls -la /private/tmp/inkarnate-catalog-backup", "expected": "Snapshot exists."},
+        {"description": "Integrity check", "command": "/usr/bin/sqlite3 /private/tmp/inkarnate-catalog-backup/asset_catalog-2026-10-11.db \"PRAGMA integrity_check;\"", "expected": "ok (else stop)."},
+        {"description": "Per-table row counts source vs snapshot per human plan Task 1 Step 3", "expected": "Identical lists (else stop)."},
+        {"description": "Hash snapshot, zstd -19 -T0 --long=27, zstd -t, hash .zst, scripted decompressed-hash compare, record .zst md5 + byte size, per human plan Task 1 Step 4", "expected": "DECOMPRESS MATCH (MISMATCH stops); md5 + size recorded."},
+        {"description": "Append restore note to SHA256SUMS per human plan Task 1 Step 5", "expected": "Two # lines appended."},
+        {"description": "mkdir Drive folder; copy .zst + SHA256SUMS; ls per human plan Task 1 Step 6", "expected": "Both files present in Drive folder."},
+        {"description": "7a: read back local Drive-cache .zst -> decompressed hash == snapshot hash", "expected": "Match (local cache only)."},
+        {"description": "7b: Google Drive connector search_files title = 'asset_catalog-2026-10-11.db.zst' + get_file_metadata; recheck ~2 min up to 60 min", "expected": "Cloud file exists; size == Step 4 size; md5 == Step 4 md5 if exposed. No size exposed or not confirmed in 60 min: stop, keep temp, report."},
+        {"description": "Only after 7b: rm -r /private/tmp/inkarnate-catalog-backup; append 'Catalog backup' section to findings; stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-11-disk-usage-findings.md docs/plans/2026-10-11-inkarnate-catalog-backup-design.md docs/plans/2026-10-11-inkarnate-catalog-backup.md docs/plans/2026-10-11-inkarnate-catalog-backup.plan.json", "expected": "No output."}
+      ]
+    }
+  ]
+}

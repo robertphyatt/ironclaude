@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -505,5 +505,49 @@ describe('git.ts pure helpers', () => {
       });
     });
 
+  });
+});
+
+describe('read-only git takes no optional index lock (design 2026-10-18 lock-free-read-git)', () => {
+  const directories: string[] = [];
+
+  afterEach(() => {
+    for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+  });
+
+  function statDirtyRepository(): string {
+    const root = mkdtempSync(join(tmpdir(), 'ironclaude-lockfree-'));
+    directories.push(root);
+    git(root, 'init', '-q', '--initial-branch=main');
+    git(root, 'config', 'user.name', 'Lock Free Test');
+    git(root, 'config', 'user.email', 'lock-free@example.invalid');
+    writeFileSync(join(root, 'a.txt'), 'a\n');
+    git(root, 'add', 'a.txt');
+    git(root, 'commit', '-q', '-m', 'init');
+    utimesSync(join(root, 'a.txt'), new Date('2020-01-01T00:00:00Z'), new Date('2020-01-01T00:00:00Z'));
+    return root;
+  }
+
+  const indexMtime = (root: string): bigint => statSync(join(root, '.git', 'index'), { bigint: true }).mtimeNs;
+
+  it('runGit status leaves a stat-dirty index unwritten', () => {
+    const root = statDirtyRepository();
+    const before = indexMtime(root);
+    runGit(root, ['status', '--porcelain']);
+    expect(indexMtime(root)).toBe(before);
+  });
+
+  it('runGitEnv status leaves a stat-dirty index unwritten', () => {
+    const root = statDirtyRepository();
+    const before = indexMtime(root);
+    runGitEnv(root, ['status', '--porcelain'], { ...process.env });
+    expect(indexMtime(root)).toBe(before);
+  });
+
+  it('control: a plain git status rewrites the same stat-dirty index', () => {
+    const root = statDirtyRepository();
+    const before = indexMtime(root);
+    git(root, 'status', '--porcelain');
+    expect(indexMtime(root)).not.toBe(before);
   });
 });

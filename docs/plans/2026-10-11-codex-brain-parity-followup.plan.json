@@ -1,0 +1,96 @@
+{
+  "name": "Codex Brain parity follow-up",
+  "goal": "Commander's Codex Brain starts with its restriction hooks trusted and running: the trust warm-up answers Codex's 'Hooks need review' prompt from the rendered screen, and the parity plan's live acceptance passes.",
+  "requirements_file": "docs/plans/2026-10-10-codex-brain-parity-design.md",
+  "design_file": "docs/plans/2026-10-10-codex-brain-parity-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Warm-up answers the hooks-review prompt from the rendered screen (R7a)",
+      "description": "TDD. New main.py helper _answer_codex_hooks_review(tools, tmux, session, settle_seconds=20.0, clear_seconds=10.0, sleep=time.sleep, clock=time.monotonic) -> bool: poll tools._codex_screen(session, None) ~1/s; when whitespace-stripped lower-cased screen contains 'hooksneedreview' AND 'trustallandcontinue', tmux.send_raw_keys(session, ['2']) once, wait up to clear_seconds for it to clear (warn if not), return True; none within settle -> False. _warm_up_codex_hook_trust gains settle_seconds=20.0 and calls it after _wait_for_ready; log 'Codex hook-trust warm-up finished ready=%s trust_prompt_answered=%s'. Exact code: human plan Task 1 Steps 1 and 3.",
+      "allowed_files": ["commander/src/ironclaude/main.py", "commander/tests/test_codex_hook_trust_warmup.py"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: replace commander/tests/test_codex_hook_trust_warmup.py per human plan Task 1 Step 1."},
+        {"description": "Run RED", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_codex_hook_trust_warmup.py -q", "expected": "Collection error: ImportError on _answer_codex_hooks_review; record summary."},
+        {"description": "GREEN: main.py per human plan Task 1 Step 3 (a) helper above _warm_up_codex_hook_trust, (b) settle_seconds param, (c) call + new log line."},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_codex_hook_trust_warmup.py tests/test_codex_brain_hooks_canary.py tests/test_brain_hook_provenance.py -q", "expected": "All pass; record summary."},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/tests/test_codex_hook_trust_warmup.py", "expected": "No output."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Full suites over the whole parity change set (R11)",
+      "description": "No tests required: verification-only task that modifies no files. allowed_files lists every file of the first parity plan (Tasks 1-13), this plan's files and the plan artifacts so the end-of-plan restage and /commit cover the whole parity change set.",
+      "allowed_files": [
+        "docs/plans/2026-10-10-codex-brain-parity-design.md",
+        "docs/plans/2026-10-10-codex-brain-parity.md",
+        "docs/plans/2026-10-10-codex-brain-parity.plan.json",
+        "docs/plans/2026-10-10-codex-brain-parity-probe-findings.md",
+        "docs/plans/2026-10-11-codex-brain-parity-followup.md",
+        "docs/plans/2026-10-11-codex-brain-parity-followup.plan.json",
+        "commander/hooks/block-push.sh",
+        "commander/hooks/block-pin-enforcer.sh",
+        "commander/hooks/attention-sweep-enforcer.sh",
+        "commander/hooks/attention-sweep-arm.sh",
+        "commander/hooks/brain-orchestrator-guard.sh",
+        "commander/hooks/brain-task-gate.sh",
+        "commander/hooks/brain-hooks-canary.sh",
+        "commander/hooks/tests/test-block-push.sh",
+        "commander/hooks/tests/test-attention-sweep.sh",
+        "commander/hooks/tests/test-block-pin-enforcer.sh",
+        "commander/hooks/tests/test-brain-orchestrator-guard.sh",
+        "commander/hooks/tests/test-brain-task-gate.sh",
+        "commander/hooks/tests/test-brain-hooks-canary.sh",
+        "worker/hooks/codex-brain-hooks.sh",
+        "worker/hooks/hook-logger.sh",
+        "worker/hooks/get-back-to-work-claude.sh",
+        "worker/hooks/codex-brain-gated-actions.sh",
+        "worker/hooks/brain-gated-actions.sh",
+        "worker/hooks/test-codex-brain-gated-actions.sh",
+        "worker/hooks/test-brain-gated-actions.sh",
+        "worker/hooks/hooks.json",
+        "worker/hooks/tests/test-codex-brain-stand-down.sh",
+        "worker/hooks/tests/test-hooks-json-brain-entries.sh",
+        "worker/hooks/tests/test-execution-drift-check.sh",
+        "commander/src/ironclaude/codex_brain_client.py",
+        "commander/src/ironclaude/main.py",
+        "commander/src/ironclaude/brain_client.py",
+        "commander/src/brain/brain_settings_hooks.json",
+        "commander/tests/test_codex_brain_client.py",
+        "commander/tests/test_daemon.py",
+        "commander/tests/test_brain_client_gate_session.py",
+        "commander/tests/test_brain_hook_provenance.py",
+        "commander/tests/test_codex_brain_hooks_canary.py",
+        "commander/tests/test_codex_hook_trust_warmup.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Hook suites", "command": "make -C /Users/roberthyatt/Code/ironclaude test-hooks > /private/tmp/ironclaude-brain-parity-hooks-2.log 2>&1; echo \"test-hooks exit=$?\"", "expected": "test-hooks exit=0 (on failure: grep -n FAIL /private/tmp/ironclaude-brain-parity-hooks-2.log and stop)."},
+        {"description": "Full Commander suite (background, Bash timeout 1800000), then tail -n 5 /private/tmp/ironclaude-brain-parity-full-2.log", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q > /private/tmp/ironclaude-brain-parity-full-2.log 2>&1; echo \"pytest exit=$?\"", "expected": "Only failure allowed: tests/test_executing_plans_skill.py::test_execution_complete_restage_command_stages_from_non_root_cwd (L-T2); record summary."}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Restart the Commander and live acceptance (R11)",
+      "description": "No unit tests: live verification; each check names the hook/log line it expects. No plugin release or hook redeploy needed (worker hooks and hooks.json unchanged since the 2026-10-11 deploy; Commander code runs from the repo). If the canary fails again, stop the Commander immediately (make stop) and stop. Guard false positive: build 'git push' text with printf 'git p\\165sh ...' and grep 'pu[s]h'. Exact commands: human plan Task 3 Steps 1-13. Kill only by exact name/PID.",
+      "allowed_files": ["worker/.codex-plugin/plugin.json", "docs/plans/2026-10-10-codex-brain-parity-live-verification.md"],
+      "depends_on": [2],
+      "steps": [
+        {"description": "Commander stopped (if listed: make -C /Users/roberthyatt/Code/ironclaude/commander stop, then repeat)", "command": "pgrep -fl \"ironclaude.main\"", "expected": "No output (exit 1)."},
+        {"description": "Record daemon log length L", "command": "wc -l /tmp/ic/daemon.log", "expected": "Record L."},
+        {"description": "Relaunch detached with CC env stripped (normal Bash call, not run_in_background)", "command": "env -u CLAUDECODE -u CLAUDE_CODE_BRIDGE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH -u CLAUDE_CODE_MESSAGING_SOCKET -u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_SESSION_ATTENDED -u CLAUDE_CODE_SESSION_ID -u CLAUDE_EFFORT -u CLAUDE_PID nohup python3 -c \"import os; os.setsid(); os.execvp('make',['make','-C','/Users/roberthyatt/Code/ironclaude/commander','run'])\" >/tmp/ironclaude-restart-launch.log 2>&1 & disown", "expected": "Returns immediately."},
+        {"description": "Wait for start-up result (background, Bash timeout 660000) with the human plan Task 3 Step 4 polling loop, using literal L+1", "expected": "'Codex hook-trust warm-up finished ready=... trust_prompt_answered=True', 'Brain SDK client started client=codex', no 'hooks are not running', no provenance failure. On canary failure: make -C /Users/roberthyatt/Code/ironclaude/commander stop, record evidence, stop."},
+        {"description": "Canary marker", "command": "find /tmp/ic/codex-brain-gate -name hooks-live -newer /tmp/ironclaude-restart-launch.log", "expected": "Exactly one path."},
+        {"description": "Trust entries present", "command": "grep -n -e \"hooks.json:pre_tool_use:1[01]:0\" -e \"hooks.json:pre_tool_use:[7-9]:0\" -e \"hooks.json:post_tool_use:[78]:0\" -e \"hooks.json:user_prompt_submit:2:0\" /Users/roberthyatt/.codex/config.toml", "expected": "Lines for pre_tool_use:7-11, post_tool_use:7-8 and user_prompt_submit:2; record them."},
+        {"description": "Claude Brain settings after sync; then 'ls /Users/roberthyatt/.ironclaude/brain/.codex' (expected hooks.json.retired, no hooks.json)", "command": "jq -r '.hooks[][] .hooks[].command' /Users/roberthyatt/.ironclaude/brain/.claude/settings.json", "expected": "Exactly the 7 template commands in template order; no .ironclaude/brain/hooks/, memory-search-enforcer or startup-lookback-enforcer."},
+        {"description": "Find Brain rollout BR (grep -l '\"cwd\":\"/Users/roberthyatt/.ironclaude/brain\"' on each path)", "command": "find /Users/roberthyatt/.codex/sessions -name 'rollout-*.jsonl' -newer /tmp/ironclaude-restart-launch.log", "expected": "Record paths and BR."},
+        {"description": "Brain rollout checks: 'grep -c professional-mode-guard BR' expected 0; then the command here", "command": "grep -o '\"server\":\"orchestrator\",\"tool\":\"[a-z_]*\"' BR", "expected": ">=1 line from the start-up lookback; record distinct names."},
+        {"description": "Operator acceptance input: AskUserQuestion asking the operator to post 'what unfinished work is sitting, idle, right now?' in Slack and confirm; then the command here, then 'grep -c professional-mode-guard BR' expected 0. If deferred, record 'Step 10 pending operator question'; never substitute another check.", "command": "grep -c '\"server\":\"orchestrator\",\"tool\":\"get_worker_status\"' BR", "expected": ">= 1"},
+        {"description": "Negative probe: mkdir + git init the probe repo (two separate commands per human plan Task 3 Step 11), then run the codex exec probe exactly as human plan Task 3 Step 11 (Bash timeout 600000; prompt built with printf 'git p\\165sh origin main')", "command": "mkdir -p /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/brain-parity-probe/brainrepo", "expected": "No output; then an exit= line from the probe run."},
+        {"description": "Probe evidence; then 'ls <PROBE>/brainrepo'", "command": "grep -o -e 'block-pu[s]h' -e 'brain-orchestrator-guard' -e 'Brain cannot use mutation tools' -e 'brain-task-gate' -e 'professional-mode-guard' -e 'is blocked for Brain session' /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/brain-parity-probe/brain-turn.jsonl", "expected": "Push blocked ('is blocked for Brain session' or brain-orchestrator-guard); edit blocked ('Brain cannot use mutation tools'); subagent blocked (brain-task-gate); no professional-mode-guard; x.txt absent. Record cat result and matched lines verbatim."},
+        {"description": "Write docs/plans/2026-10-10-codex-brain-parity-live-verification.md (first attempt's failure + Steps 1-12 output), then stage it; then stage the cachebuster with 'git -C /Users/roberthyatt/Code/ironclaude add worker/.codex-plugin/plugin.json'", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-10-codex-brain-parity-live-verification.md", "expected": "No output from either add."}
+      ]
+    }
+  ]
+}

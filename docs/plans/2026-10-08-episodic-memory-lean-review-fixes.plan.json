@@ -1,0 +1,127 @@
+{
+  "name": "Episodic Memory Lean: Final-Review Fixes",
+  "goal": "Fix M1 (stale partial slim build never causes refusal), item 2 (damaged .zst fails fast, never blocks backfill), item 5 (--only=backfill refuses on a never-slimmed index in dry and real runs, writing nothing), guard 3 (larger archive copy never overwritten by smaller source; kept as superseded).",
+  "requirements_file": "docs/plans/2026-10-08-episodic-memory-lean-review-fixes-requirements.md",
+  "design_file": "docs/plans/2026-10-08-episodic-memory-lean-review-fixes-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Stale partial slim build never causes a refusal (R1)",
+      "description": "slimIndex: before the disk guard, find db.sqlite.new/-wal/-shm; real run removes them then measures free disk; dry run changes nothing, adds their bytes to free, appends '; stale partial build <bytes> bytes would be removed' to the would-run detail. Code and tests: human plan Task 1 verbatim. Execution invariants: human plan 'Execution invariants'. VT = /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/maintain.ts",
+        "worker/mcp-servers/episodic-memory/src/maintain-slim.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        { "description": "RED: insert the two tests from human plan Task 1 Step 1 verbatim at the end of describe('slimIndex')." },
+        { "description": "Run, see them fail", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/maintain-slim.test.ts", "expected": "Tests  2 failed | 9 passed (11); both new tests get 'refused'" },
+        { "description": "GREEN: replace the guard block in slimIndex per human plan Task 1 Step 3 verbatim (exact-match anchor)." },
+        { "description": "Run, see them pass", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/maintain-slim.test.ts", "expected": "exit 0; Tests  11 passed (11)" },
+        { "description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/maintain.ts worker/mcp-servers/episodic-memory/src/maintain-slim.test.ts", "expected": "no output, exit 0" }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Parsers reject on a damaged .zst; verify never lists superseded copies (R2, R7)",
+      "description": "parser.ts and codex-parser.ts capture the archive stream 'error' into failure.error, close readline, throw after the loop (never hang, never partial parse). New src/archive-damaged.test.ts: positive control (fixtures really damaged: zstd frame checksum flipped), both parsers reject, verifyIndex never lists '.superseded-' paths (positive control: the damaged transcript is listed). Parser tests were unmeasurable at planning (Bash read-only): Step 2 records pass-or-timeout, then Step 3 applies regardless. Code and tests: human plan Task 2 verbatim.",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/parser.ts",
+        "worker/mcp-servers/episodic-memory/src/codex-parser.ts",
+        "worker/mcp-servers/episodic-memory/src/archive-damaged.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        { "description": "Create src/archive-damaged.test.ts with human plan Task 2 Step 1 content verbatim." },
+        { "description": "Run the new file and record the result", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/archive-damaged.test.ts", "expected": "positive control and verify test pass; record whether each parser test passes or fails (timeout = hang is real); positive control failing: STOP and report" },
+        { "description": "Apply the parser.ts and codex-parser.ts edits per human plan Task 2 Step 3 verbatim (four exact-match anchors)." },
+        { "description": "Run, see them pass; readers still work", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/archive-damaged.test.ts src/archive-readers.test.ts src/parser-voice.test.ts src/codex-parser.test.ts", "expected": "exit 0; Tests  14 passed (14)" },
+        { "description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/parser.ts worker/mcp-servers/episodic-memory/src/codex-parser.ts worker/mcp-servers/episodic-memory/src/archive-damaged.test.ts", "expected": "no output, exit 0" }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Backfill skips unreadable sessions and never-slimmed indexes (R3, R4)",
+      "description": "maintain.ts: MaintainOptions.afterSlim (set only by runMaintain: backfillVoice({ ...o, afterSlim: !opts.only })). backfillVoice opens an existing DB read-only first in dry and real runs: tool_calls present and not (dryRun && afterSlim) -> skipped 'the index has not been slimmed yet; run maintain (slim) first' before initDatabase; full dry run on a legacy index -> would-run with '; runs after the slim rebuilds the index'; no DB + dry run -> skipped 'no index database yet'. Per-session parse in try/catch -> counts.unreadable++, advance cursor, continue, rows untouched; report appends '; unreadable archive files N'. Three tests in maintain-run.test.ts (+ import zlib). Code and tests: human plan Task 3 verbatim.",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/maintain.ts",
+        "worker/mcp-servers/episodic-memory/src/maintain-run.test.ts"
+      ],
+      "depends_on": [1, 2],
+      "steps": [
+        { "description": "RED: add import zlib and the three tests per human plan Task 3 Step 1 verbatim." },
+        { "description": "Run, see them fail", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/maintain-run.test.ts", "expected": "Tests  3 failed | 7 passed (10)" },
+        { "description": "GREEN: apply maintain.ts edits (a), (a2), (a3), (b), (c) per human plan Task 3 Step 3 verbatim (exact-match anchors)." },
+        { "description": "Run, see them pass", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/maintain-run.test.ts src/maintain-slim.test.ts", "expected": "exit 0; Tests  21 passed (21)" },
+        { "description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/maintain.ts worker/mcp-servers/episodic-memory/src/maintain-run.test.ts", "expected": "no output, exit 0" }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Sync never overwrites a larger archive copy (R5)",
+      "description": "archive-io.ts: new export supersededName(p, mtimeMs) = `${p}.superseded-${Math.trunc(mtimeMs)}`; copyIntoArchive: existing raw dest larger than src -> superseded name taken (raw or .zst) throws /refusing to overwrite/ with archive unchanged; otherwise copy src to tmp first, then rename dest to its superseded name, then rename tmp to dest (dest never left empty). Three tests in archive-io.test.ts (growth test is a guard that passes before and after). Code and tests: human plan Task 4 verbatim.",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/archive-io.ts",
+        "worker/mcp-servers/episodic-memory/src/archive-io.test.ts"
+      ],
+      "depends_on": [],
+      "steps": [
+        { "description": "RED: insert the three tests per human plan Task 4 Step 1 verbatim at the end of describe('archive-io')." },
+        { "description": "Run, see them fail", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/archive-io.test.ts", "expected": "Tests  2 failed | 8 passed (10)" },
+        { "description": "GREEN: replace copyIntoArchive (doc comment through closing brace) per human plan Task 4 Step 3 verbatim (exact-match anchor)." },
+        { "description": "Run, see them pass; sync still works", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/archive-io.test.ts src/sync-lean.test.ts src/codex-sync.test.ts", "expected": "exit 0; Tests  19 passed (19)" },
+        { "description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/archive-io.ts worker/mcp-servers/episodic-memory/src/archive-io.test.ts", "expected": "no output, exit 0" }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Compaction never overwrites a larger or undecodable .zst; superseded copies are compacted (R6, R7)",
+      "description": "maintain.ts: import supersededName; SUPERSEDED_RE = /\\.jsonl\\.superseded-\\d+$/ admitted by listCompactable; compactOne, after the crash-resume block: if <file>.zst exists, stream-decode it (byte count + sha256; decode error = keep); larger than the raw or undecodable -> rename to supersededName(rel, oldMtime)+'.zst' and append a manifest line (sha256 '' and rawBytes 0 when undecodable); name taken -> manifest-errors line, return 'error'. Four tests in maintain-compact.test.ts (+ import zlib; normal-growth test is a guard). Code and tests: human plan Task 5 verbatim.",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/maintain.ts",
+        "worker/mcp-servers/episodic-memory/src/maintain-compact.test.ts"
+      ],
+      "depends_on": [3, 4],
+      "steps": [
+        { "description": "RED: add import zlib and the four tests per human plan Task 5 Step 1 verbatim at the end of describe('compactArchive')." },
+        { "description": "Run, see them fail", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/maintain-compact.test.ts", "expected": "Tests  3 failed | 14 passed (17)" },
+        { "description": "GREEN: apply maintain.ts edits (a)-(d) per human plan Task 5 Step 3 verbatim (exact-match anchors)." },
+        { "description": "Run, see them pass", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory src/maintain-compact.test.ts src/maintain-run.test.ts", "expected": "exit 0; Tests  27 passed (27)" },
+        { "description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/maintain.ts worker/mcp-servers/episodic-memory/src/maintain-compact.test.ts", "expected": "no output, exit 0" }
+      ]
+    },
+    {
+      "id": 6,
+      "name": "README: superseded copies (R8); stage only this effort's README hunk",
+      "description": "No tests required: documentation change. Insert the '**Superseded copies.**' paragraph (human plan Task 6 Step 1 verbatim) plus one blank line immediately before '### Backup mirror (optional)'. README.md also carries a separate effort's unfinished staged edits (Codex provider paragraph + '### Managed-worker capacity handoff'): stage only the episodic-memory hunk via git apply --cached, leaving the handoff hunk unstaged in the working tree (never lost).",
+      "allowed_files": ["README.md"],
+      "depends_on": [4, 5],
+      "steps": [
+        { "description": "Insert the paragraph per human plan Task 6 Step 1 verbatim (anchor must match exactly once)." },
+        { "description": "Verify placement", "command": "grep -n -e \"^\\*\\*Superseded copies\\.\\*\\*\" -e \"^### Compressed archive\" -e \"^### Backup mirror (optional)\" /Users/roberthyatt/Code/ironclaude/README.md", "expected": "exactly 3 lines in order: ### Compressed archive, and how to restore an original; **Superseded copies.**...; ### Backup mirror (optional)" },
+        { "description": "Write the episodic-memory-only patch with the python3 script in human plan Task 6 Step 3 verbatim (splits git diff HEAD -- README.md by hunk; asserts 2 hunks, 1 handoff, 1 kept containing '+## Episodic Memory' and '+**Superseded copies.**'; writes /tmp/ic-em-readme-episodic.patch)", "expected": "hunks 2 kept 1, handoff left unstaged 1; any assertion error: STOP and report" },
+        { "description": "Stage only the episodic-memory hunk (index-only reset of README.md, working tree keeps both)", "command": "git -C /Users/roberthyatt/Code/ironclaude restore --staged -- README.md && git -C /Users/roberthyatt/Code/ironclaude apply --cached /tmp/ic-em-readme-episodic.patch && echo STAGED", "expected": "STAGED" },
+        { "description": "Verify the index holds the episodic section and no handoff text", "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached -- README.md | grep -c -e '^+## Episodic Memory$' -e '^+\\*\\*Superseded copies\\.\\*\\*' -e 'Managed-worker capacity handoff'", "expected": "2" },
+        { "description": "Verify the handoff hunk stays unstaged in the working tree", "command": "git -C /Users/roberthyatt/Code/ironclaude diff -- README.md | grep -c -e 'Managed-worker capacity handoff' -e 'Episodic Memory'", "expected": "1" }
+      ]
+    },
+    {
+      "id": 7,
+      "name": "Full verification",
+      "description": "No new tests: verification-only task; results recorded in docs/reviews/2026-10-08-episodic-memory-lean-review-fixes-verification.md. Baseline measured 2026-10-07: Test Files 18 passed (18), Tests 126 passed (126). Completion note: the orchestrator's end-of-plan union restage must exclude README.md, then re-run the Step 6b check.",
+      "allowed_files": ["docs/reviews/2026-10-08-episodic-memory-lean-review-fixes-verification.md"],
+      "depends_on": [1, 2, 3, 4, 5, 6],
+      "steps": [
+        { "description": "Full episodic-memory suite; record actual lines", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/vitest run --root /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory", "expected": "exit 0; Test Files  19 passed (19); Tests  142 passed (142) (126 + 2 + 4 + 3 + 3 + 4)" },
+        { "description": "Type-check", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/node_modules/.bin/tsc --noEmit -p /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/tsconfig.json", "expected": "no output, exit 0" },
+        { "description": "Confirm the operator's opt-out before building; any other output or missing file: STOP, do not build, report; never write that file", "command": "grep -c '\"autoRun\":false' /Users/roberthyatt/.config/superpowers/episodic-memory.json", "expected": "1" },
+        { "description": "Build (dist gitignored, not staged)", "command": "npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory run build", "expected": "exit 0; esbuild lines for dist/mcp-server.js, dist/sync-cli.js, dist/maintain-cli.js" },
+        { "description": "Smoke-test bundled CLI on throwaway dirs", "command": "env EPISODIC_MEMORY_CONFIG_DIR=/tmp/ic-em-fix-check/config TEST_DB_PATH=/tmp/ic-em-fix-check/db.sqlite TEST_ARCHIVE_DIR=/tmp/ic-em-fix-check/archive node /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/dist/maintain-cli.js --dry-run", "expected": "exit 0; exactly 4 lines: 'slim: skipped — no index database yet', 'backfill: skipped — no index database yet', 'compact: skipped — nothing to compact', 'mirror: skipped — no backup.mirrorDir configured'" },
+        { "description": "Confirm staged set; compare by script", "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached --name-only -- worker/mcp-servers/episodic-memory README.md", "expected": "38 paths: the 37 recorded in docs/reviews/2026-10-07-episodic-memory-lean-verification.md plus worker/mcp-servers/episodic-memory/src/archive-damaged.test.ts; nothing under dist/" },
+        { "description": "Step 6b: confirm the staged README holds no handoff text", "command": "git -C /Users/roberthyatt/Code/ironclaude diff --cached -- README.md | grep -c -e '^+## Episodic Memory$' -e '^+\\*\\*Superseded copies\\.\\*\\*' -e 'Managed-worker capacity handoff'", "expected": "2" },
+        { "description": "Write the verification note: every command above with actual result lines, the Task 2 Step 2 parser result (pass or timeout), the staged-set comparison, the README split result." },
+        { "description": "Stage the note", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-08-episodic-memory-lean-review-fixes-verification.md", "expected": "no output, exit 0" }
+      ]
+    }
+  ]
+}

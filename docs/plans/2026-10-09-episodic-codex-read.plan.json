@@ -1,0 +1,30 @@
+{
+  "name": "Episodic Memory: Read Codex Transcripts",
+  "goal": "Make the episodic-memory read tool and show CLI render Codex rollouts instead of returning an empty string, with Claude transcripts unchanged.",
+  "requirements_file": "docs/plans/2026-10-09-episodic-codex-read-design.md",
+  "design_file": "docs/plans/2026-10-09-episodic-codex-read-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Render Codex rollouts in read/show (R1-R5)",
+      "description": "Loop: full (size only). show.ts: add Codex block (CODEX_RECORD_TYPES, parseCodexRecord, exported isCodexRollout on first parseable record, codexText, codexToolOutput, fencedBlock, codexToolInput, exported formatCodexRolloutAsMarkdown numbering raw lines like codex-parser and reading session_meta from the whole file, formatCodexRolloutAsHTML wrapping renderMarkdownSafely); one-line dispatch at top of formatConversationAsMarkdown and formatConversationAsHTML. Line 1 import and Claude code otherwise unchanged; mcp-server.ts and show-cli.ts unchanged. New src/show-codex.test.ts: 6 tests (fixture render, .zst identity, parser-range parity with a blank line, malformed lines, Claude byte-for-byte snapshot recorded at RED, HTML via marked). Code: human plan Task 1 Steps 1 and 4 verbatim.",
+      "allowed_files": [
+        "worker/mcp-servers/episodic-memory/src/show.ts",
+        "worker/mcp-servers/episodic-memory/src/show-codex.test.ts",
+        "worker/mcp-servers/episodic-memory/src/__snapshots__/show-codex.test.ts.snap"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: create /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/src/show-codex.test.ts (human plan Task 1 Step 1 verbatim)"},
+        {"description": "Run RED and record Claude snapshot (CI unset)", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory && npx vitest run src/show-codex.test.ts", "expected": "5 failed, 1 passed, 1 snapshot written: tests 1, 2, 3, 4, 6 fail (empty output; test 4 throws SyntaxError on 'garbage first line'); test 5 passes and writes its snapshot from the unchanged renderer. Record actual summary; if counts differ or no snapshot written, stop and report before editing show.ts"},
+        {"description": "Confirm snapshot holds current Claude rendering", "command": "grep -c -e \"Plan the KIWI migration\" -e \"Claude Code Version\" /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/src/__snapshots__/show-codex.test.ts.snap", "expected": "2"},
+        {"description": "GREEN: show.ts edits 4a (Codex block before formatConversationAsMarkdown), 4b (Markdown dispatch), 4c (HTML dispatch) from human plan Task 1 Step 4 verbatim; line 1 import and all other show.ts lines unchanged"},
+        {"description": "Run GREEN", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory && npx vitest run src/show-codex.test.ts", "expected": "6 passed, 0 failed; snapshot matched (none written or updated)"},
+        {"description": "Log directory", "command": "mkdir -p /private/tmp/ironclaude-episodic-codex-read", "expected": "exit 0"},
+        {"description": "Full episodic-memory suite", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory && npx vitest run > /private/tmp/ironclaude-episodic-codex-read/vitest-full.log 2>&1; echo \"exit=$?\"", "expected": "exit=0; record Test Files and Tests summary lines"},
+        {"description": "Type check", "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory && npx tsc --noEmit > /private/tmp/ironclaude-episodic-codex-read/tsc.log 2>&1; echo \"exit=$?\"", "expected": "exit=0, empty log. Errors in src/show.ts or src/show-codex.test.ts are fixed before staging; any other error is recorded and reported as pre-existing with file and line"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/episodic-memory/src/show.ts worker/mcp-servers/episodic-memory/src/show-codex.test.ts worker/mcp-servers/episodic-memory/src/__snapshots__/show-codex.test.ts.snap", "expected": "exit 0"}
+      ]
+    }
+  ]
+}

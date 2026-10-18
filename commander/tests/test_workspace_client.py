@@ -25,6 +25,8 @@ def test_local_commands_use_argv_and_strict_json(tmp_path: Path):
     assert argv[2] == "allocate"
     assert json.loads(argv[3]) == payload
     assert runner.call_args.kwargs["shell"] is False
+    assert client.handoff_status({"workspace_guid": "w"}) == {"workspace_guid": "w"}
+    assert runner.call_args.args[0][2] == "handoff-status"
     assert runner.call_args.kwargs["check"] is False
 
 
@@ -86,6 +88,44 @@ def test_exposes_shared_resource_methods(tmp_path: Path):
     assert hasattr(client, "list_shared_resources")
 
 
+@pytest.mark.parametrize("method,command,phase", [
+    ("begin_handoff", "begin-handoff", "begun"),
+    ("transfer_handoff", "transfer-handoff", "transferred"),
+    ("finish_handoff", "finish-handoff", "finished"),
+])
+def test_exposes_private_handoff_commands_over_existing_argv_transport(tmp_path: Path, method, command, phase):
+    response = {"phase": phase, "workspace_guid": "w"}
+    runner = Mock(return_value=completed(json.dumps(response) + "\n"))
+    client = WorkspaceClient(tmp_path, runner=runner)
+    payload = {"repository_path": "/tmp/repo;$(touch nope)", "workspace_guid": "w", "generation": 3, "capability_token": "secret", "source_owner_session_id": "source"}
+    if method == "transfer_handoff":
+        payload["target_owner_session_id"] = "target"
+    assert getattr(client, method)(payload) == response
+    assert runner.call_args.args[0][:3] == ["node", str(tmp_path / "mcp-servers/workspace-manager/dist/cli.js"), command]
+    assert json.loads(runner.call_args.args[0][3]) == payload
+    assert runner.call_args.kwargs["shell"] is False
+
+
+@pytest.mark.parametrize("method,command,phase", [
+    ("begin_handoff", "begin-handoff", "begun"),
+    ("transfer_handoff", "transfer-handoff", "transferred"),
+    ("finish_handoff", "finish-handoff", "finished"),
+])
+def test_remote_private_handoff_commands_use_existing_ssh_argv(tmp_path: Path, method, command, phase):
+    response = {"workspace_guid": "w", "phase": phase}
+    ssh = Mock(); ssh.run_argv.return_value = completed(json.dumps(response) + "\n")
+    runner = Mock(); client = WorkspaceClient(tmp_path, runner=runner, ssh_manager=ssh)
+    payload = {"workspace_guid": "w", "generation": 3, "capability_token": "secret;$(touch nope)", "source_owner_session_id": "source"}
+    if method == "transfer_handoff":
+        payload["target_owner_session_id"] = "target"
+    assert getattr(client, method)(payload, ssh_host="worker-host", remote_plugin_root="/opt/iron claude") == response
+    host, argv = ssh.run_argv.call_args.args
+    assert host == "worker-host"
+    assert argv[:3] == ["node", "/opt/iron claude/mcp-servers/workspace-manager/dist/cli.js", command]
+    assert len(argv) == 4 and json.loads(argv[3]) == payload
+    ssh.run_argv.assert_called_once(); runner.assert_not_called()
+
+
 def test_each_public_method_uses_its_exact_internal_command(tmp_path: Path):
     runner = Mock(return_value=completed())
     client = WorkspaceClient(tmp_path, runner=runner)
@@ -105,6 +145,23 @@ def test_shared_resource_methods_forward_hyphenated_internal_commands(tmp_path: 
         getattr(client, method)({"marker": method})
         assert runner.call_args.args[0][2] == command
         assert json.loads(runner.call_args.args[0][3]) == {"marker": method}
+
+
+@pytest.mark.parametrize("method,command", [
+    ("release_handoff", "release-handoff"),
+    ("reap_stale_mutations", "reap-stale-mutations"),
+    ("finish_handoff_after_target", "finish-handoff-after-target"),
+])
+def test_recovery_handoff_methods_use_exact_private_commands(tmp_path: Path, method, command):
+    response = {"protocol_version": 1}
+    runner = Mock(return_value=completed(json.dumps(response) + "\n"))
+    client = WorkspaceClient(tmp_path, runner=runner)
+    payload = {"workspace_guid": "w", "generation": 2, "capability_token": "secret",
+               "source_owner_session_id": "source"}
+    assert getattr(client, method)(payload) == response
+    assert runner.call_args.args[0][2] == command
+    assert json.loads(runner.call_args.args[0][3]) == payload
+    assert runner.call_args.kwargs["shell"] is False
 
 
 def test_cleanup_forwards_payload_into_cli_argv(tmp_path: Path):

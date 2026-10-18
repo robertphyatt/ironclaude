@@ -1,0 +1,257 @@
+# Automatic worker provider handoff implementation plan
+
+Required skill: ironclaude:executing-plans; mode=subagent-sequential.
+
+Goal: Continue unfinished managed worker work on fresh alternate native provider after confirmed usage exhaustion while preserving worktree and PM progress.
+
+Requirements: docs/plans/2026-10-05-worker-provider-handoff-requirements.md
+Design: docs/plans/2026-10-05-worker-provider-handoff-design.md
+
+Loop: full. Scope: hold. Predicted answer: sequential Terra implementation and one-up plan/end review (delegated). Architecture: durable Commander phases plus assignment-side exclusion, fresh native sessions, exact durable PM continuity. Technologies: Python, SQLite, TypeScript, native tmux/SSH/provider CLI boundaries, existing pytest/Vitest. Existing APIs named below were read from current source; new APIs are explicitly introduced by tasks.
+
+Execution invariants: Each shell invocation is independent; use absolute paths and explicit cwd. Commander shell cwd cannot be assumed root. Quote globs under zsh; no foreground sleep, no suppressed evidence, no pipe/head truncation to claim absence, no hardcoded discovery counts. docs is ignored: stage with git add -f. Record actual RED/GREEN outputs; no predicted test counts. Tests must fail on named broken behavior and use non-default identity/state. Write evidence before temporary fixture cleanup; temporary test fixtures may be removed by their owning existing fixture teardown. Do not reset/clean/stash/commit/push/deploy/restart or operate live workers. Only exact allowed_files can change during each task. Parent handles claim/submit/review/staging, agents implement one focused task. Review requirement blockers; no speculative framework/harness. Source checks are not production activation proof.
+
+## Task 1: Fence managed assignments during handoff
+
+Depends on: none
+
+Exact allowed files:
+
+- worker/mcp-servers/workspace-manager/src/db.ts
+- worker/mcp-servers/workspace-manager/src/handoff.ts
+- worker/mcp-servers/workspace-manager/src/workspace-service.ts
+- worker/mcp-servers/workspace-manager/src/integration.ts
+- worker/mcp-servers/workspace-manager/src/__tests__/handoff.test.ts
+
+R2/R4/R5/R6/R9. Add durable per-assignment handoff and normal-mutation exclusion in existing workspace DB. Keep lifecycle union and ordinary bind unchanged. New handoff.ts exports beginHandoff(db,input), transferHandoff(db,input), finishHandoff(db,input), withAssignmentMutation(db,guid,operation,fn). Input carries repositoryPath, repositoryIdentity, workspaceGuid, workerId, sourceOwnerSessionId, generation, capabilityToken, expectedWorktreePath/Branch/BaseCommit/CurrentHead/IntegrationTarget; transfer adds targetOwnerSessionId. Authorization grants scoped token hash from Commander private control transport, not public tool. Compare full tuple and fresh canonical Git evidence; no primary owner/integration/rebase/active mutation. New tables additive: workspace_handoffs keyed GUID with generation/token_hash/source_owner/target_owner/evidence/phase; workspace_mutations keyed GUID with operation/nonce/process identity. Normal mutation atomically excludes unfinished hold; hold excludes live or unreconciled mutation. Never expire holds. Wrap all existing assignment mutations before first Git/filesystem effect, including finalizeCommanderLocalCommit, finalizeDirectAuthority, finalizeReconcile, finalizeConfirmResolution, finalizeCloseOut, reconcileFinalization, resolveConflictHunk, syncWorktreeToTarget, recycleFinalized/releaseFinalized and service abandon/cleanup/reap/checkout switching/shared relinks. Nested calls reuse only current operation token internally. Transfer owner CAS and revoke unconsumed source human_intents; preserved_work obligations follow owner. Hold remains after owner transfer until finish. Wrong capability/source/destination/evidence/status rejects before mutation.
+
+Step 1: RED: create handoff.test.ts using existing initDb, WorkspaceService and real temporary Git fixture style. Dirty staged/unstaged/untracked files and shared symlink; compare HEAD/branch/index tree/content/links. Distinct non-null ordinary bind still throws. Cover wrong token/generation/old owner/path/branch/base/HEAD/target, primary ownership, concurrent mutation claim using two SQLite connections, stale hold, transfer replay and normal destructive entry refusal.
+
+Step 2: Run RED; record actual failure proving absent new handoff behavior.
+
+Run:
+
+    npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test -- src/__tests__/handoff.test.ts
+
+Expected verification: Record output; new handoff assertions fail for missing behavior, not fixture failure.
+
+Step 3: GREEN: implement additive schema and scoped helper operations. Atomic SQL core: UPDATE assignments SET owner_session_id=?, updated_at=datetime('now') WHERE workspace_guid=? AND repository_identity=? AND worker_id=? AND owner_session_id=? AND lifecycle_status='active' AND worktree_path=? AND branch=? AND base_commit=? AND current_head=? AND integration_target=?; require changes==1 inside same transaction as held-generation validation, obligation owner transfer and pending-intent revocation. Token comparison validates grant and full scope; never store plaintext token. Mutation claim uses immediate transaction; finally releases only matching nonce, never another caller claim. Wrap listed real mutation boundaries, revalidate under exclusion; ordinary bind unchanged.
+
+Step 4: Run GREEN and existing integration/lifecycle regressions; record real outputs. Check failures specifically against preservation/exclusion requirements; fix within task before submit.
+
+Run:
+
+    npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test -- src/__tests__/handoff.test.ts src/__tests__/workspace-service.test.ts src/__tests__/integration-core.test.ts src/__tests__/integration-recovery.test.ts
+
+Step 5: Compile TypeScript without generated release/deployment changes.
+
+Run:
+
+    /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/node_modules/.bin/tsc --noEmit --project /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/tsconfig.json
+
+Step 6: Parent reviews and stages only exact allowed files; do not commit/push/deploy.
+
+## Task 2: Expose scoped private workspace handoff transport
+
+Depends on: 1
+
+Exact allowed files:
+
+- worker/mcp-servers/workspace-manager/src/cli.ts
+- worker/mcp-servers/workspace-manager/src/__tests__/cli.test.ts
+- commander/src/ironclaude/workspace_client.py
+- commander/src/ironclaude/workspace_handoff_authority.py
+- commander/tests/test_workspace_client.py
+- commander/tests/test_workspace_handoff_authority.py
+
+R5/R6/R8/R9. Add private begin-handoff/transfer-handoff/finish-handoff JSON commands only; no public MCP surface. Add WorkspaceClient methods with existing local/SSH argv transport, installed-root discovery and bounded errors. Scoped single-use Commander capability grant written through private Python SQLite helper on assignment host, bound to full source assignment/generation and command phase; target grant only after observed fresh UUID/source quiescence. CLI validates capability hash and scope, expiry of unused authorization, phase and exact destination; arbitrary nonce/bool/IC_ROLE cannot authorize. Tokens never worker env/prompt/event/details/logs. Same OS user remains existing administrative trust boundary; no claim of filesystem protection against arbitrary direct SQLite writes. Capability grant helper must be controller-only callable, never exported as worker/MCP tool. Preserve no-push transport and old commands.
+
+Step 1: RED: extend exact CLI dependency tests and WorkspaceClient tests; add real SQLite authorization tests proving absent/mismatched/expired/replayed token refuses, destination/source/generation scope enforced and normal commands unchanged. Inspect CLI/tests before adding required dependency fields so old fixture construction remains source-compatible.
+
+Step 2: Run RED and record actual failures.
+
+Run:
+
+    python3 -m pytest -c /Users/roberthyatt/Code/ironclaude/commander/pyproject.toml /Users/roberthyatt/Code/ironclaude/commander/tests/test_workspace_handoff_authority.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_workspace_client.py
+
+Expected verification: Record output; new authorization/transport assertions fail for missing behavior.
+
+Step 3: GREEN: implement grant helper and exact private CLI argument validation to Task1 contracts; add three command names to INTERNAL_COMMAND_NAMES/dispatch/dependencies and Python _COMMANDS. Use structured JSON and shell=False/run_argv. Reconcile unknown transport outcome through current held-generation readback; never interpret lost response as permission to retry transfer. Add protocol feature/version readback for controller preflight; no release bundle update.
+
+Step 4: Run Python transport tests and CLI tests, record outputs.
+
+Run:
+
+    python3 -m pytest -c /Users/roberthyatt/Code/ironclaude/commander/pyproject.toml /Users/roberthyatt/Code/ironclaude/commander/tests/test_workspace_handoff_authority.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_workspace_client.py
+
+Step 5: Run CLI regression tests and TypeScript compile.
+
+Run:
+
+    npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test -- src/__tests__/cli.test.ts src/__tests__/handoff.test.ts
+
+Step 6: Run explicit final TypeScript compiler verification; record exit and output. This is separate from Vitest and writes no release artifacts.
+
+Run:
+
+    /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/node_modules/.bin/tsc --noEmit --project /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/tsconfig.json
+
+Step 7: Parent reviews and stages exact allowed files.
+
+## Task 3: Persist worker handoff claims and native quota evidence
+
+Depends on: 2
+
+Exact allowed files:
+
+- commander/src/ironclaude/db.py
+- commander/src/ironclaude/worker_registry.py
+- commander/src/ironclaude/worker_quota.py
+- commander/src/ironclaude/provider_router.py
+- commander/src/ironclaude/provider_state.py
+- commander/tests/test_worker_handoff_registry.py
+- commander/tests/test_worker_quota.py
+- commander/tests/test_worker_registry.py
+- commander/tests/test_provider_router.py
+- commander/tests/test_provider_state.py
+
+R1/R5/R7/R8/R9. Add worker_handoffs durable phases and active-generation uniqueness to Commander schema; methods claim_worker_handoff, advance_worker_handoff, pause_worker_handoff, get_worker_handoff, complete_worker_handoff and replace_worker_runtime. Claim CAS exact running worker/source native UUID/runtime/workspace snapshot; status handoff_pending before old stop. Registry completion/task-status writes reject active/paused handoff except controlled phase updates. Runtime replacement is one transaction changing concrete client/model/native_uuid/tmux only, preserving worker id/type/task/objective/workspace, clearing stale finished_at/completion generation. Phase advances require exact generation and previous phase; pause retains phase+reason, never completed. Quota helper streams native JSONL with bounded per-record size, exact session/path/timestamp/turn and latest state, persists cursor/event key/generation. Claude synthetic API error 429/rate_limit/rejected quota/no fallback; Codex native token_count explicit known reached type or usage_limit_exceeded native error, with session_meta UUID and applicable limit id. Unknown fields/percentage-only/generic rate limit/quoted payloads/stale native generation/recovered latest state do not trigger. Add resolve keyword excluded_clients=() to router and preserve old default/fable fallback semantics. Mark usage quarantine; auth/install probes alone and elapsed reset never clear; fresh native provider-specific recovery required.
+
+Step 1: RED: real SQLite duplicate/cross-connection/restart/CAS/task-completion/runtime-field preservation tests. Quota fixtures match observed Claude native fields and current Codex native event_msg/token_count envelope; known snake_case reached types from upstream account protocol. Negative controls strip native error fields, spoof quoted text, wrong UUID, oversized/truncated lines, unrelated quota bucket, old generation, generic server_overloaded/network/context/auth and later successful turn. Both-way router tests exclude source, preserve semantic fallback and sticky preference; usage quarantine survives auth-only probe.
+
+Step 2: Run RED; record actual missing-behavior failures.
+
+Run:
+
+    python3 -m pytest -c /Users/roberthyatt/Code/ironclaude/commander/pyproject.toml /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_handoff_registry.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_quota.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_provider_router.py
+
+Expected verification: Record output; new claims/quota/exclusion assertions fail for missing behavior.
+
+Step 3: GREEN: implement schema/methods/parser and excluded_clients keyword. Claim transaction compares full worker tuple and inserts unique active generation; registry status/task writes use same transaction exclusion. Native latest-state reader accepts only whole valid JSONL records with matching source identity, origin and current turn; display text never Claude quota predicate. Known Codex reached types: rate_limit_reached, workspace_owner_credits_depleted, workspace_member_credits_depleted, workspace_owner_usage_limit_reached, workspace_member_usage_limit_reached. Codex enum source: https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/account.rs . Parse old unsupported schema as unknown, not availability. Availability recovery requires newer provider-native evidence for applicable account/tier.
+
+Step 4: Run focused GREEN and registry/provider regressions; inspect output without suppressed errors.
+
+Run:
+
+    python3 -m pytest -c /Users/roberthyatt/Code/ironclaude/commander/pyproject.toml /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_handoff_registry.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_quota.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_registry.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_provider_router.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_provider_state.py
+
+Step 5: Parent reviews and stages exact allowed files.
+
+## Task 4: Transfer durable PM progress to fresh native root
+
+Depends on: 3
+
+Exact allowed files:
+
+- commander/src/ironclaude/worker_pm_handoff.py
+- commander/tests/test_worker_pm_handoff.py
+
+R3/R5/R6/R9. Private bounded PM SQLite helper, no public tool or identity spoofing. Read actual sessions/wave_tasks/review_grades/tier_up_reviews/registered_designs/plan_history schemas. Verify source snapshot exact native root/project/plan/lineage/wave/task states; destination observed fresh distinct native root PM-on idle with no plan/tasks/reviews/child bindings. Atomic copy preserves plan bytes and reviewed completed tasks; in_progress/submitted become pending, review stage returns executing only for unfinished task review, testing flag resets. Preserve actual planning/brainstorming/idle obligations, review_block_count/circuit_breaker/memory_required/lineage; no execution_complete handoff. Copy only source plan-lineage/hash review rows and completed-task review grades with exact original model/verdict/hash/timestamp plus explicit provenance audit; no fabricated pass, no pending human intent/subagent transfer. Original historical session/task/review rows unchanged. Current design registration ownership transfers by exact CAS without changing design_file/registered_at/consumed; predecessor evidence audited. Idempotency bound to source+target+generation and snapshot; changed source or dirty target refuses. Return recorded continuity evidence used by controller recovery.
+
+Step 1: RED: temp SQLite schema fixture derived from current state-manager/session-init fields, real SQL review-lineage trigger behavior. Mixed review_passed/in_progress/submitted tasks and non-default blocking fields; exact original review attribution, no old-root mutation, no extra blind review. Test planning stages, memory/circuit blocks, stale snapshots, target already has work, foreign root/project, replay and missing schema. Prove current successor planning-readiness SELECT and plan-writing consumed-registration query succeed after CAS, stale registration owner refuses, registration consumed/timestamp fields stay unchanged, and any later error rolls back all continuity changes.
+
+Step 2: Run RED and record actual missing behavior.
+
+Run:
+
+    python3 -m pytest -c /Users/roberthyatt/Code/ironclaude/commander/pyproject.toml /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_pm_handoff.py
+
+Expected verification: Record output; continuity assertions fail for absent helper.
+
+Step 3: GREEN: implement snapshot/prepare/readback helper in immediate SQLite transaction with explicit column lists and exact source/target/generation checks. Preserve original rows; clone only legitimate unchanged-plan evidence with predecessor ids in audit/provenance. SQL task mapping: CASE WHEN status IN ('in_progress','submitted') THEN 'pending' ELSE status END. Retain safety counters/flags except testing_theatre_checked=0; target active_skill cleared so continuation explicitly uses correct native skill. Unsupported or inconsistent schemas/stages fail closed. Never clear circuit or manufacture canonical review. For each exact source-owned current-project design registration in captured snapshot, execute UPDATE registered_designs SET terminal_session=? WHERE design_file=? AND terminal_session=? AND registered_at=? AND consumed=?; require one changed row each, preserve other fields and insert original registration evidence in audit transaction. Recognize replay only by exact recorded generation/source/target/snapshot. Do not call registerDesign (replacement resets consumed). Require valid consumed registration in planning states that depend on it; historical sessions/tasks/reviews stay source-attributed and unchanged.
+
+Step 4: Run GREEN; inspect helper and tests for real non-default equality failures.
+
+Run:
+
+    python3 -m pytest -c /Users/roberthyatt/Code/ironclaude/commander/pyproject.toml /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_pm_handoff.py
+
+Step 5: Parent reviews and stages exact allowed files.
+
+## Task 5: Implement safe successor lifecycle and phase recovery
+
+Depends on: 4
+
+Exact allowed files:
+
+- commander/src/ironclaude/worker_handoff.py
+- commander/src/ironclaude/worker_handoff_process.py
+- commander/src/ironclaude/orchestrator_mcp.py
+- commander/src/ironclaude/tmux_manager.py
+- commander/tests/test_worker_handoff.py
+- commander/tests/test_worker_handoff_process.py
+- commander/tests/test_orchestrator_mcp.py
+- commander/tests/test_tmux_manager.py
+
+R1-R9. WorkerHandoffController uses existing OrchestratorTools capabilities/router/workspace transport/_build_worker_launch_cmd/_wait_for_ready/_activate_pm_via_sqlite/_read_pm_state_via_sqlite, never kill_worker/spawn allocation/resume_session registration. Native process adapter snapshot captures PID+creation time+parent/cwd and all descendants; inaccessible/unknown workspace processes/external jobs block. Terminate exact owned source tree; verify every identity gone plus no reparented/unknown worktree process. Tmux absence alone insufficient. Remote adapter through existing SSH argv validates feature and actual host; unsupported remote proof pauses. Preflight both existing instruction files and installed private CLI support before kill; do not call instruction injectors. Fresh alternate bootstrap uses native no-prompt read-only flags, observed fresh UUID PM-on plus proved saved-conversation persistence; after PM prepare/assignment CAS, terminate bootstrap and resume only its own target UUID with normal editing mode, verify same UUID. Atomically registry runtime CAS then durable dispatch intent, send original objective/constraints + continuation status/artifact locations. Quota/external/identity/transport errors pause with held assignment, no source rollback; uncertain launch/dispatch never replayed. New generation-specific tmux/log/done handling rejects old markers. Add active-handoff early guard before kill/commit/finalize/resume/adopt/send/raw-key paths so stale callers cannot modify held worker.
+
+Step 1: RED: inject only provider/tmux/process/SSH boundaries, real registry/PM SQLite. Both directions prove order source dead -> fresh read-only ready -> PM copied -> held owner transfer -> stop bootstrap -> own-target resume verified -> runtime CAS -> continuation. Assert no allocate/finalize/abandon/instruction writes/global preference mutation/source UUID resume. Failure injection at every phase, duplicate/restart phase, live/reused PID/unknown child/SSH failure, missing instructions/native mode/target mismatch, pending human authority and dispatch uncertainty.
+
+Step 2: Run RED and record actual missing lifecycle failures.
+
+Run:
+
+    python3 -m pytest -c /Users/roberthyatt/Code/ironclaude/commander/pyproject.toml /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_handoff.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_handoff_process.py
+
+Expected verification: Record output; successor lifecycle assertions fail for absent behavior.
+
+Step 3: Read installed CLI help through bounded subprocess (no worker launch, no network) to verify native read-only/resume contracts before command construction. Record actual version/help fields; unavailable flags yield explicit unsupported readiness rather than guessed launch. Codex bootstrap proposed --sandbox read-only --ask-for-approval never; Claude bootstrap proposed --permission-mode plan. No bypass flag in bootstrap. Same-target resume editing command derives existing resume_session branches. Bootstrap starts without objective or tool-driving prompt; PM activation is existing SQLite write, not LLM instruction. A welcome/hook UUID does not prove saved native conversation. Verify native persisted session metadata/records support exact target resume. If first turn is necessary, permit one bounded read-only acknowledgment prompt: Reply HANDOFF_BOOTSTRAP_READY; do not use tools or change workspace. Do not send original objective. Verify completed native acknowledgment and saved UUID before PM/owner transfer; missing proof pauses held work. After bootstrap shutdown resume only same target UUID and verify again.
+
+Step 4: GREEN: implement controller phases claimed/source_stopped/target_ready/pm_prepared/owner_transferred/runtime_registered/continuation_dispatched with compare-and-set and evidence before effects. Use scoped capability grant helper only after registry claim/source/target observations as required per phase. Reconcile crash readback across independent DBs without blind resend/relaunch. Any unsafe state retains hold and unfinished worker; notification claimed once. Exclude active handoff at listed ordinary OrchestratorTools boundaries before side effects and again before delayed graded dispatch/finalization. Protect entire old-owner snapshots with generation CAS, not one early check.
+
+Step 5: Run GREEN and normal orchestrator/tmux regressions; record actual output.
+
+Run:
+
+    python3 -m pytest -c /Users/roberthyatt/Code/ironclaude/commander/pyproject.toml /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_handoff.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_handoff_process.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_orchestrator_mcp.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_tmux_manager.py
+
+Step 6: Parent reviews and stages exact allowed files.
+
+## Task 6: Wire automatic quota handoff before daemon completion
+
+Depends on: 5
+
+Exact allowed files:
+
+- commander/src/ironclaude/main.py
+- commander/src/ironclaude/worker_handoff.py
+- commander/src/ironclaude/worker_registry.py
+- commander/tests/test_worker_handoff_daemon.py
+- commander/tests/test_worker_handoff.py
+- commander/tests/test_lifecycle_logging.py
+- README.md
+- CODEX_SETUP.md
+
+R1-R9. In check_workers consult handoff/quota before .done/idle/dead-session/recovery/stuck branches and before every eventual send/kill/finalize. Reconcile pending/paused handoffs on restart independently from running-worker enumeration; never mark completed/reap paused assignment. Route only confirmed current native quota to controller automatically, under configured opposite capability/host and sticky selection preservation. Slow or unavailable read yields reason and bounded one-shot warning, no death/complete inference. Recheck exact generation after blocking graders/SSH and before side effects. Both unavailable and exhausted opposite preserved paused, no bounce or repeated notification. Add end-to-end storage integration both ways and ordinary completion control. Document concrete client/model/native id vs semantic claude-* type, preserved PM/worktree behavior, supported native evidence and operational blockers. No release/deploy/live worker operation.
+
+Step 1: RED: daemon tests with real registry and temp native logs/PM state; injected tmux/process at boundaries. Exact native quota invokes controller before old .done; stale running snapshot cannot finalize changed runtime; uncertain/dead host cannot complete; paused handoff absent from ordinary reaper. Both directions and both unavailable, reboot duplicate, stale event/cursor, delayed grader race, ordinary non-quota completion positive control. End-to-end tests include real temp Git workspace transfer and PM continuation interfaces (external provider boundary only mocked).
+
+Step 2: Run RED; record actual new daemon wiring failures.
+
+Run:
+
+    python3 -m pytest -c /Users/roberthyatt/Code/ironclaude/commander/pyproject.toml /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_handoff_daemon.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_handoff.py
+
+Expected verification: Record output; automatic handoff/race assertions fail for absent behavior.
+
+Step 3: GREEN: wire native quota/controller through _get_orchestrator and daemon check/recovery seams; registry methods enforce generation-aware exclusion for delayed callers. Existing routine completion remains same for non-held same generation. Source quotas never terminal-mark jobs. Preserve original directive/task as unfinished throughout pause. Document behavior and unsupported/missing readiness proof as explicit blocker, not impossibility or false completion.
+
+Step 4: Run all newly planned Python handoff suites plus relevant existing regressions.
+
+Run:
+
+    python3 -m pytest -c /Users/roberthyatt/Code/ironclaude/commander/pyproject.toml /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_handoff_registry.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_quota.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_pm_handoff.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_handoff.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_handoff_process.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_handoff_daemon.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_workspace_handoff_authority.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_provider_router.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_worker_registry.py /Users/roberthyatt/Code/ironclaude/commander/tests/test_lifecycle_logging.py
+
+Step 5: Run workspace focused suite and TypeScript compile again only because integrated changes now landed.
+
+Run:
+
+    npm --prefix /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager test -- src/__tests__/handoff.test.ts src/__tests__/cli.test.ts src/__tests__/workspace-service.test.ts src/__tests__/integration-core.test.ts src/__tests__/integration-recovery.test.ts
+
+Step 6: Run explicit final TypeScript compiler verification; record exit and output. This is separate from Vitest and writes no release artifacts.
+
+Run:
+
+    /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/node_modules/.bin/tsc --noEmit --project /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/tsconfig.json
+
+Step 7: Parent completes task review, stages cumulative exact allowed files, runs justified end adversarial diff review under delegated authority, repairs verified requirement blockers through workflow. Report source-only status and actual checks; no commit/push/deploy/restart/live handoff.

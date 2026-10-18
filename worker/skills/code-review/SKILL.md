@@ -186,6 +186,15 @@ Organize findings into:
 - **Important**: Code quality issues, standards violations, architecture concerns
 - **Minor**: Style issues, documentation gaps
 
+Also label every finding. `blocks requirement` is any of: a Critical finding above
+(security, broken functionality, testing theatre — regardless of whether the plan
+named it); a checklist Critical check (SQL & Data Safety, Race Conditions &
+Concurrency, LLM Output Trust Boundary, Command Injection, Pinned mutable count,
+Light-loop bound); planned behavior that is wrong or missing; or a planned check that
+cannot fail. `hardening` is everything else: extra negative cases, defensive checks,
+evidence the plan did not declare. See `../../rules/scope-fidelity.md` §6 and the
+checklist's "Review scope bound".
+
 **Step 7.1: Report-only classification**
 
 Code review is report-only for both task-boundary and standalone reviews. Do not edit files, apply fixes, or otherwise mutate the implementation during review. Classify every finding, report its file and line, and assign the grade from the reviewed state.
@@ -203,6 +212,11 @@ Based on findings, assign an overall grade using this rubric:
 | C | Stage 1 PASS + one or more important issues (no criticals) |
 | D | Stage 1 PASS + multiple important issues or borderline critical |
 | F | Stage 1 FAIL **or** any critical issue (security vulnerability, broken functionality, testing theatre) |
+
+Grade from `blocks requirement` findings only; the F row above is unchanged by this
+rule because every Critical finding is a blocker. `hardening` findings are listed under
+"Hardening (backlog)" in the report, never lower the grade below B, and never reopen a
+task.
 
 **Step 8: Generate report**
 

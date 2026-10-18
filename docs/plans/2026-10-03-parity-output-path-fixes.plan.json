@@ -1,0 +1,60 @@
+{
+  "name": "Parity Output and Path Fixes (v1.1.16 L2b-1c)",
+  "goal": "Map absolute allowed_files entries to the drift root by file identity, make state-activator.sh emit context only, and stop gating MCP sideband errors; then verify and redeploy.",
+  "requirements_file": "docs/plans/2026-10-03-parity-output-path-fixes-requirements.md",
+  "design_file": "docs/plans/2026-10-03-parity-output-path-fixes-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Identity-based mapping of absolute allowed_files (R1)",
+      "description": "Replace execution-drift-check.sh:130-148 per human plan Task 1 Step 3: new _drift_rel_by_identity ENTRY ROOT (walk from ENTRY's longest existing ancestor up to '/'; first dir with [ \"$dir\" -ef \"$root\" ] -> print ${entry#\"$dir\"/}, return 0; else return 1) and _drift_allowed_files '/*)' branch calls it with '|| true'; '', \"$root\"/*, relative branches unchanged; comment updated. New test worker/hooks/tests/test-execution-drift-identity.sh (human plan Task 1 Step 1 verbatim): symlinked spelling, entry under removed dir, case variant (case-insensitive volume only, SKIP reported, EXPECTED_PASSES 4 or 3), sibling-prefix negative.",
+      "allowed_files": ["worker/hooks/execution-drift-check.sh", "worker/hooks/tests/test-execution-drift-identity.sh"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: create worker/hooks/tests/test-execution-drift-identity.sh with human plan Task 1 Step 1 content verbatim."},
+        {"description": "Run test, see it fail", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-identity.sh", "expected": "predicted: exit 1; FAIL lines for cases 1, 2, 4 and (case-insensitive volume) 3 — current '/*' drops non-'$REPO/' absolute entries so src/a.txt, gone/old.txt, case/c.txt are drift (rc 2)"},
+        {"description": "execution-drift-check.sh: replace lines 130-148 with human plan Task 1 Step 3 code verbatim."},
+        {"description": "Run new test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-identity.sh", "expected": "predicted on this Mac (APFS case-insensitive): Results: 4 pass, 0 fail; exit 0 (case-sensitive volume: SKIP  3 line and Results: 3 pass, 0 fail; exit 0)"},
+        {"description": "Existing roots suite (out-of-root negatives stay dropped)", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-roots.sh", "expected": "Results: 8 pass, 0 fail; exit 0"},
+        {"description": "Existing drift suite", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-check.sh", "expected": "Results: 9 pass, 0 fail; exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/execution-drift-check.sh worker/hooks/tests/test-execution-drift-identity.sh", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Context-only state-activator output and the MCP error level (R2, R3)",
+      "description": "state-activator.sh: replace lines 8-32 (header comment + _ic_sa_flush) per human plan Task 2 Step 3 — jq maps each buffered line in order to text (.systemMessage // .hookSpecificOutput.additionalContext? // .__text // tojson unless it has hookSpecificOutput), keeps strings, emits nothing if none, else ONE {hookSpecificOutput:{hookEventName:\"UserPromptSubmit\",additionalContext: join(\"\\n\")}}; never systemMessage; exit code, cleanup and '|| cat' fallback kept; lines 33-37 unchanged; drain comment :68-69 updated (Step 4). hook-logger.sh:614 log_hook \"MCP-ERROR\" \"Error\" -> \"ERROR\" (provenance: both lines date to 3287f3a Initial commit; comments state display intent). Test file full replacement per Task 2 Step 1 (6 cases incl. MCP error without verbose and ERR path rc 1 via read-only ~/.claude + pending PPID marker).",
+      "allowed_files": ["worker/hooks/state-activator.sh", "worker/hooks/hook-logger.sh", "worker/hooks/tests/test-state-activator-single-object.sh"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: replace worker/hooks/tests/test-state-activator-single-object.sh with human plan Task 2 Step 1 content verbatim."},
+        {"description": "Run test, see it fail", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-state-activator-single-object.sh", "expected": "predicted: exit 1, Results: 2 pass, 4 fail — cases 1, 2, 6 FAIL (merged object has systemMessage), case 5 FAIL (\"Error\" level gated, nothing printed); cases 3, 4 PASS"},
+        {"description": "state-activator.sh: replace lines 8-32 with human plan Task 2 Step 3 code verbatim."},
+        {"description": "state-activator.sh: replace the drain comment per human plan Task 2 Step 4."},
+        {"description": "hook-logger.sh:614: \"Error\" -> \"ERROR\" per human plan Task 2 Step 5."},
+        {"description": "Run new test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-state-activator-single-object.sh", "expected": "Results: 6 pass, 0 fail; exit 0"},
+        {"description": "Warning queue suite", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-warning-queue.sh", "expected": "Results: 7 pass, 0 fail; exit 0"},
+        {"description": "Deactivation suite", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-professional-mode-deactivation.sh", "expected": "Results: 28 pass, 0 fail; exit 0"},
+        {"description": "Git authority suite", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-git-authority-activation.sh", "expected": "Results: 94 passed, 0 failed; exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/state-activator.sh worker/hooks/hook-logger.sh worker/hooks/tests/test-state-activator-single-object.sh", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Full verification and redeploy (R5)",
+      "description": "Run all hook suites and the Commander suite, deploy hooks, confirm Claude plugin hooks.json unchanged (copy only on a difference), refresh the Codex cache, verify it matches worker/, write the deploy log with the R6 note (operator commits L2b-1 + L2b-1b + L2b-1c together, then re-trusts pre_tool_use:2, pre_tool_use:3, pre_tool_use:6, post_tool_use:6). No tests required: runs suites and deploys; deploy-hooks and codex plugin add write generated runtime copies outside the repo.",
+      "allowed_files": ["docs/plans/2026-10-03-parity-output-path-fixes-deploy-log.md"],
+      "depends_on": [1, 2],
+      "steps": [
+        {"description": "Run every hook suite", "command": "make -C /Users/roberthyatt/Code/ironclaude test-hooks", "expected": "exit 0; test-execution-drift-identity.sh and test-state-activator-single-object.sh headers printed; no non-zero fail count (total not measured)"},
+        {"description": "Run Commander suite (Bash timeout 600000)", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "3457 passed, exit 0"},
+        {"description": "Deploy hooks", "command": "make -C /Users/roberthyatt/Code/ironclaude deploy-hooks", "expected": "output includes 'Deployed to plugin cache /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks' and 'Deployed 31 hooks to /Users/roberthyatt/.claude/ironclaude-hooks'"},
+        {"description": "Check Claude plugin hooks.json; no output -> record 'hooks.json unchanged — copy skipped'; on a difference record it, run cp /Users/roberthyatt/Code/ironclaude/worker/hooks/hooks.json /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks/hooks.json and re-diff", "command": "diff /Users/roberthyatt/Code/ironclaude/worker/hooks/hooks.json /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks/hooks.json", "expected": "no output, exit 0"},
+        {"description": "Refresh Codex plugin cache", "command": "codex plugin add ironclaude@ironclaude --json", "expected": "exit 0; JSON installedPath /Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/1.1.15+codex.20260930172837"},
+        {"description": "Verify Codex cache matches worker/", "command": "diff -rq /Users/roberthyatt/Code/ironclaude/worker /Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/1.1.15+codex.20260930172837 -x node_modules -x __pycache__ -x .DS_Store", "expected": "no output, exit 0"},
+        {"description": "Write docs/plans/2026-10-03-parity-output-path-fixes-deploy-log.md per human plan Task 3 Step 7 (quoted outputs of Steps 1-6; hooks.json unchanged; R6 note)."},
+        {"description": "Stage deploy log", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-03-parity-output-path-fixes-deploy-log.md", "expected": "no output, exit 0"}
+      ]
+    }
+  ]
+}

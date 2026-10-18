@@ -62,12 +62,46 @@ def read_pending_decisions(decisions_dir: str) -> list[dict]:
     return decisions
 
 
+def extract_ledger_json(body: str) -> dict:
+    """Extract ledger JSON from the ## Data code fence in a wiki page body."""
+    parts = body.split("## Data")
+    if len(parts) < 2:
+        return {"objective": None, "tasks": []}
+    data_section = parts[1]
+    fence_start = data_section.find("```")
+    if fence_start == -1:
+        return {"objective": None, "tasks": []}
+    after_fence = data_section[fence_start + 3:]
+    first_newline = after_fence.find("\n")
+    if first_newline == -1:
+        return {"objective": None, "tasks": []}
+    json_content = after_fence[first_newline + 1:]
+    fence_end = json_content.find("```")
+    if fence_end == -1:
+        return {"objective": None, "tasks": []}
+    try:
+        return json.loads(json_content[:fence_end].strip())
+    except (json.JSONDecodeError, ValueError):
+        return {"objective": None, "tasks": []}
+
+
 def read_task_ledger(path: str) -> dict | None:
-    """Read the task ledger file. Returns None if not found."""
+    """Read the task ledger. A .md path is the wiki ledger page (its ## Data JSON
+    block); anything else is the legacy JSON file. Returns None if missing or
+    unparseable."""
     try:
         with open(path) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+            raw = f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if path.endswith(".md"):
+        data = extract_ledger_json(raw)
+        if not isinstance(data, dict):
+            return None
+        return data if (data.get("objective") or data.get("tasks")) else None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
         return None
 
 

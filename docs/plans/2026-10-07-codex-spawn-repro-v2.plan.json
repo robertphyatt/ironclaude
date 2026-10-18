@@ -1,0 +1,28 @@
+{
+  "name": "Codex worker spawn reproduction v2",
+  "goal": "Reach a real Codex 0.160.0 prompt past startup modals and measure id-file timing/writer, --no-daemon effect, and $skill dispatch submission; record a findings note.",
+  "requirements_file": "docs/plans/2026-10-07-codex-spawn-repro-v2-design.md",
+  "design_file": "docs/plans/2026-10-07-codex-spawn-repro-v2-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Re-run probe past modals, measure and record",
+      "description": "Write probe-v2.sh verbatim from human plan Task 1 Step 1 with the Write tool (not a bash heredoc: guard blocks Bash text containing `git commit`). Variants: B = --no-daemon = Commander's current local worker cmd (orchestrator_mcp.py:564-571 via 641-642), run first; A = daemon mode (remote-path style, :769). v1 probe + handle_modal on every check in every phase (Folder access->1, Hooks need review->2, Working directory->2; same modal still up next check -> Enter once); readiness 90 s (banner + 'Ask Codex to do anything' + no modal, stable on two checks 3 s apart); id-file poll every 1 s for 60 s then every 5 s to 300 s (ID_*=in-tree, ANY_*=any); dispatch $skill + 0.2 s + snapshot dispatch-typed (picker) + Enter, snapshot after 10 s (mention/marker counts), second Enter, plain prompt, rescans; cleanup by exact session; per-variant repo-v2-<V>/run-v2-<V>. Run B then A sequentially, each one background Bash run (timeout 900000); read run-v2-<V>/probe.log and snaps after each; record actual (investigation). Kill SURVIVOR only by exact PID if probe-launched; new codex processes reported only. Write docs/reviews/2026-10-07-codex-spawn-repro-v2-findings.md per human plan Step 4; stage with loop docs. Hard limits: no Commander process/DB or roleplaying-agents access (read-only sqlite3 -readonly on ~/.claude/ironclaude.db only), no pattern-kill, no project-repo commit/push. Disclosed side effects: config.toml trust/hooks rows for the two scratch repos and possibly their parent, session-init maintenance, ironclaude.db session rows. No tests required: investigation, no product code.",
+      "allowed_files": [
+        "/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-repro/probe-v2.sh",
+        "docs/reviews/2026-10-07-codex-spawn-repro-v2-findings.md",
+        "docs/plans/2026-10-07-codex-spawn-repro-v2-design.md",
+        "docs/plans/2026-10-07-codex-spawn-repro-v2.md",
+        "docs/plans/2026-10-07-codex-spawn-repro-v2.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Write /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-repro/probe-v2.sh verbatim from human plan Task 1 Step 1 using the Write tool."},
+        {"description": "Run variant B (production --no-daemon) in background (Bash timeout 900000); on completion read run-v2-B/probe.log and snap-*.txt", "command": "bash /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-repro/probe-v2.sh B", "expected": "record actual; note modals answered (phase/time/key), picker_when_typed, mention/marker counts, SURVIVOR lines, codex process diff"},
+        {"description": "After B completes, run variant A (daemon mode) in background (Bash timeout 900000); on completion read run-v2-A/probe.log and snap-*.txt", "command": "bash /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/codex-repro/probe-v2.sh A", "expected": "record actual; note modals answered (phase/time/key), picker_when_typed, mention/marker counts, SURVIVOR lines, codex process diff"},
+        {"description": "Write docs/reviews/2026-10-07-codex-spawn-repro-v2-findings.md per human plan Task 1 Step 4 (per-variant measurements; conclusions VERIFIED/UNRESOLVED for Q2, submitted-turn hypothesis, --no-daemon, Q3 incl. second-Enter submit + marker; relation to production spawns 1 and 2; spawn-fix inputs; leftover state)."},
+        {"description": "Stage findings and loop docs", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-07-codex-spawn-repro-v2-findings.md docs/plans/2026-10-07-codex-spawn-repro-v2-design.md docs/plans/2026-10-07-codex-spawn-repro-v2.md docs/plans/2026-10-07-codex-spawn-repro-v2.plan.json", "expected": "no output, exit 0"}
+      ]
+    }
+  ]
+}

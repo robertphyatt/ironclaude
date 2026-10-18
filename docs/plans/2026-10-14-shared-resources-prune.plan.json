@@ -1,0 +1,30 @@
+{
+  "name": "Prune committed music paths from shared resources",
+  "goal": "Remove 20 now-committed music paths from roleplaying-agents .git/info/worktree-shared-resources and record before/after evidence.",
+  "requirements_file": "docs/plans/2026-10-14-shared-resources-prune-design.md",
+  "design_file": "docs/plans/2026-10-14-shared-resources-prune-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Prune and record",
+      "description": "No tests required: operational config edit, not code; verification = line counts, diff, per-path absence. Invariants: literal absolute paths, no shell vars across steps; no 2>/dev/null; echo exit codes; only config write is Step 5 cp, all else under /private/tmp/shared-prune/; mismatch => stop and report, never widen patterns; .git/info/exclude untouched; stage with git -C /Users/roberthyatt/Code/ironclaude add -f. Measured 2026-10-14: config 66 lines, 20 exact matches.",
+      "allowed_files": [
+        "docs/reviews/2026-10-14-shared-resources-prune-findings.md",
+        "docs/plans/2026-10-14-shared-resources-prune-design.md",
+        "docs/plans/2026-10-14-shared-resources-prune.md",
+        "docs/plans/2026-10-14-shared-resources-prune.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Before snapshot + pattern file", "command": "mkdir -p /private/tmp/shared-prune && cp /Users/roberthyatt/Code/roleplaying-agents/.git/info/worktree-shared-resources /private/tmp/shared-prune/before.txt; echo \"snap=$?\"; printf '%s\\n' 'godot/artificial-adventures/tools/music_retrieval/role_audio_hybrid.py' 'godot/artificial-adventures/tools/music_retrieval/semantic_role_hybrid.py' 'godot/artificial-adventures/tools/music_retrieval/musical_role_profiles.json' 'godot/artificial-adventures/tools/music_retrieval/editorial_top2_development.json' 'godot/artificial-adventures/tools/music_retrieval/__init__.py' 'godot/artificial-adventures/tools/music_retrieval/native_clap_adapter.py' 'godot/artificial-adventures/tools/music_retrieval/native_clap_install.py' 'godot/artificial-adventures/tools/music_retrieval/native_clap_protocol.py' 'godot/artificial-adventures/tools/music_retrieval/clap_index.py' 'godot/artificial-adventures/tools/music_retrieval/native_whole_track.py' 'godot/artificial-adventures/tools/music_retrieval/native_full_catalog.py' 'godot/artificial-adventures/tools/music_retrieval/pilot_schema.py' 'godot/artificial-adventures/tools/music_retrieval/model_install.py' 'godot/artificial-adventures/tools/music_retrieval/native_clap_requirements.lock' 'godot/artificial-adventures/tools/music_retrieval/musical_intent_texts.json' 'godot/artificial-adventures/tools/music_retrieval/binary_artifacts.py' 'godot/artificial-adventures/tools/music_retrieval/native_clap_worker.py' 'godot/artificial-adventures/tools/music_retrieval/full_catalog.py' 'godot/artificial-adventures/audio/music/Call It Cooperation.ogg' 'godot/artificial-adventures/audio/music/Neglected.ogg' > /private/tmp/shared-prune/remove.txt; echo \"pat=$?\"; wc -l /private/tmp/shared-prune/before.txt /private/tmp/shared-prune/remove.txt; grep -c -x -F -f /private/tmp/shared-prune/remove.txt /private/tmp/shared-prune/before.txt; echo \"match=$?\"", "expected": "snap=0; pat=0; before.txt 66; remove.txt 20; match count 20; match=0. Else stop and report (<20 missing path, >20 duplicate)."},
+        {"description": "Build filtered candidate", "command": "grep -v -x -F -f /private/tmp/shared-prune/remove.txt /private/tmp/shared-prune/before.txt > /private/tmp/shared-prune/candidate.txt; echo \"filter=$?\"; wc -l /private/tmp/shared-prune/candidate.txt", "expected": "filter=0; candidate.txt 46."},
+        {"description": "Verify candidate diff", "command": "diff /private/tmp/shared-prune/before.txt /private/tmp/shared-prune/candidate.txt > /private/tmp/shared-prune/candidate.diff; echo \"diff=$?\"; grep -c -e '^<' /private/tmp/shared-prune/candidate.diff; grep -c -e '^>' /private/tmp/shared-prune/candidate.diff; echo \"added=$?\"", "expected": "diff=1; '<' count 20; '>' count 0; added=1."},
+        {"description": "Candidate retains non-target entries", "command": "grep -c -x -F -f /private/tmp/shared-prune/remove.txt /private/tmp/shared-prune/candidate.txt; echo \"left=$?\"; grep -x -F -e 'godot/artificial-adventures/models/music_clap' -e '.venv' /private/tmp/shared-prune/candidate.txt", "expected": "count 0; left=1; prints godot/artificial-adventures/models/music_clap and .venv."},
+        {"description": "Apply", "command": "cp /private/tmp/shared-prune/candidate.txt /Users/roberthyatt/Code/roleplaying-agents/.git/info/worktree-shared-resources; echo \"apply=$?\"", "expected": "apply=0. Guard block => stop and report, no workaround."},
+        {"description": "After snapshot + cmp + exclude untouched", "command": "cp /Users/roberthyatt/Code/roleplaying-agents/.git/info/worktree-shared-resources /private/tmp/shared-prune/after.txt; echo \"after=$?\"; wc -l /private/tmp/shared-prune/after.txt; cmp /private/tmp/shared-prune/candidate.txt /private/tmp/shared-prune/after.txt; echo \"cmp=$?\"; grep -c -x -F -e '/godot/artificial-adventures/tools/music_retrieval/model_install.py' -e '/godot/artificial-adventures/audio/music/Neglected.ogg' /Users/roberthyatt/Code/roleplaying-agents/.git/info/exclude", "expected": "after=0; after.txt 46; cmp=0; exclude count 2."},
+        {"description": "Write docs/reviews/2026-10-14-shared-resources-prune-findings.md: operator go; before/after line counts; 20 removed paths quoted from candidate.diff; cmp + exclude check; why exclude kept (worktree 3106ccc6 symlinks at all 20); backlog: remove those exclude lines when 3106ccc6 closes; deferred: 019f7d26 close-out via /reconcile in Codex after main = f9c4882.", "expected": "Note written."},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-14-shared-resources-prune-findings.md docs/plans/2026-10-14-shared-resources-prune-design.md docs/plans/2026-10-14-shared-resources-prune.md docs/plans/2026-10-14-shared-resources-prune.plan.json", "expected": "No output."}
+      ]
+    }
+  ]
+}

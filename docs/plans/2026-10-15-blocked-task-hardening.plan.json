@@ -1,0 +1,29 @@
+{
+  "name": "Blocked-task follow-up hardening",
+  "goal": "Stop a non-string ledger task description from crashing the Commander's idle enforcement, escape ledger task ids in Slack output, and pin the first-reminder delay with a test.",
+  "requirements_file": "docs/plans/2026-10-15-blocked-task-hardening-design.md",
+  "design_file": "docs/plans/2026-10-15-blocked-task-hardening-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Description coercion, id escaping and first-reminder delay test",
+      "description": "TDD. Code blocks verbatim in docs/plans/2026-10-15-blocked-task-hardening.md Task 1 Steps 1-4; apply exactly. Invariants: literal absolute paths; git -C /Users/roberthyatt/Code/ironclaude; pytest PYTHONUNBUFFERED=1 via commander/.venv/bin/python from /Users/roberthyatt/Code/ironclaude/commander; never stash/commit/push; tests use tmp_path helpers (_daemon/_write_ledger), never ~/.ironclaude. Verified: main.py:5279-5281 tier-2 idle description slice t.get(\"description\",\"unknown\")[:40]; check_idle_enforcement main.py:5194, _last_idle_check init 0.0 (:1590), sends skipped only if brain._executing_tool is True (:5261); _get_unprocessed_messages returns [] when _db None (:2058); notifications.py:163 and :238 render task id raw; _escape_mrkdwn notifications.py:12; test_blocked_tasks.py has _iso/_write_ledger/_daemon/_reminders/H and imports format_heartbeat but not format_blocked_reminder. Known pre-existing suite failure: tests/test_executing_plans_skill.py::test_execution_complete_restage_command_stages_from_non_root_cwd.",
+      "allowed_files": [
+        "commander/src/ironclaude/main.py",
+        "commander/src/ironclaude/notifications.py",
+        "commander/tests/test_blocked_tasks.py",
+        "docs/plans/2026-10-15-blocked-task-hardening-design.md",
+        "docs/plans/2026-10-15-blocked-task-hardening.md",
+        "docs/plans/2026-10-15-blocked-task-hardening.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Append TestHardening (3 tests: test_idle_enforcement_survives_non_string_description, test_task_id_is_escaped_in_heartbeat_and_reminder, test_first_reminder_waits_for_interval_since_blocked) plus the format_blocked_reminder import to commander/tests/test_blocked_tasks.py per plan.md Task 1 Step 1."},
+        {"description": "RED run.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_blocked_tasks.py -q -k TestHardening", "expected": "2 failed (idle TypeError 'NoneType' object is not subscriptable at main.py:5280; raw <!channel> present), 1 passed (first-reminder delay test guards existing behaviour); record measured."},
+        {"description": "GREEN per plan.md Task 1 Step 2: main.py:5280 str(t.get(\"description\") or \"unknown\")[:40]; notifications.py:163 and :238 task id via _escape_mrkdwn(str(task.get('id', '?')))."},
+        {"description": "GREEN + full commander suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_blocked_tasks.py tests/test_notifications.py tests/test_idle_enforcement.py -q > /private/tmp/claude-502/bth.out 2>&1; echo \"t=$?\"; tail -n 3 /private/tmp/claude-502/bth.out; PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/ -q > /private/tmp/claude-502/bth-suite.out 2>&1; echo \"suite=$?\"; tail -n 4 /private/tmp/claude-502/bth-suite.out", "expected": "t=0 (0 failed); suite=1 with only the known pre-existing test_execution_complete_restage_command_stages_from_non_root_cwd failing. Any other failure must be shown pre-existing via a temporary git worktree of HEAD (never git stash) or fixed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/main.py commander/src/ironclaude/notifications.py commander/tests/test_blocked_tasks.py; git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-15-blocked-task-hardening-design.md docs/plans/2026-10-15-blocked-task-hardening.md docs/plans/2026-10-15-blocked-task-hardening.plan.json", "expected": "No output."}
+      ]
+    }
+  ]
+}

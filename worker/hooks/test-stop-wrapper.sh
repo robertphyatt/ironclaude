@@ -29,6 +29,17 @@ is_single_termination(){
       (.[0].continue == false) and
       (.[0].stopReason | type == "string" and length > 0)' >/dev/null 2>&1
 }
+# Exercise the runner boundary with an implementation that fails after writing.
+assert_runner_failure(){
+  local input="$1" expectation="$2" label="$3" result rc
+  result="$(_run_codex_stop "$input" "$T/failing-impl.sh")"
+  rc=$?
+  if [ "$rc" = "0" ] && "$expectation" "$result"; then
+    pass "$label"
+  else
+    fail "$label (rc=$rc output=[$result])"
+  fi
+}
 assert_json(){
   is_single_json "$1" && pass "$2" || fail "$2: [$1]"
 }
@@ -139,6 +150,12 @@ RC_RUN_FAIL=$?
 is_single_block "$RUN_FAIL" &&
   pass "codex runner failure is fail-closed JSON" ||
   fail "codex runner failure not fail-closed: [$RUN_FAIL]"
+assert_runner_failure '{"loop_count":1}' is_single_termination "loop_count 1 terminates failed continuation"
+assert_runner_failure '{"loop_count":0}' is_single_block "loop_count 0 requests initial retry"
+assert_runner_failure '{"stop_hook_active":false,"loop_count":1}' is_single_block "explicit false overrides loop_count 1"
+assert_runner_failure '{"stop_hook_active":true,"loop_count":0}' is_single_termination "explicit true overrides loop_count 0"
+assert_runner_failure '{"stop_hook_active":null,"loop_count":1}' is_single_termination "null active field defers to loop_count 1"
+assert_runner_failure '{"stop_hook_active":"true","loop_count":0}' is_single_termination "non-null active value is preserved"
 
 # 4) Forced real Codex wrapper emits valid JSON and exits zero.
 CX="$(printf '%s' "$STDIN" | GBTW_FORCE_CODEX=1 bash "$WRAP")"

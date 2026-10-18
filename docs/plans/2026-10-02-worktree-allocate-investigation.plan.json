@@ -1,0 +1,53 @@
+{
+  "name": "Worktree Allocate Failure Investigation",
+  "goal": "Gather read-only evidence on why workspace-manager allocate times out and strands reservations after the reboot, the fate of worktree 13cf1c2c, and why the spawn swap guard used 8GB; write a findings note driving repair and v1.1.16.",
+  "requirements_file": "docs/plans/2026-10-02-worktree-allocate-investigation-requirements.md",
+  "design_file": "docs/plans/2026-10-02-worktree-allocate-investigation-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Forensic investigation and findings note",
+      "description": "I1-I6. Inline execution (operator choice). No tests required: read-only investigation; no code changes; deliverable is a findings doc. Never mutate live workspace DB, git refs, worktrees, config, or processes; query only a scratchpad DB snapshot; derive owner sessions from DB, not a hard-coded list. Full steps: human plan Task 1.",
+      "allowed_files": [
+        "docs/plans/2026-10-02-worktree-allocate-findings.md",
+        "docs/plans/2026-10-02-worktree-allocate-investigation-requirements.md",
+        "docs/plans/2026-10-02-worktree-allocate-investigation-design.md",
+        "docs/plans/2026-10-02-worktree-allocate-investigation.md",
+        "docs/plans/2026-10-02-worktree-allocate-investigation.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "I1 snapshot DB (+wal,shm) to scratchpad wsdb/",
+          "command": "mkdir -p /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/wsdb && cp -p /Users/roberthyatt/.claude/ironclaude-workspaces.db /Users/roberthyatt/.claude/ironclaude-workspaces.db-wal /Users/roberthyatt/.claude/ironclaude-workspaces.db-shm /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/wsdb/",
+          "expected": "exit 0; three files present"
+        },
+        {
+          "description": "I2 schema, then snapshot queries: nonterminal roleplaying-agents rows, d1501% rows, 13cf1c2c rows, lease/lock tables; owner sessions from assignments.owner_session_id + primary_checkout_owners.owner_session_id classified live/dead via ps + transcript mtime after 2026-10-02 09:57",
+          "command": "sqlite3 -readonly /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/wsdb/ironclaude-workspaces.db .schema",
+          "expected": "output captured and quoted in findings"
+        },
+        {
+          "description": "I3 git state: worktree list; for-each-ref over refs/heads refs/ironclaude refs/tags/archive; ahead counts vs each row's integration_target (fallback main, stated)",
+          "command": "git -C /Users/roberthyatt/Code/roleplaying-agents for-each-ref --format='%(refname) %(objectname:short) %(committerdate:iso)' refs/heads refs/ironclaude refs/tags/archive",
+          "expected": "output captured and quoted in findings"
+        },
+        {
+          "description": "I4 13cf1c2c: ls -laT recovery/finalization ref dirs (no reflogs); last transcript in ~/.claude/projects/-Users-roberthyatt-Code-roleplaying-agents--ironclaude-worktrees-13cf1c2c-2344-4e35-8533-8b37a41f89f5 tail-grep 13cf1c2c/recovery/rescue/abandon/close_out; grep d855cc6f/7b03ab92 transcripts; DB rows; per ref git log <integration_target>..<ref> and diff --stat <base_commit> <ref>; test 'closed out ~Oct 1 07:13 pre-reboot' hypothesis",
+          "command": "ls -laT /Users/roberthyatt/Code/roleplaying-agents/.git/refs/ironclaude/recovery /Users/roberthyatt/Code/roleplaying-agents/.git/refs/ironclaude/finalization",
+          "expected": "evidence-backed conclusion in findings"
+        },
+        {
+          "description": "I5 allocate: workspace_client.py timeout=60 subprocess.run; workspace-service.ts reserveWorkerWorktree/materializeReservedAssignment; repo size (count-objects -vH, ls-files, .gitattributes/LFS, hooks, shared resources). Swap guard: orchestrator_mcp.py:2830-2860 + config.py max_swap_used_gb load; find live local config, check max_swap_used_gb:50 / spawn_block_pressure_level:4, explain 'max 8.0GB'",
+          "command": "git -C /Users/roberthyatt/Code/roleplaying-agents count-objects -vH",
+          "expected": "evidence-backed conclusion in findings"
+        },
+        {
+          "description": "I6 write findings (timeline, root cause, 13cf1c2c fate, evidence, answer to 'thought we fixed this', repair plan ordered: make -C /Users/roberthyatt/Code/ironclaude/commander stop first -> mutate -> relaunch detached with Claude Code env unset only after allocate proven; v1.1.16 scope: (a) swap guard orchestrator_mcp.py:2834-2857 swap-used vs pressure, swap release open question via sysctl vm.swapusage; (b) stranded reservation + allocate timeout; (c) memory-leak investigation pointer) and stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-02-worktree-allocate-investigation-requirements.md docs/plans/2026-10-02-worktree-allocate-investigation-design.md docs/plans/2026-10-02-worktree-allocate-investigation.md docs/plans/2026-10-02-worktree-allocate-investigation.plan.json docs/plans/2026-10-02-worktree-allocate-findings.md",
+          "expected": "exit 0"
+        }
+      ]
+    }
+  ]
+}

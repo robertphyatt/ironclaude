@@ -1,0 +1,197 @@
+{
+  "name": "Lock-free read-only git: hooks, workspace-manager, Commander",
+  "goal": "Every read-only git command IronClaude launches stops writing the index (and taking .git/index.lock), after a scratch-repo investigation confirms the cause and decides whether git diff also needs diff.autoRefreshIndex=false.",
+  "requirements_file": "docs/plans/2026-10-18-lock-free-read-git-design.md",
+  "design_file": "docs/plans/2026-10-18-lock-free-read-git-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Scratch-repository investigation (R1)",
+      "description": "Per plan.md Task 1. No tests required: evidence only. Probe script verbatim per plan.md Step 1 on a 60000-file scratch repo under /private/tmp/claude-502/taf4/scratch (never roleplaying-agents' index); lock-free timing read in roleplaying-agents; findings file with ## Probe, ## roleplaying-agents timing, ## Diff verdict and exactly one verdict line diff_flag=APPLY | diff_flag=SKIP (not needed) | diff_flag=SKIP (unsafe) per the plan.md rule.",
+      "allowed_files": [
+        "docs/plans/2026-10-18-lock-free-read-git-findings.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {
+          "description": "Write /private/tmp/claude-502/taf4/probe.sh verbatim per plan.md Task 1 Step 1",
+          "expected": "written"
+        },
+        {
+          "description": "Run the probe",
+          "command": "bash /private/tmp/claude-502/taf4/probe.sh > /private/tmp/claude-502/taf4/t1-probe.log 2>&1; echo \"probe_rc=$?\"; cat /private/tmp/claude-502/taf4/t1-probe.log",
+          "expected": "extra lines such as bash Killed notices tolerated; probe_rc=0; files=60000; flag_status_rewrote_index, env_status_rewrote_index, plain_status_rewrote_index, env_diff_*, flag_diff_* lines and five kill_delay= lines, recorded as observed. If flag_status_rewrote_index or env_status_rewrote_index is yes -> STOP. No kill_delay line with lock=present size=0 is recorded, not a STOP."
+        },
+        {
+          "description": "Time the lock-free status in roleplaying-agents (read-only, no lock)",
+          "command": "/usr/bin/time -p git -C /Users/roberthyatt/Code/roleplaying-agents --no-optional-locks status --porcelain=v1 -z --untracked-files=all > /private/tmp/claude-502/taf4/t1-rpa-status.out 2> /private/tmp/claude-502/taf4/t1-rpa-time.log; echo \"rpa_rc=$?\"; cat /private/tmp/claude-502/taf4/t1-rpa-time.log; wc -c /private/tmp/claude-502/taf4/t1-rpa-status.out",
+          "expected": "rpa_rc=0 and real/user/sys lines; recorded"
+        },
+        {
+          "description": "Write the findings file and the diff verdict per plan.md Task 1 Step 4",
+          "command": "rg -n -e '^## Probe$' -e '^## roleplaying-agents timing$' -e '^## Diff verdict$' -e '^diff_flag=(APPLY|SKIP \\(not needed\\)|SKIP \\(unsafe\\))$' /Users/roberthyatt/Code/ironclaude/docs/plans/2026-10-18-lock-free-read-git-findings.md",
+          "expected": "exactly four lines: three headings and one verdict line"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-18-lock-free-read-git-findings.md",
+          "expected": "no output"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Hooks read lock-free (R2)",
+      "description": "Per plan.md Task 2, code verbatim. TDD. execution-drift-check.sh:152 and subagent-drift-detector.sh:41 use git --no-optional-locks status; new worker/hooks/tests/test-lock-free-read-git.sh (2 presence checks + behavioral --no-optional-locks vs plain-status control).",
+      "allowed_files": [
+        "worker/hooks/execution-drift-check.sh",
+        "worker/hooks/subagent-drift-detector.sh",
+        "worker/hooks/tests/test-lock-free-read-git.sh"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "RED test file verbatim per plan.md Task 2 Step 1",
+          "expected": "file created; no command"
+        },
+        {
+          "description": "Run RED",
+          "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-lock-free-read-git.sh > /private/tmp/claude-502/taf4/t2-red.log 2>&1; echo \"rc=$?\"; cat /private/tmp/claude-502/taf4/t2-red.log",
+          "expected": "derived: rc=1; both 'missing:' lines FAIL; both behavior lines PASS; last line '2 passed, 2 failed'"
+        },
+        {
+          "description": "GREEN code verbatim per plan.md Task 2 Step 3",
+          "expected": "files edited; no command"
+        },
+        {
+          "description": "Run GREEN and the drift suites",
+          "command": "cd /Users/roberthyatt/Code/ironclaude && for t in worker/hooks/tests/test-lock-free-read-git.sh worker/hooks/tests/test-execution-drift-check.sh worker/hooks/tests/test-execution-drift-identity.sh worker/hooks/tests/test-execution-drift-roots.sh worker/hooks/tests/test-execution-drift-writers.sh; do bash \"$t\" > \"/private/tmp/claude-502/taf4/t2-green-$(basename \"$t\" .sh).log\" 2>&1; echo \"$t rc=$?\"; tail -n 1 \"/private/tmp/claude-502/taf4/t2-green-$(basename \"$t\" .sh).log\"; done",
+          "expected": "every rc=0; the new test ends '4 passed, 0 failed'"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/execution-drift-check.sh worker/hooks/subagent-drift-detector.sh worker/hooks/tests/test-lock-free-read-git.sh",
+          "expected": "no output"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "workspace-manager reads lock-free (R3)",
+      "description": "Per plan.md Task 3, code verbatim. TDD. git.ts exports LOCK_FREE_READ_ENV = { GIT_OPTIONAL_LOCKS: '0' }; runGit/runGitEnv and integration.ts cumulativeBinaryEffect spawnSync pass it in env. [APPLY only] steps (diff.autoRefreshIndex=false + diff test) run only when Task 1 verdict is exactly diff_flag=APPLY; otherwise skipped and recorded.",
+      "allowed_files": [
+        "worker/mcp-servers/workspace-manager/src/git.ts",
+        "worker/mcp-servers/workspace-manager/src/integration.ts",
+        "worker/mcp-servers/workspace-manager/src/__tests__/git.test.ts"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "RED tests verbatim per plan.md Task 3 Step 1 (new describe with runGit status, runGitEnv status and plain-status control; node:fs import gains statSync and utimesSync); [APPLY only] Step 1b diff test",
+          "expected": "file edited; no command"
+        },
+        {
+          "description": "Run RED",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx vitest run src/__tests__/git.test.ts -t 'optional index lock' > /private/tmp/claude-502/taf4/t3-red.log 2>&1; echo \"rc=$?\"; rg -n -e ' ✓ ' -e ' × ' -e 'Tests ' /private/tmp/claude-502/taf4/t3-red.log",
+          "expected": "derived: rc=1; runGit status and runGitEnv status tests fail; control passes; [APPLY only] diff test fails too"
+        },
+        {
+          "description": "GREEN code verbatim per plan.md Task 3 Step 3 (+ [APPLY only] Step 3b)",
+          "expected": "files edited; no command"
+        },
+        {
+          "description": "Run GREEN and the package suite",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager && npx tsc --noEmit > /private/tmp/claude-502/taf4/t3-tsc.log 2>&1; echo \"tsc_rc=$?\"; npm test > /private/tmp/claude-502/taf4/t3-green.log 2>&1; echo \"npm_rc=$?\"; rg -n -e 'Test Files' -e 'Tests ' -e ' FAIL ' /private/tmp/claude-502/taf4/t3-green.log",
+          "expected": "tsc_rc=0, npm_rc=0, no ' FAIL ' lines; record Tests count as <W>"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/mcp-servers/workspace-manager/src/git.ts worker/mcp-servers/workspace-manager/src/integration.ts worker/mcp-servers/workspace-manager/src/__tests__/git.test.ts",
+          "expected": "no output"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Commander reads lock-free (R4)",
+      "description": "Per plan.md Task 4, code verbatim. TDD. push_repo's git diff --stat HEAD (orchestrator_mcp.py:1934-1937) and shadow_grader git_diff (shadow_grader.py:213-216) pass env={**os.environ, \"GIT_OPTIONAL_LOCKS\": \"0\"}; tests test_git_diff_reads_without_optional_locks and test_push_diff_stat_reads_without_optional_locks. [APPLY only] Step 3b adds -c diff.autoRefreshIndex=false.",
+      "allowed_files": [
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/src/ironclaude/shadow_grader.py",
+        "commander/tests/test_shadow_grader.py",
+        "commander/tests/test_push.py"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {
+          "description": "RED tests verbatim per plan.md Task 4 Step 1",
+          "expected": "files edited; no command"
+        },
+        {
+          "description": "Run RED",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_shadow_grader.py tests/test_push.py -k 'diff_stat_reads_without_optional_locks or git_diff_reads_without_optional_locks' -q > /private/tmp/claude-502/taf4/t4-red.log 2>&1; echo \"rc=$?\"; rg -n '^FAILED' /private/tmp/claude-502/taf4/t4-red.log; tail -n 1 /private/tmp/claude-502/taf4/t4-red.log",
+          "expected": "derived: rc=1, 2 failed (no env kwarg today -> KeyError)"
+        },
+        {
+          "description": "GREEN code verbatim per plan.md Task 4 Step 3 (+ [APPLY only] Step 3b)",
+          "expected": "files edited; no command"
+        },
+        {
+          "description": "Run GREEN",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_shadow_grader.py tests/test_push.py -q > /private/tmp/claude-502/taf4/t4-green.log 2>&1; echo \"rc=$?\"; rg -n -e '^(FAILED|ERROR)' /private/tmp/claude-502/taf4/t4-green.log; tail -n 1 /private/tmp/claude-502/taf4/t4-green.log",
+          "expected": "rc=0, no FAILED or ERROR lines"
+        },
+        {
+          "description": "Stage",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/orchestrator_mcp.py commander/src/ironclaude/shadow_grader.py commander/tests/test_shadow_grader.py commander/tests/test_push.py",
+          "expected": "no output"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Full suites, docs and staging",
+      "description": "Per plan.md Task 5. No tests required: regression run and release notes only. Commander suite (derived 4154 + 2 = 4156; different count with 0 failed recorded, not a STOP), make test-hooks (61), state-manager (273). Findings get '## Release commit message addition' with the paragraph variant for the Task 1 verdict, verbatim per plan.md (APPLY / SKIP (not needed) / SKIP (unsafe); the unsafe variant claims lock-free status only and says read-only git diff still refreshes the index). CHANGELOG bullet after the 1.2.0 Brain git bullet (line 57) verbatim, with the same verdict variant rules per plan.md; Deploy line 'Suites: commander <N>, ... hooks 61'. Stage; expected 10 M + 5 A. Then an Opus end review; the operator folds into v1.2.0 and redeploys.",
+      "allowed_files": [
+        "CHANGELOG.md",
+        "docs/plans/2026-10-18-lock-free-read-git-findings.md",
+        "docs/plans/2026-10-18-lock-free-read-git-design.md",
+        "docs/plans/2026-10-18-lock-free-read-git.md",
+        "docs/plans/2026-10-18-lock-free-read-git.plan.json"
+      ],
+      "depends_on": [2, 3, 4],
+      "steps": [
+        {
+          "description": "Commander suite (Bash timeout 600000)",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/ -q > /private/tmp/claude-502/taf4/t5-suite.log 2>&1; echo \"suite=$?\"; rg -n '^(FAILED|ERROR)' /private/tmp/claude-502/taf4/t5-suite.log; tail -n 1 /private/tmp/claude-502/taf4/t5-suite.log",
+          "expected": "suite=0, no FAILED or ERROR; derived 4156 passed; record as <N>"
+        },
+        {
+          "description": "Hook suites",
+          "command": "cd /Users/roberthyatt/Code/ironclaude && make test-hooks > /private/tmp/claude-502/taf4/t5-hooks.log 2>&1; echo \"make_rc=$?\"; rg -c '^--- ' /private/tmp/claude-502/taf4/t5-hooks.log",
+          "expected": "make_rc=0 and 61"
+        },
+        {
+          "description": "state-manager suite",
+          "command": "cd /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/state-manager && npm test > /private/tmp/claude-502/taf4/t5-npm.log 2>&1; echo \"npm=$?\"; rg -n -e 'Tests  ' -e ' FAIL ' /private/tmp/claude-502/taf4/t5-npm.log",
+          "expected": "npm=0 and 'Tests  273 passed (273)'"
+        },
+        {
+          "description": "Findings '## Release commit message addition' with the verdict's paragraph variant verbatim per plan.md Task 5 Step 4",
+          "command": "rg -n -e '^## Release commit message addition$' -e 'never takes the index lock' /Users/roberthyatt/Code/ironclaude/docs/plans/2026-10-18-lock-free-read-git-findings.md",
+          "expected": "two lines (every variant contains 'never takes the index lock')"
+        },
+        {
+          "description": "CHANGELOG bullet (verdict variant) and Suites line per plan.md Task 5 Step 5",
+          "command": "rg -n -F -e 'never takes the index lock' -e 'Suites: commander' /Users/roberthyatt/Code/ironclaude/CHANGELOG.md; rg -n -F -e 'Suites: commander 4154,' -e 'hooks 60 (' /Users/roberthyatt/Code/ironclaude/CHANGELOG.md; echo \"stale_rc=$?\"",
+          "expected": "new bullet at line 58; 1.2.0 'Suites: commander <N>, state-manager 273, hooks 61' plus older releases' lines; second rg shows no 'Suites: commander 4154,' line (older releases' 'hooks 60' lines may remain)"
+        },
+        {
+          "description": "Stage and check",
+          "command": "git -C /Users/roberthyatt/Code/ironclaude add CHANGELOG.md; git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-18-lock-free-read-git-design.md docs/plans/2026-10-18-lock-free-read-git.md docs/plans/2026-10-18-lock-free-read-git.plan.json docs/plans/2026-10-18-lock-free-read-git-findings.md; git -C /Users/roberthyatt/Code/ironclaude diff --cached --name-status; git -C /Users/roberthyatt/Code/ironclaude status --short",
+          "expected": "vs HEAD 664d3b8: M (10) CHANGELOG.md, commander/src/ironclaude/orchestrator_mcp.py, commander/src/ironclaude/shadow_grader.py, commander/tests/test_push.py, commander/tests/test_shadow_grader.py, worker/hooks/execution-drift-check.sh, worker/hooks/subagent-drift-detector.sh, worker/mcp-servers/workspace-manager/src/__tests__/git.test.ts, worker/mcp-servers/workspace-manager/src/git.ts, worker/mcp-servers/workspace-manager/src/integration.ts; A (5) worker/hooks/tests/test-lock-free-read-git.sh and the 4 docs/plans/2026-10-18-lock-free-read-git* files; nothing unstaged; any other entry -> STOP"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "name": "Disk usage: measure + dry-run",
+  "goal": "Measure current disk consumers, run episodic-memory maintain --dry-run, and write a findings doc with options; change nothing.",
+  "requirements_file": "docs/plans/2026-10-11-disk-usage-measure-design.md",
+  "design_file": "docs/plans/2026-10-11-disk-usage-measure-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Measure, dry-run, findings",
+      "description": "No tests required: read-only measurement and a findings doc; no executable code changes. Exact commands: human plan Task 1 Steps 1-8. Never delete/move/compress/gc/edit config; --dry-run only; no 2>/dev/null on evidence.",
+      "allowed_files": [
+        "docs/reviews/2026-10-11-disk-usage-findings.md",
+        "docs/plans/2026-10-11-disk-usage-measure-design.md",
+        "docs/plans/2026-10-11-disk-usage-measure.md",
+        "docs/plans/2026-10-11-disk-usage-measure.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Free disk", "command": "df -h / /System/Volumes/Data", "expected": "Record."},
+        {"description": "Episodic-memory + roleplaying-agents sizes; then ls -la /Users/roberthyatt/.config/superpowers/conversation-index", "command": "du -sh /Users/roberthyatt/.config/superpowers/conversation-index /Users/roberthyatt/.config/superpowers/conversation-archive /Users/roberthyatt/Code/roleplaying-agents/.git /Users/roberthyatt/Code/roleplaying-agents/.git/objects/pack", "expected": "Record."},
+        {"description": "Pack count, tmp_pack_*, index.stash.* per human plan Task 1 Step 3 (separate find commands)", "expected": "Record count and every path."},
+        {"description": "probe_out snapshots and large GGUFs per human plan Task 1 Step 4", "expected": "Record."},
+        {"description": "Top-level home/Library/tmp sizes per human plan Task 1 Step 5", "expected": "Top 20 each, largest first; record du errors."},
+        {"description": "Opt-out still in place", "command": "cat /Users/roberthyatt/.config/superpowers/episodic-memory.json", "expected": "{\"maintain\":{\"autoRun\":false}}"},
+        {"description": "ls -la db.sqlite before and after; dry-run (Bash timeout 900000)", "command": "/Users/roberthyatt/Code/ironclaude/worker/mcp-servers/episodic-memory/cli/episodic-memory maintain --dry-run", "expected": "Per-phase report; no change (db.sqlite size/mtime unchanged except concurrent sync writes, recorded). Record full output."},
+        {"description": "Write docs/reviews/2026-10-11-disk-usage-findings.md per human plan Task 1 Step 8, then stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-11-disk-usage-findings.md", "expected": "No output."}
+      ]
+    }
+  ]
+}

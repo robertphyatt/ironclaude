@@ -14,6 +14,7 @@ beforeAll(() => {
   // Isolate the DB and archive so the test never touches the real index.
   process.env.TEST_DB_PATH = path.join(tmp, 'db.sqlite');
   process.env.TEST_ARCHIVE_DIR = path.join(tmp, 'archive');
+  process.env.EPISODIC_MEMORY_CONFIG_DIR = path.join(tmp, 'config');
   // Build a Codex-shaped source tree with the real fixture.
   const day = path.join(tmp, 'sessions', '2026', '07', '18');
   fs.mkdirSync(day, { recursive: true });
@@ -27,6 +28,7 @@ afterAll(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
   delete process.env.TEST_DB_PATH;
   delete process.env.TEST_ARCHIVE_DIR;
+  delete process.env.EPISODIC_MEMORY_CONFIG_DIR;
 });
 
 describe('syncCodexConversations end-to-end', () => {

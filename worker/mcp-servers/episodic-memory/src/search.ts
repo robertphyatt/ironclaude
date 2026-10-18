@@ -4,12 +4,17 @@ import { initEmbeddings, generateEmbedding } from './embeddings.js';
 import { SearchResult, ConversationExchange, MultiConceptResult } from './types.js';
 import fs from 'fs';
 import readline from 'readline';
+import { openArchiveStream } from './archive-io.js';
+
+export type SessionClassFilter = 'operator' | 'brain' | 'worker' | 'unknown';
 
 export interface SearchOptions {
   limit?: number;
   mode?: 'vector' | 'text' | 'both';
   after?: string;  // ISO date string
   before?: string; // ISO date string
+  sessionClass?: SessionClassFilter;  // restrict to one provenance class
+  preferOperator?: boolean;           // rank interactive (operator) sessions first
 }
 
 function validateISODate(dateStr: string, paramName: string): void {
@@ -28,7 +33,7 @@ export async function searchConversations(
   query: string,
   options: SearchOptions = {}
 ): Promise<SearchResult[]> {
-  const { limit = 10, mode = 'both', after, before } = options;
+  const { limit = 10, mode = 'both', after, before, sessionClass, preferOperator } = options;
 
   // Validate date parameters
   if (after) validateISODate(after, '--after');
@@ -38,8 +43,9 @@ export async function searchConversations(
 
   let results: any[] = [];
 
-  // Build time filter clause with parameterized queries (defense-in-depth)
-  const timeFilterClauses: string[] = [];
+  // Filters, parameterized (defense-in-depth). Machine-session rows never surface;
+  // rows not yet classified (NULL, before the backfill) still do.
+  const timeFilterClauses: string[] = [`(e.session_class IS NULL OR e.session_class NOT IN ('machine', 'archive-only'))`];
   const timeFilterParams: string[] = [];
   if (after) {
     timeFilterClauses.push('e.timestamp >= ?');
@@ -53,15 +59,18 @@ export async function searchConversations(
     timeFilterClauses.push('e.timestamp <= ?');
     timeFilterParams.push(`${before}T23:59:59.999Z`);
   }
-  const timeClause = timeFilterClauses.length > 0
-    ? `AND ${timeFilterClauses.join(' AND ')}`
-    : '';
+  if (sessionClass) {
+    timeFilterClauses.push('e.session_class = ?');
+    timeFilterParams.push(sessionClass);
+  }
+  const timeClause = `AND ${timeFilterClauses.join(' AND ')}`;
 
   if (mode === 'vector' || mode === 'both') {
     // Vector similarity search
     await initEmbeddings();
     const queryEmbedding = await generateEmbedding(query);
 
+    const knnK = sessionClass ? Math.min(limit * 10, 500) : limit;
     const stmt = db.prepare(`
       SELECT
         e.id,
@@ -72,6 +81,8 @@ export async function searchConversations(
         e.archive_path,
         e.line_start,
         e.line_end,
+        e.entrypoint,
+        e.session_class,
         vec.distance
       FROM vec_exchanges AS vec
       JOIN exchanges AS e ON vec.id = e.id
@@ -83,9 +94,10 @@ export async function searchConversations(
 
     results = stmt.all(
       Buffer.from(new Float32Array(queryEmbedding).buffer),
-      limit,
+      knnK,
       ...timeFilterParams
     );
+    results = results.slice(0, limit);
   }
 
   if (mode === 'text' || mode === 'both') {
@@ -100,6 +112,8 @@ export async function searchConversations(
         e.archive_path,
         e.line_start,
         e.line_end,
+        e.entrypoint,
+        e.session_class,
         NULL as distance
       FROM exchanges AS e
       WHERE (e.user_message LIKE ? OR e.assistant_message LIKE ?)
@@ -126,6 +140,13 @@ export async function searchConversations(
     }
   }
 
+  if (preferOperator) {
+    results = [
+      ...results.filter((r: any) => r.session_class === 'operator'),
+      ...results.filter((r: any) => r.session_class !== 'operator'),
+    ];
+  }
+
   return results.map((row: any) => {
     const exchange: ConversationExchange = {
       id: row.id,
@@ -135,7 +156,9 @@ export async function searchConversations(
       assistantMessage: row.assistant_message,
       archivePath: row.archive_path,
       lineStart: row.line_start,
-      lineEnd: row.line_end
+      lineEnd: row.line_end,
+      entrypoint: row.entrypoint ?? undefined,
+      sessionClass: row.session_class ?? undefined
     };
 
     // Try to load summary if available
@@ -166,32 +189,23 @@ export async function searchConversations(
   });
 }
 
-// Helper function to count lines in a file efficiently
-async function countLines(filePath: string): Promise<number> {
+// Count non-empty lines and the transcript's (decompressed) size in one pass.
+async function fileMetrics(filePath: string): Promise<{ lines: number; kb: number }> {
   try {
-    const fileStream = fs.createReadStream(filePath);
-    const rl = readline.createInterface({
-      input: fileStream,
-      crlfDelay: Infinity
+    const stream = openArchiveStream(filePath);
+    let bytes = 0;
+    stream.on('data', (chunk: Buffer | string) => {
+      bytes += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
     });
-
-    let count = 0;
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    stream.once('error', () => rl.close()); // a decode/read error ends the loop instead of hanging
+    let lines = 0;
     for await (const line of rl) {
-      if (line.trim()) count++;
+      if (line.trim()) lines++;
     }
-    return count;
+    return { lines, kb: Math.round(bytes / 1024 * 10) / 10 };
   } catch (error) {
-    return 0; // Return 0 if file can't be read
-  }
-}
-
-// Helper function to get file size in KB
-function getFileSizeInKB(filePath: string): number {
-  try {
-    const stats = fs.statSync(filePath);
-    return Math.round(stats.size / 1024 * 10) / 10; // Round to 1 decimal place
-  } catch (error) {
-    return 0;
+    return { lines: 0, kb: 0 }; // missing or unreadable file
   }
 }
 
@@ -215,6 +229,10 @@ export async function formatResults(results: Array<SearchResult & { summary?: st
     }
     output += '\n';
 
+    if (result.exchange.sessionClass) {
+      output += `   Session: ${result.exchange.sessionClass}${result.exchange.entrypoint ? ` (${result.exchange.entrypoint})` : ''}\n`;
+    }
+
     // Show summary only if it's concise (< 300 chars)
     if (result.summary && result.summary.length < 300) {
       output += `   ${result.summary}\n`;
@@ -236,8 +254,7 @@ export async function formatResults(results: Array<SearchResult & { summary?: st
     }
 
     // Get file metadata
-    const fileSizeKB = getFileSizeInKB(result.exchange.archivePath);
-    const totalLines = await countLines(result.exchange.archivePath);
+    const { lines: totalLines, kb: fileSizeKB } = await fileMetrics(result.exchange.archivePath);
     const lineRange = `${result.exchange.lineStart}-${result.exchange.lineEnd}`;
 
     // File information with metadata (clean format for smart tool selection)
@@ -350,8 +367,7 @@ export async function formatMultiConceptResults(
     }
 
     // Get file metadata
-    const fileSizeKB = getFileSizeInKB(result.exchange.archivePath);
-    const totalLines = await countLines(result.exchange.archivePath);
+    const { lines: totalLines, kb: fileSizeKB } = await fileMetrics(result.exchange.archivePath);
     const lineRange = `${result.exchange.lineStart}-${result.exchange.lineEnd}`;
 
     // File information with metadata (clean format for smart tool selection)

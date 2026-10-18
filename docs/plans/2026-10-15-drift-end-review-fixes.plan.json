@@ -1,0 +1,27 @@
+{
+  "name": "Drift check end-review fixes",
+  "goal": "Fix the two drift-check end-review findings: skip unreadable windows (R3d) and close main-lineage leftover windows at submit/Stop (R3c).",
+  "requirements_file": "docs/plans/2026-10-15-drift-session-attribution-design.md",
+  "design_file": "docs/plans/2026-10-15-drift-session-attribution-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Settle main windows at submit/Stop and skip unreadable windows",
+      "description": "TDD. Code blocks verbatim in docs/plans/2026-10-15-drift-end-review-fixes.md Task 1 Steps 1-4; apply exactly. Invariants: literal absolute paths; git -C /Users/roberthyatt/Code/ironclaude; hook under set -euo pipefail+ERR trap, new read uses parameter expansion (no head/tail pipes); 'LC_ALL=C comm -23' exactly once; suites exit non-zero unless PASSES==EXPECTED_PASSES; docs need git add -f. Measured: EXPECTED_PASSES=33; case 12 asserts WIN_AT_SUBMIT=1 (test :196-202); ic_drift_checkpoint_windows called at execution-drift-check.sh:368 (Stop) and :498 (submit); head/tail read at :281-282.",
+      "allowed_files": [
+        "worker/hooks/execution-drift-check.sh",
+        "worker/hooks/tests/test-execution-drift-check.sh",
+        "docs/reviews/2026-10-15-drift-session-attribution-findings.md"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Tests (RED): EXPECTED_PASSES=36; replace case 12 with plan.md Step 1.2 block (submit closes main-lineage window, WIN_AT_SUBMIT=0); insert cases 34-36 (plan.md Step 1.3) after case 33 before Results."},
+        {"description": "RED run; record measured FAIL labels verbatim.", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-check.sh > /private/tmp/claude-502/r3.out; echo \"check=$?\"; grep -e '^FAIL' -e '^Results' /private/tmp/claude-502/r3.out", "expected": "check=1; if exit 0, stop and report."},
+        {"description": "Hook (GREEN) per plan.md Step 2: _drift_close_window_file reads once via cat + parameter expansion, return 1 on failed read or empty root (add content to locals); add ic_drift_settle_windows after ic_drift_checkpoint_windows; ic_drift_stop_violations and submit_task branch call ic_drift_settle_windows; comment/header wording."},
+        {"description": "GREEN run + all hook suites.", "command": "bash -n /Users/roberthyatt/Code/ironclaude/worker/hooks/execution-drift-check.sh; echo \"n=$?\"; grep -c -F 'LC_ALL=C comm -23' /Users/roberthyatt/Code/ironclaude/worker/hooks/execution-drift-check.sh; bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-execution-drift-check.sh > /private/tmp/claude-502/g3.out; echo \"check=$?\"; grep -e '^FAIL' -e '^Results' /private/tmp/claude-502/g3.out; make -C /Users/roberthyatt/Code/ironclaude test-hooks > /private/tmp/claude-502/th3.out 2>&1; echo \"make=$?\"", "expected": "n=0; grep count 1; 'Results: 36 pass, 0 fail'; check=0; make=0."},
+        {"description": "Append '## End-review fixes (R3c, R3d)' to docs/reviews/2026-10-15-drift-session-attribution-findings.md: two findings one line each, fixes, RED FAIL labels, GREEN Results line, make exit, operator acceptance of ~2.5 s/mutating command."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/execution-drift-check.sh worker/hooks/tests/test-execution-drift-check.sh; git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-15-drift-session-attribution-findings.md docs/plans/2026-10-15-drift-end-review-fixes.md docs/plans/2026-10-15-drift-end-review-fixes.plan.json docs/plans/2026-10-15-drift-session-attribution-design.md", "expected": "No output."}
+      ]
+    }
+  ]
+}

@@ -23,7 +23,148 @@ interface ConversationMessage {
   toolUseResult?: Array<{ type: string; text: string }> | string;
 }
 
+// Codex rollouts (~/.codex/sessions/**/rollout-*.jsonl) hold `{timestamp, type, payload}` records.
+const CODEX_RECORD_TYPES = new Set(['session_meta', 'response_item', 'event_msg', 'turn_context']);
+
+interface CodexRecord {
+  type?: string;
+  timestamp?: string;
+  payload?: any;
+}
+
+function parseCodexRecord(line: string): CodexRecord | null {
+  if (!line.trim()) return null;
+  try {
+    const rec = JSON.parse(line);
+    return rec && typeof rec === 'object' ? rec : null;
+  } catch {
+    return null;
+  }
+}
+
+/** True when the first parseable record is a Codex rollout record (a known type with a payload object). */
+export function isCodexRollout(jsonl: string): boolean {
+  let start = 0;
+  while (start < jsonl.length) {
+    const newline = jsonl.indexOf('\n', start);
+    const end = newline === -1 ? jsonl.length : newline;
+    const rec = parseCodexRecord(jsonl.slice(start, end));
+    if (rec) {
+      return CODEX_RECORD_TYPES.has(String(rec.type)) && !!rec.payload && typeof rec.payload === 'object';
+    }
+    start = end + 1;
+  }
+  return false;
+}
+
+function codexText(content: unknown, blockType: string): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter(b => b && b.type === blockType && typeof b.text === 'string')
+    .map(b => b.text)
+    .join('\n');
+}
+
+function codexToolOutput(output: unknown): string {
+  if (typeof output === 'string') return output;
+  if (Array.isArray(output)) {
+    return output.map(b => (b && typeof b.text === 'string' ? b.text : JSON.stringify(b))).join('\n');
+  }
+  return output === undefined ? '' : JSON.stringify(output, null, 2);
+}
+
+/** A code fence longer than any backtick run in `text`, so tool text cannot close it early. */
+function fencedBlock(text: string, lang = ''): string {
+  const longestRun = (text.match(/`+/g) ?? []).reduce((max, run) => Math.max(max, run.length), 0);
+  const fence = '`'.repeat(Math.max(3, longestRun + 1));
+  return `${fence}${lang}\n${text}\n${fence}\n\n`;
+}
+
+function codexToolInput(raw: unknown): string {
+  if (typeof raw === 'string') {
+    try {
+      return fencedBlock(JSON.stringify(JSON.parse(raw), null, 2), 'json');
+    } catch {
+      return fencedBlock(raw);
+    }
+  }
+  return raw === undefined ? '' : fencedBlock(JSON.stringify(raw, null, 2), 'json');
+}
+
+export function formatCodexRolloutAsMarkdown(jsonl: string, startLine?: number, endLine?: number): string {
+  // Number lines exactly as codex-parser's readline loop does: every line, 1-indexed, blank ones too.
+  const allLines = jsonl.split('\n');
+  if (allLines[allLines.length - 1] === '') allLines.pop();
+
+  // Session metadata comes from the whole file, so a paged read still names its session.
+  let sessionId: string | undefined;
+  let cwd: string | undefined;
+  let originator: string | undefined;
+  let cliVersion: string | undefined;
+  for (const line of allLines) {
+    if (!line.includes('"session_meta"')) continue;
+    const rec = parseCodexRecord(line);
+    if (rec?.type !== 'session_meta' || !rec.payload) continue;
+    sessionId = rec.payload.session_id ?? sessionId;
+    cwd = rec.payload.cwd ?? cwd;
+    originator = rec.payload.originator ?? originator;
+    cliVersion = rec.payload.cli_version ?? cliVersion;
+  }
+
+  // Apply line range if specified (1-indexed, inclusive)
+  const lines = allLines.slice(
+    startLine !== undefined ? startLine - 1 : 0,
+    endLine !== undefined ? endLine : undefined
+  );
+
+  let body = '';
+  for (const line of lines) {
+    const rec = parseCodexRecord(line);
+    if (rec?.type !== 'response_item' || !rec.payload) continue;
+    const p = rec.payload;
+    const when = rec.timestamp ? ` (${rec.timestamp})` : '';
+    if (p.type === 'message' && (p.role === 'user' || p.role === 'assistant')) {
+      const text = codexText(p.content, p.role === 'user' ? 'input_text' : 'output_text');
+      if (text.trim()) body += `### **${p.role === 'user' ? 'User' : 'Agent'}**${when}\n\n${text}\n\n`;
+    } else if (p.type === 'function_call' || p.type === 'custom_tool_call') {
+      body += `### **Tool Call:** \`${p.name || 'unknown'}\`${when}\n\n`;
+      body += codexToolInput(p.type === 'function_call' ? p.arguments : p.input);
+    } else if (p.type === 'function_call_output' || p.type === 'custom_tool_call_output') {
+      body += `### **Tool Output**${when}\n\n${fencedBlock(codexToolOutput(p.output))}`;
+    }
+    // Skipped: encrypted reasoning, agent_message and other payload types; event_msg; turn_context.
+  }
+
+  if (!body) return '';
+
+  let output = '# Conversation\n\n## Metadata\n\n';
+  if (sessionId) output += `**Session ID:** ${sessionId}\n\n`;
+  if (cwd) output += `**Working Directory:** ${cwd}\n\n`;
+  if (originator) output += `**Originator:** ${originator}\n\n`;
+  if (cliVersion) output += `**Codex CLI Version:** ${cliVersion}\n\n`;
+  output += '---\n\n## Messages\n\n';
+  return output + body;
+}
+
+function formatCodexRolloutAsHTML(jsonl: string): string {
+  const markdown = formatCodexRolloutAsMarkdown(jsonl);
+  if (!markdown) return '';
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Conversation</title>
+</head>
+<body>
+${renderMarkdownSafely(markdown)}
+</body>
+</html>`;
+}
+
 export function formatConversationAsMarkdown(jsonl: string, startLine?: number, endLine?: number): string {
+  if (isCodexRollout(jsonl)) return formatCodexRolloutAsMarkdown(jsonl, startLine, endLine);
   const allLines = jsonl.trim().split('\n').filter(line => line.trim());
 
   // Apply line range if specified (1-indexed, inclusive)
@@ -221,6 +362,7 @@ export function formatConversationAsMarkdown(jsonl: string, startLine?: number, 
 }
 
 export function formatConversationAsHTML(jsonl: string): string {
+  if (isCodexRollout(jsonl)) return formatCodexRolloutAsHTML(jsonl);
   const lines = jsonl.trim().split('\n').filter(line => line.trim());
   const allMessages: ConversationMessage[] = lines.map(line => JSON.parse(line));
 

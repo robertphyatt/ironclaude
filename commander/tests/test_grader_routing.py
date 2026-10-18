@@ -42,9 +42,12 @@ def test_claude_grader_argv_is_stable(tmp_path):
     assert "--output-format" in argv and argv[argv.index("--output-format") + 1] == "json"
     assert "--json-schema" in argv
     assert "--model" in argv and argv[argv.index("--model") + 1] == "opus[1m]"  # opus needs 1m beta
-    assert "--dangerously-skip-permissions" in argv
+    assert "--dangerously-skip-permissions" not in argv  # --restricted refuses bypassPermissions
+    assert "--restricted" in argv
     assert "--strict-mcp-config" in argv
-    assert "--disallowedTools" in argv
+    assert "--disallowedTools" not in argv
+    assert argv[argv.index("--tools") + 1] == ""
+    assert argv[argv.index("--settings") + 1] == '{"disableAllHooks":true}'
 
 
 def test_call_grader_claude_returns_verdict(tmp_path):
@@ -377,3 +380,193 @@ def test_codex_grader_env_adds_nothing(tmp_path):
     import os
     tools = _codex_cfg_with_effort(tmp_path, "low")
     assert tools._codex_grader_env() == dict(os.environ)
+
+
+def test_claude_grader_argv_does_not_persist_sessions(tmp_path):
+    tools = _tools(tmp_path)
+    argv = tools._claude_grader_argv(tools._GRADER_VERDICT_SCHEMA, "/tmp/sys.txt", "opus")
+    assert "--no-session-persistence" in argv
+
+
+# ── Requested model class (design T4): resolved per client through the router ──
+
+def test_sonnet_class_claude_uses_bare_sonnet(tmp_path):
+    tools = _tools(tmp_path)
+    with patch.object(omcp.subprocess, "run", return_value=_fake_result(
+            {"grade": "A", "approved": True, "feedback": "ok"})) as run:
+        assert tools._call_grader("sys", "user", tier="sonnet")["grade"] == "A"
+    argv = run.call_args.args[0]
+    assert argv[0] == "claude"
+    assert argv[argv.index("--model") + 1] == "sonnet"
+
+
+def test_sonnet_class_codex_uses_terra(tmp_path, monkeypatch):
+    tools = _codex_enabled_cfg(tmp_path, clients=("codex",))
+    _codex_avail(monkeypatch)
+    with patch.object(omcp.subprocess, "run", return_value=_codex_proc("codex_grader_verdict.jsonl")) as run:
+        assert tools._call_grader("sys", "user", tier="sonnet")["grade"] == "B"
+    argv = run.call_args.args[0]
+    assert argv[0] == "codex"
+    assert argv[argv.index("-m") + 1] == "gpt-5.6-terra"
+
+
+def test_default_class_codex_is_opus_class_sol(tmp_path, monkeypatch):
+    """C7/C12 positive control: no requested class -> the opus class, Sol on Codex."""
+    tools = _codex_enabled_cfg(tmp_path, clients=("codex",))
+    _codex_avail(monkeypatch)
+    with patch.object(omcp.subprocess, "run", return_value=_codex_proc("codex_grader_verdict.jsonl")) as run:
+        assert tools._call_grader("sys", "user")["grade"] == "B"
+    argv = run.call_args.args[0]
+    assert argv[argv.index("-m") + 1] == "gpt-5.6-sol"
+
+
+def test_legacy_config_sonnet_class_uses_bare_sonnet(tmp_path):
+    """No providers block: the requested class still reaches the legacy claude path."""
+    conn = init_db(str(tmp_path / "commander.db"))
+    tools = omcp.OrchestratorTools(registry=MagicMock(), tmux=MagicMock(),
+                                   db_conn=conn, config={"grader_model": "opus"})
+    with patch.object(omcp.subprocess, "run", return_value=_fake_result(
+            {"grade": "B", "approved": True, "feedback": "ok"})) as run:
+        tools._call_grader("sys", "user", tier="sonnet")
+    argv = run.call_args.args[0]
+    assert argv[argv.index("--model") + 1] == "sonnet"
+
+
+def test_sonnet_class_batch_keeps_batch_schema(tmp_path):
+    tools = _tools(tmp_path)
+    verdicts = [{"grade": "A", "approved": True, "feedback": "ok"}]
+    with patch.object(omcp.subprocess, "run", return_value=_fake_result({"verdicts": verdicts})) as run:
+        out = tools._call_grader("sys", "user", batch=True, tier="sonnet")
+    assert out == verdicts
+    argv = run.call_args.args[0]
+    assert argv[argv.index("--model") + 1] == "sonnet"
+    assert "verdicts" in argv[argv.index("--json-schema") + 1]
+
+
+_ALL_OFF = ("shell_tool", "unified_exec", "view_image", "apps", "browser_use", "computer_use",
+            "multi_agent", "image_generation", "memories", "plugins", "hooks")
+
+
+def test_codex_grader_argv_has_no_tools_and_ignores_user_config(tmp_path):
+    tools = _codex_enabled_cfg(tmp_path)
+    assert tools._codex_grader_argv("/tmp/schema.json", "gpt-5.6-sol", "low") == [
+        "codex", "exec", "-c", 'model_reasoning_effort="low"',
+        *[a for n in _ALL_OFF for a in ("-c", f"features.{n}=false")],
+        "-c", "features.goals=false", "-c", "features.tool_suggest=false",
+        "-c", "agents.enabled=false", "-c", 'web_search="disabled"',
+        "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check",
+        "--output-schema", "/tmp/schema.json", "-s", "read-only", "-m", "gpt-5.6-sol", "-",
+    ]
+
+
+def test_codex_grader_sends_strict_schema(tmp_path, monkeypatch):
+    tools = _codex_enabled_cfg(tmp_path, clients=("codex",))
+    _codex_avail(monkeypatch)
+    seen = {}
+
+    def _run(argv, **kwargs):
+        with open(argv[argv.index("--output-schema") + 1]) as f:
+            seen["schema"] = json.load(f)
+        return _codex_proc("codex_grader_verdict.jsonl")
+
+    with patch.object(omcp.subprocess, "run", side_effect=_run):
+        assert tools._call_grader("sys", "user")["grade"] == "B"
+    assert seen["schema"]["required"] == ["grade", "approved", "feedback", "recommended_model"]
+    assert seen["schema"]["properties"]["recommended_model"]["type"] == ["string", "null"]
+    assert seen["schema"]["additionalProperties"] is False
+
+
+def test_claude_grader_keeps_original_schema(tmp_path):
+    tools = _tools(tmp_path)
+    with patch.object(omcp.subprocess, "run", return_value=_fake_result(
+            {"grade": "A", "approved": True, "feedback": "ok"})) as run:
+        tools._call_grader("sys", "user")
+    argv = run.call_args.args[0]
+    assert json.loads(argv[argv.index("--json-schema") + 1]) == tools._GRADER_VERDICT_SCHEMA
+
+
+def test_codex_grader_drops_null_recommended_model(tmp_path):
+    tools = _codex_enabled_cfg(tmp_path)
+
+    def _proc(obj):
+        p = MagicMock(); p.returncode = 0; p.stderr = ""
+        p.stdout = json.dumps({"type": "item.completed",
+                               "item": {"type": "agent_message", "text": json.dumps(obj)}}) + "\n"
+        return p
+
+    single = {"grade": "A", "approved": True, "feedback": "ok", "recommended_model": None}
+    assert tools._parse_codex_grader_output(_proc(single), batch=False) == {
+        "grade": "A", "approved": True, "feedback": "ok"}
+    batch = {"verdicts": [
+        {"grade": "A", "approved": True, "feedback": "ok", "recommended_model": None},
+        {"grade": "B", "approved": True, "feedback": "x", "recommended_model": "claude-opus"}]}
+    assert tools._parse_codex_grader_output(_proc(batch), batch=True) == [
+        {"grade": "A", "approved": True, "feedback": "ok"},
+        {"grade": "B", "approved": True, "feedback": "x", "recommended_model": "claude-opus"}]
+
+
+# ── Grader rubric in the prompt (design 2026-10-17 tool-audit-fixes R6) ──
+
+RUBRIC = "# Grader Instructions\n\nRUBRIC-MARK-5c1 Robert's Three Laws of Testing\n"
+
+
+def _with_grader_home(tools, tmp_path, rubric):
+    home = tmp_path / "grader-home"
+    home.mkdir()
+    if rubric is not None:
+        (home / "CLAUDE.md").write_text(rubric)
+    tools._grader_home = str(home)
+    return tools
+
+
+def test_claude_grader_system_prompt_starts_with_rubric(tmp_path):
+    from ironclaude.communication_profiles import apply_communication_profile
+    tools = _with_grader_home(_tools(tmp_path), tmp_path, RUBRIC)
+    seen = {}
+
+    def _run(argv, **kwargs):
+        with open(argv[argv.index("--system-prompt-file") + 1]) as f:
+            seen["system"] = f.read()
+        seen["input"] = kwargs["input"]
+        return _fake_result({"grade": "A", "approved": True, "feedback": "ok"})
+
+    with patch.object(omcp.subprocess, "run", side_effect=_run):
+        assert tools._call_grader("sys", "user")["grade"] == "A"
+    assert seen["system"] == RUBRIC.strip() + "\n\n" + apply_communication_profile("claude_grader", "sys")
+    assert seen["input"] == "user"
+
+
+def test_claude_batch_grader_system_prompt_starts_with_rubric(tmp_path):
+    from ironclaude.communication_profiles import apply_communication_profile
+    tools = _with_grader_home(_tools(tmp_path), tmp_path, RUBRIC)
+    seen = {}
+    verdicts = [{"grade": "A", "approved": True, "feedback": "ok"}]
+
+    def _run(argv, **kwargs):
+        with open(argv[argv.index("--system-prompt-file") + 1]) as f:
+            seen["system"] = f.read()
+        return _fake_result({"verdicts": verdicts})
+
+    with patch.object(omcp.subprocess, "run", side_effect=_run):
+        assert tools._call_grader("sys", "user", batch=True) == verdicts
+    assert seen["system"].startswith(RUBRIC.strip() + "\n\n")
+
+
+def test_codex_grader_stdin_starts_with_rubric(tmp_path, monkeypatch):
+    from ironclaude.communication_profiles import apply_communication_profile
+    tools = _with_grader_home(_codex_enabled_cfg(tmp_path, clients=("codex",)), tmp_path, RUBRIC)
+    _codex_avail(monkeypatch)
+    with patch.object(omcp.subprocess, "run", return_value=_codex_proc("codex_grader_verdict.jsonl")) as run:
+        assert tools._call_grader("sys", "user")["grade"] == "B"
+    assert run.call_args.kwargs["input"] == (
+        RUBRIC.strip() + "\n\n" + apply_communication_profile("codex_grader", "sys") + "\n\nuser")
+
+
+def test_missing_rubric_adds_nothing(tmp_path, monkeypatch):
+    """Positive control: no CLAUDE.md in the grader home is not an error and adds nothing."""
+    from ironclaude.communication_profiles import apply_communication_profile
+    tools = _with_grader_home(_codex_enabled_cfg(tmp_path, clients=("codex",)), tmp_path, None)
+    _codex_avail(monkeypatch)
+    with patch.object(omcp.subprocess, "run", return_value=_codex_proc("codex_grader_verdict.jsonl")) as run:
+        assert tools._call_grader("sys", "user")["grade"] == "B"
+    assert run.call_args.kwargs["input"] == apply_communication_profile("codex_grader", "sys") + "\n\nuser"

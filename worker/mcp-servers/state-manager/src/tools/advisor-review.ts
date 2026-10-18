@@ -18,8 +18,6 @@ const DIAGNOSTIC_LIMIT = 512;
 const TIER_ORDER = ['luna', 'terra', 'sol', 'astra'] as const;
 type CodexTier = typeof TIER_ORDER[number];
 export const CODEX_MODEL_RE = /^gpt-(\d+(?:\.\d+)*)-(luna|terra|sol|astra)$/;
-// Used when Codex's models_cache.json is missing, unreadable, or has no tier models.
-export const FALLBACK_CODEX_MODELS = ['gpt-6-luna', 'gpt-5.6-terra', 'gpt-6-sol', 'gpt-6-astra'] as const;
 type RequesterModel = string;
 
 const REVIEW_TIERS = ['same', 'one-up'] as const;
@@ -45,6 +43,21 @@ const ALLOWED_ENV = [
   'http_proxy',
   'https_proxy',
   'no_proxy',
+] as const;
+
+// The shared Codex no-tools set: the same pairs, in the same order, as commander
+// fast_model.CODEX_NO_TOOLS_ARGS and worker/hooks/plan-validator.sh IC_CODEX_NO_TOOLS_ARGS (a
+// Commander test compares all three). The reviewer works only from the inline packet, so it gets
+// no shell, file, image, app, agent, goal or web tool. Measured 2026-10-17 without these: it ran
+// `cat` on a file outside its private cwd (tool-audit findings 2.4).
+export const CODEX_NO_TOOLS_ARGS = [
+  '-c', 'features.shell_tool=false', '-c', 'features.unified_exec=false',
+  '-c', 'features.view_image=false', '-c', 'features.apps=false',
+  '-c', 'features.browser_use=false', '-c', 'features.computer_use=false',
+  '-c', 'features.multi_agent=false', '-c', 'features.image_generation=false',
+  '-c', 'features.memories=false', '-c', 'features.plugins=false', '-c', 'features.hooks=false',
+  '-c', 'features.goals=false', '-c', 'features.tool_suggest=false',
+  '-c', 'agents.enabled=false', '-c', 'web_search="disabled"',
 ] as const;
 
 type ToolResult = {
@@ -209,34 +222,43 @@ function newestAtTier(installed: readonly string[], tier: CodexTier): string | n
 }
 
 
-export async function readInstalledCodexModels(
-  deps: Pick<AdvisorReviewDeps, 'env' | 'readFile'>,
-): Promise<string[]> {
-  const codexHome = deps.env.CODEX_HOME || path.join(deps.env.HOME || os.homedir(), '.codex');
-  try {
-    const parsed = JSON.parse(await deps.readFile(path.join(codexHome, 'models_cache.json'), 'utf8')) as {
-      models?: Array<{ slug?: unknown } | null>;
-    };
-    const slugs = (Array.isArray(parsed?.models) ? parsed.models : [])
-      .map((entry) => entry?.slug)
-      .filter((slug): slug is string => parseCodexModel(slug) !== null);
-    if (slugs.length > 0) return slugs;
-  } catch {
-    // Missing, unreadable, or malformed cache: use the built-in fallback below.
-  }
-  return [...FALLBACK_CODEX_MODELS];
+export function codexModelsCachePath(env: NodeJS.ProcessEnv): string {
+  const codexHome = env.CODEX_HOME || path.join(env.HOME || os.homedir(), '.codex');
+  return path.join(codexHome, 'models_cache.json');
 }
 
 
-export function resolveCodexReviewer(requester: string, installed: readonly string[]): string {
+// No pinned fallback (design 2026-10-17 v120-completeness R2): a missing, unreadable or malformed
+// cache lists no installed model, and the review then fails with codex-reviewer-model-unavailable.
+export async function readInstalledCodexModels(
+  deps: Pick<AdvisorReviewDeps, 'env' | 'readFile'>,
+): Promise<string[]> {
+  try {
+    const parsed = JSON.parse(await deps.readFile(codexModelsCachePath(deps.env), 'utf8')) as {
+      models?: Array<{ slug?: unknown } | null>;
+    };
+    return (Array.isArray(parsed?.models) ? parsed.models : [])
+      .map((entry) => entry?.slug)
+      .filter((slug): slug is string => parseCodexModel(slug) !== null);
+  } catch {
+    return [];
+  }
+}
+
+
+function oneUpTierIndex(requester: string): number {
   const parsed = parseCodexModel(requester);
   const ceiling = TIER_ORDER.length - 1;
-  const start = parsed ? Math.min(TIER_ORDER.indexOf(parsed.tier) + 1, ceiling) : ceiling;
-  for (let index = start; index <= ceiling; index += 1) {
+  return parsed ? Math.min(TIER_ORDER.indexOf(parsed.tier) + 1, ceiling) : ceiling;
+}
+
+
+export function resolveCodexReviewer(requester: string, installed: readonly string[]): string | null {
+  for (let index = oneUpTierIndex(requester); index < TIER_ORDER.length; index += 1) {
     const newest = newestAtTier(installed, TIER_ORDER[index]);
     if (newest) return newest;
   }
-  return FALLBACK_CODEX_MODELS[start];
+  return null;
 }
 
 
@@ -599,9 +621,19 @@ export async function runCodexAdvisorReview(
     });
   }
 
-  const reviewerModel = validated.reviewTier === 'same'
-    ? validated.requesterModel
-    : resolveCodexReviewer(validated.requesterModel, await readInstalledCodexModels(deps));
+  let reviewerModel = validated.requesterModel;
+  if (validated.reviewTier !== 'same') {
+    const resolved = resolveCodexReviewer(validated.requesterModel, await readInstalledCodexModels(deps));
+    if (resolved === null) {
+      return failure('codex-reviewer-model-unavailable', {
+        diagnostic: diagnostic(
+          `Codex model family ${TIER_ORDER[oneUpTierIndex(validated.requesterModel)]} (or a higher family) `
+          + `has no installed model in ${codexModelsCachePath(deps.env)}`,
+        ),
+      });
+    }
+    reviewerModel = resolved;
+  }
   const startedAt = deps.now();
   let privateCwd: string | null = null;
   let outcome: ToolResult;
@@ -611,6 +643,7 @@ export async function runCodexAdvisorReview(
       codexExecutable,
       [
         'exec',
+        ...CODEX_NO_TOOLS_ARGS,
         '--json',
         '--ephemeral',
         '--ignore-user-config',

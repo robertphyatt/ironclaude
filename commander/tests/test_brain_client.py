@@ -993,6 +993,56 @@ class TestBashWhitelist:
         assert "amend" in msg.lower()
 
 
+class TestBrainGitWriteGuard:
+    """Design 2026-10-18 v120-security-fixes 1b and 1c: no file writes through git --output, and
+    git branch only in listing forms. test_codex_brain_client.py holds the same rows for the Codex
+    check and compares the two."""
+
+    @pytest.mark.parametrize("command,reason", [
+        ("git diff --output=/tmp/x", "output"),
+        ("git log --output /tmp/x", "output"),
+        ("git show --output=/tmp/x", "output"),
+        ('git diff "--output=/tmp/x"', "output"),
+        ("git diff --\\output=/tmp/x", "output"),
+        ("git branch -D x", "branch"),
+        ("git branch new-name", "branch"),
+        ("git branch --delete x", "branch"),
+        ('git commit --am""end -m x', "amend"),
+        # Shell expansion rewrites an approved command (design 2026-10-18
+        # v120-security-fixes-remediation 1b-R expanding braces, 1c-R globs).
+        ("git diff {--output=/tmp/x,}", "brace"),
+        ("git log {--output=/tmp/x,-1}", "brace"),
+        ("git diff *", "glob"),
+        ("git log -- '*.py'", "glob"),
+        ("git diff ?", "glob"),
+        ("git diff [a]", "glob"),
+        ("git log HEAD~{1..2}", "brace"),
+    ])
+    def test_write_forms_refused(self, command, reason):
+        # Each row names the keyword its refusal message must carry: output, branch or amend.
+        client = BrainClient()
+        allowed, msg = client._tool_guard_logic("Bash", {"command": command})
+        assert allowed is False
+        assert reason in msg.lower()
+
+    @pytest.mark.parametrize("command", [
+        "git diff",
+        "git log --oneline",
+        "git branch",
+        "git branch -a",
+        "git branch --list",
+        "git add x",
+        "git commit -m x",
+        # Braces without , or .. do not expand (1b-R).
+        "git log HEAD@{1}",
+        "git diff @{u}",
+    ])
+    def test_listing_and_staging_allowed(self, command):
+        # Operator decision 2026-03-09: the Brain keeps git add and git commit.
+        client = BrainClient()
+        assert client._tool_guard_logic("Bash", {"command": command}) == (True, None)
+
+
 class TestBashMetacharacterGuard:
     """Shell metacharacters in git commands must be rejected outright."""
 

@@ -149,6 +149,17 @@ const GPT6_CACHE = JSON.stringify({
 });
 const MODELS_CACHE_PATH = '/Users/test/.codex/models_cache.json';
 
+// Literal copy of the shared Codex no-tools set (commander fast_model.CODEX_NO_TOOLS_ARGS).
+const NO_TOOLS = [
+  '-c', 'features.shell_tool=false', '-c', 'features.unified_exec=false',
+  '-c', 'features.view_image=false', '-c', 'features.apps=false',
+  '-c', 'features.browser_use=false', '-c', 'features.computer_use=false',
+  '-c', 'features.multi_agent=false', '-c', 'features.image_generation=false',
+  '-c', 'features.memories=false', '-c', 'features.plugins=false', '-c', 'features.hooks=false',
+  '-c', 'features.goals=false', '-c', 'features.tool_suggest=false',
+  '-c', 'agents.enabled=false', '-c', 'web_search="disabled"',
+];
+
 function enoent(): Error {
   return Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
 }
@@ -296,7 +307,7 @@ describe('runCodexAdvisorReview', () => {
     ]);
     expect(h.spawn.mock.calls[1][0]).toBe('/trusted/bin/codex');
     expect(h.spawn.mock.calls[1][1]).toEqual([
-      'exec', '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules',
+      'exec', ...NO_TOOLS, '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules',
       '--skip-git-repo-check', '-s', 'read-only', '-m', 'gpt-5.6-terra', '-',
     ]);
     const options = h.spawn.mock.calls[1][2];
@@ -368,9 +379,26 @@ describe('runCodexAdvisorReview', () => {
       reviewer_model: 'gpt-6-astra',
     }));
     expect(h.spawn.mock.calls[1][1]).toEqual([
-      'exec', '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules',
+      'exec', ...NO_TOOLS, '--json', '--ephemeral', '--ignore-user-config', '--ignore-rules',
       '--skip-git-repo-check', '-s', 'read-only', '-m', 'gpt-6-astra', '-',
     ]);
+  });
+
+  it('runs the reviewer with every Codex tool feature, agents and web search off', async () => {
+    const h = harness();
+    h.deps.trustedRequesterModel = 'gpt-5.6-sol';
+
+    await runCodexAdvisorReview(
+      { packet: 'packet', requester_model: 'gpt-5.6-sol', review_tier: 'same' }, identity, session, runtime, h.deps,
+    );
+
+    const argv = h.spawn.mock.calls[1][1] as readonly string[];
+    for (let index = 0; index < NO_TOOLS.length; index += 2) {
+      const at = argv.indexOf(NO_TOOLS[index + 1]);
+      expect(at, NO_TOOLS[index + 1]).toBeGreaterThan(0);
+      expect(argv[at - 1]).toBe('-c');
+    }
+    expect(argv).toEqual(expect.arrayContaining(['--ignore-user-config', '--ignore-rules', '-s', 'read-only']));
   });
 
   it.each([
@@ -655,7 +683,6 @@ describe('runCodexAdvisorReview', () => {
 
   it.each([
     ['gpt-6-luna', ['gpt-6-sol', 'gpt-6-astra'], 'gpt-6-sol'],
-    ['gpt-6-sol', ['gpt-6-luna'], 'gpt-6-astra'],
   ])('skips empty installed tiers for %s (installed %j) -> %s', async (requester, installed, reviewer) => {
     const h = harness();
     h.deps.readFile = vi.fn(async (target: string) => {
@@ -683,16 +710,40 @@ describe('runCodexAdvisorReview', () => {
   });
 
   it.each([
-    ['gpt-6-luna', 'gpt-5.6-terra'],
-    ['gpt-6-sol', 'gpt-6-astra'],
-  ])('falls back to the built-in ladder when the models cache is unreadable: %s -> %s', async (requester, reviewer) => {
+    ['gpt-6-luna', 'terra'],
+    ['gpt-6-sol', 'astra'],
+  ])('is unavailable with no pinned fallback when the models cache is unreadable: %s', async (requester, family) => {
     const h = harness();
     h.deps.readFile = vi.fn(async () => { throw enoent(); });
     h.deps.trustedRequesterModel = requester;
     const result = await runCodexAdvisorReview(
       { packet: 'packet', requester_model: requester }, identity, session, runtime, h.deps,
     );
-    expect(payload(result).reviewer_model).toBe(reviewer);
+    expect(payload(result)).toEqual(expect.objectContaining({
+      success: false,
+      reason: 'codex-reviewer-model-unavailable',
+    }));
+    expect(String(payload(result).diagnostic)).toContain(`Codex model family ${family}`);
+    expect(String(payload(result).diagnostic)).toContain(MODELS_CACHE_PATH);
+    expect(h.spawn).toHaveBeenCalledTimes(1); // the companion preflight only; no reviewer launch
+  });
+
+  it('is unavailable when no installed model is at or above the one-up tier', async () => {
+    const h = harness();
+    h.deps.readFile = vi.fn(async (target: string) => {
+      if (target === MODELS_CACHE_PATH) return JSON.stringify({ models: [{ slug: 'gpt-6-luna' }] });
+      throw enoent();
+    });
+    h.deps.trustedRequesterModel = 'gpt-6-sol';
+    const result = await runCodexAdvisorReview(
+      { packet: 'packet', requester_model: 'gpt-6-sol' }, identity, session, runtime, h.deps,
+    );
+    expect(payload(result)).toEqual(expect.objectContaining({
+      success: false,
+      reason: 'codex-reviewer-model-unavailable',
+    }));
+    expect(String(payload(result).diagnostic)).toContain('Codex model family astra');
+    expect(h.spawn).toHaveBeenCalledTimes(1);
   });
 
   it('keeps the requester for a same-tier gpt-6 review', async () => {

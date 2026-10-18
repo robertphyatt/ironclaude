@@ -1,0 +1,28 @@
+{
+  "name": "Re-stage at wave boundary",
+  "goal": "Make the executing-plans cumulative re-stage step actually run, by moving it to each wave boundary while the stage is still executing, and fix the commander test that extracts it.",
+  "requirements_file": "docs/plans/2026-10-16-restage-at-wave-boundary-design.md",
+  "design_file": "docs/plans/2026-10-16-restage-at-wave-boundary-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Move the re-stage to the wave boundary and fix its tests",
+      "description": "TDD. Text and code blocks verbatim in docs/plans/2026-10-16-restage-at-wave-boundary.md Task 1 Steps 1-4; apply exactly. Invariants: literal absolute paths; git -C /Users/roberthyatt/Code/ironclaude; pytest PYTHONUNBUFFERED=1 via commander/.venv/bin/python from /Users/roberthyatt/Code/ironclaude/commander; never stash/commit/push; docs need git add -f. Verified: SKILL.md Step 5 :606-610 (line 608 'After all tasks in the current wave pass review, call `mcp__plugin_ironclaude_state-manager__get_next_tasks` again.' + 2 bullets), Step 6 :612; Step 7 :715, item 2 re-stage :719-786 (prose :719-730, bash block :731-786, markers :733/:784), item 3 :787; test file imports json/re/subprocess/Path (no textwrap); placement test :355-369; non-root-cwd test :372-398 extracts undedented at :378 (IndentationError at HEAD); hook test test-skill-handoffs-restaging.sh matches '^   # BEGIN/END' and dedents; only SKILL.md and the commander test contain 'Re-stage the cumulative'. Script block moves byte-for-byte (3-space indent kept).",
+      "allowed_files": [
+        "worker/skills/executing-plans/SKILL.md",
+        "commander/tests/test_executing_plans_skill.py",
+        "docs/plans/2026-10-16-restage-at-wave-boundary-design.md",
+        "docs/plans/2026-10-16-restage-at-wave-boundary.md",
+        "docs/plans/2026-10-16-restage-at-wave-boundary.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Test edits per plan.md Task 1 Step 1: add import textwrap after import subprocess; replace test_execution_complete_restages_cumulative_allowed_files with test_wave_boundary_restages_cumulative_allowed_files (verbatim block); wrap :378 extraction in textwrap.dedent(...)."},
+        {"description": "RED run.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_executing_plans_skill.py -q -k \"wave_boundary_restages or restage_command_stages\"", "expected": "1 failed (test_wave_boundary_restages_cumulative_allowed_files: re-stage still after Step 6), 1 passed (non-root-cwd test passes once dedented); record measured."},
+        {"description": "GREEN per plan.md Task 1 Step 2: SKILL.md Step 5 lines :608-610 replaced by the verbatim intro + numbered item 1 (new re-stage prose + the bash script block cut from Step 7, unchanged) + item 2 'Call `mcp__plugin_ironclaude_state-manager__get_next_tasks` again.' with the two bullets; Step 7 item 2 (:719-786) replaced by the verbatim 'Verify the index holds every allowed file.' item directly before item 3."},
+        {"description": "GREEN + hook test + marker count + full commander suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_executing_plans_skill.py -q > /private/tmp/claude-502/rs1.out 2>&1; echo \"t=$?\"; tail -n 3 /private/tmp/claude-502/rs1.out; bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-skill-handoffs-restaging.sh > /private/tmp/claude-502/rs-hook.out 2>&1; echo \"hook=$?\"; tail -n 3 /private/tmp/claude-502/rs-hook.out; grep -c \"BEGIN EXACT ALLOWED FILES RESTAGING\" /Users/roberthyatt/Code/ironclaude/worker/skills/executing-plans/SKILL.md; PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/ -q > /private/tmp/claude-502/rs-suite.out 2>&1; echo \"suite=$?\"; tail -n 3 /private/tmp/claude-502/rs-suite.out", "expected": "t=0 (0 failed); hook=0 with trailing 'PASS reject ...' lines; count 1; suite=0 (0 failed). Any other failure must be shown pre-existing via a temporary git worktree of HEAD (never git stash) or fixed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/skills/executing-plans/SKILL.md commander/tests/test_executing_plans_skill.py; git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-16-restage-at-wave-boundary-design.md docs/plans/2026-10-16-restage-at-wave-boundary.md docs/plans/2026-10-16-restage-at-wave-boundary.plan.json", "expected": "No output."}
+      ]
+    }
+  ]
+}

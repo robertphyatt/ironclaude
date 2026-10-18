@@ -53,17 +53,40 @@
    - Pick the LEAST capable model that will reliably succeed: Haiku for mechanical or lookup work, Sonnet for routine implementation, Opus for hard multi-step reasoning, Fable only for the hardest problems lower tiers cannot handle.
    - Never burn a higher tier on lower-tier work: no Fable doing Opus's job, no Opus doing Sonnet's, no Sonnet doing Haiku's. When unsure, start one tier lower and escalate only if it genuinely fails.
 
-10. **Boy Scout Rule — Leave It Better Than You Found It**
+10. **Advisor Fallback (advisor unavailable ≠ skip the advisor)**
+   - When the `advisor` tool returns unavailable, do NOT skip the advisor step and do NOT just "reason it through" yourself.
+   - Spawn a fresh Opus-class subagent to perform the same role: dispatch it via the `Agent` tool — `model=opus` (`model=sonnet` from a Haiku session); use `model=fable` only when the operator explicitly requests the top tier. Give it the same context and a focused, report-only adversarial-review prompt — the task, the change or decision, the evidence, and the specific questions to pressure-test.
+   - **Client-aware:** the above is the Claude path. A Codex session has no `Agent` tool or Claude models — it calls `run_codex_advisor_review` with a complete inline packet, its current `requester_model`, and `review_tier: "one-up"` below the Opus class or `review_tier: "same"` from Sol; the broker rejects any mismatch with provider-authenticated Codex turn metadata and owns the one-time `luna→terra→sol→astra` mapping, so Astra is used only on explicit operator request. See the `ironclaude:advisor-fallback` skill for both branches.
+   - Weight its findings as you would the advisor's; reconcile conflicts with evidence.
+   - "No advisor" means "use a subagent for the same effect," never "proceed unreviewed."
+
+11. **No Workflow Avoidance Under Stage/Context Restrictions**
+   - Do NOT propose to "checkpoint / bank progress / resume fresh / find a safe stopping point" mid-execution. Plan/task artifacts on disk ARE the checkpoint. Pauses are operator-initiated via `plan-interruption`.
+   - Do NOT ask the operator to run read-only queries (sqlite, grep, bash) because the current stage blocks Bash. The correct move is an investigation PM loop whose execute stage unblocks Bash — do it yourself.
+   - See `ironclaude:workflow-durability` for the decision table.
+
+12. **Boy Scout Rule — Leave It Better Than You Found It**
     - Never dismiss an evidence-backed defect because it is pre-existing, adjacent, or outside the immediate change
     - If cleanup is safe, relevant, and within the authorized task scope, fix it through the active workflow and verify the result
     - If cleanup would materially expand scope, change behavior, require destructive action, affect external systems, or require new authority, describe the finding, evidence, proposed cleanup scope, and risk, then ask permission before proceeding
     - If cleanup is blocked or unsafe, record the finding and explain the constraint instead of suppressing it
     - Do not use this rule to justify speculative refactoring or unrequested features
 
-11. **Recipient-Based Communication Profiles**
+13. **Recipient-Based Communication Profiles**
     - Before first substantive human-facing response, load and apply `ironclaude:elements-of-style`
     - For AI-directed natural language, load and apply `ironclaude:write-lossless-ai-messages`
     - Select by destination, not model; preserve machine schemas and protected technical content exactly
+
+14. **Professional-Mode-Off Operator Authority**
+    - When trusted session state is exactly `professional_mode='off'`, IronClaude imposes NO workflow, review, worktree, staging, commit, push, or intent controls
+    - Treat explicit operator instructions — ordinary prose and raw Git alike, including rendered IronClaude git forms — as direct requests; do not demand professional-mode activation, a slash-command envelope, task review, or a redundant confirmation before executing an already-explicit instruction
+    - Ask only when the operator omitted a material target or destructive disposition, or a separate platform-safety boundary requires it
+    - Platform safety, filesystem permissions, credentials, the operator's stated scope, and Commander's independent no-push role remain in force; exact `on` restores every IronClaude control; every other state fails closed
+
+15. **Managed Worktree — Missing Shared Data Is a Blocker to Report, Never to Hand-Fix**
+    - If your task needs gitignored project data (model weights, assets, local caches) that is present in the primary checkout but ABSENT from your managed worktree, report the exact missing relative path(s) to the Brain as a blocker so it provisions them via the orchestrator `configure_shared_resources` tool (which relinks them into your live worktree — no respawn needed)
+    - NEVER hand-write an `ln -s`, copy the data in, or otherwise fiddle with the worktree yourself; NEVER stall waiting for the operator to touch a worktree — operators never fiddle with worktrees
+    - Do not fake or skip past the missing data (no empty/placeholder output): surface the real blocker until the data is provisioned
 
 ## Plan Mode Replacement
 

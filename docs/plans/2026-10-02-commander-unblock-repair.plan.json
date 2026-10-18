@@ -1,0 +1,34 @@
+{
+  "name": "Commander Unblock Repair",
+  "goal": "Unblock Commander worker spawning for roleplaying-agents without code changes: retire stranded reservations, clear CPU hogs, measure allocate, relaunch only if allocate fits the 60s cap.",
+  "requirements_file": "docs/plans/2026-10-02-commander-unblock-repair-requirements.md",
+  "design_file": "docs/plans/2026-10-02-commander-unblock-repair-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Repair and relaunch decision",
+      "description": "R1-R8. Subagent-sequential execution (operator choice): one Sonnet subagent, max_turns set. No tests required: operational repair, no code changes; per-step before/after evidence is the verification, recorded in the repair log. Exact-PID kills from the pre-kill snapshot only; no raw-SQL, forced-ref, or manual-cleanup fallback; any unexpected result stops for reporting; never touch Codex worktrees or pre-existing finalization/recovery/review-receipts refs. SP=/private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad. Full steps: human plan Task 1.",
+      "allowed_files": [
+        "docs/plans/2026-10-02-commander-unblock-repair-log.md",
+        "docs/plans/2026-10-02-commander-unblock-repair-requirements.md",
+        "docs/plans/2026-10-02-commander-unblock-repair-design.md",
+        "docs/plans/2026-10-02-commander-unblock-repair.md",
+        "docs/plans/2026-10-02-commander-unblock-repair.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "R1 BEFORE stop: cat /tmp/ic-daemon.pid and /tmp/ic/brain.pid, record PIDs (if brain.pid absent record that, check daemon only); stop with Bash timeout 300000; AFTER: ps -p <daemon>,<brain> lists neither (exit 1) and printed 'Daemon (PID N) stopped' matches recorded daemon PID", "command": "make -C /Users/roberthyatt/Code/ironclaude/commander stop", "expected": "both recorded PIDs gone"},
+        {"description": "R2 record sysctl vm.swapusage + uptime; pre-kill snapshot ps -axo pid=,ppid=,command=; kill set = PPID 1 + 'episodic-memory/dist/sync-cli.js'; kill <set>; ps -p <set>; kill -9 set survivors; verify all set PIDs gone; new post-snapshot matches recorded not killed; record swap/uptime after", "command": "ps -axo pid=,ppid=,command=", "expected": "every set PID gone; before/after recorded"},
+        {"description": "R3 DB backup to SP", "command": "sqlite3 /Users/roberthyatt/.claude/ironclaude-workspaces.db \".backup /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/ironclaude-workspaces.pre-repair.db\"", "expected": "exit 0; backup assignments count == live count"},
+        {"description": "R4 write 'SELECT workspace_guid,lifecycle_status,updated_at FROM assignments ORDER BY workspace_guid' to SP/assignments.before.txt; reap f9781678", "command": "node /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js reap '{\"repository_path\":\"/Users/roberthyatt/Code/roleplaying-agents\",\"workspace_guid\":\"f9781678-b968-4232-a7e7-8dc89931d12f\"}'", "expected": "lifecycle_status cleaned"},
+        {"description": "R4 reap 55a08d1e; write same query to SP/assignments.after.txt; diff before/after", "command": "node /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js reap '{\"repository_path\":\"/Users/roberthyatt/Code/roleplaying-agents\",\"workspace_guid\":\"55a08d1e-9759-45f2-a22c-b079aba1ca71\"}'", "expected": "lifecycle_status cleaned; diff shows only the 2 guid lines removed, nothing else"},
+        {"description": "R5 CAS-delete branch f9781678", "command": "git -C /Users/roberthyatt/Code/roleplaying-agents update-ref -d refs/heads/ironclaude/f9781678-b968-4232-a7e7-8dc89931d12f 3658cc9da56b0baeab9c1d00608a03bb692a4939", "expected": "exit 0"},
+        {"description": "R5 CAS-delete branch 55a08d1e; verify for-each-ref refs/heads/ironclaude lists neither; moved ref -> stop and report", "command": "git -C /Users/roberthyatt/Code/roleplaying-agents update-ref -d refs/heads/ironclaude/55a08d1e-9759-45f2-a22c-b079aba1ca71 3658cc9da56b0baeab9c1d00608a03bb692a4939", "expected": "exit 0; both refs absent"},
+        {"description": "R6 uuidgen | tr A-Z a-z -> literal UUID; run allocate with run_in_background:true timeout:7200000 logging to SP/allocate-probe.log; no ps/sqlite3 against probe while running; on completion cat log, record 'real' secs, lifecycle_status, probe row created_at/updated_at, df -h repo. If killed at 7200000ms: record '>45s, killed at 2h', no relaunch, no reap, STOP and report", "command": "/usr/bin/time -p node /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js allocate '{\"repository_path\":\"/Users/roberthyatt/Code/roleplaying-agents\",\"workspace_guid\":\"<UUID>\",\"worker_id\":\"repair-timing-probe\"}' > /private/tmp/claude-502/-Users-roberthyatt-Code-ironclaude/7c7f63a0-e272-4e34-a05b-3d6ebc128c94/scratchpad/allocate-probe.log 2>&1", "expected": "wall time measured"},
+        {"description": "R6 reap probe (if reap throws STOP and report, no manual cleanup); record worktree list --porcelain, for-each-ref refs/heads/ironclaude refs/ironclaude/recovery/<UUID>, probe DB row; leftovers recorded not hand-removed", "command": "node /Users/roberthyatt/Code/ironclaude/worker/mcp-servers/workspace-manager/dist/cli.js reap '{\"repository_path\":\"/Users/roberthyatt/Code/roleplaying-agents\",\"workspace_guid\":\"<UUID>\"}'", "expected": "probe row terminal"},
+        {"description": "R7 if wall <=45s relaunch; verify cat /tmp/ic-daemon.pid + /tmp/ic/brain.pid, ps -o pid=,ppid=,sess=,command= -p <daemon>,<brain> both present, make PPID 1, launch log no Traceback/ERROR. Else no relaunch, hotfix next", "command": "env -u CLAUDE_CODE_BRIDGE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH -u CLAUDE_CODE_MESSAGING_SOCKET -u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_SESSION_ATTENDED -u CLAUDE_CODE_SESSION_ID -u CLAUDE_EFFORT -u CLAUDE_PID -u CLAUDECODE nohup python3 -c \"import os; os.setsid(); os.execvp('make',['make','-C','/Users/roberthyatt/Code/ironclaude/commander','run'])\" >/tmp/ironclaude-restart-launch.log 2>&1 & disown", "expected": "decision + evidence recorded"},
+        {"description": "R8 write repair log from steps 1-7 evidence; stage artifacts", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-02-commander-unblock-repair-requirements.md docs/plans/2026-10-02-commander-unblock-repair-design.md docs/plans/2026-10-02-commander-unblock-repair.md docs/plans/2026-10-02-commander-unblock-repair.plan.json docs/plans/2026-10-02-commander-unblock-repair-log.md", "expected": "exit 0"}
+      ]
+    }
+  ]
+}

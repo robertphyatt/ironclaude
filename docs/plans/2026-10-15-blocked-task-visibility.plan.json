@@ -1,0 +1,50 @@
+{
+  "name": "Blocked-task visibility",
+  "goal": "Make a ledger task blocked on the operator visible in every heartbeat, with a top-level reminder every 4 hours, by having the daemon read the real wiki ledger.",
+  "requirements_file": "docs/plans/2026-10-15-blocked-task-visibility-design.md",
+  "design_file": "docs/plans/2026-10-15-blocked-task-visibility-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Shared ledger reader, and the daemon reads the wiki ledger",
+      "description": "TDD. Code blocks verbatim in docs/plans/2026-10-15-blocked-task-visibility.md Task 1 Steps 1-4; apply exactly. Invariants: literal absolute paths; git -C /Users/roberthyatt/Code/ironclaude; pytest PYTHONUNBUFFERED=1 via commander/.venv/bin/python from /Users/roberthyatt/Code/ironclaude/commander; never stash/commit/push; new tests never read ~/.ironclaude (brain_cwd=tmp_path). Verified: orchestrator _extract_ledger_json :7382-7403 (no ironclaude.protocol import); protocol.read_task_ledger :65-71; main _ledger_path :1564; main _handle_status :3520-3533 subscripts ledger['current_task']/['total_tasks'] (wiki ledger lacks them; unguarded Slack command loop -> daemon crash); tests/test_blocked_tasks.py absent.",
+      "allowed_files": [
+        "commander/src/ironclaude/protocol.py",
+        "commander/src/ironclaude/orchestrator_mcp.py",
+        "commander/src/ironclaude/main.py",
+        "commander/tests/test_blocked_tasks.py"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Create commander/tests/test_blocked_tasks.py per plan.md Task 1 Step 1 (helpers _iso/_write_ledger/_daemon; class TestLedgerReader, 4 tests; class TestStatusCommand, 1 test)."},
+        {"description": "RED run.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_blocked_tasks.py -q", "expected": "3 failed (test_reads_wiki_page_data_block, test_daemon_ledger_path_uses_brain_wiki_when_configured, test_status_progress_from_wiki_ledger), 2 passed; record measured."},
+        {"description": "GREEN per plan.md Task 1 Step 2: protocol.py extract_ledger_json + dual-format read_task_ledger (except (OSError, UnicodeDecodeError); non-dict .md data -> None); orchestrator _extract_ledger_json delegates; main.py :1564 _ledger_path from brain_cwd wiki when configured else legacy; main.py _handle_status progress = completed/total from ledger tasks list (shape-guarded), else N/A."},
+        {"description": "GREEN + affected suites.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_blocked_tasks.py tests/test_enforcement.py tests/test_idle_enforcement.py tests/test_orchestrator_mcp.py -q > /private/tmp/claude-502/bt1.out 2>&1; echo \"t1=$?\"; tail -n 3 /private/tmp/claude-502/bt1.out", "expected": "t1=0, 0 failed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/protocol.py commander/src/ironclaude/orchestrator_mcp.py commander/src/ironclaude/main.py commander/tests/test_blocked_tasks.py", "expected": "No output."}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Heartbeat section and 4-hourly reminder",
+      "description": "TDD. Code blocks verbatim in docs/plans/2026-10-15-blocked-task-visibility.md Task 2 Steps 1-4; apply exactly. Same invariants as Task 1. Verified: format_heartbeat notifications.py:115-215 (_escape_mrkdwn :12, _fmt_duration :106); post_heartbeat main.py:5479, format_heartbeat call :5542-5556; main.py imports datetime,timezone (:27) and read_task_ledger (:49); SlackInterface.get_permalink(message_ts)->str|None; SlackBot.post_message queues failed posts for flush_queue (slack_interface.py:76-87,120-131), so the reminder timer advances on every attempt; DEFAULTS heartbeat_interval_seconds in config.py. Step 2 item 7 is a documentation-only design sync (no tests required: documentation). Known pre-existing suite failure: tests/test_executing_plans_skill.py::test_execution_complete_restage_command_stages_from_non_root_cwd.",
+      "allowed_files": [
+        "commander/src/ironclaude/notifications.py",
+        "commander/src/ironclaude/main.py",
+        "commander/src/ironclaude/config.py",
+        "commander/tests/test_blocked_tasks.py",
+        "docs/plans/2026-10-15-blocked-task-visibility-design.md",
+        "docs/plans/2026-10-15-blocked-task-visibility.md",
+        "docs/plans/2026-10-15-blocked-task-visibility.plan.json"
+      ],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Append TestHeartbeatSection (3) and TestReminder (4: test_reminds_then_waits_four_hours, test_no_reminder_without_escalation, test_failed_post_is_not_reposted_within_interval, test_unblocked_task_is_pruned) to commander/tests/test_blocked_tasks.py per plan.md Task 2 Step 1."},
+        {"description": "RED run.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_blocked_tasks.py -q -k \"TestHeartbeatSection or TestReminder\"", "expected": "6 failed, 1 passed (test_no_reminder_without_escalation passes vacuously pre-change); record measured."},
+        {"description": "GREEN per plan.md Task 2 Step 2 items 1-6: notifications format_heartbeat blocked_tasks param + empty-check + section, new format_blocked_reminder; config DEFAULTS blocked_reminder_interval_seconds=14400; main.py __init__ _blocked_reminded, post_heartbeat reads blocked tasks (try/except), passes blocked_tasks=, then _maybe_remind_blocked (try/except); new _parse_iso_epoch/_blocked_ledger_tasks/_maybe_remind_blocked before post_heartbeat (timer advances on every post attempt)."},
+        {"description": "Design documentation sync per plan.md Task 2 Step 2 item 7: the six exact replacements in docs/plans/2026-10-15-blocked-task-visibility-design.md."},
+        {"description": "GREEN + full commander suite.", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/test_blocked_tasks.py tests/test_notifications.py -q > /private/tmp/claude-502/bt2.out 2>&1; echo \"t2=$?\"; tail -n 3 /private/tmp/claude-502/bt2.out; PYTHONUNBUFFERED=1 .venv/bin/python -m pytest tests/ -q > /private/tmp/claude-502/bt-suite.out 2>&1; echo \"suite=$?\"; tail -n 4 /private/tmp/claude-502/bt-suite.out", "expected": "t2=0 (0 failed); suite=1 with only the known pre-existing test_execution_complete_restage_command_stages_from_non_root_cwd failing. Any other failure must be shown pre-existing via a temporary git worktree of HEAD (never git stash) or fixed."},
+        {"description": "Stage.", "command": "git -C /Users/roberthyatt/Code/ironclaude add commander/src/ironclaude/notifications.py commander/src/ironclaude/main.py commander/src/ironclaude/config.py commander/tests/test_blocked_tasks.py; git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-15-blocked-task-visibility.md docs/plans/2026-10-15-blocked-task-visibility.plan.json docs/plans/2026-10-15-blocked-task-visibility-design.md", "expected": "No output."}
+      ]
+    }
+  ]
+}

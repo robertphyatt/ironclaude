@@ -23,8 +23,8 @@
       }
     },
     "roles": {
-      "worker": {"preferred": "codex", "clients": ["codex", "claude"]},
-      "grader": {"preferred": "codex", "clients": ["codex", "claude"]}
+      "worker": {"preferred": "claude", "clients": ["claude", "codex"]},
+      "grader": {"preferred": "claude", "clients": ["claude", "codex"]}
     }
   }
 }

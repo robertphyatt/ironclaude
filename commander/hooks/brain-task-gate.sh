@@ -1,5 +1,5 @@
 #!/bin/bash
-# brain-task-gate.sh — PreToolUse hook (registered with matcher "Agent|Task").
+# brain-task-gate.sh — PreToolUse hook (registered with matcher "Agent|Task" on Claude, "spawn_agent|collaborationspawn_agent" on Codex).
 #
 # R5a: the daemon Brain must not wrap its own gated actions in a general-purpose
 # subagent (202 such calls observed) — it should act directly (call the
@@ -21,6 +21,10 @@ if ! source "${SCRIPT_DIR}/hook-logger.sh" 2>/dev/null; then
   # Agent/Task subagent that isn't search-conversations); allow everything else.
   _IN=$(cat)
   _TN=$(echo "$_IN" | jq -r '.tool_name // empty' 2>/dev/null || true)
+  if [[ "$_TN" == *spawn_agent ]]; then
+    echo "✗ [brain-task-gate]: Blocked - IronClaude hook-logger.sh missing; enforcement cannot run. Run 'make deploy-hooks', then retry." >&2
+    exit 2
+  fi
   if [[ "$_TN" == "Agent" || "$_TN" == "Task" ]]; then
     _SUB=$(echo "$_IN" | jq -r '.tool_input.subagent_type // empty' 2>/dev/null || true)
     if [[ "$_SUB" != "ironclaude:search-conversations" ]]; then
@@ -36,6 +40,16 @@ INPUT=$(cat)
 init_session_id
 
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null || true)
+
+# Codex's native subagent tool: "spawn_agent" in the default/multi_agent_v1 namespace,
+# or namespace+name (e.g. "collaborationspawn_agent", multi-agent v2) otherwise. The
+# Codex Brain has no memory-search agent type (it searches episodic memory through MCP
+# directly), so every spawn is blocked.
+if [[ "$TOOL_NAME" == *spawn_agent ]]; then
+  block_pretooluse "brain-task-gate" "BLOCKED — the Brain must not spawn subagents.
+
+Act directly: call the orchestrator/MCP tools yourself, and search episodic memory with the episodic-memory MCP tools."
+fi
 
 # Only gate subagent dispatches; everything else passes untouched.
 if [[ "$TOOL_NAME" != "Agent" && "$TOOL_NAME" != "Task" ]]; then

@@ -20,6 +20,8 @@ export function migrateSchema(db: Database.Database): void {
     { name: 'thinking_level', sql: 'ALTER TABLE exchanges ADD COLUMN thinking_level TEXT' },
     { name: 'thinking_disabled', sql: 'ALTER TABLE exchanges ADD COLUMN thinking_disabled BOOLEAN' },
     { name: 'thinking_triggers', sql: 'ALTER TABLE exchanges ADD COLUMN thinking_triggers TEXT' },
+    { name: 'entrypoint', sql: 'ALTER TABLE exchanges ADD COLUMN entrypoint TEXT' },
+    { name: 'session_class', sql: 'ALTER TABLE exchanges ADD COLUMN session_class TEXT' },
   ];
 
   let migrated = false;
@@ -36,31 +38,22 @@ export function migrateSchema(db: Database.Database): void {
   }
 }
 
-let _db: Database.Database | null = null;
+/**
+ * idx_session_class and idx_archive_path. Building them scans every exchanges row, so
+ * initDatabase builds them only for a brand-new file; on an existing index `maintain`
+ * builds them under the sync lock (concurrent MCP starts must not race a long build).
+ */
+export function ensureProvenanceIndexes(db: Database.Database): void {
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_session_class ON exchanges(session_class)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_archive_path ON exchanges(archive_path)`);
+}
 
-export function initDatabase(): Database.Database {
-  // Reuse the cached handle only if it is still open. better-sqlite3 exposes a
-  // `.open` boolean that flips to false after `.close()`. A closed handle would
-  // throw "database is not open" on the next query, so drop it and re-open.
-  if (_db && _db.open) return _db;
-  _db = null;
-  const dbPath = getDbPath();
-
-  // Ensure directory exists
-  const dbDir = path.dirname(dbPath);
-  if (!fs.existsSync(dbDir)) {
-    fs.mkdirSync(dbDir, { recursive: true });
-  }
-
-  const db = new Database(dbPath);
-
-  // Load sqlite-vec extension
-  sqliteVec.load(db);
-
-  // Enable WAL mode for better concurrency
-  db.pragma('journal_mode = WAL');
-
-  // Create exchanges table
+/**
+ * Every table and index the index needs. There is deliberately no tool_calls table:
+ * it was write-only (nothing in src/ read it) and held ~82% of a 42 GB index. Tool
+ * names still reach the embedding text through the callers of insertExchange.
+ */
+export function applySchema(db: Database.Database, opts: { provenanceIndexes?: boolean } = {}): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS exchanges (
       id TEXT PRIMARY KEY,
@@ -81,25 +74,12 @@ export function initDatabase(): Database.Database {
       claude_version TEXT,
       thinking_level TEXT,
       thinking_disabled BOOLEAN,
-      thinking_triggers TEXT
+      thinking_triggers TEXT,
+      entrypoint TEXT,
+      session_class TEXT
     )
   `);
 
-  // Create tool_calls table
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS tool_calls (
-      id TEXT PRIMARY KEY,
-      exchange_id TEXT NOT NULL,
-      tool_name TEXT NOT NULL,
-      tool_input TEXT,
-      tool_result TEXT,
-      is_error BOOLEAN DEFAULT 0,
-      timestamp TEXT NOT NULL,
-      FOREIGN KEY (exchange_id) REFERENCES exchanges(id)
-    )
-  `);
-
-  // Create vector search index
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS vec_exchanges USING vec0(
       id TEXT PRIMARY KEY,
@@ -107,58 +87,83 @@ export function initDatabase(): Database.Database {
     )
   `);
 
-  // Run migrations first
+  db.exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+
+  // Run migrations before indexes so every indexed column exists.
   migrateSchema(db);
 
-  // Create indexes (after migrations ensure columns exist)
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_timestamp ON exchanges(timestamp DESC)
-  `);
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_session_id ON exchanges(session_id)
-  `);
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_project ON exchanges(project)
-  `);
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_sidechain ON exchanges(is_sidechain)
-  `);
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_git_branch ON exchanges(git_branch)
-  `);
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_tool_name ON tool_calls(tool_name)
-  `);
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_tool_exchange ON tool_calls(exchange_id)
-  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_timestamp ON exchanges(timestamp DESC)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_session_id ON exchanges(session_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_project ON exchanges(project)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sidechain ON exchanges(is_sidechain)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_git_branch ON exchanges(git_branch)`);
+  if (opts.provenanceIndexes) ensureProvenanceIndexes(db);
+}
+
+let _db: Database.Database | null = null;
+
+/** Close and forget the cached handle (used after the slim swaps db.sqlite, and by tests). */
+export function resetDatabaseCache(): void {
+  if (_db && _db.open) _db.close();
+  _db = null;
+}
+
+export function initDatabase(): Database.Database {
+  // Reuse the cached handle only if it is still open. better-sqlite3 exposes a
+  // `.open` boolean that flips to false after `.close()`. A closed handle would
+  // throw "database is not open" on the next query, so drop it and re-open.
+  if (_db && _db.open) return _db;
+  _db = null;
+  const dbPath = getDbPath();
+
+  const dbDir = path.dirname(dbPath);
+  if (!fs.existsSync(dbDir)) {
+    fs.mkdirSync(dbDir, { recursive: true });
+  }
+
+  const isNewFile = !fs.existsSync(dbPath);
+  const db = new Database(dbPath);
+  sqliteVec.load(db);
+  db.pragma('journal_mode = WAL');
+  applySchema(db, { provenanceIndexes: isNewFile });
 
   _db = db;
   return db;
+}
+
+export function tableExists(db: Database.Database, name: string): boolean {
+  return !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name);
+}
+
+export function getMeta(db: Database.Database, key: string): string | null {
+  if (!tableExists(db, 'meta')) return null;
+  const row = db.prepare(`SELECT value FROM meta WHERE key = ?`).get(key) as { value: string } | undefined;
+  return row ? row.value : null;
+}
+
+export function setMeta(db: Database.Database, key: string, value: string): void {
+  db.exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+  db.prepare(`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+    .run(key, value);
 }
 
 export function insertExchange(
   db: Database.Database,
   exchange: ConversationExchange,
   embedding: number[],
-  toolNames?: string[]
+  _toolNames?: string[]
 ): void {
   const now = Date.now();
 
-  // Wrap the whole multi-statement mutation in a transaction so it either
-  // commits atomically or rolls back. Without this, a throw mid-sequence could
-  // leave an exchanges row with no matching vec_exchanges row (which then never
-  // matches vector search), or partially-written tool_calls.
+  // One transaction, so an exchanges row never exists without its vec_exchanges row.
   const txn = db.transaction(() => {
-    const stmt = db.prepare(`
+    db.prepare(`
       INSERT OR REPLACE INTO exchanges
       (id, project, timestamp, user_message, assistant_message, archive_path, line_start, line_end, last_indexed,
        parent_uuid, is_sidechain, session_id, cwd, git_branch, claude_version,
-       thinking_level, thinking_disabled, thinking_triggers)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    stmt.run(
+       thinking_level, thinking_disabled, thinking_triggers, entrypoint, session_class)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
       exchange.id,
       exchange.project,
       exchange.timestamp,
@@ -176,40 +181,15 @@ export function insertExchange(
       exchange.claudeVersion || null,
       exchange.thinkingLevel || null,
       exchange.thinkingDisabled ? 1 : 0,
-      exchange.thinkingTriggers || null
+      exchange.thinkingTriggers || null,
+      exchange.entrypoint || null,
+      exchange.sessionClass || null
     );
 
-    // Insert into vector table (delete first since virtual tables don't support REPLACE)
-    const delStmt = db.prepare(`DELETE FROM vec_exchanges WHERE id = ?`);
-    delStmt.run(exchange.id);
-
-    const vecStmt = db.prepare(`
-      INSERT INTO vec_exchanges (id, embedding)
-      VALUES (?, ?)
-    `);
-
-    vecStmt.run(exchange.id, Buffer.from(new Float32Array(embedding).buffer));
-
-    // Insert tool calls if present
-    if (exchange.toolCalls && exchange.toolCalls.length > 0) {
-      const toolStmt = db.prepare(`
-        INSERT OR REPLACE INTO tool_calls
-        (id, exchange_id, tool_name, tool_input, tool_result, is_error, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      for (const toolCall of exchange.toolCalls) {
-        toolStmt.run(
-          toolCall.id,
-          toolCall.exchangeId,
-          toolCall.toolName,
-          toolCall.toolInput ? JSON.stringify(toolCall.toolInput) : null,
-          toolCall.toolResult || null,
-          toolCall.isError ? 1 : 0,
-          toolCall.timestamp
-        );
-      }
-    }
+    // Virtual tables don't support REPLACE: delete, then insert.
+    db.prepare(`DELETE FROM vec_exchanges WHERE id = ?`).run(exchange.id);
+    db.prepare(`INSERT INTO vec_exchanges (id, embedding) VALUES (?, ?)`)
+      .run(exchange.id, Buffer.from(new Float32Array(embedding).buffer));
   });
 
   txn();
@@ -231,9 +211,6 @@ export function getFileLastIndexed(db: Database.Database, archivePath: string): 
 }
 
 export function deleteExchange(db: Database.Database, id: string): void {
-  // Delete from vector table
   db.prepare(`DELETE FROM vec_exchanges WHERE id = ?`).run(id);
-
-  // Delete from main table
   db.prepare(`DELETE FROM exchanges WHERE id = ?`).run(id);
 }

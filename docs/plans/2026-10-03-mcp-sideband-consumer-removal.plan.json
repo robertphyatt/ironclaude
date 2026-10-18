@@ -1,0 +1,43 @@
+{
+  "name": "MCP Sideband Consumer Removal (v1.1.16 L2b-1d)",
+  "goal": "Stop delivering MCP sideband errors into any session's context by removing the hook-side consumer (surface_mcp_errors) and its state-activator call; then verify and redeploy.",
+  "requirements_file": "docs/plans/2026-10-03-mcp-sideband-consumer-removal-requirements.md",
+  "design_file": "docs/plans/2026-10-03-mcp-sideband-consumer-removal-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Remove the consumer (R1-R3)",
+      "description": "Per human plan Task 1: test-state-activator-single-object.sh header (:2-5) and case 5 (:53-61) replaced verbatim — case 5 asserts empty output and the log line still in ~/.claude/ironclaude-errors.log; state-activator.sh:9 writer list drops surface_mcp_errors, :66-68 (comment, call, blank) deleted; hook-logger.sh:31 MCP_ERROR_LOG comment replaced (3 lines), :600-620 (surface_mcp_errors comment, function, trailing blank) deleted; MCP_ERROR_LOG kept (session-init.sh:406). No TypeScript change.",
+      "allowed_files": ["worker/hooks/state-activator.sh", "worker/hooks/hook-logger.sh", "worker/hooks/tests/test-state-activator-single-object.sh"],
+      "depends_on": [],
+      "steps": [
+        {"description": "RED: edit test header (:2-5) and case 5 per human plan Task 1 Step 1 verbatim."},
+        {"description": "Run test, see it fail", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-state-activator-single-object.sh", "expected": "predicted: exit 1, Results: 5 pass, 1 fail — only case 5 FAILs (surface_mcp_errors emits the line and moves the log away)"},
+        {"description": "state-activator.sh: line 9 edit and delete :66-68 per human plan Task 1 Step 3."},
+        {"description": "hook-logger.sh: line 31 comment replacement and delete :600-620 per human plan Task 1 Step 4."},
+        {"description": "No reference remains", "command": "grep -rn surface_mcp_errors /Users/roberthyatt/Code/ironclaude/worker", "expected": "no output, exit 1"},
+        {"description": "Run test", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-state-activator-single-object.sh", "expected": "Results: 6 pass, 0 fail; exit 0"},
+        {"description": "Warning queue suite", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-warning-queue.sh", "expected": "Results: 7 pass, 0 fail; exit 0"},
+        {"description": "Deactivation suite", "command": "bash /Users/roberthyatt/Code/ironclaude/worker/hooks/tests/test-professional-mode-deactivation.sh", "expected": "Results: 28 pass, 0 fail; exit 0"},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add worker/hooks/state-activator.sh worker/hooks/hook-logger.sh worker/hooks/tests/test-state-activator-single-object.sh", "expected": "no output, exit 0"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Full verification and redeploy (R4)",
+      "description": "Run all hook suites and the Commander suite, deploy hooks, confirm Claude plugin hooks.json unchanged (copy only on a difference), refresh the Codex cache, verify it matches worker/, write the deploy log with the R5 note (final Fable end review of the full combined L2b-1+1b+1c+1d diff must pass; then operator commits all four; then re-trusts pre_tool_use:2, pre_tool_use:3, pre_tool_use:6, post_tool_use:6). No tests required: runs suites and deploys; deploy-hooks and codex plugin add write generated runtime copies outside the repo.",
+      "allowed_files": ["docs/plans/2026-10-03-mcp-sideband-consumer-removal-deploy-log.md"],
+      "depends_on": [1],
+      "steps": [
+        {"description": "Run every hook suite", "command": "make -C /Users/roberthyatt/Code/ironclaude test-hooks", "expected": "exit 0; test-state-activator-single-object.sh header printed with Results: 6 pass, 0 fail; no non-zero fail count"},
+        {"description": "Run Commander suite (Bash timeout 600000)", "command": "cd /Users/roberthyatt/Code/ironclaude/commander && PYTHONUNBUFFERED=1 .venv/bin/python -m pytest -q", "expected": "3457 passed, exit 0"},
+        {"description": "Deploy hooks", "command": "make -C /Users/roberthyatt/Code/ironclaude deploy-hooks", "expected": "output includes 'Deployed to plugin cache /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks' and 'Deployed 31 hooks to /Users/roberthyatt/.claude/ironclaude-hooks'"},
+        {"description": "Check Claude plugin hooks.json; no output -> record 'hooks.json unchanged — copy skipped'; on a difference record it, run cp /Users/roberthyatt/Code/ironclaude/worker/hooks/hooks.json /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks/hooks.json and re-diff", "command": "diff /Users/roberthyatt/Code/ironclaude/worker/hooks/hooks.json /Users/roberthyatt/.claude/plugins/cache/ironclaude/ironclaude/1.1.15/hooks/hooks.json", "expected": "no output, exit 0"},
+        {"description": "Refresh Codex plugin cache", "command": "codex plugin add ironclaude@ironclaude --json", "expected": "exit 0; JSON installedPath /Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/1.1.15+codex.20260930172837"},
+        {"description": "Verify Codex cache matches worker/", "command": "diff -rq /Users/roberthyatt/Code/ironclaude/worker /Users/roberthyatt/.codex/plugins/cache/ironclaude/ironclaude/1.1.15+codex.20260930172837 -x node_modules -x __pycache__ -x .DS_Store", "expected": "no output, exit 0"},
+        {"description": "Write docs/plans/2026-10-03-mcp-sideband-consumer-removal-deploy-log.md per human plan Task 2 Step 7 (quoted outputs of Steps 1-6; hooks.json unchanged; R5 note)."},
+        {"description": "Stage deploy log", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/plans/2026-10-03-mcp-sideband-consumer-removal-deploy-log.md", "expected": "no output, exit 0"}
+      ]
+    }
+  ]
+}

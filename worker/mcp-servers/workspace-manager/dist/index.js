@@ -13026,6 +13026,40 @@ function migrateSchema(db) {
       `);
     })();
   }
+  if (!db.prepare("SELECT 1 FROM schema_migrations WHERE version = 7").get()) {
+    db.transaction(() => {
+      db.exec(`
+        -- A Commander-only grant is inserted as phase=granted.  No plaintext
+        -- capability is stored here; handoff.ts compares its SHA-256 hash.
+        CREATE TABLE IF NOT EXISTS workspace_handoffs (
+          workspace_guid TEXT PRIMARY KEY REFERENCES assignments(workspace_guid),
+          generation INTEGER NOT NULL,
+          capability_token_hash TEXT NOT NULL,
+          grant_expires_at TEXT,
+          source_owner_session_id TEXT NOT NULL,
+          target_owner_session_id TEXT,
+          repository_identity TEXT NOT NULL,
+          worker_id TEXT NOT NULL,
+          worktree_path TEXT NOT NULL,
+          branch TEXT NOT NULL,
+          base_commit TEXT NOT NULL,
+          current_head TEXT NOT NULL,
+          integration_target TEXT NOT NULL,
+          phase TEXT NOT NULL CHECK (phase IN ('granted', 'begun', 'transferred', 'finished')),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS workspace_mutations (
+          workspace_guid TEXT PRIMARY KEY REFERENCES assignments(workspace_guid) ON DELETE CASCADE,
+          operation TEXT NOT NULL,
+          nonce TEXT NOT NULL,
+          process_identity TEXT NOT NULL,
+          acquired_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT OR IGNORE INTO schema_migrations(version) VALUES (7);
+      `);
+    })();
+  }
 }
 function insertPreservedWork(db, input) {
   const existing = db.prepare(
@@ -13806,9 +13840,30 @@ function contentMergedInto(cwd, tip, targetRef2, scratchDir) {
 }
 
 // src/scoped-tree.ts
-import { rmSync as rmSync2 } from "node:fs";
+import { realpathSync as realpathSync2, rmSync as rmSync2 } from "node:fs";
 import os2 from "node:os";
 import path3 from "node:path";
+function repoRelativeFromAbsolute(realRoot, entry) {
+  const absolute = path3.resolve(entry);
+  const remainder = [path3.basename(absolute)];
+  let ancestor = path3.dirname(absolute);
+  for (; ; ) {
+    try {
+      const resolved = path3.join(realpathSync2.native(ancestor), ...remainder);
+      if (!resolved.startsWith(realRoot + path3.sep)) return null;
+      return path3.relative(realRoot, resolved).split(path3.sep).join("/");
+    } catch (error) {
+      const code = error.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        throw new Error(`Cannot scope commit: cannot resolve ancestor '${ancestor}' for allowed_files entry '${entry}' (${code ?? "unknown error"})`, { cause: error });
+      }
+      const parent = path3.dirname(ancestor);
+      if (parent === ancestor) return null;
+      remainder.unshift(path3.basename(ancestor));
+      ancestor = parent;
+    }
+  }
+}
 function buildScopedStagedTree(repoPath, parentOid, allowedFiles) {
   const raw = runGit(repoPath, ["ls-files", "--stage", "-z"]);
   const index = /* @__PURE__ */ new Map();
@@ -13826,9 +13881,17 @@ function buildScopedStagedTree(repoPath, parentOid, allowedFiles) {
   const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
   try {
     runGitEnv(repoPath, ["read-tree", parentOid], env);
-    for (const rel of allowedFiles) {
+    let realRoot;
+    for (const entry of allowedFiles) {
+      let rel = entry;
+      if (path3.posix.isAbsolute(entry)) {
+        realRoot ??= realpathSync2.native(repoPath);
+        const inside = repoRelativeFromAbsolute(realRoot, entry);
+        if (inside === null) continue;
+        rel = inside;
+      }
       if (rel === "" || rel.endsWith("/") || path3.posix.isAbsolute(rel) || rel !== path3.posix.normalize(rel)) {
-        throw new Error(`Cannot scope commit: allowed_files entry '${rel}' is not a canonical repo-relative path (no leading ./, no .., no //, no absolute path, no trailing slash)`);
+        throw new Error(`Cannot scope commit: allowed_files entry '${rel}' is not a canonical repo-relative path (no leading ./, no .., no //, no trailing slash)`);
       }
       const entries = index.get(rel);
       if (entries && entries.some((e) => e.stage !== "0")) {
@@ -14408,8 +14471,8 @@ function pushExactAuthorizedIntegratedCandidate(authority, candidateOid, targetR
 }
 
 // src/integration.ts
-import { spawnSync as spawnSync2 } from "node:child_process";
-import { createHash } from "node:crypto";
+import { spawnSync as spawnSync3 } from "node:child_process";
+import { createHash as createHash2 } from "node:crypto";
 import {
   closeSync,
   existsSync as existsSync2,
@@ -14423,6 +14486,111 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path6 from "node:path";
+
+// src/handoff.ts
+import { spawnSync as spawnSync2 } from "node:child_process";
+import { createHash, randomUUID as randomUUID2, timingSafeEqual } from "node:crypto";
+var localClaims = /* @__PURE__ */ new Map();
+var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+var cachedProcessIdentity;
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = error.code;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
+    throw error;
+  }
+}
+function processStartEpoch(pid) {
+  if (!processExists(pid)) return null;
+  const result2 = spawnSync2("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: { ...process.env, LC_ALL: "C", TZ: "UTC" } });
+  if (result2.error) throw result2.error;
+  const text2 = String(result2.stdout ?? "").trim();
+  if (text2 === "") {
+    if (!processExists(pid)) return null;
+    throw new Error(`Process ${pid} start time is unavailable`);
+  }
+  const match = /^[A-Z][a-z]{2}\s+([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})$/.exec(text2);
+  const month = match ? MONTHS.indexOf(match[1]) : -1;
+  if (!match || month < 0) throw new Error(`Process ${pid} start time is unparseable: ${text2}`);
+  return Math.floor(Date.UTC(Number(match[6]), month, Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5])) / 1e3);
+}
+function currentProcessIdentity() {
+  if (cachedProcessIdentity === void 0) {
+    let started = null;
+    try {
+      started = processStartEpoch(process.pid);
+    } catch {
+      started = null;
+    }
+    cachedProcessIdentity = started === null ? `${process.pid}` : `${process.pid}:${started}`;
+  }
+  return cachedProcessIdentity;
+}
+function mutationOwnerStatus(identity) {
+  const match = /^(\d+)(?::(\d+))?$/.exec(identity);
+  if (!match) return "unproved";
+  const pid = Number(match[1]);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return "unproved";
+  let started;
+  try {
+    started = processStartEpoch(pid);
+  } catch {
+    return "unproved";
+  }
+  if (started === null) return "dead";
+  if (match[2] === void 0) return "unproved";
+  return started === Number(match[2]) ? "live" : "dead";
+}
+function assertNoPendingHandoff(db, workspaceGuid) {
+  if (db.prepare("SELECT 1 FROM workspace_handoffs WHERE workspace_guid = ? AND phase <> 'finished'").get(workspaceGuid)) throw new Error("Assignment handoff is pending");
+}
+function insertMutationClaim(db, workspaceGuid, operation, nonce) {
+  let inserted = false;
+  db.transaction(() => {
+    assertNoPendingHandoff(db, workspaceGuid);
+    try {
+      db.prepare("INSERT INTO workspace_mutations(workspace_guid, operation, nonce, process_identity) VALUES (?, ?, ?, ?)").run(workspaceGuid, operation, nonce, currentProcessIdentity());
+      inserted = true;
+    } catch {
+      inserted = false;
+    }
+  }).immediate();
+  return inserted;
+}
+function reapDeadAssignmentMutation(db, workspaceGuid) {
+  const claim = db.prepare("SELECT nonce, process_identity FROM workspace_mutations WHERE workspace_guid = ?").get(workspaceGuid);
+  if (!claim || mutationOwnerStatus(claim.process_identity) !== "dead") return false;
+  return db.prepare("DELETE FROM workspace_mutations WHERE workspace_guid = ? AND nonce = ? AND process_identity = ?").run(workspaceGuid, claim.nonce, claim.process_identity).changes === 1;
+}
+function withAssignmentMutation(db, workspaceGuid, operation, fn) {
+  const nested = localClaims.get(workspaceGuid);
+  if (nested) {
+    if (nested.db !== db) throw new Error("Assignment mutation token belongs to another database");
+    nested.depth++;
+    try {
+      return fn();
+    } finally {
+      nested.depth--;
+    }
+  }
+  const nonce = randomUUID2();
+  if (!insertMutationClaim(db, workspaceGuid, operation, nonce) && !(reapDeadAssignmentMutation(db, workspaceGuid) && insertMutationClaim(db, workspaceGuid, operation, nonce))) {
+    throw new Error("Assignment mutation is already claimed");
+  }
+  localClaims.set(workspaceGuid, { db, nonce, depth: 1 });
+  try {
+    return fn();
+  } finally {
+    localClaims.delete(workspaceGuid);
+    db.prepare("DELETE FROM workspace_mutations WHERE workspace_guid = ? AND nonce = ?").run(workspaceGuid, nonce);
+  }
+}
+
+// src/integration.ts
 var usedDirectAuthorities = /* @__PURE__ */ new WeakSet();
 var usedReconcileAuthorities = /* @__PURE__ */ new WeakSet();
 var usedConfirmResolutionAuthorities = /* @__PURE__ */ new WeakSet();
@@ -14506,7 +14674,7 @@ function cumulativeBinaryEffect(cwd, base, head) {
   try {
     wfd = openSync(file, "w");
     const args = ["diff", "--binary", "--full-index", base, head];
-    const result2 = spawnSync2("git", ["-C", cwd, ...args], { stdio: ["ignore", wfd, "pipe"], maxBuffer: GIT_MAX_BUFFER });
+    const result2 = spawnSync3("git", ["-C", cwd, ...args], { stdio: ["ignore", wfd, "pipe"], maxBuffer: GIT_MAX_BUFFER });
     closeSync(wfd);
     wfd = void 0;
     if (result2.error) {
@@ -14514,7 +14682,7 @@ function cumulativeBinaryEffect(cwd, base, head) {
       throw overflow ?? result2.error;
     }
     if (result2.status !== 0) throw gitError(cwd, args, (result2.stderr || "").toString());
-    const hash = createHash("sha256");
+    const hash = createHash2("sha256");
     const rfd = openSync(file, "r");
     try {
       const buf = Buffer.allocUnsafe(1 << 20);
@@ -14605,9 +14773,10 @@ function exactAssignment(db, repositoryPath, workspaceGuid, providerRootSessionI
   if (!assignment || assignment.repository_identity !== repository.repositoryIdentity || assignment.owner_session_id !== providerRootSessionId) {
     throw new Error("Finalization assignment binding does not match repository and provider root");
   }
+  assertNoPendingHandoff(db, workspaceGuid);
   return { assignment, primaryCheckoutPath: repository.primaryCheckoutPath };
 }
-function syncWorktreeToTarget(db, input) {
+function syncWorktreeToTargetCore(db, input) {
   const exact = exactAssignment(db, input.repositoryPath, input.workspaceGuid, input.providerRootSessionId);
   const assignment = exact.assignment;
   if (assignment.lifecycle_status !== "active") {
@@ -14735,7 +14904,7 @@ function markIntegrated(db, assignment, integratedCommit, ref, hooks) {
   })();
   return getAssignment(db, assignment.workspace_guid);
 }
-function recycleFinalized(db, repositoryPath, assignment) {
+function recycleFinalizedCore(db, repositoryPath, assignment) {
   const current = getAssignment(db, assignment.workspace_guid);
   if (!current || current.lifecycle_status !== "integrated" || !current.integrated_commit) {
     throw new Error("Recycle requires a durable integrated assignment; preserving worktree");
@@ -14999,7 +15168,7 @@ function finalizePrimaryUnassignedCommitAndPush(authority, message, hooks) {
   }
   throw new Error(`${mutationError ? `Push command failed: ${mutationError}. ` : ""}Unassigned-primary commit-and-push remote outcome is ambiguous`);
 }
-function finalizeDirectAuthority(db, authority, message, hooks) {
+function finalizeDirectAuthorityCore(db, authority, message, hooks) {
   if (authority.operation === "push") {
     const exact2 = exactAssignment(db, authority.worktreePath, authority.workspaceGuid, authority.providerRootSessionId);
     if (exact2.assignment.lifecycle_status !== "active" || authority.checkoutMode !== "managed" || authority.worktreePath !== exact2.assignment.worktree_path) {
@@ -15131,7 +15300,7 @@ function finalizeDirectAuthority(db, authority, message, hooks) {
   recycleFinalized(db, local.repositoryPath, local.assignment);
   return { state: "pushed", integratedCommit: local.integratedCommit };
 }
-function finalizeReconcile(db, authority) {
+function finalizeReconcileCore(db, authority) {
   if (authority.operation !== "reconcile") throw new Error("Reconcile finalization requires reconcile authority");
   if (authority.checkoutMode !== "managed") throw new Error("Reconcile is only valid for a managed worktree; there is no primary or unassigned reconcile lane");
   if (usedReconcileAuthorities.has(authority)) throw new Error("Direct Git reconcile authority is single-use");
@@ -15164,7 +15333,7 @@ function finalizeReconcile(db, authority) {
   }
   throw new Error("Reconcile needs an active or paused-for-integration managed assignment; if a prior finalize is frozen, run reconcile_finalization first, then re-run /reconcile");
 }
-function finalizeConfirmResolution(db, authority) {
+function finalizeConfirmResolutionCore(db, authority) {
   if (authority.operation !== "confirm-resolution") throw new Error("Confirm-resolution finalization requires confirm-resolution authority");
   if (authority.checkoutMode !== "managed") throw new Error("Confirm-resolution is only valid for a managed worktree");
   if (usedConfirmResolutionAuthorities.has(authority)) throw new Error("Direct Git confirm-resolution authority is single-use");
@@ -15308,7 +15477,7 @@ function snapshotResidualIfDirty(db, exact) {
   return { ref: recoveryRef, residualFiles };
 }
 var usedCloseOutAuthorities = /* @__PURE__ */ new WeakSet();
-function finalizeCloseOut(db, authority) {
+function finalizeCloseOutCore(db, authority) {
   if (authority.operation !== "close-out") throw new Error("Close-out finalization requires close-out authority");
   if (authority.checkoutMode !== "managed") throw new Error("Close-out is only valid for a managed worktree; there is no primary or unassigned close-out lane");
   if (usedCloseOutAuthorities.has(authority)) throw new Error("Direct Git close-out authority is single-use");
@@ -15424,7 +15593,7 @@ function classifyRebaseConflicts(worktree) {
     return { path: path9, conflictClass, summary };
   });
 }
-function resolveConflictHunk(db, input) {
+function resolveConflictHunkCore(db, input) {
   const exact = exactAssignment(db, input.repositoryPath, input.workspaceGuid, input.providerRootSessionId);
   const assignment = exact.assignment;
   if (assignment.lifecycle_status !== "ready_for_integration") {
@@ -15583,7 +15752,7 @@ function recoverNoPausedRebase(exact, mode) {
   const frozen = runGit(exact.primaryCheckoutPath, ["rev-parse", "--verify", `${freezeRef(assignment.workspace_guid)}^{commit}`]).trim();
   return mode === "rerebase" ? rerebaseFromFrozen(worktree, assignment, frozen) : restoreFrozen(worktree, frozen);
 }
-function reconcileFinalization(db, input) {
+function reconcileFinalizationCore(db, input) {
   const exact = exactAssignment(db, input.repositoryPath, input.workspaceGuid, input.providerRootSessionId);
   const assignment = exact.assignment;
   if (input.rebaseRecovery === "status") {
@@ -15799,6 +15968,30 @@ function reconcileFinalization(db, input) {
   recycleFinalized(db, exact.primaryCheckoutPath, integrated);
   return { state: "cleaned", integratedCommit: durableRecord.integrated_commit };
 }
+function syncWorktreeToTarget(db, input) {
+  return withAssignmentMutation(db, input.workspaceGuid, "sync-worktree-to-target", () => syncWorktreeToTargetCore(db, input));
+}
+function recycleFinalized(db, repositoryPath, assignment) {
+  return withAssignmentMutation(db, assignment.workspace_guid, "recycle-finalized", () => recycleFinalizedCore(db, repositoryPath, assignment));
+}
+function finalizeDirectAuthority(db, authority, message, hooks) {
+  return withAssignmentMutation(db, authority.workspaceGuid, "finalize-direct-authority", () => finalizeDirectAuthorityCore(db, authority, message, hooks));
+}
+function finalizeReconcile(db, authority) {
+  return withAssignmentMutation(db, authority.workspaceGuid, "finalize-reconcile", () => finalizeReconcileCore(db, authority));
+}
+function finalizeConfirmResolution(db, authority) {
+  return withAssignmentMutation(db, authority.workspaceGuid, "finalize-confirm-resolution", () => finalizeConfirmResolutionCore(db, authority));
+}
+function finalizeCloseOut(db, authority) {
+  return withAssignmentMutation(db, authority.workspaceGuid, "finalize-close-out", () => finalizeCloseOutCore(db, authority));
+}
+function resolveConflictHunk(db, input) {
+  return withAssignmentMutation(db, input.workspaceGuid, "resolve-conflict-hunk", () => resolveConflictHunkCore(db, input));
+}
+function reconcileFinalization(db, input) {
+  return withAssignmentMutation(db, input.workspaceGuid, "reconcile-finalization", () => reconcileFinalizationCore(db, input));
+}
 
 // src/session-identity.ts
 function record(value, label) {
@@ -15886,8 +16079,8 @@ function resolveSessionIdentity(client, requestMeta, claudePpidSession) {
 }
 
 // src/workspace-service.ts
-import { spawnSync as spawnSync3 } from "node:child_process";
-import { createHash as createHash2, randomUUID as randomUUID2 } from "node:crypto";
+import { spawnSync as spawnSync4 } from "node:child_process";
+import { createHash as createHash3, randomUUID as randomUUID3 } from "node:crypto";
 import { existsSync as existsSync3, mkdtempSync as mkdtempSync2, rmSync as rmSync4 } from "node:fs";
 import os4 from "node:os";
 import path7 from "node:path";
@@ -15909,7 +16102,7 @@ function selectWorkspaceGuid(input) {
     if (!validUuid(input.workspaceGuid)) throw new Error("workspaceGuid must be a UUID");
     return input.workspaceGuid;
   }
-  return validUuid(input.ownerSessionId) ? input.ownerSessionId : randomUUID2();
+  return validUuid(input.ownerSessionId) ? input.ownerSessionId : randomUUID3();
 }
 function nonterminal(status) {
   return status !== "integrated" && status !== "abandoned" && status !== "cleaned";
@@ -16192,8 +16385,13 @@ var WorkspaceService = class {
   }
   /** Human approval is required before logical ownership of primary checkout. */
   usePrimaryCheckout(input) {
+    if (!getAssignment(this.db, input.workspaceGuid)) this.getWorkspaceAssignment(input);
+    return withAssignmentMutation(this.db, input.workspaceGuid, "use-primary-checkout", () => this.usePrimaryCheckoutCore(input));
+  }
+  usePrimaryCheckoutCore(input) {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if (input.expectedEvidence === void 0 !== (input.nonce === void 0)) {
       throw new Error("Primary checkout switching authority input is malformed");
     }
@@ -16219,8 +16417,13 @@ var WorkspaceService = class {
   }
   /** Human approval is also required to release primary checkout ownership. */
   returnToManagedWorktree(input) {
+    if (!getAssignment(this.db, input.workspaceGuid)) this.getWorkspaceAssignment(input);
+    return withAssignmentMutation(this.db, input.workspaceGuid, "return-to-managed-worktree", () => this.returnToManagedWorktreeCore(input));
+  }
+  returnToManagedWorktreeCore(input) {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if (input.expectedEvidence === void 0 !== (input.nonce === void 0)) {
       throw new Error("Managed worktree switching authority input is malformed");
     }
@@ -16241,8 +16444,13 @@ var WorkspaceService = class {
     return { managedWorktreePath: assignment.worktree_path, assignment };
   }
   abandonWorkspace(input) {
+    if (!getAssignment(this.db, input.workspaceGuid)) this.getWorkspaceAssignment(input);
+    return withAssignmentMutation(this.db, input.workspaceGuid, "abandon-workspace", () => this.abandonWorkspaceCore(input));
+  }
+  abandonWorkspaceCore(input) {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if (assignment.lifecycle_status === "abandoned") return assignment;
     if (!nonterminal(assignment.lifecycle_status)) {
       throw new Error("Only unresolved managed worktrees can be abandoned");
@@ -16292,8 +16500,13 @@ var WorkspaceService = class {
    * proofs — the moment a worktree actually exists for this row.
    */
   cleanupReservedAssignment(input) {
+    if (!getAssignment(this.db, input.workspaceGuid)) this.getWorkspaceAssignment(input);
+    return withAssignmentMutation(this.db, input.workspaceGuid, "cleanup-reserved-assignment", () => this.cleanupReservedAssignmentCore(input));
+  }
+  cleanupReservedAssignmentCore(input) {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if (assignment.lifecycle_status !== "reserved") {
       throw new Error("Only a reserved, never-materialized assignment is eligible for this carve-out");
     }
@@ -16407,8 +16620,13 @@ var WorkspaceService = class {
    * proof still reaches its actual Git HEAD. Every failed proof preserves work.
    */
   cleanupWorkspace(input) {
+    if (!getAssignment(this.db, input.workspaceGuid)) this.getWorkspaceAssignment(input);
+    return withAssignmentMutation(this.db, input.workspaceGuid, "cleanup-workspace", () => this.cleanupWorkspaceCore(input));
+  }
+  cleanupWorkspaceCore(input) {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = this.getWorkspaceAssignment(input);
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if (assignment.lifecycle_status !== "integrated" && assignment.lifecycle_status !== "abandoned") {
       throw new Error("Only integrated or abandoned worktrees are eligible for cleanup");
     }
@@ -16428,11 +16646,19 @@ var WorkspaceService = class {
    * preserved. Only after work is anchored does it tombstone the row.
    */
   reapLeakedAssignment(input) {
+    if (!getAssignment(this.db, input.workspaceGuid)) {
+      discoverRepository(input.repositoryPath);
+      throw new Error("Leaked assignment does not match canonical managed identity for this repository");
+    }
+    return withAssignmentMutation(this.db, input.workspaceGuid, "reap-leaked-assignment", () => this.reapLeakedAssignmentCore(input));
+  }
+  reapLeakedAssignmentCore(input) {
     const repository = discoverRepository(input.repositoryPath);
     const assignment = getAssignment(this.db, input.workspaceGuid);
     if (!assignment || assignment.repository_identity !== repository.repositoryIdentity || assignment.worktree_path !== managedWorktreePath(repository.primaryCheckoutPath, assignment.workspace_guid) || assignment.branch !== managedBranch(assignment.workspace_guid)) {
       throw new Error("Leaked assignment does not match canonical managed identity for this repository");
     }
+    assertNoPendingHandoff(this.db, assignment.workspace_guid);
     if (assignment.lifecycle_status === "cleaned") return assignment;
     if (assignment.lifecycle_status === "reserved") {
       return this.reapReservedAssignment(repository, assignment);
@@ -16802,7 +17028,7 @@ var WorkspaceService = class {
         return { id, guid, outcome: "needs-manual-merge" };
       }
       const mergeTreeArgs = ["merge-tree", "--write-tree", expected, tip];
-      const mt = spawnSync3("git", ["-C", primary, ...mergeTreeArgs], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
+      const mt = spawnSync4("git", ["-C", primary, ...mergeTreeArgs], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
       if (mt.error) throw mt.error;
       if (mt.status === 1) return { id, guid, outcome: "conflict" };
       if (mt.status !== 0) throw gitError(primary, mergeTreeArgs, mt.stderr || "");
@@ -16815,14 +17041,14 @@ var WorkspaceService = class {
         GIT_COMMITTER_EMAIL: "ironclaude-reaper@localhost"
       };
       const commitTreeArgs = ["commit-tree", tree, "-p", expected, "-p", tip, "-m", `ironclaude: merge orphan ${name} into ${target}`];
-      const ct = spawnSync3("git", ["-C", primary, ...commitTreeArgs], { encoding: "utf8", env: botEnv, maxBuffer: GIT_MAX_BUFFER });
+      const ct = spawnSync4("git", ["-C", primary, ...commitTreeArgs], { encoding: "utf8", env: botEnv, maxBuffer: GIT_MAX_BUFFER });
       if (ct.error) throw ct.error;
       if (ct.status !== 0) throw gitError(primary, commitTreeArgs, ct.stderr || "");
       newCommit = (ct.stdout || "").trim();
     }
     if (newCommit !== expected) {
       assertNoPrimaryOverlap(primary, target, expected, newCommit);
-      const upd = spawnSync3("git", ["-C", primary, "update-ref", target, newCommit, expected], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
+      const upd = spawnSync4("git", ["-C", primary, "update-ref", target, newCommit, expected], { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
       if (upd.error) throw upd.error;
       if (upd.status !== 0) return { id, guid, outcome: "target-moved" };
       if (primaryOnRef(primary, target)) {
@@ -16876,7 +17102,7 @@ var WorkspaceService = class {
   }
   /** Upserts the orphan's surface row and builds the reported PreservedOrphan, including `muted`. */
   buildPreservedOrphan(repository, guid, branch, tip, category, evidence, worktreePresent) {
-    const id = createHash2("sha256").update(`${guid}\0${tip}`).digest("hex").slice(0, 8);
+    const id = createHash3("sha256").update(`${guid}\0${tip}`).digest("hex").slice(0, 8);
     const row = this.upsertOrphanSurface(repository.repositoryIdentity, guid, id, tip, category);
     return { id, guid, branch, category, tip, worktreePresent, evidence, muted: row.muted_tip === tip };
   }
@@ -16942,18 +17168,21 @@ var WorkspaceService = class {
     const toRelink = [...written.added, ...written.skipped];
     if (toRelink.length > 0) {
       const liveManaged = this.db.prepare(`
-        SELECT worktree_path FROM assignments
+        SELECT workspace_guid, worktree_path FROM assignments
         WHERE repository_identity = ?
           AND lifecycle_status NOT IN ('integrated', 'abandoned', 'cleaned')
       `).all(repository.repositoryIdentity);
-      for (const { worktree_path } of liveManaged) {
-        if (!existsSync3(worktree_path)) continue;
-        const planted = linkSharedResources(
-          repository.primaryCheckoutPath,
-          worktree_path,
-          repository.repositoryIdentity,
-          toRelink
-        );
+      for (const { workspace_guid, worktree_path } of liveManaged) {
+        const planted = withAssignmentMutation(this.db, workspace_guid, "shared-resource-relink", () => {
+          const current = getAssignment(this.db, workspace_guid);
+          if (!current || current.repository_identity !== repository.repositoryIdentity || current.worktree_path !== worktree_path || !nonterminal(current.lifecycle_status) || !existsSync3(worktree_path)) return [];
+          return linkSharedResources(
+            repository.primaryCheckoutPath,
+            worktree_path,
+            repository.repositoryIdentity,
+            toRelink
+          );
+        });
         if (planted.length > 0) relinked[worktree_path] = planted;
       }
     }

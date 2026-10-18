@@ -1,0 +1,27 @@
+{
+  "name": "Retarget music worktree to main",
+  "goal": "Change one workspace-manager DB row so roleplaying-agents music worktree 019f7d26-9faa-7e71-b7cf-ee2a2334b9f4 targets main, and record before/after.",
+  "requirements_file": "docs/plans/2026-10-13-worktree-retarget-main-design.md",
+  "design_file": "docs/plans/2026-10-13-worktree-retarget-main-design.md",
+  "tasks": [
+    {
+      "id": 1,
+      "name": "Guarded retarget and record",
+      "description": "No tests required: one-row operational data change, not code; verification = before/after snapshot, changes(), diff. Invariants: literal absolute paths, no shell vars; stderr to own .err, no 2>/dev/null, echo exit codes; only write is Step 2 UPDATE; stage with git -C /Users/roberthyatt/Code/ironclaude add -f; changes() != 1 => stop and report, never widen WHERE.",
+      "allowed_files": [
+        "docs/reviews/2026-10-12-worktree-unblock-findings.md",
+        "docs/plans/2026-10-13-worktree-retarget-main-design.md",
+        "docs/plans/2026-10-13-worktree-retarget-main.md",
+        "docs/plans/2026-10-13-worktree-retarget-main.plan.json"
+      ],
+      "depends_on": [],
+      "steps": [
+        {"description": "Snapshot row before", "command": "sqlite3 -readonly -line /Users/roberthyatt/.claude/ironclaude-workspaces.db \"SELECT * FROM assignments WHERE workspace_guid='019f7d26-9faa-7e71-b7cf-ee2a2334b9f4';\" > /private/tmp/worktree-unblock/r1-before.txt 2> /private/tmp/worktree-unblock/r1-before.err; echo \"before=$?\"; cat /private/tmp/worktree-unblock/r1-before.txt /private/tmp/worktree-unblock/r1-before.err", "expected": "before=0; one row; integration_target = portrait-gen-structural-sclera-gate; lifecycle_status = active (measured 2026-10-12 findings). Differs => stop and report."},
+        {"description": "Guarded update", "command": "sqlite3 -cmd \".timeout 10000\" /Users/roberthyatt/.claude/ironclaude-workspaces.db \"UPDATE assignments SET integration_target='main' WHERE workspace_guid='019f7d26-9faa-7e71-b7cf-ee2a2334b9f4' AND integration_target='portrait-gen-structural-sclera-gate' AND lifecycle_status='active'; SELECT 'changes=' || changes();\" > /private/tmp/worktree-unblock/r2-update.txt 2> /private/tmp/worktree-unblock/r2-update.err; echo \"update=$?\"; cat /private/tmp/worktree-unblock/r2-update.txt /private/tmp/worktree-unblock/r2-update.err", "expected": "update=0 and changes=1. changes=0 => row drifted, stop and report; busy error => stop and report stderr."},
+        {"description": "Snapshot after + diff", "command": "sqlite3 -readonly -line /Users/roberthyatt/.claude/ironclaude-workspaces.db \"SELECT * FROM assignments WHERE workspace_guid='019f7d26-9faa-7e71-b7cf-ee2a2334b9f4';\" > /private/tmp/worktree-unblock/r3-after.txt 2> /private/tmp/worktree-unblock/r3-after.err; echo \"after=$?\"; diff /private/tmp/worktree-unblock/r1-before.txt /private/tmp/worktree-unblock/r3-after.txt; echo \"diff=$?\"; cat /private/tmp/worktree-unblock/r3-after.err", "expected": "after=0; diff=1; diff shows exactly one changed line: integration_target portrait-gen-structural-sclera-gate -> main. Any other changed line = failure, report."},
+        {"description": "Append §8 'Retarget applied (2026-10-13)' to docs/reviews/2026-10-12-worktree-unblock-findings.md: operator go; before/after integration_target quoted from r1/r3; r2 changes= line; diff output; remaining Option B steps in roleplaying-agents Codex session: /commit incl. AGENTS.md (operator decision 2026-10-13) -> commit or remove untracked music research -> sync_worktree_to_target -> run music tests + game smoke in worktree, stop if sclera-only dependency missing -> /reconcile.", "expected": "Section written."},
+        {"description": "Stage", "command": "git -C /Users/roberthyatt/Code/ironclaude add -f docs/reviews/2026-10-12-worktree-unblock-findings.md docs/plans/2026-10-13-worktree-retarget-main-design.md docs/plans/2026-10-13-worktree-retarget-main.md docs/plans/2026-10-13-worktree-retarget-main.plan.json", "expected": "No output."}
+      ]
+    }
+  ]
+}
